@@ -11,10 +11,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 
+use omnigraph::Session;
 use omnigraph::changes::{ChangeFilter, ChangeOp, EntityKind};
 use omnigraph::db::{InitOptions, Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::error::{OmniError, Result as OmniResult};
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
 use omnigraph::storage::{ObjectStorageAdapter, StorageAdapter};
 
 use crate::detectors::{self, Channel, Detector, ObservationSource, Oracle};
@@ -58,7 +60,7 @@ pub(crate) fn clear_process_slots() {
     crate::lance_faults::set_kill(None);
     crate::lance_faults::set_seam_scheduler(None);
     crate::lance_faults::set_bytes_canary(None);
-    FOREIGN_SIDECAR_ROWS.lock().unwrap().clear();
+    omnigraph::storage::STORAGE.clear();
 }
 
 /// The plain (unpaused, unseeded) current-thread tokio runtime used by
@@ -88,6 +90,7 @@ pub const DET_WORLD: Detector = on(Channel::Query, Oracle::WorldDifferential);
 pub const DET_MEMBERSHIP: Detector = on(Channel::Query, Oracle::MembershipQuery);
 pub const DET_RO_AUDIT: Detector = on(Channel::Query, Oracle::ReadOnlyAudit);
 pub const DET_PHYSICAL: Detector = on(Channel::Physical, Oracle::PhysicalExport);
+pub const DET_COLLECTOR: Detector = on(Channel::Physical, Oracle::CollectorInvariant);
 pub const DET_HISTORY: Detector = on(Channel::History, Oracle::HistoryDifferential);
 pub const DET_TRAVERSAL: Detector = on(Channel::Query, Oracle::TraversalModeDifferential);
 pub const DET_SESSION: Detector = on(Channel::Session, Oracle::SessionDifferential);
@@ -100,8 +103,6 @@ pub const DET_CRASH_CONTRACT: Detector = on(Channel::Query, Oracle::CrashContrac
 pub const DET_BIRTH: Detector = on(Channel::Claim, Oracle::BirthContract);
 pub const DET_RECOVERY_OBLIGATION: Detector = on(Channel::Physical, Oracle::RecoveryObligation);
 pub const DET_RESIDUE: Detector = on(Channel::Physical, Oracle::ResidueObligation);
-pub const DET_LIVE_WRITE_AVAILABILITY: Detector =
-    on(Channel::Session, Oracle::LiveWriteAvailability);
 pub const DET_MAINTENANCE: Detector = on(Channel::Query, Oracle::MaintenanceObligations);
 pub const DET_OCC: Detector = on(Channel::History, Oracle::CommitIdUniqueness);
 pub const DET_LIVENESS: Detector = Detector {
@@ -161,11 +162,14 @@ pub struct FaultPlan {
     /// their acknowledgement lost — the effect is DURABLE (delegation
     /// happened), but the caller receives a marked error. The inverse of
     /// `error_pct`'s clean loss. Pressure-tests retry idempotency (see
-    /// `client_retry` and the CAS note on `write_text_if_match`). Adapter realm only
-    /// in v1 (the Lance realm's retry jitter sits outside the replay
-    /// envelope anyway). Rolls draw from the plan's rng stream ONLY when
-    /// this knob is nonzero, so zero-knob plans keep their exact
-    /// pre-existing draw sequences (pinned tests unchanged).
+    /// `client_retry` and the CAS note on `write_text_if_match`). Both
+    /// realms: the adapter realm always; the Lance realm too when
+    /// `lance_realm` is on — put/copy/per-item delete, which includes the
+    /// `__manifest` dataset's commit puts, the graph-publication door
+    /// (RFC 0067). Rolls draw from the plan's rng stream ONLY when this
+    /// knob is nonzero (the Lance hook draws from its own self-synchronized
+    /// counter namespace), so zero-knob plans keep their exact pre-existing
+    /// draw sequences (pinned tests unchanged).
     pub ack_loss_pct: u64,
     /// CLIENT RETRY: when a workload op fails with a lost
     /// acknowledgement, the harness plays the real client's move and
@@ -267,7 +271,7 @@ impl Default for FaultPlan {
 impl FaultPlan {
     /// All-zero plan: used when the crash-state enumeration needs the
     /// storage wrapper installed but no fault weather was requested.
-    pub(crate) fn none() -> Self {
+    pub fn none() -> Self {
         Self {
             seed: 0,
             error_pct: 0,
@@ -659,6 +663,19 @@ pub struct Scenario {
     /// sampler (die 12 → 16). Gated so every pre-existing pinned seed keeps
     /// its exact op stream.
     pub wide: bool,
+    /// schema-op workload: adds one die face emitting
+    /// `SchemaAddProperty` (a monotone additive apply on main, bounded by
+    /// `MAX_SCHEMA_EXTRAS`), the randomized requalification the roll-12
+    /// quarantine deferred. Gated like `wide` so every pre-existing pinned
+    /// seed keeps its exact op stream; composes with either die.
+    pub schema_ops: bool,
+    /// LIVENESS mode: judge every failed op's aftermath on the SAME live
+    /// handle instead of reopening — the whole universe runs on one handle,
+    /// like a real client under a fault storm, and the report's `reopens`
+    /// stays zero. Incompatible with the crash knobs (`crash_at`,
+    /// `crash_on_match`, `die_at_write`, `recovery_crash`): a dead process
+    /// has no handle to keep.
+    pub keep_handle: bool,
     /// Kill-at-kth-write: die at durable write #k (1-based). `usize::MAX`
     /// = count-only probe (learns W, never dies). Mechanism: `KillState`.
     pub die_at_write: Option<usize>,
@@ -730,19 +747,6 @@ pub struct Scenario {
     /// for ops < this index. Early-only RED + late-only GREEN = the
     /// arming reads are entirely in the FIRST LIFE's window.
     pub world_match_until: Option<usize>,
-    /// KEEP-SERVING phase (issue #554): on a `RecoveryRequired` failure,
-    /// DEFER reconcile's reopen and keep the SAME handle serving — the
-    /// long-lived-server shape where the handle is never reopened on first
-    /// refusal. The value is the budget: this many refusals naming one
-    /// operation id fire the live-write-availability detector. The watch
-    /// resolves (deferred arbitration runs) on a success, any other
-    /// failure — different-id refusals and scheduled crashes included,
-    /// EXCEPT a clean-recovery-state maintenance refusal, which continues
-    /// the watch without counting — or loop end. `client_retry` is
-    /// mutually scoped out (enforced by assert at universe start).
-    /// 0 = off; standing constraint: the knob must never perturb an
-    /// existing pin's op stream or rng draws.
-    pub keep_serving_ops: usize,
 }
 
 /// the milestone steps a window's family needs before its op
@@ -771,8 +775,7 @@ enum Milestone {
     DeleteFixtureOnBranch,
     /// `ensure_indices` on main (the non-fork ensure_indices windows).
     EnsureIndicesMain,
-    /// `ensure_indices` on the FRESH milestone branch — every table pin is
-    /// first-touch, the deferred-fork ensure_indices route.
+    /// `ensure_indices` on the milestone branch after a data op there.
     EnsureIndicesBranch,
     /// `cleanup` on main (branch-snapshot resolution / fork reconciliation /
     /// table GC run against whatever state earlier milestones built).
@@ -789,12 +792,6 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
         // Delete-shaped mutation window: guarantee a DeletePerson exists.
         "mutation.delete_node_pre_primary_delete" => {
             return vec![MutateMain, DeleteFixtureOnMain];
-        }
-        // First-touch fork route: fresh branch, then its first data op.
-        "mutation.post_sidecar_pre_fork"
-        | "mutation.post_fork_pre_commit"
-        | "fork.post_create_pre_open" => {
-            return vec![EnsureBranch, DataOnBranch];
         }
         "classify.fresh_read" | "cleanup.reconcile_fork" => {
             return vec![EnsureBranch, DataOnBranch, DeleteBranch, CleanupMain];
@@ -818,17 +815,14 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
         "branch_merge.rewrite_after_insert_pre_update" => {
             return vec![EnsureBranch, DataOnBranch, MutateMain, MergeBranch];
         }
-        // ensure_indices deferred-fork route: put data on the branch first
-        // (forks ONE table and places it) so the branch ensure_indices has
-        // work to do and the remaining tables are first-touch.
-        "ensure_indices.post_sidecar_pre_fork" | "ensure_indices.post_table_effect" => {
+        "ensure_indices.post_table_effect" => {
             return vec![EnsureBranch, DataOnBranch, EnsureIndicesBranch];
         }
         // cleanup with state to work on: a live branch fork.
         "cleanup.resolve_branch_snapshot" => {
             return vec![EnsureBranch, DataOnBranch, CleanupMain];
         }
-        "cleanup.table_gc" | "cleanup.post_recovery_check_pre_gates" => {
+        "cleanup.table_gc" | "cleanup.pre_gates" => {
             return vec![MutateMain, DeleteFixtureOnMain, CleanupMain];
         }
         // Recovery internals: build the PRIMARY crash's precondition (the
@@ -1083,12 +1077,23 @@ pub struct UniverseReport {
     /// evidence the inverse fault direction (effect durable, ack lost)
     /// saw action (0 without `ack_loss_pct`).
     pub acks_lost: usize,
+    /// acknowledgements the LANCE realm actually lost — the same fault
+    /// direction on table IO and the `__manifest` commit puts (0 without
+    /// `ack_loss_pct` + `lance_realm`).
+    pub lance_acks_lost: usize,
+    /// schema-face ops the sampler actually emitted (attempts, not
+    /// successes) — evidence the `schema_ops` workload reached the
+    /// schema_apply/schema_reload families (0 without `Scenario::schema_ops`).
+    pub schema_applies: usize,
+    /// write-handle reopens performed while judging failures (reconcile and
+    /// crash recovery). A `Scenario::keep_handle` universe must report zero:
+    /// the whole storm ran on one live handle.
+    pub reopens: usize,
     /// Client retries performed after ack-lost ops
     /// (0 without `client_retry`).
     pub client_retries: usize,
-    /// maintenance deaths whose obligation pass ran (rerun
-    /// converged + per-op obligation held). Bite evidence — 0 in universes
-    /// whose deaths never landed in a maintenance op.
+    /// Failed maintenance attempts whose obligation pass ran (rerun
+    /// converged + per-op obligation held), including returned Cleanup errors.
     pub maintenance_reruns: usize,
     /// content reads returned with read-time bit rot (0 without
     /// `corrupt_read_pct`). Bite evidence for the corruption axis; the
@@ -1119,6 +1124,9 @@ pub struct UniverseReport {
     /// structural miss, not a trial). Counts through suspension, since
     /// stored damage flows through any read.
     pub persisted_consumed: usize,
+    /// The consumed reads themselves, `<verb> <op> <uri>` with the root
+    /// normalized, so a pin can name WHICH stale object the engine read.
+    pub persisted_consumed_reads: Vec<String>,
     /// Sidecar residue at the final audit attributed
     /// to injected lost/misdirected writes — recorded (never silently
     /// excused) and then REQUIRED to heal on one reopen (the
@@ -1168,6 +1176,8 @@ type EdgeRowId = u64;
 
 #[derive(Clone, Debug, Default)]
 struct Model {
+    /// Optional Person properties in the accepted schema, not attempted applies.
+    schema_extras: usize,
     /// name → (age, ver); ver = -1 for rows written without one.
     persons: BTreeMap<String, (i64, i64)>,
     /// Physical rows by id — the multiset default: re-inserting a pair is
@@ -1234,44 +1244,6 @@ const BRANCH_POOL: [&str; 2] = ["b0", "b1"];
 /// Owned "main" for call sites needing `&[String]` (per-check
 /// mode differential runs main-only; final audit covers every branch).
 static MAIN_BRANCH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "main".to_string());
-
-/// CORRUPTION AXIS (persisted tier) — FIRST-CONTACT FINDING (2026-08-13, seed 97's first
-/// run) + its named carve-out: recovery LISTS and RE-READS a
-/// foreign-named file in `__recovery/` (a misdirected sidecar, `dstm-`
-/// prefix) but neither heals nor removes it — permanent residue, silently
-/// re-consumed on every recovery pass. Issue candidate (Azim judges): what
-/// is the contract for an unrecognized sidecar file — quarantine, delete,
-/// or refuse? Until ruled, residue whose FILENAME carries our misdirect
-/// marker (only `misdirect_uri` mints `dstm-`) is recorded as a
-/// `s11b-foreign-sidecar-ignored` known-issue row instead of panicking;
-/// REAL-named residue keeps panicking (reopen must heal what it
-/// recognizes). Per-universe sink, cleared at universe start, drained into
-/// `UniverseReport.known_issues` (lance_faults slot precedent).
-static FOREIGN_SIDECAR_ROWS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-fn is_foreign_sidecar(uri: &str) -> bool {
-    uri.rsplit_once('/')
-        .map(|(_, file)| file.starts_with("dstm-"))
-        .unwrap_or(false)
-}
-
-/// Partition residue: foreign-marked entries are recorded (root-normalized)
-/// and returned as tolerated; anything else is returned for the caller to
-/// panic on.
-fn partition_residue(residue: Vec<String>, root: &str, label: &str) -> Vec<String> {
-    let mut hard = Vec::new();
-    for uri in residue {
-        if is_foreign_sidecar(&uri) {
-            FOREIGN_SIDECAR_ROWS.lock().unwrap().push(format!(
-                "s11b-foreign-sidecar-ignored:{}@{label}",
-                uri.replace(root, "<root>")
-            ));
-        } else {
-            hard.push(uri);
-        }
-    }
-    hard
-}
 
 #[derive(Clone, Debug)]
 struct BranchSlot {
@@ -1405,6 +1377,7 @@ fn predict_merge(base: &Model, source: &Model, target: &Model) -> Option<Model> 
     // Ghosts are carried by the CALLER (`apply_world`'s merge arm, via
     // `three_way_ghosts`) — predict_merge stays a purely logical judgment.
     Some(Model {
+        schema_extras: target.schema_extras,
         persons,
         edges,
         ghosts: BTreeSet::new(),
@@ -1445,13 +1418,11 @@ enum Op {
     Optimize,
     Cleanup,
     EnsureIndices,
-    /// The widened families (sampled only under `Scenario::wide`).
-    /// Schema evolution is additive-only (extra optional Person props), so
-    /// it joins the logically-invisible set the model ignores. The focused
-    /// schema-add regression passes with Lance 11, but randomized schema-op
-    /// requalification is deferred (see the roll-12 note). Keep it out of the
-    /// sampler, with dead_code allowed, until that qualification is complete.
-    #[allow(dead_code)]
+    /// Monotone additive schema evolution (extra optional Person props), so
+    /// it joins the logically-invisible set the model ignores. Sampled only
+    /// under `Scenario::schema_ops` (the randomized requalification the
+    /// roll-12 quarantine deferred; the focused regression is
+    /// `dst_schema_add_property_after_mutation_preserves_traversal`).
     SchemaAddProperty {
         count: usize,
     },
@@ -1517,7 +1488,7 @@ fn sample_op(rng: &mut SplitMix64, model: &Model, next_ver: &mut i64, hostile: b
     }
 }
 
-async fn exec_op(db: &mut Omnigraph, branch: &str, op: &Op) -> OmniResult<()> {
+async fn exec_op(db: &Session, branch: &str, op: &Op) -> OmniResult<()> {
     match op {
         Op::InsertV { name, age, ver } => mutate_on(
             db,
@@ -1573,16 +1544,27 @@ async fn exec_op(db: &mut Omnigraph, branch: &str, op: &Op) -> OmniResult<()> {
         )
         .await
         .map(|_| ()),
-        // Boxed: the engine's maintenance futures are enormous; inlining all
-        // three into one poll fn overflows the 2 MiB test stack (known engine
-        // trait — see lessons_learned on RUST_MIN_STACK).
         Op::Optimize => Box::pin(db.optimize()).await.map(|_| ()),
-        Op::Cleanup => Box::pin(db.cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        }))
-        .await
-        .map(|_| ()),
+        Op::Cleanup => {
+            let stats = Box::pin(db.cleanup(omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            }))
+            .await?;
+            let deferred: BTreeMap<String, String> = stats
+                .iter()
+                .filter_map(|row| {
+                    row.error
+                        .as_ref()
+                        .map(|error| (row.type_key.clone(), error.clone()))
+                })
+                .collect();
+            LAST_CLEANUP_DEFERRED
+                .lock()
+                .expect("cleanup deferral map")
+                .insert(db.uri().to_string(), deferred);
+            Ok(())
+        }
         Op::EnsureIndices => Box::pin(db.ensure_indices()).await.map(|_| ()),
         Op::SchemaAddProperty { count } => Box::pin(db.apply_schema(&schema_with_extras(*count)))
             .await
@@ -1597,7 +1579,7 @@ async fn exec_op(db: &mut Omnigraph, branch: &str, op: &Op) -> OmniResult<()> {
                 "{}\n{{\"type\": \"Company\", \"data\": {{\"name\": \"lc0\"}}}}",
                 person_jsonl(people)
             );
-            Box::pin(load_jsonl(db, &payload, LoadMode::Merge))
+            Box::pin(db.load_jsonl(&payload, LoadMode::Merge))
                 .await
                 .map(|_| ())
         }
@@ -1610,7 +1592,7 @@ async fn exec_op(db: &mut Omnigraph, branch: &str, op: &Op) -> OmniResult<()> {
                 person_jsonl(people),
                 people[0].0
             );
-            Box::pin(load_jsonl(db, &payload, LoadMode::Append))
+            Box::pin(db.load_jsonl(&payload, LoadMode::Append))
                 .await
                 .map(|_| ())
         }
@@ -1670,12 +1652,8 @@ fn apply_to_model(model: &mut Model, op: &Op, rows: &mut EdgeRowId) {
         }
         // Maintenance is logically invisible by contract; schema evolution is
         // additive-only; refresh/sync only move the handle's view.
-        Op::Optimize
-        | Op::Cleanup
-        | Op::EnsureIndices
-        | Op::SchemaAddProperty { .. }
-        | Op::Refresh
-        | Op::SyncBranch => {}
+        Op::SchemaAddProperty { count } => model.schema_extras = *count,
+        Op::Optimize | Op::Cleanup | Op::EnsureIndices | Op::Refresh | Op::SyncBranch => {}
     }
 }
 
@@ -1709,11 +1687,17 @@ enum WorldOp {
     },
 }
 
-/// 12-sided sampler (16-sided under `wide`): rolls 9–11 are the branch verbs
-/// (falling back to a data op when their precondition doesn't hold), rolls
-/// 12–15 the loader-walk families (schema evolution / mid-life load / refresh
-/// / sync), everything else the existing 9-op mix on a uniformly-sampled
-/// live branch (main included).
+/// The most extra optional properties one universe's schema-op face may
+/// stack onto Person: keeps a long universe's schema (and each apply's
+/// staged rewrite) bounded; past the cap the face falls back to a data op.
+const MAX_SCHEMA_EXTRAS: usize = 5;
+
+/// 12-sided sampler (16-sided under `wide`; one more face under
+/// `schema_ops`): rolls 9–11 are the branch verbs (falling back to a data op
+/// when their precondition doesn't hold), rolls 12–15 the loader-walk
+/// families (mid-life load / refresh / sync), the extra `schema_ops` face a
+/// monotone `SchemaAddProperty` on main, everything else the existing 9-op
+/// mix on a uniformly-sampled live branch (main included).
 #[allow(clippy::too_many_arguments)]
 fn sample_world_op(
     rng: &mut SplitMix64,
@@ -1721,18 +1705,38 @@ fn sample_world_op(
     next_ver: &mut i64,
     hostile: bool,
     wide: bool,
+    schema_ops: bool,
     schema_extras: &mut usize,
     fresh_load: &mut usize,
 ) -> WorldOp {
-    let die = if wide { rng.below(16) } else { rng.below(12) };
+    let base = if wide { 16 } else { 12 };
+    let die = rng.below(base + u64::from(schema_ops));
+    if schema_ops && die == base {
+        // The schema face: one more optional property, monotone (`count` is
+        // cumulative, so every apply is additive over the last — never a
+        // drop). Bounded; at the cap the face degrades to the ordinary
+        // uniform-branch data op below.
+        if *schema_extras < MAX_SCHEMA_EXTRAS {
+            *schema_extras += 1;
+            return WorldOp::Data {
+                branch: "main".to_string(),
+                op: Op::SchemaAddProperty {
+                    count: *schema_extras,
+                },
+            };
+        }
+        let names = world.branch_names();
+        let branch = names[rng.below(names.len() as u64) as usize].clone();
+        let op = sample_op(rng, world.state_of(&branch), next_ver, hostile);
+        return WorldOp::Data { branch, op };
+    }
     match die {
-        // Roll 12 is the quarantined SchemaAddProperty slot. The original
-        // poisoned-traversal sequence now passes with Lance 11, pinned by
-        // `dst_schema_add_property_after_mutation_preserves_traversal`.
-        // Randomized schema-op requalification is deferred: keep the load
-        // frequency and RNG stream unchanged for the substrate cost comparison.
-        // Re-enabling this slot and the schema_apply/schema_reload families in
-        // `workload_can_reach` belong to that separate qualification.
+        // Rolls 12|13 are the mid-life load family. (Roll 12 was the
+        // quarantined SchemaAddProperty slot; the randomized schema-op
+        // requalification now lives on the dedicated `schema_ops` face
+        // above, keeping this family's frequency and the RNG stream of
+        // every schema-less plan unchanged for the substrate cost
+        // comparison.)
         12 | 13 => {
             let _ = &schema_extras;
             // Loads run on main (`load_jsonl` targets the active branch)
@@ -1894,26 +1898,6 @@ fn window_matches(window: &str, wop: &WorldOp) -> bool {
         // Only the implicit fork-if-missing path crosses this one.
         return matches!(wop, WorldOp::LoadFork { .. });
     }
-    if window == "mutation.post_sidecar_pre_fork" || window == "mutation.post_fork_pre_commit" {
-        // Deferred-fork route: only a data op OFF main can be a first touch
-        // (main's tables are native, never forked). Scheduling these on main
-        // ops is a guaranteed miss.
-        return matches!(
-            wop,
-            WorldOp::Data { branch, op, .. } if branch != "main" && is_mutation_op(op)
-        );
-    }
-    if window == "ensure_indices.post_sidecar_pre_fork" {
-        // Same deferred-fork gate, ensure_indices flavor.
-        return matches!(
-            wop,
-            WorldOp::Data {
-                branch,
-                op: Op::EnsureIndices,
-                ..
-            } if branch != "main"
-        );
-    }
     let family = window.split('.').next().unwrap_or(window);
     match family {
         "branch_create" => matches!(wop, WorldOp::BranchCreate { .. } | WorldOp::LoadFork { .. }),
@@ -1986,6 +1970,16 @@ pub fn window_needs_wide(window: &str) -> bool {
     matches!(window.split('.').next().unwrap_or(window), "load")
 }
 
+/// Does scheduling this window require the schema-op face
+/// (`Scenario::schema_ops`)? Scoped like `window_needs_wide`, and for the
+/// same dilution reason: only the schema families need the extra face.
+pub fn window_needs_schema_ops(window: &str) -> bool {
+    matches!(
+        window.split('.').next().unwrap_or(window),
+        "schema_apply" | "schema_reload"
+    )
+}
+
 /// Can the CURRENT workload produce any op reaching this window's family?
 /// The hunt uses this to SKIP unschedulable windows instead of burning matrix
 /// cells on them — the miss is reported as "unschedulable", not "never
@@ -2002,9 +1996,10 @@ pub fn workload_can_reach(window: &str) -> bool {
             | "optimize"
             | "cleanup"
             | "ensure_indices"
-            // schema_apply/schema_reload: the focused regression passes with
-            // Lance 11, but randomized schema-op requalification is deferred.
-            // Keep these families absent while the sampler excludes the op.
+            // schema_apply/schema_reload need the schema-op face
+            // (`window_needs_schema_ops`), the way "load" needs `wide`.
+            | "schema_apply"
+            | "schema_reload"
             | "load"
             | "mutation"
             | "graph_publish"
@@ -2015,7 +2010,7 @@ pub fn workload_can_reach(window: &str) -> bool {
     )
 }
 
-async fn exec_world_op(db: &mut Omnigraph, wop: &WorldOp) -> OmniResult<()> {
+async fn exec_world_op(db: &Session, wop: &WorldOp) -> OmniResult<()> {
     match wop {
         WorldOp::Data { branch, op } => exec_op(db, branch, op).await,
         WorldOp::BranchCreate { name } => Box::pin(db.branch_create(name)).await,
@@ -2169,33 +2164,6 @@ fn is_merge_conflict_err(err: &OmniError) -> bool {
     format!("{err:?}").contains("MergeConflict")
 }
 
-/// THE REOPEN-HEALS DISCOVERY (targeted-scheduling hunt, 2026-08-10): a
-/// Phase-D sidecar-delete failure inside a mutation is SWALLOWED by design
-/// (recovery.rs `delete_sidecar`: "callers swallow it — the write already
-/// published; the stale sidecar is healed by the next write or open"), so a
-/// stale-but-confirmed sidecar can exist while the graph is healthy and the
-/// mutation reports SUCCESS. `optimize`/`cleanup` conservatively refuse on ANY
-/// sidecar ("requires a clean recovery state") because they cannot cheaply
-/// tell stale-confirmed from partial. That refusal is therefore a LEGAL
-/// rejection; the harness answers it like a real client — reopen (the
-/// documented heal) via the reconcile path. Repro pinned:
-/// `dst_discovery5_stale_sidecar_blocks_maintenance_until_reopen`.
-/// The engine's second spelling of a pending-sidecar refusal — the
-/// `manifest_conflict` text optimize/cleanup/schema-apply raise instead of
-/// typed `RecoveryRequired`. One spelling: the keep-serving barrier branch
-/// and [`is_recovery_barrier_rejection`] both key on it.
-const CLEAN_RECOVERY_BARRIER_TEXT: &str = "requires a clean recovery state";
-
-fn is_recovery_barrier_rejection(wop: &WorldOp, err: &OmniError) -> bool {
-    matches!(
-        wop,
-        WorldOp::Data {
-            op: Op::Optimize | Op::Cleanup | Op::SchemaAddProperty { .. },
-            ..
-        }
-    ) && format!("{err:?}").contains(CLEAN_RECOVERY_BARRIER_TEXT)
-}
-
 // ------------------------------------------------------------------ faults --
 
 /// Storage wrapper injecting the full `FaultPlan` at the adapter seam:
@@ -2203,10 +2171,13 @@ fn is_recovery_barrier_rejection(wop: &WorldOp, err: &OmniError) -> bool {
 /// and VIRTUAL-time latency on both read- and write-class calls, plus the
 /// corruption (read + persisted tiers) and bounded-staleness axes.
 #[derive(Debug)]
-struct FailingStorage {
+pub struct FailingStorage {
     inner: Arc<dyn StorageAdapter>,
     rng: Mutex<SplitMix64>,
     plan: FaultPlan,
+    /// The per-step targeting a logic test installs (store places and the
+    /// one-shot a store effect arms); consulted before every gate below.
+    targets: crate::store_places::Targets,
     /// Faults apply only once enabled — init and fixture load stay clean so
     /// every universe starts from the same healthy world.
     enabled: std::sync::atomic::AtomicBool,
@@ -2241,6 +2212,7 @@ struct FailingStorage {
     writes_lost: std::sync::atomic::AtomicUsize,
     writes_misdirected: std::sync::atomic::AtomicUsize,
     persisted_consumed: std::sync::atomic::AtomicUsize,
+    persisted_consumed_reads: Mutex<Vec<String>>,
     /// the staleness clock and memory. `staleness_tick`
     /// advances on every LANDED write-class call (count-landed-only, the
     /// kill enumerator's lesson); `key_history` keeps, per URI, the
@@ -2268,6 +2240,20 @@ enum WriteFate {
 }
 
 impl FailingStorage {
+    /// A zero plan, never enabled, so nothing is drawn from the generator:
+    /// only a targeted rule or an armed one-shot acts; `root` is what a
+    /// rule's subject is relative to.
+    pub fn quiet(inner: Arc<dyn StorageAdapter>, root: String) -> Arc<Self> {
+        let mut storage = Self::new(inner, FaultPlan::none(), None, None);
+        storage.targets = crate::store_places::Targets::new(Some(root));
+        Arc::new(storage)
+    }
+
+    /// The targeting state a runner installs rules on and drains hits from.
+    pub fn targets(&self) -> &crate::store_places::Targets {
+        &self.targets
+    }
+
     fn new(
         inner: Arc<dyn StorageAdapter>,
         plan: FaultPlan,
@@ -2278,6 +2264,7 @@ impl FailingStorage {
             inner,
             rng: Mutex::new(SplitMix64(plan.seed)),
             plan,
+            targets: crate::store_places::Targets::new(None),
             enabled: std::sync::atomic::AtomicBool::new(false),
             suspended: std::sync::atomic::AtomicBool::new(false),
             lance,
@@ -2292,6 +2279,7 @@ impl FailingStorage {
             writes_lost: std::sync::atomic::AtomicUsize::new(0),
             writes_misdirected: std::sync::atomic::AtomicUsize::new(0),
             persisted_consumed: std::sync::atomic::AtomicUsize::new(0),
+            persisted_consumed_reads: Mutex::new(Vec::new()),
             staleness_tick: std::sync::atomic::AtomicU64::new(0),
             key_history: Mutex::new(std::collections::BTreeMap::new()),
             stale_reads_served: std::sync::atomic::AtomicUsize::new(0),
@@ -2377,18 +2365,47 @@ impl FailingStorage {
             .insert(uri.to_string(), verb);
     }
 
+    /// Every consumed read as `<verb> <op> <uri>`, root-normalized so the
+    /// report replay-compares across roots.
+    fn persisted_consumed_reads(&self, root: &str) -> Vec<String> {
+        self.persisted_consumed_reads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|read| read.replace(root, "<root>"))
+            .collect()
+    }
+
     /// CORRUPTION AXIS (persisted tier) — consumption tracking: a read touching a URI in
     /// the persisted ledger consumed damaged (or injected-absent) state.
     /// Counts regardless of the fault gates — suspension stops CALL-PATH
     /// faults, but stored damage flows through any read. No draws, no
     /// behavior change; zero-knob plans have an empty ledger.
     fn note_persisted_read(&self, op: &str, uri: &str) {
-        let verb = { self.persisted_damage.lock().unwrap().get(uri).copied() };
-        if let Some(verb) = verb {
-            self.persisted_consumed
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            println!("dst s11 damage-consumed: {verb} {op} {uri}");
+        if let Some(verb) = self.consume_persisted(uri) {
+            self.record_consumed_read(verb, op, uri, None);
         }
+    }
+
+    /// The damage verb last injected on `uri`, counted as consumed; `None`
+    /// when the URI carries no persisted damage.
+    fn consume_persisted(&self, uri: &str) -> Option<&'static str> {
+        let verb = { self.persisted_damage.lock().unwrap().get(uri).copied() }?;
+        self.persisted_consumed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(verb)
+    }
+
+    /// One consumed read in the report; `detail` says what the read returned
+    /// when the verb alone cannot (a sidecar's `effect_phase`).
+    fn record_consumed_read(&self, verb: &str, op: &str, uri: &str, detail: Option<&str>) {
+        let mut line = format!("{verb} {op} {uri}");
+        if let Some(detail) = detail {
+            line.push(' ');
+            line.push_str(detail);
+        }
+        println!("dst s11 damage-consumed: {line}");
+        self.persisted_consumed_reads.lock().unwrap().push(line);
     }
 
     // ---------------------------------------- bounded staleness ---------
@@ -2515,7 +2532,7 @@ impl FailingStorage {
     /// target URI to write to (`misdirect_uri`). Ledger records BOTH halves of the damage: the
     /// intended object is absent (misdirect-source), the foreign object
     /// exists (misdirect-target).
-    fn maybe_misdirect(&self, op: &str, uri: &str) -> Option<String> {
+    fn maybe_misdirect(&self, op: crate::store_places::PutMethod, uri: &str) -> Option<String> {
         if self.plan.misdirect_write_pct == 0 || !self.active() {
             return None;
         }
@@ -2523,6 +2540,46 @@ impl FailingStorage {
         if roll >= self.plan.misdirect_write_pct {
             return None;
         }
+        Some(self.misdirect_to(op, uri))
+    }
+
+    /// The rule or one-shot decision for this put, consulted before every
+    /// gate so an inactive decoration still honors it; `settle_put` records
+    /// the hit once the store has answered.
+    #[track_caller]
+    fn targeted_put(&self, uri: &str) -> Option<crate::store_places::Targeted> {
+        self.targets
+            .on_call(crate::store_places::StorePlace::Put, uri)
+    }
+
+    /// The store actions the three put hooks have an arm for; `admitted` on
+    /// the put row must stay within it.
+    pub const PUT_HOOK_ACTIONS: &[crate::store_places::StoreAction] =
+        &[crate::store_places::StoreAction::Misdirect];
+
+    fn settle_put(
+        &self,
+        targeted: Option<crate::store_places::Targeted>,
+        op: crate::store_places::PutMethod,
+        uri: &str,
+        stored: Option<&str>,
+        landed: bool,
+    ) {
+        if let Some(targeted) = targeted {
+            self.targets.record(
+                targeted,
+                crate::store_places::StorePlace::Put,
+                op.as_str(),
+                uri,
+                stored,
+                landed,
+            );
+        }
+    }
+
+    /// Runs only for a put `write_fault` let proceed.
+    fn misdirect_to(&self, op: crate::store_places::PutMethod, uri: &str) -> String {
+        let op = op.as_str();
         let target = misdirect_uri(uri);
         self.writes_misdirected
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2534,7 +2591,7 @@ impl FailingStorage {
         // injected damage as a bypass write.
         crate::write_census::record("adapter", op, &target, self.active());
         println!("dst s11 damage: misdirect {op} {uri} -> {target}");
-        Some(target)
+        target
     }
 
     /// latent sector check, called AFTER the per-call fault
@@ -2776,15 +2833,7 @@ impl FailingStorage {
     }
 }
 
-/// CORRUPTION AXIS (persisted tier) — pure misdirection transform: same directory,
-/// `dstm-` filename prefix (extension preserved) — the write lands at a
-/// wrong key inside the same keyspace, so listings still see it.
-pub(crate) fn misdirect_uri(uri: &str) -> String {
-    match uri.rsplit_once('/') {
-        Some((dir, file)) => format!("{dir}/dstm-{file}"),
-        None => format!("dstm-{uri}"),
-    }
-}
+pub use crate::store_places::misdirect_uri;
 
 /// pure, seeded read-time bit rot: substitute exactly one char
 /// (index = `pos_roll`, already reduced modulo the char count by the caller's
@@ -2834,6 +2883,17 @@ pub(crate) fn truncate_text(text: &str, pos_roll: u64) -> Option<String> {
     Some(text.chars().take(keep).collect())
 }
 
+/// `phase=<effect_phase>` of a `__recovery/` sidecar body the engine read, the
+/// evidence a pin needs to tell a stale Armed sidecar from a confirmed one.
+fn sidecar_phase(uri: &str, body: Option<&str>) -> Option<String> {
+    if !uri.contains("__recovery/") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(body?).ok()?;
+    let phase = value["protocol_v3"]["effect_phase"].as_str()?;
+    Some(format!("phase={phase}"))
+}
+
 #[async_trait::async_trait]
 impl StorageAdapter for FailingStorage {
     async fn read_text(&self, uri: &str) -> OmniResult<String> {
@@ -2855,17 +2915,22 @@ impl StorageAdapter for FailingStorage {
     async fn read_text_if_exists(&self, uri: &str) -> OmniResult<Option<String>> {
         self.read_fault("read_text_if_exists", uri).await?;
         self.latent_fault("read_text_if_exists", uri)?;
-        self.note_persisted_read("read_text_if_exists", uri);
+        let consumed = self.consume_persisted(uri);
         // both polarities are legal lies here — an old value
         // (possibly a zombie) or a stale absence (`None` before the key's
         // creation reached "the replica").
-        if let Some(as_of) = self.roll_stale(self.plan.stale_read_pct)
+        let out = if let Some(as_of) = self.roll_stale(self.plan.stale_read_pct)
             && let Some((state, _)) = self.state_as_of(uri, as_of)
         {
             self.count_stale_read("read_text_if_exists", uri, as_of);
-            return Ok(state.map(|text| self.maybe_corrupt("read_text_if_exists", uri, text)));
+            state
+        } else {
+            self.inner.read_text_if_exists(uri).await?
+        };
+        if let Some(verb) = consumed {
+            let phase = sidecar_phase(uri, out.as_deref());
+            self.record_consumed_read(verb, "read_text_if_exists", uri, phase.as_deref());
         }
-        let out = self.inner.read_text_if_exists(uri).await?;
         Ok(out.map(|text| self.maybe_corrupt("read_text_if_exists", uri, text)))
     }
     async fn read_text_if_exists_bounded(
@@ -2906,21 +2971,57 @@ impl StorageAdapter for FailingStorage {
             .await
     }
     async fn write_text(&self, uri: &str, contents: &str) -> OmniResult<()> {
+        let targeted = self.targeted_put(uri);
         let _in_flight = self.kill.as_ref().map(|k| k.enter_write());
-        if let WriteFate::Lost = self.write_fault("write_text", uri, true).await? {
+        let fate = match self.write_fault("write_text", uri, true).await {
+            Ok(fate) => fate,
+            Err(error) => {
+                self.settle_put(
+                    targeted,
+                    crate::store_places::PutMethod::WriteText,
+                    uri,
+                    None,
+                    false,
+                );
+                return Err(error);
+            }
+        };
+        if let WriteFate::Lost = fate {
+            self.settle_put(
+                targeted,
+                crate::store_places::PutMethod::WriteText,
+                uri,
+                None,
+                false,
+            );
             return Ok(());
         }
-        let (target, stored);
-        match self.maybe_misdirect("write_text", uri) {
-            Some(t) => target = t,
-            None => target = uri.to_string(),
-        }
-        match self.maybe_corrupt_write("write_text", &target, contents) {
-            Some(s) => stored = s,
-            None => stored = contents.to_string(),
-        }
+        let target = match &targeted {
+            Some(targeted) => match targeted.action {
+                crate::store_places::StoreAction::Misdirect => {
+                    self.misdirect_to(crate::store_places::PutMethod::WriteText, uri)
+                }
+                other => unreachable!(
+                    "store action {} is not admitted on storage.put",
+                    other.as_str()
+                ),
+            },
+            None => self
+                .maybe_misdirect(crate::store_places::PutMethod::WriteText, uri)
+                .unwrap_or_else(|| uri.to_string()),
+        };
+        let stored = self
+            .maybe_corrupt_write("write_text", &target, contents)
+            .unwrap_or_else(|| contents.to_string());
         self.staleness_base(&target).await;
         let out = self.inner.write_text(&target, &stored).await;
+        self.settle_put(
+            targeted,
+            crate::store_places::PutMethod::WriteText,
+            uri,
+            Some(&target),
+            out.is_ok(),
+        );
         if out.is_ok() {
             self.count_completion("write_text", uri);
             self.staleness_record(&target, Some(stored.clone()), None);
@@ -2928,40 +3029,114 @@ impl StorageAdapter for FailingStorage {
         self.lose_ack("write_text", uri, out).await
     }
     async fn write_bytes(&self, uri: &str, contents: &[u8]) -> OmniResult<()> {
+        let targeted = self.targeted_put(uri);
         let _in_flight = self.kill.as_ref().map(|k| k.enter_write());
-        if let WriteFate::Lost = self.write_fault("write_bytes", uri, true).await? {
+        let fate = match self.write_fault("write_bytes", uri, true).await {
+            Ok(fate) => fate,
+            Err(error) => {
+                self.settle_put(
+                    targeted,
+                    crate::store_places::PutMethod::WriteBytes,
+                    uri,
+                    None,
+                    false,
+                );
+                return Err(error);
+            }
+        };
+        if let WriteFate::Lost = fate {
+            self.settle_put(
+                targeted,
+                crate::store_places::PutMethod::WriteBytes,
+                uri,
+                None,
+                false,
+            );
             return Ok(());
         }
-        let target = match self.maybe_misdirect("write_bytes", uri) {
-            Some(t) => t,
-            None => uri.to_string(),
+        let target = match &targeted {
+            Some(targeted) => match targeted.action {
+                crate::store_places::StoreAction::Misdirect => {
+                    self.misdirect_to(crate::store_places::PutMethod::WriteBytes, uri)
+                }
+                other => unreachable!(
+                    "store action {} is not admitted on storage.put",
+                    other.as_str()
+                ),
+            },
+            None => self
+                .maybe_misdirect(crate::store_places::PutMethod::WriteBytes, uri)
+                .unwrap_or_else(|| uri.to_string()),
         };
         // Write corruption and the staleness history stay text-only (see
         // `read_bytes_if_exists_bounded`): both are `String`-typed. Kill,
         // write faults, misdirection, completion counting and ack loss apply.
         let out = self.inner.write_bytes(&target, contents).await;
+        self.settle_put(
+            targeted,
+            crate::store_places::PutMethod::WriteBytes,
+            uri,
+            Some(&target),
+            out.is_ok(),
+        );
         if out.is_ok() {
             self.count_completion("write_bytes", uri);
         }
         self.lose_ack("write_bytes", uri, out).await
     }
     async fn write_text_if_absent(&self, uri: &str, contents: &str) -> OmniResult<bool> {
+        let targeted = self.targeted_put(uri);
         let _in_flight = self.kill.as_ref().map(|k| k.enter_write());
-        if let WriteFate::Lost = self.write_fault("write_text_if_absent", uri, true).await? {
+        let fate = match self.write_fault("write_text_if_absent", uri, true).await {
+            Ok(fate) => fate,
+            Err(error) => {
+                self.settle_put(
+                    targeted,
+                    crate::store_places::PutMethod::WriteTextIfAbsent,
+                    uri,
+                    None,
+                    false,
+                );
+                return Err(error);
+            }
+        };
+        if let WriteFate::Lost = fate {
             // The engine believes the if-absent insert landed.
+            self.settle_put(
+                targeted,
+                crate::store_places::PutMethod::WriteTextIfAbsent,
+                uri,
+                None,
+                false,
+            );
             return Ok(true);
         }
-        let (target, stored);
-        match self.maybe_misdirect("write_text_if_absent", uri) {
-            Some(t) => target = t,
-            None => target = uri.to_string(),
-        }
-        match self.maybe_corrupt_write("write_text_if_absent", &target, contents) {
-            Some(s) => stored = s,
-            None => stored = contents.to_string(),
-        }
+        let target = match &targeted {
+            Some(targeted) => match targeted.action {
+                crate::store_places::StoreAction::Misdirect => {
+                    self.misdirect_to(crate::store_places::PutMethod::WriteTextIfAbsent, uri)
+                }
+                other => unreachable!(
+                    "store action {} is not admitted on storage.put",
+                    other.as_str()
+                ),
+            },
+            None => self
+                .maybe_misdirect(crate::store_places::PutMethod::WriteTextIfAbsent, uri)
+                .unwrap_or_else(|| uri.to_string()),
+        };
+        let stored = self
+            .maybe_corrupt_write("write_text_if_absent", &target, contents)
+            .unwrap_or_else(|| contents.to_string());
         self.staleness_base(&target).await;
         let out = self.inner.write_text_if_absent(&target, &stored).await;
+        self.settle_put(
+            targeted,
+            crate::store_places::PutMethod::WriteTextIfAbsent,
+            uri,
+            Some(&target),
+            matches!(out, Ok(true)),
+        );
         if matches!(out, Ok(true)) {
             self.count_completion("write_text_if_absent", uri);
             self.staleness_record(&target, Some(stored.clone()), None);
@@ -3190,7 +3365,7 @@ impl StorageAdapter for FailingStorage {
 
 // ----------------------------------------------------------------- oracles --
 
-async fn assert_matches_model(db: &Omnigraph, model: &Model, where_: &str) {
+async fn assert_matches_model(db: &Session, model: &Model, where_: &str) {
     assert_eq!(
         person_rows(db).await,
         model.person_rows(),
@@ -3207,7 +3382,7 @@ async fn assert_matches_model(db: &Omnigraph, model: &Model, where_: &str) {
 /// and edges — in the model's deterministic order. A branch that lists but
 /// cannot be read (torn create/delete) panics inside the readers: that IS the
 /// oracle for torn branch state.
-async fn observe_world(db: &Omnigraph) -> WorldState {
+async fn observe_world(db: &Session) -> WorldState {
     let mut names = db.branch_list().await.expect("branch list");
     names.sort();
     let mut ordered = vec!["main".to_string()];
@@ -3236,7 +3411,7 @@ pub async fn recovery_residue(storage: &Arc<dyn StorageAdapter>, root: &str) -> 
         .expect("list recovery residue")
 }
 
-async fn assert_world_matches(db: &Omnigraph, world: &WorldModel, where_: &str) {
+async fn assert_world_matches(db: &Session, world: &WorldModel, where_: &str) {
     assert_eq!(
         observe_world(db).await,
         world.render(),
@@ -3256,6 +3431,11 @@ async fn assert_world_matches(db: &Omnigraph, world: &WorldModel, where_: &str) 
 /// partial multi-table commit does not publish), and every head-advancing
 /// entry heal resolves the watch within its own iteration.
 async fn capture_history(db: &Omnigraph, main: &Model, history: &mut Vec<(String, Model)>) {
+    assert_eq!(
+        db.schema_source().as_str(),
+        schema_with_extras(main.schema_extras),
+        "history capture must use the schema accepted by the workload model"
+    );
     // Boxed: composes with the big engine op futures in run_universe's poll
     // frame (2 MiB test-stack trait).
     let head = Box::pin(db.resolve_snapshot("main"))
@@ -3284,7 +3464,7 @@ async fn capture_history(db: &Omnigraph, main: &Model, history: &mut Vec<(String
 ///    surface as an engine Update the model-diff can't see) — no guessing,
 ///    per the ghost-tie-break lesson. Edge diffs ride on net 1 (edge change
 ///    ids are ULIDs, not model-addressable pairs).
-async fn assert_history_matches(db: &Omnigraph, history: &[(String, Model)], where_: &str) {
+async fn assert_history_matches(db: &Session, history: &[(String, Model)], where_: &str) {
     for (commit_id, model) in history {
         let persons = Box::pin(person_rows_target(
             db,
@@ -3315,9 +3495,22 @@ async fn assert_history_matches(db: &Omnigraph, history: &[(String, Model)], whe
             type_names: Some(vec!["Person".to_string()]),
             ops: None,
         };
-        let cs = Box::pin(db.diff_commits(a_id, b_id, &filter))
-            .await
-            .expect("diff_commits over recorded history");
+        let cs = match Box::pin(db.diff_commits(a_id, b_id, &filter)).await {
+            Ok(changes) => changes,
+            Err(OmniError::ChangeSchemaBoundary {
+                graph_commit_id,
+                type_name,
+            }) if a_m.schema_extras != b_m.schema_extras
+                && graph_commit_id == *b_id
+                && type_name == "Person" =>
+            {
+                continue;
+            }
+            Err(error) => panic!(
+                "{where_}: diff_commits over recorded history failed without a matching \
+                 accepted schema transition: {error:?}"
+            ),
+        };
         let mut model_changed: BTreeSet<String> = BTreeSet::new();
         let mut model_deleted: BTreeSet<String> = BTreeSet::new();
         for (name, val) in &a_m.persons {
@@ -3367,7 +3560,7 @@ async fn assert_history_matches(db: &Omnigraph, history: &[(String, Model)], whe
 /// PHYSICAL-CHANNEL ORACLE (third audit channel, the one that counts rows): per
 /// branch, `export_jsonl` (no query machinery) must equal the model's physical
 /// expectation — persons exactly, Knows = every row ∪ ghosts, duplicates kept.
-async fn assert_physical_matches(db: &Omnigraph, world: &WorldModel, where_: &str) {
+async fn assert_physical_matches(db: &Session, world: &WorldModel, where_: &str) {
     for branch in world.branch_names() {
         let (persons, knows) = Box::pin(physical_view_on(db, &branch)).await;
         let m = world.state_of(&branch);
@@ -3424,9 +3617,6 @@ fn is_legal_rejection(
     if expected_conflict && is_merge_conflict_err(err) {
         return true;
     }
-    if is_recovery_barrier_rejection(wop, err) {
-        return true;
-    }
     // RI hypothesis: deleting a person with live edges may be refused.
     // `state_of_opt`: the branch can be absent from a post-ruling world.
     if let WorldOp::Data {
@@ -3440,13 +3630,43 @@ fn is_legal_rejection(
     {
         return true;
     }
+    // Mono-branch hypothesis: the engine refuses a schema apply while any
+    // non-main branch exists (entry-time, effect-free — discovered by the
+    // schema-face requalification's first seed scan). Predictable from the
+    // model's branch map, so the refusal is legal exactly when the model
+    // agrees a branch exists; a refusal on a branchless world stays red.
+    if matches!(
+        wop,
+        WorldOp::Data {
+            op: Op::SchemaAddProperty { .. },
+            ..
+        }
+    ) && !world.branches.is_empty()
+        && text.contains("requires a graph with only main")
+    {
+        return true;
+    }
     false
 }
 
+/// Classify schema settlement against the two schemas the workload permits.
+fn schema_apply_outcome(
+    before_count: usize,
+    requested_count: usize,
+    observed: &str,
+) -> Option<ReconcileOutcome> {
+    if observed == schema_with_extras(requested_count) {
+        Some(ReconcileOutcome::Applied)
+    } else if observed == schema_with_extras(before_count) {
+        Some(ReconcileOutcome::NotApplied)
+    } else {
+        None
+    }
+}
+
 /// How a failed op's world state settled after reconcile + recovery reopen.
-/// Doubles as an op's standing inside a composition hypothesis
-/// ([`composition_hypotheses`]). Declaration order IS the arbitration's
-/// preference order (`Ord`): more-applied wins ties.
+/// Declaration order IS the arbitration's preference order (`Ord`):
+/// more-applied wins ties.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum ReconcileOutcome {
     /// The op left no trace (rolled back / never landed).
@@ -3584,7 +3804,11 @@ impl RetryEffect {
     }
 }
 
-#[cfg_attr(not(feature = "failpoints"), allow(unused_variables))]
+struct CleanupEvidence<'a> {
+    images: &'a [(String, Model)],
+    paths: Option<&'a omnigraph::db::CollectorPathSnapshot>,
+}
+
 /// MAINTENANCE-OBLIGATION ORACLES. For empty-model-delta
 /// maintenance ops (Optimize/Cleanup/EnsureIndices) the two-sided crash
 /// contract's hypotheses COINCIDE — their reconcile verdicts are ties
@@ -3611,31 +3835,45 @@ impl RetryEffect {
 /// Sensitivity: `Scenario.fail_maintenance_rerun` arms a REAL
 /// engine failpoint around the rerun so the convergence assert provably
 /// fires — `dst_sensitivity_maintenance_rerun_failure_is_red`.
+#[cfg_attr(not(feature = "failpoints"), allow(unused_variables))]
 async fn maintenance_obligations(
-    db: &mut Omnigraph,
+    db: &Session,
     world: &WorldModel,
     wop: &WorldOp,
     label: &str,
     at_op: usize,
     fail_rerun: bool,
+    cleanup: CleanupEvidence<'_>,
 ) -> bool {
     let WorldOp::Data { op, .. } = wop else {
         return false;
     };
     let (rerun_window, kind) = match op {
         Op::Optimize => ("optimize.before_compact", "Optimize"),
-        Op::Cleanup => ("cleanup.post_recovery_check_pre_gates", "Cleanup"),
+        Op::Cleanup => ("cleanup.table_gc", "Cleanup"),
         Op::EnsureIndices => (
             "ensure_indices.post_phase_b_pre_manifest_commit",
             "EnsureIndices",
         ),
         _ => return false,
     };
+    crate::cost::set_label("_verify");
+    if matches!(op, Op::Cleanup) {
+        assert_collector_images(db, cleanup.images, at_op).await;
+        assert_collector_paths(
+            cleanup.paths.expect("Cleanup captured its retained paths"),
+            at_op,
+        )
+        .await;
+    }
     // (1) Idempotent convergence.
     let rerun = {
         #[cfg(feature = "failpoints")]
-        let _sensitivity =
-            fail_rerun.then(|| omnigraph::failpoints::ScopedFailPoint::new(rerun_window, "return"));
+        let _sensitivity = fail_rerun.then(|| {
+            omnigraph::seams::catalog::decide(rerun_window)
+                .unwrap_or_else(|| panic!("harness window {rerun_window} names no catalog seam"))
+                .fire_always()
+        });
         #[cfg(not(feature = "failpoints"))]
         let _ = (rerun_window, fail_rerun);
         exec_world_op(db, wop).await
@@ -3653,6 +3891,29 @@ async fn maintenance_obligations(
     }
     match op {
         Op::Cleanup => {
+            let deferred = LAST_CLEANUP_DEFERRED
+                .lock()
+                .expect("cleanup deferral map")
+                .get(db.uri())
+                .cloned()
+                .unwrap_or_default();
+            if !deferred.is_empty() {
+                detectors::violation(
+                    DET_MAINTENANCE,
+                    at_op,
+                    format!(
+                        "{label}: MAINTENANCE OBLIGATION violated — clean Cleanup retry deferred table work: {deferred:?}"
+                    ),
+                    "a fault-free Cleanup retry finishes every table",
+                );
+            }
+            assert_collector_images(db, cleanup.images, at_op).await;
+            assert_collector_paths(
+                cleanup.paths.expect("Cleanup captured its retained paths"),
+                at_op,
+            )
+            .await;
+            assert_collector_invariants(db, at_op, true, false).await;
             // (2) Whole observable world back via real traversal.
             let visible = observe_world(db).await;
             if visible != world.render() {
@@ -3691,8 +3952,8 @@ async fn maintenance_obligations(
 /// (kill the FIRST recovery sweep mid-pass, then prove a second clean
 /// reopen still converges) and the bounded retry: the recovery sweep can
 /// ITSELF hit injected faults (it writes sidecars) — a real client
-/// retries. Bounded and seeded, so still deterministic. Shared by
-/// [`reconcile_after_failure`] and [`reconcile_watch_resolution`].
+/// retries. Bounded and seeded, so still deterministic. Used by
+/// [`reconcile_after_failure`].
 async fn reopen_under_storm(
     storage: &Arc<dyn StorageAdapter>,
     root: &str,
@@ -3702,7 +3963,9 @@ async fn reopen_under_storm(
 ) -> Omnigraph {
     #[cfg(feature = "failpoints")]
     if let Some(rc) = recovery_crash {
-        let _fp = omnigraph::failpoints::ScopedFailPoint::new(rc, "return");
+        let _fp = omnigraph::seams::catalog::decide(rc)
+            .unwrap_or_else(|| panic!("harness window {rc} names no catalog seam"))
+            .fire_always();
         // Best-effort double fault: if the window IS on this crash's recovery
         // path, the first recovery sweep dies here and we prove a SECOND clean reopen
         // still converges (below). If it isn't reached, no double fault
@@ -3740,6 +4003,168 @@ async fn reopen_under_storm(
     }
 }
 
+/// Per-table errors from the last Cleanup, retained for fault attribution.
+static LAST_CLEANUP_DEFERRED: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<String, BTreeMap<String, String>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Compare workload-captured heads and fork bases without consulting collector roots.
+async fn assert_collector_images(db: &Session, images: &[(String, Model)], at_op: usize) {
+    detectors::tagged(DET_COLLECTOR, at_op, async {
+        for (commit, model) in images {
+            let target = ReadTarget::snapshot(SnapshotId::new(commit));
+            assert_eq!(
+                Box::pin(person_rows_target(db, target)).await,
+                model.person_rows(),
+                "collector lost saved Person image {commit}"
+            );
+            let target = ReadTarget::snapshot(SnapshotId::new(commit));
+            assert_eq!(
+                Box::pin(knows_pairs_target(db, target)).await,
+                model.edge_pairs(),
+                "collector lost saved Knows image {commit}"
+            );
+        }
+    })
+    .await;
+}
+
+async fn assert_collector_paths(paths: &omnigraph::db::CollectorPathSnapshot, at_op: usize) {
+    let missing = paths.missing_paths().await.unwrap_or_else(|error| {
+        detectors::violation(
+            DET_COLLECTOR,
+            at_op,
+            format!("saved paths could not be probed: {error}"),
+            "every object captured before cleanup remains present",
+        )
+    });
+    if !missing.is_empty() {
+        detectors::violation(
+            DET_COLLECTOR,
+            at_op,
+            format!("cleanup lost saved objects: {missing:?}"),
+            "every object captured before cleanup remains present",
+        );
+    }
+}
+
+/// Snapshot the model's current heads and the bases saved when its branches forked.
+async fn collector_images(
+    db: &Session,
+    world: &WorldModel,
+    fork_bases: &BTreeMap<String, (String, Model)>,
+) -> Vec<(String, Model)> {
+    let mut images = Vec::new();
+    for branch in world.branch_names() {
+        let head = Box::pin(db.resolve_snapshot(&branch))
+            .await
+            .expect("resolve collector oracle head");
+        images.push((head.to_string(), world.state_of(&branch).clone()));
+        if branch != "main" {
+            images.push(
+                fork_bases
+                    .get(&branch)
+                    .expect("workload saved this branch's fork base")
+                    .clone(),
+            );
+        }
+    }
+    images
+}
+
+/// Retained paths stay readable, and successful table sweeps leave neither
+/// published garbage nor provably dead staging manifests.
+async fn assert_collector_invariants(
+    db: &Session,
+    at_op: usize,
+    after_cleanup: bool,
+    damaged_during_cleanup: bool,
+) {
+    let expected = "retained pins and their paths exist, and cleanup removes published garbage and dead stagings";
+    let report = match db
+        .cleanup_plan(omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+    {
+        Ok(report) => report,
+        Err(error) => detectors::violation(
+            DET_COLLECTOR,
+            at_op,
+            format!("the collector could not plan: {error}"),
+            expected,
+        ),
+    };
+    let deferred = LAST_CLEANUP_DEFERRED
+        .lock()
+        .expect("cleanup deferral map")
+        .get(db.uri())
+        .cloned()
+        .unwrap_or_default();
+    if after_cleanup {
+        for (table, error) in &deferred {
+            let injected = [
+                FAULT_MARKER,
+                ACK_LOSS_MARKER,
+                LATENT_MARKER,
+                "injected failpoint triggered:",
+            ]
+            .iter()
+            .any(|marker| error.contains(marker));
+            if !injected && !damaged_during_cleanup {
+                detectors::violation(
+                    DET_COLLECTOR,
+                    at_op,
+                    format!("{table}: Cleanup returned an unattributed table error: {error}"),
+                    expected,
+                );
+            }
+        }
+    }
+    match db.cleanup_plan_missing_paths(&report).await {
+        Ok(missing) if !missing.is_empty() => detectors::violation(
+            DET_COLLECTOR,
+            at_op,
+            format!("retained pins' paths are absent (location, path): {missing:?}"),
+            expected,
+        ),
+        Ok(_) => {}
+        Err(error) => detectors::violation(
+            DET_COLLECTOR,
+            at_op,
+            format!("the collector's paths could not be probed: {error}"),
+            expected,
+        ),
+    }
+    for plan in &report.tables {
+        if !plan.errors.is_empty() {
+            detectors::violation(
+                DET_COLLECTOR,
+                at_op,
+                format!(
+                    "{}: the trace did not finish: {:?}",
+                    plan.location, plan.errors
+                ),
+                expected,
+            );
+        }
+        let mut survivors = plan.would_remove();
+        survivors.extend(plan.dead_stagings());
+        if after_cleanup && !survivors.is_empty() && !deferred.contains_key(&plan.table_key) {
+            detectors::violation(
+                DET_COLLECTOR,
+                at_op,
+                format!(
+                    "{}: published garbage or dead stagings survived cleanup: {survivors:?}",
+                    plan.location
+                ),
+                expected,
+            );
+        }
+    }
+}
+
 /// RECOVERY-OBLIGATION ORACLE (2026-08-12, from the seeded-recovery-no-op
 /// honesty experiment): the state hypotheses alone CANNOT distinguish a
 /// correct rollback from a recovery that silently did nothing — "not
@@ -3750,8 +4175,7 @@ async fn reopen_under_storm(
 /// obligation, not just state legality: a successful read-write reopen
 /// leaves no sidecar residue (the reopen-heals contract).
 /// Runs fault-suspended (callers suspend around reconcile), so this read
-/// is clean. Shared by [`reconcile_after_failure`] and
-/// [`reconcile_watch_resolution`].
+/// is clean. Used by [`reconcile_after_failure`].
 async fn assert_no_recovery_residue(
     storage: &Arc<dyn StorageAdapter>,
     root: &str,
@@ -3759,10 +4183,6 @@ async fn assert_no_recovery_residue(
     at_op: usize,
 ) {
     let residue = recovery_residue(storage, root).await;
-    // Persisted tier: foreign-named (injected-misdirect) residue is the named
-    // carve-out `s11b-foreign-sidecar-ignored` — recorded, tolerated;
-    // real-named residue still panics (reopen heals what it recognizes).
-    let residue = partition_residue(residue, root, label);
     if !residue.is_empty() {
         detectors::violation(
             DET_RECOVERY_OBLIGATION,
@@ -3839,28 +4259,31 @@ struct Arbitration<'a> {
     retry: RetryEffect,
     recovery_crash: Option<&'static str>,
     heads_before: &'a [(String, String)],
+    /// Liveness mode (`Scenario::keep_handle`): judge the aftermath on the
+    /// SAME live handle instead of reopening — a real client's view. Crash
+    /// universes never set it (a dead process has no handle to keep).
+    keep_handle: bool,
 }
 
 /// Judge the failed op and its optional retry, then reopen and enforce
 /// recovery monotonicity. Unrelated unjudged ops require watch reconciliation.
 async fn reconcile_after_failure(
-    db: Omnigraph,
+    db: Session,
     storage: Arc<dyn StorageAdapter>,
     root: &str,
     wop: &WorldOp,
     world: &WorldModel,
     arbitration: Arbitration<'_>,
-) -> (Omnigraph, ReconcileOutcome, &'static str) {
+) -> (Session, ReconcileOutcome, &'static str) {
     let Arbitration {
         label,
         at_op,
         retry,
         recovery_crash,
         heads_before,
+        keep_handle,
     } = arbitration;
-    // Stale-capture rule on [`resolve_keep_serving_watch`]: a ruling can
-    // remove the op's target between its sampling and this judgment. A
-    // dead-target op has exactly one legal outcome — NotApplied — enforced
+    // A dead-target op has exactly one legal outcome — NotApplied — enforced
     // below at the outcome derivation and the tie-break gate, not just the
     // `as_with` build.
     let target_live = op_targets_live(world, wop);
@@ -3918,8 +4341,19 @@ async fn reconcile_after_failure(
     let committed = visible == as_with;
     let fork_was_visible = as_fork_only.as_ref() == Some(&visible);
 
-    drop(db);
-    let db = reopen_under_storm(&storage, root, label, at_op, recovery_crash).await;
+    let db = if keep_handle {
+        // Liveness contract: the same live handle keeps serving and, once
+        // faults pass, writing — the aftermath is judged through it with no
+        // reopen anywhere in the universe.
+        db
+    } else {
+        let settings = db.settings().clone();
+        drop(db);
+        Session::from_defaults(
+            Arc::new(reopen_under_storm(&storage, root, label, at_op, recovery_crash).await),
+            settings,
+        )
+    };
     let after = observe_world(&db).await;
     if !legal(&after) {
         detectors::violation(
@@ -3959,6 +4393,23 @@ async fn reconcile_after_failure(
         // no-op instead of panicking or overwriting a slot).
         ReconcileOutcome::NotApplied
     };
+    if let WorldOp::Data {
+        op: Op::SchemaAddProperty { count },
+        ..
+    } = wop
+    {
+        outcome = schema_apply_outcome(world.main.schema_extras, *count, &db.schema_source())
+            .unwrap_or_else(|| {
+                detectors::violation(
+                    DET_CRASH_CONTRACT,
+                    at_op,
+                    format!(
+                        "{label}: recovered schema is neither the accepted nor attempted schema"
+                    ),
+                    "schema recovery settles to the accepted or attempted workload schema",
+                )
+            });
+    }
     // Which channel the ruling rests on — recorded so the run tables carry
     // observed provenance, never an assumption (canary lesson).
     let mut channel: &'static str = "query";
@@ -4081,7 +4532,7 @@ async fn reconcile_after_failure(
 /// deterministic cache-warming side effect auto mode could equally cause;
 /// accepted and recorded.
 async fn assert_traversal_modes_agree(
-    db: &Omnigraph,
+    db: &Session,
     world: &WorldModel,
     branches: &[String],
     where_: &str,
@@ -4183,8 +4634,8 @@ pub fn classify_bystander_view(
 /// after which the bystander must equal fresh (`StaleAfterSync`).
 #[allow(clippy::too_many_arguments)]
 async fn check_sessions(
-    actor: &Omnigraph,
-    bystander: &Omnigraph,
+    actor: &Session,
+    bystander: &Session,
     root: &str,
     storage: &Arc<dyn StorageAdapter>,
     world: &WorldModel,
@@ -4194,12 +4645,17 @@ async fn check_sessions(
     do_catch_up: bool,
     where_: &str,
 ) {
-    let fresh = Box::pin(Omnigraph::open_read_only_with_storage(
-        root,
-        storage.clone(),
-    ))
-    .await
-    .expect("open fresh session");
+    let fresh = Session::from_defaults(
+        Arc::new(
+            Box::pin(Omnigraph::open_read_only_with_storage(
+                root,
+                storage.clone(),
+            ))
+            .await
+            .expect("open fresh session"),
+        ),
+        SessionSettings::default(),
+    );
 
     // Schema fingerprint — the dimension row equality cannot see
     // (the schema-add finding lives here).
@@ -4290,7 +4746,7 @@ enum CrashOutcome {
 #[cfg(feature = "failpoints")]
 #[allow(clippy::too_many_arguments)]
 async fn crash_op(
-    db: Omnigraph,
+    db: Session,
     storage: Arc<dyn StorageAdapter>,
     root: &str,
     wop: &WorldOp,
@@ -4301,15 +4757,16 @@ async fn crash_op(
     expected_conflict: bool,
     failing: Option<&FailingStorage>,
     heads_before: &[(String, String)],
-) -> (Omnigraph, CrashOutcome) {
+) -> (Session, CrashOutcome) {
     assert!(
         !heads_before.is_empty(),
         "a scheduled crash requires pre-op commit heads for arbitration"
     );
-    let mut db = db;
     let result = {
-        let _fp = omnigraph::failpoints::ScopedFailPoint::new(failpoint, "return");
-        exec_world_op(&mut db, wop).await
+        let _fp = omnigraph::seams::catalog::decide(failpoint)
+            .unwrap_or_else(|| panic!("harness window {failpoint} names no catalog seam"))
+            .fire_always();
+        exec_world_op(&db, wop).await
     };
     match result {
         Ok(()) => {
@@ -4347,6 +4804,7 @@ async fn crash_op(
             retry: RetryEffect::None,
             recovery_crash,
             heads_before,
+            keep_handle: false,
         },
     ))
     .await;
@@ -4359,7 +4817,7 @@ async fn crash_op(
 #[cfg(not(feature = "failpoints"))]
 #[allow(clippy::too_many_arguments)]
 async fn crash_op(
-    _db: Omnigraph,
+    _db: Session,
     _storage: Arc<dyn StorageAdapter>,
     _root: &str,
     _wop: &WorldOp,
@@ -4370,7 +4828,7 @@ async fn crash_op(
     _expected_conflict: bool,
     _failing: Option<&FailingStorage>,
     _heads_before: &[(String, String)],
-) -> (Omnigraph, CrashOutcome) {
+) -> (Session, CrashOutcome) {
     panic!("crash scenarios require --features failpoints");
 }
 
@@ -4435,7 +4893,9 @@ pub fn run_birth_universe(root: &'static str, window: &'static str) -> BirthOutc
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
 
         let init_result = {
-            let _fp = omnigraph::failpoints::ScopedFailPoint::new(window, "return");
+            let _fp = omnigraph::seams::catalog::decide(window)
+                .unwrap_or_else(|| panic!("harness window {window} names no catalog seam"))
+                .fire_always();
             Box::pin(Omnigraph::init_with_storage(
                 root,
                 TEST_SCHEMA,
@@ -4445,8 +4905,8 @@ pub fn run_birth_universe(root: &'static str, window: &'static str) -> BirthOutc
             .await
         };
 
-        async fn usable(db: &Omnigraph) -> bool {
-            load_jsonl(db, TEST_DATA, LoadMode::Overwrite).await.is_ok()
+        async fn usable(db: &Session) -> bool {
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.is_ok()
                 && !person_rows(db).await.is_empty()
         }
 
@@ -4454,6 +4914,7 @@ pub fn run_birth_universe(root: &'static str, window: &'static str) -> BirthOutc
         // open-crash universe, so fleet failure rows carry the detector.
         match init_result {
             Ok(db) => {
+                let db = Session::from_defaults(Arc::new(db), SessionSettings::default());
                 if !usable(&db).await {
                     detectors::violation(
                         DET_BIRTH,
@@ -4467,6 +4928,7 @@ pub fn run_birth_universe(root: &'static str, window: &'static str) -> BirthOutc
             Err(_) => {
                 match Box::pin(Omnigraph::open_with_storage(root, storage.clone())).await {
                     Ok(db) => {
+                        let db = Session::from_defaults(Arc::new(db), SessionSettings::default());
                         if !usable(&db).await {
                             detectors::violation(
                                 DET_BIRTH,
@@ -4507,6 +4969,10 @@ pub fn run_birth_universe(root: &'static str, window: &'static str) -> BirthOutc
                         .await;
                         match reinit_result {
                             Ok(db) => {
+                                let db = Session::from_defaults(
+                                    Arc::new(db),
+                                    SessionSettings::default(),
+                                );
                                 if !usable(&db).await {
                                     detectors::violation(
                                         DET_BIRTH,
@@ -4562,22 +5028,29 @@ pub fn run_open_crash_universe(root: &'static str, window: &'static str) -> bool
         .expect("seeded runtime");
     runtime.block_on(async move {
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-        let db = Omnigraph::init_with_storage(
-            root,
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("clean init");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init_with_storage(
+                    root,
+                    TEST_SCHEMA,
+                    storage.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .expect("clean init"),
+            ),
+            SessionSettings::default(),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("clean load");
         let baseline = person_rows(&db).await;
         drop(db);
 
         let crashing_open = {
-            let _fp = omnigraph::failpoints::ScopedFailPoint::new(window, "return");
+            let _fp = omnigraph::seams::catalog::decide(window)
+                .unwrap_or_else(|| panic!("harness window {window} names no catalog seam"))
+                .fire_always();
             Box::pin(Omnigraph::open_with_storage(root, storage.clone())).await
         };
         let died = crashing_open.is_err();
@@ -4608,117 +5081,12 @@ pub fn run_open_crash_universe(root: &'static str, window: &'static str) -> bool
 
 // ---------------------------------------------------------------- universe --
 
-/// Consumed across the crate boundary — the pinned panel's shape assert
-/// keys on it, so the spelling lives in exactly one place.
-pub const KEEP_SERVING_DEFER_PREFIX: &str = "keep-serving-defer@";
-/// Watch-resolution row prefixes — same one-spelling rule as the defer
-/// prefix: the widened regression test's resolution-row assert keys on
-/// these, so producer and reader share the consts.
-pub const KEEP_SERVING_HEALED_PREFIX: &str = "keep-serving-healed@";
-pub const KEEP_SERVING_INTERRUPTED_PREFIX: &str = "keep-serving-interrupted@";
-pub const KEEP_SERVING_EXPIRED_PREFIX: &str = "keep-serving-expired@end";
-
-/// One spelling of the defer row (`keep-serving-defer@op<i>:<tail>` where
-/// the tail is the refused operation id, or `recovery-barrier` for the
-/// clean-recovery-state spelling that names none).
-fn keep_serving_defer_row(i: usize, tail: &str) -> String {
-    format!("{KEEP_SERVING_DEFER_PREFIX}op{i}:{tail}")
-}
-
-/// KEEP-SERVING watch (issue #554): the pending recovery operation the live
-/// handle is currently refused on, with reconcile's REOPEN withheld — never
-/// the judgment: the deferred op's two-picture arbitration runs at watch
-/// resolution ([`resolve_keep_serving_watch`]).
-struct KeepServingWatch {
-    operation_id: String,
-    /// Op index of the deferred (wedging) op — the arbitration's `at_op`.
-    first_op: usize,
-    /// Consecutive `RecoveryRequired` refusals naming `operation_id`.
-    streak: usize,
-    /// The wedging op whose `reconcile_after_failure` the watch withheld.
-    deferred_wop: WorldOp,
-}
-
-/// The interrupting event at a keep-serving resolution: the op whose
-/// outcome ended the watch — the second unjudged op the widened
-/// arbitration exists for ([`reconcile_watch_resolution`]).
-struct WatchInterrupt<'a> {
-    wop: &'a WorldOp,
-    /// true = E is known applied (a success ended the watch — the healed
-    /// composition): the E-absent hypotheses are impossible and dropped.
-    /// false = E failed/died with possibly-durable effects: its fate is
-    /// judged here alongside A's.
-    applied: bool,
-}
-
-/// The standings one op can take inside a composition: `Applied`, the
-/// `LoadFork` fork-survives half-state, `NotApplied`.
-fn op_modes(wop: &WorldOp) -> Vec<ReconcileOutcome> {
-    let mut modes = vec![ReconcileOutcome::Applied];
-    if matches!(wop, WorldOp::LoadFork { .. }) {
-        modes.push(ReconcileOutcome::ForkOnly);
-    }
-    modes.push(ReconcileOutcome::NotApplied);
-    modes
-}
-
-/// One composition hypothesis: what the deferred op (A) and the
-/// interrupting op (E) did, in which order, with the model and render that
-/// history produces.
-struct CompositionHypothesis {
-    a: ReconcileOutcome,
-    e: ReconcileOutcome,
-    /// Order: E composed BEFORE A. A distinct hypothesis exactly because
-    /// state-derived ops (`BranchCreate`, `LoadFork`, `BranchMerge`) read
-    /// branch state at their moment — `A+E` and `E+A` render differently
-    /// when E forks a branch A's effect lives on (specimen seed 24).
-    e_first: bool,
-    world: WorldModel,
-    render: WorldState,
-}
-
-impl CompositionHypothesis {
-    /// Report provenance: which composition this is, e.g. `A+E`, `E`,
-    /// `fork(A)+E`, `none`.
-    fn desc(&self, has_interrupt: bool) -> String {
-        let name = |m: ReconcileOutcome, tag: &str| match m {
-            ReconcileOutcome::NotApplied => None,
-            ReconcileOutcome::ForkOnly => Some(format!("fork({tag})")),
-            ReconcileOutcome::Applied => Some(tag.to_string()),
-            ReconcileOutcome::AppliedTwice => Some(format!("{tag}+retry({tag})")),
-        };
-        let a = name(self.a, "A");
-        let e = if has_interrupt {
-            name(self.e, "E")
-        } else {
-            None
-        };
-        let parts: Vec<String> = if self.e_first {
-            [e, a].into_iter().flatten().collect()
-        } else {
-            [a, e].into_iter().flatten().collect()
-        };
-        if parts.is_empty() {
-            "none".to_string()
-        } else {
-            parts.join("+")
-        }
-    }
-}
-
 /// Can `wop` be applied to this model at all? Guards every panic
 /// `apply_world` can raise ("live branch" on `Data`, the `BranchMerge`
 /// source index, `BranchDelete` of an absent name) plus the create dual:
 /// a `BranchCreate` of a name the model already holds is physically
 /// impossible (the engine refuses an existing name), and building it
 /// would overwrite the slot and rule provenance on a phantom composition.
-/// A composition ORDER can legitimately produce any of these states —
-/// e.g. E-first `BranchDelete b0` followed by A on `b0` — and such an
-/// order is structurally impossible, not a bug: the hypothesis is
-/// dropped, never built. Scope-out: a `LoadFork` applied after its branch
-/// already exists models the engine's load-into-existing path as
-/// fork-plus-load (slot overwrite) — a semantic approximation, kept
-/// because excluding the order could drop the true composition.
 fn op_targets_live(world: &WorldModel, wop: &WorldOp) -> bool {
     match wop {
         WorldOp::Data { branch, .. } => world.state_of_opt(branch).is_some(),
@@ -4727,367 +5095,6 @@ fn op_targets_live(world: &WorldModel, wop: &WorldOp) -> bool {
         WorldOp::BranchCreate { name } => !world.branches.contains_key(name),
         WorldOp::LoadFork { .. } => true,
     }
-}
-
-/// Render every legal composition of the deferred op A and (when present)
-/// the interrupting op E from the CURRENT model: for each combination of
-/// standings, clone the model, apply the ops in the composition's order,
-/// render. Orders whose next op targets a branch state that makes it
-/// impossible are skipped ([`op_targets_live`]). Sorted most-applied-first
-/// (A's standing, then E's, then A-first order — `ReconcileOutcome`'s
-/// `Ord`) so first-match preference mirrors [`reconcile_after_failure`]'s
-/// `Applied`-before-`ForkOnly`-before-`NotApplied` outcome order. With no
-/// interrupt this is exactly the one-op set {applied, (fork-only,)
-/// absent}.
-fn composition_hypotheses(
-    world: &WorldModel,
-    deferred: &WorldOp,
-    interrupt: Option<&WatchInterrupt<'_>>,
-) -> Vec<CompositionHypothesis> {
-    let a_modes = op_modes(deferred);
-    let e_modes = match interrupt {
-        None => vec![ReconcileOutcome::NotApplied],
-        Some(i) if i.applied => vec![ReconcileOutcome::Applied],
-        Some(i) => op_modes(i.wop),
-    };
-    let mut hyps = Vec::new();
-    for &a in &a_modes {
-        for &e in &e_modes {
-            let orders: &[bool] =
-                if a != ReconcileOutcome::NotApplied && e != ReconcileOutcome::NotApplied {
-                    &[false, true]
-                } else {
-                    &[false]
-                };
-            'order: for &e_first in orders {
-                let mut w = world.clone();
-                let seq: [(Option<&WorldOp>, ReconcileOutcome); 2] = if e_first {
-                    [(interrupt.map(|i| i.wop), e), (Some(deferred), a)]
-                } else {
-                    [(Some(deferred), a), (interrupt.map(|i| i.wop), e)]
-                };
-                for (op, mode) in seq {
-                    let Some(op) = op else { continue };
-                    if mode == ReconcileOutcome::NotApplied {
-                        continue;
-                    }
-                    if !op_targets_live(&w, op) {
-                        continue 'order;
-                    }
-                    mode.apply(&mut w, op);
-                }
-                let render = w.render();
-                hyps.push(CompositionHypothesis {
-                    a,
-                    e,
-                    e_first,
-                    world: w,
-                    render,
-                });
-            }
-        }
-    }
-    hyps.sort_by(|x, y| {
-        y.a.cmp(&x.a)
-            .then(y.e.cmp(&x.e))
-            .then(x.e_first.cmp(&y.e_first))
-    });
-    hyps
-}
-
-/// The widened resolution's verdict: both ops' outcomes, the matched
-/// composition (report provenance), and that composition's model — the
-/// matching composition becomes the model, wholesale.
-struct WatchRuling {
-    a_outcome: ReconcileOutcome,
-    /// `Some` exactly when an interrupt was passed. CANONICAL exactly-once
-    /// contract: the interrupting op's judgment is FINAL here and the call
-    /// site MUST NOT judge it again — the resolution's reopen empties
-    /// `__recovery/` of every recognized-name strand (the tolerated
-    /// foreign-named carve-out is an injected misdirect, never an op's own
-    /// strand), so nothing survives to change the op's fate.
-    e_outcome: Option<ReconcileOutcome>,
-    matched: String,
-    world: WorldModel,
-}
-
-/// The keep-serving resolution's arbitration (the #559 composition
-/// widening; regression evidence in
-/// `dst_keep_serving_widened_arbitration_no_false_reds`): judge the
-/// deferred op A and the interrupting op E TOGETHER, against every legal
-/// composition and order of the pair. [`reconcile_after_failure`]'s one-op
-/// set assumes at most one unjudged op separates model from store; the
-/// watch's deferral breaks that invariant — the regression test's doc
-/// carries the three proven break shapes. Red only when NO composition
-/// matches; the matching composition becomes the model.
-///
-/// Same six steps as [`reconcile_after_failure`] — look, reopen
-/// ([`reopen_under_storm`]), look again, residue
-/// ([`assert_no_recovery_residue`]), monotonicity, rule — with the checks
-/// generalized to the widened set: a fact every pre-reopen match agrees on
-/// must survive recovery, and render ties whose models differ resolve
-/// through the physical channel like the one-op ghost tie-break.
-#[allow(clippy::too_many_arguments)]
-async fn reconcile_watch_resolution(
-    db: Omnigraph,
-    storage: Arc<dyn StorageAdapter>,
-    root: &str,
-    deferred: &WorldOp,
-    interrupt: Option<&WatchInterrupt<'_>>,
-    world: &WorldModel,
-    label: &str,
-    at_op: usize,
-) -> (Omnigraph, WatchRuling, &'static str) {
-    let hyps = composition_hypotheses(world, deferred, interrupt);
-    // The failure carries its own triage: a no-match red prints every
-    // candidate composition it compared, so the reader can diff instead of
-    // re-deriving (the #559 root-cause lesson — with the renders in the
-    // message, diagnosis took two runs; without, a dedicated session).
-    let candidates = |hyps: &[CompositionHypothesis]| {
-        hyps.iter()
-            .map(|h| format!("{}={:?}", h.desc(interrupt.is_some()), h.render))
-            .collect::<Vec<_>>()
-            .join("; ")
-    };
-    let matches_of = |state: &WorldState| -> Vec<usize> {
-        hyps.iter()
-            .enumerate()
-            .filter(|(_, h)| h.render == *state)
-            .map(|(i, _)| i)
-            .collect()
-    };
-    let visible = observe_world(&db).await;
-    let visible_matches = matches_of(&visible);
-    if visible_matches.is_empty() {
-        detectors::violation(
-            DET_CRASH_CONTRACT,
-            at_op,
-            format!(
-                "{label}: PARTIAL application (deferred={deferred:?}, interrupt={:?}); \
-                 visible={visible:?}; candidates: {}",
-                interrupt.map(|i| i.wop),
-                candidates(&hyps)
-            ),
-            "the pre-reopen world renders as a legal composition of the unjudged ops",
-        );
-    }
-    drop(db);
-    // `recovery_crash: None` — the double-fault lever is deliberately not
-    // exercised at watch resolutions (parity with the kill/fault reconcile
-    // sites; the crash-window arm resolves BEFORE `crash_op`, so the lever
-    // still fires on that crash's own reconcile). A keep-serving ×
-    // double-fault arm is recorded future work.
-    let db = reopen_under_storm(&storage, root, label, at_op, None).await;
-    let after = observe_world(&db).await;
-    let mut after_matches = matches_of(&after);
-    if after_matches.is_empty() {
-        detectors::violation(
-            DET_CRASH_CONTRACT,
-            at_op,
-            format!(
-                "{label}: recovery produced an illegal state (deferred={deferred:?}, \
-                 interrupt={:?}); after={after:?}; candidates: {}",
-                interrupt.map(|i| i.wop),
-                candidates(&hyps)
-            ),
-            "the post-recovery world renders as a legal composition of the unjudged ops",
-        );
-    }
-    assert_no_recovery_residue(&storage, root, label, at_op).await;
-    let mut channel: &'static str = "query";
-    if after_matches.len() > 1 {
-        let touched = hyps[after_matches[0]].world.branch_names();
-        for branch in &touched {
-            // The raw expectation per tied composition: rows ∪ ghosts on
-            // the touched branch (None = branch absent in that model —
-            // uniform across ties, since the shared render lists branches).
-            let expectations: Vec<Option<Vec<(String, String)>>> = after_matches
-                .iter()
-                .map(|&idx| {
-                    hyps[idx]
-                        .world
-                        .state_of_opt(branch)
-                        .map(Model::physical_rows)
-                })
-                .collect();
-            let first = &expectations[0];
-            if expectations.iter().all(|e| e == first) {
-                continue;
-            }
-            channel = "query+bound";
-            let knows = Box::pin(knows_rows_bound_target(&db, ReadTarget::branch(branch))).await;
-            let keep: Vec<usize> = after_matches
-                .iter()
-                .zip(&expectations)
-                .filter(|(_, e)| e.as_deref() == Some(knows.as_slice()))
-                .map(|(&idx, _)| idx)
-                .collect();
-            if keep.is_empty() {
-                detectors::violation(
-                    DET_ARBITRATION_PHYSICAL,
-                    at_op,
-                    format!(
-                        "{label}: bound rows match NO tied composition on \
-                         '{branch}' (bound={knows:?}; tied expectations: {:?})",
-                        expectations
-                    ),
-                    "the bound-row tie-break resolves query-invisible differences to one composition",
-                );
-            }
-            after_matches = keep;
-        }
-    }
-    // Monotonicity across the widened set, judged on the NARROWED matches:
-    // a fact EVERY pre-reopen match agrees on must not be undone by
-    // recovery. Quantified over all matches ([`reconcile_after_failure`]
-    // uses exact equality on its single `as_with`) so render ambiguity
-    // never manufactures a false demotion.
-    let demoted = |get: &dyn Fn(&CompositionHypothesis) -> ReconcileOutcome| {
-        visible_matches
-            .iter()
-            .all(|&i| get(&hyps[i]) == ReconcileOutcome::Applied)
-            && !after_matches
-                .iter()
-                .any(|&i| get(&hyps[i]) == ReconcileOutcome::Applied)
-    };
-    // Fork-survives oracle, both operands: the implicit fork is a fully
-    // published branch create; recovery must never delete it (it may still
-    // roll the LOAD forward).
-    let fork_deleted = |get: &dyn Fn(&CompositionHypothesis) -> ReconcileOutcome| {
-        visible_matches
-            .iter()
-            .all(|&i| get(&hyps[i]) != ReconcileOutcome::NotApplied)
-            && after_matches
-                .iter()
-                .all(|&i| get(&hyps[i]) == ReconcileOutcome::NotApplied)
-    };
-    if demoted(&|h| h.a) {
-        detectors::violation(
-            DET_CRASH_CONTRACT,
-            at_op,
-            format!(
-                "{label}: recovery DEMOTED a committed write (deferred={deferred:?}); after={after:?}"
-            ),
-            "recovery monotonicity: a committed write stays applied",
-        );
-    }
-    if matches!(deferred, WorldOp::LoadFork { .. }) && fork_deleted(&|h| h.a) {
-        detectors::violation(
-            DET_CRASH_CONTRACT,
-            at_op,
-            format!(
-                "{label}: recovery DELETED a durably created implicit fork branch \
-                 (deferred={deferred:?}); after={after:?}"
-            ),
-            "recovery monotonicity: a durably created fork branch survives recovery",
-        );
-    }
-    if let Some(i) = interrupt
-        && !i.applied
-    {
-        if matches!(i.wop, WorldOp::LoadFork { .. }) && fork_deleted(&|h| h.e) {
-            detectors::violation(
-                DET_CRASH_CONTRACT,
-                at_op,
-                format!(
-                    "{label}: recovery DELETED the interrupting op's durably created \
-                     implicit fork branch (interrupt={:?}); after={after:?}",
-                    i.wop
-                ),
-                "recovery monotonicity: a durably created fork branch survives recovery",
-            );
-        }
-        if demoted(&|h| h.e) {
-            detectors::violation(
-                DET_CRASH_CONTRACT,
-                at_op,
-                format!(
-                    "{label}: recovery DEMOTED the interrupting op's committed write (interrupt={:?}); after={after:?}",
-                    i.wop
-                ),
-                "recovery monotonicity: a committed write stays applied",
-            );
-        }
-    }
-    let winner = &hyps[after_matches[0]];
-    let ruling = WatchRuling {
-        a_outcome: winner.a,
-        e_outcome: interrupt.map(|_| winner.e),
-        matched: winner.desc(interrupt.is_some()),
-        world: winner.world.clone(),
-    };
-    (db, ruling, channel)
-}
-
-/// Resolve a keep-serving watch: push the site's `known_issues` row
-/// (`<site-prefix>op<i>:<id> after N refusals (first at opK)`), run the
-/// DEFERRED arbitration ([`reconcile_watch_resolution`]) — widened with
-/// the interrupting op E when one exists — and install the matched
-/// composition as the model.
-///
-/// CANONICAL, the deferral contract: the watch withholds only the REOPEN,
-/// so resolution must run before any other reconcile can reopen, or the
-/// model would carry an unjudged effect window through Full recovery.
-///
-/// CANONICAL, the stale-capture rule: this resolution replaces the model
-/// and reopens the store, so any predicate captured before it (a merge
-/// prediction, a damage snapshot) must be re-derived — or deliberately
-/// snapshotted pre-resolution — before judging THIS iteration's op
-/// against the post-ruling world.
-///
-/// The returned interrupt outcome is final — exactly-once contract on
-/// [`WatchRuling::e_outcome`]. Violations inside carry the DEFERRED op's
-/// index as `at_op`; the interrupt's identity is in the message.
-/// Mid-watch history stays coherent without an assert: a pending strand's
-/// head is un-advanced (a partial multi-table commit never advances the
-/// manifest head), and every head-advancing path (an entry heal) resolves
-/// the watch within its own iteration before the next capture. No
-/// `maintenance_obligations` pass runs here — parity with the
-/// injected-fault reconcile path, which never ran one either; a deferred
-/// MAINTENANCE op that executed and armed its own strand gets no
-/// obligations judgment on this path — future work; crash/kill deaths
-/// remain the only obligation triggers.
-#[allow(clippy::too_many_arguments)]
-async fn resolve_keep_serving_watch(
-    db: Omnigraph,
-    storage: Arc<dyn StorageAdapter>,
-    root: &str,
-    failing: Option<&FailingStorage>,
-    world: &mut WorldModel,
-    reconcile_verdicts: &mut Vec<(String, String, String)>,
-    known_issues: &mut Vec<String>,
-    row_site: &str,
-    watch: KeepServingWatch,
-    interrupt: Option<&WatchInterrupt<'_>>,
-) -> (Omnigraph, Option<(ReconcileOutcome, &'static str)>) {
-    known_issues.push(format!(
-        "{row_site}:{} after {} refusals (first at op{})",
-        watch.operation_id, watch.streak, watch.first_op
-    ));
-    if let Some(f) = failing {
-        f.suspend();
-    }
-    let (db, ruling, channel) = Box::pin(reconcile_watch_resolution(
-        db,
-        storage,
-        root,
-        &watch.deferred_wop,
-        interrupt,
-        world,
-        "keep-serving deferred arbitration",
-        watch.first_op,
-    ))
-    .await;
-    if let Some(f) = failing {
-        f.resume();
-    }
-    reconcile_verdicts.push((
-        format!("keep-serving-deferred@op{}", watch.first_op),
-        format!("{:?} matched={}", ruling.a_outcome, ruling.matched),
-        channel.to_string(),
-    ));
-    *world = ruling.world;
-    (db, ruling.e_outcome.map(|o| (o, channel)))
 }
 
 /// META ORACLE — strict replay, detector-tagged: two same-seed
@@ -5128,13 +5135,44 @@ struct RustEnvironment {
     die_at_write: Option<usize>,
 }
 
-#[derive(Debug)]
 struct RustResources {
     memory: MemoryStorage,
     storage: Arc<dyn StorageAdapter>,
     failing: Option<Arc<FailingStorage>>,
     lance_faults_state: Option<Arc<crate::lance_faults::LanceFaultState>>,
     kill_state: Option<Arc<KillState>>,
+    /// Holds the storage seam for the universe's lifetime: every handle the
+    /// engine opens (init, reopen, read-only bystander) is decorated with the
+    /// same `FailingStorage` the universe built.
+    _storage_seam: Option<
+        omnigraph::seams::Installed<
+            dyn omnigraph::storage::DecorateStorage,
+            omnigraph::seams::Global<dyn omnigraph::storage::DecorateStorage>,
+        >,
+    >,
+}
+
+impl std::fmt::Debug for RustResources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RustResources")
+            .field("memory", &self.memory)
+            .field("failing", &self.failing)
+            .field("lance_faults_state", &self.lance_faults_state)
+            .field("kill_state", &self.kill_state)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The storage-seam behavior: hands back the universe's one `FailingStorage`,
+/// ignoring the base adapter the engine offers (the instance already wraps it).
+pub struct FailingStorageDecorator(pub Arc<FailingStorage>);
+
+impl omnigraph::seams::Behavior for FailingStorageDecorator {}
+
+impl omnigraph::storage::DecorateStorage for FailingStorageDecorator {
+    fn wrap(&self, _base: Arc<dyn StorageAdapter>) -> Arc<dyn StorageAdapter> {
+        self.0.clone()
+    }
 }
 
 impl UniverseEnvironment for RustEnvironment {
@@ -5169,7 +5207,6 @@ impl UniverseEnvironment for RustEnvironment {
         }
         crate::lance_faults::set_active(lance_faults_state.clone());
         crate::lance_faults::set_kill(kill_state.clone());
-        FOREIGN_SIDECAR_ROWS.lock().unwrap().clear();
         let failing: Option<Arc<FailingStorage>> = if self.faults.is_some() || kill_state.is_some()
         {
             Some(Arc::new(FailingStorage::new(
@@ -5185,6 +5222,9 @@ impl UniverseEnvironment for RustEnvironment {
             Some(f) => f.clone(),
             None => base,
         };
+        let _storage_seam = failing.as_ref().map(|f| {
+            omnigraph::storage::STORAGE.install(Arc::new(FailingStorageDecorator(f.clone())))
+        });
 
         Ok(RustResources {
             memory,
@@ -5192,6 +5232,7 @@ impl UniverseEnvironment for RustEnvironment {
             failing,
             lance_faults_state,
             kill_state,
+            _storage_seam,
         })
     }
 
@@ -5212,8 +5253,16 @@ pub fn run_universe(root: &str, scenario: &Scenario) -> UniverseReport {
 
 /// Retain detector panic payloads while the shared executor finalizes resources.
 pub fn run_universe_caught(root: &str, sc: &Scenario) -> std::thread::Result<UniverseReport> {
+    assert!(
+        !(sc.keep_handle
+            && (sc.crash_at.is_some()
+                || sc.crash_on_match.is_some()
+                || sc.die_at_write.is_some()
+                || sc.recovery_crash.is_some())),
+        "keep_handle is a live-handle liveness mode; a crash universe has no handle to keep"
+    );
     println!(
-        "dst universe [root={root} seed={} ops={} crash={:?} crash_on_match={:?} faults={} kill={:?} keep_serving={}]",
+        "dst universe [root={root} seed={} ops={} crash={:?} crash_on_match={:?} faults={} kill={:?}]",
         sc.seed,
         sc.ops,
         sc.crash_at,
@@ -5226,11 +5275,6 @@ pub fn run_universe_caught(root: &str, sc: &Scenario) -> std::thread::Result<Uni
             ))
             .unwrap_or_else(|| "none".to_string()),
         sc.die_at_write,
-        sc.keep_serving_ops
-    );
-    assert!(
-        sc.keep_serving_ops == 0 || !sc.faults.as_ref().map(|p| p.client_retry).unwrap_or(false),
-        "keep_serving_ops and FaultPlan::client_retry are mutually scoped out"
     );
 
     detectors::install_violation_panic_hook();
@@ -5280,15 +5324,20 @@ impl UniverseScenario<RustResources> for Scenario {
         let lance_faults_state = resources.lance_faults_state.clone();
         let kill_state = resources.kill_state.clone();
 
-        let mut db = Omnigraph::init_with_storage(
-            root,
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init universe root");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let mut db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init_with_storage(
+                    root,
+                    TEST_SCHEMA,
+                    storage.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .expect("init universe root"),
+            ),
+            SessionSettings::default(),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("load fixture");
 
@@ -5309,14 +5358,20 @@ impl UniverseScenario<RustResources> for Scenario {
         // history baseline (the fixture-load commit) — captured
         // before fault injection enables so the baseline read is clean.
         let mut history: Vec<(String, Model)> = Vec::new();
+        let mut fork_bases: BTreeMap<String, (String, Model)> = BTreeMap::new();
         let mut history_verified_from: usize = 0;
         Box::pin(capture_history(&db, &world.main, &mut history)).await;
 
         // the BYSTANDER session — born now (clean store), never
         // writes, read at every session check. The server's warm-idle shape.
-        let bystander = Box::pin(Omnigraph::open_with_storage(root, storage.clone()))
-            .await
-            .expect("open bystander session");
+        let bystander = Session::from_defaults(
+            Arc::new(
+                Box::pin(Omnigraph::open_with_storage(root, storage.clone()))
+                    .await
+                    .expect("open bystander session"),
+            ),
+            SessionSettings::default(),
+        );
         let mut bystander_last: Option<usize> = None;
         let mut bystander_trail: Vec<usize> = Vec::new();
         let mut session_checks = 0usize;
@@ -5336,13 +5391,14 @@ impl UniverseScenario<RustResources> for Scenario {
         let mut crashes = 0usize;
         let mut verified = 0usize;
         let mut legal_rejections = 0usize;
+        // Reopens performed while judging failures (reconcile / crash
+        // recovery). A `keep_handle` universe must end with zero.
+        let mut reopens = 0usize;
         let mut client_retries = 0usize;
         let mut maintenance_reruns = 0usize;
+        let mut schema_applies = 0usize;
         let mut reconcile_verdicts: Vec<(String, String, String)> = Vec::new();
-        let mut known_issues: Vec<String> = Vec::new();
-        // Armed only when `Scenario::keep_serving_ops > 0`; contract on
-        // [`KeepServingWatch`].
-        let mut keep_serving_watch: Option<KeepServingWatch> = None;
+        let known_issues: Vec<String> = Vec::new();
         // attributed detections — op failures whose reads
         // crossed the damage ledger (see the exec-site snapshot below).
         let mut corruption_detections: Vec<String> = Vec::new();
@@ -5358,9 +5414,9 @@ impl UniverseScenario<RustResources> for Scenario {
         #[cfg(feature = "failpoints")]
         let _persistent_probe = sc.probe_window.map(|w| {
             let flag = crossed_flag.clone();
-            omnigraph::failpoints::ScopedFailPoint::with_callback(w, move || {
-                flag.store(true, std::sync::atomic::Ordering::SeqCst)
-            })
+            omnigraph::seams::catalog::decide(w)
+                .unwrap_or_else(|| panic!("harness window {w} names no catalog seam"))
+                .observe(move || flag.store(true, std::sync::atomic::Ordering::SeqCst))
         });
 
         for i in 0..sc.ops {
@@ -5394,10 +5450,20 @@ impl UniverseScenario<RustResources> for Scenario {
                     &mut next_ver,
                     sc.hostile,
                     sc.wide,
+                    sc.schema_ops,
                     &mut schema_extras,
                     &mut fresh_load,
                 )
             });
+            if matches!(
+                wop,
+                WorldOp::Data {
+                    op: Op::SchemaAddProperty { .. },
+                    ..
+                }
+            ) {
+                schema_applies += 1;
+            }
             // RETENTION HORIZON: `cleanup(keep_versions: 1)`
             // retires old table versions, so history recorded before a
             // cleanup is no longer RELIABLY readable (GC is lazy and
@@ -5422,6 +5488,61 @@ impl UniverseScenario<RustResources> for Scenario {
                 // model-side — retention can't invalidate it, so the full
                 // list stays.
                 history_verified_from = history.len().saturating_sub(1);
+            }
+
+            crate::cost::set_label("_verify");
+            if let Some(f) = &failing {
+                f.suspend();
+            }
+            let fork_name = match &wop {
+                WorldOp::BranchCreate { name } => Some(name),
+                WorldOp::LoadFork { branch, .. } => Some(branch),
+                _ => None,
+            };
+            if let Some(name) = fork_name.filter(|name| !world.branches.contains_key(*name)) {
+                let head = Box::pin(db.resolve_snapshot("main"))
+                    .await
+                    .expect("resolve model fork base");
+                fork_bases.insert(name.clone(), (head.to_string(), world.main.clone()));
+            }
+            let cleanup_images = if matches!(
+                &wop,
+                WorldOp::Data {
+                    op: Op::Cleanup,
+                    ..
+                }
+            ) {
+                let images = collector_images(&db, &world, &fork_bases).await;
+                assert_collector_images(&db, &images, i).await;
+                images
+            } else {
+                Vec::new()
+            };
+            let cleanup_paths = if matches!(
+                &wop,
+                WorldOp::Data {
+                    op: Op::Cleanup,
+                    ..
+                }
+            ) {
+                let report = db
+                    .cleanup_plan(omnigraph::db::CleanupPolicyOptions {
+                        keep_versions: Some(1),
+                        older_than: None,
+                    })
+                    .await
+                    .expect("capture retained roots before cleanup");
+                let paths = db
+                    .cleanup_plan_path_snapshot(&report)
+                    .await
+                    .expect("capture retained object paths");
+                assert_collector_paths(&paths, i).await;
+                Some(paths)
+            } else {
+                None
+            };
+            if let Some(f) = &failing {
+                f.resume();
             }
 
             let expected_conflict = expects_merge_conflict(&world, &wop);
@@ -5455,38 +5576,12 @@ impl UniverseScenario<RustResources> for Scenario {
                     }
                 }
             }
-            let mut heads_before = if failing.is_some() || (crash_now.is_some() && !sc.probe_only) {
+            let heads_before = if failing.is_some() || (crash_now.is_some() && !sc.probe_only) {
                 branch_heads(&db, &world, i, &wop, failing.as_deref()).await
             } else {
                 Vec::new()
             };
             if let Some(failpoint) = crash_now.filter(|_| !sc.probe_only) {
-                // A scheduled crash ends any keep-serving experiment first —
-                // deferral contract on [`resolve_keep_serving_watch`]. No
-                // interrupt: the crashing op has not executed yet, so it
-                // cannot be in the store.
-                let mut expected_conflict = expected_conflict;
-                if let Some(watch) = keep_serving_watch.take() {
-                    let (new_db, _) = Box::pin(resolve_keep_serving_watch(
-                        db,
-                        storage.clone(),
-                        root,
-                        failing.as_deref(),
-                        &mut world,
-                        &mut reconcile_verdicts,
-                        &mut known_issues,
-                        &format!("{KEEP_SERVING_INTERRUPTED_PREFIX}op{i}"),
-                        watch,
-                        None,
-                    ))
-                    .await;
-                    db = new_db;
-                    heads_before = branch_heads(&db, &world, i, &wop, failing.as_deref()).await;
-                    // Stale-capture rule on [`resolve_keep_serving_watch`]:
-                    // re-derive the prediction from the world crash_op will
-                    // actually judge against.
-                    expected_conflict = expects_merge_conflict(&world, &wop);
-                }
                 let (new_db, outcome) = Box::pin(crash_op(
                     db,
                     storage.clone(),
@@ -5506,6 +5601,7 @@ impl UniverseScenario<RustResources> for Scenario {
                     CrashOutcome::OpSucceeded => apply_world(&mut world, &wop),
                     CrashOutcome::LegalRejection => legal_rejections += 1,
                     CrashOutcome::Crashed { outcome, channel } => {
+                        reopens += 1;
                         crashes += 1;
                         reconcile_verdicts.push((
                             format!("crash:{failpoint}@op{i}"),
@@ -5523,12 +5619,16 @@ impl UniverseScenario<RustResources> for Scenario {
                         }
                         let ran = if op_targets_live(&world, &wop) {
                             Box::pin(maintenance_obligations(
-                                &mut db,
+                                &db,
                                 &world,
                                 &wop,
                                 &format!("crash:{failpoint}@op{i}"),
                                 i,
                                 sc.fail_maintenance_rerun,
+                                CleanupEvidence {
+                                    images: &cleanup_images,
+                                    paths: cleanup_paths.as_ref(),
+                                },
                             ))
                             .await
                         } else {
@@ -5553,6 +5653,28 @@ impl UniverseScenario<RustResources> for Scenario {
                         }
                     }
                 }
+                if matches!(
+                    &wop,
+                    WorldOp::Data {
+                        op: Op::Cleanup,
+                        ..
+                    }
+                ) {
+                    crate::cost::set_label("_verify");
+                    if let Some(f) = &failing {
+                        f.suspend();
+                    }
+                    assert_collector_images(&db, &cleanup_images, i).await;
+                    assert_collector_paths(
+                        cleanup_paths.as_ref().expect("Cleanup captured paths"),
+                        i,
+                    )
+                    .await;
+                    assert_collector_invariants(&db, i, true, false).await;
+                    if let Some(f) = &failing {
+                        f.resume();
+                    }
+                }
                 continue;
             }
 
@@ -5574,17 +5696,22 @@ impl UniverseScenario<RustResources> for Scenario {
                 let _probe_guard = match crash_now {
                     Some(failpoint) if sc.probe_only => {
                         let flag = crossed_flag.clone();
-                        Some(omnigraph::failpoints::ScopedFailPoint::with_callback(
-                            failpoint,
-                            move || flag.store(true, std::sync::atomic::Ordering::SeqCst),
-                        ))
+                        Some(
+                            omnigraph::seams::catalog::decide(failpoint)
+                                .unwrap_or_else(|| {
+                                    panic!("harness window {failpoint} names no catalog seam")
+                                })
+                                .observe(move || {
+                                    flag.store(true, std::sync::atomic::Ordering::SeqCst)
+                                }),
+                        )
                     }
                     _ => None,
                 };
-                exec_world_op(&mut db, &wop).await
+                exec_world_op(&db, &wop).await
             };
             #[cfg(not(feature = "failpoints"))]
-            let exec_result = exec_world_op(&mut db, &wop).await;
+            let exec_result = exec_world_op(&db, &wop).await;
 
             // the dead flag — not the error text, not even the
             // op's verdict — is the authority. The dying op may surface a
@@ -5613,41 +5740,7 @@ impl UniverseScenario<RustResources> for Scenario {
                     legal_rejections += 1;
                 }
                 ks.revive_and_disarm();
-                // Deferral contract on [`resolve_keep_serving_watch`].
-                // Unlike the crash-window arm, the dying op EXECUTED (the
-                // kill fired mid-op), so it rides into the resolution as the
-                // uncertain interrupting op — DELIBERATELY uncertain even on
-                // the ABSORBED `Ok`: here the dead flag, not the op's claim,
-                // is the authority, so a kill-context success is exactly the
-                // claim the arbitration must not trust.
-                let interrupt_ruling = if let Some(watch) = keep_serving_watch.take() {
-                    let interrupt = WatchInterrupt {
-                        wop: &wop,
-                        applied: false,
-                    };
-                    let (new_db, ruling) = Box::pin(resolve_keep_serving_watch(
-                        db,
-                        storage.clone(),
-                        root,
-                        failing.as_deref(),
-                        &mut world,
-                        &mut reconcile_verdicts,
-                        &mut known_issues,
-                        &format!("{KEEP_SERVING_INTERRUPTED_PREFIX}op{i}"),
-                        watch,
-                        Some(&interrupt),
-                    ))
-                    .await;
-                    db = new_db;
-                    ruling
-                } else {
-                    None
-                };
-                let (outcome, channel) = if let Some((outcome, channel)) = interrupt_ruling {
-                    // Exactly-once contract on [`WatchRuling::e_outcome`] —
-                    // row only.
-                    (outcome, channel)
-                } else {
+                let (outcome, channel) = {
                     if let Some(f) = &failing {
                         f.suspend();
                     }
@@ -5663,10 +5756,12 @@ impl UniverseScenario<RustResources> for Scenario {
                             retry: RetryEffect::None,
                             recovery_crash: None,
                             heads_before: &heads_before,
+                            keep_handle: false,
                         },
                     ))
                     .await;
                     db = new_db;
+                    reopens += 1;
                     if let Some(f) = &failing {
                         f.resume();
                     }
@@ -5687,12 +5782,16 @@ impl UniverseScenario<RustResources> for Scenario {
                 }
                 let ran = if op_targets_live(&world, &wop) {
                     Box::pin(maintenance_obligations(
-                        &mut db,
+                        &db,
                         &world,
                         &wop,
                         &format!("crash-state:write#{}@op{i}", ks.writes_observed()),
                         i,
                         sc.fail_maintenance_rerun,
+                        CleanupEvidence {
+                            images: &cleanup_images,
+                            paths: cleanup_paths.as_ref(),
+                        },
                     ))
                     .await
                 } else {
@@ -5717,19 +5816,8 @@ impl UniverseScenario<RustResources> for Scenario {
                 match exec_result {
                     Ok(()) => {
                         // A merge the model predicted as conflicting MUST NOT
-                        // succeed — dual-hypothesis assert (H-B lives
-                        // here). Scope-out with a watch active: the flag was
-                        // captured from a model the deferred op's roll-forward
-                        // may have outrun, and the true prediction epoch is
-                        // only knowable after the resolution (stale-capture
-                        // rule on [`resolve_keep_serving_watch`]). An
-                        // engine-accepted conflicting merge mid-watch is
-                        // still caught — as the resolution's no-composition
-                        // `CrashContract` red: `apply_world` no-ops a
-                        // predicted-conflict merge, so no hypothesis can
-                        // render the merged state (the conflict is an
-                        // absorbing element of the composition algebra).
-                        if expected_conflict && keep_serving_watch.is_none() {
+                        // succeed — dual-hypothesis assert (H-B lives here).
+                        if expected_conflict {
                             detectors::violation(
                                 DET_MERGE_PREDICTION,
                                 i,
@@ -5750,128 +5838,33 @@ impl UniverseScenario<RustResources> for Scenario {
                         ) {
                             force_session_check = true;
                         }
-                        // A success on the watched handle ends the watch: the
-                        // pending operation was resolved before this op ran,
-                        // by the write entry's own heal (the issue-554
-                        // contract holding). Premise scope-out: an op that
-                        // bypasses the write entry (a view sync; an
-                        // `EnsureIndices` not touching the pending branch)
-                        // can succeed with the strand still pending — the
-                        // resolution then cures the wedge; op-class filter is
-                        // future work, the pinned scenarios never sample
-                        // those mid-wedge. The succeeding op is NOT applied
-                        // to the model first — it rides into the resolution
-                        // as the known-applied interrupting op (the break
-                        // shapes live on
-                        // `dst_keep_serving_widened_arbitration_no_false_reds`);
-                        // deferral contract on [`resolve_keep_serving_watch`].
-                        if let Some(watch) = keep_serving_watch.take() {
-                            let interrupt = WatchInterrupt {
-                                wop: &wop,
-                                applied: true,
-                            };
-                            let (new_db, _) = Box::pin(resolve_keep_serving_watch(
-                                db,
-                                storage.clone(),
-                                root,
-                                failing.as_deref(),
-                                &mut world,
-                                &mut reconcile_verdicts,
-                                &mut known_issues,
-                                &format!("{KEEP_SERVING_HEALED_PREFIX}op{i}"),
-                                watch,
-                                Some(&interrupt),
-                            ))
+                        if matches!(
+                            &wop,
+                            WorldOp::Data {
+                                op: Op::Cleanup,
+                                ..
+                            }
+                        ) {
+                            let damaged = failing.as_ref().map(|f| f.damage_events()).unwrap_or(0)
+                                > damage_before;
+                            if let Some(f) = &failing {
+                                f.suspend();
+                            }
+                            crate::cost::set_label("_verify");
+                            assert_collector_images(&db, &cleanup_images, i).await;
+                            assert_collector_paths(
+                                cleanup_paths.as_ref().expect("Cleanup captured paths"),
+                                i,
+                            )
                             .await;
-                            db = new_db;
-                        } else {
-                            apply_world(&mut world, &wop);
+                            assert_collector_invariants(&db, i, true, damaged).await;
+                            if let Some(f) = &failing {
+                                f.resume();
+                            }
                         }
+                        apply_world(&mut world, &wop);
                     }
                     Err(err) => {
-                        // KEEP-SERVING (issue #554): with the budget armed,
-                        // a `RecoveryRequired` refusal defers reconcile's
-                        // reopen and keeps the SAME handle serving — the
-                        // reopen runs Full recovery, the cure, so reopening
-                        // on first contact structurally hides any wedge a
-                        // long-lived server would sit in.
-                        //
-                        // The keep-serving `continue`s below deliberately
-                        // skip the rest of this iteration: the damage-
-                        // attribution window (a streak refusal is raised at
-                        // the write entry BEFORE op execution, so no op
-                        // reads crossed the ledger; a FRESH-watch op may
-                        // have executed — the discovery-#3 arming shape —
-                        // and its ledger crossing is deliberately dropped, a
-                        // recorded telemetry-only gap: no judgment depends
-                        // on the row), the `is_legal_rejection` catalog (the
-                        // variant match on `RecoveryRequired` is a call-site
-                        // catalog extension), and continuous verification (a
-                        // mid-wedge world-match would judge a deliberately-
-                        // held failure state, and `check_sessions`' fresh
-                        // opens would heal the wedge under observation).
-                        if sc.keep_serving_ops > 0
-                            && let OmniError::RecoveryRequired { operation_id, .. } = &err
-                            && let Some(mut watch) = keep_serving_watch
-                                .take_if(|watch| &watch.operation_id == operation_id)
-                        {
-                            watch.streak += 1;
-                            if watch.streak >= sc.keep_serving_ops {
-                                detectors::violation(
-                                    DET_LIVE_WRITE_AVAILABILITY,
-                                    i,
-                                    format!(
-                                        "writes wedged on pending recovery operation {}: \
-                                             {} consecutive RecoveryRequired refusals on the \
-                                             live handle (first at op{}), reopen deferred",
-                                        watch.operation_id, watch.streak, watch.first_op
-                                    ),
-                                    Oracle::LiveWriteAvailability.doc(),
-                                );
-                            }
-                            known_issues.push(keep_serving_defer_row(i, &watch.operation_id));
-                            keep_serving_watch = Some(watch);
-                            legal_rejections += 1;
-                            continue;
-                        }
-                        // A refusal against the SAME pending strand can
-                        // arrive as the clean-recovery-state spelling (the
-                        // `manifest_conflict` "requires a clean recovery
-                        // state" text — keyed on the TEXT, not an op set, so
-                        // any future emitter rides this branch too), not
-                        // typed `RecoveryRequired` — the engine's second
-                        // spelling of the wedge. Ending the watch on it would
-                        // reopen and CURE the wedge under observation — see
-                        // the arm-intro comment above. It continues the watch
-                        // as a defer row but does NOT count toward the
-                        // budget: the oracle's contract counts refusals
-                        // naming one operation id, and this spelling names
-                        // none. Supersedes the `reopen-heals-barrier@` tag
-                        // mid-watch — the defer row encodes the encounter.
-                        if keep_serving_watch.is_some()
-                            && !matches!(&err, OmniError::RecoveryRequired { .. })
-                            && format!("{err:?}").contains(CLEAN_RECOVERY_BARRIER_TEXT)
-                        {
-                            known_issues.push(keep_serving_defer_row(i, "recovery-barrier"));
-                            legal_rejections += 1;
-                            continue;
-                        }
-                        // Any OTHER failure while a watch is active ends the
-                        // wedge experiment before this failure's own handling
-                        // — deferral contract on [`resolve_keep_serving_watch`].
-                        // A failure class that can leave durable effects
-                        // (fault-marked, ack-lost, damage-attributed) rides
-                        // into the resolution as the UNCERTAIN interrupting
-                        // op and is judged there. A DIFFERENT-id
-                        // `RecoveryRequired` is in that class too: a same-id
-                        // refusal never reaches here (the streak branch), so
-                        // a watch-ending `RecoveryRequired` names a FRESH
-                        // strand this op armed by executing and failing
-                        // mid-write. Only a plain legal rejection (no marker,
-                        // no damage, no recovery arm) provably left nothing
-                        // and resolves with no interrupt.
-                        let mut interrupt_judged: Option<(ReconcileOutcome, &'static str)> = None;
-                        let mut watch_resolved = false;
                         // One damage snapshot for the WHOLE failure handling:
                         // persisted-damage consumption counts through
                         // suspension by design, so a post-resolution read of
@@ -5881,93 +5874,6 @@ impl UniverseScenario<RustResources> for Scenario {
                         // below.
                         let damaged_now = failing.as_ref().map(|f| f.damage_events()).unwrap_or(0)
                             > damage_before;
-                        if let Some(watch) = keep_serving_watch.take() {
-                            let err_text = format!("{err:?}");
-                            let uncertain = matches!(&err, OmniError::RecoveryRequired { .. })
-                                || err_text.contains(FAULT_MARKER)
-                                || err_text.contains(ACK_LOSS_MARKER)
-                                || damaged_now;
-                            let interrupt = WatchInterrupt {
-                                wop: &wop,
-                                applied: false,
-                            };
-                            let (new_db, ruling) = Box::pin(resolve_keep_serving_watch(
-                                db,
-                                storage.clone(),
-                                root,
-                                failing.as_deref(),
-                                &mut world,
-                                &mut reconcile_verdicts,
-                                &mut known_issues,
-                                &format!("{KEEP_SERVING_INTERRUPTED_PREFIX}op{i}"),
-                                watch,
-                                uncertain.then_some(&interrupt),
-                            ))
-                            .await;
-                            db = new_db;
-                            interrupt_judged = ruling;
-                            watch_resolved = true;
-                            heads_before.clear();
-                        }
-                        // Stale-capture rule on
-                        // [`resolve_keep_serving_watch`]: re-derive the
-                        // merge prediction from the post-ruling model for
-                        // every judgment of THIS op below — only when the
-                        // resolution did NOT judge this op. A judged
-                        // interrupt's fate is final (exactly-once contract
-                        // on [`WatchRuling::e_outcome`]): every judgment
-                        // below legalizes a judged interrupt before the
-                        // merge-conflict member reads the flag (typed
-                        // `RecoveryRequired`, marked, or damage-attributed
-                        // failures), and the ruling's world already
-                        // holds the op's OWN effect, so re-predicting a
-                        // `BranchMerge` the ruling folded would meet the
-                        // merge-and-close sentinel in
-                        // `expects_merge_conflict` (specimen seed 24, op10:
-                        // the interrupting op is the merge, matched `E+A`).
-                        let expected_conflict = if watch_resolved && interrupt_judged.is_none() {
-                            expects_merge_conflict(&world, &wop)
-                        } else {
-                            expected_conflict
-                        };
-                        // Fresh watch: this failure names a pending recovery
-                        // operation nothing is watching yet — defer its
-                        // reconcile and start counting. The budget check runs
-                        // here too, so `keep_serving_ops: 1` fires on the
-                        // FIRST refusal as the field doc promises. Skipped
-                        // when an interrupt-resolution just judged this op:
-                        // its strand was healed by that resolution's reopen,
-                        // so no pending operation is left to watch, and a
-                        // fresh watch would re-judge a judged op — the
-                        // exactly-once contract on [`WatchRuling::e_outcome`].
-                        if interrupt_judged.is_none()
-                            && sc.keep_serving_ops > 0
-                            && let OmniError::RecoveryRequired { operation_id, .. } = &err
-                        {
-                            let watch = KeepServingWatch {
-                                operation_id: operation_id.clone(),
-                                first_op: i,
-                                streak: 1,
-                                deferred_wop: wop.clone(),
-                            };
-                            if watch.streak >= sc.keep_serving_ops {
-                                detectors::violation(
-                                    DET_LIVE_WRITE_AVAILABILITY,
-                                    i,
-                                    format!(
-                                        "writes wedged on pending recovery operation {}: \
-                                             refused on first contact with a keep-serving budget \
-                                             of {}, reopen deferred",
-                                        watch.operation_id, sc.keep_serving_ops
-                                    ),
-                                    Oracle::LiveWriteAvailability.doc(),
-                                );
-                            }
-                            known_issues.push(keep_serving_defer_row(i, operation_id));
-                            keep_serving_watch = Some(watch);
-                            legal_rejections += 1;
-                            continue;
-                        }
                         // attributed detection: this op's reads
                         // crossed the damage ledger, so its (engine-born,
                         // unmarked) failure is the detection half of the
@@ -5982,19 +5888,12 @@ impl UniverseScenario<RustResources> for Scenario {
                             let snippet: String = text.chars().take(240).collect();
                             corruption_detections.push(format!("op{i} {wop:?}: {snippet}"));
                         }
-                        // Call-site catalog extension by VARIANT: a
-                        // watch-ending `RecoveryRequired` the resolution just
-                        // judged is legal per se — relying on the engine
-                        // embedding its cause's marker text into the error
-                        // would couple legality to message formatting. With
-                        // `keep_serving_ops: 0` a typed `RecoveryRequired`
-                        // reaching this check reds — a correct tripwire: no
-                        // v1-shaped universe can produce one here (every
-                        // failure reconciles in its own iteration).
-                        let judged_recovery_refusal = interrupt_judged.is_some()
-                            && matches!(&err, OmniError::RecoveryRequired { .. });
+                        // A typed `RecoveryRequired` reaching this check
+                        // reds — a correct tripwire: no v1-shaped universe
+                        // can produce one (every failure reconciles in its
+                        // own iteration, and no workload writer arms a
+                        // recovery operation).
                         if !(damaged_now
-                            || judged_recovery_refusal
                             || is_legal_rejection(&err, &world, &wop, expected_conflict))
                         {
                             detectors::violation(
@@ -6005,18 +5904,35 @@ impl UniverseScenario<RustResources> for Scenario {
                             );
                         }
                         legal_rejections += 1;
-                        // Tag known-defect encounters
-                        // with their tracking references.
-                        if is_recovery_barrier_rejection(&wop, &err) {
-                            known_issues.push(format!("reopen-heals-barrier@op{i}"));
+                        let failed_cleanup = matches!(
+                            &wop,
+                            WorldOp::Data {
+                                op: Op::Cleanup,
+                                ..
+                            }
+                        );
+                        if failed_cleanup {
+                            if let Some(f) = &failing {
+                                f.suspend();
+                            }
+                            crate::cost::set_label("_verify");
+                            assert_collector_images(&db, &cleanup_images, i).await;
+                            assert_collector_paths(
+                                cleanup_paths.as_ref().expect("Cleanup captured paths"),
+                                i,
+                            )
+                            .await;
+                            crate::cost::set_label(&crate::cost::debug_head(&wop));
+                            if let Some(f) = &failing {
+                                f.resume();
+                            }
                         }
                         let mut retry_effect = RetryEffect::None;
-                        if interrupt_judged.is_none()
-                            && format!("{err:?}").contains(ACK_LOSS_MARKER)
+                        if format!("{err:?}").contains(ACK_LOSS_MARKER)
                             && sc.faults.as_ref().is_some_and(|p| p.client_retry)
                         {
                             client_retries += 1;
-                            let retry = Box::pin(exec_world_op(&mut db, &wop)).await;
+                            let retry = Box::pin(exec_world_op(&db, &wop)).await;
                             if let Err(retry_err) = &retry
                                 && !(matches!(retry_err, OmniError::RecoveryRequired { .. })
                                     || is_legal_rejection(
@@ -6042,19 +5958,10 @@ impl UniverseScenario<RustResources> for Scenario {
                         // two-picture arbitration can decide Applied vs
                         // NotApplied (silently assuming "failed ⇒
                         // invisible" was v0's original bug).
-                        // Row context is honest provenance: a judged
-                        // interrupt records as `watch-interrupt@` — its
-                        // failure need not be an injected fault (a fresh
-                        // different-id `RecoveryRequired` is engine-born).
                         let fault_verdict: Option<(ReconcileOutcome, &'static str, &'static str)> =
-                            if let Some((outcome, channel)) = interrupt_judged {
-                                // Exactly-once contract on
-                                // [`WatchRuling::e_outcome`] — row only.
-                                Some((outcome, channel, "watch-interrupt"))
-                            } else if format!("{err:?}").contains(FAULT_MARKER)
+                            if format!("{err:?}").contains(FAULT_MARKER)
                                 || format!("{err:?}").contains(ACK_LOSS_MARKER)
                                 || damaged_now
-                                || is_recovery_barrier_rejection(&wop, &err)
                             {
                                 // The engine arms recovery and bars
                                 // writes until reopen — behave like a real client.
@@ -6075,10 +5982,14 @@ impl UniverseScenario<RustResources> for Scenario {
                                         retry: retry_effect,
                                         recovery_crash: None,
                                         heads_before: &heads_before,
+                                        keep_handle: sc.keep_handle,
                                     },
                                 ))
                                 .await;
                                 db = new_db;
+                                if !sc.keep_handle {
+                                    reopens += 1;
+                                }
                                 if let Some(f) = &failing {
                                     f.resume();
                                 }
@@ -6087,6 +5998,31 @@ impl UniverseScenario<RustResources> for Scenario {
                             } else {
                                 None
                             };
+                        if failed_cleanup && op_targets_live(&world, &wop) {
+                            if let Some(f) = &failing {
+                                f.suspend();
+                            }
+                            let ran = Box::pin(maintenance_obligations(
+                                &db,
+                                &world,
+                                &wop,
+                                &format!("fault@op{i}"),
+                                i,
+                                sc.fail_maintenance_rerun,
+                                CleanupEvidence {
+                                    images: &cleanup_images,
+                                    paths: cleanup_paths.as_ref(),
+                                },
+                            ))
+                            .await;
+                            if ran {
+                                maintenance_reruns += 1;
+                                history_verified_from = history.len().saturating_sub(1);
+                            }
+                            if let Some(f) = &failing {
+                                f.resume();
+                            }
+                        }
                         if let Some((outcome, channel, context)) = fault_verdict {
                             reconcile_verdicts.push((
                                 format!("{context}@op{i}"),
@@ -6197,29 +6133,9 @@ impl UniverseScenario<RustResources> for Scenario {
             }
         }
 
-        // A watch outliving the op loop (the wedge stayed under the budget)
-        // resolves before the closing oracles, so the final audit never
-        // inherits an unjudged pending operation — deferral contract on
-        // [`resolve_keep_serving_watch`]. No interrupt: no op is in flight
-        // at loop end. Closing traffic: its reopen and reads bill to
-        // `_close`, never the last op's row.
+        // Closing traffic: its reads bill to `_close`, never the last op's
+        // row.
         crate::cost::set_label("_close");
-        if let Some(watch) = keep_serving_watch.take() {
-            let (new_db, _) = Box::pin(resolve_keep_serving_watch(
-                db,
-                storage.clone(),
-                root,
-                failing.as_deref(),
-                &mut world,
-                &mut reconcile_verdicts,
-                &mut known_issues,
-                KEEP_SERVING_EXPIRED_PREFIX,
-                watch,
-                None,
-            ))
-            .await;
-            db = new_db;
-        }
 
         // Closing oracle phase runs on clean storage — under its own cost
         // label, so the loop's final op row never absorbs the closing
@@ -6259,38 +6175,8 @@ impl UniverseScenario<RustResources> for Scenario {
                 "convergence completes within the 120 s real-clock bound",
             ),
         };
-        // FIRST-CONTACT FINDING of the corruption axis
-        // (2026-08-13, seed 97): a FOREIGN-NAMED sidecar permanently blocks
-        // maintenance — the recovery BARRIER parses the file's CONTENT
-        // (pending Mutation, op id) via directory listing, but the HEALER
-        // deletes `sidecar_uri(root, operation_id)` — the canonical path
-        // reconstructed from the op id (recovery.rs:7995), NOT the listed
-        // file's actual path — so the dstm- file is re-"healed" every
-        // reopen yet never removed, and the typed RecoveryRequired remedy
-        // ("reopen") provably does not clear it. Named carve-out: tolerate
-        // + record ONLY when the barrier names a foreign sidecar's op and
-        // foreign damage was injected; every other failure still panics.
         if let Err(err) = lively {
-            let text = format!("{err:?}");
-            let foreign_injected = failing
-                .as_ref()
-                .map(|f| {
-                    f.persisted_damage_snapshot()
-                        .values()
-                        .any(|v| *v == "misdirect-target")
-                })
-                .unwrap_or(false);
-            assert!(
-                foreign_injected && text.contains("RecoveryRequired"),
-                "ensure_indices in-universe: {err:?}"
-            );
-            FOREIGN_SIDECAR_ROWS.lock().unwrap().push(format!(
-                "s11b-foreign-sidecar-blocks-maintenance@final-audit: {}",
-                text.replace(root, "<root>")
-                    .chars()
-                    .take(160)
-                    .collect::<String>()
-            ));
+            panic!("ensure_indices in-universe: {err:?}");
         }
         // closing capture — the loop's final op plus the closing
         // ensure_indices' own commit, if it made one.
@@ -6320,9 +6206,14 @@ impl UniverseScenario<RustResources> for Scenario {
         // Durability + full oracle through a FRESH read-write handle.
         crate::cost::set_label("_audit");
         drop(db);
-        let db = Omnigraph::open_with_storage(root, storage.clone())
-            .await
-            .expect("final reopen");
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::open_with_storage(root, storage.clone())
+                    .await
+                    .expect("final reopen"),
+            ),
+            SessionSettings::default(),
+        );
         detectors::tagged(
             DET_WORLD,
             sc.ops,
@@ -6336,7 +6227,6 @@ impl UniverseScenario<RustResources> for Scenario {
         // Persisted tier: injected residue must ALSO heal on this reopen — the
         // message names the injected verb when the survivor is attributed.
         let final_residue = recovery_residue(&storage, root).await;
-        let final_residue = partition_residue(final_residue, root, "final audit");
         if !final_residue.is_empty() {
             let ledger = failing
                 .as_ref()
@@ -6363,6 +6253,7 @@ impl UniverseScenario<RustResources> for Scenario {
             Box::pin(assert_physical_matches(&db, &world, "final reopen")),
         )
         .await;
+        assert_collector_invariants(&db, sc.ops, false, false).await;
         // both Expand modes + the bound arm, every branch.
         detectors::tagged(
             DET_TRAVERSAL,
@@ -6412,9 +6303,14 @@ impl UniverseScenario<RustResources> for Scenario {
 
         // Query-channel variant: the READ-ONLY open path must agree (main;
         // branch reads through the read-only path are a candidate widening).
-        let ro = Omnigraph::open_read_only_with_storage(root, storage)
-            .await
-            .expect("read-only reopen");
+        let ro = Session::from_defaults(
+            Arc::new(
+                Omnigraph::open_read_only_with_storage(root, storage)
+                    .await
+                    .expect("read-only reopen"),
+            ),
+            SessionSettings::default(),
+        );
         detectors::tagged(
             DET_RO_AUDIT,
             sc.ops,
@@ -6460,8 +6356,8 @@ impl UniverseScenario<RustResources> for Scenario {
             }
         }
 
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
+        omnigraph::dst_clock::CLOCK.clear();
+        omnigraph::dst_ids::IDS.clear();
         crate::lance_faults::set_active(None);
         crate::lance_faults::set_kill(None);
         // WRITE CENSUS bottom listings: with weather and kill cleared,
@@ -6479,6 +6375,10 @@ impl UniverseScenario<RustResources> for Scenario {
         let lance_realm_injected = lance_faults_state
             .as_ref()
             .map(|s| s.injected())
+            .unwrap_or(0);
+        let lance_acks_lost = lance_faults_state
+            .as_ref()
+            .map(|s| s.acks_lost())
             .unwrap_or(0);
         let writes_observed = kill_state
             .as_ref()
@@ -6499,11 +6399,12 @@ impl UniverseScenario<RustResources> for Scenario {
             .as_ref()
             .map(|f| f.persisted_consumed())
             .unwrap_or(0);
+        let persisted_consumed_reads = failing
+            .as_ref()
+            .map(|f| f.persisted_consumed_reads(root))
+            .unwrap_or_default();
         let stale_reads_served = failing.as_ref().map(|f| f.stale_reads_count()).unwrap_or(0);
         let stale_lists_served = failing.as_ref().map(|f| f.stale_lists_count()).unwrap_or(0);
-        // Persisted tier: drain the foreign-sidecar carve-out rows into the
-        // known-issues column (insertion order — deterministic).
-        known_issues.extend(FOREIGN_SIDECAR_ROWS.lock().unwrap().drain(..));
         UniverseReport {
             end_state: world.main.person_rows(),
             edges: world.main.edge_pairs(),
@@ -6524,6 +6425,9 @@ impl UniverseScenario<RustResources> for Scenario {
             writes_observed,
             crash_state_hit,
             acks_lost,
+            lance_acks_lost,
+            schema_applies,
+            reopens,
             client_retries,
             maintenance_reruns,
             reads_corrupted,
@@ -6534,6 +6438,7 @@ impl UniverseScenario<RustResources> for Scenario {
             writes_lost,
             writes_misdirected,
             persisted_consumed,
+            persisted_consumed_reads,
             attributed_residue,
             reconcile_verdicts,
             known_issues,
@@ -6583,6 +6488,92 @@ mod corruption_verb_tests {
     fn mutations_are_deterministic() {
         assert_eq!(bit_rot_text("abcdef", 3), bit_rot_text("abcdef", 3));
         assert_eq!(truncate_text("abcdef", 3), truncate_text("abcdef", 3));
+    }
+
+    #[test]
+    fn put_row_admits_only_hook_actions() {
+        let row = crate::store_places::store_place("storage.put").expect("put row");
+        for action in row.admitted {
+            assert!(
+                super::FailingStorage::PUT_HOOK_ACTIONS.contains(action),
+                "{}",
+                action.as_str()
+            );
+        }
+    }
+
+    /// Every `(place, admitted action)` pair the table offers a case is driven
+    /// through the real hooks, so a pair the row admits and no hook applies is
+    /// a red test rather than a case that silently never delivers.
+    #[tokio::test]
+    async fn every_admitted_action_lands_through_its_hooks() {
+        use std::sync::Arc;
+
+        use omnigraph::storage::{ObjectStorageAdapter, StorageAdapter};
+
+        use crate::store_places::{STORE_PLACES, StoreAction, Subject, TargetedRule};
+
+        let root = "shared-memory://dst-admitted-actions/graph";
+        for row in STORE_PLACES {
+            for action in row.admitted {
+                let base = Arc::new(ObjectStorageAdapter::in_memory());
+                let inner: Arc<dyn StorageAdapter> = base.clone();
+                let storage = super::FailingStorage::quiet(inner, root.to_string());
+                for method in row.methods {
+                    storage.targets().install_rule(TargetedRule::new(
+                        row.place,
+                        Subject::parse("**").expect("glob"),
+                        1,
+                        *action,
+                    ));
+                    let uri = format!("{root}/__recovery/{method}.json");
+                    let text = format!("text-{method}");
+                    let absent = format!("absent-{method}");
+                    match *method {
+                        "write_text" => storage.write_text(&uri, &text).await.expect("write_text"),
+                        "write_bytes" => storage
+                            .write_bytes(&uri, b"bytes")
+                            .await
+                            .expect("write_bytes"),
+                        "write_text_if_absent" => assert!(
+                            storage
+                                .write_text_if_absent(&uri, &absent)
+                                .await
+                                .expect("write_text_if_absent")
+                        ),
+                        other => unreachable!(
+                            "{} admits {} but {other} has no call here",
+                            row.name,
+                            action.as_str()
+                        ),
+                    }
+                    let hits = storage.targets().clear().hits;
+                    let label = format!("{} {} {method}", row.name, action.as_str());
+                    assert_eq!(hits.len(), 1, "{label}");
+                    assert!(hits[0].landed, "{label}");
+                    assert_eq!(hits[0].action, *action, "{label}");
+                    assert_eq!(hits[0].method, *method, "{label}");
+                    if *action == StoreAction::Misdirect {
+                        let stored = super::misdirect_uri(&uri);
+                        assert!(!base.exists(&uri).await.expect("exists"), "{label}");
+                        assert!(base.exists(&stored).await.expect("exists"), "{label}");
+                        match *method {
+                            "write_text" => assert_eq!(
+                                base.read_text(&stored).await.expect("read_text"),
+                                text,
+                                "{label}"
+                            ),
+                            "write_text_if_absent" => assert_eq!(
+                                base.read_text(&stored).await.expect("read_text"),
+                                absent,
+                                "{label}"
+                            ),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -6765,5 +6756,349 @@ mod retry_tests {
             .expect("lost insertion must report a detector violation");
         assert_eq!(violation.detector, super::DET_CRASH_CONTRACT);
         assert_eq!(retry.edge_outcome(&twice, &absent, &once, &twice), None);
+    }
+}
+
+#[cfg(test)]
+mod history_schema_tests {
+    use super::*;
+    use futures::FutureExt;
+
+    struct HistorySchemaFixture;
+
+    impl UniverseScenario<MemoryStorage> for HistorySchemaFixture {
+        type Output = ();
+
+        async fn run(&self, resources: &mut MemoryStorage, _seed: u64) {
+            let db = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::init_with_storage(
+                        &resources.root,
+                        TEST_SCHEMA,
+                        resources.adapter.clone(),
+                        InitOptions::default(),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+                SessionSettings::default(),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            let mut world = WorldModel::default();
+            for (name, age, ver) in person_rows(&db).await {
+                world.main.persons.insert(name, (age, ver));
+            }
+            for pair in knows_pairs(&db).await {
+                world.add_edge_row("main", pair);
+            }
+            let mut history = Vec::new();
+            capture_history(&db, &world.main, &mut history).await;
+            db.apply_schema(&schema_with_extras(1)).await.unwrap();
+            world.main.schema_extras = 1;
+            capture_history(&db, &world.main, &mut history).await;
+            assert_eq!(
+                history.len(),
+                2,
+                "schema publication must advance recorded history"
+            );
+            assert_history_matches(&db, &history, "accepted schema transition").await;
+
+            let mut wrong_epoch = history.clone();
+            wrong_epoch[1].1.schema_extras = 0;
+            let rejected = std::panic::AssertUnwindSafe(assert_history_matches(
+                &db,
+                &wrong_epoch,
+                "missing schema transition",
+            ))
+            .catch_unwind()
+            .await;
+            assert!(
+                rejected.is_err(),
+                "a typed boundary without model evidence must fail"
+            );
+
+            db.branch_create("blocks-schema").await.unwrap();
+            assert!(db.apply_schema(&schema_with_extras(2)).await.is_err());
+            assert_eq!(
+                schema_apply_outcome(1, 2, &db.schema_source()),
+                Some(ReconcileOutcome::NotApplied),
+                "equal rows cannot turn a rejected schema attempt into accepted history"
+            );
+            db.branch_delete("blocks-schema").await.unwrap();
+            db.load_jsonl(
+                r#"{"type":"Person","data":{"name":"after-schema","age":61,"ver":7}}"#,
+                LoadMode::Merge,
+            )
+            .await
+            .unwrap();
+            world.main.persons.insert("after-schema".into(), (61, 7));
+            capture_history(&db, &world.main, &mut history).await;
+            assert_history_matches(&db, &history, "same-schema write after rejection").await;
+            assert_eq!(schema_apply_outcome(1, 2, &schema_with_extras(3)), None);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn history_accepts_only_proven_schema_boundaries() {
+        let environment = MemoryEnvironment::new(
+            "shared-memory://dst-history-schema-boundary",
+            22_940,
+            UniverseProcess::Shared,
+        );
+        let run = crate::environment::run_universe(&environment, &HistorySchemaFixture);
+        run.cleanup.unwrap().unwrap();
+        run.result.unwrap().unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "failpoints"))]
+mod collector_oracle_tests {
+    use super::*;
+    use futures::{FutureExt, TryStreamExt};
+    use lance_io::object_store::ObjectStoreParams;
+    use lance_io::object_store::ObjectStoreProvider;
+    use lance_io::object_store::providers::shared_memory::SharedMemoryStoreProvider;
+    use object_store::ObjectStoreExt;
+    use object_store::path::Path;
+    use url::Url;
+
+    async fn objects(store: &dyn object_store::ObjectStore) -> BTreeMap<Path, bytes::Bytes> {
+        let mut objects = BTreeMap::new();
+        for meta in store.list(None).try_collect::<Vec<_>>().await.unwrap() {
+            objects.insert(
+                meta.location.clone(),
+                store
+                    .get(&meta.location)
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap(),
+            );
+        }
+        objects
+    }
+
+    async fn fixture(resources: &MemoryStorage) -> (Session, WorldModel) {
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            ),
+            SessionSettings::default(),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+        let mut world = WorldModel::default();
+        for (name, age, ver) in person_rows(&db).await {
+            world.main.persons.insert(name, (age, ver));
+        }
+        for pair in knows_pairs(&db).await {
+            world.add_edge_row("main", pair);
+        }
+        (db, world)
+    }
+
+    struct CollectorFixture {
+        saved_base: bool,
+    }
+
+    impl UniverseScenario<MemoryStorage> for CollectorFixture {
+        type Output = ();
+
+        async fn run(&self, resources: &mut MemoryStorage, _seed: u64) {
+            let (db, mut world) = fixture(resources).await;
+            let store = SharedMemoryStoreProvider::default()
+                .new_store(
+                    Url::parse(&resources.root).unwrap(),
+                    &ObjectStoreParams::default(),
+                )
+                .await
+                .unwrap()
+                .inner;
+            if self.saved_base {
+                let head = db.resolve_snapshot("main").await.unwrap().to_string();
+                let images = vec![(head, world.main.clone())];
+                let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+                let table = snapshot
+                    .dataset("node:Person")
+                    .unwrap()
+                    .dataset_path
+                    .clone();
+                let initial = objects(store.as_ref()).await;
+                let base_manifests: Vec<_> = initial
+                    .keys()
+                    .filter(|path| {
+                        path.as_ref().contains(&format!("{table}/_versions/d"))
+                            && path.as_ref().ends_with(".manifest")
+                    })
+                    .cloned()
+                    .collect();
+                assert_eq!(
+                    base_manifests.len(),
+                    1,
+                    "fixture captures its actual Person base manifest"
+                );
+                let create = WorldOp::BranchCreate {
+                    name: "saved-base".into(),
+                };
+                exec_world_op(&db, &create).await.unwrap();
+                apply_world(&mut world, &create);
+                for branch in ["main", "saved-base"] {
+                    let op = WorldOp::Data {
+                        branch: branch.into(),
+                        op: Op::InsertV {
+                            name: format!("new-{branch}"),
+                            age: 41,
+                            ver: 9,
+                        },
+                    };
+                    exec_world_op(&db, &op).await.unwrap();
+                    apply_world(&mut world, &op);
+                }
+                exec_op(&db, "main", &Op::Cleanup).await.unwrap();
+                assert_collector_images(&db, &images, 0).await;
+                store.delete(&base_manifests[0]).await.unwrap();
+                drop(db);
+                let fresh = Session::from_defaults(
+                    Arc::new(
+                        Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                            .await
+                            .unwrap(),
+                    ),
+                    SessionSettings::default(),
+                );
+                assert_world_matches(&fresh, &world, "current tips survive seeded base loss").await;
+                let red = std::panic::AssertUnwindSafe(assert_collector_images(&fresh, &images, 0))
+                    .catch_unwind()
+                    .await;
+                assert!(
+                    red.is_err(),
+                    "saved-base oracle must catch loss outside readable current tips"
+                );
+                return;
+            }
+
+            let before = objects(store.as_ref()).await;
+            {
+                let _fp = omnigraph::seams::catalog::MUTATION_POST_TABLE_COMMIT.fail_once_at(1);
+                assert!(
+                    exec_op(
+                        &db,
+                        "main",
+                        &Op::InsertV {
+                            name: "stranded".into(),
+                            age: 30,
+                            ver: 1,
+                        }
+                    )
+                    .await
+                    .is_err()
+                );
+            }
+            let staged: BTreeMap<_, _> = objects(store.as_ref())
+                .await
+                .into_iter()
+                .filter(|(path, _)| !before.contains_key(path))
+                .collect();
+            let staged_manifests: Vec<_> = staged
+                .keys()
+                .filter(|path| {
+                    path.as_ref().contains("/_versions/d") && path.as_ref().ends_with(".manifest")
+                })
+                .cloned()
+                .collect();
+            assert!(
+                !staged_manifests.is_empty(),
+                "real interrupted write must strand a manifest"
+            );
+            exec_op(&db, "main", &Op::Cleanup).await.unwrap();
+            assert_collector_invariants(&db, 0, true, false).await;
+            for path in &staged_manifests {
+                assert!(store.head(path).await.is_ok(), "live staging retained");
+            }
+            exec_op(
+                &db,
+                "main",
+                &Op::InsertV {
+                    name: "advanced".into(),
+                    age: 31,
+                    ver: 2,
+                },
+            )
+            .await
+            .unwrap();
+            exec_op(&db, "main", &Op::Cleanup).await.unwrap();
+            let mut removed = Vec::new();
+            for (path, bytes) in &staged {
+                if store.head(path).await.is_err() {
+                    removed.push(path.clone());
+                    store.put(path, bytes.clone().into()).await.unwrap();
+                }
+            }
+            assert!(
+                removed.iter().any(|path| path.as_ref().contains("/data/")),
+                "cleanup reclaimed unique staged payload"
+            );
+            let report = db
+                .cleanup_plan(omnigraph::db::CleanupPolicyOptions {
+                    keep_versions: Some(1),
+                    older_than: None,
+                })
+                .await
+                .unwrap();
+            assert!(
+                report
+                    .tables
+                    .iter()
+                    .all(|plan| plan.would_remove().is_empty()),
+                "seeded leak is only dead staging"
+            );
+            assert!(
+                report
+                    .tables
+                    .iter()
+                    .any(|plan| !plan.dead_stagings().is_empty())
+            );
+            let red =
+                std::panic::AssertUnwindSafe(assert_collector_invariants(&db, 0, true, false))
+                    .catch_unwind()
+                    .await;
+            assert!(
+                red.is_err(),
+                "dead staging alone must redden the progress oracle"
+            );
+            exec_op(&db, "main", &Op::Cleanup).await.unwrap();
+            assert_collector_invariants(&db, 0, true, false).await;
+            for path in &removed {
+                assert!(
+                    store.head(path).await.is_err(),
+                    "retry removes seeded leak: {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn collector_oracle_rejects_dead_staging_leak_and_saved_base_loss() {
+        let _scenario = omnigraph::seams::FailScenario::setup();
+        for saved_base in [false, true] {
+            let environment = MemoryEnvironment::new(
+                format!("shared-memory://dst-collector-oracle-{saved_base}"),
+                22_913,
+                UniverseProcess::Shared,
+            );
+            let run =
+                crate::environment::run_universe(&environment, &CollectorFixture { saved_base });
+            run.cleanup.unwrap().unwrap();
+            run.result.unwrap().unwrap();
+        }
     }
 }

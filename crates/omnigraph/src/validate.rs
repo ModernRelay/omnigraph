@@ -26,7 +26,7 @@
 use std::collections::{HashMap, HashSet};
 
 use arrow_array::{Array, RecordBatch, StringArray};
-use datafusion::prelude::{Expr, col, lit};
+use datafusion::prelude::{Expr, col, ident, lit};
 use datafusion::scalar::ScalarValue;
 use futures::TryStreamExt;
 use lance::Dataset;
@@ -358,8 +358,8 @@ impl<'a> CommittedState<'a> {
     /// graph-branch snapshot on the write path (so a concurrent published edge
     /// is counted — #298), the pinned committed snapshot otherwise. Resolving
     /// through the fresh graph snapshot is load-bearing for first-touch named
-    /// branches: their table still inherits another Lance ref until this write's
-    /// sidecar is armed, so opening the target ref directly would be invalid.
+    /// branches: their table still inherits another Lance ref until this write
+    /// forks it, so opening the target ref directly would be invalid.
     async fn open_cardinality(&self, table_key: &str) -> Result<Option<Dataset>> {
         if self.overwritten.contains(table_key) {
             return Ok(None);
@@ -467,7 +467,7 @@ impl<'a> CommittedState<'a> {
                     .filter(|(canonical, _)| seen.insert(canonical[i].as_str()))
                     .map(|(_, typed)| lit(typed[i].clone()))
                     .collect();
-                let in_list = col(column.as_str()).in_list(values, false);
+                let in_list = ident(column.as_str()).in_list(values, false);
                 expr = Some(match expr {
                     Some(acc) => acc.and(in_list),
                     None => in_list,

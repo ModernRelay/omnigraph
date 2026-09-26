@@ -31,22 +31,37 @@ use lance::index::DatasetIndexExt;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
+use omnigraph::Session;
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget, Snapshot, SnapshotDataset};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
 use sha2::{Digest as _, Sha256};
 
 use super::{Args, rfc023_limits, seeded_vector};
 
 const SMALL_UPSERT_ROWS: usize = 32;
 
-/// Age is setup work for these two existing fixture families only.
+/// The measured merge children's settings: the process defaults every door
+/// reads, so `OMNIGRAPH_MERGE_LINEAGE` selects the classifier and any other
+/// value is refused with the reader's message before the fixture opens.
+fn measured_settings() -> SessionSettings {
+    match omnigraph::settings::from_env() {
+        Ok((settings, _)) => settings,
+        Err(error) => panic!("process settings: {error}"),
+    }
+}
+
+/// Age is setup work for these fixture families only.
 pub(super) fn validate_fixture_age(args: &Args) -> Result<(), String> {
     let supported = super::branch_control::is_scenario(&args.scenario)
-        || args.scenario == "general-merge-updates";
+        || args.scenario == "general-merge-updates"
+        || super::concurrent_writes::is_scenario(&args.scenario);
     if args.age_options_supplied && !supported {
         return Err(
-            "age/cache/layout controls require branch controls or general-merge-updates".into(),
+            "age/cache/layout controls require branch controls, general-merge-updates or \
+             concurrent-writes"
+                .into(),
         );
     }
     if args.history_commits > 256 || !args.history_commits.is_multiple_of(2) {
@@ -501,7 +516,7 @@ pub(super) fn graph_jsonl_chunk(
 /// Add current-format history without changing the logical base fixture.
 /// Each pair writes a different first-row vector and restores the exact base
 /// vector. Branch churn is separate: its commits are retired, not main ancestry.
-pub(super) async fn age_fixture(db: &Omnigraph, args: &Args) -> serde_json::Value {
+pub(super) async fn age_fixture(db: &Session, args: &Args) -> serde_json::Value {
     let started = Instant::now();
     let before = db
         .list_commits(None)
@@ -668,7 +683,7 @@ pub(super) fn operation_io_metrics(io: &super::helpers::cost::IoCounts) -> serde
 }
 
 pub(super) async fn load_graph_rows(
-    db: &Omnigraph,
+    db: &Session,
     branch: &str,
     prefix: &str,
     rows: usize,
@@ -774,9 +789,14 @@ pub(super) async fn fenced_adopt_setup(args: &Args) -> serde_json::Value {
     let uri = root.to_str().expect("UTF-8 benchmark fixture root");
 
     let init_start = Instant::now();
-    let db = Omnigraph::init(uri, &graph_schema(args.dims))
-        .await
-        .expect("initialize production RFC-023 benchmark graph");
+    let db = Session::from_defaults(
+        std::sync::Arc::new(
+            Omnigraph::init(uri, &graph_schema(args.dims))
+                .await
+                .expect("initialize production RFC-023 benchmark graph"),
+        ),
+        SessionSettings::default(),
+    );
     let init_ms = init_start.elapsed().as_millis() as u64;
 
     let target_vectors = vector_json_patterns(args.dims, args.seed);
@@ -1045,15 +1065,12 @@ fn merge_phase_metrics(probes: &MergeWriteProbes) -> serde_json::Value {
         "proven_insert_plan_scan": probes.proven_insert_plan_scan_us(),
         "candidate_validation": probes.candidate_validation_us(),
         "final_revalidation": probes.final_revalidation_us(),
-        "recovery_arm": probes.recovery_arm_us(),
         "physical_publish": probes.physical_publish_us(),
         "keyed_stage_total": probes.keyed_stage_total_us(),
         "keyed_stage_max": probes.keyed_stage_max_us(),
         "keyed_commit_total": probes.keyed_commit_total_us(),
         "keyed_commit_max": probes.keyed_commit_max_us(),
-        "recovery_confirm": probes.recovery_confirm_us(),
         "manifest_publish": probes.manifest_publish_us(),
-        "recovery_cleanup": probes.recovery_cleanup_us(),
         "outer_restore_refresh": probes.outer_restore_refresh_us(),
     })
 }
@@ -1066,12 +1083,18 @@ fn merge_phase_metrics(probes: &MergeWriteProbes) -> serde_json::Value {
 /// operation. The immediate post-operation HWM is captured before route
 /// assertions and no final-state scan runs in this process.
 pub(super) async fn fenced_adopt_operation(args: &Args) -> serde_json::Value {
+    let settings = measured_settings();
     let root = adopt_fixture_root(args);
     let uri = root.to_str().expect("UTF-8 benchmark fixture root");
     let open_start = Instant::now();
-    let db = Omnigraph::open(uri)
-        .await
-        .expect("fresh-open phased RFC-023 benchmark fixture");
+    let db = Session::from_defaults(
+        std::sync::Arc::new(
+            Omnigraph::open(uri)
+                .await
+                .expect("fresh-open phased RFC-023 benchmark fixture"),
+        ),
+        settings,
+    );
     let table_uri = only_node_table_uri(root);
     // Both arms resolve physical source identity before the timer/HWM boundary.
     // This is preparation, not a final-state verification scan.
@@ -1162,6 +1185,7 @@ pub(super) async fn fenced_adopt_operation(args: &Args) -> serde_json::Value {
 
     serde_json::json!({
         "routing": "production-omnigraph-branch-merge",
+        "merge_lineage": db.settings().merge_lineage().as_str(),
         "measurement_boundary": "operation_wall starts after separately recorded fresh Omnigraph::open and optional metadata prewarm, and covers Omnigraph::branch_merge; no post-op scan",
         "rss_boundary": "operation child whole-process wait4 HWM includes runtime, graph open, optional metadata prewarm, merge and output; setup and final verification are separate children",
         "production_path": true,
@@ -1726,9 +1750,14 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
     let uri = root.to_str().expect("UTF-8 benchmark fixture root");
 
     let init_start = Instant::now();
-    let db = Omnigraph::init(uri, &graph_schema(args.dims))
-        .await
-        .expect("initialize general-merge benchmark graph");
+    let db = Session::from_defaults(
+        std::sync::Arc::new(
+            Omnigraph::init(uri, &graph_schema(args.dims))
+                .await
+                .expect("initialize general-merge benchmark graph"),
+        ),
+        SessionSettings::default(),
+    );
     let init_ms = init_start.elapsed().as_millis() as u64;
 
     // The committed target image.
@@ -1890,14 +1919,20 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
 /// production `branch_merge`, then records wall time plus this process's peak
 /// RSS. The parent's `wait4` peak for this child is the memory number.
 pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
+    let settings = measured_settings();
     super::helpers::cost::cost_harness(async {
     let root = general_merge_fixture_root(args);
     let uri = root.to_str().expect("UTF-8 benchmark fixture root");
     let ((db, operation_open_elapsed), open_io) = super::helpers::cost::measure(async {
     let open_start = Instant::now();
-    let db = Omnigraph::open(uri)
-        .await
-        .expect("fresh-open general-merge fixture");
+    let db = Session::from_defaults(
+        std::sync::Arc::new(
+            Omnigraph::open(uri)
+                .await
+                .expect("fresh-open general-merge fixture"),
+        ),
+        settings,
+    );
     let operation_open_elapsed = open_start.elapsed();
     (db, operation_open_elapsed)
     }).await;
@@ -1971,6 +2006,7 @@ pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
     let mut metrics = serde_json::json!({
         "routing": "production-omnigraph-branch-merge-diverged-target",
         "source_mode": args.source_mode,
+        "merge_lineage": db.settings().merge_lineage().as_str(),
         "classifier_route": classifier_route,
         "probe_completed_full_walk_classifications": full_walk_classifications,
         "probe_completed_lineage_classifications": lineage_classifications,

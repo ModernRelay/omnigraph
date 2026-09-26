@@ -25,6 +25,8 @@ use serde_json::Value as JsonValue;
 use crate::db::Omnigraph;
 use crate::error::{OmniError, Result, missing_graph_type_at_snapshot};
 use crate::exec::staging::{MutationStaging, PendingMode};
+use crate::seams::{catalog, decide_seam, fail};
+use crate::session::Session;
 use crate::storage_layer::KEYED_WRITE_MAX_BYTES;
 
 /// Result of a load operation.
@@ -81,21 +83,31 @@ enum LoadInputShape {
     StrictGraphBatch,
 }
 
-/// Convenience: load JSONL data onto the database handle's *active branch*
-/// (`main` when unbound). Equivalent to `db.load(active_branch, data, mode)`;
-/// use `Omnigraph::load`/`load_as` directly when targeting an explicit branch
-/// or when fork-from-base semantics are needed.
-pub async fn load_jsonl(db: &Omnigraph, data: &str, mode: LoadMode) -> Result<LoadResult> {
-    let current_branch = db.active_branch().await;
-    let branch = current_branch.as_deref().unwrap_or("main");
-    db.load(branch, data, mode).await
+impl Session {
+    /// Convenience: load JSONL data onto the handle's *active branch* (`main`
+    /// when unbound). Equivalent to `session.load(active_branch, data, mode)`;
+    /// use [`Session::load`]/[`Session::load_as`] directly when targeting an
+    /// explicit branch or when fork-from-base semantics are needed.
+    pub async fn load_jsonl(&self, data: &str, mode: LoadMode) -> Result<LoadResult> {
+        let current_branch = self.active_branch().await;
+        let branch = current_branch.as_deref().unwrap_or("main");
+        self.load(branch, data, mode).await
+    }
+
+    /// Convenience: like [`Session::load_jsonl`] but reading from a file path.
+    pub async fn load_jsonl_file(&self, path: &str, mode: LoadMode) -> Result<LoadResult> {
+        let current_branch = self.active_branch().await;
+        let branch = current_branch.as_deref().unwrap_or("main");
+        self.load_file(branch, path, mode).await
+    }
 }
 
-/// Convenience: like [`load_jsonl`] but reading from a file path.
-pub async fn load_jsonl_file(db: &Omnigraph, path: &str, mode: LoadMode) -> Result<LoadResult> {
-    let current_branch = db.active_branch().await;
-    let branch = current_branch.as_deref().unwrap_or("main");
-    db.load_file(branch, path, mode).await
+decide_seam! {
+    /// The implicit fork-if-missing branch
+    /// create completed durably, before any load staging byte is written.
+    /// The load "never happened" yet its target branch exists — a failed
+    /// load's surviving empty branch.
+    pub static LOAD_POST_BRANCH_CREATE_PRE_STAGE = ("load.post_branch_create_pre_stage", Unreachable, [Fail]);
 }
 
 impl Omnigraph {
@@ -115,7 +127,9 @@ impl Omnigraph {
         };
         Ok((requested, base_branch))
     }
+}
 
+impl Session {
     #[deprecated(
         note = "use `load_as` with an explicit `base` for new integrations; ingest retains its parser and branch defaults, but its result follows the current canonical vocabulary"
     )]
@@ -232,6 +246,7 @@ impl Omnigraph {
             mode,
             actor_id,
             LoadInputShape::LoaderCompatible,
+            self.settings().stage_write_concurrency(),
         )
         .await
     }
@@ -243,8 +258,8 @@ impl Omnigraph {
     /// unknown or physical fields, noncanonical supplied ids, and compatibility
     /// coercions. Omitted ids retain ordinary loader semantics: node `@key`
     /// values derive canonical ids and other entities receive generated ids. The
-    /// operation otherwise uses the same transaction, validation, recovery,
-    /// and graph-level publication path as the ordinary loader.
+    /// operation otherwise uses the same transaction, validation, and
+    /// graph-level publication path as the ordinary loader.
     pub async fn load_graph_batch_as(
         &self,
         branch: &str,
@@ -274,6 +289,7 @@ impl Omnigraph {
             mode,
             actor_id,
             LoadInputShape::StrictGraphBatch,
+            self.settings().stage_write_concurrency(),
         )
         .await
     }
@@ -289,7 +305,10 @@ impl Omnigraph {
         self.load_graph_batch_as(branch, None, data, mode, None)
             .await
     }
+}
 
+impl Omnigraph {
+    #[allow(clippy::too_many_arguments)]
     async fn load_input_as(
         &self,
         branch: &str,
@@ -298,6 +317,7 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
         input_shape: LoadInputShape,
+        stage_write_concurrency: usize,
     ) -> Result<LoadReceipt> {
         // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
         // `Branch(branch)` to match the HTTP-layer Change convention.
@@ -313,10 +333,19 @@ impl Omnigraph {
         let (requested, base_branch) = Self::normalize_load_scope(branch, base)?;
         // Keep the full load state machine off the stack of every public
         // wrapper and its callers; policy and scope checks precede allocation.
-        Box::pin(self.load_as_inner(requested, base_branch, data, mode, actor_id, input_shape))
-            .await
+        Box::pin(self.load_as_inner(
+            requested,
+            base_branch,
+            data,
+            mode,
+            actor_id,
+            input_shape,
+            stage_write_concurrency,
+        ))
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn load_as_inner(
         &self,
         requested: Option<String>,
@@ -325,17 +354,11 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
         input_shape: LoadInputShape,
+        stage_write_concurrency: usize,
     ) -> Result<LoadReceipt> {
-        // Stage A precedes both an implicit target-branch fork and data staging.
-        // The target branch and an explicit base are read/write authority for the
-        // operation, so an unresolved intent on either closes the barrier. The
-        // helper folds `Some("main")` to main's canonical `None` identity.
-        let mut recovery_branches = vec![requested.as_deref()];
-        if base_branch.is_some() {
-            recovery_branches.push(base_branch.as_deref());
-        }
-        self.heal_pending_recovery_sidecars_for_write(&recovery_branches)
-            .await?;
+        // The pending schema-contract install precedes both an implicit
+        // target-branch fork and data staging.
+        self.settle_pending_schema_install().await?;
 
         // Schema/catalog authority is captured once via the `WriteTxn` (plus its
         // cheap trailing identity-marker fence); the only second full validation
@@ -362,23 +385,30 @@ impl Omnigraph {
                 branch_created = true;
                 // DST window (loader walk D1 → D2): the implicit fork is
                 // durable, the load has not begun.
-                crate::failpoints::maybe_fail(
-                    crate::failpoints::names::LOAD_POST_BRANCH_CREATE_PRE_STAGE,
-                )?;
+                fail(&LOAD_POST_BRANCH_CREATE_PRE_STAGE)?;
             }
         }
         // Direct-to-target writes: no Run state machine, no `__run__` staging
         // branch. Cross-table OCC is enforced by the publisher's
         // `expected_table_versions` CAS inside the load attempt.
         let mut receipt = self
-            .load_direct_on_branch(requested.as_deref(), data, mode, actor_id, input_shape)
+            .load_direct_on_branch(
+                requested.as_deref(),
+                data,
+                mode,
+                actor_id,
+                input_shape,
+                stage_write_concurrency,
+            )
             .await?;
         receipt.result.branch = requested.unwrap_or_else(|| "main".to_string());
         receipt.result.base_branch = base_branch;
         receipt.result.branch_created = branch_created;
         Ok(receipt)
     }
+}
 
+impl Session {
     pub async fn load_file(&self, branch: &str, path: &str, mode: LoadMode) -> Result<LoadResult> {
         self.load_file_as(branch, None, path, mode, None).await
     }
@@ -410,7 +440,9 @@ impl Omnigraph {
         self.load_as_with_receipt(branch, base, &data, mode, actor_id)
             .await
     }
+}
 
+impl Omnigraph {
     async fn load_direct_on_branch(
         &self,
         branch: Option<&str>,
@@ -418,8 +450,18 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
         input_shape: LoadInputShape,
+        stage_write_concurrency: usize,
     ) -> Result<LoadReceipt> {
-        load_jsonl_data(self, branch, data, mode, actor_id, input_shape).await
+        load_jsonl_data(
+            self,
+            branch,
+            data,
+            mode,
+            actor_id,
+            input_shape,
+            stage_write_concurrency,
+        )
+        .await
     }
 }
 
@@ -474,6 +516,7 @@ async fn load_jsonl_data(
     mode: LoadMode,
     actor_id: Option<&str>,
     input_shape: LoadInputShape,
+    stage_write_concurrency: usize,
 ) -> Result<LoadReceipt> {
     const MAX_PRE_EFFECT_REPREPARES: usize = 32;
 
@@ -484,7 +527,17 @@ async fn load_jsonl_data(
     let retryable = matches!(mode, LoadMode::Append | LoadMode::Merge);
     for attempt in 0..=MAX_PRE_EFFECT_REPREPARES {
         let replay = BufReader::new(Cursor::new(data.as_bytes()));
-        match load_jsonl_reader_once(db, branch, replay, mode, actor_id, input_shape).await {
+        match load_jsonl_reader_once(
+            db,
+            branch,
+            replay,
+            mode,
+            actor_id,
+            input_shape,
+            stage_write_concurrency,
+        )
+        .await
+        {
             Err(err)
                 if retryable
                     && err.is_read_set_changed()
@@ -510,6 +563,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     mode: LoadMode,
     actor_id: Option<&str>,
     input_shape: LoadInputShape,
+    stage_write_concurrency: usize,
 ) -> Result<LoadReceipt> {
     // Capture the manifest/schema authority before interpreting any input. The
     // catalog rides the WriteTxn and was built from the exact accepted IR named
@@ -733,7 +787,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
             opened.full_path,
             opened.table_branch,
             opened.pinned_native_ref,
-            opened.deferred_fork,
+            opened.entry,
             opened.expected_version,
             load_op_kind,
         )?;
@@ -786,7 +840,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
             opened.full_path,
             opened.table_branch,
             opened.pinned_native_ref,
-            opened.deferred_fork,
+            opened.entry,
             opened.expected_version,
             load_op_kind,
         )?;
@@ -835,36 +889,25 @@ async fn load_jsonl_reader_once<R: BufRead>(
 
     // Phase 4: Atomic manifest commit with publisher-level OCC.
     let staged = staging
-        .stage_all_with_concurrency(db, branch, crate::exec::staging::stage_write_concurrency())
+        .stage_all_with_concurrency(db, branch, stage_write_concurrency)
         .await?;
-    crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
+    fail(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
     let lineage_intent = db.new_lineage_intent_for_branch(branch, actor_id).await?;
     // `_queue_guards` holds the root-shared schema → branch → sorted-table
     // gates across manifest publication. This closes same-process
-    // interleaving across the v3 sidecar/effect lifetime. The exact publisher
-    // token and durable sidecar remain persistent correctness authorities, but
-    // these local gates do not expand the documented single-writer-process
-    // recovery boundary.
+    // interleaving across the effect lifetime. The exact publisher token
+    // remains the persistent correctness authority; these local gates do not
+    // expand the documented single-writer-process boundary.
     let crate::exec::staging::CommittedMutation {
         updates,
         expected_versions,
-        sidecar_handle,
         guards: _queue_guards,
-    } = staged
-        .commit_all(
-            db,
-            branch,
-            crate::db::manifest::SidecarKind::Load,
-            actor_id,
-            &txn,
-            &lineage_intent,
-        )
-        .await?;
-    // Same confirmed-effects → publisher boundary as mutations: table HEADs
-    // have advanced and the v3 sidecar contains their exact transaction
-    // identities, but the graph manifest has not published the result. Reuse
-    // the mutation failpoint name so one failpoint pins the shared boundary.
-    crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
+    } = staged.commit_all(db, branch, &txn).await?;
+    // Same detached-effects → publisher boundary as mutations: every table
+    // effect is committed detached, but the graph manifest has not published
+    // the result. Reuse the mutation failpoint name so one failpoint pins the
+    // shared boundary.
+    fail(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
     let publish_result = db
         .commit_updates_on_branch_with_expected(
             branch,
@@ -875,34 +918,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
             lineage_intent,
         )
         .await;
-    let commit = match publish_result {
-        Ok(commit) => commit,
-        Err(err) => {
-            // Empty loads can still publish lineage but have no table effect and
-            // therefore no recovery sidecar. Preserve that publish error instead
-            // of manufacturing an "unknown" recovery operation.
-            return match sidecar_handle.as_ref() {
-                Some(handle) => Err(OmniError::recovery_required(
-                    handle.operation_id.clone(),
-                    err.to_string(),
-                )),
-                None => Err(err),
-            };
-        }
-    };
-    // The v3 recovery sidecar protects every independently durable table effect
-    // through the one manifest visibility point. Phase C succeeded — clean up
-    // best-effort: failing the user here would error out a write that already
-    // landed durably; a leftover fixed outcome is idempotently finalized later.
-    if let Some(handle) = sidecar_handle {
-        if let Err(err) = crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await {
-            tracing::warn!(
-                error = %err,
-                operation_id = handle.operation_id.as_str(),
-                "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
-            );
-        }
-    }
+    let commit = publish_result?;
 
     Ok(LoadReceipt { result, commit })
 }
@@ -3418,10 +3434,13 @@ fn literal_value_to_f64(v: &omnigraph_compiler::catalog::LiteralValue) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Session;
     use crate::db::Omnigraph;
     use arrow_array::Array;
     use futures::TryStreamExt;
+    use omnigraph_compiler::settings::SessionSettings;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     const TEST_SCHEMA: &str = r#"
 node Person {
@@ -3589,14 +3608,18 @@ edge WorksAt: Person -> Company
     async fn load_refuses_date_string_with_a_time_of_day() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap()),
+            SessionSettings::default(),
+        );
         let version_before = db.version().await;
 
         let rows = r#"{"type": "Person", "data": {"name": "Alice"}}
 {"type": "Person", "data": {"name": "Bob"}}
 {"edge": "Knows", "from": "Alice", "to": "Bob", "data": {"since": "2024-01-01T02:00:00+05:00"}}
 "#;
-        let err = load_jsonl(&db, rows, LoadMode::Overwrite)
+        let err = db
+            .load_jsonl(rows, LoadMode::Overwrite)
             .await
             .expect_err("a datetime string in a Date? property fails the load");
         assert!(
@@ -3810,7 +3833,10 @@ edge WorksAt: Person -> Company
     async fn strict_graph_batch_loads_graph_rows_with_crlf_and_blank_lines() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap()),
+            SessionSettings::default(),
+        );
         let input = concat!(
             "\r\n",
             "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":30}}\r\n",
@@ -3857,9 +3883,14 @@ node Doc {
     embedding: Vector(2)? @embed(body)
 }
 "#;
-        let nullable_db = Omnigraph::init(nullable_uri, nullable_schema)
-            .await
-            .unwrap();
+        let nullable_db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init(nullable_uri, nullable_schema)
+                    .await
+                    .unwrap(),
+            ),
+            SessionSettings::default(),
+        );
         nullable_db
             .load_graph_batch(
                 "main",
@@ -3962,7 +3993,10 @@ node Doc {
 
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap()),
+            SessionSettings::default(),
+        );
         let before = db.snapshot().await;
         for (case, input, expected) in cases {
             let error = db
@@ -3993,12 +4027,17 @@ node Doc {
     #[tokio::test]
     async fn load_refuses_invalid_identity_envelopes_before_effects() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Omnigraph::init(
-            dir.path().to_str().unwrap(),
-            "node Person { name: String? } edge Knows: Person -> Person",
-        )
-        .await
-        .unwrap();
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init(
+                    dir.path().to_str().unwrap(),
+                    "node Person { name: String? } edge Knows: Person -> Person",
+                )
+                .await
+                .unwrap(),
+            ),
+            SessionSettings::default(),
+        );
         let before = db.version().await;
         let mut cases = [
             (
@@ -4039,7 +4078,8 @@ node Doc {
             }
         }
         for (input, expected) in cases {
-            let error = load_jsonl(&db, &input, LoadMode::Overwrite)
+            let error = db
+                .load_jsonl(&input, LoadMode::Overwrite)
                 .await
                 .unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
@@ -4060,11 +4100,12 @@ node Doc {
     async fn test_load_creates_data() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap()),
+            SessionSettings::default(),
+        );
 
-        let result = load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
-            .await
-            .unwrap();
+        let result = db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
 
         assert_eq!(result.nodes_loaded["Person"], 2);
         assert_eq!(result.nodes_loaded["Company"], 1);
@@ -4076,10 +4117,11 @@ node Doc {
     async fn test_load_data_readable_via_lance() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
-            .await
-            .unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap()),
+            SessionSettings::default(),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
 
         // Read back via snapshot
         let snap = db.snapshot().await;
@@ -4114,10 +4156,11 @@ node Doc {
     async fn test_load_edges_reference_node_keys() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
-            .await
-            .unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap()),
+            SessionSettings::default(),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
 
         let snap = db.snapshot().await;
         let knows_ds = snap.open_dataset("edge:Knows").await.unwrap();
@@ -4153,12 +4196,13 @@ node Doc {
     async fn test_load_manifest_version_advances() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap()),
+            SessionSettings::default(),
+        );
         let v1 = db.version().await;
 
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
-            .await
-            .unwrap();
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
 
         assert!(db.version().await > v1);
     }
@@ -4167,13 +4211,16 @@ node Doc {
     async fn test_load_append_adds_rows() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap()),
+            SessionSettings::default(),
+        );
 
         let batch1 = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}"#;
         let batch2 = r#"{"type": "Person", "data": {"name": "Bob", "age": 25}}"#;
 
-        load_jsonl(&db, batch1, LoadMode::Overwrite).await.unwrap();
-        load_jsonl(&db, batch2, LoadMode::Append).await.unwrap();
+        db.load_jsonl(batch1, LoadMode::Overwrite).await.unwrap();
+        db.load_jsonl(batch2, LoadMode::Append).await.unwrap();
 
         let snap = db.snapshot().await;
         let person_ds = snap.open_dataset("node:Person").await.unwrap();
@@ -4184,10 +4231,13 @@ node Doc {
     async fn test_load_unknown_type_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap()),
+            SessionSettings::default(),
+        );
 
         let bad = r#"{"type": "FakeType", "data": {"name": "x"}}"#;
-        let result = load_jsonl(&db, bad, LoadMode::Overwrite).await;
+        let result = db.load_jsonl(bad, LoadMode::Overwrite).await;
         assert!(result.is_err());
     }
 
@@ -4200,14 +4250,18 @@ node Doc {
     async fn load_refuses_float_epoch_in_nullable_date_issue_628() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap()),
+            SessionSettings::default(),
+        );
         let version_before = db.version().await;
 
         let rows = r#"{"type": "Person", "data": {"name": "Alice"}}
 {"type": "Person", "data": {"name": "Bob"}}
 {"edge": "Knows", "from": "Alice", "to": "Bob", "data": {"since": 19723.0}}
 "#;
-        let err = load_jsonl(&db, rows, LoadMode::Overwrite)
+        let err = db
+            .load_jsonl(rows, LoadMode::Overwrite)
             .await
             .expect_err("a float epoch in a Date? property fails the load");
         assert!(
@@ -4228,7 +4282,10 @@ node Doc {
     async fn test_ingest_creates_branch_and_reports_tables() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap()),
+            SessionSettings::default(),
+        );
 
         let result = db
             .ingest("feature", Some("main"), TEST_DATA, LoadMode::Overwrite)
@@ -4273,10 +4330,11 @@ node Doc {
     async fn test_ingest_existing_branch_ignores_from_and_merges_data() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
-            .await
-            .unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap()),
+            SessionSettings::default(),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
         db.branch_create_from(crate::db::ReadTarget::branch("main"), "feature")
             .await
             .unwrap();
@@ -4348,7 +4406,10 @@ node Doc {
     async fn test_ingest_as_stamps_actor_on_branch_head_commit() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap()),
+            SessionSettings::default(),
+        );
 
         db.ingest_as(
             "feature",
@@ -4374,7 +4435,10 @@ node Doc {
     async fn test_load_as_with_base_forks_missing_branch_and_stamps_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap()),
+            SessionSettings::default(),
+        );
 
         let result = db
             .load_as("feature", Some("main"), TEST_DATA, LoadMode::Merge, None)
@@ -4411,7 +4475,10 @@ node Doc {
     async fn test_load_as_without_base_errors_on_missing_branch() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap()),
+            SessionSettings::default(),
+        );
 
         let result = db
             .load_as("nonexistent", None, TEST_DATA, LoadMode::Merge, None)

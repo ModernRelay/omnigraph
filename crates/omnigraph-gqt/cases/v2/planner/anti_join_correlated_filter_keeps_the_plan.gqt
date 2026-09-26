@@ -1,0 +1,43 @@
+# issue: none
+# red_on: 2026-09-16 working tree: `planner internal error: a GQ filter op has no input`.
+# notes: Count documents whose slug does not start with x. The negated filter
+# notes: uses the outer binding, without introducing another scan.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    embedding: Vector(4)?
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d0","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d1","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"x2"}}
+
+--- query
+set engine = v2;
+query count_non_x_docs() {
+    match {
+        $d: Doc
+        not { $d.slug starts_with "x" }
+    }
+    return { count($d) as n }
+}
+
+--- expect unordered
+{"n":2}
+
+--- expect shape
+n: I64
+
+--- expect plan
+scan Doc as $d: columns [__id, slug]
+scan Doc as $d: no filter
+filter reads [d.slug]
+pass projection_pushdown

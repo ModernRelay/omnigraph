@@ -6,18 +6,19 @@ use std::time::{Duration, Instant};
 
 use omnigraph::error::OmniError;
 use omnigraph_compiler::QueryResult;
+use omnigraph_compiler::settings::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::runner_config::{Environment, Execution, Fault};
+use crate::runner_config::{Environment, Execution};
 use crate::{CaseOutcome, parse_case, stem_of};
 
-mod known_failure;
+mod seams;
 mod settings;
 
-pub(crate) fn validate_known_failure(case: &crate::Case) -> Result<(), String> {
-    known_failure::validate(case)
-}
+#[cfg(tokio_unstable)]
+use seams::{DECORATION, DecideGuard};
+pub(crate) use seams::{admit_seam, arm_seams, finish_seams, refuse_two_store_actors};
 
 const WORKER_INPUT: &str = "OMNIGRAPH_GQT_WORKER_INPUT";
 const WORKER_REPORT: &str = "OMNIGRAPH_GQT_WORKER_REPORT";
@@ -32,7 +33,6 @@ struct Observations {
     values: Vec<String>,
     bytes: usize,
     overflow: bool,
-    fault_hits: Vec<String>,
     operation: Option<serde_json::Value>,
     evidence: Vec<serde_json::Value>,
     lifecycle: Option<[std::sync::Arc<std::sync::atomic::AtomicU64>; 2]>,
@@ -72,21 +72,21 @@ pub(crate) fn lifetime_counts() -> Option<[u64; 2]> {
 #[cfg(tokio_unstable)]
 fn lifecycle_probe() -> (
     [std::sync::Arc<std::sync::atomic::AtomicU64>; 2],
-    Vec<omnigraph::failpoints::ScopedFailPoint>,
+    Vec<DecideGuard>,
 ) {
     let counts = [
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     ];
     let guards = [
-        omnigraph::failpoints::names::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN,
-        omnigraph::failpoints::names::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
+        &omnigraph::seams::catalog::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN,
+        &omnigraph::seams::catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
     ]
     .into_iter()
     .zip(counts.iter())
-    .map(|(name, count)| {
+    .map(|(seam, count)| {
         let count = count.clone();
-        omnigraph::failpoints::ScopedFailPoint::with_callback(name, move || {
+        seam.observe(move || {
             count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         })
     })
@@ -151,93 +151,29 @@ pub(crate) fn observe_query<E: std::fmt::Display>(result: &Result<QueryResult, E
     }
 }
 
+/// Record the typed shape of a step's error, the evidence a known-failure
+/// marker is matched against: a `RecoveryRequired` with its reason, or a
+/// `Manifest` error with its kind.
 pub(crate) fn observe_fault(error: &OmniError) {
-    if let OmniError::RecoveryRequired {
-        operation_id,
-        reason,
-    } = error
-    {
-        record(
+    match error {
+        OmniError::RecoveryRequired {
+            operation_id,
+            reason,
+        } => record(
             "typed_error",
             serde_json::json!({"error": "RecoveryRequired", "reason": reason, "operation_id": operation_id, "message": error.to_string()}),
-        );
-    }
-    let message = match error {
-        OmniError::Manifest(error) => &error.message,
-        OmniError::RecoveryRequired { reason, .. } => reason,
-        _ => return,
-    };
-    if let Some(name) = message.strip_prefix("injected failpoint triggered: ") {
-        OBSERVATIONS
-            .try_with(|events| events.borrow_mut().fault_hits.push(name.to_string()))
-            .unwrap_or_default();
-        record("fault_delivered", serde_json::json!({"hook": name}));
-        observe(|| format!("fault delivered: {name}"));
+        ),
+        OmniError::Manifest(manifest) => record(
+            "typed_error",
+            serde_json::json!({"error": "Manifest", "kind": format!("{:?}", manifest.kind), "reason": manifest.message, "message": error.to_string()}),
+        ),
+        _ => {}
     }
 }
 
-fn supported_fault(fault: &Fault) -> bool {
-    [
-        "branch_merge.post_authority_capture",
-        "branch_merge.post_sidecar_pre_fork",
-        "branch_merge.post_effects_pre_confirm",
-        "branch_merge.post_phase_b_pre_manifest_commit",
-        "mutation.post_sidecar_pre_fork",
-    ]
-    .contains(&fault.at.as_str())
-}
-
-#[cfg(tokio_unstable)]
-pub(crate) fn arm_fault(
-    fault: Option<&Fault>,
-) -> Result<Option<omnigraph::failpoints::ScopedFailPoint>, String> {
-    OBSERVATIONS
-        .try_with(|events| events.borrow_mut().fault_hits.clear())
-        .unwrap_or_default();
-    fault
-        .map(|fault| {
-            if !supported_fault(fault) {
-                return Err(format!(
-                    "unsupported_environment: unsupported DST failpoint: {}",
-                    fault.at
-                ));
-            }
-            let action = if fault.occurrence == 1 {
-                "1*return".into()
-            } else {
-                format!("{}*off->1*return", fault.occurrence - 1)
-            };
-            Ok(omnigraph::failpoints::ScopedFailPoint::new(
-                &fault.at, &action,
-            ))
-        })
-        .transpose()
-}
-
-#[cfg(not(tokio_unstable))]
-pub(crate) fn arm_fault(fault: Option<&Fault>) -> Result<Option<()>, String> {
-    if fault.is_some() {
-        Err("unsupported_environment: DST runner is unavailable".into())
-    } else {
-        Ok(None)
-    }
-}
-
-pub(crate) fn finish_fault(fault: Option<&Fault>) -> Result<(), String> {
-    let Some(fault) = fault else {
-        return Ok(());
-    };
-    let hits = OBSERVATIONS
-        .try_with(|events| events.borrow().fault_hits.clone())
-        .unwrap_or_default();
-    if hits != [fault.at.clone()] {
-        Err(format!(
-            "fault_unobserved: configured faults were not observed exactly once by the selected operation: {}; observed: {hits:?}",
-            fault.at
-        ))
-    } else {
-        Ok(())
-    }
+/// `file:line` of a seam's declaration or firing, as a report prints it.
+fn location(at: &std::panic::Location<'_>) -> String {
+    omnigraph_dst::store_places::file_line(at.file(), at.line())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -255,7 +191,13 @@ struct Input {
     environment: Environment,
     seed: Option<u64>,
     effective_settings: settings::EffectiveSettings,
+    #[serde(default, skip_serializing_if = "is_v1")]
+    engine: Engine,
     bless: bool,
+}
+
+fn is_v1(engine: &Engine) -> bool {
+    *engine == Engine::V1
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,7 +217,6 @@ struct Attempt {
     environment: Environment,
     seed: Option<u64>,
     replay: usize,
-    known_failure: bool,
     input: Input,
     outcome: Result<WorkerReport, String>,
 }
@@ -355,6 +296,9 @@ fn invocation_id() -> String {
 }
 
 fn refuse_ambient() -> Result<(), String> {
+    let settings_variables = omnigraph_compiler::settings::DEFINITIONS
+        .iter()
+        .map(|spec| spec.env);
     for name in [
         "FAILPOINTS",
         "DST_ENTROPY_SEED",
@@ -362,8 +306,11 @@ fn refuse_ambient() -> Result<(), String> {
         "LANCE_CPU_THREADS",
         "LANCE_DETERMINISTIC_BACKOFF",
         crate::CASE_TIMEOUT_ENV,
-        "OMNIGRAPH_TRAVERSAL_MODE",
-    ] {
+    ]
+    .into_iter()
+    .chain(settings_variables)
+    .chain(crate::RETIRED_SETTING_ENVIRONMENT)
+    {
         if std::env::var_os(name).is_some() {
             return Err(format!(
                 "invalid_case: ambient {name} conflicts with file-owned execution; unset it"
@@ -378,13 +325,12 @@ fn error_code(error: &str) -> &'static str {
         "invalid_case",
         "unsupported_environment",
         "environment_changed",
-        "fault_unobserved",
+        "seam_unobserved",
         "fault_cleanup_failed",
         "replay_mismatch",
         "worker_failed",
         "report_failed",
         "timeout",
-        "unexpected_pass",
     ] {
         if error.starts_with(&format!("{code}:")) {
             return code;
@@ -401,9 +347,6 @@ fn result_code(result: &Result<(), String>) -> &'static str {
 }
 
 fn summary_code(summary: &Summary) -> &str {
-    if summary.result.is_ok() && summary.attempts.iter().any(|attempt| attempt.known_failure) {
-        return "known_failure";
-    }
     let code = result_code(&summary.result);
     if code != "assertion_failed" {
         return code;
@@ -685,6 +628,7 @@ fn run_invocation(
     summary: &mut Summary,
 ) -> Result<(), String> {
     refuse_ambient()?;
+    let engine = crate::engine_from_env()?;
     let selected = selection.target;
     let selected_storage = selection.storage;
     let selected_seed = selection.seed;
@@ -692,8 +636,13 @@ fn run_invocation(
         String::from_utf8(read_bounded(path)?).map_err(|e| format!("invalid_case: UTF-8: {e}"))?;
     let text: std::sync::Arc<str> = text.into();
     summary.case_digest = Some(digest(text.as_bytes()));
-    let case =
-        parse_case(&stem_of(path), &text).map_err(|error| format!("invalid_case: {error}"))?;
+    let case = parse_case(&stem_of(path), &text).map_err(|error| {
+        if error.starts_with("invalid_case:") {
+            error
+        } else {
+            format!("invalid_case: {error}")
+        }
+    })?;
     summary.declared = Some(case.runner.environments.clone());
     for env in &case.runner.environments {
         for seed in env.seeds() {
@@ -734,15 +683,9 @@ fn run_invocation(
         return Err("invalid_case: environment selector matches no declared environment".into());
     }
     for env in &selected_envs {
-        env.admit(!case.faults.is_empty())?;
+        env.admit(!case.seams.is_empty())?;
     }
-    for (ordinal, fault) in &case.faults {
-        if !supported_fault(fault) {
-            return Err(format!(
-                "unsupported_environment: unsupported DST failpoint: {}",
-                fault.at
-            ));
-        }
+    for (ordinal, seams) in &case.seams {
         let step = case
             .items
             .iter()
@@ -751,23 +694,11 @@ fn run_invocation(
                 crate::Item::Loop { steps, .. } => steps.as_slice(),
             })
             .find(|step| step.ordinal() == *ordinal);
-        let compatible = match step {
-            Some(crate::Step::Mutate(_)) => fault.at.starts_with("mutation."),
-            Some(crate::Step::Control(crate::ControlStep {
-                write: crate::ControlWrite::Merge { .. },
-                ..
-            })) => fault.at.starts_with("branch_merge."),
-            _ => false,
-        };
-        if !compatible {
-            return Err(format!(
-                "unsupported_environment: fault {} is incompatible with operation {ordinal}",
-                fault.at
-            ));
-        }
-    }
-    if bless && case.known_failure.is_some() {
-        return Err("invalid_case: bless is refused for known_failure cases".into());
+        let admitted = seams
+            .iter()
+            .map(|seam| admit_seam(seam, step))
+            .collect::<Result<Vec<_>, _>>()?;
+        refuse_two_store_actors(seams, &admitted)?;
     }
     if bless
         && (case.runner.environments.len() != 1
@@ -820,6 +751,7 @@ fn run_invocation(
                     environment: env.clone(),
                     seed,
                     effective_settings: settings::EffectiveSettings::for_seed(seed),
+                    engine,
                     bless,
                 };
                 let mut outcome = run_child(&input, executable, left);
@@ -831,25 +763,13 @@ fn run_invocation(
                         outcome = Err("report_failed: invocation evidence budget exhausted; remaining attempts not run".into());
                     }
                 }
-                let mut known_failure = false;
                 match &outcome {
                     Ok(report) => {
-                        match known_failure::classify(&case, report) {
-                            Ok(accepted) => {
-                                known_failure = accepted;
-                                if accepted {
-                                    println!(
-                                        "KNOWN_FAILURE environment={} seed={seed:?} replay={replay}: known recovery failure",
-                                        env
-                                    );
-                                }
-                            }
-                            Err(error) => {
-                                failures.push(format!(
-                                    "{error}; environment={} seed={seed:?} replay={replay}",
-                                    env
-                                ));
-                            }
+                        if let Err(error) = &report.result {
+                            failures.push(format!(
+                                "{error}; environment={} seed={seed:?} replay={replay}",
+                                env
+                            ));
                         }
                         reports.push(json(report)?);
                     }
@@ -864,7 +784,6 @@ fn run_invocation(
                     environment: env.clone(),
                     seed,
                     replay,
-                    known_failure,
                     input,
                     outcome,
                 });
@@ -1021,7 +940,7 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
     {
         return Err("environment_changed: worker selection is not declared".into());
     }
-    input.environment.admit(!case.faults.is_empty())?;
+    input.environment.admit(!case.seams.is_empty())?;
     match input.seed {
         None => {
             let settings::TokioRuntime::MultiThread {
@@ -1042,18 +961,24 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
                 .map_err(|e| format!("worker_failed: runtime: {e}"))?;
             runtime.block_on(capture(
                 input_digest,
-                crate::execute_case(&case, &input.case_path, input.bless),
+                crate::execute_case_on_engine(&case, &input.case_path, input.bless, input.engine),
             ))
         }
         Some(seed) => dst_report(input, &case, seed, input_digest),
     }
 }
 
+/// One capture at a time per process: the lifecycle probe installs two
+/// process-wide seams, and two in-process tests would collide on them.
+static CAPTURE_ONE_AT_A_TIME: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 async fn capture(
     input_digest: String,
     future: impl std::future::Future<Output = Result<(), String>>,
 ) -> Result<WorkerReport, String> {
     use futures::FutureExt;
+    let _one_at_a_time = CAPTURE_ONE_AT_A_TIME.lock().await;
     let mut initial = Observations::default();
     #[cfg(tokio_unstable)]
     let _guards = {
@@ -1113,21 +1038,38 @@ struct GqtScenario<'a> {
 impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for GqtScenario<'_> {
     type Output = Result<WorkerReport, String>;
 
+    /// The engine talks to the store through the `STORAGE` seam on every run,
+    /// faulted or not: the decoration is a property of the target, and a
+    /// store action only hands it one rule for one step.
     async fn run(
         &self,
         resources: &mut omnigraph_dst::memory::MemoryStorage,
         _workload_seed: u64,
     ) -> Self::Output {
-        capture(
-            self.input_digest.clone(),
-            crate::execute_case_with_storage(
-                self.case,
-                &self.input.case_path,
-                &resources.root,
-                resources.adapter.clone(),
-            ),
-        )
-        .await
+        use omnigraph::storage::StorageAdapter;
+        let base: std::sync::Arc<dyn StorageAdapter> = resources.adapter.clone();
+        let decoration =
+            omnigraph_dst::harness::FailingStorage::quiet(base, resources.root.clone());
+        omnigraph::storage::STORAGE.clear();
+        let _installed = omnigraph::storage::STORAGE.install(std::sync::Arc::new(
+            omnigraph_dst::harness::FailingStorageDecorator(decoration.clone()),
+        ));
+        let storage: std::sync::Arc<dyn StorageAdapter> = decoration.clone();
+        DECORATION
+            .scope(
+                decoration,
+                capture(
+                    self.input_digest.clone(),
+                    crate::execute_case_with_storage(
+                        self.case,
+                        &self.input.case_path,
+                        &resources.root,
+                        storage,
+                        self.input.engine,
+                    ),
+                ),
+            )
+            .await
     }
 }
 
@@ -1146,7 +1088,7 @@ fn dst_report(
             ));
         }
     }
-    let _failpoints = omnigraph::failpoints::FailScenario::setup();
+    let _seams = omnigraph::seams::FailScenario::setup();
     let environment = omnigraph_dst::memory::MemoryEnvironment::new(
         "shared-memory://gqt-dst/case",
         seed,
@@ -1249,6 +1191,7 @@ fn replay_attempts(
     executed: &mut Vec<Attempt>,
 ) -> Result<(), String> {
     refuse_ambient()?;
+    crate::engine_from_env()?;
     for attempt in &summary.attempts {
         attempt
             .input
@@ -1321,7 +1264,6 @@ fn replay_attempts(
             .as_ref()
             .map_err(|e| format!("report_failed: incomplete prior execution: {e}"))?;
         let case = parse_case(&attempt.input.stem, &attempt.input.text)?;
-        known_failure::verify_status(&case, prior, attempt.known_failure)?;
         if summary.declared.as_ref() != Some(&case.runner.environments) {
             return Err("report_failed: declared environments differ from frozen input".into());
         }
@@ -1343,7 +1285,6 @@ fn replay_attempts(
                     environment: attempt.environment.clone(),
                     seed: attempt.seed,
                     replay: attempt.replay,
-                    known_failure: false,
                     input: attempt.input.clone(),
                     outcome: Err(error),
                 });
@@ -1356,18 +1297,13 @@ fn replay_attempts(
                 attempt.environment, attempt.seed
             ));
         }
-        let known_failure = match known_failure::classify(&case, &report) {
-            Ok(known_failure) => known_failure,
-            Err(error) => {
-                failures.push(error);
-                false
-            }
-        };
+        if let Err(error) = &report.result {
+            failures.push(error.clone());
+        }
         executed.push(Attempt {
             environment: attempt.environment.clone(),
             seed: attempt.seed,
             replay: attempt.replay,
-            known_failure,
             input: attempt.input.clone(),
             outcome: Ok(report),
         });
@@ -1379,5 +1315,40 @@ fn replay_attempts(
         Ok(())
     } else {
         Err(failures.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod action_tests {
+    use omnigraph::seams::Effect;
+
+    use super::seams::admitted_effect;
+    use crate::runner_config::SeamAction;
+
+    #[test]
+    fn fail_and_contention_are_selectable_regardless_of_declaration_order() {
+        for effects in [
+            [Effect::Fail, Effect::Contention],
+            [Effect::Contention, Effect::Fail],
+        ] {
+            assert_eq!(
+                admitted_effect(SeamAction::Fail, &effects),
+                Some(Effect::Fail)
+            );
+            assert_eq!(
+                admitted_effect(SeamAction::Contention, &effects),
+                Some(Effect::Contention)
+            );
+        }
+        assert_eq!(
+            admitted_effect(SeamAction::Fail, &[Effect::Contention]),
+            Some(Effect::Contention),
+            "existing fail directives on contention-only seams stay compatible"
+        );
+        assert_eq!(
+            admitted_effect(SeamAction::Contention, &[Effect::Fail, Effect::Skip]),
+            None,
+            "explicit contention cannot fall back to another effect"
+        );
     }
 }

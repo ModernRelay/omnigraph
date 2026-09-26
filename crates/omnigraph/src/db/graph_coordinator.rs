@@ -6,7 +6,6 @@ use lance::Dataset;
 use omnigraph_compiler::catalog::Catalog;
 
 use crate::error::{OmniError, Result};
-use crate::failpoints;
 use crate::storage::{StorageAdapter, normalize_root_uri};
 
 use super::commit_graph::{CommitGraph, CommitGraphSnapshot, FirstParentEdge, GraphCommit};
@@ -16,6 +15,7 @@ use super::manifest::{
     LineageIntent, LineageRefresh, ManifestChange, ManifestCoordinator, ManifestIncarnation,
     ManifestInitError, PublishPrecondition, Snapshot,
 };
+use crate::seams::{decide_seam, fail};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SnapshotId(String);
@@ -124,6 +124,14 @@ pub(crate) struct GraphCoordinator {
     bound_branch: Option<String>,
 }
 
+decide_seam! {
+    pub static GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT = ("graph_publish.after_manifest_commit", AnyWrite, [Fail]);
+}
+
+decide_seam! {
+    pub static GRAPH_PUBLISH_BEFORE_COMMIT_APPEND = ("graph_publish.before_commit_append", AnyWrite, [Fail]);
+}
+
 impl GraphCoordinator {
     /// Commit half of coordinator init: ends at the `__manifest` Create
     /// commit (see `init_commit_phase` for the phase contract).
@@ -184,6 +192,7 @@ impl GraphCoordinator {
         })
     }
 
+    #[cfg(test)]
     pub async fn open(root_uri: &str, storage: Arc<dyn StorageAdapter>) -> Result<Self> {
         let control_session = crate::lance_access::control_session();
         Self::open_with_session(root_uri, storage, &control_session).await
@@ -207,6 +216,7 @@ impl GraphCoordinator {
         })
     }
 
+    #[cfg(test)]
     pub async fn open_branch(
         root_uri: &str,
         branch: &str,
@@ -365,6 +375,10 @@ impl GraphCoordinator {
                 .filter(|branch| !is_internal_system_branch(branch))
                 .collect()
         })
+    }
+
+    pub(crate) async fn schema_apply_locked(&self) -> Result<bool> {
+        self.manifest.schema_apply_locked().await
     }
 
     pub(crate) async fn all_branches(&self) -> Result<Vec<String>> {
@@ -741,8 +755,9 @@ impl GraphCoordinator {
 
     /// Publish a pre-minted lineage intent under an explicit authority
     /// precondition. The intent's identity and timestamp remain stable across
-    /// publisher retries and can also be persisted by the caller's recovery
-    /// protocol before this method is invoked.
+    /// publisher retries and can also be persisted by the caller before this
+    /// method is invoked (schema apply records the commit id in its staged
+    /// contract).
     pub(crate) async fn commit_changes_with_intent_and_expected(
         &mut self,
         changes: &[ManifestChange],
@@ -750,7 +765,7 @@ impl GraphCoordinator {
         intent: LineageIntent,
         precondition: &PublishPrecondition,
     ) -> Result<PublishedSnapshot> {
-        failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
+        fail(&GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
         let mut outcome = self
             .manifest
             .commit_changes_with_lineage_and_precondition(
@@ -760,7 +775,7 @@ impl GraphCoordinator {
                 precondition,
             )
             .await?;
-        failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
+        fail(&GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
         let commit = self.apply_lineage_to_cache(intent, &outcome);
         self.manifest.acknowledge_published_lineage(&mut outcome);
         Ok(PublishedSnapshot {

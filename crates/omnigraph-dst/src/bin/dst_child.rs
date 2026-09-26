@@ -58,8 +58,10 @@
 mod child {
     use std::sync::Arc;
 
+    use omnigraph::Session;
     use omnigraph::db::{InitOptions, Omnigraph};
-    use omnigraph::loader::{LoadMode, load_jsonl};
+    use omnigraph::loader::LoadMode;
+    use omnigraph::settings::SessionSettings;
     use omnigraph::storage::{ObjectStorageAdapter, StorageAdapter};
     use omnigraph_dst::fixtures::{
         MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, mixed_params, mutate_on,
@@ -149,7 +151,7 @@ mod child {
         // file-scheme Lance provider BEFORE the engine first resolves a
         // store for this root.
         let rig = (die_at.is_some() || weather).then(|| {
-            omnigraph_dst::lance_faults::install_file();
+            omnigraph_dst::lance_faults::install();
             let base: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::local());
             let rig = RealKillRig::new(base, die_at, weather.then(|| weather_plan(seed)));
             rig.set_barrier_path(&oplog_path);
@@ -180,15 +182,20 @@ mod child {
                 return;
             }
 
-            let mut db = Omnigraph::init_with_storage(
-                &root,
-                TEST_SCHEMA,
-                storage.clone(),
-                InitOptions::default(),
-            )
-            .await
-            .expect("init store at file root");
-            load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+            let db = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::init_with_storage(
+                        &root,
+                        TEST_SCHEMA,
+                        storage.clone(),
+                        InitOptions::default(),
+                    )
+                    .await
+                    .expect("init store at file root"),
+                ),
+                SessionSettings::default(),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
                 .await
                 .expect("load fixtures");
             if let Some(r) = &rig {
@@ -324,7 +331,7 @@ mod child {
                     "branch_create" => db.branch_create(&parts[4]).await.map(|_| ()),
                     "branch_delete" => db.branch_delete(&parts[4]).await.map(|_| ()),
                     "insert" | "set_age" | "remove" | "edge" => {
-                        mutate_on(&mut db, &target, MUTATION_QUERIES, query, &params)
+                        mutate_on(&db, &target, MUTATION_QUERIES, query, &params)
                             .await
                             .map(|_| ())
                     }
@@ -379,7 +386,9 @@ fn main() {
     child::run();
     #[cfg(not(tokio_unstable))]
     {
-        eprintln!("dst_child requires --cfg tokio_unstable (run cargo from the crate dir)");
+        eprintln!(
+            "dst_child requires --cfg tokio_unstable (the workspace .cargo/config.toml sets it; an env RUSTFLAGS without it overrides that)"
+        );
         std::process::exit(2);
     }
 }

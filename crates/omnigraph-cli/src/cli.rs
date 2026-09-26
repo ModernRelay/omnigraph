@@ -22,8 +22,8 @@ repair, cleanup, schema plan, lint).\n  \
 control — manage or inspect a cluster (cluster via --config; policy & queries via \
 --cluster).\n  \
 local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, version.\n\
-MANAGED FOLDERS: cluster commands use .omnigraph/context; cluster token caches data access.\n\
-Implicit query and mutate use folder context and require --graph plus a cached data credential.\n\
+MANAGED FOLDERS: cluster commands use .omnigraph/context; data commands acquire identity credentials automatically.\n\
+Implicit query, mutate, load and commit list/show use folder context and require --graph.\n\
 Explicit target selectors retain ordinary addressing; competing ambient targets refuse.\n\
 --direct selects ordinary addressing, including operator profiles and defaults.\n\
 See the 'Command capabilities' section of the CLI reference for which flags apply where.")]
@@ -49,7 +49,8 @@ pub(crate) struct Cli {
     /// Select a graph within a multi-graph scope: on a `--server` it appends
     /// `/graphs/<id>` to the server url; on `--cluster` it picks which cluster
     /// graph to maintain. Rejected on a single-graph address (a positional URI /
-    /// `--store`). Required for managed data queries, mutations, and token issuance.
+    /// `--store`). Required for managed queries, mutations, loads, commit reads,
+    /// and legacy restricted token issuance with `--actions`.
     #[arg(long, global = true, value_name = "GRAPH_ID")]
     pub(crate) graph: Option<String>,
 
@@ -101,7 +102,7 @@ pub(crate) struct Cli {
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
     // ── Data plane ── run against a graph (embedded or via --server).
-    /// Execute a read query, or `branch list`, against a branch or snapshot.
+    /// Execute a read query, `branch list`, or an `explain` statement against a branch or snapshot.
     ///
     /// Canonical read endpoint, paired with `mutate`; `read` is a visible alias that warns.
     #[command(visible_alias = "read")]
@@ -110,13 +111,14 @@ pub(crate) enum Command {
         /// the catalog (served — addressed via --server/--profile). With
         /// `--query`/`-e`, selects which query in that ad-hoc source to run.
         name: Option<String>,
-        /// Ad-hoc query file (a `.gq` you're authoring / break-glass), or one
-        /// `branch list` statement.
+        /// Ad-hoc query file (a `.gq` you're authoring / break-glass), one
+        /// `branch list` statement, or one `explain query …` statement, which
+        /// answers the plan the query would run under as results.
         #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
         /// Inline ad-hoc GQ source — alternative to `--query <path>`. May be
         /// the `branch list` statement, which takes no name, params, --branch
-        /// or --snapshot.
+        /// or --snapshot, or an `explain query …` statement.
         #[arg(
             short = 'e',
             long = "query-string",
@@ -130,6 +132,11 @@ pub(crate) enum Command {
         branch: Option<String>,
         #[arg(long, conflicts_with = "branch")]
         snapshot: Option<String>,
+        /// Session setting for this invocation (repeatable): `name=value` in
+        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
+        /// `settings` field (the Session settings RFC).
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        settings: Vec<String>,
         #[arg(long, conflicts_with = "json")]
         format: Option<ReadOutputFormat>,
         #[arg(long, conflicts_with = "format")]
@@ -169,6 +176,11 @@ pub(crate) enum Command {
         /// `precondition_failure` body — re-read the branch and decide again.
         #[arg(long = "if-commit", value_name = "COMMIT_ID")]
         if_commit: Option<String>,
+        /// Session setting for this invocation (repeatable): `name=value` in
+        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
+        /// `settings` field (the Session settings RFC).
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        settings: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -192,7 +204,7 @@ pub(crate) enum Command {
         #[arg(long, conflicts_with = "format")]
         json: bool,
     },
-    /// Load data into a graph (local or remote)
+    /// Load data into a graph (local, remote, or the selected managed cluster)
     Load {
         /// Graph URI
         uri: Option<String>,
@@ -209,6 +221,11 @@ pub(crate) enum Command {
         /// Required — overwrite is destructive, so there is no default.
         #[arg(long)]
         mode: CliLoadMode,
+        /// Session setting for this invocation (repeatable): `name=value` in
+        /// GQ spelling, e.g. `--set stage_write_concurrency=8`. Embedded
+        /// stores only: no served load route carries a `settings` field.
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        settings: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -225,6 +242,11 @@ pub(crate) enum Command {
         from: Option<String>,
         #[arg(long, default_value = "merge")]
         mode: CliLoadMode,
+        /// Session setting for this invocation (repeatable): `name=value` in
+        /// GQ spelling, e.g. `--set stage_write_concurrency=8`. Embedded
+        /// stores only: no served load route carries a `settings` field.
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        settings: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -407,7 +429,7 @@ pub(crate) enum Command {
         /// `servers:` in ~/.omnigraph/config.yaml)
         #[arg(required_unless_present = "api", conflicts_with = "api")]
         name: Option<String>,
-        /// Log in to a managed Intent API using browser device authorization.
+        /// Reuse or renew a managed session; use browser device authorization when needed.
         #[arg(long, conflicts_with = "token")]
         api: Option<String>,
         /// The token. Prefer piping via stdin over this flag (shell
@@ -587,14 +609,14 @@ pub(crate) enum ClusterCommand {
         #[command(flatten)]
         managed: ManagedRunArgs,
     },
-    /// Cache a scoped data credential for this managed cluster, or forget it locally.
+    /// Cache an identity credential for this cluster, or forget it locally.
     Token {
         #[arg(long, default_value = ".")]
         config: PathBuf,
         #[arg(long)]
         json: bool,
-        /// Comma-separated data actions, such as read,change.
-        #[arg(long, required_unless_present = "clear", conflicts_with = "clear")]
+        /// Legacy restricted profile: exact comma-separated actions; requires --graph.
+        #[arg(long, conflicts_with = "clear")]
         actions: Option<String>,
         /// Credential lifetime, 60 seconds to 24 hours (default 1h).
         #[arg(long, value_parser = crate::managed::data::parse_ttl, conflicts_with = "clear")]
@@ -771,6 +793,9 @@ pub(crate) enum GraphsCommand {
     List {
         #[arg(long)]
         json: bool,
+        /// Minimal authenticated graph existence; requires an identity credential.
+        #[arg(long)]
+        discovery: bool,
     },
 }
 
@@ -817,6 +842,11 @@ pub(crate) enum BranchCommand {
         /// and never fails the already-landed merge.
         #[arg(long)]
         delete_branch: bool,
+        /// Session setting for this invocation (repeatable): `name=value` in
+        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
+        /// `settings` field (the Session settings RFC).
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        settings: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -866,6 +896,18 @@ pub(crate) enum SchemaCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Respell a legacy graph's system columns in place (`id`/`src`/`dst` to
+    /// `__id`/`__src`/`__dst`, storage format v8 to v9; RFC 0040)
+    #[command(name = "upgrade-system-columns")]
+    UpgradeSystemColumns {
+        /// Standalone graph storage URI; alternatively use --store
+        uri: Option<String>,
+        /// Run the preflight only; write nothing
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -911,6 +953,11 @@ pub(crate) enum CommitCommand {
         /// Filter by operation (repeatable): insert | update | delete
         #[arg(long = "op", value_enum)]
         ops: Vec<ChangeOpArg>,
+        /// Session setting for this invocation (repeatable): `name=value` in
+        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
+        /// `settings` field (the Session settings RFC).
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        settings: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -976,6 +1023,11 @@ pub(crate) enum ChangesCommand {
         /// Filter by operation (repeatable): insert | update | delete
         #[arg(long = "op", value_enum)]
         ops: Vec<ChangeOpArg>,
+        /// Session setting for this invocation (repeatable): `name=value` in
+        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
+        /// `settings` field (the Session settings RFC).
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        settings: Vec<String>,
         #[arg(long)]
         json: bool,
     },

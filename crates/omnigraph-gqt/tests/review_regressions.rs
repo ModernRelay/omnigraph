@@ -138,6 +138,20 @@ fn ambient_refusal_and_parse_failure_preserve_their_causes() {
             .unwrap()
             .contains("OMNIGRAPH_TRAVERSAL_MODE")
     );
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(&path)
+        .env("OMNIGRAPH_MERGE_LINEAGE", "off")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let report = summary(&output);
+    assert_eq!(report["code"], "invalid_case");
+    assert!(
+        report["not_run"][0]["reason"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("OMNIGRAPH_MERGE_LINEAGE")
+    );
     std::fs::write(&path, "--- schema\nnode Person { name: String @key }\n").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
         .arg(&path)

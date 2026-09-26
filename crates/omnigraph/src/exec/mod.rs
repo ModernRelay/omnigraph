@@ -21,8 +21,7 @@ use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::{
-    IRAssignment, IRExpr, IRFilter, IRMutationPredicate, IROp, IROrdering, IRProjection,
-    MutationOpIR, ParamMap, QueryIR,
+    IRAssignment, IRExpr, IROp, IROrdering, IRProjection, MutationOpIR, ParamMap, QueryIR,
 };
 use omnigraph_compiler::lower_mutation_query;
 use omnigraph_compiler::lower_query;
@@ -34,7 +33,6 @@ use omnigraph_compiler::types::ScalarType;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::db::commit_graph::CommitGraph;
 use crate::db::manifest::ManifestCoordinator;
 use crate::db::{MergeOutcome, Omnigraph, WriteTxn, is_internal_system_branch};
 use crate::db::{ReadTarget, Snapshot};
@@ -44,8 +42,8 @@ use crate::graph_index::GraphIndex;
 use crate::storage_layer::SnapshotHandle;
 use tempfile::{Builder as TempDirBuilder, TempDir};
 
-mod merge;
-mod mutation;
+pub(crate) mod merge;
+pub(crate) mod mutation;
 mod projection;
 mod query;
 pub(crate) mod staging;

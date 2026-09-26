@@ -50,9 +50,13 @@ Substitute the owning package and existing test target; the coverage map in
 non-trivial change, run the canonical feature-superset gate:
 
 ```bash
-cargo test --workspace --locked \
+cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 ```
+
+The GQT corpus and the DST suite are excluded by name: each has its own
+command and process environment, listed in
+[`docs/dev/testing.md`](docs/dev/testing.md).
 
 If you touch S3-backed flows, the CI model uses a local RustFS instance for
 integration tests.
@@ -92,6 +96,12 @@ CI runs both.
 - Keep changes focused; one logical change per PR.
 - Include tests for behavior changes when practical.
 - Update public docs when the user-facing surface changes.
+- GitHub requests reviewers from `.github/CODEOWNERS` when a change touches an
+  owned crate; the request is advisory, not a merge gate (see
+  [docs/dev/branch-protection.md](docs/dev/branch-protection.md)).
+- Merges into `main` go through the merge queue: click **Merge when ready**
+  once the checks have reported (same page, Merge queue); queueing needs write
+  access, so a fork author asks a maintainer to click it.
 
 New to the codebase? Read [AGENTS.md](AGENTS.md) — the architecture map and the
 always-on invariants every change is reviewed against.

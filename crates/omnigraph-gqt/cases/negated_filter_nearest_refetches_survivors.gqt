@@ -1,9 +1,6 @@
 # issue: none
-# notes: `not { $d.name starts_with "doc-00" }` over 20 docs, limit 4: a `not`
-# notes: block is an anti-join above the scan, never a pushed filter, and it
-# notes: drops rows 0..9. The first pass (0..3) loses every row, short; the x4
-# notes: rerun asks for 16 of the 20 live rows (16 < 20, a wider rung) and holds
-# notes: survivors 10..15 (6 > 4): d010, d011, d012, d013.
+# notes: Negation removes d000..d009 after the scan. The first four candidates all fail.
+# notes: Keep 20 docs: the k = 16 retry finds six survivors without reaching the full corpus.
 
 --- runner
 timeout_ms: 10000
@@ -17,9 +14,6 @@ node Doc {
     n: I64 @index
     name: String @index
     embedding: Vector(4) @index
-}
-
-edge Knows: Doc -> Doc {
 }
 
 --- seed
@@ -45,7 +39,7 @@ edge Knows: Doc -> Doc {
 {"type":"Doc","data":{"slug":"d019","n":19,"name":"doc-019","embedding":[19.0,0.0,0.0,0.0]}}
 
 --- query
-query scenario($q: Vector(4)) {
+query nearest_after_negation($q: Vector(4)) {
     match {
         $d: Doc
         not { $d.name starts_with "doc-00" }

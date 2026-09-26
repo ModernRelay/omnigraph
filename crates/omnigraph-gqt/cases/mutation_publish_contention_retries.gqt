@@ -1,0 +1,45 @@
+# issue: none
+# notes: Contention while loading publish state is retried; the mutation and reopen retain the new row.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- seam
+at: publish.load_state
+occurrence: 1
+action: contention
+scope: next_step
+
+--- mutate
+query add_row() {
+    insert Person { name: "bob" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- query
+query rows_after_reopen() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+
+--- expect shape
+p.name: String

@@ -46,6 +46,7 @@ use super::{
     NativeRefPin, OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION,
     TableIdentity, TableRegistration, TableRename, TableTombstone, WinnerRef,
 };
+use crate::seams::{contention, decide_seam, fail};
 
 /// Bound on the publisher-level retry loop that wraps Lance's row-level CAS
 /// (`TooMuchWriteContention`). Lance's own `conflict_retries` is set to 0 in
@@ -149,9 +150,10 @@ pub(super) struct PublishOutcome {
 
 #[async_trait]
 pub(super) trait ManifestBatchPublisher: Send + Sync {
-    /// Compatibility/default publish behavior for bounded or recovery paths
-    /// that do not carry an exact graph-head precondition. Exact RFC-022
-    /// adapters call `publish_with_precondition` directly.
+    /// Publish without a graph-head precondition. Every production writer
+    /// calls `publish_with_precondition`; only the publisher's own tests use
+    /// this shorthand.
+    #[cfg(test)]
     async fn publish(
         &self,
         changes: &[ManifestChange],
@@ -220,6 +222,34 @@ type FoldedPublishInputs = (
     Vec<(TableIdentity, u64)>,
 );
 
+decide_seam! {
+    /// The publisher's `load_publish_state` read, inside the CAS retry loop.
+    /// Contention here proves the outer retry re-runs the load.
+    pub static PUBLISH_LOAD_STATE = ("publish.load_state", AnyWrite, [Contention]);
+}
+
+decide_seam! {
+    /// Before the `__manifest` merge-insert is issued: nothing has landed, and
+    /// the failure carries no conflict details, so the publish loop's ambiguity
+    /// arm must prove the attempted version absent instead of reporting doubt.
+    pub static PUBLISH_PRE_MERGE = ("publish.pre_merge", AnyWrite, [Fail]);
+}
+
+decide_seam! {
+    /// After the `__manifest` merge-insert committed durably and before the
+    /// publisher acknowledges it: the graph is already published and visible,
+    /// only the caller's acknowledgement is at risk (the lost-ack window). A
+    /// failure here models a dropped acknowledgement of a durable commit; the
+    /// publisher's ambiguity read-back must recognize it as success (RFC 0067).
+    pub static PUBLISH_POST_MERGE_PRE_ACK = ("publish.post_merge_pre_ack", AnyWrite, [Fail]);
+}
+
+decide_seam! {
+    /// Readback may be unavailable after a lost acknowledgement. This cannot
+    /// turn an indeterminate commit into permission to replay the mutation.
+    pub static PUBLISH_READ_BACK = ("publish.read_back", AnyWrite, [Fail]);
+}
+
 impl GraphNamespacePublisher {
     fn checked_base_incarnation(
         &self,
@@ -275,9 +305,7 @@ impl GraphNamespacePublisher {
         // Test seam: inject a retryable contention here to exercise the outer
         // retry loop's re-run-on-retryable-load-error path (no-op without the
         // `failpoints` feature). The migration surfaces the same typed error.
-        crate::failpoints::maybe_fail_retryable_contention(
-            crate::failpoints::names::PUBLISH_LOAD_STATE_RETRYABLE_CONTENTION,
-        )?;
+        contention(&PUBLISH_LOAD_STATE)?;
         let dataset = self.dataset().await?;
         guard_stamp(&dataset)?;
         // ONE `__manifest` scan for everything the publish needs: table
@@ -935,6 +963,7 @@ impl GraphNamespacePublisher {
     }
 
     async fn merge_rows(&self, dataset: Dataset, rows: Vec<PendingVersionRow>) -> Result<Dataset> {
+        fail(&PUBLISH_PRE_MERGE)?;
         let batch = Self::pending_rows_to_batch(rows)?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], manifest_schema());
         let dataset = Arc::new(dataset);
@@ -960,6 +989,11 @@ impl GraphNamespacePublisher {
             .execute_reader(Box::new(reader))
             .await
             .map_err(map_lance_publish_error)?;
+        // The commit is durable and the graph is published; a failure here
+        // models the acknowledgement being lost after that (RFC 0067). It is
+        // an opaque error with no conflict details, so the publish loop's
+        // ambiguity arm reads the manifest back rather than reporting failure.
+        fail(&PUBLISH_POST_MERGE_PRE_ACK)?;
         Ok(Arc::try_unwrap(new_dataset).unwrap_or_else(|arc| (*arc).clone()))
     }
 
@@ -1039,6 +1073,24 @@ pub(crate) fn map_lance_publish_error(err: LanceError) -> OmniError {
         ));
     }
     OmniError::storage(err)
+}
+
+/// Construct the typed in-doubt outcome for an ambiguous manifest publish: an
+/// opaque error whose read-back could not itself complete, so whether the
+/// commit is durable is genuinely unknown. Distinct from an opaque storage
+/// error so a caller does not blindly retry a possibly-durable write; kind
+/// Internal, so the server surfaces it as a server-side unknown rather than a
+/// definitive conflict (RFC 0067).
+fn publish_outcome_in_doubt(
+    original: &OmniError,
+    graph_commit_id: &str,
+    cause: impl std::fmt::Display,
+) -> OmniError {
+    OmniError::manifest_publish_in_doubt(format!(
+        "manifest publish outcome is in doubt: graph commit {graph_commit_id} may be durable but \
+         it could not be confirmed ({cause}); reopen the graph and look that commit up before \
+         retrying a non-idempotent write. original error: {original}"
+    ))
 }
 
 #[async_trait]
@@ -1182,7 +1234,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 fold_graph_heads,
             )?;
 
-            match self.merge_rows(dataset, rows).await {
+            match self.merge_rows(dataset.clone(), rows).await {
                 Ok(new_dataset) => {
                     if new_dataset.version().version != new_manifest_version {
                         return Err(OmniError::manifest_internal(format!(
@@ -1204,6 +1256,107 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 Err(err) => {
                     if attempt < PUBLISHER_RETRY_BUDGET && is_retryable_publish_conflict(&err) {
                         continue;
+                    }
+                    // Ambiguity resolution (RFC 0067): a typed conflict (details
+                    // present) definitively did not land — surface it. An opaque
+                    // error may instead mean the `__manifest` merge-insert landed
+                    // durably and only its acknowledgement was lost (a dropped S3
+                    // 200), in which case the write is already graph-visible.
+                    // Since the stable lineage commit id is durably written into
+                    // the branch's `graph_head` row, read the manifest back and
+                    // check for it before reporting anything: returning an opaque
+                    // failure for a durable write invites a non-idempotent retry
+                    // to double-apply.
+                    let ambiguous = !matches!(&err, OmniError::Manifest(m) if m.details.is_some());
+                    if let (true, Some(intent)) = (ambiguous, lineage) {
+                        if let Err(readback_err) = fail(&PUBLISH_READ_BACK) {
+                            return Err(publish_outcome_in_doubt(
+                                &err,
+                                &intent.graph_commit_id,
+                                readback_err,
+                            ));
+                        }
+                        match dataset.checkout_version(new_manifest_version).await {
+                            Ok(reloaded) => match read_publish_scan(&reloaded).await {
+                                Ok(scan) => {
+                                    let branch_key =
+                                        intent.branch.as_deref().unwrap_or(MAIN_BRANCH_HEAD_KEY);
+                                    // Read the attempted immutable version on the captured
+                                    // native branch, even when another writer has moved HEAD.
+                                    let landed = scan.graph_heads.get(branch_key)
+                                        == Some(&intent.graph_commit_id)
+                                        && scan.lineage_rows.iter().any(|commit| {
+                                            commit.graph_commit_id == intent.graph_commit_id
+                                                && commit.graph_manifest_version
+                                                    == new_manifest_version
+                                                && commit.graph_branch == intent.branch
+                                                && commit.parent_commit_id == parent_commit_id
+                                                && commit.merged_parent_commit_id
+                                                    == intent.merged_parent_commit_id
+                                                && commit.actor_id == intent.actor_id
+                                                && commit.created_at == intent.created_at
+                                        });
+                                    if landed {
+                                        // Durable; only the ack was lost. Return
+                                        // the exact success outcome this attempt
+                                        // would have produced.
+                                        known_state.version = reloaded.version().version;
+                                        return Ok(PublishOutcome {
+                                            dataset: reloaded,
+                                            parent_commit_id,
+                                            known_state,
+                                            base_incarnation,
+                                            projection: Some(Box::new(projection)),
+                                        });
+                                    }
+                                    if scan.graph_heads.get(branch_key)
+                                        == Some(&intent.graph_commit_id)
+                                        || scan.lineage_rows.iter().any(|commit| {
+                                            commit.graph_commit_id == intent.graph_commit_id
+                                        })
+                                    {
+                                        return Err(publish_outcome_in_doubt(
+                                            &err,
+                                            &intent.graph_commit_id,
+                                            "attempted commit identity has inconsistent lineage",
+                                        ));
+                                    }
+                                    // This exact version belongs to a different commit.
+                                    // A moved latest HEAD alone would prove nothing.
+                                    return Err(err);
+                                }
+                                Err(scan_err) => {
+                                    return Err(publish_outcome_in_doubt(
+                                        &err,
+                                        &intent.graph_commit_id,
+                                        scan_err,
+                                    ));
+                                }
+                            },
+                            Err(readback_err) => {
+                                let version_absent = matches!(
+                                    readback_err,
+                                    LanceError::VersionNotFound { .. }
+                                        | LanceError::DatasetNotFound { .. }
+                                );
+                                let failed_before_any_store_request =
+                                    err.storage_failure().is_none();
+                                if version_absent
+                                    && failed_before_any_store_request
+                                    && matches!(
+                                        dataset.latest_version_id().await,
+                                        Ok(latest) if latest < new_manifest_version
+                                    )
+                                {
+                                    return Err(err);
+                                }
+                                return Err(publish_outcome_in_doubt(
+                                    &err,
+                                    &intent.graph_commit_id,
+                                    readback_err,
+                                ));
+                            }
+                        }
                     }
                     return Err(err);
                 }

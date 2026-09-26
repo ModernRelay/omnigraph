@@ -1313,6 +1313,102 @@ fn validate_type_constraints(
     Ok(())
 }
 
+/// Respell the bare endpoint references a legacy graph's edge constraints may
+/// carry (`@unique(src, dst)`) as the meta-fields every vintage accepts
+/// (`@unique(@src, @dst)`), byte-for-byte otherwise. A node's `src`/`dst` are
+/// user properties and stay; `@src` already spelled stays; bare `id` was never
+/// admissible in a constraint, so no `id` arm exists (RFC 0040 upgrade).
+pub fn respell_legacy_system_field_references(input: &str) -> Result<String> {
+    let pairs = SchemaParser::parse(Rule::schema_file, input)
+        .map_err(|error| CompilerError::Parse(pest_error_to_diagnostic(error).to_string()))?;
+    let mut insert_at = Vec::new();
+    for file in pairs {
+        for decl in file.into_inner() {
+            if decl.as_rule() != Rule::schema_decl {
+                continue;
+            }
+            for typed in decl.into_inner() {
+                let is_edge = match typed.as_rule() {
+                    Rule::node_decl => false,
+                    Rule::edge_decl => true,
+                    _ => continue,
+                };
+                for item in typed.into_inner() {
+                    if item.as_rule() != Rule::body_constraint {
+                        continue;
+                    }
+                    for part in item.into_inner() {
+                        if part.as_rule() != Rule::constraint_args {
+                            continue;
+                        }
+                        for arg in part.into_inner() {
+                            let Some(inner) = arg.into_inner().next() else {
+                                continue;
+                            };
+                            if inner.as_rule() != Rule::ident {
+                                continue;
+                            }
+                            let name = inner.as_str();
+                            let legacy = SYSTEM_COLUMNS_LEGACY;
+                            if is_edge && (name == legacy.src || name == legacy.dst) {
+                                insert_at.push(inner.as_span().start());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    insert_at.sort_unstable();
+    let mut output = String::with_capacity(input.len() + insert_at.len());
+    let mut cursor = 0;
+    for offset in insert_at {
+        output.push_str(&input[cursor..offset]);
+        output.push('@');
+        cursor = offset;
+    }
+    output.push_str(&input[cursor..]);
+    Ok(output)
+}
+
+#[cfg(test)]
+mod respell_tests {
+    use super::respell_legacy_system_field_references;
+
+    #[test]
+    fn respells_edge_endpoints_only() {
+        let source = "node Person {\n    src: String\n    name: String\n    @unique(src)\n    @key(name)\n}\nedge Knows: Person -> Person {\n    // endpoints\n    @unique(src, dst)\n    @index(@src)\n    weight: I32\n}\n";
+        let respelled = respell_legacy_system_field_references(source).unwrap();
+        assert_eq!(
+            respelled,
+            "node Person {\n    src: String\n    name: String\n    @unique(src)\n    @key(name)\n}\nedge Knows: Person -> Person {\n    // endpoints\n    @unique(@src, @dst)\n    @index(@src)\n    weight: I32\n}\n"
+        );
+        assert_eq!(
+            respell_legacy_system_field_references(&respelled).unwrap(),
+            respelled,
+            "respelling is idempotent"
+        );
+        super::parse_schema_for_vintage(&respelled, crate::catalog::schema_ir::SYSTEM_COLUMNS_V3)
+            .expect("the respelled source is admissible on the current vintage");
+        super::parse_schema_for_vintage(source, crate::catalog::schema_ir::SYSTEM_COLUMNS_LEGACY)
+            .expect("the legacy source is admissible on the legacy vintage");
+    }
+
+    #[test]
+    fn leaves_sources_without_system_references_untouched() {
+        let source = "node Person {\n    name: String @key\n}\nedge Knows: Person -> Person\n";
+        assert_eq!(
+            respell_legacy_system_field_references(source).unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn refuses_unparseable_source() {
+        assert!(respell_legacy_system_field_references("node {").is_err());
+    }
+}
+
 #[cfg(test)]
 #[path = "parser_tests.rs"]
 mod tests;

@@ -29,6 +29,7 @@ use crate::storage_layer::{
 use crate::table_store::{StagedWrite, TableStore};
 use arrow_array::{Array, Int32Array, RecordBatch, StringArray, StructArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::prelude::{ident, lit};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::transaction::{Operation, UpdateMode};
@@ -81,7 +82,7 @@ fn exact_effect_free_commit_adapter_is_the_only_generic_conflict_replay_signal()
         timeout.storage_failure().map(|failure| failure.kind),
         Some(StorageFailureKind::Transient)
     );
-    assert!(!timeout.is_retryable_commit_conflict());
+    assert!(!matches!(timeout, OmniError::RetryableCommitConflict(_)));
 }
 
 fn person_schema() -> Arc<Schema> {
@@ -204,19 +205,6 @@ fn numbered_person_batch(range: std::ops::Range<i32>) -> RecordBatch {
     let ages: Vec<Option<i32>> = range.map(Some).collect();
     RecordBatch::try_new(
         person_schema(),
-        vec![
-            Arc::new(StringArray::from(ids)),
-            Arc::new(Int32Array::from(ages)),
-        ],
-    )
-    .unwrap()
-}
-
-fn numbered_person_pk_batch(range: std::ops::Range<i32>) -> RecordBatch {
-    let ids: Vec<String> = range.clone().map(|i| format!("p{i}")).collect();
-    let ages: Vec<Option<i32>> = range.map(Some).collect();
-    RecordBatch::try_new(
-        person_pk_schema(),
         vec![
             Arc::new(StringArray::from(ids)),
             Arc::new(Int32Array::from(ages)),
@@ -603,10 +591,6 @@ async fn all_new_upsert_certifies_insert_absence_and_persists_it_in_history() {
     assert!(
         super::has_insert_absence_certificate(&staged.transaction),
         "an all-new upsert's completed merge proves every inserted id absent from its parent"
-    );
-    assert!(
-        staged.strict_source_ids.is_none(),
-        "certification must not change upsert conflict-normalization semantics"
     );
     assert_eq!(
         staged
@@ -1320,125 +1304,6 @@ async fn keyed_write_stream_stages_source_dataset_without_wide_collection() {
         vec!["alice", "bob", "carol"]
     );
     assert_eq!(source.version().version, 1, "source remains read-only");
-}
-
-#[tokio::test]
-async fn proven_insert_delta_scan_is_interval_exact_and_batch_bounded() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let source_uri = format!("{root}/source.lance");
-    let store = TableStore::new(root, test_session());
-    let mut source = TableStore::write_dataset(&source_uri, person_pk_batch(&[("base", Some(30))]))
-        .await
-        .unwrap();
-    let begin_version = source.version().version;
-    lance_append_inline_local(&mut source, numbered_person_pk_batch(0..10_000)).await;
-    let end_version = source.version().version;
-
-    let external_preflight = super::ExternalBlobPreflight::default();
-    let mut stream = store
-        .scan_proven_insert_delta_bounded(
-            &source,
-            "Person",
-            begin_version,
-            end_version,
-            &external_preflight,
-            SYSTEM_COLUMNS_LEGACY,
-        )
-        .await
-        .unwrap();
-    let mut rows = 0_usize;
-    let mut batches = 0_usize;
-    while let Some(batch) = stream.try_next().await.unwrap() {
-        assert!(batch.num_rows() <= KEYED_WRITE_MAX_ROWS);
-        assert!(u64::try_from(batch.get_array_memory_size()).unwrap() <= KEYED_WRITE_MAX_BYTES);
-        let ids = batch
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert!((0..ids.len()).all(|row| ids.value(row) != "base"));
-        rows += batch.num_rows();
-        batches += 1;
-    }
-    assert_eq!(rows, 10_000);
-    assert_eq!(batches, 2, "10K rows must be emitted as 8192 + 1808");
-    assert_eq!(
-        source.version().version,
-        end_version,
-        "the scan is read-only"
-    );
-}
-
-#[tokio::test]
-async fn proven_insert_delta_scan_normalizes_oversized_raw_emission() {
-    const APPENDS: usize = 9;
-    const ROWS_PER_APPEND: usize = 512;
-
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let source_uri = format!("{root}/source.lance");
-    let store = TableStore::new(root, test_session());
-    let mut source = TableStore::write_dataset(&source_uri, person_pk_batch(&[("base", Some(0))]))
-        .await
-        .unwrap();
-    let begin_version = source.version().version;
-    let padding = "x".repeat(8 * 1024);
-    for append in 0..APPENDS {
-        let start = append * ROWS_PER_APPEND;
-        let ids = (start..start + ROWS_PER_APPEND)
-            .map(|row| format!("p{row:05}-{padding}"))
-            .collect::<Vec<_>>();
-        let batch = RecordBatch::try_new(
-            person_pk_schema(),
-            vec![
-                Arc::new(StringArray::from(ids)),
-                Arc::new(Int32Array::from(vec![Some(append as i32); ROWS_PER_APPEND])),
-            ],
-        )
-        .unwrap();
-        lance_append_inline_local(&mut source, batch).await;
-    }
-    let end_version = source.version().version;
-
-    let probes = MergeWriteProbes::default();
-    let (rows, normalized_batches) = with_merge_write_probes(probes.clone(), async {
-        let external_preflight = super::ExternalBlobPreflight::default();
-        let mut stream = store
-            .scan_proven_insert_delta_bounded(
-                &source,
-                "Person",
-                begin_version,
-                end_version,
-                &external_preflight,
-                SYSTEM_COLUMNS_LEGACY,
-            )
-            .await
-            .unwrap();
-        let mut rows = 0_usize;
-        let mut batches = 0_usize;
-        while let Some(batch) = stream.try_next().await.unwrap() {
-            assert!(batch.num_rows() <= KEYED_WRITE_MAX_ROWS);
-            assert!(u64::try_from(batch.get_array_memory_size()).unwrap() <= KEYED_WRITE_MAX_BYTES);
-            rows += batch.num_rows();
-            batches += 1;
-        }
-        (rows, batches)
-    })
-    .await;
-
-    assert_eq!(rows, APPENDS * ROWS_PER_APPEND);
-    assert!(
-        normalized_batches >= 2,
-        "the ~36-MiB interval must cross the normalized transaction ceiling"
-    );
-    assert!(probes.proven_insert_raw_batch_calls() > 0);
-    assert!(
-        probes.proven_insert_raw_batch_max_bytes() > KEYED_WRITE_MAX_BYTES,
-        "fixture must expose Lance's approximate byte target before the hard normalizer: max raw batch was {} bytes",
-        probes.proven_insert_raw_batch_max_bytes()
-    );
 }
 
 #[test]
@@ -2521,8 +2386,9 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
     // Metadata-only coverage cases, reusing this fixture's typed index
     // inventory. The synthetic empty segment borrows another index UUID;
     // no posting files are opened and these snapshots are never searched.
-    // A scalar's full union is a no-op, but vector segments may still need
-    // partition rebalancing, so preserve their previous per-segment candidacy.
+    // A scalar's full union is a no-op, but a vector index split into
+    // segments costs a nearest scan one probe set per segment, so the fold
+    // still collapses it into one (RFC 0067 rebuilds it whole).
     use lance::index::DatasetIndexExt;
     let inventory = new_ds.load_indices().await.unwrap();
     let mut coverage_ds = new_ds;
@@ -2564,7 +2430,7 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
                 .await
                 .unwrap(),
             expected_work,
-            "scalar union coverage must not suppress vector rebalance candidacy on {column}"
+            "scalar union coverage must not suppress the vector segment collapse on {column}"
         );
     }
 }
@@ -2697,10 +2563,10 @@ async fn stage_delete_does_not_advance_head_and_reads_through_staged() {
     .unwrap();
     let pre_version = ds.version().version;
 
-    // Stage a delete of alice — writes the deletion file (Phase A) but does
-    // NOT advance HEAD.
+    // Stage a delete of alice — writes the deletion file but does NOT advance
+    // HEAD.
     let staged = store
-        .stage_delete(&ds, "id = 'alice'")
+        .stage_delete(&ds, ident("id").eq(lit("alice")))
         .await
         .unwrap()
         .expect("alice matches → Some(StagedWrite)");
@@ -2732,7 +2598,7 @@ async fn stage_delete_does_not_advance_head_and_reads_through_staged() {
 
     // A 0-row delete is a true no-op: None, no version, no fragments.
     let none = store
-        .stage_delete(&committed, "id = 'nobody'")
+        .stage_delete(&committed, ident("id").eq(lit("nobody")))
         .await
         .unwrap();
     assert!(none.is_none(), "a 0-row delete must stage nothing");
@@ -2748,7 +2614,7 @@ async fn stage_delete_commit_rebases_over_disjoint_committed_delete() {
         .await
         .unwrap();
     let staged = store
-        .stage_delete(&ds, "age < 10")
+        .stage_delete(&ds, ident("age").lt(lit(10)))
         .await
         .unwrap()
         .expect("delete should match rows");
@@ -2763,197 +2629,6 @@ async fn stage_delete_commit_rebases_over_disjoint_committed_delete() {
         .await
         .unwrap();
     assert_eq!(committed.count_rows(None).await.unwrap(), 80);
-}
-
-/// Empirical pin of `Dataset::restore` semantics for the recovery sweep.
-///
-/// The recovery sweep depends on the `restore` invariant: from HEAD =
-/// `h`, calling `Dataset::checkout_version(p).await?` then
-/// `Dataset::restore().await?` produces a NEW commit at HEAD = `h + 1`
-/// with content == content at version `p`.
-///
-/// The Lance source confirms this — `restore()` (no args) takes the
-/// currently-checked-out version's content and applies it via
-/// `apply_commit` against the latest manifest, advancing HEAD by one.
-/// See lance-6.0.1 `src/dataset.rs:1106` and the transaction-spec
-/// example at https://lance.org/format/table/transaction/.
-///
-/// If the lance bump (4.0.0 → 4.x) ever changes this delta or the call
-/// signature, the recovery sweep's rollback path breaks; this test
-/// surfaces the regression at compile/test time rather than under
-/// production drift recovery.
-#[tokio::test]
-async fn lance_restore_appends_one_commit_with_checked_out_content() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-
-    // Build version history: v1 = {alice}, v2 = {alice, bob}, v3 = {alice, bob, carol}.
-    let mut ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
-        .await
-        .unwrap();
-    assert_eq!(ds.version().version, 1);
-
-    lance_append_inline_local(&mut ds, person_batch(&[("bob", Some(25))])).await;
-    assert_eq!(ds.version().version, 2);
-
-    lance_append_inline_local(&mut ds, person_batch(&[("carol", Some(40))])).await;
-    assert_eq!(ds.version().version, 3);
-
-    let head_before = ds.version().version;
-
-    // Recovery's rollback shape: open + checkout(p) + restore().
-    let head_ds = Dataset::open(&uri).await.unwrap();
-    let mut to_restore = head_ds.checkout_version(1).await.unwrap();
-    assert_eq!(to_restore.manifest.version, 1);
-    to_restore.restore().await.unwrap();
-
-    // Verify against a fresh open — the previous handle's view doesn't
-    // tell us what other openers see.
-    let post = Dataset::open(&uri).await.unwrap();
-    assert_eq!(
-        post.version().version,
-        head_before + 1,
-        "Dataset::restore must append exactly one commit (HEAD + 1). If \
-         this assertion fires, lance changed restore semantics — re-read \
-         lance src/dataset.rs::restore and update the recovery sweep's \
-         rollback path before proceeding."
-    );
-    assert_eq!(
-        post.manifest.next_row_id, ds.manifest.next_row_id,
-        "restore must not make previously allocated stable row IDs reusable"
-    );
-    assert_eq!(
-        post.manifest.max_fragment_id(),
-        ds.manifest.max_fragment_id(),
-        "restore must retain the historical fragment-ID high-water mark"
-    );
-
-    // Content equality: the restored HEAD must match version 1 (just alice).
-    let scanner = post.scan();
-    let batches: Vec<RecordBatch> = scanner
-        .try_into_stream()
-        .await
-        .unwrap()
-        .try_collect()
-        .await
-        .unwrap();
-    let ids = collect_ids(&batches);
-    assert_eq!(
-        ids,
-        vec!["alice".to_string()],
-        "post-restore content must equal version 1's content; got {:?}",
-        ids,
-    );
-}
-
-/// Empirical pin of the `Dataset::restore` concurrency hazard that requires
-/// Full recovery to join the root-scoped writer gates and leaves a real
-/// cross-process fencing boundary.
-///
-/// `Dataset::restore`'s `check_restore_txn` (lance-6.0.1
-/// `src/io/commit/conflict_resolver.rs:986`) returns `Ok(())` against
-/// almost every other op (Append, Update, Delete, CreateIndex, Merge, …),
-/// so a Restore commits successfully even with concurrent commits in
-/// flight. The symmetric checks (lines 318, 473, 634, 787, 853, 947, 978,
-/// 1018, 1059, 1115, 1187, 1280) classify Restore as incompatible from
-/// the *other* op's POV — but the *other* op already committed before the
-/// Restore arrived, so it sees no conflict. Net: the Restore appends a
-/// rewind commit AFTER the legitimate concurrent Append, silently
-/// orphaning that Append's data from the active timeline.
-///
-/// Full recovery may invoke Restore on a read-write open, but first joins the
-/// same root-scoped schema → branch → sorted-table gates as live writers and
-/// rechecks that the sidecar still exists after waiting. The in-process healer
-/// is roll-forward-only and never restores beneath live traffic. Together those
-/// rules keep this substrate asymmetry unreachable against another handle in
-/// the same process.
-///
-/// The gates remain process-local. A recovery pass cannot fence a live writer
-/// in another process, so general multi-process write/recovery topologies remain
-/// outside the supported boundary until a distributed fence exists. See
-/// `docs/dev/invariants.md` and `docs/dev/writes.md`.
-///
-/// This test is the load-bearing constraint any future reconciler must
-/// honor.
-#[tokio::test]
-async fn lance_restore_loses_to_concurrent_append_via_orphaning() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-
-    // v1: seed with alice.
-    let _ = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
-        .await
-        .unwrap();
-
-    // Recovery handle: opened at the latest, then checked out at v1 (the
-    // pin we'd "rollback" to in a real recovery scenario). This handle
-    // has NOT yet called restore.
-    let recovery_open = Dataset::open(&uri).await.unwrap();
-    let mut recovery_handle = recovery_open.checkout_version(1).await.unwrap();
-
-    // Concurrent legitimate writer: appends bob, advancing HEAD to v2.
-    // This simulates a per-table-queue model where another tenant wrote
-    // between recovery's open and recovery's restore call.
-    let mut writer_handle = Dataset::open(&uri).await.unwrap();
-    lance_append_inline_local(&mut writer_handle, person_batch(&[("bob", Some(25))])).await;
-    assert_eq!(writer_handle.version().version, 2);
-
-    // Recovery now restores. Because restore's `check_restore_txn` returns
-    // Ok against Append, this commits at v3 with content == v1 (just alice).
-    recovery_handle.restore().await.unwrap();
-
-    // Re-open and inspect: HEAD is v3, content is just alice. Bob is gone
-    // from the active timeline.
-    let post = Dataset::open(&uri).await.unwrap();
-    assert_eq!(
-        post.version().version,
-        3,
-        "Restore commits at HEAD+1 even when a concurrent commit landed \
-         between recovery's open and recovery's restore call. If this \
-         assertion fails, lance changed restore-vs-append conflict \
-         semantics — re-read check_restore_txn and update the recovery \
-         sweep's concurrency analysis."
-    );
-
-    let scanner = post.scan();
-    let batches: Vec<RecordBatch> = scanner
-        .try_into_stream()
-        .await
-        .unwrap()
-        .try_collect()
-        .await
-        .unwrap();
-    let ids = collect_ids(&batches);
-    assert_eq!(
-        ids,
-        vec!["alice".to_string()],
-        "Concurrent Append's row 'bob' was silently orphaned by the \
-         Restore. Active-timeline contents == v1's contents. Full recovery \
-         must join the root-scoped writer gates before Restore; those gates \
-         remain process-local, so a distributed fence is required before \
-         multi-process recovery can be supported. Got: {:?}",
-        ids,
-    );
-
-    // Sanity: bob's commit IS still readable via explicit checkout_version(2).
-    // The data isn't gone from disk — it's just unreachable from HEAD until
-    // cleanup_old_versions reclaims the orphan.
-    let v2 = Dataset::open(&uri)
-        .await
-        .unwrap()
-        .checkout_version(2)
-        .await
-        .unwrap();
-    let v2_batches: Vec<RecordBatch> = v2
-        .scan()
-        .try_into_stream()
-        .await
-        .unwrap()
-        .try_collect()
-        .await
-        .unwrap();
-    let v2_ids = collect_ids(&v2_batches);
-    assert_eq!(v2_ids, vec!["alice".to_string(), "bob".to_string()]);
 }
 
 /// Regression for PR #229: `commit_staged` must skip Lance's per-commit

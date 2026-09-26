@@ -31,9 +31,9 @@ same triage rights as applying the real one. Run from the repository root:
 AGENTS.md and git are resolved relative to the working directory.
 
 A closed issue N is satisfied by a regression that is added or
-strengthened. Corpus shape: a `.gqt` case named `issue_N_*` at the top
-level of the logic-test corpus, new, or modified with at least one added
-body line (a line that is neither a `#` header line nor a `//` comment).
+strengthened. Corpus shape: a regular `.gqt` case named `issue_N_*` anywhere
+under the logic-test corpus, with no hidden path components. It must be new
+or modified with at least one added body line (a line that is neither a `#` header line nor a `//` comment).
 Rust shapes, in a top-level test target `<crates|tools>/*/tests/<name>.rs`
 or an in-source module under `<crates|tools>/*/src/`: an added test
 definition, a function whose name carries `issue_N`, with an added
@@ -55,7 +55,7 @@ under a crate, a rustdoc-only change) satisfy it only through the
 differs by shape: a corpus match ran green in the required `GQ Logic
 Tests` job; a Rust match is a test-attributed definition or an edit inside
 one, not a run. A pull request runs every workspace test target in `Test
-Workspace`, a reporting context the gate does not consult, and workspace
+Workspace`, a required context the gate does not consult, and workspace
 clippy refuses an unreferenced private function but not an `#[ignore]`d or
 cfg-gated one, so whether that test runs in the suite and asserts the right
 thing stays with review.
@@ -70,7 +70,7 @@ asserts nothing, are deliberate and stay with review.
 
 A failure names the code paths that made the gate look, the ways through,
 any near miss the diff holds (a case whose header says `# issue: N` under
-another name or a subdirectory; a test named with the bare number, moved
+another name or a hidden path; a test named with the bare number, moved
 rather than added, under a leading `_`, or in a helper module; a function
 named for the issue with no added test attribute directly above it), and a
 case skeleton, as a log line and as a GitHub `::error` annotation. The
@@ -284,13 +284,18 @@ def issue_satisfied(
     removed_fns: frozenset[str] | set[str] = frozenset(),
     positioned: list[tuple[str, int, str]] = (),
     read_file=None,
+    corpus_files: set[str] | None = None,
 ) -> bool:
     token = issue_token(n)
+
+    def runnable_case(path: str) -> bool:
+        return corpus_case(path) and (corpus_files is None or path in corpus_files)
+
     for path in files:
-        if corpus_case(path) and Path(path).name.startswith(f"issue_{n}_"):
+        if runnable_case(path) and Path(path).name.startswith(f"issue_{n}_"):
             return True
     for i, (path, text) in enumerate(lines):
-        if corpus_case(path):
+        if runnable_case(path):
             # A strengthened case: a body line added to a case named for the
             # issue, new or modified. Header (`#`) and GQ comment (`//`)
             # lines carry no assertion. (An added `# issue: N` header line
@@ -327,7 +332,7 @@ def near_misses(
 ) -> list[str]:
     """What the diff holds that almost satisfies issue `n`, named in the
     failure and never credited: a corpus case whose header says
-    `# issue: n` under another name or under a subdirectory; a test named
+    `# issue: n` under another name or a hidden path; a test named
     with the bare number, moved rather than added, under a leading `_`, or
     in a helper module; a function named for the issue with no added test
     attribute directly above it."""
@@ -343,11 +348,12 @@ def near_misses(
                 continue
             stem = CASE_ISSUE_STEM.sub("", name[: -len(".gqt")]).lower()
             short = re.sub(r"[^a-z0-9_]", "_", stem)
-            target = f"{CORPUS_DIR_PREFIX}issue_{n}_{short or '<short_name>'}.gqt"
+            directory = str(Path(path).parent) + "/" if corpus_case(path) else CORPUS_DIR_PREFIX
+            target = f"{directory}issue_{n}_{short or '<short_name>'}.gqt"
             if not corpus_case(path):
                 hints.append(
-                    f"`{path}` carries `# issue: {n}` but the corpus runs top-level "
-                    f"`.gqt` files only; move it to `{target}`"
+                    f"`{path}` carries `# issue: {n}` but the corpus excludes hidden "
+                    f"or invalid path components; move it to `{target}`"
                 )
             elif not name.startswith(f"issue_{n}_") or name == f"issue_{n}_.gqt":
                 hints.append(
@@ -540,14 +546,45 @@ def test_attributed(lines: list[tuple[str, str]], i: int) -> bool:
 
 
 def corpus_case(path: str) -> bool:
-    """A case is a top-level corpus file whose name ends in `.gqt` and does
-    not start with `.`: the name half of the rule the corpus target's
-    `datatest_stable::harness!` pattern applies
-    (`crates/omnigraph-gqt/tests/gq_logic_tests.rs`, mirrored by `list_cases`
-    in `src/lib.rs`), so nothing the gate credits can be a file the target
-    never runs. Both self-tests walk one name battery."""
+    """The recursive corpus name rule; Git modes separately exclude symlinks."""
     rest = path[len(CORPUS_DIR_PREFIX) :] if path.startswith(CORPUS_DIR_PREFIX) else ""
-    return bool(rest) and "/" not in rest and rest.endswith(".gqt") and not rest.startswith(".")
+    try:
+        rest.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return (
+        rest.endswith(".gqt")
+        and all(part and not part.startswith(".") for part in rest.split("/"))
+    )
+
+
+def parse_corpus_tree(tree: str) -> set[str]:
+    """Regular visible cases from NUL-separated `git ls-tree -r` records."""
+    cases = set()
+    for record in tree.split("\0"):
+        metadata, separator, path = record.partition("\t")
+        fields = metadata.split()
+        if (
+            separator
+            and len(fields) == 3
+            and fields[0] in {"100644", "100755"}
+            and fields[1] == "blob"
+            and corpus_case(path)
+        ):
+            cases.add(path)
+    return cases
+
+
+def head_corpus_cases(range_: str) -> set[str]:
+    head = range_.split("...")[-1].split("..")[-1] or "HEAD"
+    result = subprocess.run(
+        ["git", "ls-tree", "-r", "-z", head, "--", CORPUS_DIR_PREFIX],
+        check=True,
+        capture_output=True,
+        text=True,
+        errors="surrogateescape",
+    )
+    return parse_corpus_tree(result.stdout)
 
 
 def check_agents_md() -> bool:
@@ -586,6 +623,7 @@ def run_gate(body: str, labels: list[str], range_: str, repo: str | None) -> int
             return 0 if ok else 1
         files = added_files(range_)
         lines, removed, positioned = diff_changes(range_)
+        corpus_files = head_corpus_cases(range_)
     except subprocess.CalledProcessError as e:
         stderr = (e.stderr or "").strip()
         print(f"FAIL: git diff {range_} failed: {stderr or e}")
@@ -599,7 +637,7 @@ def run_gate(body: str, labels: list[str], range_: str, repo: str | None) -> int
                 "inside an existing test there cannot count as a strengthened regression"
             )
     for n in issues:
-        if issue_satisfied(n, files, lines, removed_fns, positioned, read_file):
+        if issue_satisfied(n, files, lines, removed_fns, positioned, read_file, corpus_files):
             print(f"ok: issue #{n} has a matching regression addition")
         else:
             message = failure_message(n, code_paths, near_misses(n, lines, removed_fns))
@@ -672,6 +710,21 @@ def self_test() -> int:
             raise AssertionError(f"parse_repo({bad!r}) accepted")
     corpus = "crates/omnigraph-gqt/cases/issue_563_x.gqt"
     rust = "crates/omnigraph/tests/search.rs"
+    nested = CORPUS_DIR_PREFIX + "v2/planner/issue_563_nested.gqt"
+    linked = CORPUS_DIR_PREFIX + "v2/issue_563_link.gqt"
+    hidden_case = CORPUS_DIR_PREFIX + ".hidden/issue_563_case.gqt"
+    modes = parse_corpus_tree(
+        f"100644 blob abc\t{corpus}\0"
+        f"100755 blob abc\t{nested}\0"
+        f"120000 blob abc\t{linked}\0"
+        f"100644 blob abc\t{hidden_case}\0"
+        f"160000 commit abc\t{CORPUS_DIR_PREFIX}submodule.gqt\0"
+    )
+    assert modes == {corpus, nested}, modes
+    assert issue_satisfied("563", [nested], [], corpus_files=modes)
+    assert issue_satisfied("563", [], [(nested, '{"n": 1}')], corpus_files=modes)
+    assert not issue_satisfied("563", [linked], [], corpus_files=modes)
+    assert not issue_satisfied("563", [], [(linked, "target.gqt")], corpus_files=modes)
     assert issue_satisfied("563", [corpus], [])
     assert not issue_satisfied("563", ["crates/omnigraph/tests/fixtures/issue_563_x.gqt"], [])
     assert not issue_satisfied("563", ["crates/omnigraph/tests/repro_issue_563.rs"], [])
@@ -729,7 +782,7 @@ def self_test() -> int:
     assert not issue_satisfied(
         "563", ["crates/omnigraph-cli/tests/gq_logic_tests/issue_563_x.gqt"], []
     )
-    assert not issue_satisfied(
+    assert issue_satisfied(
         "563", ["crates/omnigraph-gqt/cases/nested/issue_563_x.gqt"], []
     )
     assert not issue_satisfied(
@@ -747,7 +800,15 @@ def self_test() -> int:
         (".hidden.gqt", False),
         (".DS_Store", False),
         ("c.GQT", False),
-        ("nested/d.gqt", False),
+        ("nested/d.gqt", True),
+        ("v2/planner/d.gqt", True),
+        (".hidden/d.gqt", False),
+        ("v2/.hidden/d.gqt", False),
+        ("v2/.hidden.gqt", False),
+        ("v2/../d.gqt", False),
+        ("v2//d.gqt", False),
+        ("/d.gqt", False),
+        ("invalid_\udcff.gqt", False),
     ]:
         got = corpus_case(CORPUS_DIR_PREFIX + name)
         assert got == expected, f"corpus_case({name!r}) = {got}, expected {expected}"
@@ -1056,7 +1117,11 @@ def self_test() -> int:
     assert near_misses("563", [("crates/omnigraph-gqt/cases/README.md", "# issue: 563")]) == []
     assert "issue_563_<short_name>.gqt" in near_misses("563", [("crates/omnigraph-gqt/cases/issue_563.gqt", "# issue: 563")])[0]
     hints = near_misses("563", [("crates/omnigraph-gqt/cases/traversal/issue_563_x.gqt", "# issue: 563")])
-    assert len(hints) == 1 and "top-level" in hints[0] and "cases/issue_563_x.gqt" in hints[0], hints
+    assert hints == [], hints
+    hints = near_misses("563", [("crates/omnigraph-gqt/cases/v2/planner/wrong.gqt", "# issue: 563")])
+    assert len(hints) == 1 and "cases/v2/planner/issue_563_wrong.gqt" in hints[0], hints
+    hints = near_misses("563", [("crates/omnigraph-gqt/cases/v2/.hidden/issue_563_x.gqt", "# issue: 563")])
+    assert len(hints) == 1 and "excludes hidden" in hints[0], hints
     hints = near_misses("563", [(rust, "#[test]"), (rust, "fn bm25_underfill_563() {")])
     assert len(hints) == 1 and "bare number" in hints[0], hints
     assert near_misses("563", [(rust, "fn bm25_underfill_563() {")]) == []

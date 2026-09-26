@@ -1,0 +1,97 @@
+# issue: none
+# notes: Show values and their sources across set, reset and scoped prefixes.
+# notes: Debug builds start merge_lineage at verify; its declared default is on.
+# notes: Pin engine to v1 so show all is identical under either runner baseline.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+
+--- mutate
+set engine = v1;
+
+--- expect ok
+
+--- query
+show all;
+
+--- expect ordered
+{"name": "engine", "value": "v1", "default": "v1", "source": "file", "scope": "request"}
+{"name": "rrf_plan", "value": "auto", "default": "auto", "source": "default", "scope": "process"}
+{"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}
+{"name": "ann_nprobes", "value": "20", "default": "20", "source": "default", "scope": "request"}
+{"name": "stage_write_concurrency", "value": "8", "default": "8", "source": "default", "scope": "process"}
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}
+
+--- mutate
+set merge_lineage = off;
+
+--- expect ok
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "off", "default": "on", "source": "file", "scope": "request"}
+
+--- mutate
+reset merge_lineage;
+
+--- expect ok
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}
+
+--- mutate
+set merge_lineage = off;
+set merge_lineage = on;
+
+--- expect ok
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "on", "default": "on", "source": "file", "scope": "request"}
+
+--- query
+set merge_lineage = off;
+reset all;
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "on", "default": "on", "source": "file", "scope": "request"}
+
+--- mutate
+reset all;
+
+--- expect ok
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}

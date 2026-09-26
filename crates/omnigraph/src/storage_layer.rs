@@ -38,8 +38,7 @@
 //! `schema_apply` onto the staged surface). Phase 1b (call-site
 //! conversion) and Phase 9 landed in MR-854, which made `db.storage()`
 //! staged-only. The exact EnsureIndices adapter later retired the final
-//! inline-commit residual. Phase 7 (recovery reconciler) shipped as MR-847;
-//! Phase 8 (index reconciler) is tracked as MR-848.
+//! inline-commit residual. Phase 8 (index reconciler) is tracked as MR-848.
 
 pub(crate) mod lance_clone;
 
@@ -50,6 +49,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::prelude::Expr;
 use lance::Dataset;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
 #[cfg(test)]
@@ -220,6 +220,15 @@ impl ProvenInsertChunk {
 
 // ─── opaque handles ────────────────────────────────────────────────────────
 
+/// Outcome of replaying a detached transaction at its linear target, in the
+/// storage boundary's own terms (RFC 0067).
+#[derive(Debug)]
+pub enum PromotionOutcome {
+    Landed(SnapshotHandle),
+    Refused,
+    Unsafe(String),
+}
+
 /// Opaque handle to a snapshot of a single sub-table dataset at a
 /// specific version.
 ///
@@ -318,28 +327,18 @@ impl StagedHandle {
         self.inner.transaction_identity()
     }
 
-    /// Remove the exact strict-insert ids before the staged transaction is
-    /// consumed by commit. They are retained only for the fresh-authority
-    /// conflict re-probe; Lance's commit packet does not consume them.
-    pub(crate) fn take_strict_source_ids(&mut self) -> Option<Vec<String>> {
-        self.inner.take_strict_source_ids()
-    }
-
-    /// Replace Lance's random transaction UUID with the identity durably armed
-    /// before a deferred first-touch fork. The read version must still match.
-    pub(crate) fn bind_transaction_identity(
-        &mut self,
-        planned: &StagedTransactionIdentity,
-    ) -> Result<()> {
-        self.inner.bind_transaction_identity(planned)
+    /// Record the ids a staged delete removes on its transaction; see
+    /// `StagedWrite::record_deleted_ids`.
+    pub(crate) async fn record_deleted_ids(&mut self, ds: &Dataset, ids: &[String]) -> Result<()> {
+        self.inner.record_deleted_ids(ds, ids).await
     }
 }
 
-/// Result of the no-conflict-retry commit path used by RFC-022-enrolled
-/// writers. `is_exact` checks both transaction identity and achieved version:
-/// Lance's initial conflict-resolution pass can preserve `(read_version, uuid)`
-/// while committing at a later version. The table effect is durable when that
-/// happens, so the caller must leave its recovery sidecar armed.
+/// Result of the no-conflict-retry linear commit path. `is_exact` checks both
+/// transaction identity and achieved version: Lance's initial
+/// conflict-resolution pass can preserve `(read_version, uuid)` while
+/// committing at a later version. The table effect is durable when that
+/// happens, so the caller must not treat the outcome as effect-free.
 #[derive(Debug)]
 pub struct ExactCommitOutcome {
     snapshot: SnapshotHandle,
@@ -351,18 +350,6 @@ impl ExactCommitOutcome {
     pub fn is_exact(&self) -> bool {
         self.planned_transaction == self.committed_transaction
             && self.snapshot.version() == self.planned_transaction.read_version + 1
-    }
-
-    pub fn planned_transaction(&self) -> &StagedTransactionIdentity {
-        &self.planned_transaction
-    }
-
-    pub fn committed_transaction(&self) -> &StagedTransactionIdentity {
-        &self.committed_transaction
-    }
-
-    pub fn committed_version(&self) -> u64 {
-        self.snapshot.version()
     }
 
     pub fn into_snapshot(self) -> SnapshotHandle {
@@ -414,22 +401,13 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         branch: Option<&str>,
     ) -> Result<SnapshotHandle>;
 
-    /// Native identity of the branch backing an already-open snapshot. Used
-    /// by recovery-enrolled first-touch effects to confirm the exact ref they
-    /// created, closing delete/recreate ABA during later recovery.
+    /// Native identity of the branch backing an already-open snapshot. Branch
+    /// merge uses it to bind a proven source interval and its target to the
+    /// exact native ref incarnation, closing delete/recreate ABA.
     async fn branch_identifier(
         &self,
         snapshot: &SnapshotHandle,
     ) -> Result<lance::dataset::refs::BranchIdentifier>;
-
-    async fn fork_branch_from_state(
-        &self,
-        dataset_uri: &str,
-        source_branch: Option<&str>,
-        table_key: &str,
-        source_version: u64,
-        target_branch: &str,
-    ) -> Result<SnapshotHandle>;
 
     /// Idempotent branch-tree reclaim used by the best-effort fork cleanup
     /// under branch delete (`db/omnigraph.rs::cleanup_deleted_branch_tables`)
@@ -445,14 +423,6 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     /// branch set to find orphaned per-table forks. `main`/default is not a
     /// named branch and never appears here.
     async fn list_native_branches(&self, dataset_uri: &str) -> Result<Vec<String>>;
-
-    async fn reopen_for_mutation(
-        &self,
-        dataset_uri: &str,
-        branch: Option<&str>,
-        table_key: &str,
-        expected_version: u64,
-    ) -> Result<SnapshotHandle>;
 
     fn ensure_expected_version(
         &self,
@@ -478,6 +448,15 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         filter: Option<&str>,
         order_by: Option<Vec<ColumnOrdering>>,
         with_row_id: bool,
+    ) -> Result<Vec<RecordBatch>>;
+
+    /// `scan` under a typed DataFusion filter, the form the mutation path
+    /// builds from a GQ `where`; no SQL text is rendered.
+    async fn scan_filtered(
+        &self,
+        snapshot: &SnapshotHandle,
+        projection: Option<&[&str]>,
+        filter: Expr,
     ) -> Result<Vec<RecordBatch>>;
 
     async fn scan_batches(&self, snapshot: &SnapshotHandle) -> Result<Vec<RecordBatch>>;
@@ -508,7 +487,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         pending: &[RecordBatch],
         pending_schema: Option<SchemaRef>,
         projection: Option<&[&str]>,
-        filter: Option<&str>,
+        filter: Option<Expr>,
         key_column: Option<&str>,
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>>;
@@ -523,7 +502,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         snapshot: &SnapshotHandle,
         pending: &[RecordBatch],
         pending_schema: Option<SchemaRef>,
-        filter: Option<&str>,
+        filter: Option<Expr>,
         key_column: Option<&str>,
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>>;
@@ -531,7 +510,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     async fn first_row_id_for_filter(
         &self,
         snapshot: &SnapshotHandle,
-        filter: &str,
+        filter: Expr,
         system_columns: SystemColumns,
     ) -> Result<Option<u64>>;
 
@@ -553,6 +532,23 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     /// [`Self::commit_staged_create_exact`] succeeds.
     async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedHandle>;
 
+    /// RFC 0067: stage one detached-ready compaction rewrite of the pinned
+    /// base, or `None` when there is nothing to compact.
+    async fn stage_compaction(
+        &self,
+        snapshot: &SnapshotHandle,
+        options: &lance::dataset::optimize::CompactionOptions,
+    ) -> Result<Option<(StagedHandle, lance::dataset::optimize::CompactionMetrics)>>;
+
+    /// RFC 0067: stage one detached-ready fold of every foldable index whose
+    /// coverage lags the fragments, each rebuilt whole under its name; `None`
+    /// when every index is current. The second value names the vector
+    /// columns whose index could not be trained.
+    async fn stage_index_fold(
+        &self,
+        snapshot: &SnapshotHandle,
+    ) -> Result<(Option<StagedHandle>, Vec<(String, String)>)>;
+
     /// Atomically create version 1 from a staged read-version-0 transaction.
     /// Lance conflict retries are disabled so a concurrently-created dataset
     /// is rejected rather than overwritten.
@@ -566,7 +562,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
     /// Resolve bounded keyed-source inputs that require pre-stage I/O (today,
     /// absolute blob URIs) without writing Lance files or advancing HEAD.
-    /// Deferred first-touch writers call this before recovery arm because the
+    /// Deferred first-touch writers call this before their fork because the
     /// target ref needed by `stage_keyed_write` does not exist yet.
     async fn prepare_keyed_write_batch(
         &self,
@@ -602,7 +598,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     /// Validate the physical key contract shared by every v6 graph-table
     /// write batch: exact Utf8 `id`, no nulls, and no duplicate ids within the
     /// batch. Callers preparing a deferred first-touch or Overwrite plan must
-    /// invoke this before recovery is armed or a native branch ref is created.
+    /// invoke this before a native branch ref is created.
     fn validate_keyed_write_batch(
         &self,
         table_key: &str,
@@ -675,8 +671,8 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     ) -> Result<StagedHandle>;
 
     /// Blob-aware full-row stream with an explicit batch ceiling. Branch
-    /// adoption uses this to turn a large all-new delta into an exact recovery
-    /// chain of bounded fenced writes instead of one delta-wide hash join.
+    /// adoption uses this to turn a large all-new delta into an exact chain of
+    /// bounded fenced writes instead of one delta-wide hash join.
     async fn scan_stream_for_rewrite_bounded(
         &self,
         source: &SnapshotHandle,
@@ -684,19 +680,14 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         batch_bytes: u64,
     ) -> Result<SendableRecordBatchStream>;
 
-    /// Stream a provenance-proven pure-insert source interval as bounded
-    /// full-row batches for the existing per-chunk strict keyed writer.
-    /// `source` must be pinned at `end_version`; only rows whose
-    /// `_row_created_at_version` lies in `(begin_version, end_version]` are
-    /// emitted. Blob materialization consumes the caller's operation-wide
-    /// external-source proof, so it never repeats policy checks or HEADs per
-    /// row. This read-only primitive writes no files and advances no HEAD.
+    /// Stream only the proven rows of a pure-insert source interval (`source`
+    /// pinned at its end) as bounded full-row batches for the strict keyed
+    /// writer; read-only, it writes no files and advances no HEAD.
     async fn scan_proven_insert_delta_bounded(
         &self,
         source: &SnapshotHandle,
         table_key: &str,
-        begin_version: u64,
-        end_version: u64,
+        interval: &crate::table_store::ProvenInsertInterval,
         external_preflight: &ExternalBlobPreflight,
         system_columns: SystemColumns,
     ) -> Result<SendableRecordBatchStream>;
@@ -718,13 +709,41 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     ) -> Result<SnapshotHandle>;
 
     /// Commit one staged effect with Lance conflict retries disabled and expose
-    /// the transaction identity that actually landed. Legacy callers retain
-    /// `commit_staged`; RFC-022 adapters opt into this method explicitly.
+    /// the transaction identity that actually landed. Other linear callers
+    /// retain `commit_staged`.
     async fn commit_staged_exact(
         &self,
         snapshot: SnapshotHandle,
         staged: StagedHandle,
     ) -> Result<ExactCommitOutcome>;
+
+    /// RFC 0067: commit one staged effect as a detached version, stamped
+    /// with the authority it was staged against.
+    async fn commit_staged_detached(
+        &self,
+        snapshot: SnapshotHandle,
+        staged: StagedHandle,
+        witness: &crate::table_store::StagingWitness,
+    ) -> Result<(
+        SnapshotHandle,
+        crate::table_store::StagedTransactionIdentity,
+    )>;
+
+    /// RFC 0067: the identity of the transaction a version records.
+    fn transaction_identity(
+        &self,
+        snapshot: &SnapshotHandle,
+    ) -> Result<crate::table_store::StagedTransactionIdentity>;
+
+    /// RFC 0067: replay the transaction recorded in `staged` on `base` so the
+    /// linear history gains its twin at `target`.
+    async fn promote_detached(
+        &self,
+        base: SnapshotHandle,
+        staged: &SnapshotHandle,
+        target: u64,
+        expected_uuid: &str,
+    ) -> Result<PromotionOutcome>;
 
     /// Stage an overwrite (Operation::Overwrite). MR-793 Phase 2.
     async fn stage_overwrite(
@@ -733,13 +752,21 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         batch: RecordBatch,
     ) -> Result<StagedHandle>;
 
-    /// Stage a delete (two-phase, no HEAD advance). `None` when 0 rows match —
-    /// the table is not touched (no transaction, no version). See
-    /// `TableStore::stage_delete`.
+    /// Stage a rename-only column alteration; see
+    /// `TableStore::stage_rename_columns`. Committed through `commit_staged_exact`.
+    async fn stage_rename_columns(
+        &self,
+        snapshot: &SnapshotHandle,
+        renames: &[(String, String)],
+    ) -> Result<StagedHandle>;
+
+    /// Stage a delete (two-phase, no HEAD advance) of the rows `filter`, a typed
+    /// DataFusion expression, selects; `None` when 0 rows match and the table is
+    /// not touched (no transaction, no version). See `TableStore::stage_delete`.
     async fn stage_delete(
         &self,
         snapshot: &SnapshotHandle,
-        filter: &str,
+        filter: Expr,
     ) -> Result<Option<StagedHandle>>;
 
     /// Stage every requested full-table index in one Lance transaction.
@@ -831,31 +858,9 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
     ) -> Result<lance::dataset::refs::BranchIdentifier> {
-        snapshot
-            .dataset()
-            .branch_identifier()
+        crate::branch_control::dataset_branch_identifier(snapshot.dataset())
             .await
             .map_err(OmniError::storage)
-    }
-
-    async fn fork_branch_from_state(
-        &self,
-        dataset_uri: &str,
-        source_branch: Option<&str>,
-        table_key: &str,
-        source_version: u64,
-        target_branch: &str,
-    ) -> Result<SnapshotHandle> {
-        let dataset = TableStore::fork_branch_from_state(
-            self,
-            dataset_uri,
-            source_branch,
-            table_key,
-            source_version,
-            target_branch,
-        )
-        .await?;
-        Ok(SnapshotHandle::new(dataset))
     }
 
     async fn force_delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
@@ -864,18 +869,6 @@ impl TableStorage for TableStore {
 
     async fn list_native_branches(&self, dataset_uri: &str) -> Result<Vec<String>> {
         TableStore::list_native_branches(self, dataset_uri).await
-    }
-
-    async fn reopen_for_mutation(
-        &self,
-        dataset_uri: &str,
-        branch: Option<&str>,
-        table_key: &str,
-        expected_version: u64,
-    ) -> Result<SnapshotHandle> {
-        TableStore::reopen_for_mutation(self, dataset_uri, branch, table_key, expected_version)
-            .await
-            .map(SnapshotHandle::new)
     }
 
     fn ensure_expected_version(
@@ -913,6 +906,27 @@ impl TableStorage for TableStore {
             order_by,
             with_row_id,
             |_| Ok(()),
+        )
+        .await
+    }
+
+    async fn scan_filtered(
+        &self,
+        snapshot: &SnapshotHandle,
+        projection: Option<&[&str]>,
+        filter: Expr,
+    ) -> Result<Vec<RecordBatch>> {
+        TableStore::scan_with(
+            self,
+            snapshot.dataset(),
+            projection,
+            None,
+            None,
+            false,
+            |scanner| {
+                scanner.filter_expr(filter);
+                Ok(())
+            },
         )
         .await
     }
@@ -960,7 +974,7 @@ impl TableStorage for TableStore {
         pending: &[RecordBatch],
         pending_schema: Option<SchemaRef>,
         projection: Option<&[&str]>,
-        filter: Option<&str>,
+        filter: Option<Expr>,
         key_column: Option<&str>,
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>> {
@@ -982,7 +996,7 @@ impl TableStorage for TableStore {
         snapshot: &SnapshotHandle,
         pending: &[RecordBatch],
         pending_schema: Option<SchemaRef>,
-        filter: Option<&str>,
+        filter: Option<Expr>,
         key_column: Option<&str>,
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>> {
@@ -1001,7 +1015,7 @@ impl TableStorage for TableStore {
     async fn first_row_id_for_filter(
         &self,
         snapshot: &SnapshotHandle,
-        filter: &str,
+        filter: Expr,
         system_columns: SystemColumns,
     ) -> Result<Option<u64>> {
         TableStore::first_row_id_for_filter(self, snapshot.dataset(), filter, system_columns).await
@@ -1028,6 +1042,26 @@ impl TableStorage for TableStore {
         TableStore::stage_create(self, dataset_uri, batch)
             .await
             .map(StagedHandle::new)
+    }
+
+    async fn stage_compaction(
+        &self,
+        snapshot: &SnapshotHandle,
+        options: &lance::dataset::optimize::CompactionOptions,
+    ) -> Result<Option<(StagedHandle, lance::dataset::optimize::CompactionMetrics)>> {
+        Ok(
+            TableStore::stage_compaction(self, snapshot.dataset(), options)
+                .await?
+                .map(|compaction| (StagedHandle::new(compaction.staged), compaction.metrics)),
+        )
+    }
+
+    async fn stage_index_fold(
+        &self,
+        snapshot: &SnapshotHandle,
+    ) -> Result<(Option<StagedHandle>, Vec<(String, String)>)> {
+        let fold = TableStore::stage_index_fold(self, snapshot.dataset()).await?;
+        Ok((fold.staged.map(StagedHandle::new), fold.skipped))
     }
 
     async fn commit_staged_create_exact(
@@ -1188,8 +1222,7 @@ impl TableStorage for TableStore {
         &self,
         source: &SnapshotHandle,
         table_key: &str,
-        begin_version: u64,
-        end_version: u64,
+        interval: &crate::table_store::ProvenInsertInterval,
         external_preflight: &ExternalBlobPreflight,
         system_columns: SystemColumns,
     ) -> Result<SendableRecordBatchStream> {
@@ -1197,8 +1230,7 @@ impl TableStorage for TableStore {
             self,
             source.dataset(),
             table_key,
-            begin_version,
-            end_version,
+            interval,
             external_preflight,
             system_columns,
         )
@@ -1231,6 +1263,51 @@ impl TableStorage for TableStore {
             .map(SnapshotHandle::new)
     }
 
+    async fn commit_staged_detached(
+        &self,
+        snapshot: SnapshotHandle,
+        staged: StagedHandle,
+        witness: &crate::table_store::StagingWitness,
+    ) -> Result<(
+        SnapshotHandle,
+        crate::table_store::StagedTransactionIdentity,
+    )> {
+        let ds_arc = snapshot.into_arc();
+        let (dataset, identity) =
+            TableStore::commit_staged_detached(self, ds_arc, staged.into_staged(), witness).await?;
+        Ok((SnapshotHandle::new(dataset), identity))
+    }
+
+    fn transaction_identity(
+        &self,
+        snapshot: &SnapshotHandle,
+    ) -> Result<crate::table_store::StagedTransactionIdentity> {
+        TableStore::transaction_identity(self, snapshot.dataset())
+    }
+
+    async fn promote_detached(
+        &self,
+        base: SnapshotHandle,
+        staged: &SnapshotHandle,
+        target: u64,
+        expected_uuid: &str,
+    ) -> Result<PromotionOutcome> {
+        let base = base.into_arc();
+        Ok(
+            match TableStore::promote_detached(self, base, staged.dataset(), target, expected_uuid)
+                .await?
+            {
+                crate::table_store::PromotionCommit::Landed(dataset) => {
+                    PromotionOutcome::Landed(SnapshotHandle::new(*dataset))
+                }
+                crate::table_store::PromotionCommit::Refused => PromotionOutcome::Refused,
+                crate::table_store::PromotionCommit::Unsafe(reason) => {
+                    PromotionOutcome::Unsafe(reason)
+                }
+            },
+        )
+    }
+
     async fn commit_staged_exact(
         &self,
         snapshot: SnapshotHandle,
@@ -1257,10 +1334,20 @@ impl TableStorage for TableStore {
             .map(StagedHandle::new)
     }
 
+    async fn stage_rename_columns(
+        &self,
+        snapshot: &SnapshotHandle,
+        renames: &[(String, String)],
+    ) -> Result<StagedHandle> {
+        TableStore::stage_rename_columns(self, snapshot.dataset(), renames)
+            .await
+            .map(StagedHandle::new)
+    }
+
     async fn stage_delete(
         &self,
         snapshot: &SnapshotHandle,
-        filter: &str,
+        filter: Expr,
     ) -> Result<Option<StagedHandle>> {
         Ok(TableStore::stage_delete(self, snapshot.dataset(), filter)
             .await?

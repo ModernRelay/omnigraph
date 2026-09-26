@@ -19,10 +19,10 @@ p.name: String
 --- mutate
 branch create source
 --- expect ok
---- fault
-at: branch_merge.post_sidecar_pre_fork
+--- seam
+at: branch_merge.post_table_effect
 occurrence: 1
-action: return_error
+action: fail
 scope: next_step
 --- mutate
 branch merge source into main

@@ -1,0 +1,41 @@
+# issue: none
+# notes: A comparison between two bindings must stay above their scans.
+# notes: Open documents match each other; the closed document matches only itself.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    state: String
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d0","state":"open"}}
+{"type":"Doc","data":{"slug":"d1","state":"open"}}
+{"type":"Doc","data":{"slug":"x2","state":"closed"}}
+
+--- query
+query same_state_pairs() {
+    match {
+        $a: Doc
+        $b: Doc
+        $a.state = $b.state
+    }
+    return { $a.slug, $b.slug }
+}
+
+--- expect unordered
+{"a.slug":"d0","b.slug":"d0"}
+{"a.slug":"d0","b.slug":"d1"}
+{"a.slug":"d1","b.slug":"d0"}
+{"a.slug":"d1","b.slug":"d1"}
+{"a.slug":"x2","b.slug":"x2"}
+
+--- expect shape
+a.slug: String
+b.slug: String

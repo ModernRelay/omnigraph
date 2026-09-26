@@ -47,7 +47,10 @@ updates into a diverged target; `--source-mode insert` selects new IDs instead.
 Their route counters report the classifier and write adapter actually used.
 Hold the delta fixed while changing `--rows` to measure scaling, and run
 `OMNIGRAPH_MERGE_LINEAGE=off`, `on`, and `verify` separately when comparing
-classification paths. Verify mode executes both paths and is not comparable
+classification paths: the operation child reads that variable through the
+process-default settings reader before it opens the fixture, records the
+mode as `merge_lineage` in its metrics, and refuses any other value with the
+reader's message. Verify mode executes both paths and is not comparable
 to a single-path throughput sample.
 
 ### Small graph-age fixtures
@@ -138,6 +141,95 @@ third process. The bounded SHA reader works on Python 3.9 and later.
 These fixtures model accumulated history on the current format. They do not
 claim compatibility with old binary formats or legacy bare branch refs, and
 their constrained-runtime timings are not comparable to unrestricted runs.
+
+## Concurrent-writes throughput diagnostics
+
+The `concurrent-writes` scenario is the instrument RFC 0067's "What to
+measure before promising numbers" section asks for: sustained commits per
+second per branch under N concurrent writers, before and after each step of
+the RFC's throughput path, on a compact and on a fragmented manifest, on
+local storage and on an S3-compatible store. Its baseline exhibits the
+serialization the path's second step targets: every writer crosses the
+exclusive schema gate during publication, so adding writers raises
+service-time percentiles long before it raises the commit rate.
+
+```bash
+RUSTFLAGS= cargo bench --locked -p omnigraph-engine --bench scenarios -- \
+  --scenario concurrent-writes --writers 8 --duration-secs 30 \
+  --rows 256 --dims 8 --history-commits 64 --manifest-layout uncompacted \
+  --runs 3 --out /tmp/concurrent-writes.jsonl
+```
+
+`RUSTFLAGS=` (empty) is part of the command: the workspace Cargo
+configuration otherwise injects `--cfg tokio_unstable`, whose runtime cost
+is unmeasured, and the record's `attestation` block captures the cfg, the
+enabled engine features, `LANCE_MEM_POOL_SIZE`, and the effective Tokio
+worker count so a mixed comparison is visible rather than silent.
+
+**The driver is closed-loop and therefore not claim-grade.** Each writer
+task issues its next insert only after the previous acknowledgement, which
+is the right shape for finding the ceiling but — per RFC 0039 Rule 1 — is
+subject to coordinated omission: the driver pauses exactly when the system
+stalls. The record self-labels `driver: "closed-loop"` and
+`claim_grade: false`, and its latencies are `service_time_*` (time to serve
+one acknowledged write), never arrival latency. Claim-grade throughput or
+latency numbers require the future open-loop scheduled-arrival benchmark
+kind; these records are decision evidence for the RFC's ordered path.
+
+One repetition is one measured child: it builds a fresh `Chunk` fixture
+(`--rows`, `--dims`, the age and layout controls above), then runs
+`--writers` closed-loop tasks over clones of one `Session` — the production
+server shape — issuing insert-only mutations with disjoint per-worker keys
+for `--warmup-secs` plus `--duration-secs`. `--write-branches B` spreads
+writers round-robin over `B` forks instead of `main`; the first write on
+each fork pays the deferred first-touch fork of `node:Chunk`, which the
+warm-up absorbs unless `--warmup-secs 0` puts it inside the window. Setup, warm-up,
+verification and teardown sit outside the measured window. After every
+counter and clock is read, a fresh handle verifies exact per-branch row
+counts (seeded rows plus this run's acknowledgements) and reads sampled
+acknowledged keys back. `Omnigraph::mutate` replays a typed read-set
+conflict (the graph head moved under a concurrent writer) itself, up to 32
+times for an insert-only mutation; the record counts those replays as
+`reprepares` and `io.per_op.reprepares_per_commit`. A conflict reaches the
+driver only when that loop is exhausted; the driver retries it like a real
+client and counts the exhaustion as `authority_conflicts`. Both kinds of
+retry sit inside the op's service time. Any other worker error, any key
+conflict, or a verification mismatch fails the run rather than emitting a
+green record.
+
+`commits_per_sec` divides by `window_us`, the measured window alone;
+`drain_us` is the time ops in flight at the stop took to finish.
+`commits_by_second` is the acknowledgement count per second of the window,
+which is where a plateau or a stall shows; `completed_in_drain` holds the
+ops that finished after the stop.
+
+Op counting rides the ungated instrumentation surface: Lance manifest- and
+table-plane logical calls through per-run `IOTracker` wrappers installed on
+the graph open and on every writer task, and control-plane calls through
+`CountingStorageAdapter`. Counters are logical calls, not physical
+requests; the `io.per_op` block divides them by acknowledged
+commits, which is where a future group-commit change must show
+`manifest_writes_per_commit` falling below one. The unit is one range get
+or one put at the seam, so these counts are not the round trips RFC 0067
+counts per write and must not be divided by them. The totals are read from
+each probed Lance `ObjectStore`'s own `io_tracker`, not from the wrapper:
+on a local target Lance writes and reads file bodies through its direct
+local writer and reader, which never reach a wrapped store, and the
+store's own tracker sees both paths. `--no-probes` runs the same
+workload without any counting for an A/B of the counting overhead.
+
+To measure an S3-compatible store, pass `--target-uri s3://bucket/prefix`;
+the child appends a unique `cw-{nanos}` segment, refuses (exit 78) when the
+store is unreachable, and deletes the prefix afterwards unless
+`--keep-fixture`. Credentials and endpoint come from the standard `AWS_*`
+variables; the RustFS recipe CI uses (`.github/workflows/ci.yml`, the
+`rustfs_integration` job: `docker run rustfs/rustfs`, then
+`AWS_ENDPOINT_URL_S3=http://127.0.0.1:9000`, `AWS_ALLOW_HTTP=true`,
+`AWS_S3_FORCE_PATH_STYLE=true`, access key pair, `create-bucket`) works
+verbatim on a laptop. The harness passes the parent environment through to
+the measured child, so exporting those variables is sufficient.
+
+These records are diagnostic evidence and do not enter the durable archive.
 
 ## Layout
 
@@ -357,10 +449,12 @@ runner slice.
 
 ### CaseV1 suite runner
 
-Wall-clock execution is available only from a release-profile binary:
+Wall-clock execution is available only from a flag-free release-profile binary
+(`RUSTFLAGS=` clears the workspace's development `--cfg tokio_unstable`; the
+runner refuses a build whose build script saw encoded Rust flags):
 
 ```bash
-cargo run --release --locked -p omnigraph-bench -- \
+RUSTFLAGS= cargo run --release --locked -p omnigraph-bench -- \
   suite run benchmarks/suites/local-smoke.suite-v1.yaml \
   --archive .bench/archive
 
@@ -492,7 +586,7 @@ Build the CLI in release mode and run the checked-in FinGraph declaration and
 logical reference against a local registered bundle:
 
 ```bash
-cargo build --release --locked -p omnigraph-bench
+RUSTFLAGS= cargo build --release --locked -p omnigraph-bench
 
 target/release/omnigraph-bench fixture run-graph \
   benchmarks/real-graph/finbench-2026-08-21-sf10-v1.run-v1.yaml \
@@ -588,8 +682,9 @@ slice.
 2. Reference it from a suite with a path relative to that suite.
 3. Run both `case validate` and `suite validate`.
 4. Inspect `suite plan` before executing the suite.
-5. Run from a release build on a host that can prove every declared environment
-   fact; an unsupported factor is a refusal, not permission to approximate it.
+5. Run from a flag-free release build (`RUSTFLAGS= cargo …`) on a host that can
+   prove every declared environment fact; an unsupported factor is a refusal,
+   not permission to approximate it.
 
 Do not encode a profile such as `micro` or `realistic` in a case. Profiles are
 derived from the declared factor levels. Benchmark timing is evidence and does

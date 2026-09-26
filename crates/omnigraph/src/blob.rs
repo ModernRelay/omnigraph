@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 use crate::changes::EntityKind;
 use crate::db::{Omnigraph, ReadTarget, ResolvedTarget};
 use crate::error::{OmniError, Result};
+use crate::seams::{decide_seam, fail};
 
 /// Inclusive raw-byte ceiling for one configured or input external Blob URI.
 ///
@@ -969,6 +970,13 @@ struct ResolvedBlobCell {
     stable_property_id: u64,
 }
 
+decide_seam! {
+    /// A Blob read has captured one exact graph snapshot and table authority,
+    /// but has not opened the selected Lance table version yet. Tests replace
+    /// a named branch here to prove a live read fails rather than retargeting.
+    pub static BLOB_READ_POST_CAPTURE = ("blob_read.post_capture", Unreachable, [Fail]);
+}
+
 impl Omnigraph {
     /// Resolve and read one Blob cell against a branch or immutable snapshot.
     ///
@@ -1027,7 +1035,7 @@ impl Omnigraph {
         let stable_table_id = entry.identity.stable_table_id;
         let table_incarnation_id = entry.identity.table_incarnation_id;
 
-        crate::failpoints::maybe_fail(crate::failpoints::names::BLOB_READ_POST_CAPTURE)?;
+        fail(&BLOB_READ_POST_CAPTURE)?;
 
         let dataset = Arc::new(if entry.native_dataset_branch.is_some() {
             // Local filesystems provide no manifest e-tag, so the ordinary
@@ -1069,7 +1077,9 @@ impl Omnigraph {
                 .await?
         });
         let actual_table_version = dataset.version().version;
-        if actual_table_version != expected_table_version {
+        // RFC 0067: a pending pin resolves to its staged version.
+        let pending_staged = entry.version_metadata.staged_version() == Some(actual_table_version);
+        if actual_table_version != expected_table_version && !pending_staged {
             return Err(OmniError::blob_integrity(format!(
                 "selected dataset for {} type '{}' opened at Lance version {}, expected published dataset version {}",
                 entity_label(cell.entity),
@@ -1116,9 +1126,7 @@ impl Omnigraph {
                 )));
             }
         }
-        if let Some(expected_e_tag) = entry.version_metadata.e_tag()
-            && dataset.manifest_location().e_tag.as_deref() != Some(expected_e_tag)
-        {
+        if !entry.version_metadata.witnesses(&dataset) {
             return Err(OmniError::blob_integrity(format!(
                 "selected dataset for {} type '{}' opened a different Lance manifest incarnation at published dataset version {}",
                 entity_label(cell.entity),
@@ -1184,7 +1192,9 @@ impl Omnigraph {
                     || live_cell.stable_property_id != resolved_cell.stable_property_id
                     || live_entry.published_dataset_version != entry.published_dataset_version
                     || live_entry.native_dataset_branch != entry.native_dataset_branch
-                    || live_entry.version_metadata != entry.version_metadata
+                    || !live_entry
+                        .version_metadata
+                        .same_read_witness(&entry.version_metadata)
                 {
                     return Err(OmniError::manifest(format!(
                         "Blob property '{}.{}' has no persisted property-lifetime witness at the selected target",

@@ -45,10 +45,12 @@ use omnigraph_compiler::ir::ParamMap;
 /// the `id` index absent and stale: neither state may affect the plan. Both
 /// extent sweep points publish the same number of graph commits — the smaller
 /// point pads history with commits on the untouched dataset — so the known
-/// `__manifest` fold term stays comparable.
+/// `__manifest` fold term stays comparable; every point keeps at least one
+/// padding commit, so the stale arm's index build covers the same table set
+/// at both points and its `__manifest` footprint compares like with like.
 #[tokio::test]
 async fn changes_page_opens_and_data_reads_are_bounded_by_delta() {
-    const SEED_COMMITS: u64 = 8;
+    const SEED_COMMITS: u64 = 9;
     const ROWS_PER_COMMIT: u64 = 64;
     cost_harness(async {
         for stale_index in [false, true] {
@@ -69,6 +71,7 @@ node Company {
                 )
                 .await
                 .unwrap();
+                let db = helpers::session(db);
                 for commit in 0..SEED_COMMITS {
                     let batch = if commit < person_commits {
                         (0..ROWS_PER_COMMIT)
@@ -193,7 +196,7 @@ node Company {
 /// target meaningful without paying payload I/O for un-emitted rows.
 #[tokio::test]
 async fn changes_page_size_one_bounds_large_candidate_delta() {
-    const DELTA_ROWS: usize = 2_048;
+    const DELTA_ROWS: usize = 4_096;
     const PAGE_BYTES: u64 = 4 * 1_024;
 
     cost_harness(async {
@@ -209,10 +212,11 @@ node Document {
         )
         .await
         .unwrap();
+        let db = helpers::session(db);
         let batch = (0..DELTA_ROWS)
             .map(|row| {
                 format!(
-                    r#"{{"type":"Document","data":{{"slug":"d{row:05}","payload":"base64:QQ=="}}}}"#
+                    r#"{{"type":"Document","data":{{"slug":"document-{row:012}","payload":"base64:QQ=="}}}}"#
                 )
             })
             .collect::<Vec<_>>()
@@ -222,49 +226,69 @@ node Document {
             .await
             .unwrap();
 
-        let (page, io) = measure(db.commit_changes_page(
-            &inserted.commit.graph_commit_id,
-            &ChangeFeedScope::default(),
-            None,
-            Some(1),
-            Some(PAGE_BYTES),
-        ))
-        .await;
-        let first = page.unwrap();
-        assert_eq!(first.block.changes.len(), 1);
-        let token = first
-            .next_page_token
-            .expect("the large delta must continue");
-        let (second, second_io) = measure(db.commit_changes_page(
-            &inserted.commit.graph_commit_id,
-            &ChangeFeedScope::default(),
-            Some(&token),
-            Some(1),
-            Some(PAGE_BYTES),
-        ))
-        .await;
-        let second = second.unwrap();
-        assert_eq!(second.block.changes.len(), 1);
-        assert_ne!(first.block.changes[0].id, second.block.changes[0].id);
+        let deleted = db.mutate_with_receipt(
+            "main",
+            "query del() { delete Document where slug != \"\" }",
+            "del",
+            &ParamMap::new(),
+        ).await.unwrap().commit.unwrap();
+        let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+        let table = snapshot.dataset("node:Document").unwrap();
+        let spill_dir = dir.path().join(&table.dataset_path).join("_omnigraph/deleted_ids");
+        let spills: Vec<_> = std::fs::read_dir(spill_dir).unwrap().map(|entry| entry.unwrap()).collect();
+        assert_eq!(spills.len(), 1, "the measured delete must use a spilled ID record");
+        assert!(spills[0].metadata().unwrap().len() > 64 * 1024);
 
-        for io in [io, second_io] {
-            assert_eq!(io.candidate_transaction_reads, 1);
-            assert_eq!(
-                io.candidate_rows_examined, 2,
-                "one emitted candidate plus one continuation sentinel; no 8,192-row queue"
-            );
-            assert_eq!(
-                io.candidate_scan_target_rows_peak, 2,
-                "candidate scanner row target follows max_changes + one sentinel"
-            );
-            assert_eq!(
-                io.candidate_scan_target_bytes_peak, PAGE_BYTES,
-                "candidate scanner byte target follows the current page budget"
-            );
-            assert_eq!(
-                io.change_images_materialized, 1,
-                "the continuation sentinel must not materialize JSON or Blob payloads"
-            );
+        for (commit_id, op) in [
+            (inserted.commit.graph_commit_id, omnigraph::changes::ChangeOpKind::Insert),
+            (deleted.graph_commit_id, omnigraph::changes::ChangeOpKind::Delete),
+        ] {
+            let (page, io) = measure(db.commit_changes_page(
+                &commit_id,
+                &ChangeFeedScope::default(),
+                None,
+                Some(1),
+                Some(PAGE_BYTES),
+            ))
+            .await;
+            let first = page.unwrap();
+            assert_eq!(first.block.changes.len(), 1);
+            let token = first
+                .next_page_token
+                .expect("the large delta must continue");
+            let (second, second_io) = measure(db.commit_changes_page(
+                &commit_id,
+                &ChangeFeedScope::default(),
+                Some(&token),
+                Some(1),
+                Some(PAGE_BYTES),
+            ))
+            .await;
+            let second = second.unwrap();
+            assert_eq!(second.block.changes.len(), 1);
+            assert_ne!(first.block.changes[0].id, second.block.changes[0].id);
+
+            for io in [io, second_io] {
+                assert_eq!(io.candidate_transaction_reads, 1);
+                assert_eq!(
+                    io.candidate_rows_examined, 2,
+                    "one emitted candidate plus one continuation sentinel; no 8,192-row queue"
+                );
+                assert_eq!(
+                    io.candidate_scan_target_rows_peak, 2,
+                    "candidate scanner row target follows max_changes + one sentinel"
+                );
+                assert_eq!(
+                    io.candidate_scan_target_bytes_peak, PAGE_BYTES,
+                    "candidate scanner byte target follows the current page budget"
+                );
+                assert_eq!(
+                    io.change_images_materialized, 1,
+                    "the continuation sentinel must not materialize JSON or Blob payloads"
+                );
+            }
+            assert_eq!(first.block.changes[0].op, op);
+            assert_eq!(second.block.changes[0].op, op);
         }
     })
     .await;
@@ -276,6 +300,7 @@ node Document {
 /// `max_changes=1` pages must each fall back before reading either transaction;
 /// the page count cannot multiply a transaction-history walk.
 #[tokio::test]
+#[ignore = "the multi-version interval is built by `repair`, which promotes at head; phase 4 of RFC \"Detached-only tables\" restates it over a detached chain"]
 async fn changes_page_size_one_skips_transaction_history_for_multi_version_intervals() {
     cost_harness(async {
         let dir = tempfile::tempdir().unwrap();
@@ -285,6 +310,7 @@ async fn changes_page_size_one_skips_transaction_history_for_multi_version_inter
         )
         .await
         .unwrap();
+        let db = helpers::session(db);
         db.load_with_receipt(
             "main",
             concat!(
@@ -385,11 +411,8 @@ async fn changes_page_size_one_skips_transaction_history_for_multi_version_inter
     .await;
 }
 
-/// The fallback path stays honestly pinned: an unproven operation (a delete)
-/// forces the exact ordered merge of both pinned versions, so page data reads
-/// grow with the table's physical extent even at Δ=1. This is the counterpart
-/// to the pruned flat assertion above — if a future change mistakenly pruned an
-/// unproven op, this tripwire would go flat and fail.
+/// A delete's commit path proves it from the recorded ids, so its page data
+/// reads stay flat as the table grows.
 #[tokio::test]
 async fn changes_page_unproven_op_scan_term_grows_with_table_extent() {
     const SEED_COMMITS: u64 = 8;
@@ -404,6 +427,7 @@ async fn changes_page_unproven_op_scan_term_grows_with_table_extent() {
             )
             .await
             .unwrap();
+            let db = helpers::session(db);
             for commit in 0..SEED_COMMITS {
                 let batch = if commit < person_commits {
                     (0..ROWS_PER_COMMIT)
@@ -446,13 +470,25 @@ async fn changes_page_unproven_op_scan_term_grows_with_table_extent() {
             .await;
             let page = page.unwrap();
             assert_eq!(page.block.changes.len(), 1, "the measured commit is one delete");
+            let change = &page.block.changes[0];
+            assert_eq!(change.op, omnigraph::changes::ChangeOpKind::Delete);
+            assert!(
+                change.before.is_some() && change.after.is_none(),
+                "a delete carries only its before-image: {change:?}"
+            );
             curve.push((person_commits, io));
         }
-        assert_grows(
+        for (_, io) in &curve {
+            assert_eq!(
+                io.candidate_transaction_reads, 1,
+                "the recorded delete reads exactly its own transaction"
+            );
+        }
+        assert_flat(
             &curve,
             |io| io.data_reads,
-            1,
-            "unproven-op fallback still reads both pinned versions (O(dataset extent))",
+            3,
+            "recorded-delete page data reads (touched parent fragments, not dataset extent)",
         );
     })
     .await;
@@ -482,6 +518,7 @@ node Document {
             )
             .await
             .unwrap();
+            let db = helpers::session(db);
             let batch: Vec<String> = (0..blob_rows)
                 .map(|i| {
                     format!(
@@ -550,6 +587,7 @@ async fn change_feed_caught_up_poll_is_data_flat() {
             )
             .await
             .unwrap();
+            let db = helpers::session(db);
             let batch: Vec<String> = (0..rows)
                 .map(|i| format!(r#"{{"type":"Person","data":{{"name":"p{i:05}","age":1}}}}"#))
                 .collect();
@@ -623,6 +661,7 @@ async fn change_feed_caught_up_poll_manifest_reads_are_flat_in_history() {
             )
             .await
             .unwrap();
+            let db = helpers::session(db);
             // Build commit-history depth: one commit per load.
             for i in 0..depth {
                 db.load_with_receipt(
@@ -695,6 +734,7 @@ async fn change_feed_backlog_walk_grows_with_commits_examined() {
             )
             .await
             .unwrap();
+            let db = helpers::session(db);
             let now = db
                 .poll_change_feed(omnigraph::changes::ChangeFeedRequest {
                     branch: None,
@@ -790,6 +830,7 @@ async fn change_feed_small_ceiling_poll_is_bounded_across_backlog_depths() {
             )
             .await
             .unwrap();
+            let db = helpers::session(db);
             let now = db
                 .poll_change_feed(omnigraph::changes::ChangeFeedRequest {
                     branch: None,

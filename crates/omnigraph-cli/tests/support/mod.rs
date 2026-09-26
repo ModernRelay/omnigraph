@@ -486,6 +486,14 @@ use lance::index::DatasetIndexExt;
 #[allow(unused_imports)]
 use omnigraph::db::{Omnigraph, ReadTarget};
 
+/// A session with the definition's defaults over a handle the fixture opened.
+fn session_over(db: Omnigraph) -> omnigraph::Session {
+    omnigraph::Session::from_defaults(
+        std::sync::Arc::new(db),
+        omnigraph::settings::SessionSettings::default(),
+    )
+}
+
 pub const POLICY_YAML: &str = r#"
 version: 1
 groups:
@@ -537,7 +545,10 @@ pub fn manifest_dataset_version(graph: &std::path::Path) -> u64 {
     })
 }
 
-pub fn forge_person_delete_drift(graph: &std::path::Path) -> (u64, u64) {
+/// A foreign commit on the Person table's Lance linear history (a config
+/// upsert, which commits on the empty linear HEAD a detached-only table
+/// keeps). Returns (published version, Lance HEAD after the commit).
+pub fn forge_person_foreign_commit(graph: &std::path::Path) -> (u64, u64) {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let uri = graph.to_string_lossy();
         let db = Omnigraph::open(uri.as_ref()).await.unwrap();
@@ -545,10 +556,12 @@ pub fn forge_person_delete_drift(graph: &std::path::Path) -> (u64, u64) {
         let entry = snap.dataset("node:Person").unwrap();
         let full_path = format!("{}/{}", uri.trim_end_matches('/'), entry.dataset_path);
         let mut ds = Dataset::open(&full_path).await.unwrap();
-        let deleted = ds.delete("name = 'Alice'").await.unwrap();
-        assert_eq!(deleted.num_deleted_rows, 1);
-        let head = deleted.new_dataset.version().version;
-        assert!(head > entry.published_dataset_version);
+        let linear_head_before = ds.version().version;
+        ds.update_config(vec![("forged_by", Some("cli_data test"))])
+            .await
+            .unwrap();
+        let head = ds.version().version;
+        assert!(head > linear_head_before);
         (entry.published_dataset_version, head)
     })
 }
@@ -946,7 +959,8 @@ pub fn merge_managed_blob(graph: &Path, title: &str, bytes: &[u8]) {
         let db = omnigraph::db::Omnigraph::open(&graph.to_string_lossy())
             .await
             .unwrap();
-        omnigraph::loader::load_jsonl(&db, &data, omnigraph::loader::LoadMode::Merge)
+        session_over(db)
+            .load_jsonl(&data, omnigraph::loader::LoadMode::Merge)
             .await
             .unwrap();
     });
@@ -983,7 +997,8 @@ pub fn init_blob_graph(graph: &Path) {
         let db = omnigraph::db::Omnigraph::init(&graph.to_string_lossy(), BLOB_CLI_SCHEMA)
             .await
             .unwrap();
-        omnigraph::loader::load_jsonl(&db, BLOB_CLI_DATA, omnigraph::loader::LoadMode::Overwrite)
+        session_over(db)
+            .load_jsonl(BLOB_CLI_DATA, omnigraph::loader::LoadMode::Overwrite)
             .await
             .unwrap();
     });
@@ -1017,7 +1032,8 @@ pub fn init_external_blob_graph(
             }
         })
         .to_string();
-        omnigraph::loader::load_jsonl(&db, &data, omnigraph::loader::LoadMode::Overwrite)
+        session_over(db)
+            .load_jsonl(&data, omnigraph::loader::LoadMode::Overwrite)
             .await
             .unwrap();
     });
@@ -1113,7 +1129,8 @@ policies:
         let data = format!(
             "{BLOB_CLI_DATA}\n{{\"type\":\"Document\",\"data\":{{\"title\":\"external\",\"content\":\"{external_uri}\",\"note\":\"descriptor only\"}}}}"
         );
-        omnigraph::loader::load_jsonl(&db, &data, omnigraph::loader::LoadMode::Overwrite)
+        session_over(db)
+            .load_jsonl(&data, omnigraph::loader::LoadMode::Overwrite)
             .await
             .unwrap();
     });

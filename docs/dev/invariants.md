@@ -24,9 +24,14 @@ five more changes like this one?**
 
 2. **There is one graph-content publication door.** A graph change becomes
    authoritative through one `__manifest` publication containing every
-   visible table pointer and graph-lineage update. A writer may move Lance HEADs
-   first only under durable recovery ownership. Per-table publication is never
-   graph publication.
+   visible table pointer and graph-lineage update. A writer never moves a
+   table's linear HEAD: its effects are detached commits the `__manifest`
+   pin `(published_dataset_version, staged_version, transaction_uuid)`
+   names, every pin is a detached version that opens, and the pin is the
+   table's version for its whole life. A graph table's linear HEAD stays at
+   its creation version, recorded per registration as
+   `omnigraph.last_linear_version`, and only `repair` reads it. Per-table
+   publication is never graph publication.
 
 3. **Every operation uses one coherent accepted view.** A read holds one
    immutable snapshot for its lifetime. A writer captures schema, catalog,
@@ -39,11 +44,22 @@ five more changes like this one?**
    They do not acknowledge or publish per statement or per table. The D2
    constructive-versus-destructive mutation split remains explicit.
 
-5. **Recovery is part of the commit protocol.** Any independently durable
-   effect that could become graph-visible must have enough persisted identity,
-   authority, and intended outcome to roll forward or compensate safely.
-   Ambiguous or foreign movement fails closed. Writers resolve or refuse
-   relevant recovery before replanning. See [recovery.md](recovery.md).
+5. **Crash convergence is part of the commit protocol.** An effect that is
+   durable before publication must be unreachable: a detached version or a
+   staged file nothing references, which a retry ignores. `cleanup`'s
+   collector reclaims such a version only when the publication authority
+   its transaction properties record is provably gone; age does not prove
+   abandonment. A published table effect is complete at publication and
+   nothing finishes it. The one published effect with work left, a staged
+   schema contract, carries its publishing commit in the manifest itself.
+   There is no side record to classify. The collector holds two properties
+   on every run: safety, that every pin of every retained `__manifest`
+   version on every live branch still opens and every path its manifest
+   lists still exists after the run; and progress, that a table version no
+   retained `__manifest` version names is gone after a run that retains
+   nothing else. Foreign movement fails closed: a linear commit above a
+   table's last linear version is reported by `repair` and never adopted.
+   See [recovery.md](recovery.md).
 
 6. **Stable identity survives renames, not lifetimes.** Accepted SchemaIR owns
    non-zero type, property, and table-incarnation identities. A rename
@@ -80,7 +96,9 @@ five more changes like this one?**
     history.
 
 12. **One source of truth, cheaply derived.** Lance, `__manifest`, and the
-    accepted schema are authoritative. Immutable version-pinned state may be
+    accepted schema are authoritative. `__manifest` is a table's only
+    lineage; the table's Lance linear history is not a second, derived
+    history. Immutable version-pinned state may be
     cached; mutable-tip caches are hints, never commit authority. Do not
     maintain a shadow copy that can drift or rebuild a warm projection from
     full history on every call.
@@ -123,15 +141,20 @@ different:
 - Azure writes require the admission wrapper and remain a qualification preview
   pending the adversarial live-Azure matrix. The narrower managed-identity
   smoke proof is complete.
-- Some Optimize and destructive full-recovery decisions retain a
-  one-mutation-process boundary because Lance does not expose the exact
-  caller-owned maintenance transaction proof they would need for distributed
-  takeover. The live write-entry heal's effect-free retirement (issue #554)
-  relies on the same boundary: its proof-then-delete is fenced by
-  process-local gates, so a second mutation process's live Armed intent, or
-  an already-transmitted storage write of a just-dropped in-process writer,
-  is outside what it can observe — the same bounded residual the Full-sweep
-  abandonment of an effect-free intent has always carried.
+- The open-time decisions about a schema apply another process may still be
+  running retain a one-mutation-process boundary: a read-write open discards
+  an unpublished staged schema contract and reclaims a schema-apply sentinel,
+  fenced only by process-local gates. A live apply in another process loses
+  its staging and then installs its contract from memory, so within that
+  boundary the graph does not tear, and its sentinel no longer excludes other
+  writers. The residual the boundary carries: if a concurrent read-write open
+  discards a live apply's staging and that apply then lands its manifest commit
+  but dies before installing from memory, the published outcome is paired with
+  the old contract with no staging left to install, so a same-identity
+  contract change can serve stale until the next apply. Add/drop and
+  identity-changing shapes still fail loudly; only a same-identity rewrite is
+  silent, and only outside the single-process boundary. Table effects carry no
+  such boundary: a detached commit needs no takeover.
 - Physical index reconciliation is explicit; there is no background scheduler
   whose queue is a second authority.
 
@@ -142,7 +165,14 @@ code, tests, guide, and—when irreversible—RFC.
 
 - Does one snapshot or authority token cover the whole operation?
 - Is graph visibility still one manifest publication?
-- Is every pre-publication durable effect owned by recovery?
+- Is every pre-publication durable effect unreachable until the manifest names
+  it, is a published table effect complete at its pin, and does a staged
+  contract carry what finishing it needs?
+- Does the change read a table's linear HEAD anywhere but `repair`, or
+  rebuild a registration row without carrying
+  `omnigraph.last_linear_version` forward?
+- Does the collector's mark set still cover every retained pin, and does its
+  sweep still reach every unretained published version?
 - Are names kept separate from stable identity?
 - Does a missing physical optimization preserve logical correctness?
 - Are retries, memory, I/O, and failure outcomes bounded?

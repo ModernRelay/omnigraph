@@ -1,12 +1,7 @@
 # issue: none
-# notes: `$d knows $t` over 20 docs with edges leaving 2, 5, 8, 11: 4 of 20 (20%,
-# notes: still 15% with one fewer) fails the gate's 10% fence, so the scan is
-# notes: unfiltered and the traversal drops rows above it. Limit 3: the first
-# notes: pass (rows 0..2) keeps one source, short; the x4 rerun asks for 12 of
-# notes: the 20 live rows (12 < 20, so a wider rung, not the exact pass) and
-# notes: holds four sources (4 > 3): the loop stops there with d002, d005, d008.
-# notes: Rust twin (probes: one overfetch, no exact pass):
-# notes: issue_567_nearest_gate_falls_back_above_the_ratio.
+# notes: Keep 20 docs: 4/20 edge sources exceeds the 10% gate threshold.
+# notes: At limit 3, the first scan finds only d002; k = 12 finds all four sources without an exact pass.
+# notes: Rust probe: issue_567_nearest_gate_falls_back_above_the_ratio.
 
 --- runner
 timeout_ms: 10000
@@ -52,7 +47,7 @@ edge Knows: Doc -> Doc {
 {"edge":"Knows","id":"e011_0","from":"d011","to":"d012","data":{}}
 
 --- query
-query scenario($q: Vector(4)) {
+query nearest_fills_limit($q: Vector(4)) {
     match {
         $d: Doc
         $d knows $t

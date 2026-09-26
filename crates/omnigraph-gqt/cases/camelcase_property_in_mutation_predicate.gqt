@@ -1,0 +1,53 @@
+# issue: none
+# notes: camelCase properties are the columns of a compound `delete`/`update … where`: the predicate lowers through the shared
+# notes: expression lowering onto the exact column names. Retires the `predicate_to_sql` quoting unit test: its `repoName` row lives here, its `interval` row in `reserved_word_property_in_mutation_predicate.gqt`.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Deal {
+    slug: String @key
+    dealStage: String
+    amountUsd: I32
+}
+
+--- seed
+{"type":"Deal","data":{"slug":"d1","dealStage":"open","amountUsd":5}}
+{"type":"Deal","data":{"slug":"d2","dealStage":"open","amountUsd":20}}
+{"type":"Deal","data":{"slug":"d3","dealStage":"won","amountUsd":30}}
+
+--- mutate
+query delete_open_large_deals() {
+    delete Deal where dealStage = "open" and amountUsd > 10
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query close_large_deals($floor: I32) {
+    update Deal set { dealStage: "closed" } where amountUsd > $floor
+}
+
+--- params
+{"floor": 10}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query survivors() {
+    match { $d: Deal }
+    return { $d.slug, $d.dealStage, $d.amountUsd }
+}
+
+--- expect unordered
+{"d.slug": "d1", "d.dealStage": "open", "d.amountUsd": 5}
+{"d.slug": "d3", "d.dealStage": "closed", "d.amountUsd": 30}
+
+--- expect shape
+d.slug: String
+d.dealStage: String
+d.amountUsd: I32

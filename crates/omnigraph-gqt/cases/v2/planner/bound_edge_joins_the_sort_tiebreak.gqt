@@ -1,0 +1,41 @@
+# issue: none
+# notes: Two parallel edges under a bound edge binding differ only by the edge, so the sort tie-break includes the edge binding and both rows survive.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+node Doc {
+    slug: String @key
+}
+edge Knows: Person -> Doc {
+    weight: I64
+}
+
+--- seed
+{"type":"Person","data":{"name":"ann"}}
+{"type":"Doc","data":{"slug":"x"}}
+{"edge":"Knows","from":"ann","to":"x","data":{"weight":1}}
+{"edge":"Knows","from":"ann","to":"x","data":{"weight":2}}
+
+--- query
+set engine = v2;
+query weights_by_name() {
+    match { $p: Person $p $e:knows $d }
+    return { $p.name, $e.weight }
+    order { $p.name }
+}
+--- expect unordered
+{"p.name":"ann","e.weight":1}
+{"p.name":"ann","e.weight":2}
+--- expect shape
+p.name: String
+e.weight: I64
+--- expect plan
+sort tiebreak [$d, $e, $p]

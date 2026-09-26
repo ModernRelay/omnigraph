@@ -28,22 +28,39 @@ pub(crate) fn native_branch_name(logical: &str, incarnation: &str) -> String {
     format!("{logical}.{incarnation}")
 }
 
-/// Name one table fork using the accepted base and the existing commit identity.
-/// The name describes an attempt; publication order comes from the manifest.
-/// Ownership is recorded in table-version metadata, never inferred from this text.
-pub(crate) fn table_fork_name(owner: &str, base_manifest_version: u64, commit_id: &str) -> String {
-    let incarnation = split_native_branch_name(owner).1.unwrap_or("legacy");
-    format!("fork.{incarnation}.m{base_manifest_version}.{commit_id}")
+/// Names can conservatively retain unpublished forks, never authorize ownership.
+/// Unknown generated names lack enough evidence to reclaim safely.
+pub(crate) fn retain_unpublished_table_fork(
+    native: &str,
+    incarnation_is_live: impl FnOnce(&str) -> bool,
+) -> bool {
+    let Some(rest) = native.strip_prefix("fork.") else {
+        return false;
+    };
+    let mut parts = rest.split('.');
+    let (Some(incarnation), Some(base), Some(commit), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return true;
+    };
+    if !is_incarnation(incarnation)
+        || !is_incarnation(commit)
+        || !base.strip_prefix('m').is_some_and(|version| {
+            version
+                .parse::<u64>()
+                .is_ok_and(|parsed| parsed.to_string() == version)
+        })
+    {
+        return true;
+    }
+    incarnation_is_live(incarnation)
 }
 
 fn is_incarnation(candidate: &str) -> bool {
     candidate.len() == INCARNATION_LEN
-        && candidate.bytes().all(|byte| {
-            matches!(
-                byte,
-                b'0'..=b'9' | b'A'..=b'H' | b'J' | b'K' | b'M' | b'N' | b'P'..=b'T' | b'V'..=b'Z'
-            )
-        })
+        && candidate
+            .parse::<ulid::Ulid>()
+            .is_ok_and(|id| id.to_string() == candidate)
 }
 
 /// Split a native ref name into its logical name and incarnation.
@@ -114,6 +131,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unpublished_fork_retention_tracks_incarnations_not_logical_names() {
+        let incarnation = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let replacement = "01BX5ZZKBKACTAV9WEVGEMMVRZ";
+        let native = "fork.01ARZ3NDEKTSV4RRFFQ69G5FAV.m42.01ARZ3NDEKTSV4RRFFQ69G5FAW";
+        assert!(retain_unpublished_table_fork(native, |owner| owner == incarnation));
+        assert!(!retain_unpublished_table_fork(native, |owner| owner == replacement));
+        assert!(!retain_unpublished_table_fork(native, |_| false));
+    }
+
+    #[test]
+    fn unknown_generated_forks_are_retained_without_authorizing_identity() {
+        for native in [
+            "fork.legacy.m42.01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            "fork.future-format",
+            "fork.ZZZZZZZZZZZZZZZZZZZZZZZZZZ.m42.01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            "fork.01ARZ3NDEKTSV4RRFFQ69G5FAV.m42.ZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+            "fork.01ARZ3NDEKTSV4RRFFQ69G5FAV.m042.01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            "fork.01ARZ3NDEKTSV4RRFFQ69G5FAV.m18446744073709551616.01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            "fork.01ARZ3NDEKTSV4RRFFQ69G5FAV.mbad.01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            "fork.01ARZ3NDEKTSV4RRFFQ69G5FAV.m42.bad",
+            "fork.01ARZ3NDEKTSV4RRFFQ69G5FAV.m42.01ARZ3NDEKTSV4RRFFQ69G5FAW/child",
+        ] {
+            assert!(retain_unpublished_table_fork(native, |_| {
+                panic!("unknown names cannot identify an owner")
+            }));
+        }
+        assert!(!retain_unpublished_table_fork("feature", |_| true));
+    }
+
+    #[test]
     fn minted_native_names_split_back_to_their_logical_name() {
         let incarnation = mint_incarnation();
         assert_eq!(incarnation.len(), INCARNATION_LEN);
@@ -125,32 +172,14 @@ mod tests {
         assert_eq!(logical_branch_name(&native), "feature/x");
     }
 
-    /// GQT cannot supply u64::MAX manifest versions or legacy native-owner strings.
-    #[test]
-    fn table_fork_names_bound_encoded_paths_for_native_and_legacy_owners() {
-        let incarnation = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
-        let commit = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
-        let next_commit = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
-        for logical in ["a".repeat(175), "équipe/data/topic".to_string()] {
-            for owner in [logical.clone(), native_branch_name(&logical, incarnation)] {
-                let name = table_fork_name(&owner, u64::MAX, commit);
-                assert!(name.is_ascii());
-                assert!(!name.contains('/'));
-                assert!(
-                    name.len() <= 80,
-                    "bounded ref leaves room for local temporary suffixes"
-                );
-                lance::dataset::refs::check_valid_branch(&name).unwrap();
-                assert_eq!(name, table_fork_name(&owner, u64::MAX, commit));
-                assert_ne!(name, table_fork_name(&owner, u64::MAX, next_commit));
-            }
-        }
-    }
-
     #[test]
     fn legacy_and_lookalike_names_are_not_split() {
         assert_eq!(split_native_branch_name("feature"), ("feature", None));
         assert_eq!(split_native_branch_name("v1.2.3"), ("v1.2.3", None));
+        assert_eq!(
+            split_native_branch_name("x.ZZZZZZZZZZZZZZZZZZZZZZZZZZ"),
+            ("x.ZZZZZZZZZZZZZZZZZZZZZZZZZZ", None)
+        );
         // Wrong length, wrong alphabet (I/L/O/U, lowercase), or a leading dot.
         assert_eq!(
             split_native_branch_name("x.01ARZ3NDEKTSV4RRFFQ69G5FA"),

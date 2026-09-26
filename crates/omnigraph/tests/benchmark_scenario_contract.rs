@@ -49,13 +49,11 @@ fn benchmark_caps_match_production() {
         rfc023_limits::KEYED_WRITE_MAX_BYTES
     );
 
-    let recovery = include_str!("../src/db/manifest/recovery.rs");
+    let merge = include_str!("../src/exec/merge.rs");
     assert_eq!(
-        product_const(recovery, "MAX_BRANCH_MERGE_DATA_TRANSACTIONS"),
+        product_const(merge, "MAX_BRANCH_MERGE_DATA_TRANSACTIONS"),
         rfc023_limits::RECOVERY_MAX_TRANSACTIONS as u64
     );
-
-    let merge = include_str!("../src/exec/merge.rs");
     assert_eq!(
         product_const(merge, "PURE_INSERT_HISTORY_MAX_VERSIONS"),
         rfc023_limits::PURE_INSERT_HISTORY_MAX_VERSIONS as u64
@@ -394,6 +392,70 @@ fn general_update_reports_completed_classifiers_and_keeps_update_semantics() {
     assert!(source.contains("aged fixture row missing"));
 }
 
+/// The `OMNIGRAPH_MERGE_LINEAGE` comparison in `benchmarks/README.md`: each
+/// measured merge child reads the process defaults before the fixture opens and
+/// records the mode (the per-mode route: `merge_cost.rs`, the refusal: `settings.rs`).
+#[test]
+fn measured_merge_children_take_merge_lineage_from_the_process_defaults() {
+    let source = include_str!("../benches/scenarios/rfc023.rs");
+    let reader = source
+        .split_once("fn measured_settings() -> SessionSettings")
+        .expect("one shared process-default reader")
+        .1
+        .split_once("\n}\n")
+        .unwrap()
+        .0;
+    assert!(reader.contains("omnigraph::settings::from_env()"));
+    assert!(reader.contains("Err(error) => panic!(\"process settings: {error}\")"));
+    assert!(!reader.contains("SessionSettings::default()"));
+
+    for (child, end) in [
+        ("pub(super) async fn fenced_adopt_operation", "/// Phase 3:"),
+        (
+            "pub(super) async fn general_merge_operation",
+            "async fn verify_fixture_row",
+        ),
+    ] {
+        let operation = source
+            .split_once(child)
+            .expect(child)
+            .1
+            .split_once(end)
+            .expect(end)
+            .0;
+        let read = operation
+            .find("let settings = measured_settings();")
+            .unwrap_or_else(|| panic!("{child}: reads the process defaults"));
+        let open = operation.find("Omnigraph::open(uri)").unwrap();
+        assert!(
+            read < open,
+            "{child}: the selector is read before the fixture opens"
+        );
+        assert_eq!(
+            operation.matches("Session::from_defaults(").count(),
+            1,
+            "{child}: one measured session"
+        );
+        assert!(
+            !operation.contains("SessionSettings::default()"),
+            "{child}: the measured merge must not run on default settings"
+        );
+        assert!(
+            operation.contains("\"merge_lineage\": db.settings().merge_lineage().as_str()"),
+            "{child}: records the mode it measured"
+        );
+    }
+    let general = source
+        .split_once("pub(super) async fn general_merge_operation")
+        .unwrap()
+        .1;
+    assert!(
+        general.find("let settings = measured_settings();").unwrap()
+            < general.find("helpers::cost::cost_harness").unwrap(),
+        "the selector is read before the cost harness starts"
+    );
+}
+
 #[test]
 fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
     let harness = include_str!("../benches/scenarios.rs");
@@ -572,4 +634,111 @@ fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
     assert!(controls.contains("one payload row from every table"));
     assert!(!controls.contains("cleanup_old_versions("));
     assert!(!controls.contains(".optimize().await"));
+}
+
+/// The concurrent-writes throughput diagnostic (RFC 0067 "What to measure")
+/// keeps its measurement honest by construction. Pins, in the order the run
+/// executes them:
+///
+/// 1. RFC 0039 self-labeling — a closed-loop driver cannot back claims, so
+///    the record must say so and name its latencies service time.
+/// 2. Probe coverage — the counting reopen and EVERY spawned worker run
+///    under the same task-local probes value (the task_local does not cross
+///    `tokio::spawn`), and the workload runs on the production
+///    `Session::mutate` path with disjoint per-worker keys.
+/// 3. Boundary — the measured window opens only after the warmup drain, and
+///    verification runs on a fresh handle after every counter and clock has
+///    been read.
+/// 4. Refusals — an unusable target exits 78, the harness's refusal code;
+///    the watchdog exits 75 (`EX_TEMPFAIL`), which the harness reports as a
+///    plain failed run; and an invalid run (worker error or
+///    verification mismatch) fails the child rather than emitting a green
+///    record.
+#[test]
+fn concurrent_writes_is_closed_loop_labeled_probe_covered_and_verified() {
+    let source = include_str!("../benches/scenarios/concurrent_writes.rs");
+
+    // 1. Self-labeling.
+    assert!(source.contains(r#""driver": "closed-loop""#));
+    assert!(source.contains(r#""claim_grade": false"#));
+    assert!(source.contains("coordinated omission (RFC 0039 Rule 1)"));
+    assert!(source.contains(r#""service_time_us""#));
+    assert!(
+        !source.contains(r#""latency_us""#),
+        "closed-loop numbers are service time, never arrival latency"
+    );
+
+    // 2. Probe coverage and the production write path.
+    let (_, measured) = source
+        .split_once("async fn run_measured")
+        .expect("measured region");
+    assert!(measured.contains("Omnigraph::open_with_storage(&root_uri, counting)"));
+    assert!(measured.contains("CountingStorageAdapter::new(storage)"));
+    let (_, spawn_region) = measured
+        .split_once("handles.push(if no_probes")
+        .expect("worker spawn region");
+    assert!(
+        spawn_region.contains("tokio::spawn(with_query_io_probes(worker_probes"),
+        "every spawned worker must re-enter the probes scope"
+    );
+    assert!(measured.contains("session.mutate(&branch, &insert_src"));
+    assert!(
+        measured.contains("cw-w{worker:02}-{acked_ops:010}"),
+        "worker keys must be disjoint by construction"
+    );
+
+    // 3. Boundary: warmup drain before the measured flip; verification on a
+    //    fresh handle after the measured scope returned.
+    let (before_flip, after_flip) = measured
+        .split_once("phase.store(PHASE_MEASURED")
+        .expect("measured flip");
+    assert!(
+        before_flip.contains("drain_from(&manifest_tracker, &probes_for_main.manifest_stores)"),
+        "warmup IO must be drained before the measured window opens"
+    );
+    assert!(after_flip.contains("let measured_started = Instant::now()"));
+    let (_, judge) = source
+        .split_once("async fn judge_and_summarize")
+        .expect("judge region");
+    assert!(
+        judge.contains("open fixture for verification"),
+        "verification opens its own fresh handle"
+    );
+    assert!(judge.contains("count_rows_branch"));
+    assert!(judge.contains("rows, expected 1"));
+    assert!(
+        judge.contains("readback of acknowledged slug"),
+        "a failed readback query must surface its error, never read as zero rows"
+    );
+
+    // 4. Refusals and invalidation.
+    assert!(source.contains("std::process::exit(78)"));
+    assert!(source.contains("std::process::exit(75)"));
+    assert!(judge.contains("concurrent-writes run invalid"));
+
+    // Registration: the harness routes the scenario through the single-child
+    // path with the new flags forwarded, and the fixture-age controls admit
+    // the scenario.
+    let harness = include_str!("../benches/scenarios.rs");
+    assert!(
+        harness.contains(r#"("concurrent-writes", None) => concurrent_writes::run(args).await"#)
+    );
+    assert!(harness.contains("concurrent_writes::validate_args(&args)"));
+    for flag in [
+        "--writers",
+        "--duration-secs",
+        "--warmup-secs",
+        "--write-branches",
+        "--target-uri",
+        "--keep-fixture",
+        "--no-probes",
+        "--tokio-workers",
+    ] {
+        assert!(
+            harness.contains(&format!("\"{flag}\"")),
+            "harness must parse and forward {flag}"
+        );
+    }
+    let rfc023 = include_str!("../benches/scenarios/rfc023.rs");
+    assert!(rfc023.contains("super::concurrent_writes::is_scenario(&args.scenario)"));
 }

@@ -1,0 +1,131 @@
+# issue: none
+# notes: A divergent merge publishes detached node and edge pins on main; reads, restart and the next target write preserve source isolation.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person { name: String @key }
+edge Knows: Person -> Person { @key(@src, @dst) }
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+{"edge":"Knows","from":"alice","to":"alice"}
+
+--- mutate
+branch create source
+--- expect ok
+
+--- mutate branch: source
+query add_source() { insert Person { name: "bob" } insert Knows { from: "bob", to: "alice" } }
+--- expect affected: nodes=1 edges=1
+
+--- mutate branch: main
+query advance_target() { insert Person { name: "carol" } }
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge source into main
+--- expect ok
+
+--- query branch: main
+query people() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+{"p.name":"carol"}
+--- expect shape
+p.name: String
+
+--- query branch: main
+query edges() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+--- expect unordered
+{"p.name":"alice","q.name":"alice"}
+{"p.name":"bob","q.name":"alice"}
+--- expect shape
+p.name: String
+q.name: String
+
+--- query branch: source
+query people() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+--- expect shape
+p.name: String
+
+--- query branch: source
+query edges() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+--- expect unordered
+{"p.name":"alice","q.name":"alice"}
+{"p.name":"bob","q.name":"alice"}
+--- expect shape
+p.name: String
+q.name: String
+
+--- restart
+
+--- query branch: main
+query people() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+{"p.name":"carol"}
+--- expect shape
+p.name: String
+
+--- query branch: main
+query edges() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+--- expect unordered
+{"p.name":"alice","q.name":"alice"}
+{"p.name":"bob","q.name":"alice"}
+--- expect shape
+p.name: String
+q.name: String
+
+--- mutate branch: main
+query after_merge() { insert Person { name: "diana" } insert Knows { from: "diana", to: "carol" } }
+--- expect affected: nodes=1 edges=1
+
+--- restart
+
+--- query branch: main
+query people() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+{"p.name":"carol"}
+{"p.name":"diana"}
+--- expect shape
+p.name: String
+
+--- query branch: main
+query edges() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+--- expect unordered
+{"p.name":"alice","q.name":"alice"}
+{"p.name":"bob","q.name":"alice"}
+{"p.name":"diana","q.name":"carol"}
+--- expect shape
+p.name: String
+q.name: String
+
+--- query branch: source
+query people() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+--- expect shape
+p.name: String
+
+--- query branch: source
+query edges() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+--- expect unordered
+{"p.name":"alice","q.name":"alice"}
+{"p.name":"bob","q.name":"alice"}
+--- expect shape
+p.name: String
+q.name: String

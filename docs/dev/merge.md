@@ -25,8 +25,7 @@ The table classifier chooses one of four routes:
 
 1. **No change:** source contributes nothing.
 2. **Pointer adoption:** target still equals the base and the exact source table
-   state can become the target's visible pointer without copying rows. A
-   first-touch lazy target stays on this ref-only route.
+   state can become the target's visible pointer without copying rows.
 3. **Proven insertion replay:** target still permits data replay and the
    complete retained source interval proves a contiguous sequence of exact-ID,
    insertion-only transactions.
@@ -37,18 +36,17 @@ An optimization miss is not a merge failure. Missing transaction history,
 unknown certificate fields, or an unfamiliar Lance shape
 falls back to the general route.
 
-On the adopt route, every named target selects the source's exact table ref,
-version, and metadata, including when the target already owns a fork. Main
-keeps its data-delta route for a source on a named ref. Numeric table versions
-are not compared across refs: the publication's manifest version orders the
-registration within the graph branch (RFC 0062).
+On the adopt route, every target, main included, selects the source's exact
+table ref, version and pin: the target's registration takes the source's
+`staged_version` in the same dataset, with no fenced insert, keyed update or
+payload copy, and external blob descriptors stay external. Numeric table
+versions are not compared across refs: the publication's manifest version
+orders the registration within the graph branch (RFC 0062).
 
-The source's owner metadata stays with an adopted pointer. A later target
-write creates a unique target-owned fork from the accepted source version.
-Old target forks remain available to other branches and native descendants;
-explicit cleanup reclaims only forks outside that protection set. Pointer
-adoption still computes any required validation delta and runs the shared
-constraint evaluator.
+The source's registration metadata stays with an adopted pointer. A later
+target write stages detached on that same dataset from the adopted pin; no
+table fork is created. Pointer adoption still computes any required
+validation delta and runs the shared constraint evaluator.
 
 ## Proven insertion route
 
@@ -75,7 +73,9 @@ unsupported. RFC 0023 owns the detailed proof and performance evidence.
 
 ## General route
 
-`OMNIGRAPH_MERGE_LINEAGE=on` (the release default) derives candidate IDs from
+The `merge_lineage` session setting at `on` (the release default, `verify` in
+a debug build; `request` scope, process default `OMNIGRAPH_MERGE_LINEAGE`,
+read by the merge from its session) derives candidate IDs from
 compatible pinned fragment and deletion metadata. Deletion differences remain
 compressed until bounded offset chunks are needed; known positions use direct
 reads against the pinned before-image. The 32 MiB candidate budget is checked
@@ -174,9 +174,10 @@ rules, and the small cache/layout controls in the
 it unset, so timing does not read the clock. Its top-level timing flow is:
 
 `OuterPrepare` -> ((`ProvenInsertHistory` -> `ProvenInsertPlanScan`) | `TableWalk`)
--> `CandidateValidation` -> `FinalRevalidation` -> `RecoveryArm` ->
-`PhysicalPublish` -> `RecoveryConfirm` -> `ManifestPublish` -> `RecoveryCleanup`
--> `OuterRestoreRefresh`.
+-> `CandidateValidation` -> `FinalRevalidation` -> `PhysicalPublish` ->
+`ManifestPublish` -> `OuterRestoreRefresh`. The `RecoveryArm`,
+`RecoveryConfirm` and `RecoveryCleanup` phases retired with the merge
+sidecar (RFC 0067).
 
 The parenthesized classification routes are chosen per table, so a mixed-table
 operation can record both route families. `TableWalk` covers one general
@@ -235,16 +236,22 @@ structured result to its public 409 representation.
 
 ## Publication and recovery
 
-A merge with physical table effects uses one BranchMerge recovery sidecar.
-Its complete intended delta includes pointer-only siblings as well as the
-physical effects. Unique first-touch names and owners are fixed in that sidecar
-before native creation. A merge containing only pointer changes needs no table
-effect sidecar. Both routes publish the target through one manifest CAS.
+A merge into a named branch with physical table effects chains each merged
+table's chunks as detached commits on the target's pin and publishes one pin
+per table, `base + 1` as its `published_dataset_version` and the chain's
+tip as its `staged_version` (RFC 0067, detached-only). A merge onto main is
+a pointer switch: main's registration takes the source's pin, and the merge
+stages nothing; an empty source delta leaves main's registration untouched.
+Pointer-only siblings ride the same manifest CAS, and no table fork is
+created. The merge proofs walk the source's commit chain by `read_version`
+links from the source pin to the base pin (`try_proven_pure_insert_history`,
+`proven_chain_fragments`, `chain_reaches`, `plan_lineage_merge`).
 
-After recovery arm, a failed table link or publish retains recovery ownership
-and returns `RecoveryRequired`. Merge does not re-run semantic classification
-around a committed prefix. Full recovery either publishes the complete
-confirmed result or compensates the owned partial set before visibility.
+A failure anywhere before the CAS returns the original error and leaves the
+target untouched: the chunk chains are unpublished staging that `cleanup`'s
+collector reclaims, and a retry plans from scratch. A target that advanced
+meanwhile makes the merge lose its CAS and return the ordinary conflict. After
+the CAS the merge is complete; nothing follows the publication.
 
 ## Outcomes
 

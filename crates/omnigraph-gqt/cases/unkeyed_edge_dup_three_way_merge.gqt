@@ -31,27 +31,27 @@ branch create b0
 --- expect ok
 
 --- mutate branch: main
-query change() { insert Knows { from: "Diana", to: "Diana" } }
+query add_loop_on_main() { insert Knows { from: "Diana", to: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: b0
-query change() { insert Knows { from: "Diana", to: "Diana" } }
+query add_loop_on_branch() { insert Knows { from: "Diana", to: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: b0
-query change() { insert Knows { from: "Diana", to: "Diana" } }
+query duplicate_branch_loop() { insert Knows { from: "Diana", to: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: b0
-query change() { insert Knows { from: "Alice", to: "Bob" } }
+query duplicate_inherited_edge() { insert Knows { from: "Alice", to: "Bob" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: main
-query change() { insert Person { name: "Eve" } }
+query add_person_on_main() { insert Person { name: "Eve" } }
 
 --- expect affected: nodes=1 edges=0
 

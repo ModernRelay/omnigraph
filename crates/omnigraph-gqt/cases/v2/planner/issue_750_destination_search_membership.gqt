@@ -1,0 +1,208 @@
+# issue: 750
+# red_on: pre-fix read-path planner working tree (destination search membership lost); destination Search reaches unsupported expression in filter
+# notes: Destination Search and MatchText are exact membership predicates.
+# notes: Scalar and multiple search predicates conjoin before graph rows return.
+# notes: Duplicate paths, multihop endpoints and limits retain surviving rows.
+# notes: This case makes no BM25 ranking or score-equivalence assertion.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Source {
+    slug: String @key
+}
+node Doc {
+    slug: String @key
+    body: String @index
+    summary: String @index
+    state: String
+}
+edge Links: Source -> Doc
+edge Hops: Doc -> Doc
+
+--- seed
+{"type":"Source","data":{"slug":"root"}}
+{"type":"Source","data":{"slug":"second"}}
+{"type":"Source","data":{"slug":"orphan"}}
+{"type":"Doc","data":{"slug":"a-blocked","body":"needle zeta","summary":"beacon","state":"closed"}}
+{"type":"Doc","data":{"slug":"b-body","body":"needle","summary":"other","state":"open"}}
+{"type":"Doc","data":{"slug":"c-summary","body":"other zeta","summary":"beacon","state":"open"}}
+{"type":"Doc","data":{"slug":"d-hit","body":"needle zeta","summary":"beacon","state":"open"}}
+{"type":"Doc","data":{"slug":"e-near","body":"needlf zeta","summary":"beacon","state":"open"}}
+{"type":"Doc","data":{"slug":"z-end","body":"endpoint","summary":"beacon","state":"open"}}
+{"edge":"Links","from":"root","to":"a-blocked"}
+{"edge":"Links","from":"root","to":"b-body"}
+{"edge":"Links","from":"root","to":"c-summary"}
+{"edge":"Links","from":"root","to":"d-hit"}
+{"edge":"Links","from":"root","to":"e-near"}
+{"edge":"Links","from":"second","to":"d-hit"}
+{"edge":"Hops","from":"a-blocked","to":"z-end"}
+{"edge":"Hops","from":"d-hit","to":"z-end"}
+
+--- query
+set engine = v2;
+query destination_search() {
+    match {
+        $s: Source
+        $s links $d
+        search($d.body, "needle")
+    }
+    return { $d.slug }
+    order { $d.slug }
+}
+--- expect ordered
+{"d.slug":"a-blocked"}
+{"d.slug":"b-body"}
+{"d.slug":"d-hit"}
+{"d.slug":"d-hit"}
+--- expect shape
+d.slug: String
+--- expect plan
+hash join $d
+scan Doc as $d: filter reads [d.body]
+
+--- query
+set engine = v2;
+query destination_match_text() {
+    match {
+        $s: Source
+        $s links $d
+        match_text($d.body, "needle")
+    }
+    return { $d.slug }
+    order { $d.slug }
+}
+--- expect ordered
+{"d.slug":"a-blocked"}
+{"d.slug":"b-body"}
+{"d.slug":"d-hit"}
+{"d.slug":"d-hit"}
+--- expect shape
+d.slug: String
+--- expect plan
+hash join $d
+scan Doc as $d: filter reads [d.body]
+
+--- query
+set engine = v2;
+query scalar_and_two_destination_searches() {
+    match {
+        $s: Source
+        $s links $d
+        $d: Doc { state: "open" }
+        search($d.body, "needle")
+        match_text($d.summary, "beacon")
+    }
+    return { $d.slug }
+}
+--- expect unordered
+{"d.slug":"d-hit"}
+{"d.slug":"d-hit"}
+--- expect shape
+d.slug: String
+--- expect plan
+hash join $d
+scan Doc as $d: filter reads [d.state, d.body, d.summary]
+
+--- query
+set engine = v2;
+query two_searches_on_one_property() {
+    match {
+        $s: Source
+        $s links $d
+        $d: Doc { state: "open" }
+        search($d.body, "needle")
+        match_text($d.body, "zeta")
+    }
+    return { $d.slug }
+}
+--- expect unordered
+{"d.slug":"d-hit"}
+{"d.slug":"d-hit"}
+--- expect shape
+d.slug: String
+--- expect plan
+hash join $d
+scan Doc as $d: filter reads [d.state, d.body]
+
+--- query
+set engine = v2;
+query multihop_endpoint_membership() {
+    match {
+        $s: Source
+        $s links $d
+        $d: Doc { state: "open" }
+        $d hops $e
+        search($e.body, "endpoint")
+    }
+    return { $e.slug }
+}
+--- expect unordered
+{"e.slug":"z-end"}
+{"e.slug":"z-end"}
+--- expect shape
+e.slug: String
+--- expect plan
+hash join $d
+scan Doc as $d: filter reads [d.state]
+scan Doc as $e: filter reads [e.body]
+
+--- query
+set engine = v2;
+query limit_counts_surviving_paths() {
+    match {
+        $s: Source
+        $s links $d
+        $d: Doc { state: "open" }
+        search($d.body, "needle")
+        match_text($d.summary, "beacon")
+    }
+    return { $d.slug }
+    limit 2
+}
+--- expect unordered
+{"d.slug":"d-hit"}
+{"d.slug":"d-hit"}
+--- expect shape
+d.slug: String
+--- expect plan
+hash join $d
+scan Doc as $d: filter reads [d.state, d.body, d.summary]
+
+--- query
+set engine = v2;
+query empty_source_destination_search() {
+    match {
+        $s: Source { slug: "orphan" }
+        $s links $d
+        search($d.body, "needle")
+    }
+    return { $d.slug }
+}
+--- expect unordered
+--- expect shape
+d.slug: String
+--- expect plan
+hash join $d
+scan Doc as $d: filter reads [d.body]
+
+--- query
+set engine = v2;
+query destination_search_has_no_matches() {
+    match {
+        $s: Source
+        $s links $d
+        match_text($d.body, "absenttoken")
+    }
+    return { $d.slug }
+}
+--- expect unordered
+--- expect shape
+d.slug: String
+--- expect plan
+hash join $d
+scan Doc as $d: filter reads [d.body]

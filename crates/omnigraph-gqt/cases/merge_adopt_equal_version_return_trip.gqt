@@ -1,10 +1,7 @@
 # issue: none
-# notes: The return trip of the equal-number round trip. The first eight steps
-# notes: match merge_adopt_equal_source_version_collides.gqt: two edge writes on
-# notes: `feature`, so both edge tables reach Lance v4 on different native refs.
-# notes: After `main` is adopted into `feature`, only a node is edited on
-# notes: `feature` and the branch merges back; `main` must keep all four edges
-# notes: across a restart.
+# notes: Two feature edge writes produce equal Lance versions on different refs, as in
+# notes: merge_adopt_equal_source_version_collides.gqt. Adopt main, edit only a node,
+# notes: then merge back: all four edges must survive restart.
 
 --- runner
 timeout_ms: 10000

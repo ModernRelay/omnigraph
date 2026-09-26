@@ -48,6 +48,10 @@ pub struct ManifestError {
     pub kind: ManifestErrorKind,
     pub message: String,
     pub details: Option<ManifestConflictDetails>,
+    /// Publication may be durable despite an unavailable acknowledgement or
+    /// readback. Retention guards must remain until authority proves it cannot
+    /// still publish; the external error category remains `Internal`.
+    pub publication_in_doubt: bool,
 }
 
 impl ManifestError {
@@ -56,6 +60,7 @@ impl ManifestError {
             kind,
             message: message.into(),
             details: None,
+            publication_in_doubt: false,
         }
     }
 
@@ -183,7 +188,7 @@ pub enum OmniError {
         /// after an effect-free substrate conflict.
         entity_id: Option<String>,
     },
-    /// A write was rejected before recovery was armed because its bounded
+    /// A write was rejected before publication because its bounded
     /// physical plan would exceed an explicit safety ceiling. This is a
     /// retryable input-shaping error, not a partial-success signal.
     #[error("resource limit exceeded for {resource}: actual {actual}, limit {limit}")]
@@ -248,11 +253,12 @@ pub enum OmniError {
     /// A managed Blob range used reversed or out-of-bounds coordinates.
     #[error("blob range [{start}, {end}) is not satisfiable for a value of length {length}")]
     BlobRangeNotSatisfiable { start: u64, end: u64, length: u64 },
-    /// A durable recovery intent overlaps this write. Its physical effects may
-    /// already have landed, or it may still be armed before its first effect;
-    /// either way the sidecar named by `operation_id` must be resolved before
-    /// the caller retries. Treating this as ordinary OCC would let a writer
-    /// advance around unresolved commit ownership.
+    /// The graph commit named by `operation_id` is published but its schema
+    /// contract is not installed yet: schema apply or the system-column
+    /// upgrade failed after its manifest commit, or a read-only open found the
+    /// staged contract pending. A read-write open or the next write on the
+    /// publishing handle installs it. Treating this as ordinary OCC would
+    /// retry a change that is already committed.
     #[error("recovery required for operation {operation_id}: {reason}")]
     RecoveryRequired {
         operation_id: String,
@@ -506,6 +512,18 @@ impl OmniError {
         datafusion::error::DataFusionError::External(source)
     }
 
+    /// A memory refusal carried by a build stream, excluding the scratch quota.
+    pub(crate) fn is_query_memory_failure(error: &datafusion::error::DataFusionError) -> bool {
+        if matches!(
+            error.find_root(),
+            datafusion::error::DataFusionError::ResourcesExhausted(_)
+        ) {
+            return !crate::table_store::is_scratch_exhaustion(error);
+        }
+        matches!(recover_datafusion_stream_failure(error),
+            Some(Self::ResourceLimitExceeded { resource, .. }) if resource == "query_memory_bytes")
+    }
+
     /// Preserve typed storage evidence carried through DataFusion execution;
     /// otherwise retain the user query/execution category.
     pub fn datafusion(error: datafusion::error::DataFusionError) -> Self {
@@ -594,10 +612,6 @@ impl OmniError {
         }
     }
 
-    pub(crate) fn is_retryable_commit_conflict(&self) -> bool {
-        matches!(self, Self::RetryableCommitConflict(_))
-    }
-
     pub(crate) fn is_read_set_changed(&self) -> bool {
         matches!(
             self,
@@ -622,6 +636,25 @@ impl OmniError {
 
     pub fn manifest_internal(message: impl Into<String>) -> Self {
         Self::Manifest(ManifestError::new(ManifestErrorKind::Internal, message))
+    }
+
+    pub(crate) fn manifest_publish_in_doubt(message: impl Into<String>) -> Self {
+        Self::Manifest(ManifestError {
+            publication_in_doubt: true,
+            ..ManifestError::new(ManifestErrorKind::Internal, message)
+        })
+    }
+
+    /// Whether a manifest publication lacks a definitive durable outcome.
+    /// This signal is independent of the diagnostic text and conflict details.
+    pub fn is_manifest_publish_in_doubt(&self) -> bool {
+        matches!(
+            self,
+            Self::Manifest(ManifestError {
+                publication_in_doubt: true,
+                ..
+            })
+        )
     }
 
     pub fn published_dataset_version_mismatch(
@@ -965,6 +998,7 @@ mod tests {
                 Some("commit-before".to_string()),
                 Some("commit-after".to_string()),
             ),
+            OmniError::manifest_publish_in_doubt("exact in-doubt outcome").with_context("merge"),
             OmniError::ResourceLimitExceeded {
                 resource: "blob materialization bytes".to_string(),
                 limit: 10,
@@ -993,6 +1027,7 @@ mod tests {
                 assert_eq!(actual.kind, expected.kind);
                 assert_eq!(actual.message, expected.message);
                 assert_eq!(actual.details, expected.details);
+                assert_eq!(actual.publication_in_doubt, expected.publication_in_doubt);
             }
             (
                 OmniError::ResourceLimitExceeded {
@@ -1937,5 +1972,39 @@ mod tests {
             "merge conflicts: node type 'Person', entity id 'p1' (divergent_update): divergent update for id 'p1'"
         );
         assert!(!error.to_string().contains("table_key"));
+    }
+    /// GQT cannot construct DataFusion carriers or distinguish build failure classes.
+    #[test]
+    fn hash_build_fallback_accepts_only_memory_refusals() {
+        use datafusion::error::DataFusionError;
+        for (error, retry) in [
+            (
+                DataFusionError::ResourcesExhausted("allocation refused".into()),
+                true,
+            ),
+            (
+                DataFusionError::ResourcesExhausted("max_temp_directory_size exceeded".into()),
+                false,
+            ),
+            (
+                OmniError::resource_limit("query_memory_bytes", 1, 2).into_datafusion_external(),
+                true,
+            ),
+            (
+                OmniError::resource_limit("query_scratch_bytes", 1, 2).into_datafusion_external(),
+                false,
+            ),
+            (
+                OmniError::manifest_internal("build error").into_datafusion_external(),
+                false,
+            ),
+        ] {
+            let shared = DataFusionError::Shared(std::sync::Arc::new(error));
+            assert_eq!(
+                OmniError::is_query_memory_failure(&shared),
+                retry,
+                "{shared}"
+            );
+        }
     }
 }

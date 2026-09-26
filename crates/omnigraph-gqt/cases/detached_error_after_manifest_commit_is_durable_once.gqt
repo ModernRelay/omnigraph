@@ -1,0 +1,69 @@
+# issue: none
+# notes: A failure after main's __manifest commit surfaces as an error while the write is already durable. The same handle sees the row exactly once, a retry of the keyed insert adds no row, and an update lands and survives restart.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I64
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob","age":40}}
+
+--- seam
+at: graph_publish.after_manifest_commit
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+query add_carol() { insert Person { name: "carol", age: 50 } }
+--- expect error: injected failpoint triggered: graph_publish.after_manifest_commit
+
+--- query branch: main
+query people() { match { $p: Person } return { $p.name, $p.age } }
+--- expect unordered
+{"p.name":"alice","p.age":30}
+{"p.name":"bob","p.age":40}
+{"p.name":"carol","p.age":50}
+--- expect shape
+p.name: String
+p.age: I64
+
+--- mutate
+query add_carol() { insert Person { name: "carol", age: 50 } }
+--- expect affected: nodes=1 edges=0
+
+--- query branch: main
+query people() { match { $p: Person } return { $p.name, $p.age } }
+--- expect unordered
+{"p.name":"alice","p.age":30}
+{"p.name":"bob","p.age":40}
+{"p.name":"carol","p.age":50}
+--- expect shape
+p.name: String
+p.age: I64
+
+--- mutate
+query older() { update Person set { age: 51 } where name = "carol" }
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- query branch: main
+query people() { match { $p: Person } return { $p.name, $p.age } }
+--- expect unordered
+{"p.name":"alice","p.age":30}
+{"p.name":"bob","p.age":40}
+{"p.name":"carol","p.age":51}
+--- expect shape
+p.name: String
+p.age: I64

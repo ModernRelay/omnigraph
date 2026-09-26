@@ -88,10 +88,10 @@ both branches descend from, counting a merged branch as an ancestor. Two
 branches that each merged the same third branch therefore share that
 branch's commit as their base, and an entity only one of them changed after
 that import merges cleanly. The record of such a commit lives in the branch
-it was merged from, and the merge reads it from any live branch whose
-lineage still holds it. Once no live branch holds it, the base falls back to
-the older common commit, so an entity both sides received from the deleted
-branch and one side then changed can report `divergent_update`.
+it was merged from, and the merge can read it from a live branch or retained
+retired history. Cleanup preserves the exact selected base and the retired
+histories needed to resolve it. Recreating the logical branch name cannot
+substitute the replacement branch's same-numbered snapshot.
 
 Each conflict identifies the affected type and, when applicable, entity id. The
 HTTP server returns conflicts with status `409`, the same answer for
@@ -121,7 +121,10 @@ type's declared identity:
 
 ## Merge classification mode
 
-`OMNIGRAPH_MERGE_LINEAGE` selects how a branch merge finds what changed. `on`
+The `merge_lineage` [session setting](../queries/index.md#session-settings)
+(`request` scope; `set merge_lineage = off;` before the statement, `--set
+merge_lineage=off`, or the request's `settings` field; process default
+`OMNIGRAPH_MERGE_LINEAGE`) selects how a branch merge finds what changed. `on`
 (the release default) discovers candidates from Lance version metadata —
 fragment lists and deletion files — and compares candidate rows. Known deleted
 row positions use bounded direct reads. Candidate filtering may still scan data
@@ -136,7 +139,8 @@ everywhere — the operational fallback if merge results are ever in question.
 scan's result, and fails the merge loudly on any divergence (the debug-build
 default, used for validation; it costs both paths). A merge that succeeds
 produces the same result in every mode; only cost differs. An unrecognized
-value logs a warning and behaves as `off`.
+value is refused where it arrives: in the environment it refuses startup, in
+a request or a file it refuses that request.
 
 Later writes create fresh table storage when needed and leave unused former
 storage for explicit cleanup. They do not reclaim a previous table history as

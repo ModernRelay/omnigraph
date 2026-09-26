@@ -1,0 +1,211 @@
+{
+  "explain_version": 1,
+  "route": "engine",
+  "override": "registry",
+  "operation": {
+    "kind": "query",
+    "tables": []
+  },
+  "logical_plan": {
+    "node": "Limit",
+    "rows": 3,
+    "bytes": 0,
+    "resume": null,
+    "inputs": [
+      {
+        "node": "Projection",
+        "columns": [
+          "d.slug"
+        ],
+        "inputs": [
+          {
+            "node": "RankFuse",
+            "targets": [
+              "d",
+              "d"
+            ],
+            "reads": [],
+            "inputs": [
+              {
+                "node": "TableScan",
+                "binding": "d",
+                "table": "node:Doc",
+                "version": 2,
+                "projection": [
+                  "__id",
+                  "slug",
+                  "text"
+                ],
+                "filter": null
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "logical_hash": "8f4008347ef2690d",
+  "physical_plan": {
+    "node": "Page",
+    "rows": 3,
+    "bytes": 0,
+    "resume": null,
+    "id": 4,
+    "properties": {
+      "ordering": [
+        "rrf($d, $d) desc"
+      ],
+      "rows": {
+        "known": 3
+      },
+      "work_bytes": "unknown",
+      "retained_limit": null,
+      "sources": []
+    },
+    "inputs": [
+      {
+        "node": "Projection",
+        "exprs": [
+          "$d.slug"
+        ],
+        "id": 3,
+        "properties": {
+          "ordering": [
+            "rrf($d, $d) desc"
+          ],
+          "rows": {
+            "known": 3
+          },
+          "work_bytes": "unknown",
+          "retained_limit": null,
+          "sources": []
+        },
+        "inputs": [
+          {
+            "node": "RankFuse",
+            "arms": [
+              {
+                "binding": "d",
+                "kind": "nearest"
+              },
+              {
+                "binding": "d",
+                "kind": "bm25"
+              }
+            ],
+            "k": null,
+            "limit": 3,
+            "id": 2,
+            "properties": {
+              "ordering": [
+                "rrf($d, $d) desc"
+              ],
+              "rows": {
+                "known": 3
+              },
+              "work_bytes": "unknown",
+              "retained_limit": null,
+              "sources": []
+            },
+            "inputs": [
+              {
+                "node": "Scan",
+                "binding": "d",
+                "table": "node:Doc",
+                "version": 2,
+                "projection": [
+                  "__id",
+                  "slug",
+                  "text"
+                ],
+                "filter": null,
+                "ordered": false,
+                "keys_only": false,
+                "ranked": {
+                  "kind": "nearest",
+                  "property": "embedding",
+                  "query": "$q",
+                  "fetch": 3,
+                  "scope": "primary"
+                },
+                "id": 0,
+                "properties": {
+                  "ordering": [
+                    "$d._distance asc"
+                  ],
+                  "rows": {
+                    "known": 3
+                  },
+                  "work_bytes": "unknown",
+                  "retained_limit": null,
+                  "sources": [
+                    {
+                      "statistic": "scan_row_estimate(node:Doc)",
+                      "value": "3",
+                      "origin": "manifest row count, at most one row under a key equality"
+                    }
+                  ]
+                }
+              },
+              {
+                "node": "Scan",
+                "binding": "d",
+                "table": "node:Doc",
+                "version": 2,
+                "projection": [
+                  "__id",
+                  "slug",
+                  "text"
+                ],
+                "filter": null,
+                "ordered": false,
+                "keys_only": false,
+                "ranked": {
+                  "kind": "bm25",
+                  "property": "text",
+                  "query": "$t",
+                  "fetch": null,
+                  "scope": "secondary"
+                },
+                "id": 1,
+                "properties": {
+                  "ordering": [
+                    "$d._score desc"
+                  ],
+                  "rows": {
+                    "known": 3
+                  },
+                  "work_bytes": "unknown",
+                  "retained_limit": null,
+                  "sources": [
+                    {
+                      "statistic": "scan_row_estimate(node:Doc)",
+                      "value": "3",
+                      "origin": "manifest row count, at most one row under a key equality"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "statistics": [
+    {
+      "statistic": "scan_row_estimate(node:Doc)",
+      "value": "3",
+      "origin": "manifest row count, at most one row under a key equality"
+    },
+    {
+      "statistic": "scan_row_estimate(node:Doc)",
+      "value": "3",
+      "origin": "manifest row count, at most one row under a key equality"
+    }
+  ],
+  "passes": [
+    "resolve",
+    "projection_pushdown"
+  ]
+}

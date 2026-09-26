@@ -1,0 +1,151 @@
+# issue: none
+# notes: An assignment value and an inline binding match are constants, evaluated once per invocation
+# notes: after parameter binding under the three-valued rules: `$age > 30` gives opposite results with 20 and 40; with `$flag` null, `true or $flag` is true and `false and $flag` is false.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    adult: Bool
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a","adult":false}}
+{"type":"Person","data":{"slug":"b","adult":true}}
+
+--- query
+set engine = v2;
+query inline_match_with_twenty($age: I64) {
+    match { $p: Person { adult: $age > 30 } }
+    return { $p.slug }
+}
+
+--- params
+{"age": 20}
+
+--- expect unordered
+{"p.slug": "a"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query inline_match_with_forty($age: I64) {
+    match { $p: Person { adult: $age > 30 } }
+    return { $p.slug }
+}
+
+--- params
+{"age": 40}
+
+--- expect unordered
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String
+
+--- mutate
+query assign_with_forty($slug: String, $age: I64) {
+    update Person set { adult: $age > 30 } where slug = $slug
+}
+
+--- params
+{"slug": "a", "age": 40}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query assign_with_twenty($slug: String, $age: I64) {
+    update Person set { adult: $age > 30 } where slug = $slug
+}
+
+--- params
+{"slug": "b", "age": 20}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query the_two_invocations_flipped_both_rows() {
+    match { $p: Person }
+    return { $p.slug, $p.adult }
+}
+
+--- expect unordered
+{"p.slug": "a", "p.adult": true}
+{"p.slug": "b", "p.adult": false}
+
+--- expect shape
+p.slug: String
+p.adult: Bool
+
+--- mutate
+query or_absorbs_null($slug: String, $flag: Bool?) {
+    update Person set { adult: true or $flag } where slug = $slug
+}
+
+--- params
+{"slug": "b", "flag": null}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query and_absorbs_null($slug: String, $flag: Bool?) {
+    update Person set { adult: false and $flag } where slug = $slug
+}
+
+--- params
+{"slug": "a", "flag": null}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query the_two_null_writes_flipped_both_rows() {
+    match { $p: Person }
+    return { $p.slug, $p.adult }
+}
+
+--- expect unordered
+{"p.slug": "a", "p.adult": false}
+{"p.slug": "b", "p.adult": true}
+
+--- expect shape
+p.slug: String
+p.adult: Bool
+
+--- query
+set engine = v2;
+query inline_match_or_absorbs_null($flag: Bool?) {
+    match { $p: Person { adult: true or $flag } }
+    return { $p.slug }
+}
+
+--- params
+{"flag": null}
+
+--- expect unordered
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query inline_match_and_absorbs_null($flag: Bool?) {
+    match { $p: Person { adult: false and $flag } }
+    return { $p.slug }
+}
+
+--- params
+{"flag": null}
+
+--- expect unordered
+{"p.slug": "a"}
+
+--- expect shape
+p.slug: String

@@ -1,0 +1,212 @@
+# issue: 723
+# red_on: none; small-result correctness guard, memory reproduction in engine_v2_memory.rs
+# notes: Bound transfer edges retain parallel rows and nullable amounts through grouping.
+# notes: Fixed-pool and scale acceptance: omnigraph/tests/engine_v2_memory.rs and repro_issue_723.rs.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Account {
+    accountId: String @key
+}
+edge AccountTransferAccount: Account -> Account {
+    amount: I64?
+}
+
+--- seed
+{"type":"Account","data":{"accountId":"a"}}
+{"type":"Account","data":{"accountId":"b"}}
+{"type":"Account","data":{"accountId":"c"}}
+{"type":"Account","data":{"accountId":"sink"}}
+{"type":"Account","data":{"accountId":"orphan"}}
+{"edge":"AccountTransferAccount","from":"a","to":"sink","data":{"amount":10}}
+{"edge":"AccountTransferAccount","from":"a","to":"sink","data":{"amount":20}}
+{"edge":"AccountTransferAccount","from":"a","to":"sink","data":{}}
+{"edge":"AccountTransferAccount","from":"b","to":"sink","data":{"amount":7}}
+{"edge":"AccountTransferAccount","from":"b","to":"sink","data":{"amount":7}}
+{"edge":"AccountTransferAccount","from":"c","to":"sink","data":{}}
+
+--- query
+set engine = v2;
+query top_senders() {
+    match {
+        $src: Account
+        $src $t:accountTransferAccount $dst
+    }
+    return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
+    order { sent desc, $src.accountId }
+    limit 20
+}
+--- expect unordered
+{"src.accountId":"a","transfers":2,"sent":30.0}
+{"src.accountId":"b","transfers":2,"sent":14.0}
+{"src.accountId":"c","transfers":0}
+--- expect shape
+src.accountId: String
+transfers: I64
+sent: F64?
+--- expect plan
+scan Account as $src: columns [__id, accountId]
+scan Account as $dst: columns [__id, accountId]
+pass projection_pushdown
+not pass aggregate_pushdown
+
+--- query
+set engine = v2;
+query top_two_senders() {
+    match { $src: Account $src $t:accountTransferAccount $dst }
+    return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
+    order { sent desc, $src.accountId }
+    limit 2
+}
+--- expect unordered
+{"src.accountId":"a","transfers":2,"sent":30.0}
+{"src.accountId":"b","transfers":2,"sent":14.0}
+--- expect shape
+src.accountId: String
+transfers: I64
+sent: F64?
+--- query
+set engine = v2;
+query filtered_transfers() {
+    match { $src: Account $src $t:accountTransferAccount $dst $t.amount > 10 }
+    return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
+}
+--- expect unordered
+{"src.accountId":"a","transfers":1,"sent":20.0}
+--- expect shape
+src.accountId: String
+transfers: I64
+sent: F64?
+--- expect plan
+not pass aggregate_pushdown
+
+--- query
+set engine = v2;
+query empty_frontier() {
+    match { $src: Account { accountId: "absent" } $src $t:accountTransferAccount $dst }
+    return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
+}
+--- expect unordered
+--- expect shape
+src.accountId: String
+transfers: I64
+sent: F64?
+
+--- query
+set engine = v2;
+query empty_expansion() {
+    match { $src: Account { accountId: "orphan" } $src $t:accountTransferAccount $dst }
+    return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
+}
+--- expect unordered
+--- expect shape
+src.accountId: String
+transfers: I64
+sent: F64?
+
+--- query
+set engine = v2;
+query no_qualifying_edges() {
+    match { $src: Account $src $t:accountTransferAccount $dst $t.amount > 100 }
+    return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
+}
+--- expect unordered
+--- expect shape
+src.accountId: String
+transfers: I64
+sent: F64?
+
+--- mutate
+query add_direction_boundaries() {
+    insert AccountTransferAccount { from: "a", to: "a", amount: 5 }
+    insert AccountTransferAccount { from: "sink", to: "a", amount: 3 }
+}
+--- expect affected: nodes=0 edges=2
+
+--- query
+set engine = v2;
+query reverse_transfers() {
+    match {
+        $dst: Account { accountId: "a" }
+        $src $t:accountTransferAccount $dst
+    }
+    return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
+}
+--- expect unordered
+{"src.accountId":"a","transfers":1,"sent":5.0}
+{"src.accountId":"sink","transfers":1,"sent":3.0}
+--- expect shape
+src.accountId: String
+transfers: I64
+sent: F64?
+
+--- query
+set engine = v2;
+query either_direction_once_per_edge() {
+    match {
+        $src: Account { accountId: "a" }
+        $src $t:<accountTransferAccount> $dst
+    }
+    return { count($dst) as edges, count($t.amount) as transfers, sum($t.amount) as sent }
+}
+--- expect unordered
+{"edges":5,"transfers":4,"sent":38.0}
+--- expect shape
+edges: I64
+transfers: I64
+sent: F64?
+
+--- query
+set engine = v2;
+query repeated_source_rows() {
+    match {
+        $copy: Account
+        $src: Account { accountId: "a" }
+        $src $t:accountTransferAccount $dst
+    }
+    return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
+}
+--- expect unordered
+{"src.accountId":"a","transfers":15,"sent":175.0}
+--- expect shape
+src.accountId: String
+transfers: I64
+sent: F64?
+
+--- query
+set engine = v2;
+query filtered_destination() {
+    match {
+        $src: Account { accountId: "a" }
+        $src $t:accountTransferAccount $dst
+        $dst: Account { accountId: "sink" }
+    }
+    return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
+}
+--- expect unordered
+{"src.accountId":"a","transfers":2,"sent":30.0}
+--- expect shape
+src.accountId: String
+transfers: I64
+sent: F64?
+
+--- query
+set engine = v2;
+query largest_individual_transfers() {
+    match { $src: Account $src $t:accountTransferAccount $dst }
+    return { $src.accountId, $dst.accountId, $t.amount }
+    order { $t.amount desc, $src.accountId, $dst.accountId }
+    limit 2
+}
+--- expect ordered
+{"src.accountId":"a","dst.accountId":"sink","t.amount":20}
+{"src.accountId":"a","dst.accountId":"sink","t.amount":10}
+--- expect shape
+src.accountId: String
+dst.accountId: String
+t.amount: I64?

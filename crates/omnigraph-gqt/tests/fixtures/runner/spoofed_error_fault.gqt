@@ -9,11 +9,11 @@ environments:
 --- schema
 node Person { name: String @key }
 --- seed
---- fault
-at: branch_merge.post_sidecar_pre_fork
+--- seam
+at: branch_merge.post_table_effect
 occurrence: 1
-action: return_error
+action: fail
 scope: next_step
 --- mutate
-branch merge "injected failpoint triggered: branch_merge.post_sidecar_pre_fork" into main
---- expect error: injected failpoint triggered: branch_merge.post_sidecar_pre_fork
+branch merge "injected failpoint triggered: branch_merge.post_table_effect" into main
+--- expect error: injected failpoint triggered: branch_merge.post_table_effect

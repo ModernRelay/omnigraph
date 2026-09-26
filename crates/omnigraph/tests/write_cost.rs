@@ -28,7 +28,9 @@ use helpers::cost::{
     IoCounts, assert_flat, assert_grows, cost_harness, last_manifest_reads, local_graph, measure,
     measure_insert, measure_insert_as, measure_with_staged,
 };
-use helpers::{MUTATION_QUERIES, commit_many, commit_many_as, init_and_load, mixed_params};
+use helpers::{
+    MUTATION_QUERIES, commit_many, commit_many_as, init_and_load, mixed_params, mutate_main,
+};
 
 // ── (A) The internal-table LOCK — the acceptance test for step 2 (compaction) ──
 //
@@ -50,19 +52,19 @@ async fn internal_table_scans_are_flat_in_history() {
     cost_harness(async {
         const ACTOR: &str = "act-cost-gate";
         let dir = tempfile::tempdir().unwrap();
-        let mut db = local_graph(&dir).await;
+        let db = local_graph(&dir).await;
 
         let mut curve: Vec<(u64, IoCounts)> = Vec::new();
         let mut current = 0u64;
         for d in [10u64, 100] {
             if d > current {
-                commit_many_as(&mut db, (d - current) as usize, ACTOR).await;
+                commit_many_as(&db, (d - current) as usize, ACTOR).await;
                 current = d;
             }
             // Step 2: compaction folds all three internal tables' O(depth) fragments back
             // to a small constant, so the following write's scan of them is flat.
             db.optimize().await.unwrap();
-            let io = measure_insert_as(&mut db, &format!("lock_{d}"), ACTOR).await;
+            let io = measure_insert_as(&db, &format!("lock_{d}"), ACTOR).await;
             current += 1; // the measured write advanced depth by one
             eprintln!(
                 "depth~{d}: data={} __manifest={}",
@@ -89,8 +91,8 @@ async fn ensure_indices_manifest_reads_are_flat_in_history() {
         let mut curve: Vec<(u64, IoCounts)> = Vec::new();
         for depth in [10u64, 100] {
             let dir = tempfile::tempdir().unwrap();
-            let mut db = local_graph(&dir).await;
-            commit_many(&mut db, depth as usize).await;
+            let db = local_graph(&dir).await;
+            commit_many(&db, depth as usize).await;
             db.optimize().await.unwrap();
 
             let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
@@ -114,6 +116,176 @@ async fn ensure_indices_manifest_reads_are_flat_in_history() {
     .await;
 }
 
+/// RFC 0067: the index writer arms no recovery sidecar either. A pass with
+/// work on one table writes and deletes no control object.
+#[tokio::test]
+async fn ensure_indices_writes_no_control_object() {
+    use omnigraph::instrumentation::CountingStorageAdapter;
+    use omnigraph::storage::storage_for_uri;
+
+    let dir = tempfile::tempdir().unwrap();
+    let _ = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let (adapter, counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
+    let db = helpers::session(
+        omnigraph::db::Omnigraph::open_with_storage(uri, adapter)
+            .await
+            .unwrap(),
+    );
+    db.apply_schema(&helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index"))
+        .await
+        .unwrap();
+
+    let before_write_text = counts.write_text();
+    let before_delete = counts.delete();
+    db.ensure_indices().await.unwrap();
+    assert_eq!(
+        counts.write_text() - before_write_text,
+        0,
+        "a detached index batch arms no recovery sidecar: no control-object write"
+    );
+    assert_eq!(
+        counts.delete() - before_delete,
+        0,
+        "a detached index batch has no sidecar to delete after publication"
+    );
+}
+
+/// RFC 0067: schema apply arms no recovery sidecar. A property addition
+/// rewrites one table detached; the only control objects written are the
+/// three staged contract files and the three live ones, and the only deletes
+/// retire the staging.
+#[tokio::test]
+async fn schema_apply_writes_no_control_object() {
+    use omnigraph::instrumentation::CountingStorageAdapter;
+    use omnigraph::storage::storage_for_uri;
+
+    let dir = tempfile::tempdir().unwrap();
+    let _ = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let (adapter, counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
+    let db = helpers::session(
+        omnigraph::db::Omnigraph::open_with_storage(uri, adapter)
+            .await
+            .unwrap(),
+    );
+
+    let before_write_text = counts.write_text();
+    let before_delete = counts.delete();
+    db.apply_schema(&helpers::TEST_SCHEMA.replace("age: I32?", "age: I32?\n    city: String?"))
+        .await
+        .unwrap();
+    assert_eq!(
+        counts.write_text() - before_write_text,
+        6,
+        "a detached schema apply writes the staged and live contract files and no sidecar"
+    );
+    assert_eq!(
+        counts.delete() - before_delete,
+        3,
+        "a detached schema apply deletes only its three staging files"
+    );
+    assert!(
+        !dir.path().join("__recovery").exists()
+            || std::fs::read_dir(dir.path().join("__recovery"))
+                .unwrap()
+                .next()
+                .is_none(),
+        "no recovery sidecar may exist after a schema apply"
+    );
+}
+
+/// RFC 0067: a branch merge arms no recovery sidecar either. A fast-forward
+/// merge with one table effect writes and deletes no control object.
+#[tokio::test]
+async fn branch_merge_writes_no_control_object() {
+    use omnigraph::instrumentation::CountingStorageAdapter;
+    use omnigraph::storage::storage_for_uri;
+
+    let dir = tempfile::tempdir().unwrap();
+    let _ = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let (adapter, counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
+    let db = helpers::session(
+        omnigraph::db::Omnigraph::open_with_storage(uri, adapter)
+            .await
+            .unwrap(),
+    );
+    db.branch_create("feature").await.unwrap();
+    db.mutate(
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "merged")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap();
+
+    let before_write_text = counts.write_text();
+    let before_delete = counts.delete();
+    db.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(
+        counts.write_text() - before_write_text,
+        0,
+        "a detached merge chain arms no recovery sidecar: no control-object write"
+    );
+    assert_eq!(
+        counts.delete() - before_delete,
+        0,
+        "a detached merge has no sidecar to delete after publication"
+    );
+}
+
+/// RFC 0067: Optimize with compaction work on one table stages the rewrite
+/// detached, publishes its pin, and writes or deletes no control object (the
+/// adjacency artifact is written only when an edge table advances).
+#[tokio::test]
+async fn optimize_writes_no_control_object() {
+    use omnigraph::instrumentation::CountingStorageAdapter;
+    use omnigraph::storage::storage_for_uri;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    for (name, age) in [("opt-a", 41), ("opt-b", 42), ("opt-c", 43)] {
+        mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", name)], &[("$age", age)]),
+        )
+        .await
+        .unwrap();
+    }
+    drop(db);
+    let uri = dir.path().to_str().unwrap();
+    let (adapter, counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
+    let db = helpers::session(
+        omnigraph::db::Omnigraph::open_with_storage(uri, adapter)
+            .await
+            .unwrap(),
+    );
+
+    let before_write_text = counts.write_text();
+    let before_delete = counts.delete();
+    let stats = db.optimize().await.unwrap();
+    assert!(
+        stats
+            .iter()
+            .any(|stat| stat.type_key == "node:Person" && stat.committed),
+        "Person must compact: {stats:?}"
+    );
+    assert_eq!(
+        counts.write_text() - before_write_text,
+        0,
+        "a detached compaction arms no recovery sidecar: no control-object write"
+    );
+    assert_eq!(
+        counts.delete() - before_delete,
+        0,
+        "a detached compaction has no sidecar to delete after publication"
+    );
+}
+
 /// Optimize is now one graph-wide writer rather than one writer per productive
 /// table. Its planning and monotonic batch publication must stay bounded by the
 /// current table set, not by graph commit-history depth. Each depth fixture is
@@ -125,10 +297,10 @@ async fn optimize_manifest_reads_are_flat_in_history() {
         let mut curve: Vec<(u64, IoCounts)> = Vec::new();
         for depth in [10u64, 100] {
             let dir = tempfile::tempdir().unwrap();
-            let mut db = local_graph(&dir).await;
-            commit_many(&mut db, depth as usize).await;
+            let db = local_graph(&dir).await;
+            commit_many(&db, depth as usize).await;
             db.optimize().await.unwrap();
-            commit_many(&mut db, 3).await;
+            commit_many(&db, 3).await;
 
             let commits_before = db.list_commits(None).await.unwrap().len();
             let (result, io) = measure(db.optimize()).await;
@@ -189,18 +361,18 @@ async fn internal_table_scans_grow_without_compaction() {
     cost_harness(async {
         const ACTOR: &str = "act-cost-gate-served";
         let dir = tempfile::tempdir().unwrap();
-        let mut db = local_graph(&dir).await;
+        let db = local_graph(&dir).await;
 
         let mut curve: Vec<(u64, IoCounts)> = Vec::new();
         let mut current = 0u64;
         for d in [10u64, 100] {
             if d > current {
-                commit_many_as(&mut db, (d - current) as usize, ACTOR).await;
+                commit_many_as(&db, (d - current) as usize, ACTOR).await;
                 current = d;
             }
             // NO `db.optimize()` here — that omission is the whole point. The flat gate
             // above compacts before measuring and so never exercises this served regime.
-            let io = measure_insert_as(&mut db, &format!("served_{d}"), ACTOR).await;
+            let io = measure_insert_as(&db, &format!("served_{d}"), ACTOR).await;
             current += 1; // the measured write advanced depth by one
             eprintln!(
                 "depth~{d} (uncompacted): data={} __manifest={}",
@@ -244,16 +416,16 @@ async fn internal_table_scans_grow_without_compaction() {
 #[tokio::test]
 async fn data_table_reads_split_into_flat_opener_and_scan_flat_with_session() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = local_graph(&dir).await;
+    let db = local_graph(&dir).await;
 
     let mut curve: Vec<(u64, IoCounts)> = Vec::new();
     let mut current = 0u64;
     for d in [10u64, 100] {
         if d > current {
-            commit_many(&mut db, (d - current) as usize).await;
+            commit_many(&db, (d - current) as usize).await;
             current = d;
         }
-        let io = measure_insert(&mut db, &format!("split_{d}")).await;
+        let io = measure_insert(&db, &format!("split_{d}")).await;
         current += 1;
         eprintln!(
             "depth~{d}: opener={} scan={} data_total={}",
@@ -262,10 +434,14 @@ async fn data_table_reads_split_into_flat_opener_and_scan_flat_with_session() {
         curve.push((d, io));
     }
 
-    assert!(
-        curve[0].1.data_opener_reads > 0,
-        "opener reads must be > 0 — the classifier missed version-resolution reads, \
-         so a flat opener assertion would be vacuous"
+    // RFC 0067: a write on a warm handle opens nothing. The writer stages on
+    // the handle the previous write landed in the read-handle cache, so the
+    // opener term is zero at every depth; the flat assertion below therefore
+    // pins zero, and a non-zero opener read here means a write-side open
+    // stopped going through the held handle.
+    assert_eq!(
+        curve[0].1.data_opener_reads, 0,
+        "a write on a warm handle stages on the held pin and opens nothing"
     );
     assert_flat(
         &curve,
@@ -291,9 +467,9 @@ async fn data_table_reads_split_into_flat_opener_and_scan_flat_with_session() {
 #[tokio::test]
 async fn single_insert_data_write_is_bounded() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = local_graph(&dir).await;
-    commit_many(&mut db, 5).await;
-    let io = measure_insert(&mut db, "w").await;
+    let db = local_graph(&dir).await;
+    commit_many(&db, 5).await;
+    let io = measure_insert(&db, "w").await;
     eprintln!("single insert: data_writes={}", io.data_writes);
     assert!(
         io.data_writes <= 4,
@@ -318,9 +494,9 @@ async fn single_insert_data_write_is_bounded() {
 async fn write_op_count_ceiling_at_shallow_depth() {
     cost_harness(async {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = local_graph(&dir).await;
-        commit_many(&mut db, 5).await;
-        let io = measure_insert(&mut db, "ceil").await;
+        let db = local_graph(&dir).await;
+        commit_many(&db, 5).await;
+        let io = measure_insert(&db, "ceil").await;
         eprintln!(
             "depth~5: data={} __manifest={} total_reads={}",
             io.data_reads,
@@ -370,8 +546,8 @@ async fn multi_table_staging_is_flat_in_history() {
         let mut curve: Vec<(u64, IoCounts)> = Vec::new();
         for depth in [10u64, 100] {
             let dir = tempfile::tempdir().unwrap();
-            let mut db = local_graph(&dir).await;
-            commit_many(&mut db, depth as usize).await;
+            let db = local_graph(&dir).await;
+            commit_many(&db, depth as usize).await;
             // Compact first for the same reason as the internal-table lock above:
             // the gate pins the periodically-compacted production shape.
             db.optimize().await.unwrap();
@@ -457,7 +633,7 @@ async fn keyed_insert_routes_through_fenced_adapter_only() {
 /// and one full validation under the pre-effect gates (7 `read_text` + 4 `exists`
 /// total). Per-table resolves must not add more validation. The gate read is
 /// correctness work: it arbitrates schema identity after preparation and before
-/// the recovery sidecar or any Lance HEAD movement. The shape is
+/// any detached table effect; no recovery sidecar is written (RFC 0067). The shape is
 /// the write twin of `warm_read_cost.rs::warm_query_validates_schema_contract_once`,
 /// built with ZERO production change via the counting storage adapter.
 #[tokio::test]
@@ -469,9 +645,11 @@ async fn write_schema_io_is_bounded_to_capture_fence_and_effect_gate() {
     let _ = init_and_load(&dir).await;
     let uri = dir.path().to_str().unwrap();
     let (adapter, counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
-    let db = omnigraph::db::Omnigraph::open_with_storage(uri, adapter)
-        .await
-        .unwrap();
+    let db = helpers::session(
+        omnigraph::db::Omnigraph::open_with_storage(uri, adapter)
+            .await
+            .unwrap(),
+    );
 
     let before_read_text = counts.read_text();
     let before_exists = counts.exists();
@@ -502,12 +680,12 @@ async fn write_schema_io_is_bounded_to_capture_fence_and_effect_gate() {
         "a write must probe contract-file existence at capture + pre-effect revalidation (4 probes)",
     );
     assert_eq!(
-        write_text_delta, 2,
-        "an enrolled write must write its recovery sidecar exactly twice (arm + exact confirmation)",
+        write_text_delta, 0,
+        "a detached write arms no recovery sidecar (RFC 0067): no control-object write",
     );
     assert_eq!(
-        delete_delta, 1,
-        "a successful enrolled write must delete its confirmed sidecar once",
+        delete_delta, 0,
+        "a detached write has no sidecar to delete after publication",
     );
 }
 
@@ -572,9 +750,9 @@ async fn manifest_reads_capture_warm_probe() {
     // under the limit.
     let fresh = Box::pin(async {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = local_graph(&dir).await;
-        commit_many(&mut db, 3).await; // warm the coordinator
-        let io = measure_insert(&mut db, "fresh").await;
+        let db = local_graph(&dir).await;
+        commit_many(&db, 3).await; // warm the coordinator
+        let io = measure_insert(&db, "fresh").await;
         eprintln!("fresh-only warm write: __manifest={}", io.manifest_reads);
         io.manifest_reads
     })
@@ -583,9 +761,9 @@ async fn manifest_reads_capture_warm_probe() {
     // Ground truth (`cost_harness`): the same warm probe is now counted.
     cost_harness(async move {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = local_graph(&dir).await;
-        commit_many(&mut db, 3).await;
-        let io = measure_insert(&mut db, "ground_truth").await;
+        let db = local_graph(&dir).await;
+        commit_many(&db, 3).await;
+        let io = measure_insert(&db, "ground_truth").await;
         eprintln!("ground-truth warm write: __manifest={}", io.manifest_reads);
         assert!(
             io.manifest_reads > fresh,
@@ -631,20 +809,17 @@ node User {
     for rows in [4u64, 64] {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = omnigraph::db::Omnigraph::init(uri, UNIQUE_COST_SCHEMA)
-            .await
-            .unwrap();
+        let db = helpers::session(
+            omnigraph::db::Omnigraph::init(uri, UNIQUE_COST_SCHEMA)
+                .await
+                .unwrap(),
+        );
         // Committed baseline so the cross-version `@unique` probe has a
         // non-empty committed view (an empty view skips the probe entirely).
-        omnigraph::loader::load_jsonl(
-            &db,
-            &users_jsonl("seed", 4),
-            omnigraph::loader::LoadMode::Append,
-        )
-        .await
-        .unwrap();
-        let (res, io) = measure(omnigraph::loader::load_jsonl(
-            &db,
+        db.load_jsonl(&users_jsonl("seed", 4), omnigraph::loader::LoadMode::Append)
+            .await
+            .unwrap();
+        let (res, io) = measure(db.load_jsonl(
             &users_jsonl(&format!("delta{rows}"), rows),
             omnigraph::loader::LoadMode::Append,
         ))

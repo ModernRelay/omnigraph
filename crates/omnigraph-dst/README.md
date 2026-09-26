@@ -23,7 +23,7 @@ scheduler seam (TODO(#527), a v2 issue).
 ## Run
 
 ```bash
-cd crates/omnigraph-dst   # the crate-local .cargo/config.toml sets the flag
+cd crates/omnigraph-dst   # its [env]-only .cargo/config.toml supplies the pool trio
 cargo test
 # fast simulations that keep assertions:
 cargo test --profile dst
@@ -38,9 +38,10 @@ the nightly deterministic fleet uses `DST_FLEET_SEED_BASE` +
 failing job's log line.
 
 The required `--cfg tokio_unstable` (it gates tokio's seeded scheduler,
-`Builder::rng_seed`) comes from this crate's own `.cargo/config.toml` when
-cargo is invoked from the crate directory; from anywhere else, set
-`RUSTFLAGS="--cfg tokio_unstable"` yourself. The `failpoints` feature is a
+`Builder::rng_seed`) comes from the workspace `.cargo/config.toml` for every
+build; an env `RUSTFLAGS` replaces that list, so never set one without the
+cfg. The pool trio (`env_knobs::QUIESCE_ENV`) still needs the crate directory
+or an explicit export, as `dst.yml` does. The `failpoints` feature is a
 default of this crate.
 
 ## Shared execution and storage lifetime

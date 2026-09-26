@@ -1,0 +1,59 @@
+# issue: none
+# notes: inventory sweep, input class `ann_nprobes`: the same nearest query under `set ann_nprobes = 1` and under the
+# notes: default cap returns the same rows, and the ranked scan line differs: `nprobes 1` against the default `nprobes 20`.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    embedding: Vector(4) @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d000","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d001","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d002","embedding":[2.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d003","embedding":[3.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d004","embedding":[4.0,0.0,0.0,0.0]}}
+
+--- query
+set engine = v2;
+set ann_nprobes = 1;
+query by_vector($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 2
+}
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+--- expect ordered
+{"d.slug":"d000"}
+{"d.slug":"d001"}
+--- expect shape
+d.slug: String
+--- expect plan
+scan Doc as $d: ranked nearest fetch 2 nprobes 1
+
+--- query
+set engine = v2;
+query by_vector($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 2
+}
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+--- expect ordered
+{"d.slug":"d000"}
+{"d.slug":"d001"}
+--- expect shape
+d.slug: String
+--- expect plan
+scan Doc as $d: ranked nearest fetch 2 nprobes 20

@@ -1,0 +1,117 @@
+# issue: none
+# notes: Reject missing, empty and null required parameters without changing
+# notes: data. An omitted nullable parameter becomes null and matches nothing.
+# notes: Already green on fe9eb339 (2026-09-16); guards the issue 722 symptom.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Thing {
+    id: String @key
+    name: String?
+}
+
+--- seed
+{"type":"Thing","data":{"id":"abc","name":"first"}}
+{"type":"Thing","data":{"id":"def","name":"second"}}
+{"type":"Thing","data":{"id":"ghi"}}
+
+--- query
+query thing_by_id($id: String) {
+    match { $t: Thing { id: $id } }
+    return { $t.id, $t.name }
+}
+
+--- params
+{"id": "abc"}
+
+--- expect unordered
+{"t.id": "abc", "t.name": "first"}
+
+--- expect shape
+t.id: String
+t.name: String?
+
+--- query
+query thing_by_id_without_params($id: String) {
+    match { $t: Thing { id: $id } }
+    return { $t.id }
+}
+
+--- expect error: parameter 'id' not provided
+
+--- query
+query thing_by_id_with_empty_params($id: String) {
+    match { $t: Thing { id: $id } }
+    return { $t.id }
+}
+
+--- params
+{}
+
+--- expect error: parameter 'id' not provided
+
+--- query
+query thing_by_id_with_null($id: String) {
+    match { $t: Thing { id: $id } }
+    return { $t.id }
+}
+
+--- params
+{"id": null}
+
+--- expect error: param 'id': null is not accepted for non-nullable parameter
+
+--- mutate
+query delete_thing_by_id_without_params($id: String) {
+    delete Thing where id = $id
+}
+
+--- expect error: parameter 'id' not provided
+
+--- mutate
+query rename_thing_by_id_with_empty_params($id: String, $name: String) {
+    update Thing set { name: $name } where id = $id
+}
+
+--- params
+{}
+
+--- expect error: parameter 'id' not provided
+
+--- mutate
+query insert_thing_without_params($id: String) {
+    insert Thing { id: $id }
+}
+
+--- expect error: parameter 'id' not provided
+
+--- query
+query all_things_untouched() {
+    match { $t: Thing }
+    return { $t.id, $t.name }
+}
+
+--- expect unordered
+{"t.id": "abc", "t.name": "first"}
+{"t.id": "def", "t.name": "second"}
+{"t.id": "ghi"}
+
+--- expect shape
+t.id: String
+t.name: String?
+
+--- query
+query things_by_name_omitted_nullable($name: String?) {
+    match { $t: Thing { name: $name } }
+    return { $t.id }
+}
+
+--- expect unordered
+
+--- expect shape
+t.id: String

@@ -1,0 +1,79 @@
+# issue: none
+# notes: A search order is an access path of the ranked binding's scan: the physical Scan row carries `ranked` with the index, the candidates asked for and the scope, and an rrf() plans one scan per arm.
+# red_on: 2026-09-21, task 0226 PR A tree (branch v2-plan-lower-trait before PR B): every step failed `expect plan` with `the scan of Doc is not ranked`; ranking rode beside the plan in SearchMode, so no Scan row carried `ranked`.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    text: String @index
+    embedding: Vector(4) @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d000","embedding":[0.0,0.0,0.0,0.0],"text":"needle needle needle needle filler"}}
+{"type":"Doc","data":{"slug":"d001","embedding":[1.0,0.0,0.0,0.0],"text":"needle needle needle filler"}}
+{"type":"Doc","data":{"slug":"d002","embedding":[2.0,0.0,0.0,0.0],"text":"needle needle filler"}}
+{"type":"Doc","data":{"slug":"d003","embedding":[3.0,0.0,0.0,0.0],"text":"needle filler"}}
+{"type":"Doc","data":{"slug":"d004","embedding":[4.0,0.0,0.0,0.0],"text":"filler"}}
+
+--- query
+set engine = v2;
+query by_text($t: String) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { bm25($d.text, $t) }
+    limit 2
+}
+--- params
+{"t": "needle"}
+--- expect ordered
+{"d.slug":"d000"}
+{"d.slug":"d001"}
+--- expect shape
+d.slug: String
+--- expect plan
+scan Doc as $d: ranked bm25
+
+--- query
+set engine = v2;
+query by_vector($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 2
+}
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+--- expect ordered
+{"d.slug":"d000"}
+{"d.slug":"d001"}
+--- expect shape
+d.slug: String
+--- expect plan
+scan Doc as $d: ranked nearest fetch 2
+
+--- query
+set engine = v2;
+query fused($q: Vector(4), $t: String) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { rrf(nearest($d.embedding, $q), bm25($d.text, $t)) }
+    limit 3
+}
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0], "t": "needle"}
+--- expect unordered
+{"d.slug":"d000"}
+{"d.slug":"d001"}
+{"d.slug":"d002"}
+--- expect shape
+d.slug: String
+--- expect plan
+scan Doc as $d: ranked nearest fetch 3
+scan Doc as $d: ranked bm25

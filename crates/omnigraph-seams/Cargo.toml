@@ -1,0 +1,32 @@
+[package]
+name = "omnigraph-seams"
+version = "0.11.0"
+edition = "2024"
+description = "One seam type for test-time behavior substitution: a named slot a test fills and the engine consults."
+license = "MIT"
+repository = "https://github.com/ModernRelay/omnigraph"
+
+[features]
+# `install`: the test-side half (`Seam::install`, the guard, `clear`, the
+# decision installers). A build without it can consult seams but never fill
+# one, so a test that arms a seam in an ungated build fails to compile.
+install = []
+# `decide`: the decision installers (`fire_always` and friends, catalog
+# `clear`); enabled by the engine's `failpoints` only, the one flag whose
+# helpers read those slots, so a `dst`-only build cannot arm a seam it never
+# consults.
+decide = ["install"]
+
+[dependencies]
+
+# tests/failpoint_names_guard.rs: the source walk over the engine, cluster
+# and DST crates and the `.gqt` corpus (it decodes `--- seam` bodies the way
+# the GQT runner does), and its manifest test, which decodes this file.
+[dev-dependencies]
+serde_yaml = { workspace = true }
+syn = { workspace = true }
+tempfile = { workspace = true }
+toml = "0.9"
+
+[lints]
+workspace = true

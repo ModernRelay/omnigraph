@@ -1,0 +1,70 @@
+# issue: none
+# notes: Two seams on one mutation: contention while loading publish state is retried, and the lost acknowledgement after publication is recognized by the publisher's read-back, so the mutation succeeds with its detached pin (RFC 0067).
+# notes: The reopen reads the row through the pin's staged version; the next write on the table stages on that pin and both rows read back.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- seam
+at: publish.load_state
+occurrence: 1
+action: contention
+scope: next_step
+--- seam
+at: publish.post_merge_pre_ack
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+query add_row() {
+    insert Person { name: "bob" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- query
+query rows_after_reopen() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+--- expect shape
+p.name: String
+
+--- mutate
+query add_another() {
+    insert Person { name: "carol" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query rows_after_second_write() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+{"p.name":"carol"}
+--- expect shape
+p.name: String

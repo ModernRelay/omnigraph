@@ -1,0 +1,59 @@
+# issue: none
+# notes: A read's setting prefix must not leak into the case session, whether
+# notes: the read succeeds or fails. This checks scope, not merge routing.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- mutate
+set merge_lineage = on;
+
+--- expect ok
+
+--- query
+set merge_lineage = off;
+query people($name: String) {
+    match { $p: Person { name: $name } }
+    return { $p.name }
+}
+
+--- params
+{"name":"alice"}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "on", "default": "on", "source": "file", "scope": "request"}
+
+--- query
+set merge_lineage = off;
+query salary() {
+    match { $p: Person }
+    return { $p.salary }
+}
+
+--- expect error: T6: type `Person` has no property `salary`
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "on", "default": "on", "source": "file", "scope": "request"}

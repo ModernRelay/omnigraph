@@ -79,12 +79,19 @@ mod branch_control;
 #[cfg(unix)]
 mod fixture_controls;
 
+#[path = "scenarios/concurrent_writes.rs"]
+#[cfg(unix)]
+mod concurrent_writes;
+
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
+use std::sync::Arc;
 use std::time::Instant;
 
+use omnigraph::Session;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
 use sha2::{Digest as _, Sha256};
 
 // ---------------------------------------------------------------------------
@@ -138,6 +145,25 @@ struct Args {
     manifest_layout: String,
     /// Reject explicit age flags on scenarios that would otherwise ignore them.
     age_options_supplied: bool,
+    /// Closed-loop writer tasks for concurrent-writes.
+    writers: usize,
+    /// Measured-window seconds for concurrent-writes.
+    duration_secs: u64,
+    /// Warm-up seconds preceding the measured window; ops counted, latencies
+    /// discarded.
+    warmup_secs: u64,
+    /// Writer branches for concurrent-writes: 1 = every writer on main,
+    /// N > 1 = round-robin over forks `cw-0..N-1`.
+    write_branches: u32,
+    /// Concurrent-writes target root: an `s3://` prefix, or unset for a
+    /// local tempdir. The child appends a unique `cw-{nanos}` segment.
+    target_uri: Option<String>,
+    /// Skip the best-effort S3 teardown of the run's unique prefix.
+    keep_fixture: bool,
+    /// Skip probe/counter installation (plain open) to A/B counting cost.
+    no_probes: bool,
+    /// Pin the child runtime's worker-thread count; recorded either way.
+    tokio_workers: Option<usize>,
     memory_cap_mb: Option<u64>,
     /// Results-log override; see `results_path`.
     out: Option<String>,
@@ -180,6 +206,14 @@ impl Args {
             cache_state: "cold".into(),
             manifest_layout: "uncompacted".into(),
             age_options_supplied: false,
+            writers: 4,
+            duration_secs: 30,
+            warmup_secs: 5,
+            write_branches: 1,
+            target_uri: None,
+            keep_fixture: false,
+            no_probes: false,
+            tokio_workers: None,
             memory_cap_mb: None,
             out: None,
             baseline: false,
@@ -239,6 +273,24 @@ impl Args {
                     args.manifest_layout = take("--manifest-layout");
                     args.age_options_supplied = true;
                 }
+                "--writers" => args.writers = take("--writers").parse().expect("--writers"),
+                "--duration-secs" => {
+                    args.duration_secs = take("--duration-secs").parse().expect("--duration-secs")
+                }
+                "--warmup-secs" => {
+                    args.warmup_secs = take("--warmup-secs").parse().expect("--warmup-secs")
+                }
+                "--write-branches" => {
+                    args.write_branches =
+                        take("--write-branches").parse().expect("--write-branches")
+                }
+                "--target-uri" => args.target_uri = Some(take("--target-uri")),
+                "--keep-fixture" => args.keep_fixture = true,
+                "--no-probes" => args.no_probes = true,
+                "--tokio-workers" => {
+                    args.tokio_workers =
+                        Some(take("--tokio-workers").parse().expect("--tokio-workers"))
+                }
                 "--out" => args.out = Some(take("--out")),
                 "--memory-cap-mb" => {
                     args.memory_cap_mb = Some(take("--memory-cap-mb").parse().expect("cap"))
@@ -283,8 +335,30 @@ impl Args {
             self.branches.to_string(),
             "--tables".into(),
             self.tables.to_string(),
+            "--writers".into(),
+            self.writers.to_string(),
+            "--duration-secs".into(),
+            self.duration_secs.to_string(),
+            "--warmup-secs".into(),
+            self.warmup_secs.to_string(),
+            "--write-branches".into(),
+            self.write_branches.to_string(),
             "--child".into(),
         ];
+        if let Some(uri) = &self.target_uri {
+            v.push("--target-uri".into());
+            v.push(uri.clone());
+        }
+        if self.keep_fixture {
+            v.push("--keep-fixture".into());
+        }
+        if self.no_probes {
+            v.push("--no-probes".into());
+        }
+        if let Some(workers) = self.tokio_workers {
+            v.push("--tokio-workers".into());
+            v.push(workers.to_string());
+        }
         if self.age_options_supplied {
             v.extend([
                 "--history-commits".into(),
@@ -331,13 +405,16 @@ fn main() {
     if args.scenario.is_empty() {
         eprintln!(
             "usage: --scenario <merge-all-changed|nearest-prefilter|ann-probe-budget|fenced-small-upsert|\
-             fenced-adopt-all-new|general-merge-updates|branch-create|branch-create-from|branch-list|branch-delete|branch-pointer-adopt-lazy|branch-pointer-adopt-owned|branch-first-write|branch-cleanup|rrf-gate> [--rows N] [--dims D] \
+             fenced-adopt-all-new|general-merge-updates|branch-create|branch-create-from|branch-list|branch-delete|branch-pointer-adopt-lazy|branch-pointer-adopt-owned|branch-first-write|branch-cleanup|rrf-gate|concurrent-writes> [--rows N] [--dims D] \
              [--seed S] [--runs K] [--selectivity F] [--k K] [--ann-partitions N] \
              [--ann-probes N] [--text-bytes B] [--delta-rows N] \
              [--source-mode update|insert] [--branches N] [--tables N] [--memory-cap-mb M] \
              [--history-commits N (even, 0..256)] [--retired-branches N (0..32)]\n\
              [--cache-state cold|warm] [--manifest-layout uncompacted|compacted]\n\
-             Age flags apply only to branch controls and general-merge-updates."
+             concurrent-writes only: [--writers N] [--duration-secs W] [--warmup-secs W] \
+             [--write-branches B] [--target-uri s3://…] [--keep-fixture] [--no-probes] \
+             [--tokio-workers N]\n\
+             Age flags apply only to branch controls, general-merge-updates and concurrent-writes."
         );
         // `cargo bench` with no args must exit 0 so the target stays inert in
         // any blanket `cargo bench` invocation.
@@ -349,6 +426,8 @@ fn main() {
         Err("--runs must be greater than zero".to_string())
     } else if branch_control::is_scenario(&args.scenario) {
         branch_control::validate_args(&args)
+    } else if concurrent_writes::is_scenario(&args.scenario) {
+        concurrent_writes::validate_args(&args)
     } else {
         rfc023_scenarios::validate_args(&args)
     };
@@ -594,6 +673,14 @@ fn run_once(args: &Args, run: usize) -> serde_json::Value {
             "manifest_layout": args.manifest_layout,
             "memory_cap_mb": args.memory_cap_mb,
             "baseline": args.baseline,
+            "writers": args.writers,
+            "duration_secs": args.duration_secs,
+            "warmup_secs": args.warmup_secs,
+            "write_branches": args.write_branches,
+            "target_uri": args.target_uri,
+            "keep_fixture": args.keep_fixture,
+            "no_probes": args.no_probes,
+            "tokio_workers": args.tokio_workers,
         },
         "exit_status": child.exit_status,
         "child_process_exit_status": child.process_exit_status,
@@ -880,10 +967,11 @@ fn run_child(args: &Args) {
         eprintln!("requested memory cap was not verifiably applied; refusing to run the scenario");
         std::process::exit(78);
     }
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(worker_threads) = args.tokio_workers {
+        runtime_builder.worker_threads(worker_threads);
+    }
+    let runtime = runtime_builder.enable_all().build().expect("tokio runtime");
     let metrics = runtime.block_on(async {
         match (args.scenario.as_str(), args.phase.as_deref()) {
             ("fenced-adopt-all-new", Some("setup")) => {
@@ -918,6 +1006,7 @@ fn run_child(args: &Args) {
             ("ann-probe-budget", None) => ann_probe_budget(args).await,
             ("rrf-gate", None) => rrf_gate(args).await,
             ("fenced-small-upsert", None) => rfc023_scenarios::fenced_small_upsert(args).await,
+            ("concurrent-writes", None) => concurrent_writes::run(args).await,
             (other, phase) => panic!("unknown scenario/phase '{other}/{phase:?}'"),
         }
     });
@@ -1104,7 +1193,10 @@ async fn merge_all_changed(args: &Args) -> serde_json::Value {
     );
     let dir = tempfile::tempdir().expect("tempdir");
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, &schema).await.expect("init");
+    let db = Session::from_defaults(
+        Arc::new(Omnigraph::init(uri, &schema).await.expect("init")),
+        SessionSettings::default(),
+    );
 
     // Seed N rows on main in batches (merge-written fragments, matching the
     // embed workflow's write shape). JSONL strings are per-batch transients.
@@ -1171,7 +1263,7 @@ async fn merge_all_changed(args: &Args) -> serde_json::Value {
 
 #[cfg(unix)]
 async fn load_vector_rows(
-    db: &Omnigraph,
+    db: &Session,
     branch: &str,
     args: &Args,
     batch_rows: usize,
@@ -1693,7 +1785,10 @@ async fn nearest_prefilter(args: &Args) -> serde_json::Value {
     );
     let dir = tempfile::tempdir().expect("tempdir");
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, &schema).await.expect("init");
+    let db = Session::from_defaults(
+        Arc::new(Omnigraph::init(uri, &schema).await.expect("init")),
+        SessionSettings::default(),
+    );
 
     // Every ~1/selectivity-th row is a far-from-query "hit"; the rest cluster
     // near the query point (+e1 pole).
@@ -1814,7 +1909,7 @@ async fn nearest_prefilter(args: &Args) -> serde_json::Value {
 async fn rrf_gate(args: &Args) -> serde_json::Value {
     use lance::io::WrappingObjectStore;
     use lance_io::utils::tracking_store::IOTracker;
-    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_rrf_plan};
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
 
     const ARTIFACTS: usize = 750;
     const FANOUT: usize = 2;
@@ -1846,7 +1941,10 @@ async fn rrf_gate(args: &Args) -> serde_json::Value {
                           edge ChunkOfArtifact: Chunk -> Artifact {\n    label: String\n}\n";
             let dir = tempfile::tempdir().expect("tempdir");
             let uri = dir.path().to_str().unwrap();
-            let db = Omnigraph::init(uri, schema).await.expect("init");
+            let db = Session::from_defaults(
+                Arc::new(Omnigraph::init(uri, schema).await.expect("init")),
+                SessionSettings::default(),
+            );
 
             // Both query terms in every row (rank ties are irrelevant here —
             // this is a cost instrument, not the equality oracle), padded to
@@ -1921,7 +2019,10 @@ async fn rrf_gate(args: &Args) -> serde_json::Value {
             // matrix wants — iteration 0 must pay real data opens and the
             // gate's cold CSR build.
             drop(db);
-            let db = Omnigraph::open(uri).await.expect("reopen");
+            let db = Session::from_defaults(
+                Arc::new(Omnigraph::open(uri).await.expect("reopen")),
+                SessionSettings::default(),
+            );
 
             // Constructing one `lit()` per eligible id plus the `IN`-list
             // `Expr` — the per-id predicate-BUILD cost, which prior
@@ -1950,19 +2051,25 @@ async fn rrf_gate(args: &Args) -> serde_json::Value {
             let _ = table.incremental_stats();
             let _ = manifest.incremental_stats();
 
+            let planned = Session::from_defaults(
+                Arc::clone(db.db()),
+                db.settings()
+                    .clone()
+                    .with("rrf_plan", plan_mode)
+                    .expect("rrf_plan setting"),
+            );
+
             let mut iterations: Vec<serde_json::Value> = Vec::new();
             for iter in 0..QUERY_ITERS {
                 let started = Instant::now();
-                let outcome = with_rrf_plan(
-                    plan_mode,
-                    db.query(
+                let outcome = planned
+                    .query(
                         ReadTarget::branch("main"),
                         &query_src,
                         "recall_rrf",
                         &query_params,
-                    ),
-                )
-                .await;
+                    )
+                    .await;
                 let wall_ms = started.elapsed().as_millis() as u64;
                 let table_stats = table.incremental_stats();
                 let manifest_stats = manifest.incremental_stats();

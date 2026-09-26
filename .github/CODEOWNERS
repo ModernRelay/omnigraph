@@ -1,0 +1,20 @@
+# Advisory reviewer requests, one line per workspace member plus the dependency allowlist; nothing here blocks a merge.
+# See docs/dev/branch-protection.md, section Code owners.
+
+/deny.toml                              @azimafroozeh
+
+/crates/omnigraph/                      @azimafroozeh @aaltshuler
+/crates/omnigraph-api-types/            @aaltshuler
+/crates/omnigraph-azure-admission/      @aaltshuler
+/crates/omnigraph-bench/                @aaltshuler
+/crates/omnigraph-cli/                  @aaltshuler
+/crates/omnigraph-cluster/              @aaltshuler
+/crates/omnigraph-compiler/             @azimafroozeh @aaltshuler
+/crates/omnigraph-dst/                  @azimafroozeh
+/crates/omnigraph-gqt/                  @azimafroozeh
+/crates/omnigraph-planner/              @azimafroozeh @aaltshuler
+/crates/omnigraph-policy/               @aaltshuler
+/crates/omnigraph-seams/                @azimafroozeh @aaltshuler
+/crates/omnigraph-server/               @aaltshuler
+/crates/omnigraph-storage/              @azimafroozeh @aaltshuler
+/tools/omnigraph-vocabulary-guard/      @azimafroozeh @aaltshuler

@@ -150,8 +150,8 @@ oracles! {
     // ---- prediction (expectation = the model's per-op prediction) -------
     OpArbitration, "prediction",
         &[Store(Query), Store(Physical)],
-        "harness.rs::reconcile_after_failure (hypothesis arbitration + ghost tie-break) / reconcile_watch_resolution (keep-serving composition widening)",
-        "after a failed op the world renders as exactly one model hypothesis — Applied / ForkOnly / NotApplied — with the export tie-break resolving ghost-only effects; a keep-serving resolution instead matches against every composition and order of the deferred and interrupting ops";
+        "harness.rs::reconcile_after_failure (hypothesis arbitration + ghost tie-break)",
+        "after a failed op the world renders as exactly one model hypothesis — Applied / ForkOnly / NotApplied — with the export tie-break resolving ghost-only effects";
     MergePrediction, "prediction",
         &[Store(Claim)],
         "harness.rs::predict_merge + the accept/conflict asserts around branch_merge",
@@ -168,7 +168,7 @@ oracles! {
     // ---- obligation (expectation = a standing contract) -----------------
     CrashContract, "obligation",
         &[Store(Query)],
-        "harness.rs::reconcile_after_failure + reconcile_watch_resolution (legal-state + monotonicity asserts)",
+        "harness.rs::reconcile_after_failure (legal-state + monotonicity asserts)",
         "the two-sided crash contract: atomicity (no partial application) and recovery monotonicity (no demoted commit, no deleted durable fork)";
     BirthContract, "obligation",
         &[Store(Claim)],
@@ -182,14 +182,10 @@ oracles! {
         &[Store(Physical)],
         "harness.rs final audit residue check + tests::dst_residue_channel_sees_planted_file",
         "no universe ends owing recovery work: __recovery/ empty at quiesce, backed by the planted-file channel canary";
-    LiveWriteAvailability, "obligation",
-        &[Store(Session)],
-        "harness.rs::run_universe_caught keep-serving watch (Scenario::keep_serving_ops)",
-        "a live handle must not wedge permanently on one pending effect-free Armed recovery operation: with reconcile's reopen deferred, consecutive same-operation RecoveryRequired refusals (clean-recovery-state maintenance refusals interleave without resetting the streak) stay under the keep-serving budget (issue #554)";
     MaintenanceObligations, "obligation",
         &[Store(Query)],
         "harness.rs::maintenance_obligations",
-        "after every maintenance death the rerun converges (idempotence), post-Cleanup state stays readable, and indexes agree immediately";
+        "a fault-free maintenance retry must succeed without per-table errors, preserve independently saved snapshots, reclaim proved garbage, and restore index agreement";
     DetectedOrHarmless, "obligation",
         &[Store(Claim)],
         "harness.rs damage-attribution window (corruption_detections)",
@@ -202,6 +198,10 @@ oracles! {
         &[Time],
         "harness.rs final audit ensure_indices timeout (real clock)",
         "convergence completes within the real-clock bound — the deadlock detector every state oracle is blind to";
+    CollectorInvariant, "obligation",
+        &[Store(Physical)],
+        "harness.rs::assert_collector_invariants + assert_collector_images (Cleanup, retry and final audit)",
+        "independently saved heads and fork bases remain readable; every captured retained object, including inherited files and each index member, survives; successful cleanup removes unrooted published manifests and proved-dead staging";
 
     // ---- meta (expectation = the harness's own guarantees) --------------
     StrictReplay, "meta",

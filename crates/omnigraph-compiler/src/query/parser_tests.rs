@@ -114,11 +114,11 @@ return { $f.name }
         c => panic!("expected Traversal, got {c:?}"),
     }
     match &q.match_clause[3] {
-        Clause::Negation(inner) => match &inner[0] {
+        Clause::Subquery(block) => match &block.clauses[0] {
             Clause::Traversal(t) => assert!(t.undirected, "undirected inside not{{}}"),
             c => panic!("expected Traversal in not, got {c:?}"),
         },
-        c => panic!("expected Negation, got {c:?}"),
+        c => panic!("expected a not block, got {c:?}"),
     }
 }
 
@@ -163,9 +163,11 @@ return { $p.name }
     let q = qf.single_decl();
     assert_eq!(q.match_clause.len(), 2);
     match &q.match_clause[1] {
-        Clause::Negation(clauses) => {
-            assert_eq!(clauses.len(), 1);
-            match &clauses[0] {
+        Clause::Subquery(block) => {
+            assert_eq!(block.keyword, BlockKeyword::Not);
+            assert_eq!((block.func, block.op), (AggFunc::Count, CompOp::Eq));
+            assert_eq!(block.clauses.len(), 1);
+            match &block.clauses[0] {
                 Clause::Traversal(t) => {
                     assert_eq!(t.src, "p");
                     assert_eq!(t.edge_name, "worksAt");
@@ -176,7 +178,7 @@ return { $p.name }
                 _ => panic!("expected Traversal inside negation"),
             }
         }
-        _ => panic!("expected Negation"),
+        _ => panic!("expected a not block"),
     }
 }
 
@@ -308,7 +310,7 @@ match { $c: Company }
 return { $c.name }
 }
 "#;
-    let QueryFile::Queries(queries) = parse_query(input).unwrap() else {
+    let FileBody::Queries(queries) = parse_query(input).unwrap().body else {
         panic!("expected query declarations");
     };
     assert_eq!(queries.len(), 2);
@@ -348,10 +350,17 @@ return { $p.name }
     let q = qf.single_decl();
     match &q.match_clause[1] {
         Clause::Filter(f) => {
-            assert_eq!(f.op, CompOp::Ne);
+            assert_eq!(comparison(f).1, CompOp::Ne);
         }
         _ => panic!("expected Filter"),
     }
+}
+
+/// The parts of a comparison-rooted filter clause.
+fn comparison(filter: &Expr) -> (&Expr, CompOp, &Expr) {
+    filter
+        .comparison_parts()
+        .unwrap_or_else(|| panic!("expected a comparison, got {filter:?}"))
 }
 
 #[test]
@@ -368,7 +377,7 @@ return { $p.name }
     let qf = parse_query(input).unwrap();
     let q = qf.single_decl();
     match &q.match_clause[1] {
-        Clause::Filter(f) => match &f.right {
+        Clause::Filter(f) => match comparison(f).2 {
             Expr::Literal(Literal::String(value)) => {
                 assert_eq!(value, "Bob\n\"Builder\"\t\\");
             }
@@ -408,14 +417,14 @@ return { $p.name }
     let qf = parse_query(input).unwrap();
     let q = qf.single_decl();
     match &q.match_clause[1] {
-        Clause::Filter(f) => match &f.right {
+        Clause::Filter(f) => match comparison(f).2 {
             Expr::Literal(Literal::Bool(value)) => assert!(*value),
             other => panic!("expected bool literal, got {:?}", other),
         },
         _ => panic!("expected Filter"),
     }
     match &q.match_clause[2] {
-        Clause::Filter(f) => match &f.right {
+        Clause::Filter(f) => match comparison(f).2 {
             Expr::Literal(Literal::Bool(value)) => assert!(!*value),
             other => panic!("expected bool literal, got {:?}", other),
         },
@@ -438,25 +447,387 @@ return { $p.name }
     let q = qf.single_decl();
     match &q.match_clause[1] {
         Clause::Filter(f) => {
-            assert_eq!(f.op, CompOp::Contains);
+            let (left, op, right) = comparison(f);
+            assert_eq!(op, CompOp::Contains);
             assert!(matches!(
-                &f.left,
+                left,
                 Expr::PropAccess { variable, property } if variable == "p" && property == "tags"
             ));
-            assert!(matches!(&f.right, Expr::Variable(v) if v == "tag"));
+            assert!(matches!(right, Expr::Variable(v) if v == "tag"));
         }
         _ => panic!("expected Filter"),
     }
 }
 
+/// The mutation `where` is the same expression as a read filter, so
+/// `contains` and `starts_with` are legal there over the target's property.
 #[test]
-fn test_parse_contains_is_rejected_in_mutation_predicate() {
+fn test_parse_contains_and_starts_with_in_mutation_predicate() {
+    for (input, op, property) in [
+        (
+            "query drop_person($tag: String) { delete Person where tags contains $tag }",
+            CompOp::Contains,
+            "tags",
+        ),
+        (
+            "query drop_person($q: String) { delete Person where name starts_with $q }",
+            CompOp::StartsWith,
+            "name",
+        ),
+    ] {
+        let qf = parse_query(input).unwrap();
+        let Mutation::Delete(delete) = &qf.single_decl().mutations[0] else {
+            panic!("expected a delete");
+        };
+        let (left, parsed_op, right) = comparison(&delete.predicate);
+        assert_eq!(parsed_op, op);
+        assert_eq!(*left, Expr::mutation_property("Person", property));
+        assert!(matches!(right, Expr::Variable(_)));
+    }
+}
+
+/// `expected` is the filter of `match { $p: Person  $f: Person  <filter> }`.
+fn parse_filter_of(filter: &str) -> Expr {
+    let input = format!(
+        "query q($q: String) {{ match {{ $p: Person  $f: Person  {filter} }} return {{ $p.name }} }}"
+    );
+    let qf = parse_query(&input).unwrap_or_else(|error| panic!("{filter}: {error}"));
+    match &qf.single_decl().match_clause[2] {
+        Clause::Filter(expr) => expr.clone(),
+        other => panic!("{filter}: expected a filter, got {other:?}"),
+    }
+}
+
+fn prop(variable: &str, property: &str) -> Expr {
+    Expr::PropAccess {
+        variable: variable.to_string(),
+        property: property.to_string(),
+    }
+}
+
+fn int(value: i64) -> Expr {
+    Expr::Literal(Literal::Integer(value))
+}
+
+fn and(left: Expr, right: Expr) -> Expr {
+    Expr::Binary {
+        left: Box::new(left),
+        op: BinaryOp::And,
+        right: Box::new(right),
+    }
+}
+
+fn or(left: Expr, right: Expr) -> Expr {
+    Expr::Binary {
+        left: Box::new(left),
+        op: BinaryOp::Or,
+        right: Box::new(right),
+    }
+}
+
+fn not(inner: Expr) -> Expr {
+    Expr::Not(Box::new(inner))
+}
+
+#[test]
+fn test_parse_precedence_ladder() {
+    let a = || Expr::comparison(prop("p", "a"), CompOp::Eq, int(1));
+    let b = || Expr::comparison(prop("p", "b"), CompOp::Eq, int(2));
+    let c = || Expr::comparison(prop("p", "c"), CompOp::Eq, int(3));
+    let null_test = |negated: bool| Expr::IsNull {
+        expr: Box::new(prop("p", "email")),
+        negated,
+    };
+    for (filter, expected) in [
+        ("$p.a = 1 or $p.b = 2 and $p.c = 3", or(a(), and(b(), c()))),
+        (
+            "($p.a = 1 or $p.b = 2) and $p.c = 3",
+            and(or(a(), b()), c()),
+        ),
+        (
+            "$p.a = 1 and $p.b = 2 and $p.c = 3",
+            and(and(a(), b()), c()),
+        ),
+        ("$p.a = 1 or $p.b = 2 or $p.c = 3", or(or(a(), b()), c())),
+        ("not $p.a = 1 and $p.b = 2", and(not(a()), b())),
+        ("not ($p.a = 1 and $p.b = 2)", not(and(a(), b()))),
+        ("not not $p.a = 1", not(not(a()))),
+        (
+            "$p.email is not null and $p.a = 1",
+            and(null_test(true), a()),
+        ),
+        ("not $p.email is null", not(null_test(false))),
+        (
+            "($p.a = 1) = true",
+            Expr::comparison(a(), CompOp::Eq, Expr::Literal(Literal::Bool(true))),
+        ),
+        (
+            "($p.a = 1) is null",
+            Expr::IsNull {
+                expr: Box::new(a()),
+                negated: false,
+            },
+        ),
+        ("(($p.a = 1))", a()),
+        ("$p.active", prop("p", "active")),
+        ("$q", Expr::Variable("q".to_string())),
+    ] {
+        assert_eq!(parse_filter_of(filter), expected, "{filter}");
+    }
+}
+
+#[test]
+fn test_parse_chained_comparison_is_a_positional_error() {
+    let input =
+        "query q() { match { $p: Person  $f: Person  $p.age < $f.age < 3 } return { $p.name } }";
+    let error = parse_query(input).unwrap_err().to_string();
+    assert!(error.starts_with("parse error:"), "{error}");
+    assert!(!error.contains("chained"), "{error}");
+}
+
+#[test]
+fn test_parse_bare_search_conjunct_is_spelled_true() {
+    let search = Expr::Search {
+        field: Box::new(prop("p", "name")),
+        query: Box::new(Expr::Variable("q".to_string())),
+    };
+    let predicate = Expr::comparison(
+        search.clone(),
+        CompOp::Eq,
+        Expr::Literal(Literal::Bool(true)),
+    );
+    let age = Expr::comparison(prop("p", "age"), CompOp::Gt, int(3));
+    assert_eq!(parse_filter_of("search($p.name, $q)"), predicate);
+    assert_eq!(
+        parse_filter_of("search($p.name, $q) and $p.age > 3"),
+        and(predicate.clone(), age.clone())
+    );
+    assert_eq!(
+        parse_filter_of("$p.age > 3 and search($p.name, $q) = true"),
+        and(age.clone(), predicate)
+    );
+    assert_eq!(
+        parse_filter_of("search($p.name, $q) or $p.age > 3"),
+        or(search.clone(), age)
+    );
+    assert_eq!(parse_filter_of("not search($p.name, $q)"), not(search));
+}
+
+#[test]
+fn test_parse_not_brace_stays_the_pattern_negation() {
     let input = r#"
-query drop_person($tag: String) {
-delete Person where tags contains $tag
+query q() {
+match {
+    $p: Person
+    not { $p knows $f }
+    not $p.active
+}
+return { $p.name }
 }
 "#;
-    assert!(parse_query(input).is_err());
+    let qf = parse_query(input).unwrap();
+    let q = qf.single_decl();
+    assert!(
+        matches!(&q.match_clause[1], Clause::Subquery(subquery) if subquery.keyword == BlockKeyword::Not)
+    );
+    assert!(matches!(&q.match_clause[2], Clause::Filter(Expr::Not(_))));
+}
+
+#[test]
+fn test_parse_boolean_words_are_word_bounded_and_reserved_words_never_edge_names() {
+    assert_eq!(
+        parse_filter_of("$p.trueish = 1"),
+        Expr::comparison(prop("p", "trueish"), CompOp::Eq, int(1))
+    );
+    let qf = parse_query("query q() { delete Person where falsey = 1 and false_ = true }").unwrap();
+    let Mutation::Delete(delete) = &qf.single_decl().mutations[0] else {
+        panic!("expected a delete");
+    };
+    assert_eq!(
+        delete.predicate,
+        and(
+            Expr::comparison(
+                Expr::mutation_property("Person", "falsey"),
+                CompOp::Eq,
+                int(1)
+            ),
+            Expr::comparison(
+                Expr::mutation_property("Person", "false_"),
+                CompOp::Eq,
+                Expr::Literal(Literal::Bool(true))
+            ),
+        )
+    );
+    let param = |name: &str| Expr::Variable(name.to_string());
+    assert_eq!(parse_filter_of("$a and $b"), and(param("a"), param("b")));
+    assert_eq!(parse_filter_of("$a or $b"), or(param("a"), param("b")));
+    let qf =
+        parse_query("query q() { match { $p: Person  $p andy $f } return { $p.name } }").unwrap();
+    assert!(matches!(
+        &qf.single_decl().match_clause[1],
+        Clause::Traversal(traversal) if traversal.edge_name == "andy"
+    ));
+}
+
+#[test]
+fn test_parse_reserved_words() {
+    let reserved_property = |word: &str| {
+        format!(
+            "parse error: `{word}` is a reserved word; a property of that name is written `$p.{word}` in a read and cannot be named bare in a mutation `where`"
+        )
+    };
+    for word in ["and", "or", "not", "is", "null"] {
+        let read =
+            format!("query q() {{ match {{ $p: Person  {word} = 1 }} return {{ $p.name }} }}");
+        assert_eq!(
+            parse_query(&read).unwrap_err().to_string(),
+            reserved_property(word),
+            "{read}"
+        );
+        let mutation = format!("query q() {{ delete Person where {word} = 1 }}");
+        assert_eq!(
+            parse_query(&mutation).unwrap_err().to_string(),
+            reserved_property(word),
+            "{mutation}"
+        );
+        let alias = format!("query q() {{ match {{ $p: Person }} return {{ $p.age as {word} }} }}");
+        assert_eq!(
+            parse_query(&alias).unwrap_err().to_string(),
+            format!("parse error: `{word}` is a reserved word and cannot be a return alias"),
+            "{alias}"
+        );
+    }
+    assert_eq!(
+        parse_filter_of("$p.and = 1"),
+        Expr::comparison(prop("p", "and"), CompOp::Eq, int(1))
+    );
+    let binding =
+        parse_query("query q() { match { $p: Person { and: 1, null: 2 } } return { $p.or } }")
+            .unwrap();
+    let Clause::Binding(binding) = &binding.single_decl().match_clause[0] else {
+        panic!("expected a binding");
+    };
+    assert_eq!(binding.prop_matches[0].prop_name, "and");
+    assert_eq!(binding.prop_matches[1].prop_name, "null");
+    let insert = parse_query("query q() { insert Person { and: 1, is: 2 } }").unwrap();
+    let Mutation::Insert(insert) = &insert.single_decl().mutations[0] else {
+        panic!("expected an insert");
+    };
+    assert_eq!(insert.assignments[0].property, "and");
+    assert_eq!(insert.assignments[1].property, "is");
+    let identifiers =
+        parse_query("query q() { match { $p: Person  $p.android = nothing } return { $p.age as notnull, $p.name as island } }")
+            .unwrap();
+    let decl = identifiers.single_decl();
+    assert_eq!(
+        parse_filter_of("$p.android = nothing"),
+        Expr::comparison(
+            prop("p", "android"),
+            CompOp::Eq,
+            Expr::AliasRef("nothing".to_string())
+        )
+    );
+    assert_eq!(decl.return_clause[0].alias.as_deref(), Some("notnull"));
+    assert_eq!(decl.return_clause[1].alias.as_deref(), Some("island"));
+}
+
+#[test]
+fn test_parse_mutation_where_boolean_shapes() {
+    let qf = parse_query(
+        r#"
+query exact() {
+delete Knows where @src = "a" and @dst = "b" or not since is null
+}
+"#,
+    )
+    .unwrap();
+    let Mutation::Delete(delete) = &qf.single_decl().mutations[0] else {
+        panic!("expected a delete");
+    };
+    let endpoint = |field: &str, value: &str| {
+        Expr::comparison(
+            Expr::mutation_property("Knows", field),
+            CompOp::Eq,
+            Expr::Literal(Literal::String(value.to_string())),
+        )
+    };
+    assert_eq!(
+        delete.predicate,
+        or(
+            and(endpoint("@src", "a"), endpoint("@dst", "b")),
+            not(Expr::IsNull {
+                expr: Box::new(Expr::mutation_property("Knows", "since")),
+                negated: false,
+            })
+        )
+    );
+}
+
+#[test]
+fn test_parse_assignment_and_binding_match_values_are_expressions() {
+    let qf = parse_query(
+        r#"
+query q($flag: Bool, $cut: I64) {
+match { $p: Person { active: $flag or $cut > 3, name: age } }
+return { $p.name }
+}
+"#,
+    )
+    .unwrap();
+    let Clause::Binding(binding) = &qf.single_decl().match_clause[0] else {
+        panic!("expected a binding");
+    };
+    assert_eq!(
+        binding.prop_matches[0].value,
+        or(
+            Expr::Variable("flag".to_string()),
+            Expr::comparison(Expr::Variable("cut".to_string()), CompOp::Gt, int(3))
+        )
+    );
+    assert_eq!(
+        binding.prop_matches[1].value,
+        Expr::mutation_property("Person", "age")
+    );
+    let qf =
+        parse_query("query q($cut: I64) { insert Person { active: not $cut > 3, name: @id } }")
+            .unwrap();
+    let Mutation::Insert(insert) = &qf.single_decl().mutations[0] else {
+        panic!("expected an insert");
+    };
+    assert_eq!(
+        insert.assignments[0].value,
+        not(Expr::comparison(
+            Expr::Variable("cut".to_string()),
+            CompOp::Gt,
+            int(3)
+        ))
+    );
+    assert_eq!(
+        insert.assignments[1].value,
+        Expr::mutation_property("Person", "@id")
+    );
+}
+
+#[test]
+fn test_parse_boolean_projection_with_alias() {
+    let qf = parse_query(
+        "query q() { match { $p: Person } return { $p.slug, $p.age > 30 as adult, $p.email is not null as reachable } }",
+    )
+    .unwrap();
+    let decl = qf.single_decl();
+    assert_eq!(
+        decl.return_clause[1].expr,
+        Expr::comparison(prop("p", "age"), CompOp::Gt, int(30))
+    );
+    assert_eq!(decl.return_clause[1].alias.as_deref(), Some("adult"));
+    assert_eq!(
+        decl.return_clause[2].expr,
+        Expr::IsNull {
+            expr: Box::new(prop("p", "email")),
+            negated: true,
+        }
+    );
+    assert_eq!(decl.return_clause[2].alias.as_deref(), Some("reachable"));
 }
 
 #[test]
@@ -474,25 +845,16 @@ return { $p.name }
     let q = qf.single_decl();
     match &q.match_clause[1] {
         Clause::Filter(f) => {
-            assert_eq!(f.op, CompOp::StartsWith);
+            let (left, op, right) = comparison(f);
+            assert_eq!(op, CompOp::StartsWith);
             assert!(matches!(
-                &f.left,
+                left,
                 Expr::PropAccess { variable, property } if variable == "p" && property == "name"
             ));
-            assert!(matches!(&f.right, Expr::Variable(v) if v == "q"));
+            assert!(matches!(right, Expr::Variable(v) if v == "q"));
         }
         _ => panic!("expected Filter"),
     }
-}
-
-#[test]
-fn test_parse_starts_with_is_rejected_in_mutation_predicate() {
-    let input = r#"
-query drop_person($q: String) {
-delete Person where name starts_with $q
-}
-"#;
-    assert!(parse_query(input).is_err());
 }
 
 #[test]
@@ -570,8 +932,9 @@ update Person set {
         Mutation::Update(upd) => {
             assert_eq!(upd.type_name, "Person");
             assert_eq!(upd.assignments.len(), 1);
-            assert_eq!(upd.predicate.property, "name");
-            assert_eq!(upd.predicate.op, CompOp::Eq);
+            let (property, op, _) = comparison(&upd.predicate);
+            assert_eq!(*property, Expr::mutation_property("Person", "name"));
+            assert_eq!(op, CompOp::Eq);
         }
         _ => panic!("expected Update mutation"),
     }
@@ -589,8 +952,9 @@ delete Person where name = $name
     match q.mutations.first().expect("expected mutation") {
         Mutation::Delete(del) => {
             assert_eq!(del.type_name, "Person");
-            assert_eq!(del.predicate.property, "name");
-            assert_eq!(del.predicate.op, CompOp::Eq);
+            let (property, op, _) = comparison(&del.predicate);
+            assert_eq!(*property, Expr::mutation_property("Person", "name"));
+            assert_eq!(op, CompOp::Eq);
         }
         _ => panic!("expected Delete mutation"),
     }
@@ -611,14 +975,14 @@ return { $e.id }
     let qf = parse_query(input).unwrap();
     let q = qf.single_decl();
     match &q.match_clause[1] {
-        Clause::Filter(f) => match &f.right {
+        Clause::Filter(f) => match comparison(f).2 {
             Expr::Literal(Literal::Date(v)) => assert_eq!(v, "2026-02-14"),
             other => panic!("expected date literal, got {:?}", other),
         },
         _ => panic!("expected Filter"),
     }
     match &q.match_clause[2] {
-        Clause::Filter(f) => match &f.right {
+        Clause::Filter(f) => match comparison(f).2 {
             Expr::Literal(Literal::DateTime(v)) => assert_eq!(v, "2026-02-14T10:00:00Z"),
             other => panic!("expected datetime literal, got {:?}", other),
         },
@@ -640,7 +1004,7 @@ return { now() as ts }
     let qf = parse_query(input).unwrap();
     let q = qf.single_decl();
     match &q.match_clause[1] {
-        Clause::Filter(f) => assert!(matches!(f.right, Expr::Now)),
+        Clause::Filter(f) => assert!(matches!(comparison(f).2, Expr::Now)),
         _ => panic!("expected Filter"),
     }
     assert!(matches!(q.return_clause[0].expr, Expr::Now));
@@ -655,8 +1019,11 @@ update Event set { updated_at: now() } where created_at <= now()
     .unwrap();
     match mutation.single_decl().mutations.first().unwrap() {
         Mutation::Update(update) => {
-            assert!(matches!(update.assignments[0].value, MatchValue::Now));
-            assert!(matches!(update.predicate.value, MatchValue::Now));
+            assert!(matches!(update.assignments[0].value, Expr::Now));
+            let (property, op, value) = comparison(&update.predicate);
+            assert_eq!(*property, Expr::mutation_property("Event", "created_at"));
+            assert_eq!(op, CompOp::Le);
+            assert!(matches!(value, Expr::Now));
         }
         _ => panic!("expected update mutation"),
     }
@@ -715,7 +1082,7 @@ return { $p.tags }
     let q = qf.single_decl();
     match &q.match_clause[0] {
         Clause::Binding(b) => match &b.prop_matches[0].value {
-            MatchValue::Literal(Literal::List(items)) => {
+            Expr::Literal(Literal::List(items)) => {
                 assert_eq!(items.len(), 2);
             }
             other => panic!("expected list literal, got {:?}", other),
@@ -845,8 +1212,9 @@ return { $s.slug }
     let q = qf.single_decl();
     assert_eq!(q.match_clause.len(), 2);
     match &q.match_clause[1] {
-        Clause::Filter(Filter { left, op, right }) => {
-            assert_eq!(*op, CompOp::Eq);
+        Clause::Filter(f) => {
+            let (left, op, right) = comparison(f);
+            assert_eq!(op, CompOp::Eq);
             assert!(matches!(right, Expr::Literal(Literal::Bool(true))));
             match left {
                 Expr::Search { field, query } => {
@@ -878,8 +1246,9 @@ return { $s.slug }
     let q = qf.single_decl();
     assert_eq!(q.match_clause.len(), 2);
     match &q.match_clause[1] {
-        Clause::Filter(Filter { left, op, right }) => {
-            assert_eq!(*op, CompOp::Eq);
+        Clause::Filter(f) => {
+            let (left, op, right) = comparison(f);
+            assert_eq!(op, CompOp::Eq);
             assert!(matches!(right, Expr::Literal(Literal::Bool(true))));
             match left {
                 Expr::Fuzzy {
@@ -919,8 +1288,9 @@ return { $s.slug }
     let q = qf.single_decl();
     assert_eq!(q.match_clause.len(), 2);
     match &q.match_clause[1] {
-        Clause::Filter(Filter { left, op, right }) => {
-            assert_eq!(*op, CompOp::Eq);
+        Clause::Filter(f) => {
+            let (left, op, right) = comparison(f);
+            assert_eq!(op, CompOp::Eq);
             assert!(matches!(right, Expr::Literal(Literal::Bool(true))));
             match left {
                 Expr::MatchText { field, query } => {
@@ -1053,12 +1423,14 @@ return { $f.name }
 }
 
 fn parse_branch(input: &str) -> BranchStmt {
-    match parse_query(input).unwrap() {
-        QueryFile::Branch(stmt) => stmt,
-        QueryFile::Queries(queries) => panic!(
+    match parse_query(input).unwrap().body {
+        FileBody::Branch(stmt) => stmt,
+        FileBody::Queries(queries) => panic!(
             "expected a branch statement, got {} declarations",
             queries.len()
         ),
+        FileBody::Show(id) => panic!("expected a branch statement, got show {id:?}"),
+        FileBody::Explain(_) => panic!("expected a branch statement, got an explain statement"),
     }
 }
 
@@ -1200,6 +1572,80 @@ fn branch_statement_never_shares_a_file_with_a_declaration() {
     assert!(err.to_string().contains("expected query_file"), "{err}");
 }
 
+fn parse_explained(input: &str) -> QueryDecl {
+    match parse_query(input).unwrap().body {
+        FileBody::Explain(decl) => decl,
+        other => panic!("expected an explain statement, got {other:?}"),
+    }
+}
+
+#[test]
+fn explain_statement_wraps_one_declaration() {
+    let decl = parse_explained(
+        "explain query q($n: String) {\n    match { $p: Person { name: $n } }\n    return { $p.name }\n}\n",
+    );
+    assert_eq!(decl.name, "q");
+    assert_eq!(decl.params.len(), 1);
+    assert_eq!(decl.return_clause.len(), 1);
+    let decl =
+        parse_explained("  explain\n  query m() { insert Person { name: \"a\" } } // trailing\n");
+    assert_eq!(decl.mutations.len(), 1);
+}
+
+#[test]
+fn explain_statement_never_shares_a_file_with_a_declaration() {
+    let decl = "query q() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
+    let err = parse_query(&format!("explain {decl}{decl}")).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("an `explain` statement stands alone in its file"),
+        "{err}"
+    );
+    let err = parse_query(&format!("explain {decl}explain {decl}")).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("an `explain` statement stands alone in its file"),
+        "{err}"
+    );
+    for input in [
+        format!("{decl}explain {decl}"),
+        format!("explain {decl}branch list\n"),
+        format!("branch list\nexplain {decl}"),
+    ] {
+        let error = parse_query(&input).unwrap_err();
+        assert!(matches!(error, CompilerError::Parse(_)), "{input}: {error}");
+    }
+}
+
+#[test]
+fn explain_keyword_ends_at_a_word_boundary_and_needs_a_declaration() {
+    let decl = "query q() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
+    for input in [
+        "explainquery q() { match { $p: Person } return { $p.name } }".to_string(),
+        format!("explain_ {decl}"),
+        "explain".to_string(),
+        "explain branch list".to_string(),
+        format!("explain explain {decl}"),
+    ] {
+        let error = parse_query(&input).unwrap_err();
+        assert!(matches!(error, CompilerError::Parse(_)), "{input}: {error}");
+    }
+}
+
+#[test]
+fn explain_stays_an_identifier_inside_bodies() {
+    let input = r#"
+query explain($e: String) {
+match {
+    $p: Person { explain: $e }
+}
+return { $p.explain as explain }
+}
+"#;
+    let qf = parse_query(input).unwrap();
+    assert_eq!(qf.single_decl().name, "explain");
+}
+
 #[test]
 fn branch_keywords_stay_identifiers_inside_bodies() {
     let input = r#"
@@ -1217,4 +1663,236 @@ return { $p.branch, $q.into as create }
     let insert =
         parse_query("query m() {\n    insert Knows { from: \"a\", to: \"b\" }\n}\n").unwrap();
     assert_eq!(insert.single_decl().mutations.len(), 1);
+}
+
+fn set(id: SettingId, value: SettingValue) -> SettingStmt {
+    SettingStmt::Set { id, value }
+}
+
+fn ident(text: &str) -> SettingValue {
+    SettingValue::Ident(text.to_string())
+}
+
+#[test]
+fn settings_prefix_parses_before_every_body() {
+    let decl = "query q() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
+    let file = parse_query(&format!(
+        "set merge_lineage = off;\nreset merge_lineage;\nset ann_nprobes = 0;\nreset all;\n{decl}"
+    ))
+    .unwrap();
+    assert_eq!(
+        file.settings,
+        vec![
+            set(SettingId::MergeLineage, ident("off")),
+            SettingStmt::Reset {
+                id: Some(SettingId::MergeLineage)
+            },
+            set(SettingId::AnnNprobes, SettingValue::Integer(0)),
+            SettingStmt::Reset { id: None },
+        ]
+    );
+    assert_eq!(file.single_decl().name, "q");
+
+    let merge = parse_query("set merge_lineage = off;\nbranch merge b0 into main;\n").unwrap();
+    assert_eq!(
+        merge.settings,
+        vec![set(SettingId::MergeLineage, ident("off"))]
+    );
+    assert!(
+        matches!(merge.body, FileBody::Branch(ref stmt) if *stmt == merge_stmt("b0", Some("main")))
+    );
+    assert!(matches!(
+        parse_query("branch list").unwrap().body,
+        FileBody::Branch(BranchStmt::List)
+    ));
+
+    let only_settings = parse_query("set merge_lineage = on;").unwrap();
+    assert_eq!(only_settings.settings.len(), 1);
+    assert!(matches!(only_settings.body, FileBody::Queries(ref queries) if queries.is_empty()));
+    let empty = parse_query("").unwrap();
+    assert!(empty.settings.is_empty());
+    assert!(matches!(empty.body, FileBody::Queries(ref queries) if queries.is_empty()));
+
+    let quoted = parse_query("set merge_lineage = \"off\";\nshow all;").unwrap();
+    assert_eq!(
+        quoted.settings,
+        vec![set(
+            SettingId::MergeLineage,
+            SettingValue::Str("off".to_string())
+        )]
+    );
+    assert!(matches!(quoted.body, FileBody::Show(None)));
+    assert!(matches!(
+        parse_query("show merge_lineage;").unwrap().body,
+        FileBody::Show(Some(SettingId::MergeLineage))
+    ));
+    assert!(matches!(
+        parse_query("  set\n  stage_write_concurrency = 3 ; // width\n show all ;")
+            .unwrap()
+            .body,
+        FileBody::Show(None)
+    ));
+}
+
+fn merge_stmt(source: &str, into: Option<&str>) -> BranchStmt {
+    merge(source, into)
+}
+
+#[test]
+fn empty_kind_separates_a_settings_only_file_from_no_statement() {
+    use crate::query::ast::EmptyFile;
+
+    assert_eq!(
+        parse_query("").unwrap().empty_kind(),
+        Some(EmptyFile::NoStatement)
+    );
+    assert_eq!(
+        parse_query("set merge_lineage = on;").unwrap().empty_kind(),
+        Some(EmptyFile::SettingsOnly)
+    );
+    assert_eq!(
+        parse_query("set merge_lineage = on;\nshow all;")
+            .unwrap()
+            .empty_kind(),
+        None
+    );
+    assert_eq!(
+        parse_query("query q() {\n    match { $p: Person }\n    return { $p.name }\n}\n")
+            .unwrap()
+            .empty_kind(),
+        None
+    );
+}
+
+#[test]
+fn settings_statements_are_checked_against_the_definition() {
+    for (input, needle) in [
+        (
+            "set merge_lineage = v3;",
+            "unknown value `v3` for setting `merge_lineage`; expected one of off, on, verify",
+        ),
+        ("set traversal = v2;", "unknown setting `traversal`"),
+        ("reset traversal;", "unknown setting `traversal`"),
+        ("show traversal;", "unknown setting `traversal`"),
+        (
+            "set ann_nprobes = \"many\";",
+            "takes an integer of at least 0, got a string `many`",
+        ),
+        (
+            "set stage_write_concurrency = 0;",
+            "takes an integer in 1..=64, got 0",
+        ),
+        (
+            "set stage_write_concurrency = 99999999999999999999;",
+            "takes an integer in 1..=64, got 99999999999999999999",
+        ),
+        (
+            "set merge_lineage = 5;",
+            "unknown value `5` for setting `merge_lineage`",
+        ),
+        (
+            "set search.nprobes = 5;",
+            "unknown setting `search.nprobes`",
+        ),
+    ] {
+        let err = parse_query_diagnostic(input).unwrap_err();
+        assert!(
+            err.message.contains(needle),
+            "{input}: {} (the full text is `settings::tests::messages_follow_the_definition`'s)",
+            err.message
+        );
+        assert!(err.span.is_some(), "{input} carries a position");
+    }
+    let rendered = parse_query("set merge_lineage = v3;")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        rendered.starts_with("parse error: unknown value `v3` for setting `merge_lineage`"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn settings_prefix_peek_agrees_with_the_parser() {
+    let decl = "query q() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
+    for (input, expected) in [
+        (format!("set merge_lineage = off;\n{decl}"), true),
+        (
+            format!("  \t\r\n// pinned\n/* block\n */ reset all;\n{decl}"),
+            true,
+        ),
+        (format!("/* set merge_lineage = off; */\n{decl}"), false),
+        (format!("// set merge_lineage = off;\n{decl}"), false),
+        (decl.to_string(), false),
+        ("show all;".to_string(), false),
+        ("setmerge_lineage = off;".to_string(), false),
+        ("reset_all;".to_string(), false),
+        (
+            "/* never closed set merge_lineage = off;".to_string(),
+            false,
+        ),
+        (String::new(), false),
+    ] {
+        assert_eq!(has_settings_prefix(&input), expected, "{input:?}");
+        if expected {
+            assert!(
+                !parse_query(&input).unwrap().settings.is_empty(),
+                "{input:?}"
+            );
+        } else if let Ok(file) = parse_query(&input) {
+            assert!(file.settings.is_empty(), "{input:?}");
+        }
+    }
+}
+
+#[test]
+fn settings_keywords_end_at_a_word_boundary_and_stand_at_the_head() {
+    for input in [
+        "setmerge_lineage = off;",
+        "set merge_lineage = off",
+        "set merge_lineage off;",
+        "set search . nprobes = 5;",
+        "resetall;",
+        "showall;",
+        "show all",
+        "show all; show all;",
+        "branch list; set merge_lineage = off;",
+        "query q() {\n    match { $p: Person }\n    return { $p.name }\n}\nset merge_lineage = off;",
+    ] {
+        assert!(parse_query(input).is_err(), "{input}");
+    }
+    let err = parse_query("show all;\nbranch list").unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("a show statement stands alone in its file"),
+        "{err}"
+    );
+    let err = parse_query(
+        "branch list;\nquery q() {\n    match { $p: Person }\n    return { $p.name }\n}\n",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("a branch statement stands alone in its file"),
+        "{err}"
+    );
+}
+
+#[test]
+fn settings_keywords_stay_identifiers_inside_bodies() {
+    let input = r#"
+query q($all: String) {
+match {
+    $p: Person { set: $all }
+    $p show $q
+    $q.reset = "x"
+}
+return { $p.set, $q.traversal as all }
+}
+"#;
+    let file = parse_query(input).unwrap();
+    assert!(file.settings.is_empty());
+    assert_eq!(file.single_decl().name, "q");
+    assert_eq!(parse_branch("branch create set"), create("set", None));
+    assert_eq!(parse_branch("branch create all"), create("all", None));
 }

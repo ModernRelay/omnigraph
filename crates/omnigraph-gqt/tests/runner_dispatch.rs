@@ -5,10 +5,10 @@ use std::process::Command;
 fn refuses_unknown_or_unobserved_faults() {
     let expected = if cfg!(tokio_unstable) {
         [
-            "unsupported DST failpoint",
-            "configured faults were not observed",
-            "configured faults were not observed",
-            "configured faults were not observed",
+            "unknown seam",
+            "was not crossed on occurrence",
+            "was not crossed on occurrence",
+            "was not crossed on occurrence",
         ]
     } else {
         [
@@ -286,6 +286,109 @@ fn replay_uses_frozen_case_and_rejects_changed_evidence() {
 
 #[cfg(tokio_unstable)]
 #[test]
+fn several_seams_before_one_step_each_deliver_and_a_repeated_seam_is_refused() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(
+        root.join("cases/mutation_contention_and_lost_ack_survive_reopen.gqt"),
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("two_seams.gqt");
+    std::fs::write(&path, &text).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (_, summary) = report(&output);
+    let delivered = summary["attempts"][0]["outcome"]["Ok"]["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "seam_delivered")
+        .map(|event| event["value"]["at"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        delivered,
+        vec!["publish.load_state", "publish.post_merge_pre_ack"],
+        "one delivery record per seam, in declaration order"
+    );
+
+    let confirm_block =
+        "--- seam\nat: publish.load_state\noccurrence: 1\naction: contention\nscope: next_step\n";
+    let repeated = text.replace(confirm_block, &format!("{confirm_block}\n{confirm_block}"));
+    assert_ne!(
+        repeated, text,
+        "the confirm seam block must be found verbatim"
+    );
+    std::fs::write(&path, repeated).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("is declared twice before one step"));
+}
+
+#[cfg(tokio_unstable)]
+#[test]
+fn contention_action_records_the_retryable_effect_and_keeps_legacy_fail() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(root.join("cases/mutation_publish_contention_retries.gqt"))
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("contention.gqt");
+    for action in ["contention", "fail"] {
+        std::fs::write(
+            &path,
+            text.replace("action: contention", &format!("action: {action}")),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let (_, summary) = report(&output);
+        for attempt in summary["attempts"].as_array().unwrap() {
+            let deliveries = attempt["outcome"]["Ok"]["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| event["kind"] == "seam_delivered")
+                .collect::<Vec<_>>();
+            assert_eq!(deliveries.len(), 1);
+            assert_eq!(deliveries[0]["value"]["at"], "publish.load_state");
+            assert_eq!(deliveries[0]["value"]["effect"], "contention");
+            assert!(
+                deliveries[0]["value"]["crossings"].as_u64().unwrap() >= 2,
+                "the publisher must retry after the injected contention"
+            );
+        }
+    }
+    std::fs::write(
+        &path,
+        text.replace("publish.load_state", "mutation.post_table_commit"),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not admit action contention"));
+}
+
+#[cfg(tokio_unstable)]
+#[test]
 fn occurrence_is_counted_inside_the_selected_operation() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let text = std::fs::read_to_string(root.join("cases/dst_fault_on_second_merge.gqt")).unwrap();
@@ -297,7 +400,7 @@ fn occurrence_is_counted_inside_the_selected_operation() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("fault_unobserved"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("seam_unobserved"));
     let (_, summary) = report(&output);
     assert_eq!(
         summary["attempts"].as_array().unwrap().len(),
@@ -362,127 +465,4 @@ fn selecting_engine_does_not_allow_blessing_a_shared_case() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("bless requires"));
     assert_eq!(std::fs::read(&path).unwrap(), before);
-}
-
-#[cfg(tokio_unstable)]
-#[test]
-fn known_recovery_failure_is_explicit_and_replay_status_is_verified() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let path = root.join("cases/dst_mutation_failure_keeps_writing.gqt");
-    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
-        .arg(&path)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("KNOWN_FAILURE environment="));
-    let (report_path, summary) = report(&output);
-    assert_eq!(summary["code"], "known_failure");
-    assert_eq!(summary["scope"], "full");
-    let attempts = summary["attempts"].as_array().unwrap();
-    assert_eq!(attempts.len(), 4);
-    for attempt in attempts {
-        assert_eq!(attempt["known_failure"], true);
-        assert_eq!(attempt["outcome"]["Ok"]["code"], "assertion_failed");
-        assert!(
-            attempt["outcome"]["Ok"]["result"]["Err"]
-                .as_str()
-                .unwrap()
-                .contains("step 4 (mutate)")
-        );
-    }
-    let replay = |path: &Path| {
-        Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
-            .arg("--replay")
-            .arg(path)
-            .output()
-            .unwrap()
-    };
-    let replayed = replay(&report_path);
-    assert!(
-        replayed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&replayed.stderr)
-    );
-    assert_eq!(report(&replayed).1["code"], "known_failure");
-    let dir = tempfile::tempdir().unwrap();
-    let tampered = dir.path().join("tampered.json");
-    for field in ["attempt", "summary"] {
-        let mut forged = summary.clone();
-        if field == "attempt" {
-            forged["attempts"][0]["known_failure"] = false.into();
-        } else {
-            forged["code"] = "passed".into();
-        }
-        std::fs::write(&tampered, serde_json::to_vec(&forged).unwrap()).unwrap();
-        let output = replay(&tampered);
-        assert!(!output.status.success(), "accepted forged {field} status");
-        assert!(String::from_utf8_lossy(&output.stderr).contains("report_failed"));
-    }
-    let selected = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
-        .arg(&path)
-        .args(["--target", "omnigraph-engine-dst", "--seed", "42"])
-        .output()
-        .unwrap();
-    assert!(selected.status.success());
-    assert_eq!(report(&selected).1["scope"], "partial");
-}
-
-#[cfg(tokio_unstable)]
-#[test]
-fn known_failure_does_not_waive_changed_failure_missing_fault_or_unexpected_pass() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let text =
-        std::fs::read_to_string(root.join("cases/dst_mutation_failure_keeps_writing.gqt")).unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("known_failure_refusals.gqt");
-    let selected = text.replace("seeds: [0, 42]", "seeds: [42]");
-    for (text, expected) in [
-        (
-            selected.replace("pending Mutation recovery", "different Mutation recovery"),
-            "recovery required",
-        ),
-        (
-            selected.replace("occurrence: 1", "occurrence: 2"),
-            "fault_unobserved",
-        ),
-        (
-            selected.replace("step: 4", "step: 5").replace(
-                "--- mutate branch: work\nquery retry",
-                "--- restart\n\n--- mutate branch: work\nquery retry",
-            ),
-            "unexpected_pass",
-        ),
-    ] {
-        std::fs::write(&path, text).unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert!(!output.status.success(), "accepted {expected}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains(expected),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            report(&output).1["attempts"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|a| a["known_failure"] == false)
-        );
-    }
-    std::fs::write(&path, &selected).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
-        .arg(&path)
-        .env("OMNIGRAPH_GQ_BLESS", "1")
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("bless is refused for known_failure"));
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), selected);
 }

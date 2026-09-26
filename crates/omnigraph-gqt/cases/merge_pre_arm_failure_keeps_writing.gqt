@@ -1,6 +1,6 @@
 # issue: none
-# notes: The runner section injects one merge failure under DST.
-# notes: Reads and the next unrelated write use the same Omnigraph without reopening.
+# notes: Fail before arming merge recovery. The same Omnigraph must accept an unrelated write
+# notes: without reopening, while source and target retain their separate rows.
 
 --- runner
 timeout_ms: 10000
@@ -41,10 +41,10 @@ query advance_target() {
 
 --- expect affected: nodes=1 edges=0
 
---- fault
+--- seam
 at: branch_merge.post_authority_capture
 occurrence: 1
-action: return_error
+action: fail
 scope: next_step
 
 --- mutate

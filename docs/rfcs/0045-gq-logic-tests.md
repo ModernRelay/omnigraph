@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - azimafroozeh
 created: 2026-08-29
-updated: 2026-09-10
+updated: 2026-09-18
 discussion: https://github.com/ModernRelay/omnigraph/pull/584
 supersedes: []
 superseded_by: []
@@ -33,9 +33,9 @@ dedicated workspace crate, `omnigraph-gqt` (`publish = false`, outside
 `default-members`, and outside the explicit `-p` list `release.yml`
 builds, so never in a release), holds the corpus and the runner: its one
 integration-test target, `crates/omnigraph-gqt/tests/gq_logic_tests.rs`,
-registers every top-level, non-dot-prefixed
-`crates/omnigraph-gqt/cases/*.gqt` file (any other entry except an
-extension-less dot-file fails `corpus_layout`, Runner mechanics) as its own libtest-compatible test and
+recursively registers every non-dot-prefixed `.gqt` file under
+`crates/omnigraph-gqt/cases/` (invalid entries fail `corpus_layout`,
+Runner mechanics) as its own libtest-compatible test and
 runs each case against a fresh temporary store: init, load, index, then
 the steps in order.
 
@@ -157,9 +157,9 @@ refusal message, and the remaining cases still run. The per-case lines
 print on every run: the target's harness never captures output, so
 `--nocapture` changes nothing for it (the crate's unit tests, under real
 libtest, still honor it). Every case is its own libtest-compatible test,
-named `case::<file>.gqt`, so
+named `case::<relative/path>.gqt`, so
 `cargo test -p omnigraph-gqt --test gq_logic_tests issue_563`
-restricts the run to cases whose file name contains the argument, and
+restricts the run to cases whose relative path contains the argument, and
 `-- --list` names every registered case.
 
 ***Bless mode*** (the update-in-place workflow rustc calls `--bless` and
@@ -294,7 +294,8 @@ among Rust test targets only `omnigraph-gqt`'s (the corpus target and its
 unit tests), `Test omnigraph-server --features aws`, and `DST pinned suite`
 (`cargo test -p omnigraph-dst`, `dst.yml`) run on a pull request as
 required contexts (`Test Workspace` runs the remaining workspace targets on
-the pull request as a reporting context, CI above); a test-attributed
+the pull request and on the merge queue's branch as a required context since
+2026-09-16, CI above); a test-attributed
 `issue_N` function inside `crates/omnigraph-gqt/`, `crates/omnigraph-server/`,
 or `crates/omnigraph-dst/` therefore runs in a required context, and the
 Rust shape stays a naming check everywhere else, where a defined
@@ -461,13 +462,13 @@ path (Execution semantics owns the default); a statement step traverses
 nothing and runs outside the pin.
 
 A file is: required `--- runner` (Explicit execution environments),
-optional `--- known_failure` (Known recovery failures), then `--- schema`, then
+then `--- schema`, then
 `--- seed`, then one or more steps, of
 which at least one is a query or mutate step; a file missing any of these
 three leading sections, ordering them differently, or carrying no query or
 mutate step (nothing would be asserted, a restart-only step list
-included) is refused. A `--- fault` may precede an operation as specified
-in Faults at an explicit step. A step is one of:
+included) is refused. A `--- seam` may precede an operation as specified
+in Seams at an explicit step. A step is one of:
 
 - `--- query` holding exactly one GQ declaration with a read body, followed
   by an optional `--- params` section (JSON object) and a mandatory
@@ -501,7 +502,38 @@ in Faults at an explicit step. A step is one of:
   `DateTime`). A shape section anywhere but directly after a rows expect is
   refused, and so is a rows expect without one; the latter refusal names the
   two routes: write it from the `.pg` schema, or fill it with
-  `OMNIGRAPH_GQ_BLESS=1` and review the diff.
+  `OMNIGRAPH_GQ_BLESS=1` and review the diff. A rows step may carry one
+  optional `--- expect plan` section, the ***plan section***, directly after
+  its shape section: one assertion per line over the plan the step's query
+  runs under, in nine forms. The query's effective engine must
+  be v2, after applying the runner baseline, case settings and query prefix.
+  Under v1 the runner fails the step before execution or explain because
+  v1 produces no plan. A `scan <Type>[ as $var]:` head
+  selects the scans of that node type (every scan of it, or the one bound
+  to `$var`) and claims one fact of each: `columns [<a>, <b>]` the exact
+  columns it projects; `not columns [<a>, <b>]` columns it must not read;
+  `filter reads [<v.a>, <v.b>]` a pushed filter reading exactly those
+  columns, each spelled `binding.property`; `no filter` no pushed filter.
+  `filter reads [<a.x>, <b.y>]` without a scan head states that an in-memory
+  `Filter` node stays in the plan reading exactly those columns. `pass
+  <name>` states that the named optimizer pass fired; `not pass <name>` that
+  it did not. Pass names must be registered optimizer passes; excluded
+  columns must exist in the selected type's catalog schema. An unknown name
+  is refused even in a negative assertion. Expansion destination projection
+  belongs to its dependent `scan`, not the topology-only `Expand`.
+  An `expand $<src> <Edge> $<dst>:` head selects the one physical `Expand`
+  between those bindings over that edge type and claims `mode csr` or `mode
+  indexed_scan`, the traversal mode the planner recorded on it; it fails
+  when the physical plan holds no such expand or its mode differs.
+  A `scan <Type>[ as $var]: access <id_lookup|hash_join>` line selects the
+  physical scans of that node type (or the one bound to `$var`) and claims
+  the access path the planner recorded on a dependent scan, the per-batch
+  id lookup or the destination table read once as a hash join's build side;
+  it fails when the physical plan holds no such scan, the scan is a table
+  scan, or its access path differs.
+  Every list is a set. A plan section anywhere but directly
+  after a shape section, an empty one, or a line outside the nine forms is
+  refused with the forms spelled out.
 - `--- mutate` holding exactly one GQ declaration with a mutation body,
   followed by an optional `--- params` and a mandatory `--- expect` with
   mode word `ok` (success, counts unasserted),
@@ -695,7 +727,7 @@ compatibility or change its existing qualification status.
 
 `Intended` means potential support gated by Rollout; it does not mean
 implemented or qualified. Initial implementation admission is limited to
-`omnigraph-engine` with `local-filesystem` and no fault directives, and
+`omnigraph-engine` with `local-filesystem` and no seam directives, and
 `omnigraph-engine-dst` with `in-memory-object-store`. Every other combination
 must report `unsupported_environment` before case setup. Further targets,
 storage combinations and controls require their own acceptance evidence.
@@ -801,24 +833,25 @@ meaning. Rust generated scenarios and GQT scenarios retain their own loops,
 fixture setup, checks, and outputs; neither language is interpreted by the
 shared executor.
 
-### Faults at an explicit step
+### Seams at an explicit step
 
-A ***fault directive*** is a `--- fault` YAML section immediately before
-one query or mutate step. It arms a named engine hook only during that
-operation; schema creation, seed loading, and earlier steps cannot consume
-it. The following example begins after branch setup:
+A ***seam directive*** is a `--- seam` YAML section immediately before
+one mutate step (a GQ mutation or a branch statement). It installs a decision at a named engine seam
+(RFC 0066) only during that operation; schema creation, seed loading, and
+earlier steps cannot consume it. The following example begins after branch
+setup:
 
 ```text
---- fault
-at: branch_merge.post_sidecar_pre_fork
+--- seam
+at: branch_merge.post_fork_pre_commit
 occurrence: 1
-action: return_error
+action: fail
 scope: next_step
 
 --- mutate
 branch merge source into target
 
---- expect error: injected failpoint triggered: branch_merge.post_sidecar_pre_fork
+--- expect error: injected failpoint triggered: branch_merge.post_fork_pre_commit
 
 --- mutate branch: target
 query unrelated_write() {
@@ -828,52 +861,139 @@ query unrelated_write() {
 --- expect affected: nodes=1 edges=0
 ```
 
-All four fault fields are required. `scope` accepts only `next_step`;
-`action` accepts only `return_error`. `occurrence` is 1 to 1000000 and
-counts crossings of that hook attributable to the selected operation,
-including its production retries. It starts at zero when the operation
-is armed. The selected crossing injects once; subsequent crossings do
-not inject. Target and storage do not change this meaning.
+The four seam fields `at`, `occurrence`, `action` and `scope` are required.
+`subject` is optional on a `--- seam` block; a store place requires it, and
+a block whose catalog entry or `STORE_PLACES` row declares no subject
+refuses it. Its grammar and matching rule are RFC 0066 §Design **Subjects**,
+where the value a store place's crossing carries is the object's
+root-relative name. `scope` accepts only `next_step`; `action` is `fail`,
+`contention`, `skip`, or a store action, the first being `misdirect`. `fail`
+selects the declared `Fail` effect, falling back to `Contention` for
+compatibility when `Fail` is absent. Explicit `contention` selects only `Contention`, and `skip`
+selects only `Skip`; undeclared effects are refused. Thus a seam declaring
+both `Fail` and `Contention` lets a case choose either. `hold` is refused
+until a case can express two concurrent steps. `occurrence` is 1 to 1000000 and counts crossings of
+that seam attributable to the selected operation, including its production
+retries. It starts at zero when the operation is armed. The installed
+decision passes the first N-1 crossings, fires on the Nth, and passes every
+later one. Target and storage do not change this meaning.
 
-The hook must be supported for the operation and selected environment.
-No caller-supplied code or arbitrary failpoint action string is accepted.
-Initial hook ownership is the prototype's merge hooks
-(`branch_merge.post_authority_capture`,
-`branch_merge.post_sidecar_pre_fork`,
-`branch_merge.post_effects_pre_confirm`,
-`branch_merge.post_phase_b_pre_manifest_commit`) and mutation hook
-`mutation.post_sidecar_pre_fork`. New hooks require an implementation,
-scope proof, and negative tests before the parser accepts them.
+With `subject`, `occurrence` counts only the crossings whose subject matches
+the glob; without it, every crossing.
 
-The selected operation must finish before fault cleanup can be considered
+The seam must exist in the engine's catalog, or be a store place in the
+decoration's table `STORE_PLACES` (RFC 0066 §Design **Store places**), and
+be crossed by the kind of step it precedes: a seam of operation `mutation`
+before a mutate step, one of `branch_merge`, `branch_create` or
+`branch_delete` before the matching branch statement, one of `any_write`
+before either, a store place before either; a seam whose operation no step
+starts is refused as unreachable. No caller-supplied code or
+arbitrary action string is accepted. A new seam requires an implementation,
+a declared operation and set of effects in the catalog, and a proof case
+before a case may name it; the action must be among the declared effects. A
+seam that wraps one operation declares every outcome that operation can
+have, so a further action at a seam the catalog already lists needs a case
+and nothing else.
+
+Each admission refusal, the four the store shapes add included (a `subject`
+on a block whose entry or row declares none, a store action on a decision
+seam that does not declare it, an engine action on a store place, and a
+place-and-action pair the table lists but this amendment does not admit), is
+an `unsupported_environment:` report naming the directive's `at`, the entry
+or table row, and the reason (`declares no subject`, `does not admit action
+X`, `not admitted`).
+
+The selected operation must finish before seam cleanup can be considered
 complete. On cancellation or timeout, stop the isolated worker or quarantine
-the dedicated server graph until outstanding work has stopped and hooks are
-disarmed. Use a bounded supervisor cleanup deadline; failure to establish
+the dedicated server graph until outstanding work has stopped and seams are
+uninstalled. Use a bounded supervisor cleanup deadline; failure to establish
 cleanup prevents reuse and is reported, never an unbounded wait. A killed
 worker or quarantined graph does not count as a successful replay.
 
-The operation must observe the exact injected error through a typed error
-or an equivalent correlated server result. Matching text in query rows or
-an unrelated error is insufficient. The runner verifies delivery and
-disarms the hook before the following operation, including after an
-assertion failure. An unreached hook, failed cleanup, timeout, or lost
-delivery evidence fails the execution. A fault that leaked into another
-operation or graph fails isolation even if the expected rows match.
+Delivery is proven by the installed decision itself: the runner's decision
+counts every crossing and records `seam_delivered` with the seam name, the
+declared occurrence, the crossings counted over the step (for a store place,
+its matching calls) and the effect that fired. A `fail` action on a seam declaring fail states the
+injected error in its `--- expect error:` row; on a seam declaring
+contention the injected error is retryable, the publisher retries it, the
+step succeeds, and the delivery record is the proof. A `skip` step carries
+the healthy expectation the skipped path produces.
+The runner uninstalls the decision before the following operation,
+including after an assertion failure. An unreached seam or a missing
+delivery record fails the execution with `seam_unobserved`; a failed
+cleanup fails it with `fault_cleanup_failed` and a timeout with `timeout`.
+A decision that leaked into another operation or graph
+fails isolation even if the expected rows match.
 
-One fault directive attaches to one operation; adjacent directives,
-directives before restart/setup, orphan directives, and directives inside
-loops are refused in this phase. Multiple faults in one operation and
-faults during setup remain out of scope. A case may contain up to 16
-fault directives at separate operations. No fault state survives a
-restart, environment change, seed, or replay.
+A store action carries the healthy expectation of the step, since the engine
+sees success: the fault is in the bucket, and the case reads it back at a
+later step. Its delivery record carries, beside the seam name, occurrence,
+crossings and effect, `subject` (the glob as written for a store place; the
+site's declared subject for a store effect) and `hit`, an object with
+`method`, `requested` (the
+name the engine asked for) and, for `misdirect` only, `stored` (the name the
+store used); both names are root-relative, the domain `subject` is matched
+in. For a store place `declared_at` is the `STORE_PLACES` row and
+`fired_at` the adapter method that recorded the hit, both as `file:line`.
+The rule and any one-shot are installed and removed with the step's
+decisions, before the next operation or restart. A fired store effect whose
+hit the decoration never recorded fails the execution with
+`seam_unobserved`, as an unreached seam does, and so does a store place
+whose matching calls never reach the declared occurrence, the message
+carrying the matching calls seen.
 
-Initial `omnigraph-engine` admission rejects faults. A future fault-capable
-direct-engine implementation can use process isolation where failpoints are
-global. A server implementation needs equivalent isolation and explicit
-operation attribution; a shared server-wide toggle does not satisfy it.
-This amendment defines no production fault-control endpoint. HTTP fault
-execution stays unavailable until the test-only lifecycle/control owner
-proves this contract.
+A seam directive attaches to the one operation it precedes. Several
+directives may precede one operation when they name distinct seams (two
+independent lost writes on one mutation); each is armed, counted and
+recorded on its own, and the same seam named twice before one operation is
+refused. The one exception is the store: at most one store action precedes
+an operation, as a store place or as a store effect on a decision seam, and
+a second is refused with `unsupported_environment: one store action per
+step`, naming both directives, since admission cannot tell whether two
+store actions reach one store call (RFC 0066 §Design **Store places**).
+Directives before restart/setup, orphan directives, and directives
+inside loops are refused in this phase; seams during setup remain out of
+scope. A case may contain up to 16 seam directives. No installed decision
+survives a restart, environment change, seed, or replay.
+
+Initial `omnigraph-engine` admission rejects seams. A future seam-capable
+direct-engine implementation can use process isolation where the decision
+seams are process-wide. A server implementation needs equivalent isolation
+and explicit operation attribution; a shared server-wide toggle does not
+satisfy it. This amendment defines no production seam-control endpoint.
+HTTP seam execution stays unavailable until the test-only
+lifecycle/control owner proves this contract.
+
+There is no `--- fault` section: a fault injected at the object store is a
+`--- seam` naming a store place or a decision seam that declares a store
+effect, and a `--- fault` section is refused with a pointer to `--- seam`.
+The store places, their methods and the actions each honors are RFC 0066's
+table; a place-and-action pair outside it, or listed but not implemented, is
+refused at admission naming the table row. The two forms of one store fault:
+
+```text
+--- seam
+at: recovery.sidecar_write
+occurrence: 1
+action: misdirect
+scope: next_step
+```
+
+```text
+--- seam
+at: storage.put
+subject: __recovery/*
+occurrence: 1
+action: misdirect
+scope: next_step
+```
+
+The first selects the write by the engine line before it; the second by the
+object's name. Both land the sidecar's arm put as
+`__recovery/dstm-<opid>.json` and record one delivery. A mutation puts the
+sidecar name twice, the arm put then the confirm put, and deletes it once
+after publish; on `storage.put` with `subject: __recovery/*`,
+`occurrence: 1` is the arm put and `occurrence: 2` the confirm put.
 
 `--- restart` continues to mean closing the graph handle and reopening
 the same stored graph. It does not mean process crash or HTTP reconnect.
@@ -883,6 +1003,14 @@ crashes, multi-connection interleavings, and randomized fault discovery
 remain outside this format extension.
 
 ### Known recovery failures
+
+> Removed with RFC 0067 rollout step 5. The marker existed to keep a known
+> recovery-sidecar defect in the corpus without going red. No writer arms a
+> recovery sidecar any more, the classifier that produced those typed
+> failures is deleted, and no case carried the marker, so the section
+> parser, the `known_failure` attempt field and status code, and the
+> `unexpected_pass` refusal are gone; a `--- known_failure` section is now
+> an ordinary invalid case. The text below records the retired contract.
 
 An optional `--- known_failure` section immediately after `--- runner` records one
 known recovery failure while keeping the healthy operation expectations.
@@ -897,26 +1025,40 @@ match:
 ```
 
 `step` and `match` are required, and other fields are refused. `step` is a
-positive operation ordinal. `match` is a typed error matcher: the only supported
-variant is `error: RecoveryRequired`, with a nonempty exact `reason` of at most
-2048 bytes. It names `OmniError::RecoveryRequired` directly; there is no wildcard
-or fallback variant. Unknown error names, including `Unknown`, are refused,
-as is the old `--- fixme` syntax. The existing `# issue` and `# notes` headers
-provide issue identity and context; `none` remains valid for an unassigned
-issue. The marker does not repeat notes or contain the generated operation ID.
+positive operation ordinal. `match` is a typed error matcher with two
+variants: `error: RecoveryRequired`, with a nonempty exact `reason` of at
+most 2048 bytes, naming `OmniError::RecoveryRequired` returned by a mutate;
+and `error: Internal`, with a nonempty `reason_prefix` of at most 2048
+bytes, naming an `OmniError::Manifest` of kind `Internal` returned by the
+reopen at a `--- restart` (the prefix, because such a refusal embeds a
+per-run operation id). There is no wildcard or fallback variant. Unknown
+error names, including `Unknown`, are refused, as is the old `--- fixme`
+syntax. The existing `# issue` and `# notes` headers provide issue identity
+and context; `none` remains valid for an unassigned issue. The marker does
+not repeat notes or contain the generated operation ID.
 
 Admission requires only `omnigraph-engine-dst` with
-`in-memory-object-store`, no loops, and an ordinary mutate at the declared
-step with its healthy `ok` or `affected` expectation. At least one supported
-fault must precede that step. Faults at or after the marked step are refused.
+`in-memory-object-store`, no loops, and at the declared step either an
+ordinary mutate with its healthy `ok` or `affected` expectation (for the
+`RecoveryRequired` matcher) or a `--- restart` (for the `Internal`
+matcher). At least one seam, a store place included, must precede that step;
+the classifier resolves the name by exact membership, the engine catalog
+first and `STORE_PLACES` second, by the rule the runner arms with, compares
+the subject when one is declared, and validates each store delivery's `hit`
+(present and complete, `method` among the row's methods, `requested`
+matched by the subject, `stored` the `dstm-` transform of `requested` for
+`misdirect`), so a report with a missing or foreign hit is not a known
+failure. Seams at or after the marked step are refused.
 
 An execution qualifies only when every preceding assertion passes, every
-declared fault has exact typed delivery evidence at its own operation, and
-the marked assertion fails because that mutate returned the typed
-`OmniError::RecoveryRequired` variant with exactly the declared reason.
-The operation's typed error and the failed assertion must identify the same
-step and actual error. Matching text in data, a different error variant,
-another reason or step, and missing fault evidence never qualify.
+declared seam has its delivery record at its own operation, and the marked
+assertion fails because that mutate returned the typed
+`OmniError::RecoveryRequired` variant with exactly the declared reason, or
+that reopen returned an `Internal` manifest error whose message opens with
+the declared prefix. The operation's typed error and the failed assertion
+must identify the same step and actual error. Matching text in data, a
+different error variant, another reason or step, and missing seam evidence
+never qualify.
 
 The step loop still stops at its first failure; later healthy assertions
 remain unchanged and unexecuted. Every selected seed and mandatory fresh
@@ -958,7 +1100,7 @@ external and excluded from the recorded input. This binds tested inputs;
 it does not freeze the external service's internal execution schedule.
 
 Capability requirements are derived from actual steps and configuration.
-For example, `--- fault` requires its exact hook, and `--- expect shape`
+For example, `--- seam` requires its exact catalog seam, and `--- expect shape`
 requires result type evidence. There is no second hand-maintained
 `requires` list that can disagree with the case. A server cannot substitute
 inferred types for missing executed types or omit an existing comparison.
@@ -992,7 +1134,7 @@ fails explicitly and cannot truncate compared evidence into success.
 Structured failures retain applicable expected/actual values and a stable
 error code alongside the readable explanation. Contract codes include
 `invalid_case`, `unsupported_environment`, `environment_changed`,
-`fault_unobserved`, `fault_cleanup_failed`, `assertion_failed`,
+`seam_unobserved`, `fault_cleanup_failed`, `assertion_failed`,
 `replay_mismatch`, `worker_failed`, `report_failed`, `timeout`, and
 `unexpected_pass`. `known_failure` is a separate accepted status defined
 in Known recovery failures; its raw worker result remains an assertion failure.
@@ -1167,15 +1309,13 @@ expect section is JSONL, one object per row, same keys.
   operation that later stops being deterministic is refused by name in
   the harness, the way `@embed` is today. Second, given that set, the
   engine's order is total, which is an authoring rule: the `order` keys
-  must be total over the rows the step returns. The `<var>.id` tie-break
-  `apply_ordering` appends to every non-aggregate ordering is an
-  implementation detail no expect may depend on (it is the `@key` value
-  for keyed node types and a per-load ULID otherwise, so an unkeyed
-  type's order changes across runs), an aggregate result batch carries no
-  `<var>.id` column at all, so group rows tied on the sort key have no
-  guaranteed order, and a tie on the sort keys surfaces as flakiness the
-  harness cannot see statically (`ordered_two_key_sort.gqt` is the corpus
-  example). The harness checks the parsed declaration and refuses
+  must be total over the rows the step returns, including the documented
+  `<var>.id` tie-break for non-aggregate ordering. A case may depend on
+  that tie-break only when it fixes every binding's identity, through an
+  `@key` property or an explicit id; generated ULIDs vary across runs.
+  Aggregate result batches have no `<var>.id` columns, so their user sort
+  keys must determine a total order. The harness cannot prove this
+  statically (`ordered_two_key_sort.gqt` is a corpus example). The harness checks the parsed declaration and refuses
   `ordered` where no total order is possible: no `order` clause; an
   `order` clause led by
   `rrf()`, whose fusion sorts by score alone; and any aggregate in the
@@ -1233,6 +1373,27 @@ expect section is JSONL, one object per row, same keys.
   shape section is the author's statement of the columns, the way the rows
   body is the author's statement of the values, and the computed check
   proves the compiler and the executor agree.
+- The plan section, when present, is checked before the shape section,
+  against the explain document `Session::explain_query` returns for the
+  step's declaration on the step's branch (the same compile, the same pinned
+  snapshot, after query execution): a `scan` projection or filter line selects the `TableScan` nodes
+  of the document's `logical_plan` whose table is `node:<Type>` (and whose
+  `binding` is `$var` when named) and compares the line's column set with
+  each selected scan's `projection` (equality for `columns`, disjointness
+  for `not columns`) or with the reads of each selected scan's `filter`
+  predicate (equality for `filter reads`, absence for `no filter`; the reads
+  of an `and` predicate are the union of its sides); a bare `filter reads`
+  line requires a `Filter` node whose `predicate` reads exactly that set; a
+  `pass` line requires its name in the document's `passes`, a `not pass`
+  line its absence. An `expand $src Edge $dst: mode` line selects every
+  matching physical `Expand` and compares its recorded mode. A `scan`
+  `access` line selects physical `Scan` nodes and compares the dependent
+  scan access path. No selected node, a scan without a projection, or a
+  contradicted line fails the step with the line, what the document holds
+  instead, and the whole document; bless never rewrites a plan section. The comparison
+  is over the document's fields, never over rendered text, so a later
+  planner that reaches the same facts by another route keeps the case green
+  .
 
 Ranking scores are projectable (`nearest` and `bm25` since v0.11.0, `T33`
 ties the projection to the executed retrieval) and their values are
@@ -1242,9 +1403,13 @@ project the score only when the value itself is the claim.
 ### Runner mechanics
 
 The test target is `harness = false` and hands discovery to
-`datatest-stable`: every `cases/*.gqt` file, rooted at the crate, is
-registered at run time as its own libtest-compatible test (a libtest-mimic
-trial under `datatest-stable`) named `case::<file>.gqt`. The runner it
+`datatest-stable`: every `.gqt` file under `cases/`, including subdirectories,
+is registered at run time as its own libtest-compatible test (a libtest-mimic
+trial under `datatest-stable`) named `case::<relative/path>.gqt`. Shared cases
+live directly under `cases/`; v2-specific cases live in `cases/v2/`, with
+plan assertions in `cases/v2/planner/`. Directory placement is organizational:
+a case that requires v2 still explicitly selects `engine = v2`, and discovery
+never supplies a setting. The runner it
 calls (parser, execution, comparison, bless) is the crate's library,
 `crates/omnigraph-gqt/src/lib.rs`, and the format self-tests are unit
 tests beside it in `crates/omnigraph-gqt/src/tests.rs`; the crate is
@@ -1286,11 +1451,11 @@ checkout or a bad rename, never a green run; `--exact` excepted: it
 resolves the one name without scanning); a name filter matching
 nothing runs zero tests and exits green, libtest's own behavior, where
 the merged selector failed on an unmatched value. The `corpus_layout`
-unit test fails on an empty corpus and on any entry that is not a
-top-level regular `.gqt` file with a UTF-8 name (a symlink is foreign),
-dot-prefixed `.gqt` names included; dot-prefixed
-entries without the extension (`.DS_Store`, `.gitkeep`) are skipped (a
-mis-renamed, nested, or dot-prefixed case must never silently skip). One
+unit test recursively admits normal directories and regular `.gqt` files
+with UTF-8 names. It fails on an empty corpus, symlinks, foreign files,
+and dot-prefixed case files. Hidden directories and non-case dot-files
+(`.DS_Store`, `.gitkeep`) are skipped. A nested case is enrolled; an invalid
+entry must never silently skip. One
 new dev-dependency, `datatest-stable` (bringing `libtest-mimic`,
 `fancy-regex`, `camino`, `escape8259` into the lockfile), which takes
 libtest's own arguments, so the workspace's `-- --nocapture` is accepted
@@ -1682,6 +1847,30 @@ supersedes their implicit execution and ambient-budget rules and assigns the
 complete corpus to the separate configured `GQ Logic Tests` context. Their
 historical command and configuration descriptions are not migration aliases.
 
+- 2026-09-14, from the implementation of RFC 0066: the hook form of
+  `--- fault` is replaced by `--- seam`. Replaced sentences: the directive
+  definition ("A fault directive is a `--- fault` YAML section..."), the
+  action sentence ("`action` accepts only `return_error`"), the hook
+  ownership paragraph naming the five prototype hooks, the delivery
+  paragraph ("The operation must observe the exact injected error through
+  a typed error..."), and the isolation paragraph's fault vocabulary.
+  Delivery proof now comes from the installed decision's own crossing
+  count (`seam_delivered`), admission from the engine's seam catalog, and
+  the action word must match the seam's declared effect. `--- fault` is
+  reserved for storage-boundary faults. The known-failure matcher gains
+  `error: Internal` with `reason_prefix` for a refused reopen at a
+  `--- restart`. Second pass, same date: the placement sentence names
+  mutate steps only (no seam is crossed by a query step), the contention
+  pairing and the per-cause failure codes are stated, and the
+  contract-code list says `seam_unobserved`.
+- 2026-09-15, from the RFC 0066 amendment on effect sets: a seam declares
+  the set of effects its site honors and the action must be among them.
+  Replaced sentences in §Seams at an explicit step: "A new seam requires an
+  implementation, a declared effect and operation in the catalog, and a
+  proof case before a case may name it" (now a declared operation and set
+  of effects, with the membership rule and the wrapped-operation sentence),
+  the `seam_delivered` record sentence (now carries the effect that fired),
+  and "on a seam of effect fail/contention" (now "declaring").
 - 2026-09-02, from review of the RFC PR: the fix-PR gate is a diff check
   whose execution guarantee differs by shape (a corpus match ran green in
   the required job; a Rust match is a naming check), and the Rust shape
@@ -2098,3 +2287,35 @@ historical command and configuration descriptions are not migration aliases.
     silent on `ok` being satisfied by a no-op merge; and the refusal string
     `a branch statement names its branches itself`, which now names the next
     action. Frontmatter `updated:` bumped to 2026-09-06.
+- 2026-09-15, from the RFC 0066 amendment on store faults: a fault injected
+  at the object store is a `--- seam` naming a store place or a decision
+  seam that declares a store effect, and no `--- fault` section exists.
+  Replaced sentences in §Seams at an explicit step: "All four seam fields
+  are required. `scope` accepts only `next_step`; `action` is `fail`,
+  `contention`, or `skip`" (now the four required fields, the optional
+  `subject` with its owner rule, and store actions in the action list); "The
+  seam must exist in the engine's catalog and be crossed by the kind of step
+  it precedes" (now the catalog or a store place in `STORE_PLACES`, with the
+  `unsupported_environment:` shape of each refusal); and the reserved
+  paragraph "`--- fault` is reserved for storage-boundary faults, injected
+  at the object store rather than at a code seam; its grammar is a separate
+  amendment, and until it lands a `--- fault` section is refused with a
+  pointer to `--- seam`" (now the two seam forms of a store fault and the
+  table that bounds them). The delivery paragraph gains the store's own hit,
+  `declared_at` and `fired_at` for a store place, and `seam_unobserved` for
+  an unreached store rule; "Several directives may precede one operation
+  when they name distinct seams" keeps its rule and gains the one exception,
+  at most one store action per operation. In §Known recovery failures: "At
+  least one seam must precede that step" (now a store place counts, and the
+  classifier resolves the name by exact membership in the engine catalog or
+  `STORE_PLACES` and validates the store hit). In the 2026-09-14
+  entry of this log: "`--- fault` is reserved for storage-boundary faults"
+  (no such section exists).
+- 2026-09-16, amendment from the PR that made CI listen to the merge queue
+  (`docs/dev/branch-protection.md`, Merge queue): `Test Workspace` is a
+  required context on pull requests and on the merge queue's branch. §CI's
+  parenthetical is rewritten to say so. Superseded sentence: "(`Test
+  Workspace` runs the remaining workspace targets on the pull request as a
+  reporting context, CI above)". The claim that a test-attributed `issue_N`
+  function inside the three named crates runs in a required context stands;
+  it now also holds for every other workspace crate through `Test Workspace`.

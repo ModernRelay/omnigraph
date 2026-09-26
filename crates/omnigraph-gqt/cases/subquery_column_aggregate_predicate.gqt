@@ -1,0 +1,301 @@
+# issue: none
+# red_on: e588815a; `invalid_case: --- query section starting at line 52 does not parse: expected comp_op` at `sum($m.size) {`, so no step runs; the only aggregate in match today is the bare form, rejected with T7.
+# notes: An aggregate over an inner column per outer row, then a predicate on it: sum, min, max, avg.
+# notes: An outer row with no inner match has no aggregate and fails every comparison.
+# notes: min and max admit what they admit in a return: numbers, String, Bool, Date, DateTime.
+# notes: count over a column counts its non-null values; a null bound satisfies nothing; a U64 above the I64 range is kept.
+# notes: On v1 a block binding introduced by a scan must still load the argument's column.
+# notes: Shared row/error steps inherit the CI engine baseline; only plan assertions select v2.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Actor {
+    slug: String @key
+}
+node Artifact {
+    slug: String @key
+    size: I64
+    score: F64?
+    label: String?
+    created: Date
+    published: Bool
+    big: U64?
+}
+edge ArtifactOwnedByActor: Artifact -> Actor {}
+
+--- seed
+{"type":"Actor","data":{"slug":"zero"}}
+{"type":"Actor","data":{"slug":"small"}}
+{"type":"Actor","data":{"slug":"large"}}
+{"type":"Artifact","data":{"slug":"s1","size":10,"score":-2.5,"label":"a","created":"2024-01-10","published":false}}
+{"type":"Artifact","data":{"slug":"s2","size":21,"created":"2024-02-10","published":false}}
+{"type":"Artifact","data":{"slug":"l1","size":50,"score":0.5,"label":"c","created":"2024-03-10","published":false}}
+{"type":"Artifact","data":{"slug":"l2","size":70,"score":4.5,"label":"d","created":"2025-06-01","published":true,"big":18446744073709551615}}
+{"edge":"ArtifactOwnedByActor","from":"s1","to":"small"}
+{"edge":"ArtifactOwnedByActor","from":"s2","to":"small"}
+{"edge":"ArtifactOwnedByActor","from":"l1","to":"large"}
+{"edge":"ArtifactOwnedByActor","from":"l2","to":"large"}
+
+--- query
+query total_above_100() {
+    match {
+        $n: Actor
+        sum($m.size) {
+            $m artifactOwnedByActor $n
+        } > 100
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"large"}
+--- expect shape
+n.slug: String
+
+--- query
+query largest_artifact_at_most_21() {
+    match {
+        $n: Actor
+        max($m.size) {
+            $m artifactOwnedByActor $n
+        } <= 21
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"small"}
+--- expect shape
+n.slug: String
+
+--- query
+query smallest_artifact_is_50() {
+    match {
+        $n: Actor
+        min($m.size) {
+            $m artifactOwnedByActor $n
+        } = 50
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"large"}
+--- expect shape
+n.slug: String
+
+--- query
+query integer_inputs_have_a_fractional_average() {
+    match {
+        $n: Actor
+        avg($m.size) {
+            $m artifactOwnedByActor $n
+        } = 15.5
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"small"}
+--- expect shape
+n.slug: String
+
+--- query
+query no_match_has_no_aggregate() {
+    match {
+        $n: Actor
+        sum($m.size) {
+            $m artifactOwnedByActor $n
+        } >= 0
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"small"}
+{"n.slug":"large"}
+--- expect shape
+n.slug: String
+
+--- query
+query newest_artifact_after_a_date($since: Date) {
+    match {
+        $n: Actor
+        max($m.created) {
+            $m artifactOwnedByActor $n
+        } > $since
+    }
+    return { $n.slug }
+}
+--- params
+{"since": "2025-01-01"}
+--- expect unordered
+{"n.slug":"large"}
+--- expect shape
+n.slug: String
+
+--- query
+query oldest_artifact_before_a_date_literal() {
+    match {
+        $n: Actor
+        min($m.created) {
+            $m artifactOwnedByActor $n
+        } < date("2024-02-01")
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"small"}
+--- expect shape
+n.slug: String
+
+--- query
+query scan_introduced_block_binding_loads_the_argument() {
+    match {
+        $n: Actor
+        sum($a.size) {
+            $a: Artifact { published: true }
+            $a.label != $n.slug
+        } > 60
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"zero"}
+{"n.slug":"small"}
+{"n.slug":"large"}
+--- expect shape
+n.slug: String
+
+--- query
+query count_over_a_column_counts_its_values() {
+    match {
+        $n: Actor
+        count($m.label) {
+            $m artifactOwnedByActor $n
+        } > 1
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"large"}
+--- expect shape
+n.slug: String
+
+--- query
+query null_bound_satisfies_nothing($s: String?) {
+    match {
+        $n: Actor
+        max($m.label) {
+            $m artifactOwnedByActor $n
+        } != $s
+    }
+    return { $n.slug }
+}
+--- params
+{"s": null}
+--- expect unordered
+--- expect shape
+n.slug: String
+
+--- query
+query unsigned_above_the_signed_range_is_kept() {
+    match {
+        $n: Actor
+        max($m.big) {
+            $m artifactOwnedByActor $n
+        } > 0
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"large"}
+--- expect shape
+n.slug: String
+
+--- query
+query largest_label() {
+    match {
+        $n: Actor
+        max($m.label) {
+            $m artifactOwnedByActor $n
+        } = "d"
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"large"}
+--- expect shape
+n.slug: String
+
+--- query
+query sum_over_a_string_is_refused() {
+    match {
+        $n: Actor
+        sum($m.label) {
+            $m artifactOwnedByActor $n
+        } > 1
+    }
+    return { $n.slug }
+}
+--- expect error: T8: sum requires numeric type, got String
+
+--- query
+query date_aggregate_against_a_number_is_refused() {
+    match {
+        $n: Actor
+        max($m.created) {
+            $m artifactOwnedByActor $n
+        } > 2024
+    }
+    return { $n.slug }
+}
+--- expect error: T40: cannot compare max over a block (Date) with I64
+
+--- query
+query count_null_values_and_empty_input_are_zero() {
+    match {
+        $n: Actor
+        count($m.big) {
+            $m artifactOwnedByActor $n
+        } = 0
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"zero"}
+{"n.slug":"small"}
+--- expect shape
+n.slug: String
+
+--- query
+query float_average_skips_null_values($mean: F64) {
+    match {
+        $n: Actor
+        avg($m.score) {
+            $m artifactOwnedByActor $n
+        } = $mean
+    }
+    return { $n.slug }
+}
+--- params
+{"mean": -2.5}
+--- expect unordered
+{"n.slug":"small"}
+--- expect shape
+n.slug: String
+
+--- query
+query largest_boolean() {
+    match {
+        $n: Actor
+        max($m.published) {
+            $m artifactOwnedByActor $n
+        } = true
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"large"}
+--- expect shape
+n.slug: String

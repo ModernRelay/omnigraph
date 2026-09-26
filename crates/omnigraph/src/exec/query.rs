@@ -1,13 +1,17 @@
 use super::*;
 
 use super::projection::{
-    apply_filter, apply_ordering, project_return, projections_have_aggregates,
+    apply_filter, apply_ordering, evaluate_expr, project_return, projections_have_aggregates,
 };
+use crate::engine::{SubqueryAggregate, absorb_inner_batches};
+use omnigraph_compiler::ir::SubqueryPredicate;
 
 use crate::instrumentation::{
     RrfGateFallback, RrfGatePlan, RrfGateVerdict, record_ann_prefilter_verdict,
     record_rrf_gate_verdict,
 };
+use crate::session::Session;
+use omnigraph_compiler::settings::{RrfPlan, SessionSettings, Traversal};
 
 /// Bundles the per-handle embedding client cell with the optional injected
 /// config (RFC-012 Phase 5) so the lazy init uses the injected config when
@@ -33,147 +37,8 @@ impl EmbeddingResolver<'_> {
     }
 }
 
-impl Omnigraph {
-    /// Run a named query against an explicit branch or snapshot target.
-    pub async fn query(
-        &self,
-        target: impl Into<ReadTarget>,
-        query_source: &str,
-        query_name: &str,
-        params: &ParamMap,
-    ) -> Result<QueryResult> {
-        self.query_with_head(target, query_source, query_name, params)
-            .await
-            .map(|(result, _)| result)
-    }
-
-    /// [`Self::query`] additionally returning the graph head commit id of the
-    /// exact snapshot the query executed against. A fresh named branch returns
-    /// its inherited source commit even though it has no materialized
-    /// branch-owned head row yet.
-    ///
-    /// The id comes from the same pinned version as every table read — the
-    /// value a caller passes to [`Self::mutate_as_with_expected_head`] for a
-    /// read-then-write compare-and-swap.
-    pub async fn query_with_head(
-        &self,
-        target: impl Into<ReadTarget>,
-        query_source: &str,
-        query_name: &str,
-        params: &ParamMap,
-    ) -> Result<(QueryResult, Option<String>)> {
-        // Capture the manifest snapshot and immutable catalog under the same
-        // schema-publication gate. SchemaApply publishes its fixed manifest
-        // outcome before promoting files/ArcSwap; without this gate a query on
-        // the applying handle could pair that new snapshot with the old catalog.
-        let (resolved, catalog) = self.capture_read_view(target).await?;
-
-        let ir = self.compile_named_query(&catalog, query_source, query_name)?;
-
-        let needs_graph = ir
-            .pipeline
-            .iter()
-            .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
-        // Lazy: an index-served query with no AntiJoin never builds the CSR.
-        let graph_index = if needs_graph {
-            GraphIndexHandle::cached(
-                self,
-                &resolved,
-                referenced_edge_types(&ir.pipeline, &catalog),
-                catalog.system_columns,
-            )
-        } else {
-            GraphIndexHandle::none()
-        };
-
-        let head = resolved.graph_commit_id.clone();
-        let result = execute_query(
-            &ir,
-            params,
-            &resolved.snapshot,
-            &graph_index,
-            &catalog,
-            &EmbeddingResolver {
-                cell: self.embedding_cell(),
-                config: self.embedding_config_ref(),
-            },
-        )
-        .await?;
-        Ok((result, head))
-    }
-
-    /// Run a named query against the graph as it existed at a prior graph-manifest version.
-    ///
-    /// Compiles the query normally, builds a temporary (non-cached) graph index
-    /// if traversal is needed, and executes against the historical snapshot.
-    pub async fn run_query_at(
-        &self,
-        version: u64,
-        query_source: &str,
-        query_name: &str,
-        params: &ParamMap,
-    ) -> Result<QueryResult> {
-        // Historical resolution still uses the current accepted catalog, so
-        // capture both sides of that view under schema publication just like a
-        // live-target query.
-        let (snapshot, catalog) = self.capture_historical_read_view(version).await?;
-
-        let ir = self.compile_named_query(&catalog, query_source, query_name)?;
-
-        let needs_graph = ir
-            .pipeline
-            .iter()
-            .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
-        // Lazy build against this historical snapshot (not the RuntimeCache,
-        // which is keyed to live branch targets); only a CSR-path Expand or an
-        // AntiJoin triggers it. Scoped to the edges this query traverses.
-        let graph_index = if needs_graph {
-            GraphIndexHandle::direct(
-                &snapshot,
-                referenced_edge_types(&ir.pipeline, &catalog),
-                catalog.system_columns,
-            )
-        } else {
-            GraphIndexHandle::none()
-        };
-
-        execute_query(
-            &ir,
-            params,
-            &snapshot,
-            &graph_index,
-            &catalog,
-            &EmbeddingResolver {
-                cell: self.embedding_cell(),
-                config: self.embedding_config_ref(),
-            },
-        )
-        .await
-    }
-
-    /// Compile `query_name` from `query_source` against `catalog`, cached in
-    /// `ReadCaches::compiled_queries`; errors are never cached. INPUT CONTRACT:
-    /// a hit needs the memoized `Arc` from `build_accepted_catalog_with_schema_gate_held`.
-    fn compile_named_query(
-        &self,
-        catalog: &Arc<Catalog>,
-        query_source: &str,
-        query_name: &str,
-    ) -> Result<Arc<QueryIR>> {
-        let cache = &self.read_caches().compiled_queries;
-        let key = crate::runtime_cache::CompiledQueryCache::key_for(query_source, query_name);
-        if let Some(ir) = cache.get(catalog, &key) {
-            return Ok(ir);
-        }
-        let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
-            .map_err(|e| OmniError::manifest(e.to_string()))?;
-        let type_ctx = typecheck_query(catalog, &query_decl)?;
-        let ir = Arc::new(lower_query(catalog, &query_decl, &type_ctx)?);
-        crate::instrumentation::record_query_compile();
-        cache.insert(catalog, key, Arc::clone(&ir));
-        Ok(ir)
-    }
-}
+#[path = "query_doors.rs"]
+mod doors;
 
 // ─── Search mode ─────────────────────────────────────────────────────────────
 
@@ -369,6 +234,7 @@ async fn extract_search_mode(
     params: &ParamMap,
     catalog: &Catalog,
     embedding: &EmbeddingResolver<'_>,
+    settings: &SessionSettings,
 ) -> Result<SearchMode> {
     if ir.order_by.is_empty() {
         return Ok(SearchMode::default());
@@ -390,7 +256,7 @@ async fn extract_search_mode(
             .unwrap_or(usize::MAX);
             Ok(SearchMode {
                 nearest: Some((variable.clone(), property.clone(), vec, k)),
-                ann_probe_budget: ann_nprobes(),
+                ann_probe_budget: settings.ann_nprobes(),
                 ..Default::default()
             })
         }
@@ -431,9 +297,10 @@ async fn extract_search_mode(
                 .unwrap_or(60);
 
             let primary_mode =
-                extract_sub_search_mode(ir, primary, params, catalog, embedding).await?;
+                extract_sub_search_mode(ir, primary, params, catalog, embedding, settings).await?;
             let secondary_mode =
-                extract_sub_search_mode(ir, secondary, params, catalog, embedding).await?;
+                extract_sub_search_mode(ir, secondary, params, catalog, embedding, settings)
+                    .await?;
 
             Ok(SearchMode {
                 rrf: Some(RrfMode {
@@ -456,6 +323,7 @@ async fn extract_sub_search_mode(
     params: &ParamMap,
     catalog: &Catalog,
     embedding: &EmbeddingResolver<'_>,
+    settings: &SessionSettings,
 ) -> Result<SearchMode> {
     match expr {
         IRExpr::Nearest {
@@ -473,7 +341,7 @@ async fn extract_sub_search_mode(
                 .unwrap_or(100);
             Ok(SearchMode {
                 nearest: Some((variable.clone(), property.clone(), vec, k)),
-                ann_probe_budget: ann_nprobes(),
+                ann_probe_budget: settings.ann_nprobes(),
                 ..Default::default()
             })
         }
@@ -690,7 +558,8 @@ pub(super) fn check_param_date_literals(
     Ok(())
 }
 
-/// Execute a lowered QueryIR. Pure function — no state, no caches.
+/// Execute a lowered QueryIR. Pure function: no state, no caches; the
+/// traversal path, the rrf plan and the probe cap come from `settings`.
 pub async fn execute_query(
     ir: &QueryIR,
     params: &ParamMap,
@@ -698,6 +567,7 @@ pub async fn execute_query(
     graph_index: &GraphIndexHandle<'_>,
     catalog: &Catalog,
     embedding: &EmbeddingResolver<'_>,
+    settings: &SessionSettings,
 ) -> Result<QueryResult> {
     check_param_date_literals(params, &ir.params)?;
     let mut resolved_params = None;
@@ -717,7 +587,7 @@ pub async fn execute_query(
     }
     let params = resolved_params.as_ref().unwrap_or(params);
 
-    let search_mode = extract_search_mode(ir, params, catalog, embedding).await?;
+    let search_mode = extract_search_mode(ir, params, catalog, embedding, settings).await?;
 
     // Every large future awaited here is boxed: this function's state is
     // inline in its callers' (a `block_on` body in tests puts it on the 2 MiB
@@ -730,6 +600,7 @@ pub async fn execute_query(
             graph_index,
             catalog,
             rrf,
+            settings,
         ))
         .await;
     }
@@ -745,6 +616,7 @@ pub async fn execute_query(
             graph_index,
             catalog,
             &search_mode,
+            settings.rrf_plan(),
         ))
         .await
         {
@@ -769,6 +641,7 @@ pub async fn execute_query(
         graph_index,
         catalog,
         &search_mode,
+        settings,
     ))
     .await?;
 
@@ -798,6 +671,7 @@ pub async fn execute_query(
             graph_index,
             catalog,
             &uncapped,
+            settings,
         ))
         .await?;
         return Ok(QueryResult::new(retried.schema(), vec![retried]));
@@ -859,6 +733,7 @@ pub async fn execute_query(
                     graph_index,
                     catalog,
                     &wider,
+                    settings,
                 ))
                 .await?;
                 result_batch = retried;
@@ -898,6 +773,7 @@ async fn execute_query_once(
     graph_index: &GraphIndexHandle<'_>,
     catalog: &Catalog,
     search_mode: &SearchMode,
+    settings: &SessionSettings,
 ) -> Result<(RecordBatch, ScanReport)> {
     let has_aggregates = projections_have_aggregates(&ir.return_exprs);
 
@@ -929,6 +805,7 @@ async fn execute_query_once(
         &mut scan_report,
         final_expand_cap,
         &needed_columns,
+        settings,
     )
     .await?;
     let wide_batch = wide.unwrap_or_else(|| RecordBatch::new_empty(Arc::new(Schema::empty())));
@@ -1085,38 +962,6 @@ fn rrf_gate_max_ids() -> usize {
         .unwrap_or(DEFAULT_RRF_GATE_MAX_IDS)
 }
 
-/// The rrf gate's force hook. `OMNIGRAPH_RRF_PLAN` ∈ {auto (default),
-/// force_prefilter, force_postfilter}; the scoped test seam
-/// (`instrumentation::with_rrf_plan`) takes precedence over the
-/// process-global env var, mirroring `traversal_indexed_override`. A force
-/// overrides only the gate's THRESHOLD decision, never a correctness fence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RrfPlanForce {
-    Auto,
-    Prefilter,
-    Postfilter,
-}
-
-fn rrf_plan_force() -> RrfPlanForce {
-    let mode = crate::instrumentation::rrf_plan_override()
-        .map(str::to_string)
-        .or_else(|| std::env::var("OMNIGRAPH_RRF_PLAN").ok());
-    match mode.as_deref() {
-        Some("force_prefilter") => RrfPlanForce::Prefilter,
-        Some("force_postfilter") => RrfPlanForce::Postfilter,
-        // A diagnosis knob must not fail silent while someone is diagnosing:
-        // an unrecognized value runs auto, loudly.
-        Some(other) if !other.is_empty() && other != "auto" => {
-            tracing::warn!(
-                value = other,
-                "unrecognized OMNIGRAPH_RRF_PLAN value; running auto"
-            );
-            RrfPlanForce::Auto
-        }
-        _ => RrfPlanForce::Auto,
-    }
-}
-
 /// Top-level Expand ops whose `src_var` is the ranked variable — the
 /// admission table's eligibility sources, as (edge_type, direction) pairs.
 /// `None` is the shape fall-back: the ranked variable is some Expand's dst
@@ -1208,6 +1053,7 @@ async fn rrf_prefilter_gate(
     graph_index: &GraphIndexHandle<'_>,
     catalog: &Catalog,
     rrf: &RrfMode,
+    rrf_plan: RrfPlan,
 ) -> Option<EligibleIds> {
     let fall_back =
         |fallback: RrfGateFallback, forced: bool, eligible: Option<u64>, corpus: Option<u64>| {
@@ -1229,12 +1075,11 @@ async fn rrf_prefilter_gate(
             });
         };
 
-    let force = rrf_plan_force();
-    if force == RrfPlanForce::Postfilter {
+    if rrf_plan == RrfPlan::ForcePostfilter {
         fall_back(RrfGateFallback::Forced, true, None, None);
         return None;
     }
-    let forced = force == RrfPlanForce::Prefilter;
+    let forced = rrf_plan == RrfPlan::ForcePrefilter;
 
     // Both arms must target one ranked variable, and at least one arm must
     // be bm25 — a nearest-only fusion has nothing the gate may prefilter.
@@ -1469,12 +1314,12 @@ async fn nearest_prefilter_gate(
     graph_index: &GraphIndexHandle<'_>,
     catalog: &Catalog,
     mode: &SearchMode,
+    rrf_plan: RrfPlan,
 ) -> NearestGatePlan {
     let Some((ranked_var, ..)) = mode.nearest.as_ref() else {
         return NearestGatePlan::Postfilter;
     };
-    let force = rrf_plan_force();
-    let forced = force != RrfPlanForce::Auto;
+    let forced = rrf_plan != RrfPlan::Auto;
     let fall_back = |fallback: RrfGateFallback, eligible: Option<u64>, corpus: Option<u64>| {
         tracing::debug!(
             ?fallback,
@@ -1489,7 +1334,7 @@ async fn nearest_prefilter_gate(
             corpus,
         });
     };
-    if force == RrfPlanForce::Postfilter {
+    if rrf_plan == RrfPlan::ForcePostfilter {
         fall_back(RrfGateFallback::Forced, None, None);
         return NearestGatePlan::Postfilter;
     }
@@ -1576,6 +1421,7 @@ async fn execute_rrf_fusion(
     graph_index: &GraphIndexHandle<'_>,
     catalog: &Catalog,
     rrf: &RrfMode,
+    settings: &SessionSettings,
 ) -> Result<QueryResult> {
     debug_assert!(
         rrf.primary.bm25_scan_limit.is_none() && rrf.secondary.bm25_scan_limit.is_none(),
@@ -1592,7 +1438,8 @@ async fn execute_rrf_fusion(
     // `execute_node_scan` applies its filters unconditionally and has no arm
     // identity of its own. (The both-legs symmetry `fail_open_rrf_leg_targets`
     // enforces for COLUMNS deliberately does not extend to rows.)
-    let eligible = rrf_prefilter_gate(ir, snapshot, graph_index, catalog, rrf).await;
+    let eligible =
+        rrf_prefilter_gate(ir, snapshot, graph_index, catalog, rrf, settings.rrf_plan()).await;
     let gated = eligible.as_ref().map(|ids| {
         (
             arm_with_bm25_prefilter(&rrf.primary, ids),
@@ -1616,6 +1463,7 @@ async fn execute_rrf_fusion(
         &mut ScanReport::default(),
         None,
         &needed_columns,
+        settings,
     )
     .await?;
 
@@ -1631,6 +1479,7 @@ async fn execute_rrf_fusion(
         &mut ScanReport::default(),
         None,
         &needed_columns,
+        settings,
     )
     .await?;
 
@@ -1810,17 +1659,27 @@ fn build_fused_batch(
     arrow_select::concat::concat_batches(&schema, &row_slices).map_err(OmniError::arrow_internal)
 }
 
+/// The operands of a comparison-rooted filter; v1 evaluates comparisons only, and the
+/// query door refuses every other shape before a plan reaches this executor.
+fn comparison_parts_v1(filter: &IRExpr) -> (&IRExpr, CompOp, &IRExpr) {
+    filter
+        .comparison_parts()
+        .unwrap_or_else(|| panic!("engine v1 evaluates comparison filters only, got `{filter}`"))
+}
+
 /// Check if a filter is a text search filter that needs Lance SQL pushdown.
-fn is_search_filter(filter: &IRFilter) -> bool {
+fn is_search_filter(filter: &IRExpr) -> bool {
+    let (left, _, _) = comparison_parts_v1(filter);
     matches!(
-        &filter.left,
+        left,
         IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. }
     )
 }
 
 /// Extract the variable name from a search filter's field expression.
-fn search_filter_variable(filter: &IRFilter) -> Option<&str> {
-    let field = match &filter.left {
+fn search_filter_variable(filter: &IRExpr) -> Option<&str> {
+    let (left, _, _) = comparison_parts_v1(filter);
+    let field = match left {
         IRExpr::Search { field, .. } => field,
         IRExpr::Fuzzy { field, .. } => field,
         IRExpr::MatchText { field, .. } => field,
@@ -1876,7 +1735,12 @@ fn collect_expr_variables(expr: &IRExpr, vars: &mut HashSet<String>) {
             vars.insert(v.clone());
         }
         IRExpr::Aggregate { arg, .. } => collect_expr_variables(arg, vars),
-        IRExpr::Param(_) | IRExpr::Literal(_) | IRExpr::AliasRef(_) => {}
+        IRExpr::Param(_)
+        | IRExpr::Literal(_)
+        | IRExpr::AliasRef(_)
+        | IRExpr::Binary { .. }
+        | IRExpr::Not(_)
+        | IRExpr::IsNull { .. } => {}
     }
 }
 
@@ -1886,10 +1750,11 @@ fn collect_expr_variables(expr: &IRExpr, vars: &mut HashSet<String>) {
 /// equality, range, …) is hoisted onto the op that introduces that binding,
 /// where Lance can probe a covering index; a cross-variable filter references
 /// two bindings and stays in the in-memory arm on the joined batch.
-fn filter_variables(filter: &IRFilter) -> HashSet<String> {
+fn filter_variables(filter: &IRExpr) -> HashSet<String> {
+    let (left, _, right) = comparison_parts_v1(filter);
     let mut vars = HashSet::new();
-    collect_expr_variables(&filter.left, &mut vars);
-    collect_expr_variables(&filter.right, &mut vars);
+    collect_expr_variables(left, &mut vars);
+    collect_expr_variables(right, &mut vars);
     vars
 }
 
@@ -2007,13 +1872,20 @@ fn collect_pipeline_columns(pipeline: &[IROp], needed: &mut HashMap<String, Need
             IROp::AntiJoin {
                 outer_var: _,
                 inner,
-            } => collect_pipeline_columns(inner, needed),
+                predicate,
+            } => {
+                collect_pipeline_columns(inner, needed);
+                if let Some(arg) = &predicate.arg {
+                    collect_expr_columns(arg, needed);
+                }
+                collect_expr_columns(&predicate.right, needed);
+            }
         }
     }
 }
 
-fn collect_filter_columns(filter: &IRFilter, needed: &mut HashMap<String, NeededColumns>) {
-    let IRFilter { left, op: _, right } = filter;
+fn collect_filter_columns(filter: &IRExpr, needed: &mut HashMap<String, NeededColumns>) {
+    let (left, _, right) = comparison_parts_v1(filter);
     collect_expr_columns(left, needed);
     collect_expr_columns(right, needed);
 }
@@ -2076,7 +1948,12 @@ fn collect_expr_columns(expr: &IRExpr, needed: &mut HashMap<String, NeededColumn
         IRExpr::Aggregate { func: _, arg } => collect_expr_columns(arg, needed),
         // AliasRef resolves to another RETURN item, whose expression this
         // walk already visits directly; Param/Literal carry no columns.
-        IRExpr::AliasRef(_) | IRExpr::Param(_) | IRExpr::Literal(_) => {}
+        IRExpr::AliasRef(_)
+        | IRExpr::Param(_)
+        | IRExpr::Literal(_)
+        | IRExpr::Binary { .. }
+        | IRExpr::Not(_)
+        | IRExpr::IsNull { .. } => {}
     }
 }
 
@@ -2117,6 +1994,7 @@ fn execute_pipeline<'a>(
     // always pass `None`.
     final_expand_cap: Option<usize>,
     needed_columns: &'a HashMap<String, NeededColumns>,
+    settings: &'a SessionSettings,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         // Pre-pass: hoist filters onto the op that introduces their binding.
@@ -2146,9 +2024,9 @@ fn execute_pipeline<'a>(
             }
         }
 
-        let mut hoisted_search_filters: HashMap<String, Vec<IRFilter>> = HashMap::new();
-        let mut hoisted_scan_filters: HashMap<String, Vec<IRFilter>> = HashMap::new();
-        let mut hoisted_dst_filters: HashMap<String, Vec<IRFilter>> = HashMap::new();
+        let mut hoisted_search_filters: HashMap<String, Vec<IRExpr>> = HashMap::new();
+        let mut hoisted_scan_filters: HashMap<String, Vec<IRExpr>> = HashMap::new();
+        let mut hoisted_dst_filters: HashMap<String, Vec<IRExpr>> = HashMap::new();
         let mut hoisted_indices: HashSet<usize> = HashSet::new();
         for (i, op) in pipeline.iter().enumerate() {
             let IROp::Filter(filter) = op else { continue };
@@ -2205,7 +2083,7 @@ fn execute_pipeline<'a>(
                     filters,
                 } => {
                     // Merge inline filters with hoisted search + scalar filters
-                    let mut all_filters: Vec<IRFilter> = filters.clone();
+                    let mut all_filters: Vec<IRExpr> = filters.clone();
                     if let Some(extra) = hoisted_search_filters.get(variable) {
                         all_filters.extend(extra.iter().cloned());
                     }
@@ -2247,7 +2125,7 @@ fn execute_pipeline<'a>(
                     edge_binding,
                 } => {
                     // Merge lowered destination filters with hoisted ones
-                    let mut all_dst_filters: Vec<IRFilter> = dst_filters.clone();
+                    let mut all_dst_filters: Vec<IRExpr> = dst_filters.clone();
                     if let Some(extra) = hoisted_dst_filters.get(dst_var) {
                         all_dst_filters.extend(extra.iter().cloned());
                     }
@@ -2283,22 +2161,29 @@ fn execute_pipeline<'a>(
                             edge_binding.as_deref(),
                             params,
                             emit_cap,
+                            settings.traversal(),
                         )
                         .await?;
                     }
                 }
-                IROp::AntiJoin { outer_var, inner } => {
+                IROp::AntiJoin {
+                    outer_var,
+                    inner,
+                    predicate,
+                } => {
                     let gi = graph_index;
                     if let Some(batch) = wide.as_mut() {
                         execute_anti_join(
                             batch,
                             inner,
+                            predicate,
                             params,
                             snapshot,
                             gi,
                             catalog,
                             outer_var,
                             needed_columns,
+                            settings,
                         )
                         .await?;
                     }
@@ -2443,27 +2328,6 @@ impl<'a> GraphIndexHandle<'a> {
     }
 }
 
-/// Explicit traversal-mode override. `OMNIGRAPH_TRAVERSAL_MODE=indexed|csr`
-/// forces the path (ops escape hatch + test hook). Both modes are semantically
-/// identical, so the override only changes which path runs, never the result.
-fn traversal_indexed_override() -> Option<bool> {
-    // The scoped test seam (`with_traversal_mode`) takes precedence over the
-    // process-global `OMNIGRAPH_TRAVERSAL_MODE` ops escape hatch.
-    let mode = crate::instrumentation::traversal_mode_override()
-        .map(str::to_string)
-        .or_else(|| std::env::var("OMNIGRAPH_TRAVERSAL_MODE").ok());
-    match mode.as_deref() {
-        Some("indexed") => Some(true),
-        Some("csr") => Some(false),
-        _ => None,
-    }
-}
-
-/// Guard Lance's IVF search against loading every payload partition when its
-/// centroid-distance heuristic expands the adaptive minimum. This is a
-/// maximum only: easy queries retain Lance's one-partition default.
-const DEFAULT_ANN_NPROBES: usize = 20;
-
 /// Per-rung multiplier of the probe ladder (20 → 80 → 320 → none).
 const ANN_PROBE_ESCALATION_FACTOR: usize = 4;
 
@@ -2561,32 +2425,6 @@ fn batches_hold_infinite_distance(batches: &[RecordBatch]) -> bool {
             .and_then(|column| column.as_any().downcast_ref::<Float32Array>())
             .is_some_and(|distances| distances.iter().flatten().any(f32::is_infinite))
     })
-}
-
-/// `OMNIGRAPH_ANN_NPROBES`, the per-delta probe cap a nearest scan starts
-/// at: unset or empty is `DEFAULT_ANN_NPROBES`; `0` is no cap; anything
-/// else that is not a positive integer runs the default, loudly.
-fn ann_nprobes_from(value: Option<&str>) -> Option<usize> {
-    match value.map(str::trim) {
-        None | Some("") => Some(DEFAULT_ANN_NPROBES),
-        Some(other) => match other.parse::<usize>() {
-            Ok(0) => None,
-            Ok(maximum) => Some(maximum),
-            Err(_) => {
-                tracing::warn!(
-                    value = other,
-                    default = DEFAULT_ANN_NPROBES,
-                    "invalid OMNIGRAPH_ANN_NPROBES value (not a non-negative integer); using the default maximum"
-                );
-                Some(DEFAULT_ANN_NPROBES)
-            }
-        },
-    }
-}
-
-fn ann_nprobes() -> Option<usize> {
-    let value = std::env::var("OMNIGRAPH_ANN_NPROBES").ok();
-    ann_nprobes_from(value.as_deref())
 }
 
 /// Max source-row frontier for which Expand uses the BTREE-indexed path.
@@ -2938,10 +2776,11 @@ async fn execute_expand(
     dst_type: &str,
     min_hops: u32,
     max_hops: Option<u32>,
-    dst_filters: &[IRFilter],
+    dst_filters: &[IRExpr],
     edge_binding: Option<&str>,
     params: &ParamMap,
     emit_cap: Option<usize>,
+    traversal: Traversal,
 ) -> Result<()> {
     if let Some(cap) = emit_cap {
         // RecordBatch clones are Arc'd column handles — cheap insurance for
@@ -2963,6 +2802,7 @@ async fn execute_expand(
             edge_binding,
             params,
             Some(cap),
+            traversal,
         )
         .await?;
         // The cap is only legal when there are no `dst_filters`, so an
@@ -2996,6 +2836,7 @@ async fn execute_expand(
                 edge_binding,
                 params,
                 None,
+                traversal,
             )
             .await?;
         }
@@ -3017,6 +2858,7 @@ async fn execute_expand(
         edge_binding,
         params,
         None,
+        traversal,
     )
     .await
     .map(|_| ())
@@ -3038,10 +2880,11 @@ async fn execute_expand_dispatch(
     dst_type: &str,
     min_hops: u32,
     max_hops: Option<u32>,
-    dst_filters: &[IRFilter],
+    dst_filters: &[IRExpr],
     edge_binding: Option<&str>,
     params: &ParamMap,
     emit_cap: Option<usize>,
+    traversal: Traversal,
 ) -> Result<bool> {
     let frontier_rows = wide.num_rows();
     let effective_max_hops = max_hops.unwrap_or(min_hops.max(1));
@@ -3072,12 +2915,16 @@ async fn execute_expand_dispatch(
         return Ok(false);
     }
 
-    // Cardinality-first preliminary decision (no IO). The override wins; else the
-    // cost model decides under *optimistic* coverage. Optimistic is what lets us
-    // skip the dataset open on a clearly-CSR traversal: real coverage can only
-    // make the indexed path costlier, so if even a perfectly-indexed scan loses
-    // to CSR here, it loses for real.
-    let forced = traversal_indexed_override();
+    // Cardinality-first preliminary decision (no IO). A pinned traversal wins;
+    // else the cost model decides under *optimistic* coverage. Optimistic is
+    // what lets us skip the dataset open on a clearly-CSR traversal: real
+    // coverage can only make the indexed path costlier, so if even a
+    // perfectly-indexed scan loses to CSR here, it loses for real.
+    let forced = match traversal {
+        Traversal::Indexed => Some(true),
+        Traversal::Csr => Some(false),
+        Traversal::Auto => None,
+    };
     let lean_indexed = match forced {
         Some(v) => v,
         None => match gather_cost_inputs(
@@ -3278,7 +3125,7 @@ async fn execute_expand_bound(
     edge_type: &str,
     direction: Direction,
     dst_type: &str,
-    dst_filters: &[IRFilter],
+    dst_filters: &[IRExpr],
     edge_binding: &str,
     params: &ParamMap,
     edge_ds: Dataset,
@@ -3586,7 +3433,7 @@ async fn execute_expand_bfs(
     dst_type: &str,
     min_hops: u32,
     max_hops: Option<u32>,
-    dst_filters: &[IRFilter],
+    dst_filters: &[IRExpr],
     params: &ParamMap,
     start_indexed: Option<Dataset>,
     hop_policy: HopPolicy,
@@ -3896,7 +3743,7 @@ async fn expand_hydrate_and_align(
     catalog: &Catalog,
     dst_type: &str,
     dst_var: &str,
-    dst_filters: &[IRFilter],
+    dst_filters: &[IRExpr],
     params: &ParamMap,
     edge_attach: Option<(String, RecordBatch)>,
 ) -> Result<()> {
@@ -3904,7 +3751,7 @@ async fn expand_hydrate_and_align(
     // (`ir_filter_to_expr` → None) are applied in memory after hconcat. The
     // schema arg only affects a pushable literal's TYPE, never Some-vs-None, so
     // `None` here yields the same pushable/non-pushable split as `hydrate_nodes`.
-    let non_pushable: Vec<&IRFilter> = dst_filters
+    let non_pushable: Vec<&IRExpr> = dst_filters
         .iter()
         .filter(|f| ir_filter_to_expr(f, params, None).is_none())
         .collect();
@@ -4014,7 +3861,7 @@ async fn hydrate_nodes(
     catalog: &Catalog,
     type_name: &str,
     ids: &[String],
-    dst_filters: &[IRFilter],
+    dst_filters: &[IRExpr],
     params: &ParamMap,
 ) -> Result<RecordBatch> {
     let node_type = catalog
@@ -4085,7 +3932,7 @@ async fn hydrate_nodes(
 fn bulk_anti_join_applies(inner_pipeline: &[IROp], outer_var: &str) -> bool {
     matches!(
         inner_pipeline,
-        [IROp::Expand { src_var, dst_filters, min_hops, max_hops, .. }]
+        [IROp::Expand { src_var, dst_filters, min_hops, max_hops, edge_binding: None, .. }]
             if src_var == outer_var
                 && dst_filters.is_empty()
                 // `has_neighbors` is a ONE-hop existence test, so the fast path
@@ -4161,28 +4008,34 @@ fn try_bulk_anti_join_mask(
     Some(BooleanArray::from(keep_mask))
 }
 
-/// Execute an AntiJoin: remove rows from wide batch where the inner pipeline finds matches.
+/// Execute a correlated block: keep the wide batch's rows whose aggregate
+/// over the inner pipeline's matches satisfies `predicate`.
 async fn execute_anti_join(
     wide: &mut RecordBatch,
     inner_pipeline: &[IROp],
+    predicate: &SubqueryPredicate,
     params: &ParamMap,
     snapshot: &Snapshot,
     graph_index: &GraphIndexHandle<'_>,
     catalog: &Catalog,
     outer_var: &str,
     needed_columns: &HashMap<String, NeededColumns>,
+    settings: &SessionSettings,
 ) -> Result<()> {
     // Only the bulk fast path consumes the CSR; the slow path's inner Expand
     // chooses its own access path. Realize the O(|E|) graph index ONLY when the
     // inner-pipeline shape qualifies for the bulk check — a filtered/nested
     // anti-join over a large graph must not pay a whole-graph build it won't use.
-    let gi = if bulk_anti_join_applies(inner_pipeline, outer_var) {
+    let bulk_shape = predicate.is_not_exists() && bulk_anti_join_applies(inner_pipeline, outer_var);
+    let gi = if bulk_shape {
         graph_index.get().await?
     } else {
         None
     };
     // Fast path: bulk CSR existence check (O(N), zero Lance I/O)
-    if let Some(mask) = try_bulk_anti_join_mask(wide, inner_pipeline, gi, catalog, outer_var) {
+    if bulk_shape
+        && let Some(mask) = try_bulk_anti_join_mask(wide, inner_pipeline, gi, catalog, outer_var)
+    {
         *wide = arrow_select::filter::filter_record_batch(wide, &mask)
             .map_err(OmniError::arrow_internal)?;
         return Ok(());
@@ -4243,37 +4096,20 @@ async fn execute_anti_join(
         &mut ScanReport::default(),
         None,
         needed_columns,
+        settings,
     )
     .await?;
 
-    // Outer rows whose tag survived have >= 1 match. A produced-but-untagged
-    // batch means the inner pipeline dropped the correlation column — fail loudly
-    // rather than silently keeping every row (which would corrupt the anti-join).
-    let mut matched: HashSet<u32> = HashSet::new();
-    if let Some(batch) = inner_wide {
-        if batch.num_rows() > 0 {
-            let tags = batch
-                .column_by_name(tag_col.as_str())
-                .ok_or_else(|| {
-                    OmniError::manifest(
-                        "anti-join inner pipeline dropped the correlation column".to_string(),
-                    )
-                })?
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| {
-                    OmniError::manifest(format!("'{}' column is not UInt32", tag_col))
-                })?;
-            for i in 0..tags.len() {
-                matched.insert(tags.value(i));
-            }
-        }
-    }
-
-    let keep_mask: Vec<bool> = (0..num_rows as u32)
-        .map(|i| !matched.contains(&i))
-        .collect();
-    let mask = BooleanArray::from(keep_mask);
+    let mut aggregate = SubqueryAggregate::new(predicate, params, num_rows)?;
+    let inner_batches: Vec<RecordBatch> = inner_wide.into_iter().collect();
+    absorb_inner_batches(
+        &mut aggregate,
+        &inner_batches,
+        tag_col.as_str(),
+        predicate.arg.as_ref(),
+        &|batch, arg| evaluate_expr(batch, arg, params),
+    )?;
+    let mask = aggregate.keep_mask()?;
     *wide = arrow_select::filter::filter_record_batch(wide, &mask)
         .map_err(OmniError::arrow_internal)?;
     Ok(())
@@ -4283,7 +4119,7 @@ async fn execute_anti_join(
 async fn execute_node_scan(
     type_name: &str,
     variable: &str,
-    filters: &[IRFilter],
+    filters: &[IRExpr],
     params: &ParamMap,
     snapshot: &Snapshot,
     catalog: &Catalog,
@@ -4338,7 +4174,7 @@ async fn execute_node_scan(
     let hoisted_fts_queries: Vec<lance_index::scalar::FullTextSearchQuery> = filters
         .iter()
         .filter(|filter| is_search_filter(filter))
-        .filter_map(|filter| build_fts_query(&filter.left, params))
+        .filter_map(|filter| build_fts_query(comparison_parts_v1(filter).0, params))
         .collect();
     let scores_fts = search_mode
         .bm25
@@ -4766,6 +4602,9 @@ fn resolve_to_int(expr: &IRExpr, params: &ParamMap) -> Option<i64> {
     }
 }
 
+/// v1's SQL literal renderer; its last caller, the mutation predicate, now
+/// hands Lance a typed expression, and the frozen file keeps the function.
+#[allow(dead_code)]
 pub(super) fn literal_to_sql(lit: &Literal) -> String {
     match lit {
         Literal::Null => "NULL".to_string(),
@@ -4804,7 +4643,7 @@ pub(super) fn literal_to_sql(lit: &Literal) -> String {
 /// Convert IR filters to a single DataFusion `Expr` (AND-joined), or
 /// `None` if no filter is pushable.
 pub(super) fn build_lance_filter_expr(
-    filters: &[IRFilter],
+    filters: &[IRExpr],
     params: &ParamMap,
     schema: Option<&Schema>,
 ) -> Option<datafusion::prelude::Expr> {
@@ -4835,7 +4674,7 @@ pub(super) fn build_lance_filter_expr(
 /// search-mode filters (handled via `scanner.full_text_search`) or any
 /// expression shape we can't pushdown.
 pub(super) fn ir_filter_to_expr(
-    filter: &IRFilter,
+    filter: &IRExpr,
     params: &ParamMap,
     schema: Option<&Schema>,
 ) -> Option<datafusion::prelude::Expr> {
@@ -4844,15 +4683,16 @@ pub(super) fn ir_filter_to_expr(
     if is_search_filter(filter) {
         return None;
     }
+    let (left, op, right) = comparison_parts_v1(filter);
 
     // List-contains: `prop CONTAINS value` lowers to `array_has(prop, value)`.
     // This is the case the old SQL-string pushdown had to return None for
     // ("Can't pushdown list contains"); with structured Expr it pushes down fine.
     // (Element-type coercion for the contained value is deferred — list columns
     // are not scalar-indexed, so the index-eligibility concern below does not apply.)
-    if matches!(filter.op, CompOp::Contains) {
-        let left = ir_expr_to_expr(&filter.left, params, None)?;
-        let right = ir_expr_to_expr(&filter.right, params, None)?;
+    if matches!(op, CompOp::Contains) {
+        let left = ir_expr_to_expr(left, params, None)?;
+        let right = ir_expr_to_expr(right, params, None)?;
         return Some(array_has(left, right));
     }
 
@@ -4862,11 +4702,11 @@ pub(super) fn ir_filter_to_expr(
     // LikePrefix) or an NGRAM index (`contains` → StringContains + recheck)
     // when one covers the column, and falls back to a plain filtered scan
     // when none does — correct either way.
-    if matches!(filter.op, CompOp::StartsWith | CompOp::StringContains) {
+    if matches!(op, CompOp::StartsWith | CompOp::StringContains) {
         use datafusion::functions::expr_fn::{contains, starts_with};
-        let left = ir_expr_to_expr(&filter.left, params, None)?;
-        let right = ir_expr_to_expr(&filter.right, params, None)?;
-        return Some(match filter.op {
+        let left = ir_expr_to_expr(left, params, None)?;
+        let right = ir_expr_to_expr(right, params, None)?;
+        return Some(match op {
             CompOp::StartsWith => starts_with(left, right),
             _ => contains(left, right),
         });
@@ -4876,11 +4716,11 @@ pub(super) fn ir_filter_to_expr(
     // the predicate stays a direct `col OP literal` and the scalar index is used.
     // Without this, DataFusion widens a narrow column (`CAST(col AS Int64)`),
     // which defeats the BTREE (validated by `probe_scalar_index_use_under_literal_type`).
-    let left_col_type = prop_data_type(&filter.left, schema);
-    let right_col_type = prop_data_type(&filter.right, schema);
-    let left = ir_expr_to_expr(&filter.left, params, right_col_type.as_ref())?;
-    let right = ir_expr_to_expr(&filter.right, params, left_col_type.as_ref())?;
-    Some(match filter.op {
+    let left_col_type = prop_data_type(left, schema);
+    let right_col_type = prop_data_type(right, schema);
+    let left = ir_expr_to_expr(left, params, right_col_type.as_ref())?;
+    let right = ir_expr_to_expr(right, params, left_col_type.as_ref())?;
+    Some(match op {
         CompOp::Eq => left.eq(right),
         CompOp::Ne => left.not_eq(right),
         CompOp::Gt => left.gt(right),
@@ -5100,34 +4940,7 @@ fn take_batch(batch: &RecordBatch, indices: &UInt32Array) -> Result<RecordBatch>
 
 #[cfg(test)]
 mod ann_probe_budget_tests {
-    use super::{DEFAULT_ANN_NPROBES, LadderStep, SearchMode, ann_nprobes_from, ladder_step};
-
-    #[test]
-    fn missing_value_uses_default_maximum() {
-        for value in [None, Some(""), Some("  ")] {
-            assert_eq!(ann_nprobes_from(value), Some(DEFAULT_ANN_NPROBES));
-        }
-    }
-
-    #[test]
-    fn positive_value_is_used_as_configured() {
-        assert_eq!(ann_nprobes_from(Some("7")), Some(7));
-        assert_eq!(ann_nprobes_from(Some(" 7 ")), Some(7));
-    }
-
-    #[test]
-    fn zero_means_no_cap() {
-        for value in [Some("0"), Some("00"), Some(" 0 ")] {
-            assert_eq!(ann_nprobes_from(value), None);
-        }
-    }
-
-    #[test]
-    fn invalid_values_use_default() {
-        for value in [Some("not-a-number"), Some("-5"), Some("1.5"), Some("20x")] {
-            assert_eq!(ann_nprobes_from(value), Some(DEFAULT_ANN_NPROBES));
-        }
-    }
+    use super::{LadderStep, SearchMode, ladder_step};
 
     #[test]
     fn uncapping_rows_leaves_the_probe_budget_alone() {
@@ -5616,14 +5429,14 @@ mod referenced_edge_types_tests {
         let pipeline = vec![
             node_scan("x", "ExternalID"),
             expand("identifiesPerson"),
-            IROp::Filter(IRFilter {
-                left: IRExpr::PropAccess {
+            IROp::Filter(IRExpr::comparison(
+                IRExpr::PropAccess {
                     variable: "p".into(),
                     property: "name".into(),
                 },
-                op: omnigraph_compiler::query::ast::CompOp::Eq,
-                right: IRExpr::Literal(Literal::String("a".into())),
-            }),
+                omnigraph_compiler::query::ast::CompOp::Eq,
+                IRExpr::Literal(Literal::String("a".into())),
+            )),
             expand("identifiesPerson"),
         ];
         assert_eq!(names(&pipeline), vec!["identifiesPerson".to_string()]);
@@ -5639,6 +5452,7 @@ mod referenced_edge_types_tests {
             IROp::AntiJoin {
                 outer_var: "p".into(),
                 inner: vec![expand("worksAt")],
+                predicate: SubqueryPredicate::not_exists(),
             },
         ];
         assert_eq!(
@@ -5654,7 +5468,9 @@ mod referenced_edge_types_tests {
             inner: vec![IROp::AntiJoin {
                 outer_var: "c".into(),
                 inner: vec![expand("deepEdge")],
+                predicate: SubqueryPredicate::not_exists(),
             }],
+            predicate: SubqueryPredicate::not_exists(),
         }];
         assert_eq!(names(&pipeline), vec!["deepEdge".to_string()]);
     }
@@ -5666,6 +5482,7 @@ mod referenced_edge_types_tests {
         let pipeline = vec![IROp::AntiJoin {
             outer_var: "p".into(),
             inner: vec![node_scan("c", "Company")],
+            predicate: SubqueryPredicate::not_exists(),
         }];
         assert!(names(&pipeline).is_empty());
     }
@@ -5849,11 +5666,11 @@ mod literal_lowering_tests {
     #[test]
     fn ir_filter_coerces_literal_for_range_op() {
         let schema = int32_schema();
-        let filter = IRFilter {
-            left: count_prop(),
-            op: CompOp::Ge,
-            right: IRExpr::Literal(Literal::Integer(2)),
-        };
+        let filter = IRExpr::comparison(
+            count_prop(),
+            CompOp::Ge,
+            IRExpr::Literal(Literal::Integer(2)),
+        );
         let expr = ir_filter_to_expr(&filter, &ParamMap::new(), Some(&schema)).unwrap();
         assert!(
             binary_has_int32_literal(&expr),
@@ -5866,11 +5683,11 @@ mod literal_lowering_tests {
     #[test]
     fn ir_filter_coerces_literal_when_column_is_on_the_right() {
         let schema = int32_schema();
-        let filter = IRFilter {
-            left: IRExpr::Literal(Literal::Integer(2)),
-            op: CompOp::Lt,
-            right: count_prop(),
-        };
+        let filter = IRExpr::comparison(
+            IRExpr::Literal(Literal::Integer(2)),
+            CompOp::Lt,
+            count_prop(),
+        );
         let expr = ir_filter_to_expr(&filter, &ParamMap::new(), Some(&schema)).unwrap();
         assert!(
             binary_has_int32_literal(&expr),
@@ -5896,14 +5713,14 @@ mod literal_lowering_tests {
     fn ir_filter_preserves_camelcase_column_name() {
         use arrow_schema::{DataType, Field};
         let schema = arrow_schema::Schema::new(vec![Field::new("repoName", DataType::Utf8, true)]);
-        let filter = IRFilter {
-            left: IRExpr::PropAccess {
+        let filter = IRExpr::comparison(
+            IRExpr::PropAccess {
                 variable: "d".into(),
                 property: "repoName".into(),
             },
-            op: CompOp::Eq,
-            right: IRExpr::Literal(Literal::String("acme".into())),
-        };
+            CompOp::Eq,
+            IRExpr::Literal(Literal::String("acme".into())),
+        );
         let expr = ir_filter_to_expr(&filter, &ParamMap::new(), Some(&schema)).unwrap();
         assert_eq!(
             binary_left_column_name(&expr).as_deref(),
@@ -5920,14 +5737,14 @@ mod literal_lowering_tests {
         use arrow_schema::{DataType, Field};
         let schema =
             arrow_schema::Schema::new(vec![Field::new("itemCount", DataType::Int32, true)]);
-        let filter = IRFilter {
-            left: IRExpr::PropAccess {
+        let filter = IRExpr::comparison(
+            IRExpr::PropAccess {
                 variable: "m".into(),
                 property: "itemCount".into(),
             },
-            op: CompOp::Eq,
-            right: IRExpr::Literal(Literal::Integer(2)),
-        };
+            CompOp::Eq,
+            IRExpr::Literal(Literal::Integer(2)),
+        );
         let expr = ir_filter_to_expr(&filter, &ParamMap::new(), Some(&schema)).unwrap();
         assert!(
             binary_has_int32_literal(&expr),
@@ -6007,11 +5824,11 @@ mod needed_columns_tests {
         let q = ir(
             vec![
                 scan("c"),
-                IROp::Filter(IRFilter {
-                    left: prop("c", "state"),
-                    op: CompOp::Eq,
-                    right: IRExpr::Literal(Literal::String("open".into())),
-                }),
+                IROp::Filter(IRExpr::comparison(
+                    prop("c", "state"),
+                    CompOp::Eq,
+                    IRExpr::Literal(Literal::String("open".into())),
+                )),
             ],
             vec![IRExpr::Aggregate {
                 func: AggFunc::Count,
@@ -6044,11 +5861,11 @@ mod needed_columns_tests {
         // filter compares against.
         let inner = vec![
             scan("x"),
-            IROp::Filter(IRFilter {
-                left: prop("x", "kind"),
-                op: CompOp::Eq,
-                right: prop("c", "kind_ref"),
-            }),
+            IROp::Filter(IRExpr::comparison(
+                prop("x", "kind"),
+                CompOp::Eq,
+                prop("c", "kind_ref"),
+            )),
         ];
         let q = ir(
             vec![
@@ -6056,6 +5873,7 @@ mod needed_columns_tests {
                 IROp::AntiJoin {
                     outer_var: "c".to_string(),
                     inner,
+                    predicate: SubqueryPredicate::not_exists(),
                 },
             ],
             vec![prop("c", "slug")],
@@ -6123,11 +5941,11 @@ mod needed_columns_tests {
                     dst_type: "T".to_string(),
                     min_hops: 1,
                     max_hops: Some(1),
-                    dst_filters: vec![IRFilter {
-                        left: prop("b", "state"),
-                        op: CompOp::Eq,
-                        right: IRExpr::Literal(Literal::String("open".into())),
-                    }],
+                    dst_filters: vec![IRExpr::comparison(
+                        prop("b", "state"),
+                        CompOp::Eq,
+                        IRExpr::Literal(Literal::String("open".into())),
+                    )],
                     edge_binding: None,
                 },
             ],
@@ -6192,9 +6010,12 @@ mod needed_columns_tests {
 mod column_projection_tests {
     use super::*;
     use omnigraph_compiler::SYSTEM_COLUMNS_V3;
+    use omnigraph_compiler::settings::SessionSettings;
+    use std::sync::Arc;
 
+    use crate::Session;
     use crate::db::ReadTarget;
-    use crate::loader::{LoadMode, load_jsonl};
+    use crate::loader::LoadMode;
 
     /// Embedding width. Wide enough (4 bytes/dim = 3 KiB/row) that the vector
     /// column dominates the table, without an unwieldy JSONL fixture.
@@ -6266,7 +6087,10 @@ query first_slug() {
     /// the query below reuses that same cached `Dataset`, hence the same store
     /// and the same tracker.
     async fn read_bytes(uri: &str, read: Read) -> u64 {
-        let db = Omnigraph::open(uri).await.unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::open(uri).await.unwrap()),
+            SessionSettings::default(),
+        );
         let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
         let dataset = snapshot.open_lance_dataset("node:Chunk").await.unwrap();
         let store = dataset.object_store(None).await.unwrap();
@@ -6332,8 +6156,11 @@ query first_slug() {
     async fn slug_projection_does_not_read_vector_column_issue_564() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
-        load_jsonl(&db, &seed_data(), LoadMode::Overwrite)
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, SCHEMA).await.unwrap()),
+            SessionSettings::default(),
+        );
+        db.load_jsonl(&seed_data(), LoadMode::Overwrite)
             .await
             .unwrap();
         drop(db);

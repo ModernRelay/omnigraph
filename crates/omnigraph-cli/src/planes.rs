@@ -257,7 +257,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
             command: SchemaCommand::Show { .. } | SchemaCommand::Apply { .. },
         } => Plane::Data,
         Command::Schema {
-            command: SchemaCommand::Plan { .. },
+            command: SchemaCommand::Plan { .. } | SchemaCommand::UpgradeSystemColumns { .. },
         } => Plane::Storage,
         // `queries` and `policy` tooling now source their inputs from a
         // cluster's applied state (`--cluster`), so they live on the control
@@ -300,6 +300,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             SchemaCommand::Plan { .. } => "schema plan",
             SchemaCommand::Apply { .. } => "schema apply",
             SchemaCommand::Show { .. } => "schema show",
+            SchemaCommand::UpgradeSystemColumns { .. } => "schema upgrade-system-columns",
         },
         Command::Lint { .. } => "lint",
         Command::Queries { command } => match command {

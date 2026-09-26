@@ -1,23 +1,37 @@
 use super::*;
 
-use super::query::literal_to_sql;
+use crate::engine::{evaluate_constant, id_in_list_expr, ir_expr_to_df_expr};
+use crate::seams::{decide_seam, fail};
+use crate::session::Session;
 use crate::storage_layer::PendingScanBudget;
+use datafusion::prelude::Expr;
 
 // ─── Mutation helpers ────────────────────────────────────────────────────────
 
-/// Resolve an IRExpr to a concrete Literal value at runtime.
-fn resolve_expr_value(expr: &IRExpr, params: &ParamMap) -> Result<Literal> {
-    match expr {
-        IRExpr::Literal(lit) => Ok(lit.clone()),
-        IRExpr::Param(name) => params
-            .get(name)
-            .cloned()
-            .ok_or_else(|| OmniError::manifest(format!("parameter '{}' not provided", name))),
-        other => Err(OmniError::manifest(format!(
-            "unsupported expression in mutation: {:?}",
-            other
-        ))),
+/// The assignments evaluated per attempt over the invocation's fixed parameter
+/// map (`now()` bound before the retry loop, so every attempt gets one value); a
+/// null result on a non-nullable property, `Blob` included, is refused before any batch.
+fn resolve_assignments(
+    type_name: &str,
+    schema: &Schema,
+    assignments: &[IRAssignment],
+    params: &ParamMap,
+) -> Result<HashMap<String, Literal>> {
+    let mut resolved = HashMap::with_capacity(assignments.len());
+    for assignment in assignments {
+        let value = evaluate_constant(&assignment.value, params)?;
+        let non_nullable = schema
+            .field_with_name(&assignment.property)
+            .is_ok_and(|field| !field.is_nullable());
+        if non_nullable && matches!(value, Literal::Null) {
+            return Err(OmniError::manifest(format!(
+                "cannot assign null to non-nullable property '{}' of {type_name}",
+                assignment.property
+            )));
+        }
+        resolved.insert(assignment.property.clone(), value);
     }
+    Ok(resolved)
 }
 
 /// Create a single-element or N-element array from a Literal, matching the target DataType.
@@ -384,62 +398,35 @@ fn build_insert_batch(
     RecordBatch::try_new(schema.clone(), columns).map_err(OmniError::arrow_internal)
 }
 
-/// Convert an IRMutationPredicate to a Lance SQL filter string.
-fn predicate_to_sql(
-    predicate: &IRMutationPredicate,
-    params: &ParamMap,
-    is_edge: bool,
-    system_columns: SystemColumns,
-) -> Result<String> {
-    let column = if is_edge {
-        match predicate.property.as_str() {
-            "from" | "@src" => system_columns.src.to_string(),
-            "to" | "@dst" => system_columns.dst.to_string(),
-            "@id" => system_columns.id.to_string(),
-            other => other.to_string(),
-        }
-    } else if predicate.property == "@id" {
-        system_columns.id.to_string()
-    } else if predicate.property.starts_with('@') {
+/// The mutation `where` as the typed DataFusion expression Lance evaluates,
+/// through the lowering a read scan uses; the compiler already put every
+/// property leaf on its physical column, and `schema` types the literals.
+fn mutation_predicate_expr(predicate: &IRExpr, params: &ParamMap, schema: &Schema) -> Result<Expr> {
+    if let Some(name) = first_unbound_param(predicate, params) {
         return Err(OmniError::manifest(format!(
-            "unsupported node meta-field '{}' in mutation predicate",
-            predicate.property
+            "parameter '{name}' not provided"
         )));
-    } else {
-        predicate.property.clone()
-    };
+    }
+    ir_expr_to_df_expr(predicate, params, Some(schema)).ok_or_else(|| {
+        OmniError::manifest(format!(
+            "unsupported expression in mutation predicate: {predicate}"
+        ))
+    })
+}
 
-    let value = resolve_expr_value(&predicate.value, params)?;
-    let value_sql = literal_to_sql(&value);
-
-    let op = match predicate.op {
-        CompOp::Eq => "=",
-        CompOp::Ne => "!=",
-        CompOp::Gt => ">",
-        CompOp::Lt => "<",
-        CompOp::Ge => ">=",
-        CompOp::Le => "<=",
-        // The mutation grammar only admits comparison ops; these arms are
-        // defense in depth for IR built outside the parser.
-        CompOp::Contains | CompOp::StringContains => {
-            return Err(OmniError::manifest(
-                "contains predicate not supported in mutations".to_string(),
-            ));
+/// The first parameter of a mutation predicate, in written order, that
+/// `params` does not bind: the lowering answers `None` for it, indistinguishable
+/// from an inexpressible shape, so the name is checked before lowering.
+fn first_unbound_param<'a>(expr: &'a IRExpr, params: &ParamMap) -> Option<&'a str> {
+    match expr {
+        IRExpr::Param(name) => (!params.contains_key(name)).then_some(name.as_str()),
+        IRExpr::Binary { left, right, .. } => {
+            first_unbound_param(left, params).or_else(|| first_unbound_param(right, params))
         }
-        CompOp::StartsWith => {
-            return Err(OmniError::manifest(
-                "starts_with predicate not supported in mutations".to_string(),
-            ));
-        }
-    };
-
-    // #283: emit the column UNQUOTED. Lance's `Scanner::filter(&str)` (the
-    // committed-scan consumer) preserves an unquoted identifier's case but
-    // treats a double-quoted `"col"` as a string literal, so quoting here
-    // would silently match zero committed rows. The pending-batch MemTable
-    // query is instead made case-preserving by disabling DataFusion identifier
-    // normalization on its `SessionContext` (see `scan_pending_batches`).
-    Ok(format!("{} {} {}", column, op, value_sql))
+        IRExpr::Not(inner) => first_unbound_param(inner, params),
+        IRExpr::IsNull { expr, .. } => first_unbound_param(expr, params),
+        _ => None,
+    }
 }
 
 /// Replace specific columns in a RecordBatch with new literal values.
@@ -526,8 +513,6 @@ use super::staging::{MutationStaging, PendingMode};
 /// touch records another predicate (`record_delete`), and `stage_all` combines
 /// them into one staged delete — there is no post-inline-commit reopen to
 /// special-case anymore.
-impl Omnigraph {}
-
 async fn open_table_for_mutation(
     db: &Omnigraph,
     staging: &mut MutationStaging,
@@ -558,7 +543,7 @@ async fn open_table_for_mutation(
         opened.full_path.clone(),
         opened.table_branch.clone(),
         opened.pinned_native_ref.clone(),
-        opened.deferred_fork.clone(),
+        opened.entry.clone(),
         opened.expected_version,
         op_kind,
     )?;
@@ -594,16 +579,10 @@ async fn open_table_for_mutation(
 /// cascade, or — if it is the only match — leaves the node undeleted). Only
 /// rows a prior predicate matched as definitely TRUE should be excluded:
 /// `(prior) IS NOT TRUE` keeps both FALSE and UNKNOWN rows.
-fn dedup_delete_filter(base: &str, prior: &[String]) -> String {
-    if prior.is_empty() {
-        base.to_string()
-    } else {
-        let excluded = prior
-            .iter()
-            .map(|p| format!("({p})"))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        format!("({base}) AND (({excluded}) IS NOT TRUE)")
+fn dedup_delete_filter(base: &Expr, prior: &[Expr]) -> Expr {
+    match prior.iter().cloned().reduce(Expr::or) {
+        None => base.clone(),
+        Some(excluded) => base.clone().and(excluded.is_not_true()),
     }
 }
 
@@ -649,7 +628,31 @@ fn enforce_no_mixed_destructive_constructive(
     Ok(())
 }
 
-impl Omnigraph {
+decide_seam! {
+    pub static MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE = ("mutation.delete_node_pre_primary_delete", Mutation, [Fail]);
+}
+
+decide_seam! {
+    pub static MUTATION_POST_FINALIZE_PRE_PUBLISHER = ("mutation.post_finalize_pre_publisher", Mutation, [Fail]);
+}
+
+decide_seam! {
+    /// Deterministic OCC rendezvous after a mutation has validated and staged
+    /// its complete attempt, but before the RFC-022 branch effect gate is
+    /// acquired and the write authority token is revalidated. Tests park the
+    /// first writer here, commit a conflicting second writer, then prove the
+    /// first attempt is discarded and validation is rerun from a fresh token.
+    pub static MUTATION_POST_STAGE_PRE_EFFECT_GATE = ("mutation.post_stage_pre_effect_gate", Mutation, [Fail]);
+}
+
+decide_seam! {
+    /// After a conditional mutation has executed to a zero-effect result, but
+    /// before it acquires the branch gate and revalidates the caller's graph
+    /// head. This pins the linearization point for successful no-op CAS calls.
+    pub static MUTATION_POST_NO_EFFECT_PRE_GATE = ("mutation.post_no_effect_pre_gate", Mutation, [Fail]);
+}
+
+impl Session {
     pub async fn mutate(
         &self,
         branch: &str,
@@ -747,8 +750,7 @@ impl Omnigraph {
     /// internally retried — when the local authoritative check observes a
     /// mismatch. This is not a distributed lease: an unsupported foreign
     /// writer that races after that check is rejected by the exact publisher,
-    /// but may require recovery after table effects and therefore returns
-    /// [`OmniError::RecoveryRequired`]. All other error behavior matches
+    /// which leaves the graph unchanged. All other error behavior matches
     /// [`Self::mutate_as`].
     pub async fn mutate_as_with_expected_head(
         &self,
@@ -795,6 +797,7 @@ impl Omnigraph {
             &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
             actor_id,
         )?;
+        let settings = self.effective(query_source)?;
         self.mutate_with_current_actor(
             branch,
             query_source,
@@ -802,10 +805,13 @@ impl Omnigraph {
             params,
             actor_id,
             expected_head,
+            settings.stage_write_concurrency(),
         )
         .await
     }
+}
 
+impl Omnigraph {
     /// End-of-query validation for a constructive mutation: build the change-set
     /// from the accumulated staging and run the unified evaluator (value/enum,
     /// uniqueness incl. cross-version, edge-RI, cardinality) against committed
@@ -840,6 +846,7 @@ impl Omnigraph {
         params: &ParamMap,
         actor_id: Option<&str>,
         expected_head: Option<&str>,
+        stage_write_concurrency: usize,
     ) -> Result<crate::MutationReceipt> {
         const MAX_PRE_EFFECT_REPREPARES: usize = 32;
 
@@ -856,6 +863,7 @@ impl Omnigraph {
                     &resolved_params,
                     actor_id,
                     expected_head,
+                    stage_write_concurrency,
                     &mut retryable,
                 )
                 .await
@@ -870,6 +878,7 @@ impl Omnigraph {
                         branch,
                         "prepared mutation authority changed before effects; repreparing"
                     );
+                    crate::instrumentation::record_mutation_reprepare();
                     self.refresh().await?;
                 }
                 result => return result,
@@ -886,6 +895,7 @@ impl Omnigraph {
         params: &ParamMap,
         actor_id: Option<&str>,
         expected_head: Option<&str>,
+        stage_write_concurrency: usize,
         retryable: &mut bool,
     ) -> Result<crate::MutationReceipt> {
         let requested = Self::normalize_branch_name(branch)?;
@@ -896,18 +906,16 @@ impl Omnigraph {
         if let Some(name) = requested.as_deref() {
             crate::db::ensure_public_branch_ref(name, "mutate")?;
         }
-        // Stage A: converge any roll-forward-eligible sidecars, then close the
-        // barrier on every unresolved intent for this graph branch. This MUST
-        // run before `open_write_txn`: healing may advance the manifest, and a
-        // deferred Armed intent remains ownership even when no table HEAD moved.
-        self.heal_pending_recovery_sidecars_for_write(&[requested.as_deref()])
-            .await?;
-        // Capture one branch-wide write authority after the recovery barrier:
-        // native branch identity, exact optional graph head, accepted schema
-        // identity/catalog, and the base table snapshot. Execution, validation,
-        // staging, and publication all use this immutable attempt. `commit_all`
-        // revalidates the complete token under the root-shared schema → branch →
-        // sorted-table gates before it arms recovery or advances Lance HEAD.
+        // Install this handle's published-but-uninstalled schema contract, if
+        // any. This MUST run before `open_write_txn`, which captures the
+        // accepted schema identity and catalog.
+        self.settle_pending_schema_install().await?;
+        // Capture one branch-wide write authority: native branch identity,
+        // exact optional graph head, accepted schema identity/catalog, and the
+        // base table snapshot. Execution, validation, staging, and publication
+        // all use this immutable attempt. `commit_all` revalidates the complete
+        // token under the root-shared schema → branch → sorted-table gates
+        // before its first detached commit.
         let mut txn = self.open_write_txn(requested.as_deref()).await?;
         // Caller CAS gate against the pinned view this attempt executes with —
         // a separate head lookup would reopen the race. Re-checked per
@@ -928,10 +936,10 @@ impl Omnigraph {
         // Per-query staging accumulator. Inserts and updates push batches into
         // `pending`; deletes push predicates into `delete_predicates`. At the
         // boundary, `stage_all` prepares one exact transaction per touched table
-        // and `commit_all` records those identities in a durable schema-v3
-        // recovery intent before independently advancing the table HEADs. The
-        // publisher then makes the complete result graph-visible in one manifest
-        // CAS. Branch is threaded explicitly — no coordinator swap.
+        // and `commit_all` commits each as a detached version of its pinned
+        // base (RFC 0067). The publisher then makes the complete result
+        // graph-visible in one manifest CAS. Branch is threaded explicitly — no
+        // coordinator swap.
         let mut staging = MutationStaging::default();
 
         // Lower + validate up front so the touched-dataset set is known before
@@ -962,9 +970,7 @@ impl Omnigraph {
             Err(e) => Err(e),
             Ok(total) if staging.is_empty() => {
                 if txn.caller_expected_graph_head.is_some() {
-                    crate::failpoints::maybe_fail(
-                        crate::failpoints::names::MUTATION_POST_NO_EFFECT_PRE_GATE,
-                    )?;
+                    fail(&MUTATION_POST_NO_EFFECT_PRE_GATE)?;
                     // A no-op has no table transaction, so it never reaches
                     // `commit_all`. It still needs a linearization point for
                     // the caller's CAS promise: under the same schema -> branch
@@ -987,44 +993,30 @@ impl Omnigraph {
             }
             Ok(total) => {
                 self.validate_staged_mutation(&staging, &txn).await?;
-                let staged = staging.stage_all(self, requested.as_deref()).await?;
-                crate::failpoints::maybe_fail(
-                    crate::failpoints::names::MUTATION_POST_STAGE_PRE_EFFECT_GATE,
-                )?;
+                let staged = staging
+                    .stage_all_with_concurrency(self, requested.as_deref(), stage_write_concurrency)
+                    .await?;
+                fail(&MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
                 let lineage_intent = self
                     .new_lineage_intent_for_branch(requested.as_deref(), actor_id)
                     .await?;
                 // `_queue_guards` holds the root-shared schema gate, branch
                 // effect gate, and sorted table gates acquired by `commit_all`.
                 // They remain held through manifest publication, covering the
-                // complete same-process sidecar/effect lifetime. They are a
-                // local serialization aid; the exact publisher precondition and
-                // durable v3 recovery plan remain the correctness authorities.
+                // complete same-process effect lifetime. They are a local
+                // serialization aid; the exact publisher precondition remains
+                // the correctness authority.
                 let super::staging::CommittedMutation {
                     updates,
                     expected_versions,
-                    sidecar_handle,
                     guards: _queue_guards,
-                } = staged
-                    .commit_all(
-                        self,
-                        requested.as_deref(),
-                        crate::db::manifest::SidecarKind::Mutation,
-                        actor_id,
-                        &txn,
-                        &lineage_intent,
-                    )
-                    .await?;
-                // Failpoint for the confirmed-effects → publisher boundary:
-                // table HEADs have advanced but graph visibility has not. The
-                // v3 sidecar already contains exact transaction identities,
-                // immutable manifest delta, and fixed lineage/rollback outcomes.
-                // Any failure from here is `RecoveryRequired`; synchronous heal
-                // or a read-write open converges the recorded outcome. See
-                // `tests/failpoints.rs::recovery_rolls_forward_after_finalize_publisher_failure`.
-                crate::failpoints::maybe_fail(
-                    crate::failpoints::names::MUTATION_POST_FINALIZE_PRE_PUBLISHER,
-                )?;
+                } = staged.commit_all(self, requested.as_deref(), &txn).await?;
+                // Failpoint for the detached-effects → publisher boundary:
+                // every table effect is committed detached but nothing is
+                // graph-visible. A failure here leaves the graph unchanged and
+                // the detached versions as reclaimable garbage. See
+                // `tests/failpoints.rs::finalize_publisher_residual_does_not_drift_untouched_tables`.
+                fail(&MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
                 let publish_result = self
                     .commit_updates_on_branch_with_expected(
                         requested.as_deref(),
@@ -1035,40 +1027,10 @@ impl Omnigraph {
                         lineage_intent,
                     )
                     .await;
-                let commit = match publish_result {
-                    Ok(commit) => commit,
-                    Err(err) => {
-                        // A sidecar exists iff at least one table effect was
-                        // committed. Lineage-only / zero-row mutations have no
-                        // physical residual to recover, so preserve their original
-                        // publish error (notably ReadSetChanged) and let the normal
-                        // retry/409 path handle it.
-                        return match sidecar_handle.as_ref() {
-                            Some(handle) => Err(OmniError::recovery_required(
-                                handle.operation_id.clone(),
-                                err.to_string(),
-                            )),
-                            None => Err(err),
-                        };
-                    }
-                };
-                if let Some(handle) = sidecar_handle {
-                    // Best-effort cleanup: the manifest publish already
-                    // succeeded, so the user's mutation is durable. A failed
-                    // delete leaves a fixed, idempotent v3 outcome for the next
-                    // synchronous heal or read-write open to audit and remove.
-                    // Failing the user here would report an error for a write
-                    // that already landed.
-                    if let Err(err) =
-                        crate::db::manifest::delete_sidecar(&handle, self.storage_adapter()).await
-                    {
-                        tracing::warn!(
-                            error = %err,
-                            operation_id = handle.operation_id.as_str(),
-                            "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
-                        );
-                    }
-                }
+                // RFC 0067: every effect is a detached commit of its pinned base,
+                // so a publish failure leaves the graph unchanged; the error
+                // is returned as is (a moved head is `ReadSetChanged`).
+                let commit = publish_result?;
                 Ok(crate::MutationReceipt {
                     result: total,
                     commit: Some(commit),
@@ -1104,7 +1066,7 @@ impl Omnigraph {
             }
         }
 
-        let ir = lower_mutation_query(&query_decl)?;
+        let ir = lower_mutation_query(catalog, &query_decl)?;
         // D₂: reject mixed insert/update + delete before any I/O.
         enforce_no_mixed_destructive_constructive(&ir)?;
         Ok(ir)
@@ -1167,11 +1129,6 @@ impl Omnigraph {
         staging: &mut MutationStaging,
         txn: &crate::db::WriteTxn,
     ) -> Result<MutationResult> {
-        let mut resolved: HashMap<String, Literal> = HashMap::new();
-        for a in assignments {
-            resolved.insert(a.property.clone(), resolve_expr_value(&a.value, params)?);
-        }
-
         let catalog = &txn.catalog;
         let is_node = catalog.node_types.contains_key(type_name);
         let is_edge = catalog.edge_types.contains_key(type_name);
@@ -1179,6 +1136,7 @@ impl Omnigraph {
         if is_node {
             let node_type = &catalog.node_types[type_name];
             let schema = node_type.arrow_schema.clone();
+            let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
             let blob_props = node_type.blob_properties.clone();
             let id = if let Some(key_properties) = node_type.key.as_ref() {
                 let mut typed_keys = Vec::with_capacity(key_properties.len());
@@ -1244,6 +1202,7 @@ impl Omnigraph {
         } else if is_edge {
             let edge_type = &catalog.edge_types[type_name];
             let schema = edge_type.arrow_schema.clone();
+            let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
             let blob_props = edge_type.blob_properties.clone();
             let id = if let Some(key_columns) = edge_type.key.as_ref() {
                 let system_columns = catalog.system_columns;
@@ -1335,7 +1294,7 @@ impl Omnigraph {
         &self,
         type_name: &str,
         assignments: &[IRAssignment],
-        predicate: &IRMutationPredicate,
+        predicate: &IRExpr,
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
@@ -1365,8 +1324,8 @@ impl Omnigraph {
             }
         }
 
-        let pred_sql = predicate_to_sql(predicate, params, false, catalog.system_columns)?;
         let schema = catalog.node_types[type_name].arrow_schema.clone();
+        let pred_expr = mutation_predicate_expr(predicate, params, &schema)?;
         let blob_props = catalog.node_types[type_name].blob_properties.clone();
 
         let table_key = format!("node:{}", type_name);
@@ -1410,7 +1369,7 @@ impl Omnigraph {
                     pending_batches,
                     pending_schema,
                     None,
-                    Some(&pred_sql),
+                    Some(pred_expr),
                     Some(catalog.system_columns.id),
                     scan_budget,
                 )
@@ -1421,7 +1380,7 @@ impl Omnigraph {
                     &ds,
                     pending_batches,
                     pending_schema,
-                    Some(&pred_sql),
+                    Some(pred_expr),
                     Some(catalog.system_columns.id),
                     scan_budget,
                 )
@@ -1442,10 +1401,7 @@ impl Omnigraph {
 
         let affected_count = matched.num_rows();
 
-        let mut resolved: HashMap<String, Literal> = HashMap::new();
-        for a in assignments {
-            resolved.insert(a.property.clone(), resolve_expr_value(&a.value, params)?);
-        }
+        let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
         let updated = apply_assignments(&schema, &matched, &resolved, &blob_props)?;
         // Validation (value/enum/unique) runs end-of-query via the evaluator.
 
@@ -1466,7 +1422,7 @@ impl Omnigraph {
     async fn execute_delete(
         &self,
         type_name: &str,
-        predicate: &IRMutationPredicate,
+        predicate: &IRExpr,
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
@@ -1485,13 +1441,17 @@ impl Omnigraph {
     async fn execute_delete_node(
         &self,
         type_name: &str,
-        predicate: &IRMutationPredicate,
+        predicate: &IRExpr,
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
         txn: &crate::db::WriteTxn,
     ) -> Result<MutationResult> {
-        let pred_sql = predicate_to_sql(predicate, params, false, txn.catalog.system_columns)?;
+        let pred_expr = mutation_predicate_expr(
+            predicate,
+            params,
+            &txn.catalog.node_types[type_name].arrow_schema,
+        )?;
 
         let table_key = format!("node:{}", type_name);
         let (handle, _full_path, _table_branch) = open_table_for_mutation(
@@ -1506,24 +1466,11 @@ impl Omnigraph {
         // Delete is a STRICT op, so collapse #1 never skips its open.
         let ds = handle.expect("strict Delete op always opens its dataset");
 
-        // Scan matching IDs for cascade. Per D₂ this never overlaps with
-        // staged inserts (mixed insert/delete in one query is rejected at
-        // parse time), so we scan committed only. Exclude IDs a prior delete
-        // statement on this table already scheduled (deletes stage, so the
-        // committed snapshot is unchanged across statements): without this,
-        // overlapping predicates would double-count `affected_nodes` AND
-        // re-cascade already-deleted nodes' edges. The combined staged delete
-        // still removes the union, so we record the original `pred_sql` below.
         let scan_filter =
-            dedup_delete_filter(&pred_sql, staging.recorded_delete_predicates(&table_key));
+            dedup_delete_filter(&pred_expr, staging.recorded_delete_predicates(&table_key));
         let batches = self
             .storage()
-            .scan(
-                &ds,
-                Some(&[txn.catalog.system_columns.id]),
-                Some(&scan_filter),
-                None,
-            )
+            .scan_filtered(&ds, Some(&[txn.catalog.system_columns.id]), scan_filter)
             .await?;
 
         let deleted_ids: Vec<String> = ids_from_batches(&batches);
@@ -1544,18 +1491,11 @@ impl Omnigraph {
         // HEAD only at the unified end-of-query commit — no inline residual.
         // `open_table_for_mutation` above already captured the table's
         // path/version/op-kind via `ensure_path`.
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE,
-        )?;
+        fail(&MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE)?;
         staging.record_deleted_ids(&table_key, &deleted_ids);
-        staging.record_delete(&table_key, pred_sql.clone());
+        staging.record_delete(&table_key, pred_expr.clone());
 
         let mut affected_edges = 0usize;
-        let escaped: Vec<String> = deleted_ids
-            .iter()
-            .map(|id| format!("'{}'", id.replace('\'', "''")))
-            .collect();
-        let id_list = escaped.join(", ");
 
         let edge_info: Vec<(String, String, String)> = txn
             .catalog
@@ -1567,23 +1507,22 @@ impl Omnigraph {
         for (edge_name, from_type, to_type) in &edge_info {
             let mut cascade_filters = Vec::new();
             if from_type == type_name {
-                cascade_filters.push(format!(
-                    "{} IN ({})",
-                    txn.catalog.system_columns.src, id_list
+                cascade_filters.push(id_in_list_expr(
+                    &deleted_ids,
+                    txn.catalog.system_columns.src,
                 ));
             }
             if to_type == type_name {
-                cascade_filters.push(format!(
-                    "{} IN ({})",
-                    txn.catalog.system_columns.dst, id_list
+                cascade_filters.push(id_in_list_expr(
+                    &deleted_ids,
+                    txn.catalog.system_columns.dst,
                 ));
             }
-            if cascade_filters.is_empty() {
+            let Some(cascade_filter) = cascade_filters.into_iter().reduce(Expr::or) else {
                 continue;
-            }
+            };
 
             let edge_table_key = format!("edge:{}", edge_name);
-            let cascade_filter = cascade_filters.join(" OR ");
             let (edge_handle, _edge_full_path, _edge_table_branch) = open_table_for_mutation(
                 self,
                 staging,
@@ -1616,11 +1555,10 @@ impl Omnigraph {
             let matched_ids = ids_from_batches(
                 &self
                     .storage()
-                    .scan(
+                    .scan_filtered(
                         &edge_ds,
                         Some(&[txn.catalog.system_columns.id]),
-                        Some(&count_filter),
-                        None,
+                        count_filter,
                     )
                     .await?,
             );
@@ -1646,13 +1584,17 @@ impl Omnigraph {
     async fn execute_delete_edge(
         &self,
         type_name: &str,
-        predicate: &IRMutationPredicate,
+        predicate: &IRExpr,
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
         txn: &crate::db::WriteTxn,
     ) -> Result<MutationResult> {
-        let pred_sql = predicate_to_sql(predicate, params, true, txn.catalog.system_columns)?;
+        let pred_expr = mutation_predicate_expr(
+            predicate,
+            params,
+            &txn.catalog.edge_types[type_name].arrow_schema,
+        )?;
 
         let table_key = format!("edge:{}", type_name);
         let (handle, _full_path, _table_branch) = open_table_for_mutation(
@@ -1674,7 +1616,7 @@ impl Omnigraph {
         // ORIGINAL predicate below (the combined staged delete removes the
         // union); only record when something NEW matches.
         let count_filter =
-            dedup_delete_filter(&pred_sql, staging.recorded_delete_predicates(&table_key));
+            dedup_delete_filter(&pred_expr, staging.recorded_delete_predicates(&table_key));
         // Scan the matched edge ids (not just count): the ids feed validation so
         // a delete emptying a src below @card min is rejected; `len()` is the
         // affected count. One scan replaces the former count-here + resolve-at-
@@ -1682,19 +1624,14 @@ impl Omnigraph {
         let deleted_ids = ids_from_batches(
             &self
                 .storage()
-                .scan(
-                    &ds,
-                    Some(&[txn.catalog.system_columns.id]),
-                    Some(&count_filter),
-                    None,
-                )
+                .scan_filtered(&ds, Some(&[txn.catalog.system_columns.id]), count_filter)
                 .await?,
         );
         let affected = deleted_ids.len();
 
         if affected > 0 {
             staging.record_deleted_ids(&table_key, &deleted_ids);
-            staging.record_delete(&table_key, pred_sql.clone());
+            staging.record_delete(&table_key, pred_expr.clone());
             self.invalidate_graph_index().await;
         }
 
@@ -1759,35 +1696,8 @@ fn enrich_mutation_params(params: &ParamMap) -> Result<ParamMap> {
 }
 
 #[cfg(test)]
-mod predicate_sql_tests {
+mod literal_narrowing_tests {
     use super::*;
-
-    // #283: a camelCase column in a mutation predicate must be emitted
-    // UNQUOTED and case-preserved. The committed-scan consumer, Lance's
-    // `Scanner::filter(&str)`, preserves an unquoted identifier's case but
-    // treats a double-quoted `"col"` as a string literal (which silently
-    // matches zero rows), so the predicate string must not quote the column.
-    // The pending MemTable path stays case-preserving by disabling DataFusion
-    // identifier normalization on its context, not by quoting here.
-    #[test]
-    fn predicate_to_sql_preserves_camelcase_column_unquoted() {
-        let predicate = IRMutationPredicate {
-            property: "repoName".to_string(),
-            op: CompOp::Eq,
-            value: IRExpr::Literal(Literal::String("acme".into())),
-        };
-        let sql = predicate_to_sql(
-            &predicate,
-            &ParamMap::new(),
-            false,
-            omnigraph_compiler::SYSTEM_COLUMNS_V3,
-        )
-        .unwrap();
-        assert_eq!(
-            sql, "repoName = 'acme'",
-            "column must be unquoted and case-preserved, got {sql}"
-        );
-    }
 
     #[test]
     fn scalar_narrowing_accepts_boundaries_and_rejects_wraparound() {

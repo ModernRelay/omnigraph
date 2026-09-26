@@ -15,6 +15,8 @@
 //! suite pins (a spawned delete dying with a short-lived runtime) only
 //! reproduces realistically under it.
 
+#![recursion_limit = "256"]
+
 use std::env;
 use std::fs;
 
@@ -96,7 +98,14 @@ fn person_params(name: &str) -> ParamMap {
     params
 }
 
-async fn person_count(db: &Omnigraph, branch: &str, name: &str) -> usize {
+fn session(db: Omnigraph) -> omnigraph::Session {
+    omnigraph::Session::from_defaults(
+        std::sync::Arc::new(db),
+        omnigraph::settings::SessionSettings::default(),
+    )
+}
+
+async fn person_count(db: &omnigraph::Session, branch: &str, name: &str) -> usize {
     db.query(
         ReadTarget::branch(branch),
         FIND_PERSON_GQ,
@@ -191,7 +200,7 @@ async fn object_storage_cluster_full_lifecycle(root: &str, expected_scheme: &str
 
     // Exercise the real Lance data plane under the cluster-created root. A
     // fresh read-only handle must observe each accepted main write.
-    let writer = Omnigraph::open(&graph_root).await.unwrap();
+    let writer = session(Omnigraph::open(&graph_root).await.unwrap());
     writer
         .load(
             "main",
@@ -201,11 +210,11 @@ async fn object_storage_cluster_full_lifecycle(root: &str, expected_scheme: &str
         .await
         .unwrap();
     drop(writer);
-    let reopened = Omnigraph::open_read_only(&graph_root).await.unwrap();
+    let reopened = session(Omnigraph::open_read_only(&graph_root).await.unwrap());
     assert_eq!(person_count(&reopened, "main", "Ada").await, 1);
     drop(reopened);
 
-    let writer = Omnigraph::open(&graph_root).await.unwrap();
+    let writer = session(Omnigraph::open(&graph_root).await.unwrap());
     writer
         .mutate(
             "main",
@@ -216,14 +225,14 @@ async fn object_storage_cluster_full_lifecycle(root: &str, expected_scheme: &str
         .await
         .unwrap();
     drop(writer);
-    let reopened = Omnigraph::open_read_only(&graph_root).await.unwrap();
+    let reopened = session(Omnigraph::open_read_only(&graph_root).await.unwrap());
     assert_eq!(person_count(&reopened, "main", "Bob").await, 1);
     drop(reopened);
 
     // Delete/recreate the same branch name after a physical write. The new
     // branch must inherit main but must not retarget to the deleted branch's
     // old row or native identity.
-    let writer = Omnigraph::open(&graph_root).await.unwrap();
+    let writer = session(Omnigraph::open(&graph_root).await.unwrap());
     writer.branch_create("feature").await.unwrap();
     writer
         .load(
@@ -246,7 +255,7 @@ async fn object_storage_cluster_full_lifecycle(root: &str, expected_scheme: &str
         .unwrap();
     drop(writer);
 
-    let reopened = Omnigraph::open(&graph_root).await.unwrap();
+    let reopened = session(Omnigraph::open(&graph_root).await.unwrap());
     assert_eq!(person_count(&reopened, "feature", "OldFeature").await, 0);
     assert_eq!(person_count(&reopened, "feature", "NewFeature").await, 1);
     assert_eq!(person_count(&reopened, "main", "Ada").await, 1);

@@ -1,0 +1,60 @@
+# issue: none
+# red_on: 2026-09-16 working tree: `column 'x.foo' not found in wide batch`.
+# notes: Both negations bind $x, but one reads A.foo and the other B.bar.
+# notes: Their scan projections must stay separate.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node P {
+    name: String @key
+    foo: String
+    bar: String
+}
+node A {
+    name: String @key
+    foo: String
+}
+node B {
+    name: String @key
+    bar: String
+}
+
+--- seed
+{"type":"P","data":{"name":"p","foo":"pfoo","bar":"pbar"}}
+{"type":"P","data":{"name":"q","foo":"shared","bar":"qbar"}}
+{"type":"A","data":{"name":"a","foo":"shared"}}
+{"type":"B","data":{"name":"b","bar":"different"}}
+
+--- query
+set engine = v2;
+query independent_negations() {
+    match {
+        $p: P
+        not {
+            $x: A
+            $x.foo = $p.foo
+        }
+        not {
+            $x: B
+            $x.bar = $p.bar
+        }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name":"p"}
+
+--- expect shape
+p.name: String
+
+--- expect plan
+scan P as $p: columns [__id, name, foo, bar]
+scan A as $x: columns [name, foo]
+scan B as $x: columns [name, bar]
+pass projection_pushdown

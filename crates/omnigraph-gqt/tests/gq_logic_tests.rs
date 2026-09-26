@@ -1,4 +1,4 @@
-//! One libtest test per `cases/*.gqt`, registered at run time by
+//! One libtest test per `cases/**/*.gqt`, registered at run time by
 //! `datatest-stable` (`harness = false` in `Cargo.toml`), so
 //! `cargo test -p omnigraph-gqt <substr>` runs the matching cases,
 //! `-- --list` names them all, and `--test-threads` sets the concurrency.
@@ -13,9 +13,7 @@
 use std::path::Path;
 
 fn case(path: &Path) -> datatest_stable::Result<()> {
-    if let Some(reason) = omnigraph_gqt::traversal_override_refusal(
-        std::env::var_os("OMNIGRAPH_TRAVERSAL_MODE").as_deref(),
-    ) {
+    if let Some(reason) = omnigraph_gqt::settings_override_refusal(std::env::var_os) {
         return Err(reason.into());
     }
     let bless = omnigraph_gqt::bless_from_env().map_err(|error| {
@@ -33,5 +31,5 @@ fn case(path: &Path) -> datatest_stable::Result<()> {
 }
 
 datatest_stable::harness! {
-    { test = case, root = "cases", pattern = r"^[^./][^/]*\.gqt$" },
+    { test = case, root = "cases", pattern = r"^(?:[^./][^/]*/)*[^./][^/]*\.gqt$" },
 }

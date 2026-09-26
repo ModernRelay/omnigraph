@@ -22,13 +22,13 @@ use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
 use futures::TryStreamExt;
 use helpers::{
     MUTATION_QUERIES, TEST_DATA, TEST_QUERIES, TEST_SCHEMA, count_rows, first_column_sorted,
-    init_and_load, mixed_params, mutate_branch, mutate_main, node_blob_cell, params, query_main,
-    read_managed_blob_bytes, snapshot_main,
+    init_and_load, mixed_params, mutate_branch, mutate_main, node_blob_cell,
+    open_pinned_dataset_for_test, params, query_main, read_managed_blob_bytes, snapshot_main,
 };
-use lance::Dataset;
+use omnigraph::Session;
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 
 /// `Diana` has no outgoing `Knows` in the fixture, so adding one edge from her
 /// and then deleting every edge from her returns `edge:Knows` to its exact
@@ -60,7 +60,7 @@ query set_near_miss_row_property($slug: String, $value: String) {
 "#;
 
 /// Insert one edge from [`NET_ZERO_SOURCE`], then delete it again.
-async fn apply_net_zero_edge_cycle(db: &mut Omnigraph, branch: &str) {
+async fn apply_net_zero_edge_cycle(db: &Session, branch: &str) {
     mutate_branch(
         db,
         branch,
@@ -83,7 +83,7 @@ async fn apply_net_zero_edge_cycle(db: &mut Omnigraph, branch: &str) {
 }
 
 /// The `friends_of` answer for every fixture person, as one comparable value.
-async fn friend_map(db: &mut Omnigraph) -> Vec<(String, Vec<String>)> {
+async fn friend_map(db: &Session) -> Vec<(String, Vec<String>)> {
     let mut out = Vec::new();
     for person in ["Alice", "Bob", "Charlie", "Diana"] {
         let result = query_main(
@@ -111,13 +111,13 @@ async fn assert_adopted_string_change(
 ) {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let main = Omnigraph::init(uri, ADOPT_EQUALITY_SCHEMA).await.unwrap();
-    load_jsonl(&main, input, LoadMode::Overwrite).await.unwrap();
+    let main = helpers::session(Omnigraph::init(uri, ADOPT_EQUALITY_SCHEMA).await.unwrap());
+    main.load_jsonl(input, LoadMode::Overwrite).await.unwrap();
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         ADOPT_EQUALITY_QUERIES,
         query_name,
@@ -221,6 +221,9 @@ async fn adopt_equality_does_not_hide_a_legal_row_prefix_property() {
     .await;
 }
 
+/// A branch write leaves the untouched managed row in main's own data file, so
+/// the adopt comparison reads it unchanged: the merge onto main switches the
+/// pin with no Blob payload read.
 #[tokio::test]
 async fn adopt_equality_resolves_inherited_managed_blob_file_identity() {
     const SCHEMA: &str = r#"
@@ -238,19 +241,14 @@ query set_note($title: String, $note: String) {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let main = Omnigraph::init(uri, SCHEMA).await.unwrap();
-    // Separate loads put the managed and scalar-only rows in distinct base
-    // fragments. Updating the latter on the branch must leave the managed row
-    // as a shallow-clone reference to the original main data file.
-    load_jsonl(
-        &main,
+    let main = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
+    main.load_jsonl(
         r#"{"type":"Document","data":{"title":"blob","content":"base64:U2hhcmVk","note":"stable"}}"#,
         LoadMode::Overwrite,
     )
     .await
     .unwrap();
-    load_jsonl(
-        &main,
+    main.load_jsonl(
         r#"{"type":"Document","data":{"title":"scalar","note":"before"}}"#,
         LoadMode::Merge,
     )
@@ -258,21 +256,16 @@ query set_note($title: String, $note: String) {
     .unwrap();
     let base = snapshot_main(&main).await.unwrap();
     let base_entry = base.dataset("node:Document").expect("base Document entry");
-    let base_table_uri = dir
-        .path()
-        .join(&base_entry.dataset_path)
-        .to_string_lossy()
-        .into_owned();
-    let base_dataset = Dataset::open(&base_table_uri).await.unwrap();
+    let base_dataset = open_pinned_dataset_for_test(&main, "main", "node:Document").await;
     assert!(
         base_dataset.get_fragments().len() >= 2,
         "fixture requires distinct managed and scalar fragments"
     );
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         QUERIES,
         "set_note",
@@ -281,10 +274,6 @@ query set_note($title: String, $note: String) {
     .await
     .unwrap();
 
-    // Pin the exact Lance shallow-clone shape behind the regression: the
-    // untouched managed row scans from a branch fragment whose data file has a
-    // base_id resolving back to main, even though the Dataset URI is the branch
-    // root. Comparing raw Dataset URI + base_id would call this row changed.
     let source = main
         .snapshot_of(ReadTarget::branch("feature"))
         .await
@@ -293,13 +282,17 @@ query set_note($title: String, $note: String) {
         .dataset("node:Document")
         .expect("feature Document entry");
     assert_eq!(source_entry.dataset_path, base_entry.dataset_path);
-    helpers::assert_native_branch_of(source_entry.native_dataset_branch.as_deref(), "feature");
-    let source_table_uri = format!(
-        "{base_table_uri}/tree/{}",
-        source_entry.native_dataset_branch.as_deref().unwrap()
+    assert_eq!(source_entry.native_dataset_branch, None);
+    let source_dataset = open_pinned_dataset_for_test(&main, "feature", "node:Document").await;
+    assert_eq!(
+        source_dataset.uri(),
+        base_dataset.uri(),
+        "the branch write stages on the inherited dataset"
     );
-    let source_dataset = Dataset::open(&source_table_uri).await.unwrap();
-    assert_ne!(source_dataset.uri(), base_dataset.uri());
+    assert_ne!(
+        source_dataset.version().version,
+        base_dataset.version().version
+    );
     let mut scanner = source_dataset.scan();
     scanner.with_row_address();
     let batches = scanner
@@ -366,21 +359,12 @@ query set_note($title: String, $note: String) {
         .expect("base managed fixture data file");
     assert_eq!(base_blob_data_file.base_id, None);
     assert_eq!(blob_data_file.path, base_blob_data_file.path);
-    let inherited_base_id = blob_data_file
-        .base_id
-        .expect("untouched branch Blob file must be inherited");
-    let inherited_base = source_dataset
-        .manifest()
-        .base_paths
-        .get(&inherited_base_id)
-        .expect("inherited Blob base path");
-    assert!(inherited_base.is_dataset_root);
     assert_eq!(
-        omnigraph::storage::normalize_root_uri(&inherited_base.path).unwrap(),
-        omnigraph::storage::normalize_root_uri(base_dataset.uri()).unwrap(),
-        "inherited and local Blob files must resolve to the same physical base"
+        blob_data_file.base_id, None,
+        "the untouched managed row keeps main's own data file, no inherited base"
     );
 
+    let source_pin = helpers::pinned_version(&main, "feature", "node:Document").await;
     let probes = MergeWriteProbes::default();
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
@@ -388,13 +372,20 @@ query set_note($title: String, $note: String) {
     assert_eq!(outcome, MergeOutcome::FastForward);
     assert_eq!(
         probes.stage_known_present_update_rows(),
-        1,
-        "only the scalar row changed; the inherited managed row must be suppressed"
+        0,
+        "a merge onto an unadvanced main is a pointer switch and stages no row"
     );
+    assert_eq!(probes.stage_fenced_insert_calls(), 0);
+    assert_eq!(probes.stage_merge_insert_calls(), 0);
     assert_eq!(
         probes.blob_payload_read_calls(),
         0,
         "suppressing the inherited managed row must avoid Blob selection/materialization"
+    );
+    assert_eq!(
+        helpers::pinned_version(&main, "main", "node:Document").await,
+        source_pin,
+        "main takes the source's pin"
     );
 
     let merged = snapshot_main(&main).await.unwrap();
@@ -441,9 +432,8 @@ query replace_content($title: String, $content: Blob) {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let main = Omnigraph::init(uri, SCHEMA).await.unwrap();
-    load_jsonl(
-        &main,
+    let main = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
+    main.load_jsonl(
         r#"{"type":"Document","data":{"title":"doc","content":"base64:T2xkIQ=="}}"#,
         LoadMode::Overwrite,
     )
@@ -451,9 +441,9 @@ query replace_content($title: String, $content: Blob) {
     .unwrap();
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         QUERIES,
         "replace_content",
@@ -532,8 +522,8 @@ async fn branch_whose_edits_net_to_zero_merges_and_records_its_lineage() {
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
-    apply_net_zero_edge_cycle(&mut feature, "feature").await;
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
+    apply_net_zero_edge_cycle(&feature, "feature").await;
 
     let outcome = main
         .branch_merge("feature", "main")
@@ -568,8 +558,8 @@ async fn net_zero_merge_advances_the_manifest_once_and_moves_no_table() {
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
-    apply_net_zero_edge_cycle(&mut feature, "feature").await;
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
+    apply_net_zero_edge_cycle(&feature, "feature").await;
 
     let before = snapshot_main(&main).await.unwrap();
     let before_version = before.graph_manifest_version();
@@ -609,19 +599,19 @@ async fn net_zero_merge_advances_the_manifest_once_and_moves_no_table() {
 async fn net_zero_merge_leaves_graph_content_unchanged() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
-    apply_net_zero_edge_cycle(&mut feature, "feature").await;
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
+    apply_net_zero_edge_cycle(&feature, "feature").await;
 
-    let friends_before = friend_map(&mut main).await;
+    let friends_before = friend_map(&main).await;
     let knows_before = count_rows(&main, "edge:Knows").await;
     let people_before = count_rows(&main, "node:Person").await;
 
     main.branch_merge("feature", "main").await.unwrap();
 
-    assert_eq!(friend_map(&mut main).await, friends_before);
+    assert_eq!(friend_map(&main).await, friends_before);
     assert_eq!(count_rows(&main, "edge:Knows").await, knows_before);
     assert_eq!(count_rows(&main, "node:Person").await, people_before);
 }
@@ -633,15 +623,15 @@ async fn net_zero_merge_leaves_graph_content_unchanged() {
 async fn net_zero_branch_merges_into_a_target_that_moved() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
-    apply_net_zero_edge_cycle(&mut feature, "feature").await;
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
+    apply_net_zero_edge_cycle(&feature, "feature").await;
 
     // Move the target after the fork so the merge base is neither head.
     mutate_main(
-        &mut main,
+        &main,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Erin")], &[("$age", 41)]),
@@ -668,14 +658,14 @@ async fn net_zero_branch_merges_into_a_target_that_moved() {
 async fn merge_publishes_a_real_delta_alongside_a_net_zero_table() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     // edge:Knows nets to zero; node:Person genuinely gains a row.
-    apply_net_zero_edge_cycle(&mut feature, "feature").await;
+    apply_net_zero_edge_cycle(&feature, "feature").await;
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -694,7 +684,7 @@ async fn merge_publishes_a_real_delta_alongside_a_net_zero_table() {
 
     main.branch_merge("feature", "main").await.unwrap();
 
-    let people = query_main(&mut main, TEST_QUERIES, "total_people", &params(&[]))
+    let people = query_main(&main, TEST_QUERIES, "total_people", &params(&[]))
         .await
         .unwrap();
     assert_eq!(people.num_rows(), 1);
@@ -731,23 +721,23 @@ async fn merge_publishes_a_real_delta_alongside_a_net_zero_table() {
 async fn net_zero_branch_merges_into_a_branch_that_owns_the_table() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let main = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&main, TEST_DATA, LoadMode::Overwrite)
+    let main = helpers::session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    main.load_jsonl(TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     main.branch_create("target").await.unwrap();
 
     // Materialize `target`'s own lineage on edge:Knows before forking `source`,
     // so the merge lands on a table the target branch owns.
-    let mut target = Omnigraph::open(uri).await.unwrap();
-    apply_net_zero_edge_cycle(&mut target, "target").await;
+    let target = helpers::session(Omnigraph::open(uri).await.unwrap());
+    apply_net_zero_edge_cycle(&target, "target").await;
 
     target
         .branch_create_from(ReadTarget::branch("target"), "source")
         .await
         .unwrap();
-    let mut source = Omnigraph::open(uri).await.unwrap();
-    apply_net_zero_edge_cycle(&mut source, "source").await;
+    let source = helpers::session(Omnigraph::open(uri).await.unwrap());
+    apply_net_zero_edge_cycle(&source, "source").await;
 
     let outcome = target
         .branch_merge("source", "target")

@@ -1,6 +1,6 @@
 # issue: none
-# notes: keyed twin of issue_681_sibling_merge_readopts_deleted_edge.gqt: with @key(@src, @dst) (RFC 0044) b0's
-# notes: re-insert upserts the same row, so b1's delete wins in both merges and the pair stays gone.
+# notes: Keyed twin of issue_681_sibling_merge_readopts_deleted_edge.gqt.
+# notes: Re-inserting the same key upserts, so the sibling deletion wins and the pair stays gone.
 
 --- runner
 timeout_ms: 10000

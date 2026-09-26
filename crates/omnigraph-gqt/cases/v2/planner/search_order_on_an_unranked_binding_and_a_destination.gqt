@@ -1,0 +1,65 @@
+# issue: none
+# notes: A search-only order over a pipeline with a second, unranked binding sorts by the score and tie-breaks on every scope binding's id, which the planner reads for the scan; a search order on a traversal destination is refused at planning with the shape named.
+# red_on: 2026-09-23, task 0226 tree before the one-pass tie-break: step 1 failed with `the planned tie-break column 'z.__id' is not in the sort input` (the tie-break was derived at lowering, after projection pushdown); step 2 failed with `column 'd._distance' not found for ordering` instead of a planning refusal.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    embedding: Vector(4) @index
+}
+node Zone {
+    name: String @key
+}
+node Person {
+    name: String @key
+}
+edge Knows: Person -> Doc
+
+--- seed
+{"type":"Doc","data":{"slug":"d000","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d001","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d002","embedding":[2.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d003","embedding":[3.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d004","embedding":[4.0,0.0,0.0,0.0]}}
+{"type":"Zone","data":{"name":"z1"}}
+{"type":"Person","data":{"name":"p1"}}
+{"edge":"Knows","from":"p1","to":"d003"}
+{"edge":"Knows","from":"p1","to":"d004"}
+
+--- query
+set engine = v2;
+query search_only_order_with_an_unranked_binding($q: Vector(4)) {
+    match { $c: Doc $z: Zone }
+    return { $c.slug, $z.name }
+    order { nearest($c.embedding, $q) }
+    limit 3
+}
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+--- expect ordered
+{"c.slug":"d000","z.name":"z1"}
+{"c.slug":"d001","z.name":"z1"}
+{"c.slug":"d002","z.name":"z1"}
+--- expect shape
+c.slug: String
+z.name: String
+--- expect plan
+sort tiebreak [$c, $z]
+
+--- query
+set engine = v2;
+query nearest_on_a_traversal_destination($q: Vector(4)) {
+    match { $p: Person $p knows $d }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 1
+}
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+--- expect error: a traversal destination, which engine v2 does not support

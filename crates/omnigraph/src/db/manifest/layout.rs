@@ -32,13 +32,15 @@ pub(crate) fn manifest_uri(root: &str) -> String {
 ///
 /// The manifest dataset's ref list is the branch registry: a logical branch is
 /// live iff exactly one native ref splits back to it (see `branch_names`).
-/// Absence is the typed public miss; more than one incarnation fails loudly.
+/// Only that branch's own refs are read, so another branch's concurrent
+/// retirement cannot fail this lookup. Absence is the typed public miss; more
+/// than one incarnation fails loudly.
 pub(super) async fn resolve_native_manifest_branch(
     dataset: &Dataset,
     logical: &str,
 ) -> Result<String> {
-    let branches = crate::branch_control::list_live_manifest_branch_contents(dataset).await?;
-    crate::branch_names::resolve_native_branch(branches.keys().map(String::as_str), logical)?
+    crate::branch_control::resolve_live_native_branch(dataset, logical)
+        .await?
         .ok_or_else(|| OmniError::BranchNotFound {
             branch: logical.to_string(),
         })
@@ -141,18 +143,14 @@ pub(super) async fn open_manifest_branch_with_identifier(
     let native = resolve_native_manifest_branch(&dataset, branch).await?;
 
     for _ in 0..BRANCH_IDENTIFIER_CAPTURE_ATTEMPTS {
-        let before = dataset
-            .branches()
-            .get_identifier(Some(&native))
+        let before = crate::branch_control::get_branch_identifier(&dataset, &native)
             .await
             .map_err(|error| branch_ref_error(error, branch))?;
         let branch_dataset = dataset
             .checkout_branch(&native)
             .await
             .map_err(|error| branch_ref_error(error, branch))?;
-        let after = dataset
-            .branches()
-            .get_identifier(Some(&native))
+        let after = crate::branch_control::get_branch_identifier(&dataset, &native)
             .await
             .map_err(|error| branch_ref_error(error, branch))?;
         if before == after {

@@ -1,8 +1,6 @@
 # issue: none
-# notes: two pushed predicates, numeric and string, joined by AND in one scan filter:
-# notes: `$d.n >= 7` admits rows 7..11, `$d.name contains "-00"` admits rows
-# notes: 0..9, the conjunction admits 7, 8, 9: exactly limit 3, so the scan
-# notes: returns k matching rows and the unfiltered top-3 (0, 1, 2) is not it.
+# notes: Both filters must apply before nearest: n >= 7 and name containing "-00" keep only d007..d009.
+# notes: The unfiltered top three (d000..d002) fail the numeric filter.
 
 --- runner
 timeout_ms: 10000
@@ -16,9 +14,6 @@ node Doc {
     n: I64 @index
     name: String @index
     embedding: Vector(4) @index
-}
-
-edge Knows: Doc -> Doc {
 }
 
 --- seed
@@ -36,7 +31,7 @@ edge Knows: Doc -> Doc {
 {"type":"Doc","data":{"slug":"d011","n":11,"name":"doc-011","embedding":[11.0,0.0,0.0,0.0]}}
 
 --- query
-query scenario($q: Vector(4)) {
+query nearest_matching_both_filters($q: Vector(4)) {
     match {
         $d: Doc
         $d.n >= 7

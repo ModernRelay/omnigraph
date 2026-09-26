@@ -1,7 +1,6 @@
 // The crate is `#![cfg(tokio_unstable)]`-gated (tokio's seeded scheduler
 // RNG); without the flag the lib compiles EMPTY, so this file must vanish
-// with it or the workspace gate fails on unresolved imports. CI sets
-// RUSTFLAGS in .github/workflows/dst.yml.
+// with it or the build fails on unresolved imports.
 #![cfg(tokio_unstable)]
 
 //! DST scenario suite — an omnigraph graph living entirely in memory.
@@ -26,9 +25,15 @@ use omnigraph_dst::rand::SplitMix64;
 use omnigraph_dst::{catalog, trace};
 use serial_test::serial;
 
+use omnigraph::Session;
 use omnigraph::db::{InitOptions, Omnigraph};
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
 use omnigraph::storage::{ObjectStorageAdapter, StorageAdapter};
+
+fn session(db: Omnigraph) -> Session {
+    Session::from_defaults(Arc::new(db), SessionSettings::default())
+}
 
 /// Seeded-runtime smoke: the tokio_unstable `rng_seed` current-thread
 /// runtime makes `select!` tie-breaks a pure function of the seed.
@@ -103,13 +108,13 @@ fn dst_harness_same_seed_identical_universes_including_ids() {
 #[test]
 #[serial]
 fn dst_harness_crash_recovery_deterministic() {
-    let _scenario = omnigraph::failpoints::FailScenario::setup();
+    let _scenario = omnigraph::seams::FailScenario::setup();
     let sc = Scenario {
         seed: 21,
         ops: 24,
         crash_at: Some((
             7,
-            omnigraph::failpoints::names::MUTATION_POST_STAGE_PRE_EFFECT_GATE,
+            omnigraph::seams::catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE.name(),
         )),
         ..Default::default()
     };
@@ -133,7 +138,7 @@ fn dst_harness_crash_recovery_deterministic() {
 #[test]
 #[ignore = "hunt: targeted-scheduling catalog run; run explicitly with -- --ignored"]
 fn dst_hunt_crash_window_sweep() {
-    let _scenario = omnigraph::failpoints::FailScenario::setup();
+    let _scenario = omnigraph::seams::FailScenario::setup();
 
     // Per schedulable window: a (seed × skip) matrix — different seeds sample
     // different op streams, skip k schedules the crash on the (k+1)-th
@@ -158,7 +163,9 @@ fn dst_hunt_crash_window_sweep() {
                     // Wide only where its ops are the ONLY route (load.*) —
                     // the wide die dilutes branch-verb frequency and measured
                     // as all merge windows going dark in an all-wide pass.
+                    // The schema face is scoped the same way.
                     wide: omnigraph_dst::harness::window_needs_wide(window),
+                    schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
                     ..Default::default()
                 };
                 let root = format!("shared-memory://dst-hunt-{w}-{seed}-{skip}");
@@ -198,6 +205,7 @@ fn dst_hunt_crash_window_sweep() {
                     crash_on_match: Some((window, skip)),
                     probe_only: true,
                     wide: omnigraph_dst::harness::window_needs_wide(window),
+                    schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
                     ..Default::default()
                 };
                 let root = format!("shared-memory://dst-probe-{w}-{seed}-{skip}");
@@ -233,49 +241,6 @@ fn dst_hunt_crash_window_sweep() {
     );
 }
 
-/// REOPEN-HEALS DISCOVERY pin — the targeted-scheduling hunt's first catch
-/// (2026-08-10, hunt cell window=recovery.sidecar_delete seed=10 skip=1,
-/// minimized to 3 ops): a mutation whose Phase-D sidecar delete fails
-/// SWALLOWS the failure by design (recovery.rs `delete_sidecar`: the write
-/// already published; heal on next write or open) and reports success —
-/// leaving a stale-but-confirmed sidecar. An immediately following
-/// `optimize` refuses with "optimize requires a clean recovery state;
-/// reopen the graph..." (optimize.rs fast-path probe refuses on ANY
-/// sidecar — it cannot cheaply tell stale-confirmed from partial). The
-/// harness treats that refusal as a legal rejection and reopens (the
-/// documented heal); this test pins the whole shape end to end, including
-/// that the universe replays identically.
-#[cfg(feature = "failpoints")]
-#[test]
-#[serial]
-fn dst_discovery5_stale_sidecar_blocks_maintenance_until_reopen() {
-    let _scenario = omnigraph::failpoints::FailScenario::setup();
-    let sc = Scenario {
-        seed: 10,
-        ops: 24,
-        // Arm on the 2nd mutation-class op: its Phase-D delete fails
-        // (swallowed — so this universe records ZERO crashes), the 3rd
-        // sampled op is `optimize` and trips the barrier.
-        crash_on_match: Some(("recovery.sidecar_delete", 1)),
-        ..Default::default()
-    };
-    let a = run_universe("shared-memory://dst-disc5-a", &sc);
-    assert_eq!(
-        a.crashes, 0,
-        "phase-D delete failure must be SWALLOWED (op succeeds; no crash observable)"
-    );
-    assert!(
-        a.legal_rejections >= 1,
-        "the follow-up maintenance op should trip the recovery barrier"
-    );
-    let b = run_universe("shared-memory://dst-disc5-b", &sc);
-    omnigraph_dst::harness::assert_strict_replay(
-        &a,
-        &b,
-        "discovery-5 universe must replay identically",
-    );
-}
-
 /// Regression for the schema-add poisoned traversal originally reduced
 /// from seed 4040 op[17]. Adding an optional property after a mutation must
 /// preserve exact node and edge content on the live, refreshed, and reopened
@@ -291,19 +256,21 @@ fn dst_schema_add_property_after_mutation_preserves_traversal() {
     runtime.block_on(async move {
         let root = "shared-memory://dst-schema-add-traversal";
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-        let mut db = Omnigraph::init_with_storage(
-            root,
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let db = session(
+            Omnigraph::init_with_storage(
+                root,
+                TEST_SCHEMA,
+                storage.clone(),
+                InitOptions::default(),
+            )
+            .await
+            .expect("init"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("load");
         mutate_main(
-            &mut db,
+            &db,
             MUTATION_QUERIES,
             "insert_person",
             &mixed_params(&[("$name", "w3")], &[("$age", 69)]),
@@ -354,9 +321,11 @@ fn dst_schema_add_property_after_mutation_preserves_traversal() {
         );
 
         drop(db);
-        let db2 = Omnigraph::open_with_storage(root, storage)
-            .await
-            .expect("reopen");
+        let db2 = session(
+            Omnigraph::open_with_storage(root, storage)
+                .await
+                .expect("reopen"),
+        );
         assert_eq!(
             person_rows(&db2).await,
             expected_persons,
@@ -392,27 +361,27 @@ fn dst_schema_add_property_after_mutation_preserves_traversal() {
 #[serial]
 fn dst_birth_contract_sweep() {
     use omnigraph_dst::harness::{BirthOutcome, run_birth_universe};
-    let _scenario = omnigraph::failpoints::FailScenario::setup();
+    let _scenario = omnigraph::seams::FailScenario::setup();
 
     #[allow(clippy::type_complexity)]
     let cases: [(&'static str, &dyn Fn(&BirthOutcome) -> bool, &str); 4] = [
         (
-            omnigraph::failpoints::names::INIT_AFTER_SCHEMA_PG_WRITTEN,
+            omnigraph::seams::catalog::INIT_AFTER_SCHEMA_PG_WRITTEN.name(),
             &|o| *o == BirthOutcome::DiedThenReinitRecovers,
             "DiedThenReinitRecovers",
         ),
         (
-            omnigraph::failpoints::names::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN,
+            omnigraph::seams::catalog::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN.name(),
             &|o| *o == BirthOutcome::DiedThenReinitRecovers,
             "DiedThenReinitRecovers",
         ),
         (
-            omnigraph::failpoints::names::INIT_POST_MANIFEST_CREATE,
+            omnigraph::seams::catalog::INIT_POST_MANIFEST_CREATE.name(),
             &|o| *o == BirthOutcome::DiedThenOpensClean,
             "DiedThenOpensClean (post-#495 init-cleanup fix)",
         ),
         (
-            omnigraph::failpoints::names::INIT_AFTER_COORDINATOR_INIT,
+            omnigraph::seams::catalog::INIT_AFTER_COORDINATOR_INIT.name(),
             &|o| *o == BirthOutcome::DiedThenOpensClean,
             "DiedThenOpensClean (post-#495 init-cleanup fix)",
         ),
@@ -445,18 +414,18 @@ fn dst_birth_contract_sweep() {
 #[serial]
 fn dst_open_crash_is_effect_free() {
     use omnigraph_dst::harness::run_open_crash_universe;
-    let _scenario = omnigraph::failpoints::FailScenario::setup();
+    let _scenario = omnigraph::seams::FailScenario::setup();
     assert!(
         run_open_crash_universe(
             "shared-memory://dst-opencrash-contract",
-            omnigraph::failpoints::names::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
+            omnigraph::seams::catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ.name(),
         ),
         "open.before_schema_contract_read is no longer hit on the open path"
     );
     assert!(
         !run_open_crash_universe(
             "shared-memory://dst-opencrash-reload",
-            omnigraph::failpoints::names::SCHEMA_RELOAD_BEFORE_CONTRACT_READ,
+            omnigraph::seams::catalog::SCHEMA_RELOAD_BEFORE_CONTRACT_READ.name(),
         ),
         "schema_reload.before_contract_read started firing on the PLAIN open path — \
          update the birth/open sweeps (it was reload-verb-only when pinned)"
@@ -574,47 +543,10 @@ fn dst_sessions_agree_and_replay() {
     );
 }
 
-/// Faulted merges and separately confirmed retries need raw-row arbitration.
-#[test]
-#[serial]
-fn dst_failed_attempts_arbitrate_on_bound_rows() {
-    for (seed, op, expected) in [(228_316u64, 8, "NotApplied"), (228_319, 14, "AppliedTwice")] {
-        let sc = Scenario {
-            seed,
-            ops: 30,
-            faults: Some(omnigraph_dst::harness::FaultPlan {
-                seed: seed.wrapping_mul(103),
-                error_pct: 0,
-                read_error_pct: 0,
-                latency_pct: 0,
-                max_latency_ms: 1,
-                lance_realm: false,
-                ack_loss_pct: 15,
-                client_retry: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let report = run_universe(&format!("shared-memory://dst-pin-failed-bound-{seed}"), &sc);
-        assert!(
-            report
-                .reconcile_verdicts
-                .iter()
-                .any(|(tag, outcome, channel)| {
-                    tag == &format!("fault@op{op}")
-                        && outcome == expected
-                        && channel == "query+bound"
-                }),
-            "seed {seed} must be ruled on raw rows: {:?}",
-            report.reconcile_verdicts
-        );
-    }
-}
-
 #[test]
 #[serial]
 fn dst_maintenance_commit_uses_execution_branch() {
-    for (seed, write, op) in [(228_301, 118, 13), (228_317, 133, 9)] {
+    for (seed, write, op) in [(228_301, 102, 13), (228_317, 102, 9)] {
         let report = run_universe(
             &format!("shared-memory://dst-maintenance-commit-{seed}"),
             &Scenario {
@@ -811,10 +743,12 @@ async fn person_names_sorted(db: &Omnigraph) -> Vec<String> {
 /// Returns the observable end state.
 async fn run_seeded_workload(root: &str, seed: u64, ops: usize) -> Vec<String> {
     let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-    let mut db = Omnigraph::init_with_storage(root, TEST_SCHEMA, storage, InitOptions::default())
-        .await
-        .expect("init workload root");
-    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+    let db = session(
+        Omnigraph::init_with_storage(root, TEST_SCHEMA, storage, InitOptions::default())
+            .await
+            .expect("init workload root"),
+    );
+    db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
         .await
         .expect("seed data");
 
@@ -829,7 +763,7 @@ async fn run_seeded_workload(root: &str, seed: u64, ops: usize) -> Vec<String> {
         let result = match op {
             0 => {
                 mutate_main(
-                    &mut db,
+                    &db,
                     MUTATION_QUERIES,
                     "insert_person",
                     &mixed_params(&[("$name", name)], &[("$age", age)]),
@@ -838,7 +772,7 @@ async fn run_seeded_workload(root: &str, seed: u64, ops: usize) -> Vec<String> {
             }
             1 => {
                 mutate_main(
-                    &mut db,
+                    &db,
                     MUTATION_QUERIES,
                     "set_age",
                     &mixed_params(&[("$name", name)], &[("$age", age)]),
@@ -847,7 +781,7 @@ async fn run_seeded_workload(root: &str, seed: u64, ops: usize) -> Vec<String> {
             }
             _ => {
                 mutate_main(
-                    &mut db,
+                    &db,
                     MUTATION_QUERIES,
                     "remove_person",
                     &mixed_params(&[("$name", name)], &[]),
@@ -906,7 +840,7 @@ async fn end_state(db: &Omnigraph) -> (Vec<(String, i64)>, usize) {
 /// under the seeded scheduler. An OCC loser's conflict is a LEGAL outcome
 /// when handles race on one root — retried (bounded); every other error is
 /// a real failure.
-async fn actor_workload(mut db: Omnigraph, actor_seed: u64, ops: usize) {
+async fn actor_workload(db: Session, actor_seed: u64, ops: usize) {
     let mut rng = SplitMix64(actor_seed);
     let names = ["w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7"];
     for _ in 0..ops {
@@ -918,7 +852,7 @@ async fn actor_workload(mut db: Omnigraph, actor_seed: u64, ops: usize) {
             let result = match op {
                 0 => {
                     mutate_main(
-                        &mut db,
+                        &db,
                         MUTATION_QUERIES,
                         "insert_person",
                         &mixed_params(&[("$name", name)], &[("$age", age)]),
@@ -927,7 +861,7 @@ async fn actor_workload(mut db: Omnigraph, actor_seed: u64, ops: usize) {
                 }
                 1 => {
                     mutate_main(
-                        &mut db,
+                        &db,
                         MUTATION_QUERIES,
                         "set_age",
                         &mixed_params(&[("$name", name)], &[("$age", age)]),
@@ -936,7 +870,7 @@ async fn actor_workload(mut db: Omnigraph, actor_seed: u64, ops: usize) {
                 }
                 _ => {
                     mutate_main(
-                        &mut db,
+                        &db,
                         MUTATION_QUERIES,
                         "remove_person",
                         &mixed_params(&[("$name", name)], &[]),
@@ -987,27 +921,35 @@ fn concurrent_universe(root: &'static str, seed: u64) -> (Vec<(String, i64)>, us
     runtime.block_on(async move {
         // Identity + clock seams installed: ULIDs and wall-time reads in this
         // universe come from the seed tree / logical clock.
-        omnigraph::dst_ids::install_seeded_ulids(seeds.next_u64());
-        omnigraph::dst_clock::install_logical_clock();
+        let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+            omnigraph::dst_ids::SeededUlids::new(seeds.next_u64()),
+        ));
+        let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+            omnigraph::dst_clock::LogicalClock::default(),
+        ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-        let db = Omnigraph::init_with_storage(
-            root,
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init shared root");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let db = session(
+            Omnigraph::init_with_storage(
+                root,
+                TEST_SCHEMA,
+                storage.clone(),
+                InitOptions::default(),
+            )
+            .await
+            .expect("init shared root"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("seed data");
         drop(db);
 
         let mut handles = Vec::new();
         for actor_seed in actor_seeds {
-            let actor_db = Omnigraph::open_with_storage(root, storage.clone())
-                .await
-                .expect("actor handle on shared root");
+            let actor_db = session(
+                Omnigraph::open_with_storage(root, storage.clone())
+                    .await
+                    .expect("actor handle on shared root"),
+            );
             handles.push(tokio::task::spawn_local(actor_workload(
                 actor_db, actor_seed, 12,
             )));
@@ -1016,9 +958,11 @@ fn concurrent_universe(root: &'static str, seed: u64) -> (Vec<(String, i64)>, us
             handle.await.expect("actor task join");
         }
 
-        let db = Omnigraph::open_with_storage(root, storage)
-            .await
-            .expect("post-run handle");
+        let db = session(
+            Omnigraph::open_with_storage(root, storage)
+                .await
+                .expect("post-run handle"),
+        );
         end_state(&db).await
     })
 }
@@ -1072,11 +1016,12 @@ async fn dst_memory_graph_end_to_end() {
     let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
 
     // Init + load + index, all in memory.
-    let mut db =
+    let db = session(
         Omnigraph::init_with_storage(uri, TEST_SCHEMA, storage.clone(), InitOptions::default())
             .await
-            .expect("init on shared-memory root");
-    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+            .expect("init on shared-memory root"),
+    );
+    db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
         .await
         .expect("load test data");
     db.ensure_indices().await.expect("ensure indices");
@@ -1086,7 +1031,7 @@ async fn dst_memory_graph_end_to_end() {
 
     // Mutate through the normal write path so a commit happens in-memory.
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "DstSpike")], &[("$age", 1)]),
@@ -1098,9 +1043,11 @@ async fn dst_memory_graph_end_to_end() {
     // Reopen through a FRESH handle sharing only the adapter + the process:
     // proves both storage realms persist independent of the first handle.
     drop(db);
-    let db2 = Omnigraph::open_with_storage(uri, storage)
-        .await
-        .expect("reopen on shared-memory root");
+    let db2 = session(
+        Omnigraph::open_with_storage(uri, storage)
+            .await
+            .expect("reopen on shared-memory root"),
+    );
     assert_eq!(
         count_rows(&db2, "node:Person").await,
         persons + 1,
@@ -1159,11 +1106,16 @@ fn dst_v11_fault_injection_atomicity_and_replay() {
 #[test]
 #[serial]
 fn dst_staleness_bite_and_replay() {
+    // Seed 278 since RFC 0067 moved the storage-action schedule three times
+    // (the detached writers, the detached index writer, then the removal of
+    // the per-write `__recovery/` listing): each earlier pin then met a stale
+    // absence of a schema contract file, which the engine refuses as manual
+    // coordination. `dst_staleness_seed_search` lists the green seeds.
     let sc = Scenario {
-        seed: 251,
+        seed: 278,
         ops: 30,
         faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: 25_100,
+            seed: 27_800,
             stale_read_pct: 15,
             stale_list_pct: 15,
             max_lag_ticks: 4,
@@ -1194,6 +1146,66 @@ fn dst_staleness_bite_and_replay() {
         a.commit_ids.len(),
         a.legal_rejections
     );
+}
+
+/// SEARCH INSTRUMENT for the bounded-staleness pin above: enumerate seeds
+/// and print which universes bite, replay identically, keep every oracle
+/// green and make progress, so the pin can be re-chosen when the engine's
+/// storage-action schedule shifts. Not part of the suite.
+#[test]
+#[serial]
+#[ignore = "instrument: bounded-staleness seed search — run explicitly"]
+fn dst_staleness_seed_search() {
+    for seed in 251u64..291 {
+        let sc = Scenario {
+            seed,
+            ops: 30,
+            faults: Some(omnigraph_dst::harness::FaultPlan {
+                seed: seed * 100,
+                stale_read_pct: 15,
+                stale_list_pct: 15,
+                max_lag_ticks: 4,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let a = match omnigraph_dst::harness::run_universe_caught(
+            &format!("shared-memory://dst-s25-search-{seed}-a"),
+            &sc,
+        ) {
+            Ok(report) => report,
+            Err(panic) => {
+                println!(
+                    "seed {seed}: RED {}",
+                    omnigraph_dst::harness::panic_message(&*panic)
+                );
+                continue;
+            }
+        };
+        let b = match omnigraph_dst::harness::run_universe_caught(
+            &format!("shared-memory://dst-s25-search-{seed}-b"),
+            &sc,
+        ) {
+            Ok(report) => report,
+            Err(panic) => {
+                println!(
+                    "seed {seed}: RED on replay {}",
+                    omnigraph_dst::harness::panic_message(&*panic)
+                );
+                continue;
+            }
+        };
+        let replays = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            omnigraph_dst::harness::assert_strict_replay(&a, &b, "search")
+        }))
+        .is_ok();
+        println!(
+            "seed {seed}: bite={} commits={} replay={}",
+            a.stale_reads_served + a.stale_lists_served,
+            a.commit_ids.len(),
+            replays
+        );
+    }
 }
 
 /// the UNBOUNDED-staleness probe (instrument): every read and
@@ -1283,210 +1295,47 @@ fn dst_lance_realm_faults_bite_and_oracles_hold() {
     assert!(a.verified > 0);
 }
 
-/// ONE spelling of the keep-serving scenario shared by the panel, the
-/// widened-arbitration regression, and the seed search — the panel's
-/// re-pin protocol ("screen at THIS test's parameters") holds by
-/// construction, not copy discipline.
-fn keep_serving_scenario(seed: u64, ops: usize, error_pct: u64) -> Scenario {
-    Scenario {
-        seed,
-        ops,
-        faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: seed * 100,
-            error_pct,
-            lance_realm: true,
-            ..Default::default()
-        }),
-        keep_serving_ops: 3,
-        ..Default::default()
-    }
-}
-
-/// The rendered detector tag a wedge red carries — built from the detector
-/// const, never hand-spelled.
-fn wedge_detector_tag() -> String {
-    format!(
-        "detector={}",
-        omnigraph_dst::harness::DET_LIVE_WRITE_AVAILABILITY
-    )
-}
-
-/// Keep-serving defer rows in a report (the wedge-shape evidence the
-/// panel's and the regression's shape asserts count).
-fn keep_serving_defer_rows(report: &omnigraph_dst::harness::UniverseReport) -> usize {
-    report
-        .known_issues
-        .iter()
-        .filter(|row| row.starts_with(omnigraph_dst::harness::KEEP_SERVING_DEFER_PREFIX))
-        .count()
-}
-
-/// Defer-implies-resolution invariant: a universe that deferred must also
-/// have resolved — the watch never outlives its universe unjudged. Keyed
-/// on the producer's exported prefixes, one spelling.
-fn assert_resolution_row(report: &omnigraph_dst::harness::UniverseReport, seed: u64) {
-    assert!(
-        report.known_issues.iter().any(|row| {
-            row.starts_with(omnigraph_dst::harness::KEEP_SERVING_HEALED_PREFIX)
-                || row.starts_with(omnigraph_dst::harness::KEEP_SERVING_INTERRUPTED_PREFIX)
-                || row.starts_with(omnigraph_dst::harness::KEEP_SERVING_EXPIRED_PREFIX)
-        }),
-        "seed {seed}: defer rows without a resolution row"
-    );
-}
-
-/// Exercises live retirement of effect-free Armed mutation/load intents with a short fault panel.
-/// Seed 21 strands Optimize, which lacks exact transaction ownership and requires Full recovery.
-/// Every eligible seed must stay available, and at least one must exercise deferred recovery.
+/// Availability panel under a short, harsh fault plan (issue #554's
+/// descendant). The 13 seeds once wedged a live handle on its own failed
+/// attempt's recovery sidecar; since RFC 0067 no writer arms a recovery
+/// operation, so nothing can wedge and every seed must run green under the
+/// same weather — any red here is a genuine availability or oracle
+/// regression. ops is deliberately SHORT and error_pct HIGH so retry
+/// chains die instead of rescuing a commit.
 #[test]
 #[serial]
-fn dst_keep_serving_wedge_issue_554() {
-    // ops is deliberately SHORT: the panel seeds strand early — a longer
-    // life under this fault plan eventually strands an EFFECTFUL Armed
-    // intent (partial multi-table commit), which the engine CORRECTLY
-    // refuses to retire live; the detector's effect-free precision is
-    // enforced by scenario construction (verifying effect-freedom in the
-    // oracle itself is future work). error_pct is HIGH so retry chains
-    // die instead of rescuing the commit.
-    // Every member is a verified FLIP seed: wedges (or strands harmlessly)
-    // at engine HEAD and heals under the issue-554 engine fix. Seeds 12 and
-    // 18 were screened OUT — their strands stay wedged under the fix
-    // (effectful / excluded-class intents the engine correctly refuses to
-    // retire live — the detector's precision boundary, observed in the
-    // wild; not panel material).
+fn dst_availability_panel_survives_harsh_faults_issue_554() {
     const PANEL: [u64; 13] = [0, 4, 10, 11, 14, 15, 17, 20, 22, 23, 25, 26, 28];
-    let mut wedged: Vec<String> = Vec::new();
-    let mut defer_rows = 0usize;
     for seed in PANEL {
-        let sc = keep_serving_scenario(seed, 10, 80);
+        let sc = Scenario {
+            seed,
+            ops: 10,
+            faults: Some(omnigraph_dst::harness::FaultPlan {
+                seed: seed * 100,
+                error_pct: 80,
+                lance_realm: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         let root = format!("shared-memory://dst-keep-serving-554-{seed}");
-        match omnigraph_dst::harness::run_universe_caught(&root, &sc) {
-            Ok(report) => {
-                let defers = keep_serving_defer_rows(&report);
-                if defers > 0 {
-                    assert_resolution_row(&report, seed);
-                }
-                defer_rows += defers;
-            }
-            Err(panic) => {
-                let message = omnigraph_dst::harness::panic_message(panic.as_ref());
-                if message.contains(&wedge_detector_tag()) {
-                    wedged.push(format!("seed {seed}: {message}"));
-                } else {
-                    // A non-wedge red on a panel seed is a different bug —
-                    // surface it with its seed rather than folding it into
-                    // the wedge verdict.
-                    panic!("seed {seed}: {message}");
-                }
-            }
-        }
+        omnigraph_dst::harness::run_universe_caught(&root, &sc).unwrap_or_else(|panic| {
+            panic!(
+                "seed {seed}: {}",
+                omnigraph_dst::harness::panic_message(panic.as_ref())
+            )
+        });
     }
-    assert!(
-        wedged.is_empty(),
-        "ISSUE-554 PANEL RED: live handles wedged on {} of {} panel seeds.\n\
-         Orientation for a CI reader: at engine HEAD WITHOUT the #554 live-heal \
-         engine fix this red is DESIGNED and expected to flip green when that \
-         fix merges. If that fix is already on this branch's base, this is a \
-         REGRESSION in the live retirement of effect-free Armed intents.\n{}",
-        wedged.len(),
-        PANEL.len(),
-        wedged.join("\n")
-    );
-    assert!(
-        defer_rows > 0,
-        "no panel seed entered the wedge shape (a deferred RecoveryRequired \
-         refusal) — re-pin the panel via dst_keep_serving_wedge_seed_search"
-    );
 }
 
-/// ARBITRATION-WIDENING REGRESSION (#559, "arbitration uses future
-/// state"): a keep-serving resolution judges TWO unjudged ops — the
-/// deferred op and the interrupting op — so its legal set is every
-/// composition and order of the pair (`reconcile_watch_resolution`), never
-/// the one-op set. CANONICAL record of the three proven break shapes:
-/// before the widening these seeds fired false `CrashContract` reds on a
-/// correct engine because (1) the write-entry heal rolled the deferred
-/// op's strand forward mid-watch (the store outran the model), (2) a
-/// state-derived success baked the wrong composition ORDER into the model
-/// (seed 24: the fork copied model-main without the rolled-forward write),
-/// and (3) the resolution's own reopen healed the interrupting op's strand
-/// (seed 47: the after-state held an op no hypothesis contained).
-///
-/// The assert is shape-typed, not outcome-pinned: lance-realm strands are
-/// process-context-sensitive (the panel's lesson), so each seed may end
-/// green or wedge-red (`LiveWriteAvailability` — the pin's designed red at
-/// engine HEAD). Any OTHER red — `CrashContract`, `ArbitrationPhysical`, a
-/// bare panic — is the arbitration bug regressing. The defer-row shape
-/// assert makes total strand evaporation a loud re-pin signal instead of a
-/// vacuous green, and gives the resolution rows a mechanical reader.
-#[test]
-#[serial]
-fn dst_keep_serving_widened_arbitration_no_false_reds() {
-    // The identified false-red class members from the 0..60 search: the two
-    // instrumented specimens (24, 47) plus the other four CrashContract
-    // reds observed under the pre-widening arbitration (8, 16, 46, 51).
-    // The search totals implied a seventh; it never re-fired identifiably
-    // across contexts (lance-realm jitter) and is not individually pinned.
-    const SPECIMENS: [u64; 6] = [8, 16, 24, 46, 47, 51];
-    let mut defer_rows = 0usize;
-    for seed in SPECIMENS {
-        let sc = keep_serving_scenario(seed, 30, 15);
-        let root = format!("shared-memory://dst-keep-serving-widened-{seed}");
-        match omnigraph_dst::harness::run_universe_caught(&root, &sc) {
-            Ok(report) => {
-                let defers = keep_serving_defer_rows(&report);
-                if defers > 0 {
-                    assert_resolution_row(&report, seed);
-                }
-                defer_rows += defers;
-            }
-            Err(panic) => {
-                let message = omnigraph_dst::harness::panic_message(panic.as_ref());
-                assert!(
-                    message.contains(&wedge_detector_tag()),
-                    "seed {seed}: non-wedge red on a widened-arbitration specimen \
-                     (a legal composition is missing from the arbitration's set): {message}"
-                );
-                // A wedge red proves the deferral shape was entered.
-                defer_rows += 1;
-            }
-        }
-    }
-    assert!(
-        defer_rows > 0,
-        "no specimen entered the keep-serving shape — the regression pin is \
-         vacuous; re-pick specimens via dst_keep_serving_wedge_seed_search"
-    );
-}
-
-/// SEARCH INSTRUMENT for the issue-554 catch: enumerate seeds 0..60,
-/// printing each seed's outcome (green with defer counts, or RED with the
-/// rendered violation), so the panel above can be (re)chosen — see the
-/// panel's two-step re-pin protocol.
-/// Not part of the suite — run explicitly with `-- --ignored --nocapture`.
-#[test]
-#[serial]
-#[ignore = "search: enumerate seeds for the issue-554 keep-serving wedge pin"]
-fn dst_keep_serving_wedge_seed_search() {
-    for seed in 0..60u64 {
-        let sc = keep_serving_scenario(seed, 30, 15);
-        let root = format!("shared-memory://dst-keep-serving-search-{seed}");
-        match omnigraph_dst::harness::run_universe_caught(&root, &sc) {
-            Ok(report) => {
-                let defers = keep_serving_defer_rows(&report);
-                println!("seed {seed}: green (defer rows: {defers})");
-            }
-            Err(panic) => {
-                let message = omnigraph_dst::harness::panic_message(panic.as_ref());
-                let hit = message.contains(&wedge_detector_tag());
-                println!(
-                    "seed {seed}: RED{} — {message}",
-                    if hit { " (WEDGE)" } else { "" }
-                );
-            }
-        }
-    }
-}
+// The arbitration-widening regression pin
+// (`dst_keep_serving_widened_arbitration_no_false_reds` and its seed
+// search) retired with RFC 0067's last sidecar writer: a keep-serving
+// deferral needs a live handle refused on a pending recovery operation,
+// and no writer the workload reaches arms one any more (the 0..60 search
+// found no seed entering the shape). The keep-serving machinery itself
+// (`Scenario::keep_serving_ops`, the watch, the widened two-op
+// arbitration) followed once every sidecar writer was gone.
 
 /// ACK-LOSS: the inverse fault direction — the write HAPPENED, but you're
 /// told it failed (a dropped S3 200). Injected AFTER delegation on every
@@ -1508,7 +1357,7 @@ fn dst_ack_loss_bite_and_replay() {
             latency_pct: 0,
             max_latency_ms: 1,
             lance_realm: false,
-            ack_loss_pct: 20,
+            ack_loss_pct: 100,
             client_retry: false,
             ..Default::default()
         }),
@@ -1527,53 +1376,122 @@ fn dst_ack_loss_bite_and_replay() {
     );
     assert!(
         a.acks_lost > 0,
-        "acknowledgements should actually be lost (acks_lost={})",
+        "acknowledgements should actually be lost (acks_lost={}); the adapter realm's routine \
+         writes are Optimize's CSR persist since RFC 0067 removed the sidecars and the reaper \
+         moved to the Lance realm, so every one of them loses its ack here",
         a.acks_lost
     );
     assert!(a.verified > 0);
 }
 
-/// Both ack-lost insert attempts may survive; the row-count oracle and
-/// strict replay must agree with the model for both pinned failure signatures.
+// The ack-loss client-retry pin (`dst_ack_loss_client_retry` and its seed
+// search) retired with RFC 0067's last sidecar writer: the standard
+// workload's only adapter-realm write whose lost acknowledgement failed an
+// op was the recovery sidecar, so no fault seed can exercise a client
+// retry any more (the search enumerated 80 schedules with zero retries).
+// The lost-acknowledgement contract of the manifest CAS itself is owned by
+// the failpoint suite (`GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT` cells per
+// writer); the Lance-realm ack-loss verb below brings the shape back under
+// seeded schedules.
+
+/// LANCE-REALM ACK-LOSS: the follow-up the retirement note above names.
+/// Write-class calls of Lance's own table IO — data files, txn files, and
+/// the `__manifest` dataset's commit puts, the graph-publication door
+/// itself — have their acknowledgement lost AFTER the store applied them.
+/// Under RFC 0067 nothing becomes graph-visible before the manifest
+/// commit, a failed attempt is presumed aborted, and a promotion replay is
+/// refused over its own twin, so every schedule must land in a state the
+/// arbitration accepts ("reconcile arbitrates which picture holds"): an
+/// op whose publication landed durably arbitrates Applied, one that died
+/// staging arbitrates NotApplied, and a client retry runs against its own
+/// durable-but-denied commits and must converge. Green oracles here ARE
+/// the presumed-abort verdict under seeded weather. Replay identity is
+/// deliberately not asserted (the lance-realm replay-envelope note above).
 #[test]
 #[serial]
-fn dst_ack_loss_client_retry() {
-    for (seed, fault_seed, ack_loss_pct, ops) in [(226251, 23303853, 15, 1), (79, 7912, 20, 30)] {
-        let sc = Scenario {
-            seed,
-            ops,
-            faults: Some(omnigraph_dst::harness::FaultPlan {
-                seed: fault_seed,
-                error_pct: 0,
-                read_error_pct: 0,
-                latency_pct: 0,
-                max_latency_ms: 1,
-                lance_realm: false,
-                ack_loss_pct,
-                client_retry: true,
-                ..Default::default()
-            }),
+fn dst_lance_realm_ack_loss_bites_and_oracles_hold() {
+    let sc = Scenario {
+        seed: 89,
+        ops: 30,
+        faults: Some(omnigraph_dst::harness::FaultPlan {
+            seed: 8900,
+            lance_realm: true,
+            ack_loss_pct: 18,
+            client_retry: true,
             ..Default::default()
-        };
-        let a = run_universe(&format!("shared-memory://dst-ackretry-{seed}-a"), &sc);
-        let b = run_universe(&format!("shared-memory://dst-ackretry-{seed}-b"), &sc);
-        omnigraph_dst::harness::assert_strict_replay(
-            &a,
-            &b,
-            "client-retry universes must replay identically",
-        );
-        assert!(
-            a.client_retries > 0,
-            "seed {seed} must exercise a client retry"
-        );
-        assert!(
-            a.reconcile_verdicts
-                .iter()
-                .any(|(_, verdict, channel)| verdict == "AppliedTwice" && channel == "query+bound"),
-            "seed {seed} must account for both inserts using physical rows: {:?}",
-            a.reconcile_verdicts,
-        );
-    }
+        }),
+        ..Default::default()
+    };
+    let r = run_universe("shared-memory://dst-lance-ackloss", &sc);
+    println!(
+        "dst lance ack-loss: {} lance acks lost, {} adapter acks lost, {} client retries, {} legal rejections, {} checks",
+        r.lance_acks_lost, r.acks_lost, r.client_retries, r.legal_rejections, r.verified
+    );
+    assert!(
+        r.lance_acks_lost > 0,
+        "lance-realm acknowledgements should actually be lost (lance_acks_lost={})",
+        r.lance_acks_lost
+    );
+    // The client-retry path must actually be exercised, not merely enabled: a
+    // lost ack of a staging (data/txn) write fails its op and the harness
+    // replays it against its own durable success, which must converge. (Lost
+    // acks of the `__manifest` commit itself instead read back as success in
+    // the engine and never reach a retry — the publisher's ambiguity arm.)
+    assert!(
+        r.client_retries > 0,
+        "the client-retry path should actually fire (client_retries={})",
+        r.client_retries
+    );
+    assert!(r.verified > 0);
+}
+
+/// GENERALIZED LIVENESS (the successor of the retired RecoveryRequired-
+/// specific keep-serving checks): one live handle rides out an entire
+/// adapter-realm fault storm — clean errors, lost acknowledgements, client
+/// retries — and is NEVER reopened (`keep_handle`; `reopens == 0` is the
+/// proof). Every failed op's aftermath is judged through the same handle a
+/// real client would keep, ops keep landing between faults, and the full
+/// oracle stack holds. Adapter realm only ⇒ strict replay identity.
+#[test]
+#[serial]
+fn dst_fault_storm_on_one_live_handle_keeps_writing() {
+    let sc = Scenario {
+        seed: 103,
+        ops: 30,
+        keep_handle: true,
+        faults: Some(omnigraph_dst::harness::FaultPlan {
+            seed: 10300,
+            error_pct: 12,
+            read_error_pct: 6,
+            latency_pct: 10,
+            max_latency_ms: 3,
+            ack_loss_pct: 12,
+            client_retry: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let a = run_universe("shared-memory://dst-live-handle-a", &sc);
+    let b = run_universe("shared-memory://dst-live-handle-b", &sc);
+    println!(
+        "dst live handle: {} reopens, {} legal rejections, {} acks lost, {} client retries, {} checks",
+        a.reopens, a.legal_rejections, a.acks_lost, a.client_retries, a.verified
+    );
+    omnigraph_dst::harness::assert_strict_replay(
+        &a,
+        &b,
+        "live-handle universes must replay identically",
+    );
+    assert_eq!(
+        a.reopens, 0,
+        "the whole storm must run on one never-reopened handle"
+    );
+    assert!(
+        a.legal_rejections > 0,
+        "the storm should actually fail ops on the live handle (legal_rejections={})",
+        a.legal_rejections
+    );
+    assert!(a.verified > 0);
 }
 
 /// CORRUPTION AXIS (read tier): the store LIES (read-time bit rot,
@@ -1679,164 +1597,178 @@ fn dst_corruption_detections_attributed() {
     );
 }
 
-/// CORRUPTION AXIS (persisted tier) — SIDECAR WEATHER, self-healing verbs: lost writes
-/// (success fabricated, effect absent — the claim channel's
-/// claimed-but-invisible shape, inverse of ack-loss) and misdirected writes
-/// (landed at a wrong key in the same keyspace), riding the 08-13 write
-/// census: a standard universe's adapter-realm content writes are exactly
-/// the `__recovery/` sidecars. `error_pct` forces deaths so damaged
-/// sidecar states MEET recovery. Contract under judgment: the two-picture
-/// crash arbitration holds with recovery's own metadata sabotaged, and
-/// injected residue (a lost disarm's stale sidecar, a `dstm-` foreign
-/// file) must HEAL on reopen — recorded pre-reopen in
-/// `attributed_residue`, asserted empty after (the reopen-heals contract
-/// extended over injected residue). Persisted damage flows through
-/// SUSPENDED reads (stored bytes ignore call-path gates), so recovery
-/// genuinely consumes it — no unsuspension knob needed. Strict replay.
+// The sidecar-weather pin (`dst_sidecar_weather_lost_and_misdirected`)
+// retired with the recovery sidecars (RFC 0067 step 5): the lost-write and
+// misdirected-write verbs act on adapter-realm content writes, which in a
+// standard universe were exactly the `__recovery/` sidecars, so they could
+// no longer bite. The `schema_ops` workload writes control objects again
+// (the schema contract files), and `dst_schema_weather_persisted_write_verbs`
+// below is that pin's successor.
+
+/// SCHEMA-OP REQUALIFICATION (the deferred half of the roll-12 quarantine):
+/// the sampler's schema face live under clean storage. Monotone additive
+/// applies interleave the standard mix on seeded schedules; the model
+/// ignores them by construction, so every oracle judges the surrounding
+/// workload across real staged-contract applies (RFC 0067's schema
+/// staging). The face's first seed scan discovered the engine's mono-branch
+/// restriction ("schema apply requires a graph with only main"), now a
+/// model-predicted legal refusal — so branchy schedules validate the typed
+/// refusal while branchless intervals run real applies. Clean IO in both
+/// realms ⇒ strict replay identity is asserted. Seed 7 emits three applies.
 #[test]
 #[serial]
-fn dst_sidecar_weather_lost_and_misdirected() {
+fn dst_schema_ops_randomized_oracles_hold_and_replay() {
     let sc = Scenario {
-        seed: 97,
+        seed: 7,
         ops: 30,
-        faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: 9700,
-            error_pct: 12,
-            lose_write_pct: 15,
-            misdirect_write_pct: 10,
-            ..Default::default()
-        }),
+        schema_ops: true,
         ..Default::default()
     };
-    let a = run_universe("shared-memory://dst-s11b-a", &sc);
-    let b = run_universe("shared-memory://dst-s11b-b", &sc);
+    let a = run_universe("shared-memory://dst-schema-ops-a", &sc);
+    let b = run_universe("shared-memory://dst-schema-ops-b", &sc);
     println!(
-        "dst sidecar-weather: {} lost, {} misdirected, {} consumed, {} residue rows, {} legal rejections",
-        a.writes_lost,
-        a.writes_misdirected,
-        a.persisted_consumed,
-        a.attributed_residue.len(),
-        a.legal_rejections
+        "dst schema ops: {} applies sampled, {} legal rejections, {} checks",
+        a.schema_applies, a.legal_rejections, a.verified
     );
-    for row in &a.attributed_residue {
-        println!("dst sidecar-weather residue: {row}");
-    }
     omnigraph_dst::harness::assert_strict_replay(
         &a,
         &b,
-        "sidecar-weather universes must replay identically",
+        "schema-op universes must replay identically",
     );
     assert!(
-        a.writes_lost + a.writes_misdirected > 0,
-        "the persisted verbs should actually bite (lost={} misdirected={})",
-        a.writes_lost,
-        a.writes_misdirected
+        a.schema_applies > 0,
+        "the schema face should actually emit (schema_applies={})",
+        a.schema_applies
     );
     assert!(a.verified > 0);
 }
 
-/// CORRUPTION AXIS (persisted tier) — FINDING PIN (first contact 2026-08-13, seed 103):
-/// a LOST sidecar-UPDATE write (arm landed, update lost — the file exists
-/// with STALE content) meets recovery's own OCC cross-check — "found
-/// original commit id … but its manifest delta differs" — and recovery
-/// REFUSES THE REOPEN with kind=Internal, permanently: every retry reads
-/// the same stale sidecar, so the whole store is bricked through the
-/// prescribed recovery path (the cleanup-brick class). The DETECTION is
-/// correct (applying a stale delta would corrupt data — the sidecar's
-/// redundancy check working); the finding is the failure MODE: a
-/// full-store brick wearing an internal-error shape, no typed
-/// corrupted-recovery-state diagnosis, no quarantine/skip path. This pin
-/// asserts today's reality EXACTLY (both same-seed runs brick, same
-/// message) so it flips LOUDLY when the engine gains a remedy.
-/// The planned "reopen heals lost disarms" contract was REFUTED by this
-/// first contact — reality: heal holds only for whole-sidecar loss
-/// (absence = rollback), not stale content.
+/// SCHEMA-APPLY CRASH WINDOWS under the randomized workload: a failure at the
+/// detached table commit or the staged contract write, judged by reconcile,
+/// recovery reopen and the full oracle stack (bite-and-replay).
+#[cfg(feature = "failpoints")]
 #[test]
 #[serial]
-fn dst_stale_sidecar_bricks_recovery() {
-    // Seed re-pinned 103 -> 100 (2026-09-01): the graph-index artifact
-    // write (`__graph_index/csr-current.bin`, write_bytes) now consumes a
-    // fault-plan roll, shifting every seed's fault schedule; seed 103 no
-    // longer strands a stale sidecar. Seed 100 reproduces the pinned
-    // intent (both runs brick with the same OCC refusal); found by the
-    // bounded 100..150 search at these exact parameters.
-    let sc = Scenario {
-        seed: 100,
-        ops: 30,
-        faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: 10000,
-            error_pct: 10,
-            lose_write_pct: 25,
+fn dst_schema_apply_crash_windows_bite_and_replay() {
+    let _s = omnigraph::seams::FailScenario::setup();
+    let cells: [(&str, u64, usize, bool); 2] = [
+        ("schema_apply.post_table_commit", 7, 30, true),
+        ("schema_apply.after_staging_write", 7, 30, true),
+    ];
+    for (window, seed, ops, dies) in cells {
+        // Crossing proof first: same seed, record-only callback on the seam
+        // (`probe_only` swaps the injection for observation — same-seam
+        // probe_window + crash_on_match would double-install the seam).
+        let probe = Scenario {
+            seed,
+            ops,
+            schema_ops: true,
+            crash_on_match: Some((window, 0)),
+            probe_only: true,
             ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let brick = |root: &'static str| {
-        let err =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_universe(root, &sc)))
-                .expect_err("stale-sidecar universe must brick until the engine gains a remedy");
-        // Detector-aware extraction: the brick surfaces as a
-        // tagged (Store(Query), CrashContract) violation — reopen failing
-        // for a non-injected reason.
-        let msg = omnigraph_dst::harness::panic_message(err.as_ref());
-        assert!(
-            msg.contains("but its manifest delta differs"),
-            "expected the stale-sidecar OCC refusal, got: {msg}"
+        };
+        let probed = run_universe(
+            &format!("shared-memory://dst-schema-probe-{window}"),
+            &probe,
         );
-        msg.replace(root, "<root>")
-    };
-    let a = brick("shared-memory://dst-s11b-lost-a");
-    let b = brick("shared-memory://dst-s11b-lost-b");
-    assert_eq!(a, b, "the brick must replay identically");
-    println!("dst sidecar-weather finding pin: stale-sidecar recovery brick reproduced: {a}");
+        assert!(
+            probed.crossed,
+            "schema cell {window}: the seam must actually be walked"
+        );
+        let sc = Scenario {
+            seed,
+            ops,
+            schema_ops: true,
+            crash_on_match: Some((window, 0)),
+            ..Default::default()
+        };
+        let first = run_universe(&format!("shared-memory://dst-schema-crash-{window}-a"), &sc);
+        assert_eq!(
+            first.crashes > 0,
+            dies,
+            "schema cell {window}: dying vs absorbing shape (crashes={})",
+            first.crashes
+        );
+        let second = run_universe(&format!("shared-memory://dst-schema-crash-{window}-b"), &sc);
+        omnigraph_dst::harness::assert_strict_replay(&first, &second, "schema cell: strict replay");
+    }
 }
 
-/// Pins consumed persisted corruption and an attributed refusal, with strict replay.
-/// Malformed sidecars can stop recovery; this specimen is not a fleet availability guarantee.
+/// PERSISTED-TIER WRITE VERBS, revived (the successor of the retired
+/// sidecar-weather pin above): with the schema face on, the adapter realm's
+/// content writes are the schema contract files, and the write-time
+/// corruption / lost-write / misdirected-write verbs have live subjects
+/// again. These verbs are STORE LIES (success acknowledged, wrong or no
+/// bytes durable), so the contract is the violation tier's
+/// detected-or-harmless: either the damage only ever grazes writes whose
+/// loss the apply absorbs (universe completes, oracles green), or the
+/// engine detects the lie on the schema control plane and refuses LOUDLY,
+/// which fails the universe's own observation reads — a caught, typed,
+/// deterministic death, never silent acceptance. Seed 101 empirically takes
+/// the refusal arm (a misdirected `__schema_state.json` install); both arms
+/// assert pairwise determinism.
 #[test]
 #[serial]
-fn dst_corrupt_write_first_contact() {
+fn dst_schema_weather_persisted_lies_detected_or_harmless() {
     let sc = Scenario {
-        seed: 112,
+        seed: 101,
         ops: 30,
+        schema_ops: true,
         faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: 11204,
-            error_pct: 12,
-            corrupt_write_pct: 25,
+            seed: 10100,
+            corrupt_write_pct: 10,
+            lose_write_pct: 8,
+            misdirect_write_pct: 8,
             ..Default::default()
         }),
         ..Default::default()
     };
-    let a = run_universe("shared-memory://dst-s11b-corrupt", &sc);
-    println!(
-        "dst sidecar-weather corrupt-write: {} corrupted, {} consumed, {} detections, {} legal rejections",
-        a.writes_corrupted,
-        a.persisted_consumed,
-        a.corruption_detections.len(),
-        a.legal_rejections
-    );
-    for row in &a.corruption_detections {
-        println!("dst sidecar-weather detection: {row}");
+    let a =
+        omnigraph_dst::harness::run_universe_caught("shared-memory://dst-schema-weather-a", &sc);
+    let b =
+        omnigraph_dst::harness::run_universe_caught("shared-memory://dst-schema-weather-b", &sc);
+    match (a, b) {
+        (Err(a), Err(b)) => {
+            let ma = omnigraph_dst::harness::panic_message(a.as_ref());
+            let mb = omnigraph_dst::harness::panic_message(b.as_ref());
+            for message in [&ma, &mb] {
+                // Require the engine's exact control-plane refusal string. A
+                // looser `contains("schema")` would also pass on a genuine
+                // DET_LEGAL_CLAIM oracle violation (whose text names "schema
+                // apply"), masking a real red as the intended refusal arm.
+                assert!(
+                    message.contains("does not match the recorded schema state"),
+                    "the death must be the engine's typed control-plane refusal, \
+                     not an oracle violation, got: {message}"
+                );
+            }
+            assert_eq!(ma, mb, "the refusal arm must be deterministic");
+            println!(
+                "dst schema weather: refusal arm — {}",
+                ma.lines().next().unwrap_or("")
+            );
+        }
+        (Ok(a), Ok(b)) => {
+            println!(
+                "dst schema weather: harmless arm — {} applies, {} corrupted, {} lost, {} misdirected",
+                a.schema_applies, a.writes_corrupted, a.writes_lost, a.writes_misdirected
+            );
+            omnigraph_dst::harness::assert_strict_replay(
+                &a,
+                &b,
+                "schema-weather universes must replay identically",
+            );
+            assert!(
+                a.writes_corrupted + a.writes_lost + a.writes_misdirected > 0,
+                "the persisted-tier write verbs should actually bite again \
+                 (corrupted={} lost={} misdirected={})",
+                a.writes_corrupted,
+                a.writes_lost,
+                a.writes_misdirected
+            );
+        }
+        _ => panic!("the two same-seed universes took different arms — nondeterministic outcome"),
     }
-    assert!(
-        a.writes_corrupted > 0,
-        "corrupt-write should actually bite (writes_corrupted={})",
-        a.writes_corrupted
-    );
-    assert!(
-        a.persisted_consumed > 0,
-        "an engine read must consume persisted damage, not merely leave an unobserved write"
-    );
-    assert!(
-        !a.corruption_detections.is_empty(),
-        "the first-contact specimen must record a refusal attributed to consumed corruption"
-    );
-    let replay = run_universe("shared-memory://dst-s11b-corrupt-replay", &sc);
-    omnigraph_dst::harness::assert_strict_replay(
-        &a,
-        &replay,
-        "adapter-realm persisted corruption must strictly replay",
-    );
 }
 
 /// CRASH-STATE ENUMERATION (sampled; ALICE-style crash-state
@@ -2037,11 +1969,11 @@ fn dst_crash_state_enumeration_full() {
 #[test]
 #[serial]
 fn dst_maintenance_obligations_bite_and_replay() {
-    let _s = omnigraph::failpoints::FailScenario::setup();
+    let _s = omnigraph::seams::FailScenario::setup();
     let cells: [(&str, u64, usize); 3] = [
         ("optimize.before_compact", 7, 24),
-        ("cleanup.post_recovery_check_pre_gates", 7, 24),
-        ("ensure_indices.post_effects_pre_confirm", 9, 24),
+        ("cleanup.pre_gates", 7, 24),
+        ("ensure_indices.post_table_effect", 9, 24),
     ];
     for (window, seed, ops) in cells {
         let sc = Scenario {
@@ -2066,6 +1998,45 @@ fn dst_maintenance_obligations_bite_and_replay() {
             "s20 cell {window}: strict replay",
         );
     }
+    for keep_handle in [false, true] {
+        let report = run_universe(
+            &format!("shared-memory://dst-s20-returned-cleanup-{keep_handle}"),
+            &returned_cleanup_error_scenario(keep_handle),
+        );
+        assert_eq!(report.crashes, 0, "this route returns an ordinary error");
+        assert!(!report.crash_state_hit);
+        assert!(
+            report.lance_realm_injected > 0,
+            "storage faults must be delivered"
+        );
+        assert_eq!(
+            report.maintenance_reruns, 1,
+            "the one failed Cleanup must receive its clean convergence pass"
+        );
+        assert!(
+            report
+                .reconcile_verdicts
+                .iter()
+                .any(|(context, _, _)| context.starts_with("fault@op"))
+        );
+        assert_eq!(report.reopens == 0, keep_handle);
+    }
+}
+
+#[cfg(feature = "failpoints")]
+fn returned_cleanup_error_scenario(keep_handle: bool) -> Scenario {
+    Scenario {
+        seed: 7,
+        ops: 3,
+        reach_target: Some("cleanup.pre_gates"),
+        keep_handle,
+        faults: Some(omnigraph_dst::harness::FaultPlan {
+            read_error_pct: 100,
+            lance_realm: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 /// SENSITIVITY PROOF (a green oracle is worthless until
@@ -2076,36 +2047,54 @@ fn dst_maintenance_obligations_bite_and_replay() {
 #[test]
 #[serial]
 fn dst_sensitivity_maintenance_rerun_failure_is_red() {
-    let _s = omnigraph::failpoints::FailScenario::setup();
-    let sc = Scenario {
-        seed: 7,
-        ops: 24,
-        crash_on_match: Some(("optimize.before_compact", 0)),
-        fail_maintenance_rerun: true,
-        ..Default::default()
-    };
-    let result = omnigraph_dst::harness::run_universe_caught("shared-memory://dst-s20-red", &sc);
-    let Err(panic) = result else {
-        panic!("s20 sensitivity: a failing rerun MUST redden the universe");
-    };
-    let msg = omnigraph_dst::harness::panic_message(panic.as_ref());
-    assert!(
-        msg.contains("MAINTENANCE OBLIGATION"),
-        "s20 sensitivity: the red must name the obligation, got: {msg}"
-    );
-    // The recorded violation must carry the EXPECTED detector tag.
-    let violation = panic
-        .downcast_ref::<omnigraph_dst::detectors::Violation>()
-        .expect("s20 sensitivity: the red must be a detector-tagged Violation");
-    assert_eq!(
-        violation.detector,
-        omnigraph_dst::harness::DET_MAINTENANCE,
-        "s20 sensitivity: wrong detector tag"
-    );
-    assert!(
-        msg.contains("detector=Store(Query)/MaintenanceObligations"),
-        "s20 sensitivity: the rendered row must carry the detector field, got: {msg}"
-    );
+    let _s = omnigraph::seams::FailScenario::setup();
+    let mut cases = ["optimize.before_compact", "cleanup.pre_gates"]
+        .into_iter()
+        .map(|window| {
+            (
+                window.to_string(),
+                Scenario {
+                    seed: 7,
+                    ops: 24,
+                    crash_on_match: Some((window, 0)),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    cases.extend([false, true].into_iter().map(|keep_handle| {
+        (
+            format!("returned-cleanup-{keep_handle}"),
+            returned_cleanup_error_scenario(keep_handle),
+        )
+    }));
+    for (case, mut sc) in cases {
+        sc.fail_maintenance_rerun = true;
+        let result = omnigraph_dst::harness::run_universe_caught(
+            &format!("shared-memory://dst-s20-red-{case}"),
+            &sc,
+        );
+        let Err(panic) = result else {
+            panic!("s20 sensitivity: a failing rerun MUST redden the universe");
+        };
+        let msg = omnigraph_dst::harness::panic_message(panic.as_ref());
+        assert!(
+            msg.contains("MAINTENANCE OBLIGATION"),
+            "s20 sensitivity: the red must name the obligation, got: {msg}"
+        );
+        let violation = panic
+            .downcast_ref::<omnigraph_dst::detectors::Violation>()
+            .expect("s20 sensitivity: the red must be a detector-tagged Violation");
+        assert_eq!(
+            violation.detector,
+            omnigraph_dst::harness::DET_MAINTENANCE,
+            "s20 sensitivity: wrong detector tag"
+        );
+        assert!(
+            msg.contains("detector=Store(Query)/MaintenanceObligations"),
+            "s20 sensitivity: the rendered row must carry the detector field, got: {msg}"
+        );
+    }
 }
 
 /// SETUP CRASHES: windows whose precondition is a
@@ -2118,7 +2107,7 @@ fn dst_sensitivity_maintenance_rerun_failure_is_red() {
 /// - recovery.* internals: each executes only during a recovery pass of the
 ///   matching SHAPE — primary picked from the ledger's commit-point map
 ///   (post_phase_b merge = roll-forward; post_table_commit mutation =
-///   rollback+restore; post_sidecar_pre_fork = zero-effect orphan discard;
+///   rollback+restore; post_fork_pre_commit = zero-effect orphan discard;
 ///   post_finalize = any recovery pass for the list/audit steps).
 fn census_setup(window: &'static str) -> Option<(&'static str, usize)> {
     match window {
@@ -2150,7 +2139,7 @@ fn census_setup(window: &'static str) -> Option<(&'static str, usize)> {
 #[serial]
 #[ignore = "instrument: law-8 predict_merge disagreement triage — run explicitly"]
 fn dst_predict_triage() {
-    let _s = omnigraph::failpoints::FailScenario::setup();
+    let _s = omnigraph::seams::FailScenario::setup();
     let windows = [
         "branch_merge.adopt_after_append_pre_upsert",
         "branch_merge.adopt_after_upsert_pre_delete",
@@ -2170,6 +2159,7 @@ fn dst_predict_triage() {
                 probe_window: Some(window),
                 reach_target: Some(window),
                 wide: omnigraph_dst::harness::window_needs_wide(window),
+                schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
                 ..Default::default()
             };
             let root = format!("shared-memory://dst-law8-{idx}-{base}");
@@ -2205,7 +2195,7 @@ fn dst_predict_triage() {
 #[test]
 #[serial]
 fn dst_milestone_never_remerges_merged_branch() {
-    let _scenario = omnigraph::failpoints::FailScenario::setup();
+    let _scenario = omnigraph::seams::FailScenario::setup();
     let window = "branch_merge.adopt_between_insert_chunks";
     let sc = Scenario {
         seed: 218120,
@@ -2233,48 +2223,270 @@ fn dst_milestone_never_remerges_merged_branch() {
     omnigraph_dst::harness::assert_strict_replay(&a, &b, "milestone-remerge pin: strict replay");
 }
 
-/// BENCH HARNESS — the COUNTING PASS golden: one standard universe's
-/// storage actions, tallied per op kind and per realm-verb at both
-/// interposition points, compared byte-for-byte against the checked-in
-/// golden (`cost_table.txt`, crate root; regen with DST_REGEN_COSTS=1).
-/// Exact deterministic counts, no wall-clock claims; the counting must
-/// replay identically before the golden is trusted. A diff is a NAMED
-/// cost regression ("Optimize's l.put count moved").
-///
-/// Lance 11's tag checks add one LIST per native branch reclaim, including
-/// absent-tree cleanup before create/first-touch. The fixture's String @keys
-/// implicitly create FTS indexes: RFC 0043 defers their incremental folding.
-/// An optimizer-only ablation removed 21 Optimize PUTs (85 -> 64); the full
-/// path adds two artifact-certificate PUTs (64 -> 66). The lower Optimize,
-/// audit, and verification read counts also replay under that ablation: they
-/// follow the reduced folding/version work, not a general performance win.
-///
-/// Fold-eligible planning also skips one FTS-only no-op in this universe:
-/// Optimize adapter PUT/DELETE each fall 3 -> 2 (no empty recovery cycle).
-/// Skipping its apply-phase fresh snapshot removes two schema EXISTS and
-/// three schema GETs, plus the unnecessary manifest/index reads (Lance GET
-/// 642 -> 622, LIST 72 -> 71). Lance PUT stays 66 and every other op's counts
-/// stay identical: useful maintenance work and verification are unchanged.
-///
-/// The graph-index artifact (`__graph_index/csr-current.bin`) adds one
-/// Optimize adapter PUT (write_bytes, 2 -> 3); its probes surface as adapter
-/// GETs (`read_bytes_if_exists_bounded` tallies as a.get: Optimize 60 -> 63
-/// plus EXISTS 38 -> 42, _audit 114 -> 116, _verify 564 -> 575) and stamp-fresh
-/// loads shave a few cold-build Lance GETs (_audit 1222 -> 1221,
-/// _verify 2079 -> 2074; Optimize l.get 622 -> 628 from the save-side stamping).
-///
-/// Graph-wide borrower proofs add first-touch reads; lineage identity creation
-/// and exact captured-view reuse avoid unrelated branch opens. Net changes are
-/// AddFriend 382/74 -> 396/75 and InsertLegacy 291/60 -> 278/58.
-/// Empty cleanup sweeps skip the proof and two old branch-registry LISTs.
-/// Count retention uses version_refs() to avoid 18 manifest GETs, reducing
-/// Cleanup GET/LIST 227/136 -> 209/134. Other counts are unchanged.
-/// A branch first-touch write lists the table's refs once before arming, so
-/// an orphan ref is dropped pre-arm: AddFriend/InsertLegacy LIST 75/58 -> 76/59.
+/// Branch creation reads stay independent of unrelated retired history.
+/// The provider meter observes native ref IO that dataset wrappers can miss.
+#[test]
+#[serial]
+fn dst_branch_creation_reads_ignore_unrelated_retired_history() {
+    let _s = omnigraph::seams::FailScenario::setup();
+    struct BranchCreationCost {
+        retired_count: usize,
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for BranchCreationCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            db.branch_create("source").await.unwrap();
+            for index in 0..self.retired_count {
+                let name = format!("unrelated-retired/branch-{index}");
+                db.branch_create(&name).await.unwrap();
+                db.branch_delete(&name).await.unwrap();
+            }
+
+            omnigraph_dst::cost::set_label("CreateMain");
+            db.branch_create("fresh").await.unwrap();
+            omnigraph_dst::cost::set_label("CreateFromCold");
+            db.branch_create_from("source", "from-source")
+                .await
+                .unwrap();
+            omnigraph_dst::cost::set_label("CreateFromWarm");
+            db.branch_create_from("source", "from-source-warm")
+                .await
+                .unwrap();
+            omnigraph_dst::cost::set_label("_verify");
+            assert_eq!(
+                db.branch_list().await.unwrap(),
+                vec!["main", "fresh", "from-source", "from-source-warm", "source"]
+            );
+        }
+    }
+
+    omnigraph_dst::lance_faults::install();
+    let mut baseline_reads = None;
+    for retired_count in [0, 16] {
+        let environment = omnigraph_dst::memory::MemoryEnvironment::new(
+            format!("shared-memory://dst-branch-create-retired-{retired_count}"),
+            22_901,
+            omnigraph_dst::UniverseProcess::Shared,
+        );
+        let ledger = omnigraph_dst::cost::arm();
+        let run = omnigraph_dst::run_universe(&environment, &BranchCreationCost { retired_count });
+        let table = ledger.render_calls();
+        omnigraph_dst::cost::disarm();
+        run.cleanup.unwrap().unwrap();
+        run.result.unwrap().unwrap();
+        let reads = table
+            .lines()
+            .filter_map(|line| {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                (fields[1] == "l.get"
+                    && ["CreateMain", "CreateFromCold", "CreateFromWarm"].contains(&fields[0]))
+                .then(|| {
+                    (
+                        fields[0].to_string(),
+                        fields[2]
+                            .strip_prefix("calls=")
+                            .unwrap()
+                            .parse::<u64>()
+                            .unwrap(),
+                    )
+                })
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            reads.len(),
+            3,
+            "every creation route must reach the physical meter: {table}"
+        );
+        assert!(reads.values().all(|count| *count > 0), "{table}");
+        if let Some(baseline) = &baseline_reads {
+            assert_eq!(
+                &reads, baseline,
+                "unrelated retired lifetimes must not add physical branch creation reads: {table}"
+            );
+        } else {
+            baseline_reads = Some(reads);
+        }
+    }
+}
+
+/// Successful deletion must remove retired lifetimes from creation's physical reads.
+/// Reopen and provider-level metering keep a warm cache from hiding history growth.
+#[test]
+#[serial]
+fn dst_branch_recreation_reads_ignore_same_name_retired_history() {
+    let _s = omnigraph::seams::FailScenario::setup();
+    struct BranchRecreationCost {
+        retired_count: usize,
+        reopen: bool,
+        from_source: bool,
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage>
+        for BranchRecreationCost
+    {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            db.branch_create("source").await.unwrap();
+            db.branch_create_from("source", "source-primer")
+                .await
+                .unwrap();
+            db.branch_delete("source-primer").await.unwrap();
+            for _ in 0..self.retired_count {
+                if self.from_source {
+                    db.branch_create_from("source", "recycled").await.unwrap();
+                } else {
+                    db.branch_create("recycled").await.unwrap();
+                }
+                db.branch_delete("recycled").await.unwrap();
+            }
+
+            let db = if self.reopen {
+                omnigraph_dst::cost::set_label("_reopen");
+                drop(db);
+                session(
+                    Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                db
+            };
+            omnigraph_dst::cost::set_label("Create");
+            if self.from_source {
+                db.branch_create_from("source", "recycled").await.unwrap();
+            } else {
+                db.branch_create("recycled").await.unwrap();
+            }
+            omnigraph_dst::cost::set_label("_verify");
+            assert_eq!(
+                db.branch_list().await.unwrap(),
+                vec!["main", "recycled", "source"]
+            );
+            assert_eq!(
+                person_rows_on(&db, "recycled").await,
+                person_rows_on(&db, "source").await
+            );
+        }
+    }
+
+    omnigraph_dst::lance_faults::install();
+    let mut baselines = std::collections::BTreeMap::new();
+    let mut regressions = Vec::new();
+    for retired_count in [0, 1, 16] {
+        for reopen in [false, true] {
+            for from_source in [false, true] {
+                let handle = if reopen { "reopened" } else { "warm" };
+                let route = if from_source {
+                    "branch_create_from"
+                } else {
+                    "branch_create"
+                };
+                let environment = omnigraph_dst::memory::MemoryEnvironment::new(
+                    format!(
+                        "shared-memory://dst-branch-recreate-{retired_count}-{reopen}-{from_source}"
+                    ),
+                    22_902,
+                    omnigraph_dst::UniverseProcess::Shared,
+                );
+                let ledger = omnigraph_dst::cost::arm();
+                let run = omnigraph_dst::run_universe(
+                    &environment,
+                    &BranchRecreationCost {
+                        retired_count,
+                        reopen,
+                        from_source,
+                    },
+                );
+                let table = ledger.render_calls();
+                omnigraph_dst::cost::disarm();
+                run.cleanup.unwrap().unwrap();
+                run.result.unwrap().unwrap();
+                let reads = table
+                    .lines()
+                    .filter_map(|line| {
+                        let fields = line.split_whitespace().collect::<Vec<_>>();
+                        (fields[0] == "Create" && matches!(fields[1], "l.get" | "l.list")).then(
+                            || {
+                                (
+                                    fields[1].to_string(),
+                                    fields[2]
+                                        .strip_prefix("calls=")
+                                        .unwrap()
+                                        .parse::<u64>()
+                                        .unwrap(),
+                                )
+                            },
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                assert_eq!(
+                    reads.len(),
+                    2,
+                    "creation must reach both physical read meters: {table}"
+                );
+                assert!(reads.values().all(|count| *count > 0), "{table}");
+                if retired_count == 0 {
+                    baselines.insert((reopen, from_source), reads);
+                } else {
+                    let baseline = &baselines[&(reopen, from_source)];
+                    if &reads != baseline {
+                        regressions.push(format!(
+                            "retired={retired_count} handle={handle} route={route}: \
+                             baseline={baseline:?}, observed={reads:?}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(baselines.len(), 4);
+    assert!(
+        regressions.is_empty(),
+        "same-name retirement history must not add physical branch creation reads:\n{}",
+        regressions.join("\n")
+    );
+}
+
+/// The counting-pass golden: one universe's storage actions per op kind and
+/// realm-verb, replayed identically, then compared with `cost_table.txt`
+/// (regen with DST_REGEN_COSTS=1); every changed line is a named cost change.
 #[test]
 #[serial]
 fn dst_bench_cost_count_golden() {
-    let _s = omnigraph::failpoints::FailScenario::setup();
+    let _s = omnigraph::seams::FailScenario::setup();
     let sc = Scenario {
         seed: 7,
         ops: 30,
@@ -2343,18 +2555,24 @@ fn dst_lance_bytes_canary() {
         .build_local(Default::default())
         .expect("canary runtime");
     runtime.block_on(Box::pin(async move {
-        omnigraph::dst_ids::install_seeded_ulids(11_002);
-        omnigraph::dst_clock::install_logical_clock();
+        let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+            omnigraph::dst_ids::SeededUlids::new(11_002),
+        ));
+        let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+            omnigraph::dst_clock::LogicalClock::default(),
+        ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-        let db = Omnigraph::init_with_storage(
-            root,
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let db = session(
+            Omnigraph::init_with_storage(
+                root,
+                TEST_SCHEMA,
+                storage.clone(),
+                InitOptions::default(),
+            )
+            .await
+            .expect("init"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("fixtures");
         drop(db);
@@ -2444,8 +2662,8 @@ fn dst_lance_bytes_canary() {
             "the canary never bit — no fired cell affected a read (all \
              miss/unfired); target substring or read path needs rework"
         );
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
+        drop(_clock);
+        drop(_ids);
     }));
 }
 
@@ -2463,7 +2681,7 @@ fn dst_lance_bytes_canary() {
 #[serial]
 #[ignore = "instrument: reborn-branch cache-poison reader ablation — run explicitly"]
 fn dst_reborn_branch_cache_poison_reader_ablation() {
-    let _s = omnigraph::failpoints::FailScenario::setup();
+    let _s = omnigraph::seams::FailScenario::setup();
     #[allow(clippy::type_complexity)] // (label, knob-mutator) cells
     let cells: [(&str, fn(&mut Scenario)); 14] = [
         ("baseline", |_| {}),
@@ -2535,13 +2753,6 @@ fn dst_reborn_branch_cache_poison_standalone_repro() {
 }
 
 fn reborn_branch_cache_poison_body() {
-    struct DstHookGuard;
-    impl Drop for DstHookGuard {
-        fn drop(&mut self) {
-            omnigraph::dst_clock::uninstall_logical_clock();
-            omnigraph::dst_ids::uninstall_seeded_ulids();
-        }
-    }
     let mut seeds = SplitMix64(9401);
     let runtime_seed = seeds.next_u64();
     let ulid_seed = seeds.next_u64();
@@ -2554,21 +2765,24 @@ fn reborn_branch_cache_poison_body() {
         .build_local(Default::default())
         .expect("seeded runtime");
     runtime.block_on(Box::pin(async move {
-        omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-        omnigraph::dst_clock::install_logical_clock();
-        // Uninstall on BOTH exits: a failing assertion below must not leak
-        // the process-global DST hooks into the next #[serial] test.
-        let _dst_hooks = DstHookGuard;
+        let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+            omnigraph::dst_ids::SeededUlids::new(ulid_seed),
+        ));
+        let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+            omnigraph::dst_clock::LogicalClock::default(),
+        ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-        let db = Omnigraph::init_with_storage(
-            "shared-memory://dst-f9-standalone",
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let db = session(
+            Omnigraph::init_with_storage(
+                "shared-memory://dst-f9-standalone",
+                TEST_SCHEMA,
+                storage.clone(),
+                InitOptions::default(),
+            )
+            .await
+            .expect("init"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("load");
         macro_rules! m {
@@ -2578,7 +2792,7 @@ fn reborn_branch_cache_poison_body() {
             };
         }
         // The two arming reads: exactly observe_world's surface.
-        async fn world_read(db: &Omnigraph) {
+        async fn world_read(db: &Session) {
             let mut names = db.branch_list().await.expect("branch list");
             names.sort();
             for name in names {
@@ -2586,7 +2800,7 @@ fn reborn_branch_cache_poison_body() {
                 let _ = Box::pin(omnigraph_dst::fixtures::knows_pairs_on(db, &name)).await;
             }
         }
-        let mut db = db;
+        let db = db;
         m!(
             db,
             "main",
@@ -2769,7 +2983,7 @@ fn reborn_branch_cache_poison_body() {
 #[test]
 #[serial]
 fn dst_reborn_branch_cache_poison_wide_face_regression() {
-    let _s = omnigraph::failpoints::FailScenario::setup();
+    let _s = omnigraph::seams::FailScenario::setup();
     let sc = Scenario {
         seed: 10_133,
         ops: 30,
@@ -2804,18 +3018,22 @@ fn dst_reborn_branch_cache_poison_minimal_shape_probe() {
         .build_local(Default::default())
         .expect("probe runtime");
     runtime.block_on(Box::pin(async move {
-        omnigraph::dst_ids::install_seeded_ulids(9_002);
-        omnigraph::dst_clock::install_logical_clock();
+        let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+            omnigraph::dst_ids::SeededUlids::new(9_002),
+        ));
+        let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+            omnigraph::dst_clock::LogicalClock::default(),
+        ));
 
         // EXACTLY observe_world's reads: person traversal + edge traversal
         // on the branch (the query channel — graph index machinery), not a
         // raw snapshot scan.
-        async fn read_branch(db: &Omnigraph, branch: &str) -> usize {
+        async fn read_branch(db: &Session, branch: &str) -> usize {
             let p = Box::pin(omnigraph_dst::fixtures::person_rows_on(db, branch)).await;
             let e = Box::pin(omnigraph_dst::fixtures::knows_pairs_on(db, branch)).await;
             p.len() + e.len()
         }
-        async fn insert(db: &mut Omnigraph, branch: &str, name: &str, age: i64) -> String {
+        async fn insert(db: &Session, branch: &str, name: &str, age: i64) -> String {
             let params = mixed_params(&[("$name", name)], &[("$age", age)]);
             match mutate_on(db, branch, MUTATION_QUERIES, "insert_person", &params).await {
                 Ok(_) => "OK".to_string(),
@@ -2826,75 +3044,81 @@ fn dst_reborn_branch_cache_poison_minimal_shape_probe() {
         // (a) fork -> read -> first write
         {
             let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-            let mut db = Omnigraph::init_with_storage(
-                &format!("{root_base}-a"),
-                TEST_SCHEMA,
-                storage,
-                InitOptions::default(),
-            )
-            .await
-            .expect("init a");
-            load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &format!("{root_base}-a"),
+                    TEST_SCHEMA,
+                    storage,
+                    InitOptions::default(),
+                )
+                .await
+                .expect("init a"),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
                 .await
                 .expect("fixtures a");
             db.branch_create("b0").await.expect("branch a");
             let n = read_branch(&db, "b0").await;
-            let v = insert(&mut db, "b0", "mina", 1).await;
+            let v = insert(&db, "b0", "mina", 1).await;
             println!("dst cache-poison min (a) fork->read({n})->write: {v}");
         }
         // (b) prior churn on main, then fork -> read -> first write
         {
             let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-            let mut db = Omnigraph::init_with_storage(
-                &format!("{root_base}-b"),
-                TEST_SCHEMA,
-                storage,
-                InitOptions::default(),
-            )
-            .await
-            .expect("init b");
-            load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &format!("{root_base}-b"),
+                    TEST_SCHEMA,
+                    storage,
+                    InitOptions::default(),
+                )
+                .await
+                .expect("init b"),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
                 .await
                 .expect("fixtures b");
             for i in 0..6 {
-                insert(&mut db, "main", &format!("mc{i}"), i).await;
+                insert(&db, "main", &format!("mc{i}"), i).await;
             }
             db.branch_create("b0").await.expect("branch b");
             let n = read_branch(&db, "b0").await;
-            let v = insert(&mut db, "b0", "minb", 2).await;
+            let v = insert(&db, "b0", "minb", 2).await;
             println!("dst cache-poison min (b) churn->fork->read({n})->write: {v}");
         }
         // (c) the second-life shape: fork, write, merge back, delete,
         // re-create, READ the reborn branch, then its first write.
         {
             let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-            let mut db = Omnigraph::init_with_storage(
-                &format!("{root_base}-c"),
-                TEST_SCHEMA,
-                storage,
-                InitOptions::default(),
-            )
-            .await
-            .expect("init c");
-            load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &format!("{root_base}-c"),
+                    TEST_SCHEMA,
+                    storage,
+                    InitOptions::default(),
+                )
+                .await
+                .expect("init c"),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
                 .await
                 .expect("fixtures c");
             db.branch_create("b0").await.expect("branch c1");
-            insert(&mut db, "b0", "life1", 3).await;
+            insert(&db, "b0", "life1", 3).await;
             Box::pin(db.branch_merge("b0", "main"))
                 .await
                 .expect("merge c");
             Box::pin(db.branch_delete("b0")).await.expect("delete c");
             db.branch_create("b0").await.expect("branch c2");
             let n = read_branch(&db, "b0").await;
-            let v = insert(&mut db, "b0", "life2", 4).await;
+            let v = insert(&db, "b0", "life2", 4).await;
             println!(
                 "dst cache-poison min (c) life1->merge->delete->rebirth->read({n})->write: {v}"
             );
         }
 
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
+        drop(_clock);
+        drop(_ids);
     }));
 }
 
@@ -2918,26 +3142,32 @@ fn dst_predict_born_on_both_person_probe() {
         .build_local(Default::default())
         .expect("probe runtime");
     runtime.block_on(Box::pin(async move {
-        omnigraph::dst_ids::install_seeded_ulids(8_002);
-        omnigraph::dst_clock::install_logical_clock();
-        let mut db = Omnigraph::init_with_storage(
-            root,
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+            omnigraph::dst_ids::SeededUlids::new(8_002),
+        ));
+        let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+            omnigraph::dst_clock::LogicalClock::default(),
+        ));
+        let db = session(
+            Omnigraph::init_with_storage(
+                root,
+                TEST_SCHEMA,
+                storage.clone(),
+                InitOptions::default(),
+            )
+            .await
+            .expect("init"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("fixtures");
         db.branch_create("bb").await.expect("branch");
         // Same @key, same values, born on BOTH sides since the fork.
         let params = mixed_params(&[("$name", "bob2")], &[("$age", 41)]);
-        mutate_on(&mut db, "bb", MUTATION_QUERIES, "insert_person", &params)
+        mutate_on(&db, "bb", MUTATION_QUERIES, "insert_person", &params)
             .await
             .expect("insert on branch");
-        mutate_on(&mut db, "main", MUTATION_QUERIES, "insert_person", &params)
+        mutate_on(&db, "main", MUTATION_QUERIES, "insert_person", &params)
             .await
             .expect("insert on main");
         let merge = Box::pin(db.branch_merge("bb", "main")).await;
@@ -2958,10 +3188,10 @@ fn dst_predict_born_on_both_person_probe() {
         let p2b = mixed_params(&[("$name", "carol2")], &[("$age", 10)]);
         let p2m = mixed_params(&[("$name", "carol2")], &[("$age", 99)]);
         db.branch_create("bb2").await.expect("branch 2");
-        mutate_on(&mut db, "bb2", MUTATION_QUERIES, "insert_person", &p2b)
+        mutate_on(&db, "bb2", MUTATION_QUERIES, "insert_person", &p2b)
             .await
             .expect("insert on branch 2");
-        mutate_on(&mut db, "main", MUTATION_QUERIES, "insert_person", &p2m)
+        mutate_on(&db, "main", MUTATION_QUERIES, "insert_person", &p2m)
             .await
             .expect("insert on main 2");
         match Box::pin(db.branch_merge("bb2", "main")).await {
@@ -2979,8 +3209,8 @@ fn dst_predict_born_on_both_person_probe() {
             }
         }
         drop(db);
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
+        drop(_clock);
+        drop(_ids);
     }));
 }
 
@@ -2990,13 +3220,14 @@ fn dst_predict_born_on_both_person_probe() {
 /// `crash_on_match` probe_only (record-only crossing). Reports per-window
 /// crossed/not and the tally. Success target: every milestone-reachable
 /// window crosses in its single universe; the residue (recovery internals,
-/// schema quarantine, init/open) is expected dark for NAMED reasons.
+/// init/open) is expected dark for NAMED reasons. (The schema families
+/// left the dark list when the `schema_ops` face requalified them.)
 ///   cargo test -p omnigraph-dst dst_window_reach_probe -- --ignored --nocapture
 #[test]
 #[serial]
 #[ignore = "instrument: 66-window one-universe-each milestone reach census"]
 fn dst_window_reach_probe() {
-    let _s = omnigraph::failpoints::FailScenario::setup();
+    let _s = omnigraph::seams::FailScenario::setup();
     let mut crossed: Vec<&str> = Vec::new();
     let mut dark: Vec<&str> = Vec::new();
     let mut errored: Vec<&str> = Vec::new();
@@ -3017,6 +3248,7 @@ fn dst_window_reach_probe() {
                 reach_target: Some(window),
                 wide: omnigraph_dst::harness::window_needs_wide(window)
                     || setup.is_some_and(|(w, _)| omnigraph_dst::harness::window_needs_wide(w)),
+                schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
                 ..Default::default()
             };
             let root = format!("shared-memory://dst-reach-{idx}-{attempt}");
@@ -3049,11 +3281,12 @@ fn dst_window_reach_probe() {
         errored.len()
     );
     // Non-regression floor: the census measured 50/66 on 2026-08-12; the
-    // 16 non-crossing windows all carry NAMED reasons (schema quarantine,
-    // birth-owned init, #473-blocked adopts, chunk thresholds,
-    // branch-from-branch first-touch shapes, kill-territory orphan
-    // discard). Floor 48 leaves margin for benign seed sensitivity; a
-    // bigger drop = a recipe-mechanism regression.
+    // then-16 non-crossing windows all carried NAMED reasons (schema
+    // quarantine — since requalified by the `schema_ops` face, whose
+    // windows now cross — birth-owned init, #473-blocked adopts, chunk
+    // thresholds, branch-from-branch first-touch shapes, kill-territory
+    // orphan discard). Floor 48 leaves margin for benign seed sensitivity;
+    // a bigger drop = a recipe-mechanism regression.
     assert!(
         crossed.len() >= 48,
         "milestone reach regressed below the measured 50 ({} crossed)",
@@ -3100,7 +3333,7 @@ fn known_failure_family(msg: &str) -> Option<&'static str> {
 fn dst_fleet() {
     // The window arm schedules real crash windows — same setup the hunt
     // and the reach probe perform.
-    let _s = omnigraph::failpoints::FailScenario::setup();
+    let _s = omnigraph::seams::FailScenario::setup();
     let n: u64 = std::env::var("DST_FLEET_SEEDS")
         .ok()
         .and_then(|s| s.trim().parse().ok())
@@ -3239,6 +3472,7 @@ fn dst_fleet() {
                     crash_on_match: Some((window, 0)),
                     reach_target: Some(window),
                     wide: omnigraph_dst::harness::window_needs_wide(window),
+                    schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
                     ..Default::default()
                 },
                 &mut failures,
@@ -3364,7 +3598,7 @@ fn fleet_replay_bundle(
 #[test]
 #[serial]
 fn dst_seeded_violation_is_auto_bundled() {
-    let _s = omnigraph::failpoints::FailScenario::setup();
+    let _s = omnigraph::seams::FailScenario::setup();
     let sc = Scenario {
         seed: 7,
         ops: 24,
@@ -3435,17 +3669,23 @@ fn dst_v11_conservation_transfers() {
             .build_local(Default::default())
             .expect("seeded runtime");
         runtime.block_on(async move {
-            omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-            omnigraph::dst_clock::install_logical_clock();
+            let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+                omnigraph::dst_ids::SeededUlids::new(ulid_seed),
+            ));
+            let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+                omnigraph::dst_clock::LogicalClock::default(),
+            ));
             let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-            let mut db = Omnigraph::init_with_storage(
-                root,
-                TEST_SCHEMA,
-                storage.clone(),
-                InitOptions::default(),
-            )
-            .await
-            .expect("init");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    root,
+                    TEST_SCHEMA,
+                    storage.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .expect("init"),
+            );
 
             // Accounts: 4 people, ages summing to a fixed total.
             let accounts = ["acc0", "acc1", "acc2", "acc3"];
@@ -3456,7 +3696,7 @@ fn dst_v11_conservation_transfers() {
             for (name, bal) in &balances {
                 ver += 1;
                 mutate_main(
-                    &mut db,
+                    &db,
                     MUTATION_QUERIES,
                     "insert_person_v",
                     &mixed_params(&[("$name", name)], &[("$age", *bal), ("$ver", ver)]),
@@ -3483,7 +3723,7 @@ fn dst_v11_conservation_transfers() {
                 ver += 1;
                 let vb = ver;
                 mutate_main(
-                    &mut db,
+                    &db,
                     MUTATION_QUERIES,
                     "transfer",
                     &mixed_params(
@@ -3514,8 +3754,8 @@ fn dst_v11_conservation_transfers() {
             }
 
             let rows = person_rows(&db).await;
-            omnigraph::dst_clock::uninstall_logical_clock();
-            omnigraph::dst_ids::uninstall_seeded_ulids();
+            drop(_clock);
+            drop(_ids);
             rows
         })
     }
@@ -3525,10 +3765,12 @@ fn dst_v11_conservation_transfers() {
     assert_eq!(a, b, "conservation universes must replay identically");
 }
 
-/// DOUBLE-FAULT lever — CRASH-DURING-RECOVERY: die in a workload window,
-/// then die AGAIN inside the recovery sweep, then let a clean reopen finish.
-/// "Does recovery recover from its own death?" — the least-tested code in any
-/// storage engine. Must still land atomically and replay identically.
+/// DOUBLE-FAULT lever — CRASH-DURING-REOPEN: die in a workload window after a
+/// detached table commit, then die AGAIN inside the reopen, then let a clean
+/// reopen finish. Since RFC 0067 the reopen runs no recovery sweep over table
+/// effects (the unpublished detached commit is garbage), so the second fault
+/// lands on the open path itself, which every reopen crosses. Must still land
+/// atomically and replay identically.
 #[cfg(feature = "failpoints")]
 #[test]
 #[serial]
@@ -3536,8 +3778,11 @@ fn dst_lever1_crash_during_recovery() {
     let sc = Scenario {
         seed: 4242,
         ops: 20,
-        crash_at: Some((6, omnigraph::failpoints::names::MUTATION_POST_TABLE_COMMIT)),
-        recovery_crash: Some(omnigraph::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH),
+        crash_at: Some((
+            6,
+            omnigraph::seams::catalog::MUTATION_POST_TABLE_COMMIT.name(),
+        )),
+        recovery_crash: Some(omnigraph::seams::catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ.name()),
         ..Default::default()
     };
     let a = run_universe("shared-memory://dst-l1-a", &sc);
@@ -3592,18 +3837,24 @@ fn dst_lever2_branch_lifecycle() {
             .build_local(Default::default())
             .expect("seeded runtime");
         runtime.block_on(async move {
-            omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-            omnigraph::dst_clock::install_logical_clock();
+            let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+                omnigraph::dst_ids::SeededUlids::new(ulid_seed),
+            ));
+            let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+                omnigraph::dst_clock::LogicalClock::default(),
+            ));
             let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-            let db = Omnigraph::init_with_storage(
-                root,
-                TEST_SCHEMA,
-                storage.clone(),
-                InitOptions::default(),
-            )
-            .await
-            .expect("init");
-            load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+            let db = session(
+                Omnigraph::init_with_storage(
+                    root,
+                    TEST_SCHEMA,
+                    storage.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .expect("init"),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
                 .await
                 .expect("load");
 
@@ -3629,8 +3880,8 @@ fn dst_lever2_branch_lifecycle() {
             db.branch_delete("feature").await.expect("branch delete");
             let after = db.branch_list().await.expect("branch list 2");
 
-            omnigraph::dst_clock::uninstall_logical_clock();
-            omnigraph::dst_ids::uninstall_seeded_ulids();
+            drop(_clock);
+            drop(_ids);
             (main_before, after.len())
         })
     }
@@ -3660,18 +3911,24 @@ fn dst_merge_version_collision_diverged_edge_table() {
         .build_local(Default::default())
         .expect("seeded runtime");
     runtime.block_on(async move {
-        omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-        omnigraph::dst_clock::install_logical_clock();
+        let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+            omnigraph::dst_ids::SeededUlids::new(ulid_seed),
+        ));
+        let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+            omnigraph::dst_clock::LogicalClock::default(),
+        ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-        let db = Omnigraph::init_with_storage(
-            "shared-memory://dst-merge-collision",
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let db = session(
+            Omnigraph::init_with_storage(
+                "shared-memory://dst-merge-collision",
+                TEST_SCHEMA,
+                storage.clone(),
+                InitOptions::default(),
+            )
+            .await
+            .expect("init"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("load");
 
@@ -3746,8 +4003,8 @@ fn dst_merge_version_collision_diverged_edge_table() {
             );
         }
 
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
+        drop(_clock);
+        drop(_ids);
     })
 }
 
@@ -3768,18 +4025,24 @@ fn dst_merge_duplicates_born_on_both_edge() {
         .build_local(Default::default())
         .expect("seeded runtime");
     runtime.block_on(async move {
-        omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-        omnigraph::dst_clock::install_logical_clock();
+        let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+            omnigraph::dst_ids::SeededUlids::new(ulid_seed),
+        ));
+        let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+            omnigraph::dst_clock::LogicalClock::default(),
+        ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-        let db = Omnigraph::init_with_storage(
-            "shared-memory://dst-class-probe",
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let db = session(
+            Omnigraph::init_with_storage(
+                "shared-memory://dst-class-probe",
+                TEST_SCHEMA,
+                storage.clone(),
+                InitOptions::default(),
+            )
+            .await
+            .expect("init"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("load");
 
@@ -3870,8 +4133,8 @@ fn dst_merge_duplicates_born_on_both_edge() {
             }
         }
 
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
+        drop(_clock);
+        drop(_ids);
     })
 }
 
@@ -3909,18 +4172,24 @@ edge WorksAt: Person -> Company
         .build_local(Default::default())
         .expect("seeded runtime");
     runtime.block_on(async move {
-        omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-        omnigraph::dst_clock::install_logical_clock();
+        let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+            omnigraph::dst_ids::SeededUlids::new(ulid_seed),
+        ));
+        let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+            omnigraph::dst_clock::LogicalClock::default(),
+        ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-        let db = Omnigraph::init_with_storage(
-            "shared-memory://dst-keyed-born-on-both",
-            KEYED_TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let db = session(
+            Omnigraph::init_with_storage(
+                "shared-memory://dst-keyed-born-on-both",
+                KEYED_TEST_SCHEMA,
+                storage.clone(),
+                InitOptions::default(),
+            )
+            .await
+            .expect("init"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("load");
 
@@ -3997,8 +4266,8 @@ edge WorksAt: Person -> Company
             );
         }
 
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
+        drop(_clock);
+        drop(_ids);
     })
 }
 
@@ -4040,7 +4309,7 @@ fn dst_classa_ablation_matrix_body() {
         ))
         .build_local(Default::default())
         .expect("seeded runtime");
-    async fn upsert(db: &Omnigraph, br: &str, name: &str, age: i64, ver: i64) {
+    async fn upsert(db: &Session, br: &str, name: &str, age: i64, ver: i64) {
         db.mutate(
             br,
             MUTATION_QUERIES,
@@ -4051,22 +4320,22 @@ fn dst_classa_ablation_matrix_body() {
         .unwrap_or_else(|e| panic!("upsert {name} v{ver} on {br}: {e:?}"));
     }
     runtime.block_on(async move {
-        omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-        omnigraph::dst_clock::install_logical_clock();
+        let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(omnigraph::dst_ids::SeededUlids::new(ulid_seed)));
+        let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(omnigraph::dst_clock::LogicalClock::default()));
         let mut verdicts: Vec<(bool, bool, bool, String)> = Vec::new();
         for combo in 0u8..8 {
             let (o, c, r) = (combo & 1 != 0, combo & 2 != 0, combo & 4 != 0);
             let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
             let root = format!("shared-memory://dst-classa-{combo}");
-            let mut db = Omnigraph::init_with_storage(
+            let db = session(Omnigraph::init_with_storage(
                 &root,
                 TEST_SCHEMA,
                 storage.clone(),
                 InitOptions::default(),
             )
             .await
-            .expect("init");
-            load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+            .expect("init"));
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
                 .await
                 .expect("load");
             // Churn: births + rewrite-upserts (deletion files) on main.
@@ -4150,15 +4419,15 @@ fn dst_classa_ablation_matrix_body() {
         // second merge, and the Knows fork before the Person fork.
         {
             let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-            let db = Omnigraph::init_with_storage(
+            let db = session(Omnigraph::init_with_storage(
                 "shared-memory://dst-classa-faithful",
                 TEST_SCHEMA,
                 storage.clone(),
                 InitOptions::default(),
             )
             .await
-            .expect("init");
-            load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+            .expect("init"));
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
                 .await
                 .expect("load");
             macro_rules! m {
@@ -4166,7 +4435,7 @@ fn dst_classa_ablation_matrix_body() {
                     $db.mutate($br, MUTATION_QUERIES, $q, &mixed_params($s, $n)).await
                 };
             }
-            let mut db = db;
+            let db = db;
             m!(db, "main", "set_age_v", &[("$name", "w5")], &[("$age", 70), ("$ver", 1)]).expect("op0");
             m!(db, "main", "insert_person", &[("$name", "w6")], &[("$age", 7)]).expect("op1");
             db.branch_create("b0").await.expect("op2");
@@ -4206,8 +4475,8 @@ fn dst_classa_ablation_matrix_body() {
                 }
             }
         }
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
+        drop(_clock);
+        drop(_ids);
     })
 }
 
@@ -4234,18 +4503,24 @@ fn dst_liveness_oracle_survives_cross_thread_work() {
         .build_local(Default::default())
         .expect("seeded runtime");
     runtime.block_on(async move {
-        omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-        omnigraph::dst_clock::install_logical_clock();
+        let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+            omnigraph::dst_ids::SeededUlids::new(ulid_seed),
+        ));
+        let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+            omnigraph::dst_clock::LogicalClock::default(),
+        ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-        let db = Omnigraph::init_with_storage(
-            "shared-memory://dst-liveness-bound",
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let db = session(
+            Omnigraph::init_with_storage(
+                "shared-memory://dst-liveness-bound",
+                TEST_SCHEMA,
+                storage.clone(),
+                InitOptions::default(),
+            )
+            .await
+            .expect("init"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("load");
 
@@ -4261,8 +4536,8 @@ fn dst_liveness_oracle_survives_cross_thread_work() {
             .expect("liveness bound tripped on a converging ensure_indices")
             .expect("ensure_indices");
 
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
+        drop(_clock);
+        drop(_ids);
     })
 }
 
@@ -5008,15 +5283,17 @@ fn dst_optimize_races_branch_delete_minimal_two_thread_negative() {
             .expect("setup runtime");
         let storage = storage.clone();
         runtime.block_on(async move {
-            let db = Omnigraph::init_with_storage(
-                root,
-                TEST_SCHEMA,
-                storage.clone(),
-                InitOptions::default(),
-            )
-            .await
-            .expect("init");
-            load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+            let db = session(
+                Omnigraph::init_with_storage(
+                    root,
+                    TEST_SCHEMA,
+                    storage.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .expect("init"),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
                 .await
                 .expect("fixtures");
             drop(db);
@@ -5046,9 +5323,11 @@ fn dst_optimize_races_branch_delete_minimal_two_thread_negative() {
                         .build_local(Default::default())
                         .expect("optimize runtime");
                     runtime.block_on(Box::pin(async move {
-                        let mut db = Omnigraph::open_with_storage(root, storage)
-                            .await
-                            .expect("optimize handle");
+                        let db = session(
+                            Omnigraph::open_with_storage(root, storage)
+                                .await
+                                .expect("optimize handle"),
+                        );
                         barrier.wait();
                         for round in 0..80u32 {
                             // Real work first: an optimize over an unchanged
@@ -5060,8 +5339,8 @@ fn dst_optimize_races_branch_delete_minimal_two_thread_negative() {
                                     &[("$name", name)],
                                     &[("$age", (round as i64) * 2 + j as i64 + 1)],
                                 );
-                                let _ = mutate_main(&mut db, MUTATION_QUERIES, "set_age", &params)
-                                    .await;
+                                let _ =
+                                    mutate_main(&db, MUTATION_QUERIES, "set_age", &params).await;
                             }
                             match Box::pin(db.optimize()).await {
                                 Ok(_) => {}
@@ -5111,9 +5390,11 @@ fn dst_optimize_races_branch_delete_minimal_two_thread_negative() {
                         .build_local(Default::default())
                         .expect("churn runtime");
                     runtime.block_on(Box::pin(async move {
-                        let mut db = Omnigraph::open_with_storage(root, storage)
-                            .await
-                            .expect("churn handle");
+                        let db = session(
+                            Omnigraph::open_with_storage(root, storage)
+                                .await
+                                .expect("churn handle"),
+                        );
                         barrier.wait();
                         let mut i = 0u64;
                         while !stop.load(std::sync::atomic::Ordering::SeqCst) {
@@ -5138,14 +5419,9 @@ fn dst_optimize_races_branch_delete_minimal_two_thread_negative() {
                                 &[("$name", format!("f12p{i}").as_str())],
                                 &[("$age", 77)],
                             );
-                            let _ = mutate_on(
-                                &mut db,
-                                &name,
-                                MUTATION_QUERIES,
-                                "insert_person",
-                                &params,
-                            )
-                            .await;
+                            let _ =
+                                mutate_on(&db, &name, MUTATION_QUERIES, "insert_person", &params)
+                                    .await;
                             if let Err(err) = Box::pin(db.branch_delete(&name)).await {
                                 let rendered = format!("{err:?}");
                                 assert!(
@@ -5190,7 +5466,7 @@ fn dst_optimize_races_branch_delete_minimal_two_thread_negative() {
 #[serial]
 #[ignore = "0044 analysis instrument — run by hand with --ignored"]
 fn dst_bench_same_ruler_floor_probe() {
-    let _s = omnigraph::failpoints::FailScenario::setup();
+    let _s = omnigraph::seams::FailScenario::setup();
     // kind -> (seed, calls table); BTreeMap so the printout is stable.
     let mut cells: std::collections::BTreeMap<String, (u64, String)> = Default::default();
     for seed in 0..120u64 {

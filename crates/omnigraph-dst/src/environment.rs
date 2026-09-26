@@ -4,6 +4,10 @@ use std::future::Future;
 
 use futures::FutureExt;
 
+use omnigraph::dst_clock::Clock;
+use omnigraph::dst_ids::IdSource;
+use omnigraph::seams::{Installed, ThreadLocal};
+
 use crate::harness::{UNIVERSE_STACK_BYTES, clear_process_slots};
 use crate::rand::SplitMix64;
 
@@ -60,16 +64,29 @@ impl<T: std::fmt::Debug> std::fmt::Debug for UniverseRun<T> {
     }
 }
 
-#[derive(Debug)]
-struct InstalledEnvironment(UniverseProcess);
+/// Holds the universe thread's seeded-execution guards. Dropping the guards
+/// uninstalls the clock and id source; both slots are thread-local, so the
+/// value must stay on the universe thread.
+struct InstalledEnvironment {
+    process: UniverseProcess,
+    _clock: Option<Installed<dyn Clock, ThreadLocal<dyn Clock>>>,
+    _ids: Option<Installed<dyn IdSource, ThreadLocal<dyn IdSource>>>,
+}
+
+impl InstalledEnvironment {
+    fn new(process: UniverseProcess) -> Self {
+        Self {
+            process,
+            _clock: None,
+            _ids: None,
+        }
+    }
+}
 
 impl Drop for InstalledEnvironment {
     fn drop(&mut self) {
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
-        omnigraph::dst_gate::uninstall_gate_hook();
         clear_process_slots();
-        if self.0 == UniverseProcess::Isolated {
+        if self.process == UniverseProcess::Isolated {
             crate::entropy::disarm();
         }
     }
@@ -111,7 +128,7 @@ pub fn run_universe<E: UniverseEnvironment, S: UniverseScenario<E::Resources>>(
             .name("dst-universe".into())
             .stack_size(UNIVERSE_STACK_BYTES)
             .spawn_scoped(scope, move || {
-                let _environment = InstalledEnvironment(process);
+                let mut installed = InstalledEnvironment::new(process);
                 if process == UniverseProcess::Isolated {
                     crate::entropy::arm(entropy_seed);
                 }
@@ -127,8 +144,12 @@ pub fn run_universe<E: UniverseEnvironment, S: UniverseScenario<E::Resources>>(
                     .expect("seeded current-thread runtime");
 
                 let run = runtime.block_on(Box::pin(async {
-                    omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-                    omnigraph::dst_clock::install_logical_clock();
+                    installed._ids = Some(omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+                        omnigraph::dst_ids::SeededUlids::new(ulid_seed),
+                    )));
+                    installed._clock = Some(omnigraph::dst_clock::CLOCK.install(
+                        std::sync::Arc::new(omnigraph::dst_clock::LogicalClock::default()),
+                    ));
                     let setup = std::panic::AssertUnwindSafe(async { environment.setup().await })
                         .catch_unwind()
                         .await;

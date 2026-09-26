@@ -1,0 +1,90 @@
+# issue: none
+# notes: An I64 column or literal compared with a fractional F64 keeps the fraction on every arm:
+# notes: the projection, its swapped operands, an assignment constant and the pushed scan filter agree.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    age: I64
+    adult: Bool
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a","age":2,"adult":true}}
+
+--- query
+set engine = v2;
+query projected() {
+    match { $p: Person }
+    return { 2 = 2.7 as same, $p.age = 2.7 as row_same, 2.7 = $p.age as swapped, $p.age < 2.7 as below, 2.0 = $p.age as whole }
+}
+
+--- expect unordered
+{"same": false, "row_same": false, "swapped": false, "below": true, "whole": true}
+
+--- expect shape
+same: Bool
+row_same: Bool
+swapped: Bool
+below: Bool
+whole: Bool
+
+--- mutate
+query assign($age: I64) {
+    update Person set { adult: $age = 2.7 } where slug = "a"
+}
+
+--- params
+{"age": 2}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query stored() {
+    match { $p: Person }
+    return { $p.adult }
+}
+
+--- expect unordered
+{"p.adult": false}
+
+--- expect shape
+p.adult: Bool
+
+--- query
+set engine = v2;
+query pushed_filter() {
+    match { $p: Person  $p.age = 2.7 }
+    return { $p.slug }
+}
+
+--- expect unordered
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query pushed_filter_below() {
+    match { $p: Person  $p.age < 2.7 }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "a"}
+
+--- expect shape
+p.slug: String
+
+--- mutate
+query pushed_mutation() {
+    update Person set { adult: true } where age = 2.7
+}
+
+--- expect affected: nodes=0 edges=0

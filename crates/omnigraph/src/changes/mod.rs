@@ -19,7 +19,11 @@ use std::collections::{BTreeMap, HashSet};
 use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
 use omnigraph_compiler::SystemColumns;
 
-use self::row_compare::{OrderedRows, RawRow, rows_equal_across_vintages, user_schema_fingerprint};
+use self::candidate_scan::{EmitSource, interval_candidate_plan};
+use self::enumerate::Emit;
+use self::row_compare::{
+    OrderedRows, RawRow, ScanTargets, rows_equal_across_vintages, user_schema_fingerprint,
+};
 use crate::db::DatasetEntry;
 use crate::db::manifest::{Snapshot, TableIdentity, system_columns_at_image};
 use crate::error::{OmniError, Result};
@@ -236,7 +240,24 @@ pub(crate) async fn diff_snapshots(
             (Some(from), None) => diff_table_removed(table_store, from, is_edge, filter).await?,
             // Fast path: version-column diff
             (Some(from), Some(to)) if same_lineage(from_entry, to_entry) => {
-                diff_table_same_lineage(table_store, from, to, is_edge, filter).await?
+                match diff_table_same_lineage(table_store, from, to, is_edge, filter).await? {
+                    Some(changes) => changes,
+                    // RFC 0067: the `to` endpoint is a pending pin's detached
+                    // version. Rows staged on a detached predecessor carry
+                    // stamps outside the linear interval, so compare exactly.
+                    None => {
+                        diff_table_cross_branch(
+                            table_store,
+                            from,
+                            to,
+                            is_edge,
+                            filter,
+                            type_name,
+                            to_commit_id.as_deref().unwrap_or_default(),
+                        )
+                        .await?
+                    }
+                }
             }
             // Cross-branch path: streaming ID-based diff
             (Some(from), Some(to)) => {
@@ -279,12 +300,17 @@ pub(crate) async fn diff_snapshots(
     })
 }
 
+/// Whether two registrations name one table state, the pin included: two
+/// branches staging detached on one dataset share `published_dataset_version`
+/// while their pins differ (RFC "Detached-only tables", Branches).
 fn same_state(a: Option<&DatasetEntry>, b: Option<&DatasetEntry>) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(a), Some(b)) => {
             a.published_dataset_version == b.published_dataset_version
                 && a.native_dataset_branch == b.native_dataset_branch
+                && a.version_metadata.staged_version() == b.version_metadata.staged_version()
+                && a.version_metadata.transaction_uuid() == b.version_metadata.transaction_uuid()
         }
         _ => false,
     }
@@ -315,17 +341,27 @@ fn compute_stats(changes: &[EntityChange]) -> ChangeStats {
 
 // ─── Fast path: version-column diff ─────────────────────────────────────────
 
+/// The stamp path over a forward interval of one chain, or `None` for the
+/// exact compare: a detached `to` its transaction cannot prove, or a `from`
+/// at or past a linear `to` (another branch's chain of the same dataset).
 async fn diff_table_same_lineage(
     table_store: &TableStore,
     from_entry: &DatasetEntry,
     to_entry: &DatasetEntry,
     is_edge: bool,
     filter: &ChangeFilter,
-) -> Result<Vec<EntityChange>> {
+) -> Result<Option<Vec<EntityChange>>> {
     let vf = from_entry.published_dataset_version;
     let vt = to_entry.published_dataset_version;
     let storage: &dyn TableStorage = table_store;
     let to_ds = storage.open_snapshot_at_entry(to_entry).await?;
+    if TableStore::is_detached_version(to_ds.dataset().version().version) {
+        return diff_table_detached_commit(storage, from_entry, to_entry, &to_ds, is_edge, filter)
+            .await;
+    }
+    if vf >= vt {
+        return Ok(None);
+    }
     let to_columns = system_columns_at_image(to_ds.dataset().schema(), &to_entry.type_key)?;
 
     let cols: Vec<&str> = if is_edge {
@@ -364,7 +400,7 @@ async fn diff_table_same_lineage(
         Vec::new()
     };
     if changed_rows.is_empty() && !wants_deletes {
-        return Ok(changes);
+        return Ok(Some(changes));
     }
     let from_ds = storage.open_snapshot_at_entry(from_entry).await?;
     let from_columns = system_columns_at_image(from_ds.dataset().schema(), &from_entry.type_key)?;
@@ -392,7 +428,55 @@ async fn diff_table_same_lineage(
         );
     }
 
-    Ok(changes)
+    Ok(Some(changes))
+}
+
+/// The commit path of a same-lineage interval whose `to` side is a detached
+/// pin (RFC "Detached-only tables"): its own transaction proves a one-commit
+/// interval, else `None` for the exact compare; changes carry the pin's target.
+async fn diff_table_detached_commit(
+    storage: &dyn TableStorage,
+    from_entry: &DatasetEntry,
+    to_entry: &DatasetEntry,
+    to_ds: &SnapshotHandle,
+    is_edge: bool,
+    filter: &ChangeFilter,
+) -> Result<Option<Vec<EntityChange>>> {
+    let from_ds = storage.open_snapshot_at_entry(from_entry).await?;
+    let Some(plan) =
+        interval_candidate_plan(from_entry, to_entry, from_ds.dataset(), to_ds.dataset()).await?
+    else {
+        return Ok(None);
+    };
+    let from_columns = system_columns_at_image(from_ds.dataset().schema(), &from_entry.type_key)?;
+    let to_columns = system_columns_at_image(to_ds.dataset().schema(), &to_entry.type_key)?;
+    let mut source = EmitSource::plan(
+        from_entry,
+        from_ds.dataset().clone(),
+        to_ds.dataset().clone(),
+        Some(plan),
+        None,
+        &ChangeFeedScope::default(),
+        ScanTargets::default(),
+        from_columns,
+        to_columns,
+    )
+    .await?;
+    let mut changes = Vec::new();
+    while let Some(emit) = source.next().await? {
+        let (raw, op, columns) = match &emit {
+            Emit::Insert(raw) => (raw, ChangeOp::Insert, to_columns),
+            Emit::Update { after, .. } => (after, ChangeOp::Update, to_columns),
+            Emit::Delete(raw) => (raw, ChangeOp::Delete, from_columns),
+        };
+        if !filter.wants_op(op) {
+            continue;
+        }
+        let mut change = entity_change_from_raw(raw, op, is_edge, columns);
+        change.published_dataset_version = to_entry.published_dataset_version;
+        changes.push(change);
+    }
+    Ok(Some(changes))
 }
 
 // ─── Cross-branch path: streaming ID-based diff ────────────────────────────

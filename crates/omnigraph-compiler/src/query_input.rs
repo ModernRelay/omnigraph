@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::error::CompilerError;
 use crate::ir::ParamMap;
-use crate::query::ast::{Literal, Param, QueryDecl, QueryFile};
+use crate::query::ast::{Literal, Param, QueryDecl};
 use crate::query::parser::parse_query;
 
 const JS_MAX_SAFE_INTEGER_I64: i64 = 9_007_199_254_740_991;
@@ -260,13 +260,54 @@ macro_rules! params {
 }
 
 pub fn find_named_query(query_source: &str, query_name: &str) -> RunInputResult<QueryDecl> {
-    match parse_query(query_source)? {
-        QueryFile::Queries(queries) => queries
-            .into_iter()
-            .find(|query| query.name == query_name)
-            .ok_or_else(|| RunInputError::message(format!("query '{}' not found", query_name))),
-        QueryFile::Branch(stmt) => Err(RunInputError::message(stmt.not_a_declaration_message())),
+    let queries = parse_query(query_source)?
+        .into_declarations()
+        .map_err(RunInputError::message)?;
+    named_declaration(queries, query_name)
+}
+
+fn named_declaration(queries: Vec<QueryDecl>, query_name: &str) -> RunInputResult<QueryDecl> {
+    queries
+        .into_iter()
+        .find(|query| query.name == query_name)
+        .ok_or_else(|| RunInputError::message(format!("query '{}' not found", query_name)))
+}
+
+/// What a read door compiles from a source and a name: the named declaration
+/// of a declaration file, or the read declaration under the file's `explain`
+/// statement, whose plan the door answers instead of executing the query.
+#[derive(Debug, Clone)]
+pub enum ReadStatement {
+    Query(QueryDecl),
+    Explain(QueryDecl),
+}
+
+impl ReadStatement {
+    pub fn decl(&self) -> &QueryDecl {
+        match self {
+            ReadStatement::Query(decl) | ReadStatement::Explain(decl) => decl,
+        }
     }
+
+    pub fn is_explain(&self) -> bool {
+        matches!(self, ReadStatement::Explain(_))
+    }
+}
+
+/// [`find_named_query`] for the read doors: an `explain` statement is
+/// accepted when it wraps `query_name` and that declaration is a read.
+pub fn find_read_statement(query_source: &str, query_name: &str) -> RunInputResult<ReadStatement> {
+    let body = parse_query(query_source)?.body;
+    let explain = body.is_explain();
+    let queries = body
+        .into_read_declarations()
+        .map_err(RunInputError::message)?;
+    let decl = named_declaration(queries, query_name)?;
+    Ok(if explain {
+        ReadStatement::Explain(decl)
+    } else {
+        ReadStatement::Query(decl)
+    })
 }
 
 pub fn json_params_to_param_map(
@@ -775,7 +816,9 @@ fn json_type_name(value: &Value) -> &'static str {
 mod tests {
     use serde_json::json;
 
-    use super::{JsonParamMode, ToParam, find_named_query, json_params_to_param_map};
+    use super::{
+        JsonParamMode, ToParam, find_named_query, find_read_statement, json_params_to_param_map,
+    };
     use crate::query::ast::Literal;
 
     #[test]
@@ -806,6 +849,40 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "`branch merge` is a branch statement, not a query declaration"
+        );
+    }
+
+    const EXPLAINED: &str = "explain query q() { match { $p: Person } return { $p.name } }";
+
+    #[test]
+    fn find_named_query_refuses_an_explain_statement() {
+        let error = find_named_query(EXPLAINED, "q")
+            .expect_err("an explain statement is not run as its declaration");
+        assert_eq!(
+            error.to_string(),
+            "`explain` is a statement, not a query declaration"
+        );
+    }
+
+    #[test]
+    fn find_read_statement_tells_an_explain_statement_from_a_declaration() {
+        let explained = find_read_statement(EXPLAINED, "q").unwrap();
+        assert!(explained.is_explain());
+        assert_eq!(explained.decl().name, "q");
+        let declared = find_read_statement(&EXPLAINED["explain ".len()..], "q").unwrap();
+        assert!(!declared.is_explain());
+        assert_eq!(declared.decl().name, "q");
+        let error = find_read_statement(EXPLAINED, "r").expect_err("the name must match");
+        assert_eq!(error.to_string(), "query 'r' not found");
+    }
+
+    #[test]
+    fn find_read_statement_refuses_explain_of_a_mutation() {
+        let error = find_read_statement("explain query m() { insert Person { name: \"a\" } }", "m")
+            .expect_err("a mutation has no read plan");
+        assert_eq!(
+            error.to_string(),
+            "`explain` applies to a read query; 'm' contains mutations"
         );
     }
 

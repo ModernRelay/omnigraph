@@ -15,7 +15,9 @@ node Document {
 
 `Blob` cannot be a key, unique member, index, embed source, or list member.
 Schema parsing rejects those combinations. Blob properties also cannot be
-projected, filtered, ordered, or aggregated in `.gq`.
+projected, filtered, ordered, or aggregated in `.gq` (`T24: Blob property … is
+not available as a .gq read value`), and a bare node projection
+(`return { $p }`) silently omits them.
 
 Write input uses one String representation:
 
@@ -24,7 +26,8 @@ Write input uses one String representation:
 - `null` stores null when the property is optional.
 
 There is no `blob put` or `blob clear`; use the normal atomic graph write path.
-Blob payloads count toward write limits.
+Blob payloads count toward write limits. `export` writes Blob cells in the same
+`base64:`/URI spelling, so exported lines reload as-is.
 
 ## External-reference policy and ownership
 
@@ -45,7 +48,8 @@ OmniGraph never deletes the external source object.
 ## CLI reads
 
 Select one cell as `<node|edge> <TYPE> <ID> <PROPERTY>` and address the graph
-with `--store`, `--server`, or a profile:
+with `--store`, `--server`, or a profile. A keyed edge's `<ID>` is its derived
+JSON-array id (for example `'["alice","bob"]'`):
 
 ```bash
 omnigraph blob stat node Document manual content --store graph.omni --json
@@ -77,12 +81,14 @@ in `Location`; it does not fetch, sign, authorize, or proxy the object.
 
 ## Lifecycle
 
-A reader stays pinned to the snapshot selected when it opens. Branch deletion
-or destructive cleanup can reclaim bytes needed by a long read, so quiesce such
-readers first. Blob-aware compaction is supported.
+A reader stays pinned to the snapshot selected when it opens. Explicit
+`cleanup` (including table forks left by a deleted branch) and
+`schema apply --allow-data-loss` can reclaim bytes needed by a long read, so
+quiesce such readers first; branch deletion alone defers reclamation to
+`cleanup`. Blob-aware compaction is supported.
 
 Historical identity fails closed: if a rename, drop/re-add, or branch lifetime
 does not prove that a historical property is the same logical Blob property,
 OmniGraph returns an error rather than guessing.
 
-Canonical user contract: [Blob values](../../../docs/user/blobs.md).
+Canonical user contract: [Blob values](https://github.com/ModernRelay/omnigraph/blob/v0.11.0/docs/user/blobs.md).

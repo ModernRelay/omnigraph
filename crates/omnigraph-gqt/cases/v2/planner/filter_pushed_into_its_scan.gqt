@@ -1,0 +1,73 @@
+# issue: none
+# notes: Push the open-state filter into the Doc scan. Read slug and state,
+# notes: without loading the unused embedding.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    state: String
+    embedding: Vector(4)?
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d0","state":"open","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d1","state":"closed"}}
+{"type":"Doc","data":{"slug":"d2","state":"open"}}
+
+--- query
+set engine = v2;
+query open_docs() {
+    match {
+        $d: Doc
+        $d.state = "open"
+    }
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug":"d0"}
+{"d.slug":"d2"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan Doc as $d: filter reads [d.state]
+scan Doc as $d: columns [slug, state]
+pass predicate_pushdown
+pass projection_pushdown
+
+--- query
+set engine = v2;
+query same_state_pairs() {
+    match {
+        $a: Doc
+        $b: Doc
+        $a.state = $b.state
+    }
+    return { $a.slug, $b.slug }
+}
+
+--- expect unordered
+{"a.slug":"d0","b.slug":"d0"}
+{"a.slug":"d0","b.slug":"d2"}
+{"a.slug":"d2","b.slug":"d0"}
+{"a.slug":"d2","b.slug":"d2"}
+{"a.slug":"d1","b.slug":"d1"}
+
+--- expect shape
+a.slug: String
+b.slug: String
+
+--- expect plan
+filter reads [a.state, b.state]
+scan Doc as $a: no filter
+scan Doc as $b: no filter
+not pass predicate_pushdown
+pass projection_pushdown

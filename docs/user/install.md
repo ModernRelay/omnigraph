@@ -42,8 +42,8 @@ iwr -UseBasicParsing https://raw.githubusercontent.com/ModernRelay/omnigraph/mai
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -ReleaseChannel edge
 ```
 
-Install a specific tag with `VERSION=v0.10.0` on macOS/Linux or
-`-Version v0.10.0` on Windows. Set `INSTALL_DIR` or `-InstallDir` to choose a
+Install a specific tag with `VERSION=v0.11.0` on macOS/Linux or
+`-Version v0.11.0` on Windows. Set `INSTALL_DIR` or `-InstallDir` to choose a
 different destination.
 
 Documentation on `main` may describe behavior newer than the latest stable
@@ -55,11 +55,15 @@ Install the Rust stable toolchain and the Protocol Buffers compiler (`protoc`),
 then:
 
 ```bash
-cargo build --release --locked \
+RUSTFLAGS= cargo build --release --locked \
   -p omnigraph-cli \
   -p omnigraph-server \
   -p omnigraph-azure-admission
 ```
+
+The empty `RUSTFLAGS` replaces the workspace `.cargo/config.toml` build flags,
+which exist for the development test suites; release binaries build without
+them.
 
 Or use the source installer:
 

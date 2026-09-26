@@ -44,8 +44,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use omnigraph::Session;
 use omnigraph::db::{CleanupPolicyOptions, InitOptions, Omnigraph, ReadTarget, SnapshotId};
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
 use omnigraph::storage::{ObjectStorageAdapter, StorageAdapter};
 
 use crate::fixtures::{
@@ -439,8 +441,8 @@ pub struct FinishOnDrop {
 
 impl Drop for FinishOnDrop {
     fn drop(&mut self) {
+        omnigraph::dst_gate::GATE.clear();
         self.sched.finish(self.actor);
-        omnigraph::dst_gate::uninstall_gate_hook();
     }
 }
 
@@ -1305,25 +1307,32 @@ fn writer_life(
     runtime.block_on(Box::pin(async move {
         // Thread-local seams: this writer's ULIDs/timestamps are its own
         // seeded stream — deterministic per writer, interleaving aside.
-        omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-        omnigraph::dst_clock::install_logical_clock();
+        let _ids = omnigraph::dst_ids::IDS
+            .install(Arc::new(omnigraph::dst_ids::SeededUlids::new(ulid_seed)));
+        let _clock = omnigraph::dst_clock::CLOCK
+            .install(Arc::new(omnigraph::dst_clock::LogicalClock::default()));
         // The write-gate seam (`omnigraph::dst_gate`'s doc has the why):
         // gate acquisition takes turns through the same arbiter; unarmed,
         // the hook returns None (plain blocking locks).
-        if let Some(s) = &sched {
+        let _gate = sched.as_ref().map(|s| {
             let hook_sched = s.clone();
-            omnigraph::dst_gate::install_gate_hook(Box::new(move || {
+            omnigraph::dst_gate::GATE.install(Arc::new(omnigraph::dst_gate::TurnFn(move || {
                 hook_sched
                     .enter(writer)
                     .map(|g| Box::new(g) as Box<dyn std::any::Any + Send>)
-            }));
-        }
+            })))
+        });
 
         // Survivors reopen with their own storage view on RecoveryRequired.
         let storage_for_reopen = storage.clone();
-        let mut db = Omnigraph::open_with_storage(root, storage)
-            .await
-            .expect("writer handle on shared root");
+        let mut db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::open_with_storage(root, storage)
+                    .await
+                    .expect("writer handle on shared root"),
+            ),
+            SessionSettings::default(),
+        );
         let _finish = sched.as_ref().map(|s| s.finish_on_drop(writer));
         // Start barrier: handles open at each thread's own pace, but the op
         // races begin TOGETHER — without this, thread-start skew lets a fast
@@ -1364,7 +1373,7 @@ fn writer_life(
 
             let mut occ_retries = 0usize;
             loop {
-                let result = mutate_on(&mut db, "main", MUTATION_QUERIES, query, &params).await;
+                let result = mutate_on(&db, "main", MUTATION_QUERIES, query, &params).await;
                 // ARM 2, dead-flag-is-authority: the
                 // kill wrapper's flag decides death, not the op's result —
                 // an op can return Ok when death landed on a best-effort
@@ -1404,7 +1413,12 @@ fn writer_life(
                             match Omnigraph::open_with_storage(root, storage_for_reopen.clone())
                                 .await
                             {
-                                Ok(fresh) => db = fresh,
+                                Ok(fresh) => {
+                                    db = Session::from_defaults(
+                                        Arc::new(fresh),
+                                        db.settings().clone(),
+                                    )
+                                }
                                 Err(e) => {
                                     let re = format!("{e:?}");
                                     // An injected fault DURING the reopen is
@@ -1495,9 +1509,8 @@ fn writer_life(
         // synchronous and the adapter surface is async, so the drops
         // issue no gated calls.)
         drop(_finish);
+        drop(_gate);
         drop(db);
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
         (claims, reopens, fault_retries)
     }))
 }
@@ -1527,19 +1540,26 @@ fn maintenance_life(
         .build_local(Default::default())
         .expect("maintenance runtime");
     runtime.block_on(Box::pin(async move {
-        omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-        omnigraph::dst_clock::install_logical_clock();
-        if let Some((s, actor)) = &sched_ctx {
+        let _ids = omnigraph::dst_ids::IDS
+            .install(Arc::new(omnigraph::dst_ids::SeededUlids::new(ulid_seed)));
+        let _clock = omnigraph::dst_clock::CLOCK
+            .install(Arc::new(omnigraph::dst_clock::LogicalClock::default()));
+        let _gate = sched_ctx.as_ref().map(|(s, actor)| {
             let (hook_sched, hook_actor) = (s.clone(), *actor);
-            omnigraph::dst_gate::install_gate_hook(Box::new(move || {
+            omnigraph::dst_gate::GATE.install(Arc::new(omnigraph::dst_gate::TurnFn(move || {
                 hook_sched
                     .enter(hook_actor)
                     .map(|g| Box::new(g) as Box<dyn std::any::Any + Send>)
-            }));
-        }
-        let mut db = Omnigraph::open_with_storage(root, storage)
-            .await
-            .expect("maintenance handle on shared root");
+            })))
+        });
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::open_with_storage(root, storage)
+                    .await
+                    .expect("maintenance handle on shared root"),
+            ),
+            SessionSettings::default(),
+        );
         let _finish = sched_ctx
             .as_ref()
             .map(|(s, actor)| s.finish_on_drop(*actor));
@@ -1592,9 +1612,8 @@ fn maintenance_life(
             tokio::time::sleep(std::time::Duration::from_micros(think_us)).await;
         }
         drop(_finish);
+        drop(_gate);
         drop(db);
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
         (committed, retries, cleanups)
     }))
 }
@@ -1625,19 +1644,26 @@ fn branch_life(
         .build_local(Default::default())
         .expect("branch actor runtime");
     runtime.block_on(Box::pin(async move {
-        omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-        omnigraph::dst_clock::install_logical_clock();
-        if let Some(s) = &sched {
+        let _ids = omnigraph::dst_ids::IDS
+            .install(Arc::new(omnigraph::dst_ids::SeededUlids::new(ulid_seed)));
+        let _clock = omnigraph::dst_clock::CLOCK
+            .install(Arc::new(omnigraph::dst_clock::LogicalClock::default()));
+        let _gate = sched.as_ref().map(|s| {
             let (hook_sched, hook_actor) = (s.clone(), actor);
-            omnigraph::dst_gate::install_gate_hook(Box::new(move || {
+            omnigraph::dst_gate::GATE.install(Arc::new(omnigraph::dst_gate::TurnFn(move || {
                 hook_sched
                     .enter(hook_actor)
                     .map(|g| Box::new(g) as Box<dyn std::any::Any + Send>)
-            }));
-        }
-        let mut db = Omnigraph::open_with_storage(root, storage)
-            .await
-            .expect("branch actor handle on shared root");
+            })))
+        });
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::open_with_storage(root, storage)
+                    .await
+                    .expect("branch actor handle on shared root"),
+            ),
+            SessionSettings::default(),
+        );
         let _finish = sched.as_ref().map(|s| s.finish_on_drop(actor));
         start.wait();
         if let Some(s) = &sched {
@@ -1686,7 +1712,7 @@ fn branch_life(
                 let params = mixed_params(&[("$name", key.as_str())], &[("$age", value)]);
                 retries += attempt!(
                     format!("branch write {key}"),
-                    mutate_on(&mut db, &branch, MUTATION_QUERIES, "insert_person", &params)
+                    mutate_on(&db, &branch, MUTATION_QUERIES, "insert_person", &params)
                 );
                 claims.push(ClaimedWrite {
                     writer: actor,
@@ -1710,9 +1736,8 @@ fn branch_life(
             tokio::time::sleep(std::time::Duration::from_micros(think_us)).await;
         }
         drop(_finish);
+        drop(_gate);
         drop(db);
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
         (claims, merges, retries)
     }))
 }
@@ -1750,14 +1775,21 @@ fn reader_life(
         let mut seen: BTreeMap<String, (usize, usize)> = BTreeMap::new();
         let mut completed = 0usize;
         for round in 0..rounds {
-            let db = Box::pin(Omnigraph::open_read_only_with_storage(
-                root,
-                storage.clone(),
-            ))
-            .await
-            .unwrap_or_else(|e| {
-                panic!("reader {reader} round {round}: read-only OPEN failed mid-storm: {e:?}")
-            });
+            let db = Session::from_defaults(
+                Arc::new(
+                    Box::pin(Omnigraph::open_read_only_with_storage(
+                        root,
+                        storage.clone(),
+                    ))
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "reader {reader} round {round}: read-only OPEN failed mid-storm: {e:?}"
+                        )
+                    }),
+                ),
+                SessionSettings::default(),
+            );
             // Surface 1: the raw snapshot scan — duplicate detection needs
             // the row list, not the map.
             let rows = person_rows_target(&db, ReadTarget::branch("main")).await;
@@ -1861,18 +1893,26 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                 let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
 
                 // ---- setup (sequential, this thread's seams) ----
-                omnigraph::dst_ids::install_seeded_ulids(setup_ulid_seed);
-                omnigraph::dst_clock::install_logical_clock();
+                let _setup_ids = omnigraph::dst_ids::IDS.install(Arc::new(
+                    omnigraph::dst_ids::SeededUlids::new(setup_ulid_seed),
+                ));
+                let _setup_clock = omnigraph::dst_clock::CLOCK
+                    .install(Arc::new(omnigraph::dst_clock::LogicalClock::default()));
                 let (setup_ids, base_map) = runtime.block_on(Box::pin(async {
-                    let db = Omnigraph::init_with_storage(
-                        root,
-                        TEST_SCHEMA,
-                        storage.clone(),
-                        InitOptions::default(),
-                    )
-                    .await
-                    .expect("init shared root");
-                    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+                    let db = Session::from_defaults(
+                        Arc::new(
+                            Omnigraph::init_with_storage(
+                                root,
+                                TEST_SCHEMA,
+                                storage.clone(),
+                                InitOptions::default(),
+                            )
+                            .await
+                            .expect("init shared root"),
+                        ),
+                        SessionSettings::default(),
+                    );
+                    db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
                         .await
                         .expect("load fixtures");
                     let ids: BTreeSet<String> = db
@@ -2121,9 +2161,14 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
 
                 // ---- final audit (fresh handle, this thread) ----
                 let report = runtime.block_on(Box::pin(async {
-                    let db = Omnigraph::open_with_storage(root, storage.clone())
-                        .await
-                        .expect("open the post-race audit handle on the shared root");
+                    let db = Session::from_defaults(
+                        Arc::new(
+                            Omnigraph::open_with_storage(root, storage.clone())
+                                .await
+                                .expect("open the post-race audit handle on the shared root"),
+                        ),
+                        SessionSettings::default(),
+                    );
 
                     // OCC commit-id uniqueness + the ascending lineage.
                     let commits = db.list_commits(Some("main")).await.expect("list commits");
@@ -2410,8 +2455,8 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                     }
                 }));
 
-                omnigraph::dst_clock::uninstall_logical_clock();
-                omnigraph::dst_ids::uninstall_seeded_ulids();
+                drop(_setup_clock);
+                drop(_setup_ids);
                 report
             })
             .expect("spawn concurrent universe thread")

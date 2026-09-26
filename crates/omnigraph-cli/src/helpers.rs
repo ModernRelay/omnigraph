@@ -7,7 +7,10 @@ use std::io::IsTerminal;
 use omnigraph_api_types::{
     ChangeRequest, QueryRequest, branch_statement_refusals, query_file_refusals,
 };
-use omnigraph_compiler::query::ast::{BranchStmt, BranchWrite, QueryFile};
+use omnigraph_compiler::query::ast::{
+    BranchStmt, BranchWrite, EXPLAIN_STATEMENT_NAME, QueryFile, show_statement_name,
+};
+use omnigraph_compiler::settings::SettingId;
 
 use super::*;
 use crate::operator;
@@ -455,6 +458,21 @@ impl std::fmt::Display for PreconditionFailedCli {
 
 impl std::error::Error for PreconditionFailedCli {}
 
+/// Preserve a typed server refusal through the command dispatch so JSON
+/// callers retain its code and detail fields instead of parsing a message.
+#[derive(Debug)]
+pub(crate) struct RemoteErrorCli {
+    pub(crate) output: ErrorOutput,
+}
+
+impl std::fmt::Display for RemoteErrorCli {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.output.error)
+    }
+}
+
+impl std::error::Error for RemoteErrorCli {}
+
 /// Build the typed CAS-lost error for the embedded transport, mirroring the
 /// structured body a server would have returned so `--json` output is
 /// transport-uniform. `message` is the engine error's own `Display` text, so
@@ -544,7 +562,16 @@ pub(crate) async fn remote_json_bounded<T: DeserializeOwned>(
     } else {
         request
     };
-    let mut response = request.send().await?;
+    remote_response_json_bounded(request.send().await?, bearer_token, response_limit).await
+}
+
+/// Decode either JSON requests or raw NDJSON loads through the same bounded,
+/// credential-safe response path. The request owner chooses its deadline.
+pub(crate) async fn remote_response_json_bounded<T: DeserializeOwned>(
+    mut response: reqwest::Response,
+    bearer_token: Option<&str>,
+    response_limit: Option<usize>,
+) -> Result<T> {
     let status = response.status();
     let text = if let Some(limit) = response_limit {
         if status.is_redirection() {
@@ -575,7 +602,7 @@ pub(crate) async fn remote_json_bounded<T: DeserializeOwned>(
             if error.precondition_failure.is_some() {
                 return Err(PreconditionFailedCli { output: error }.into());
             }
-            bail!(error.error);
+            return Err(RemoteErrorCli { output: error }.into());
         }
         bail!("server returned {}: {}", status, text);
     }
@@ -848,18 +875,17 @@ pub(crate) fn load_params_json(params: &ParamsArgs) -> Result<Option<Value>> {
     }
 }
 
-/// Pick the query the caller named out of an already-parsed source. The
-/// `Branch` arm stays as the guard: a statement never reaches a declaration
-/// path.
+/// Pick the query the caller named out of an already-parsed source. An
+/// `explain` statement offers its one declaration (the engine answers the
+/// plan); the `Branch` arm stays as the guard: a branch statement never
+/// reaches a declaration path.
 pub(crate) fn select_named_query(
     query_file: QueryFile,
     requested_name: Option<&str>,
 ) -> Result<(String, Vec<omnigraph_compiler::query::ast::Param>)> {
-    let queries = match query_file {
-        QueryFile::Queries(queries) => queries,
-        QueryFile::Branch(stmt) => {
-            bail!("{}", stmt.not_a_declaration_message())
-        }
+    let queries = match query_file.body.into_read_declarations() {
+        Ok(queries) => queries,
+        Err(message) => bail!("{message}"),
     };
     let query = if let Some(name) = requested_name {
         queries
@@ -903,6 +929,22 @@ pub(crate) fn read_at_write_door() -> String {
     )
 }
 
+/// `show` is a read: the same refusal `branch list` meets at the write door.
+pub(crate) fn show_at_write_door(id: Option<SettingId>) -> String {
+    branch_statement_refusals::with_statement(
+        branch_statement_refusals::READ_AT_WRITE_DOOR,
+        &show_statement_name(id),
+    )
+}
+
+/// The server's refusal for an `explain` statement sent through `mutate`.
+pub(crate) fn explain_at_write_door() -> String {
+    branch_statement_refusals::with_statement(
+        branch_statement_refusals::READ_AT_WRITE_DOOR,
+        EXPLAIN_STATEMENT_NAME,
+    )
+}
+
 /// The server's envelope refusals for a branch statement, checked in its
 /// order: a request target, then a query name or parameters, then a commit
 /// precondition. Runs before any round trip or engine open.
@@ -923,7 +965,8 @@ pub(crate) fn refuse_statement_envelope(
     Ok(())
 }
 
-/// The `POST /query` body for `branch list`: the source alone.
+/// The `POST /query` body for `branch list` or `show`: the source alone; the
+/// caller fills `settings` from its `--set` values.
 pub(crate) fn branch_statement_query_request(query_source: &str) -> QueryRequest {
     QueryRequest {
         query: query_source.to_string(),
@@ -931,16 +974,19 @@ pub(crate) fn branch_statement_query_request(query_source: &str) -> QueryRequest
         params: None,
         branch: None,
         snapshot: None,
+        settings: None,
     }
 }
 
-/// The `POST /mutate` body for a control write: the source alone.
+/// The `POST /mutate` body for a control write: the source alone; the caller
+/// fills `settings` from its `--set` values.
 pub(crate) fn branch_statement_change_request(query_source: &str) -> ChangeRequest {
     ChangeRequest {
         query: query_source.to_string(),
         name: None,
         params: None,
         branch: None,
+        settings: None,
     }
 }
 

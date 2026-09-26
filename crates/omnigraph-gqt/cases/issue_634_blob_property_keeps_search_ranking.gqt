@@ -1,13 +1,7 @@
 # issue: 634
 # red_on: 2026-09-05, main b570ebb2: query failed: search-ordered query produced rows without its 'c._score' ranking column
-# notes: a node type with a Blob property scans with an explicit non-Blob
-# notes: projection and rebuilds the batch afterwards; the rebuild must keep
-# notes: the ranking column the scan projects (`_score` for bm25, `_distance`
-# notes: for nearest) or the search-ordered read is refused. This case is the
-# notes: sole guard (no Rust twin). Seed rows have equal length so the bm25
-# notes: order rests on tf alone, not on length normalisation, and both
-# notes: expected orders are the reverse of the id tie-break order, so a
-# notes: present-but-constant ranking column fails the step.
+# notes: A Blob property must not lose the search ranking column when the batch is rebuilt.
+# notes: Equal-length texts isolate term frequency; both rankings oppose ID order, catching constant scores.
 
 --- runner
 timeout_ms: 10000

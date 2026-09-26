@@ -1,0 +1,118 @@
+# issue: none
+# notes: Beyond the single-table pre-publication cases: every one of three tables has its detached commit staged when the failure hits, and none of them is visible, so atomicity holds across tables; restart and retry preserve it.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person { name: String @key }
+node Marker { name: String @key }
+edge Knows: Person -> Person { @key(@src, @dst) }
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+{"type":"Person","data":{"name":"eve"}}
+{"type":"Marker","data":{"name":"initial"}}
+{"edge":"Knows","from":"alice","to":"alice"}
+
+--- seam
+at: mutation.post_table_commit
+occurrence: 3
+action: fail
+scope: next_step
+
+--- mutate branch: main
+query add_all() {
+    insert Person { name: "bob" }
+    insert Marker { name: "after" }
+    insert Knows { from: "alice", to: "eve" }
+}
+--- expect error: injected failpoint triggered: mutation.post_table_commit
+
+--- query branch: main
+query people() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"eve"}
+--- expect shape
+p.name: String
+
+--- query branch: main
+query markers() { match { $m: Marker } return { $m.name } }
+--- expect unordered
+{"m.name":"initial"}
+--- expect shape
+m.name: String
+
+--- query branch: main
+query edges() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+--- expect unordered
+{"p.name":"alice","q.name":"alice"}
+--- expect shape
+p.name: String
+q.name: String
+
+--- restart
+
+--- query branch: main
+query people() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"eve"}
+--- expect shape
+p.name: String
+
+--- query branch: main
+query markers() { match { $m: Marker } return { $m.name } }
+--- expect unordered
+{"m.name":"initial"}
+--- expect shape
+m.name: String
+
+--- query branch: main
+query edges() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+--- expect unordered
+{"p.name":"alice","q.name":"alice"}
+--- expect shape
+p.name: String
+q.name: String
+
+--- mutate branch: main
+query add_all() {
+    insert Person { name: "bob" }
+    insert Marker { name: "after" }
+    insert Knows { from: "alice", to: "eve" }
+}
+--- expect affected: nodes=2 edges=1
+
+--- restart
+
+--- query branch: main
+query people() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"eve"}
+{"p.name":"bob"}
+--- expect shape
+p.name: String
+
+--- query branch: main
+query markers() { match { $m: Marker } return { $m.name } }
+--- expect unordered
+{"m.name":"initial"}
+{"m.name":"after"}
+--- expect shape
+m.name: String
+
+--- query branch: main
+query edges() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+--- expect unordered
+{"p.name":"alice","q.name":"alice"}
+{"p.name":"alice","q.name":"eve"}
+--- expect shape
+p.name: String
+q.name: String

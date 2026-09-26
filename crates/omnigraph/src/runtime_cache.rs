@@ -33,6 +33,9 @@ struct GraphIndexTableState {
     identity: crate::db::manifest::TableIdentity,
     table_key: String,
     table_version: u64,
+    /// The detached pin the version resolves to: `table_version` is a
+    /// per-lineage counter, so two branches share it with different pins.
+    staged_version: Option<u64>,
     table_branch: Option<String>,
     /// Lance manifest incarnation token for this edge table version. Preserves the
     /// incarnation distinction the dropped synthetic snapshot id used to carry: a
@@ -314,6 +317,7 @@ fn graph_index_cache_key(
                     identity: entry.identity,
                     table_key,
                     table_version: entry.published_dataset_version,
+                    staged_version: entry.version_metadata.staged_version(),
                     table_branch: entry.native_dataset_branch.clone(),
                     e_tag: entry.version_metadata.e_tag().map(str::to_string),
                     endpoints: endpoints.clone(),
@@ -337,14 +341,17 @@ struct TableHandleKey {
     table_path: String,
     table_branch: Option<String>,
     version: u64,
+    /// The detached pin `version` resolves to; `version` alone is a
+    /// per-lineage counter two branches share.
+    staged_version: Option<u64>,
     e_tag: Option<String>,
 }
 
-/// Held open-`Dataset` handles keyed by `(table_path, branch, version, e_tag)` — the
-/// version-keyed analogue of LanceDB's `DatasetConsistencyWrapper`
+/// Held open-`Dataset` handles keyed by `(table_path, branch, version, pin,
+/// e_tag)` — the version-keyed analogue of LanceDB's `DatasetConsistencyWrapper`
 /// (`rust/lancedb/src/table/dataset.rs`). A warm read reuses a held handle with
 /// zero open IO (a cheap `Dataset` clone); a miss opens once at the location with
-/// the shared `Session`. Version plus e_tag are in the key, so a write (or a
+/// the shared `Session`. Version, pin and e_tag are in the key, so a write (or a
 /// delete/recreate that reuses a version number on object stores with e_tags) is
 /// simply a new key. A same-branch manifest refresh clears this cache as the
 /// fallback for e_tag-less table locations. Only read-path Data opens use this —
@@ -376,6 +383,9 @@ impl TableHandleCache {
         table_branch: Option<&str>,
         version: u64,
         e_tag: Option<&str>,
+        staged_version: Option<u64>,
+        transaction_uuid: Option<&str>,
+        last_linear_version: Option<u64>,
         location: &str,
         session: Option<&Arc<Session>>,
     ) -> Result<Dataset> {
@@ -383,6 +393,7 @@ impl TableHandleCache {
             table_path: dataset_path.to_string(),
             table_branch: table_branch.map(str::to_string),
             version,
+            staged_version,
             e_tag: e_tag.map(str::to_string),
         };
         {
@@ -394,9 +405,12 @@ impl TableHandleCache {
         // Miss: open without holding the lock (the open is async IO). A concurrent
         // double-miss opens twice and one wins the insert — correct (the dataset
         // at a version is immutable) and rare.
-        let ds = crate::instrumentation::open_dataset(
+        let ds = crate::instrumentation::open_pinned_dataset(
             location,
-            crate::instrumentation::VersionResolution::At(version),
+            version,
+            staged_version,
+            transaction_uuid,
+            last_linear_version,
             session,
             crate::instrumentation::table_wrapper(),
         )
@@ -407,6 +421,27 @@ impl TableHandleCache {
         }
         inner.insert(key, ds.clone());
         Ok(ds)
+    }
+
+    /// A held handle for this pin, without opening on a miss (RFC 0067: a
+    /// writer that just published a pin holds the handle it needs).
+    pub async fn get(
+        &self,
+        dataset_path: &str,
+        table_branch: Option<&str>,
+        version: u64,
+        staged_version: Option<u64>,
+        e_tag: Option<&str>,
+    ) -> Option<Dataset> {
+        let key = TableHandleKey {
+            table_path: dataset_path.to_string(),
+            table_branch: table_branch.map(str::to_string),
+            version,
+            staged_version,
+            e_tag: e_tag.map(str::to_string),
+        };
+        let mut inner = self.inner.lock().await;
+        inner.entries.get(&key).cloned()
     }
 }
 
@@ -490,9 +525,25 @@ pub(crate) struct CompiledQueryKey {
     name: String,
 }
 
+/// A compiled read statement: a declaration the door runs for rows, or an
+/// `explain` statement over one, which the door answers with the plan.
+#[derive(Clone)]
+pub(crate) enum CompiledRead {
+    Query(Arc<QueryIR>),
+    Explain(Arc<QueryIR>),
+}
+
+impl CompiledRead {
+    pub(crate) fn ir(&self) -> &Arc<QueryIR> {
+        match self {
+            Self::Query(ir) | Self::Explain(ir) => ir,
+        }
+    }
+}
+
 struct CompiledQueryEntry {
     catalog: Weak<Catalog>,
-    ir: Arc<QueryIR>,
+    compiled: CompiledRead,
 }
 
 impl Default for CompiledQueryCache {
@@ -515,7 +566,7 @@ impl CompiledQueryCache {
         &self,
         catalog: &Arc<Catalog>,
         key: &CompiledQueryKey,
-    ) -> Option<Arc<QueryIR>> {
+    ) -> Option<CompiledRead> {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -526,10 +577,15 @@ impl CompiledQueryCache {
                     .upgrade()
                     .is_some_and(|held| Arc::ptr_eq(&held, catalog))
             })
-            .map(|entry| Arc::clone(&entry.ir))
+            .map(|entry| entry.compiled.clone())
     }
 
-    pub(crate) fn insert(&self, catalog: &Arc<Catalog>, key: CompiledQueryKey, ir: Arc<QueryIR>) {
+    pub(crate) fn insert(
+        &self,
+        catalog: &Arc<Catalog>,
+        key: CompiledQueryKey,
+        compiled: CompiledRead,
+    ) {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -537,7 +593,7 @@ impl CompiledQueryCache {
                 key,
                 CompiledQueryEntry {
                     catalog: Arc::downgrade(catalog),
-                    ir,
+                    compiled,
                 },
             );
     }
@@ -571,11 +627,53 @@ mod tests {
                 identity: crate::db::manifest::TableIdentity::new(id as u64 + 1, 1).unwrap(),
                 table_key: format!("edge:t{id}"),
                 table_version: 1,
+                staged_version: None,
                 table_branch: None,
                 e_tag: None,
                 endpoints: ("A".to_string(), "B".to_string()),
             }],
         }
+    }
+
+    /// Two branches write the same lineage counter to different detached pins
+    /// on one physical table; without e_tags (Windows local files) the pin is
+    /// the only thing that tells the two datasets apart, in both caches.
+    #[test]
+    fn same_counter_different_pin_splits_both_keys_without_etag() {
+        let on_main = GraphIndexTableState {
+            identity: crate::db::manifest::TableIdentity::new(1, 2).unwrap(),
+            table_key: "edge:Knows".to_string(),
+            table_version: 3,
+            staged_version: Some(1 << 63 | 3),
+            table_branch: None,
+            e_tag: None,
+            endpoints: ("Person".to_string(), "Person".to_string()),
+        };
+        let on_branch = GraphIndexTableState {
+            staged_version: Some(1 << 63 | 4),
+            ..on_main.clone()
+        };
+        assert_ne!(
+            GraphIndexCacheKey {
+                edge_tables: vec![on_main]
+            },
+            GraphIndexCacheKey {
+                edge_tables: vec![on_branch]
+            }
+        );
+
+        let handle_on_main = TableHandleKey {
+            table_path: "nodes/person".to_string(),
+            table_branch: None,
+            version: 3,
+            staged_version: Some(1 << 63 | 3),
+            e_tag: None,
+        };
+        let handle_on_branch = TableHandleKey {
+            staged_version: Some(1 << 63 | 4),
+            ..handle_on_main.clone()
+        };
+        assert_ne!(handle_on_main, handle_on_branch);
     }
 
     fn empty_index() -> Arc<GraphIndex> {
@@ -591,6 +689,7 @@ mod tests {
             identity: crate::db::manifest::TableIdentity::new(1, 2).unwrap(),
             table_key: "edge:Knows".to_string(),
             table_version: 7,
+            staged_version: None,
             table_branch: None,
             e_tag: Some("etag".to_string()),
             endpoints: ("Person".to_string(), "Person".to_string()),
@@ -617,6 +716,7 @@ mod tests {
             identity: crate::db::manifest::TableIdentity::new(1, 2).unwrap(),
             table_key: "edge:Knows".to_string(),
             table_version: 1,
+            staged_version: None,
             table_branch: None,
             e_tag: None,
             endpoints: ("Person".to_string(), "Person".to_string()),
@@ -701,10 +801,15 @@ edge Likes: Person -> Person {}
 {"edge":"Likes","from":"b","to":"a"}"#;
 
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
-            .await
-            .unwrap();
-        crate::loader::load_jsonl(&db, DATA, crate::loader::LoadMode::Overwrite)
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(
+                crate::db::Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+                    .await
+                    .unwrap(),
+            ),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
+        db.load_jsonl(DATA, crate::loader::LoadMode::Overwrite)
             .await
             .unwrap();
         db.optimize().await.unwrap();
@@ -749,16 +854,18 @@ edge Likes: Person -> Person {}
             let decl = omnigraph_compiler::find_named_query(source, name).unwrap();
             let ctx =
                 omnigraph_compiler::query::typecheck::typecheck_query(catalog, &decl).unwrap();
-            Arc::new(omnigraph_compiler::lower_query(catalog, &decl, &ctx).unwrap())
+            CompiledRead::Query(Arc::new(
+                omnigraph_compiler::lower_query(catalog, &decl, &ctx).unwrap(),
+            ))
         };
         let cache = CompiledQueryCache::default();
         let source = "query q() { match { $p: Person } return { $p.name } }";
         let key = CompiledQueryCache::key_for(source, "q");
 
         let first = Arc::new((*built).clone());
-        let ir = compile(&first, source, "q");
-        cache.insert(&first, key.clone(), Arc::clone(&ir));
-        assert!(Arc::ptr_eq(&cache.get(&first, &key).unwrap(), &ir));
+        let ir = Arc::clone(compile(&first, source, "q").ir());
+        cache.insert(&first, key.clone(), CompiledRead::Query(Arc::clone(&ir)));
+        assert!(Arc::ptr_eq(cache.get(&first, &key).unwrap().ir(), &ir));
 
         let equal = Arc::new((*built).clone());
         assert!(

@@ -70,8 +70,7 @@ names such as `release.1.2` are fine.
 Deleting a branch and creating another with the same name yields a fresh
 branch lifetime. Readers that captured the deleted branch fail with a typed
 error rather than seeing the replacement. Deletion retires the logical name
-and leaves native manifest history and table storage for explicit `omnigraph cleanup`; it starts no background table-reclaim work and
-does not wait for table-fork reclamation. Cleanup preserves data still needed by
+and leaves native manifest history and table storage for explicit `omnigraph cleanup`; it starts no background table-reclaim work. Cleanup preserves data still needed by
 other branches and their underlying histories.
 
 Branch-control operations are safe across handles in one writer process. Do not

@@ -29,15 +29,13 @@
 use std::time::Duration;
 
 use futures::stream::StreamExt;
-use lance::dataset::cleanup::{CleanupPolicy, RemovalStats};
 use lance::dataset::optimize::{
     CompactionMetrics, CompactionOptions, compact_files, plan_compaction,
 };
 use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
-use lance_index::optimize::OptimizeOptions;
 
 use super::*;
-use crate::error::missing_graph_type_at_snapshot;
+use crate::seams::{decide_seam, fail};
 
 /// How many datasets to optimize/cleanup concurrently. Each has separate
 /// Lance dataset so there is no shared state; the bound is there to avoid
@@ -71,7 +69,7 @@ pub struct CleanupPolicyOptions {
 #[non_exhaustive]
 pub enum SkipReason {
     /// The Lance dataset HEAD is ahead of the version recorded in
-    /// `__manifest`, and no recovery sidecar covers that movement. `optimize`
+    /// `__manifest`, and no pending pin explains that movement. `optimize`
     /// cannot infer whether the drift is benign maintenance or an external
     /// semantic write, so it leaves the dataset untouched and points operators at
     /// explicit `repair`.
@@ -127,7 +125,7 @@ pub struct DatasetOptimizeStats {
     pub lance_head_version: Option<u64>,
     /// Index work deferred this run, with the reason and remedy: a vector
     /// property without trainable vectors, or full-text coverage requiring an
-    /// explicit rebuild. Deferred work alone does not arm recovery or publish.
+    /// explicit rebuild. Deferred work alone does not stage or publish.
     pub pending_indexes: Vec<super::PendingIndex>,
 }
 
@@ -145,24 +143,6 @@ impl DatasetOptimizeStats {
             pending_indexes: Vec::new(),
         }
     }
-
-    /// Stat for a dataset skipped because the graph manifest and Lance HEAD disagree.
-    fn skipped_for_drift(
-        type_key: String,
-        published_dataset_version: u64,
-        lance_head_version: u64,
-    ) -> Self {
-        Self {
-            type_key,
-            fragments_removed: 0,
-            fragments_added: 0,
-            committed: false,
-            skipped: Some(SkipReason::DriftNeedsRepair),
-            published_dataset_version: Some(published_dataset_version),
-            lance_head_version: Some(lance_head_version),
-            pending_indexes: Vec::new(),
-        }
-    }
 }
 
 /// Per-dataset outcome of `cleanup_all_datasets`. `error` is `Some` when this
@@ -175,6 +155,15 @@ pub struct DatasetCleanupStats {
     pub bytes_removed: u64,
     pub old_versions_removed: u64,
     pub error: Option<String>,
+    /// Detached manifests the tracing collector removes: published once and
+    /// named by no retained `__manifest` version.
+    pub manifests_removed: u64,
+    /// Detached manifests no `__manifest` version ever named: staging in
+    /// flight or abandoned.
+    pub unpublished_manifests: u64,
+    pub unpublished_bytes: u64,
+    /// Linear versions above the newest pin any registration names.
+    pub foreign_versions: Vec<u64>,
 }
 
 struct OptimizeTableTask {
@@ -182,6 +171,8 @@ struct OptimizeTableTask {
     table_key: String,
     full_path: String,
     expected_version: u64,
+    entry: crate::db::manifest::DatasetEntry,
+    witness: crate::table_store::StagingWitness,
 }
 
 struct PreparedOptimizeTable {
@@ -190,6 +181,8 @@ struct PreparedOptimizeTable {
     full_path: String,
     expected_version: u64,
     initial_snapshot: crate::storage_layer::SnapshotHandle,
+    witness: crate::table_store::StagingWitness,
+    last_linear_version: Option<u64>,
 }
 
 enum OptimizePreparation {
@@ -199,13 +192,32 @@ enum OptimizePreparation {
 
 struct OptimizeEffectOutcome {
     stat: DatasetOptimizeStats,
-    update: Option<crate::db::DatasetUpdate>,
+    effect: Option<OptimizeTableEffect>,
+}
+
+/// One table's staged maintenance: the pin update to publish and the version it
+/// was planned from.
+struct OptimizeTableEffect {
+    update: crate::db::DatasetUpdate,
+    expected_version: u64,
+}
+
+decide_seam! {
+    pub static OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT = ("optimize.post_phase_b_pre_manifest_commit", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// After Optimize captures its authority token, before the schema -> main
+    /// -> table gates and the revalidation that consumes it. Tests advance the
+    /// graph in this window and prove Optimize refuses rather than planning
+    /// against authority that has already moved.
+    pub static OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES = ("optimize.post_authority_capture_pre_gates", Unreachable, [Fail]);
 }
 
 /// Run Lance maintenance across every node + edge dataset on `main` under one
 /// graph visibility envelope. Physical dataset work remains bounded-parallel,
-/// but every productive dataset shares one recovery sidecar and one monotonic
-/// manifest batch publish, so one public Optimize produces at most one graph
+/// but every productive dataset stages detached and the batch publishes once
+/// with an exact pin CAS, so one public Optimize produces at most one graph
 /// commit. The final physical `__manifest` compaction remains outside that
 /// graph-visible envelope because the system dataset is read directly at HEAD.
 pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimizeStats>> {
@@ -213,36 +225,12 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("optimize").await?;
 
-    // Refuse on an unrecovered graph. A pending recovery sidecar means a failed
-    // write left partial state that the open-time sweep must resolve (roll
-    // forward/back) first; compacting + publishing a table covered by such a
-    // sidecar could commit a partial write the sweep would roll back. Reopen the
-    // graph to run recovery, then re-run optimize.
-    if !crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter())
-        .await?
-        .is_empty()
-    {
-        return Err(OmniError::manifest_conflict(
-            "optimize requires a clean recovery state; reopen the graph to run the \
-             recovery sweep before optimizing",
-        ));
-    }
-    // Deterministic race seam: the broad fast-path probe above has completed,
-    // but main's branch-writer gate is not held yet. A writer may arm recovery
-    // in this window; the load-bearing check below runs only after Optimize owns
-    // the branch authority every sidecar-enrolled main writer must cross.
-    crate::failpoints::maybe_fail(
-        crate::failpoints::names::OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE,
-    )?;
-
     // Capture complete graph authority before entering any writer gate, then
     // revalidate it after schema -> main -> table acquisition. A concurrent
-    // graph or schema publish therefore refuses this attempt before physical
-    // maintenance effects or recovery ownership.
+    // graph or schema publish therefore refuses this attempt before any
+    // physical maintenance effect.
     let authority_txn = db.open_write_txn(None).await?;
-    crate::failpoints::maybe_fail(
-        crate::failpoints::names::OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES,
-    )?;
+    fail(&OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES)?;
 
     // Canonical writer order: schema -> branch -> sorted tables. Planning reads
     // catalog index intent, so it must use an operation-local accepted catalog
@@ -255,8 +243,7 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
 
     // Optimize's one visibility point advances main's graph head, so its
     // authority is branch-wide even though physical effects are table-local.
-    // Retain main through the final physical-only __manifest compaction so a
-    // new main recovery intent cannot arm before raw manifest movement ends.
+    // Retain main through the final physical-only __manifest compaction.
     let _main_branch_guard = db.write_queue().acquire_branch(None).await;
 
     let table_keys = all_table_keys(&catalog);
@@ -266,16 +253,13 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
         .collect::<Vec<_>>();
     let table_guards = db.write_queue().acquire_many(&queue_keys).await;
 
-    // This relist is authoritative: every in-process writer that could have
-    // armed a main/global intent crosses one of the gates now held. The entry
-    // probe above is only a cheap fast-path/race seam.
-    ensure_no_pending_recovery_for_optimize_under_main_gate(db).await?;
     let snapshot = db.revalidate_write_txn(&authority_txn).await?;
 
     // Whether this run advanced any edge table — consumed by the graph-index
     // artifact gate at the tail (a no-work optimize skips the rebuild+PUT).
     let mut edge_tables_committed = false;
 
+    let witness = authority_txn.authority.staging_witness()?;
     let table_tasks = table_keys
         .into_iter()
         .filter_map(|table_key| {
@@ -285,6 +269,8 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
                 table_key,
                 full_path: format!("{}/{}", db.root_uri, entry.dataset_path),
                 expected_version: entry.published_dataset_version,
+                entry: entry.clone(),
+                witness: witness.clone(),
             })
         })
         .collect::<Vec<_>>();
@@ -313,32 +299,6 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
     prepared.sort_by(|left, right| left.table_key.cmp(&right.table_key));
 
     if !prepared.is_empty() {
-        // Phase A: one durable bounded-v2 intent before the first table HEAD
-        // advance. Exact provenance is deferred until Lance has a stable public
-        // maintenance-transaction API and recovery has a distributed fence.
-        let pins = prepared
-            .iter()
-            .map(|work| crate::db::manifest::SidecarTablePin {
-                table_fork_owner: None,
-                identity: work.identity,
-                table_key: work.table_key.clone(),
-                table_path: work.full_path.clone(),
-                expected_version: work.expected_version,
-                // Lower bound: compact_files may reserve then rewrite, while
-                // reindex/config/index work can add more versions.
-                post_commit_pin: work.expected_version + 1,
-                confirmed_version: None,
-                table_branch: None,
-            })
-            .collect();
-        let sidecar = crate::db::manifest::new_optimize_sidecar_v9(pins)?;
-        let recovery_handle =
-            crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar)
-                .await?;
-
-        // Phase B: settle every bounded-parallel task. Never early-cancel
-        // siblings: after the shared sidecar is armed, recovery needs the most
-        // knowable completed effect set possible.
         let effect_concurrency = maint_concurrency().min(prepared.len()).max(1);
         let effect_results: Vec<Result<OptimizeEffectOutcome>> = futures::stream::iter(prepared)
             .map(|work| {
@@ -348,58 +308,45 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
             .buffer_unordered(effect_concurrency)
             .collect()
             .await;
-
         let mut outcomes = Vec::new();
-        let mut first_error = None;
         for result in effect_results {
-            match result {
-                Ok(outcome) => outcomes.push(outcome),
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
+            outcomes.push(result?);
+        }
+        fail(&OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT)?;
+        let mut updates = Vec::new();
+        let mut expected_versions = crate::db::manifest::ExpectedTableVersions::new();
+        for outcome in &mut outcomes {
+            if let Some(effect) = outcome.effect.take() {
+                expected_versions.insert(
+                    effect.update.identity,
+                    crate::db::manifest::TableVersionExpectation {
+                        table_key: effect.update.type_key.clone(),
+                        table_version: effect.expected_version,
+                        native_ref: crate::db::manifest::NativeRefPin::Exact(None),
+                    },
+                );
+                updates.push(effect.update);
             }
         }
-        if let Some(error) = first_error {
-            return Err(optimize_recovery_required(&recovery_handle, error));
-        }
-
-        // One graph-wide Phase-B -> Phase-C crash seam, after every physical
-        // effect and before the only graph visibility point.
-        if let Err(error) = crate::failpoints::maybe_fail(
-            crate::failpoints::names::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-        ) {
-            return Err(optimize_recovery_required(&recovery_handle, error));
-        }
-
-        let updates = outcomes
+        let any_committed = !updates.is_empty();
+        let edge_committed = updates
             .iter()
-            .filter_map(|outcome| outcome.update.clone())
-            .collect::<Vec<_>>();
-        if let Err(error) = publish_optimize_batch_monotonic(db, &updates).await {
-            return Err(optimize_recovery_required(&recovery_handle, error));
+            .any(|update| update.type_key.starts_with("edge:"));
+        if any_committed {
+            let lineage = db.new_lineage_intent_for_branch(None, None).await?;
+            super::table_ops::commit_updates_on_branch_with_expected(
+                db,
+                None,
+                &updates,
+                &expected_versions,
+                None,
+                &authority_txn,
+                lineage,
+            )
+            .await?;
         }
-
-        let any_committed = outcomes.iter().any(|outcome| outcome.stat.committed);
-        let edge_committed = outcomes
-            .iter()
-            .any(|outcome| outcome.stat.committed && outcome.stat.type_key.starts_with("edge:"));
         edge_tables_committed = edge_committed;
         stats.extend(outcomes.into_iter().map(|outcome| outcome.stat));
-
-        // Phase D: the graph-visible postcondition is durable. A failed delete
-        // is harmless; legacy recovery recognizes the manifest-aligned stale
-        // sidecar and records/cleans it on the next pass.
-        if let Err(err) =
-            crate::db::manifest::delete_sidecar(&recovery_handle, db.storage_adapter()).await
-        {
-            tracing::warn!(
-                error = %err,
-                operation_id = recovery_handle.operation_id.as_str(),
-                "graph-wide optimize recovery sidecar cleanup failed; next open will resolve it"
-            );
-        }
-
-        // Cache invalidation happens once, after the one visibility point. A
-        // partial Phase B is deliberately not exposed through runtime caches.
         if any_committed {
             db.runtime_cache.invalidate_all().await;
             if edge_committed {
@@ -407,18 +354,14 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
             }
         }
     }
-
     stats.sort_by(|left, right| left.type_key.cmp(&right.type_key));
 
-    // Data-table recovery/publish is finished. Release the sorted table and
-    // schema gates before physical internal maintenance; retain main's branch
-    // gate through that maintenance to preserve the late-intent barrier.
     drop(table_guards);
     drop(schema_guard);
 
     // Compact the internal system tables too (RFC-013 step 2). They are not
     // catalog-tracked, so they take a separate, simpler path (`compact_internal_table`):
-    // compact in place, no manifest publish, no sidecar. Appended after the
+    // compact in place, no manifest publish. Appended after the
     // data-table stats so the data-table cache invalidation above is computed from
     // data-table stats only; each internal compaction does its own coordinator
     // refresh for cache coherence.
@@ -535,35 +478,8 @@ async fn prepare_optimize_table(
     task: OptimizeTableTask,
 ) -> Result<OptimizePreparation> {
     let snapshot = db
-        .storage()
-        .open_dataset_head(&task.full_path, None)
+        .open_pinned_for_write(&task.full_path, &task.entry)
         .await?;
-    let lance_head_version = snapshot.version();
-    if lance_head_version < task.expected_version {
-        return Err(OmniError::manifest_internal(format!(
-            "{} is at Lance HEAD version {}, behind published dataset version {}",
-            dataset_subject(&task.table_key),
-            lance_head_version,
-            task.expected_version
-        )));
-    }
-    if lance_head_version > task.expected_version {
-        tracing::warn!(
-            target: "omnigraph::optimize",
-            table = %task.table_key,
-            manifest_version = task.expected_version,
-            lance_head_version,
-            "skipping compaction: Lance HEAD is ahead of the manifest; run `omnigraph repair` \
-             to classify and publish covered maintenance drift explicitly",
-        );
-        return Ok(OptimizePreparation::Stat(
-            DatasetOptimizeStats::skipped_for_drift(
-                task.table_key,
-                task.expected_version,
-                lance_head_version,
-            ),
-        ));
-    }
 
     let options = CompactionOptions::default();
     let will_compact = plan_compaction(snapshot.dataset(), &options)
@@ -594,6 +510,8 @@ async fn prepare_optimize_table(
         full_path: task.full_path,
         expected_version: task.expected_version,
         initial_snapshot: snapshot,
+        witness: task.witness,
+        last_linear_version: task.entry.version_metadata.last_linear_version(),
     }))
 }
 
@@ -643,349 +561,129 @@ async fn append_deferred_full_text_indexes(
     Ok(())
 }
 
-/// Apply one productive dataset's physical maintenance work. This helper owns no
-/// locks, sidecar, or graph publish; those are graph-wide responsibilities of
-/// `optimize_all_datasets`.
+decide_seam! {
+    /// After one table's detached rewrite or index link committed, before the
+    /// next link or table (RFC 0067). Nothing is published yet.
+    pub static OPTIMIZE_POST_TABLE_EFFECT = ("optimize.post_table_effect", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    pub static OPTIMIZE_BEFORE_COMPACT = ("optimize.before_compact", Unreachable, [Fail]);
+}
+
+/// Stage one productive table's maintenance detached from its pin, as a
+/// chain of at most three links: the compaction rewrite, then a whole rebuild
+/// of every foldable index whose coverage lags the rewritten layout (Lance 11
+/// folds only through a linear commit, so `stage_index_fold` rebuilds instead
+/// of merging), then any declared-but-unbuilt index. The rewrite comes first
+/// so an index is rebuilt once, over the settled layout.
 async fn apply_optimize_table_effects(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
     work: PreparedOptimizeTable,
 ) -> Result<OptimizeEffectOutcome> {
-    let identity = work.identity;
     let table_key = work.table_key;
     let full_path = work.full_path;
-    let mut initial_snapshot = Some(work.initial_snapshot);
-
-    // Tracks whether one of OUR Phase-B ops (auto-cleanup strip / compact / reindex)
-    // already committed and advanced Lance HEAD past the manifest in a prior attempt.
-    // Once true, a reopened `lance_head > manifest` is our own sidecar-covered work,
-    // NOT external drift — so the drift guard and the no-op early-return must not treat
-    // it as such (that would drop our committed work as uncovered drift).
-    let mut head_advanced = false;
-
-    // Outer loop: open → plan → Phase B, reopening + re-planning on a retryable
-    // Lance conflict. Breaks with the committed snapshot once Phase B succeeds.
-    let mut attempt: u32 = 0;
-    let (snapshot, metrics, pending_indexes, committed) = loop {
-        attempt += 1;
-
-        let selected = match initial_snapshot.take() {
-            Some(snapshot) => snapshot,
-            None => db.storage().open_dataset_head(&full_path, None).await?,
-        };
-
-        // CAS baseline: the table's current manifest version, re-read each attempt
-        // (a reopen means the manifest may have advanced).
-        let expected_version = db
-            .fresh_snapshot_for_branch(None)
-            .await?
-            .dataset(&table_key)
-            .map(|e| e.published_dataset_version)
-            .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
-
-        let lance_head_version = selected.version();
-        if lance_head_version < expected_version {
-            return Err(OmniError::manifest_internal(format!(
-                "{} is at Lance HEAD version {}, behind published dataset version {}",
-                dataset_subject(&table_key),
-                lance_head_version,
-                expected_version
-            )));
-        }
-        if !head_advanced && lance_head_version > expected_version {
-            // Pre-existing EXTERNAL uncovered drift (we have not advanced HEAD yet) —
-            // go through explicit repair. Once `head_advanced` is set, a reopened
-            // `lance_head > manifest` is our own prior Phase-B commit (sidecar-covered)
-            // that the publish below fast-forwards, NOT external drift, so this guard is
-            // skipped on those retries.
-            return Err(OmniError::manifest_conflict(format!(
-                "optimize {} moved after the graph-wide recovery intent armed: \
-                 published dataset version {}, Lance HEAD version {}",
-                dataset_subject(&table_key),
-                expected_version,
-                lance_head_version
-            )));
-        }
-
-        // Precise "will it compact?" check — `plan_compaction` also accounts for
-        // deletion materialization (which can rewrite even a single fragment).
-        let options = CompactionOptions::default();
-        let plan = plan_compaction(selected.dataset(), &options)
-            .await
-            .map_err(OmniError::storage)?;
-        let will_compact = plan.num_tasks() > 0;
-        // Even with nothing to compact, the table may still have index work
-        // (needs_reindex: rows appended since the index was built; needs_index_create:
-        // a declared `@index` whose physical build schema apply deferred, iss-848).
-        // Any of the three enters the publish path. If NONE, this is a no-op and must
-        // NOT be pinned in a sidecar (a zero-commit pin classifies NoMovement on
-        // recovery and rolls back siblings).
-        let needs_reindex =
-            TableStore::has_foldable_unindexed_fragments(selected.dataset()).await?;
-        let index_work = super::table_ops::index_work_status_on_dataset_for_catalog(
-            db, catalog, &table_key, &selected,
-        )
-        .await?;
-        let needs_index_create = index_work.needs_commit;
-        if !will_compact && !needs_reindex && !needs_index_create {
-            if head_advanced {
-                // Nothing left to compact, but a prior attempt already advanced HEAD
-                // (e.g. the strip committed, then compaction conflicted, and the reopen
-                // is now already compacted). Publish that committed work instead of
-                // dropping it as uncovered drift.
-                break (
-                    selected,
-                    CompactionMetrics::default(),
-                    index_work.pending,
-                    true,
-                );
-            }
-            let mut stat = DatasetOptimizeStats::compacted(
-                table_key.clone(),
-                &CompactionMetrics::default(),
-                false,
-            );
-            stat.pending_indexes = index_work.pending;
-            append_deferred_full_text_indexes(&selected, &stat.type_key, &mut stat.pending_indexes)
-                .await?;
-            return Ok(OptimizeEffectOutcome { stat, update: None });
-        }
-
-        // Test seam: a concurrent (cross-process) writer can interleave here, before
-        // any Phase-B commit lands, to exercise the reopen+replan path.
-        crate::failpoints::maybe_fail(crate::failpoints::names::OPTIMIZE_BEFORE_COMPACT)?;
-
-        // Phase B: scrub stale auto_cleanup (keeps optimize non-destructive on a
-        // graph upgraded from a pre-v7 binary whose `compact_files`/`optimize_indices`
-        // commits would otherwise fire Lance's auto-cleanup GC hook), compact,
-        // incremental reindex, then materialize declared-but-missing indexes. The
-        // maintenance APIs still commit inline; missing-index materialization uses a
-        // staged CreateIndex immediately committed under this bounded-v2 sidecar.
-        // A retryable Lance conflict
-        // here means a concurrent writer preempted an overlapping fragment → reopen at
-        // the new HEAD and re-plan. Baseline captured BEFORE the scrub so that if the
-        // scrub is the only commit, `committed` still triggers the Phase-C publish.
-        let mut ds = selected.into_dataset();
-        let version_before = ds.version().version;
-        match clear_stale_auto_cleanup_config(&mut ds).await {
-            // `true` ⇒ the strip committed and advanced HEAD past the manifest.
-            Ok(stripped) => head_advanced |= stripped,
-            Err(e) if attempt < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) => {
-                continue;
-            }
-            Err(e) => return Err(OmniError::storage(e)),
-        }
-        let metrics: CompactionMetrics = if will_compact {
-            match compact_files(&mut ds, options, None).await {
-                Ok(m) => {
-                    head_advanced = true;
-                    m
-                }
-                Err(e) if attempt < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) => {
-                    continue;
-                }
-                Err(e) => return Err(OmniError::storage(e)),
-            }
-        } else {
-            CompactionMetrics::default()
-        };
-        // Test seam: inject one retryable reindex conflict AFTER compaction has
-        // committed (so HEAD is already ahead of the manifest from our own work),
-        // exercising the own-HEAD (not external) drift classification on the next
-        // reopened attempt.
-        if crate::failpoints::maybe_fail(crate::failpoints::names::OPTIMIZE_INJECT_REINDEX_CONFLICT)
-            .is_err()
-            && attempt < COMPACTION_RETRY_BUDGET
-        {
-            continue;
-        }
-        // FTS folding merges existing postings into a new UUID without an
-        // uncommitted proof hook. Keep those immutable artifacts (stable-row-ID
-        // compaction preserves them), and scan uncovered rows until an explicit
-        // full rebuild. Never bless mixed old/new analyzer postings. RFC 0043.
-        let index_names = ds
-            .load_indices()
-            .await
-            .map_err(OmniError::storage)?
-            .iter()
-            .filter(|index| TableStore::can_fold_index(index))
-            .map(|index| index.name.clone())
-            .collect();
-        match ds
-            .optimize_indices(&OptimizeOptions::default().index_names(index_names))
-            .await
-        {
-            Ok(()) => {}
-            Err(e) if attempt < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) => {
-                continue;
-            }
-            Err(e) => {
-                return Err(OmniError::storage_context(
-                    format!("optimize_indices on {table_key}"),
-                    e,
-                ));
-            }
-        }
-
-        let mut snapshot = crate::storage_layer::SnapshotHandle::new(ds);
-        let pending_indexes: Vec<super::PendingIndex> =
-            super::table_ops::build_indices_on_dataset_for_catalog(
-                db,
-                catalog,
-                &table_key,
-                &mut snapshot,
-            )
+    let base = work.initial_snapshot;
+    let witness = work.witness;
+    fail(&OPTIMIZE_BEFORE_COMPACT)?;
+    let options = CompactionOptions::default();
+    let mut chain = Vec::new();
+    let mut tip = base.clone();
+    let mut tip_identity = None;
+    let mut metrics = CompactionMetrics::default();
+    if let Some((staged, compaction_metrics)) =
+        db.storage().stage_compaction(&base, &options).await?
+    {
+        let (rewrite, identity) = db
+            .storage()
+            .commit_staged_detached(tip, staged, &witness)
             .await?;
-        // optimize_indices / index build may also have committed (folded fragments,
-        // built a deferred index). Any HEAD advance this attempt counts too.
-        let version_after = snapshot.version();
-        head_advanced |= version_after != version_before;
-
-        break (snapshot, metrics, pending_indexes, head_advanced);
-    };
-
-    let mut stat = DatasetOptimizeStats::compacted(table_key, &metrics, committed);
-    stat.pending_indexes = pending_indexes;
-    append_deferred_full_text_indexes(&snapshot, &stat.type_key, &mut stat.pending_indexes).await?;
-    let update = if committed {
-        let state = db.storage().table_state(&full_path, &snapshot).await?;
-        Some(crate::db::DatasetUpdate {
-            identity,
-            type_key: stat.type_key.clone(),
-            published_dataset_version: state.version,
-            native_dataset_branch: None,
-            entity_count: state.row_count,
-            version_metadata: state.version_metadata,
-        })
-    } else {
-        None
-    };
-    Ok(OptimizeEffectOutcome { stat, update })
-}
-
-/// Publish every still-needed table pointer in one manifest/lineage CAS. This
-/// is maintenance-class OCC, not logical read-set OCC: a current pointer at or
-/// beyond the achieved target is already converged and is omitted; remaining
-/// pointers use their freshly observed versions as row-level expectations.
-async fn publish_optimize_batch_monotonic(
-    db: &Omnigraph,
-    targets: &[crate::db::DatasetUpdate],
-) -> Result<()> {
-    if targets.is_empty() {
-        return Ok(());
+        metrics = compaction_metrics;
+        tip = rewrite;
+        tip_identity = Some(identity);
+        fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
     }
-
-    let mut last_conflict = None;
-    for _ in 0..COMPACTION_RETRY_BUDGET {
-        let current = db.fresh_snapshot_for_branch(None).await?;
-        let mut updates = Vec::with_capacity(targets.len());
-        let mut expected = std::collections::HashMap::with_capacity(targets.len());
-        for target in targets {
-            let entry = current.dataset(&target.type_key).ok_or_else(|| {
-                OmniError::manifest_conflict(format!(
-                    "optimize target '{}' disappeared before graph-wide publish",
-                    target.type_key
+    // Fold every index whose coverage lags (appended fragments, or a vector
+    // index that keeps row addresses and dropped the compacted fragments)
+    // as a detached rebuild chained on the rewrite.
+    let (fold, skipped_folds) = db.storage().stage_index_fold(&tip).await?;
+    if let Some(staged) = fold {
+        if tip_identity.is_some() {
+            chain.push(tip.clone());
+        }
+        let (folded, identity) = db
+            .storage()
+            .commit_staged_detached(tip, staged, &witness)
+            .await?;
+        tip = folded;
+        tip_identity = Some(identity);
+        fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
+    }
+    let mut index_work =
+        super::table_ops::plan_index_work_on_dataset_for_catalog(db, catalog, &table_key, &tip)
+            .await?;
+    for (column, reason) in skipped_folds {
+        index_work.pending.push(super::PendingIndex {
+            type_key: table_key.clone(),
+            property: column,
+            reason: format!(
+                "vector index coverage lags and the column cannot train an index: {reason}"
+            ),
+        });
+    }
+    if !index_work.specs.is_empty() {
+        let staged = db
+            .storage()
+            .stage_create_indices(&tip, &index_work.specs)
+            .await
+            .map_err(|error| {
+                error.with_context(format!(
+                    "stage index batch on {table_key} ({:?})",
+                    index_work.specs
                 ))
             })?;
-            if entry.identity != target.identity {
-                return Err(OmniError::manifest_read_set_changed(
-                    format!("dataset_identity:{}", target.type_key),
-                    Some(target.identity.to_string()),
-                    Some(entry.identity.to_string()),
-                ));
-            }
-            if entry.published_dataset_version < target.published_dataset_version {
-                expected.insert(
-                    entry.identity,
-                    crate::db::manifest::TableVersionExpectation {
-                        table_key: target.type_key.clone(),
-                        table_version: entry.published_dataset_version,
-                        native_ref: crate::db::manifest::NativeRefPin::Exact(
-                            entry.native_dataset_branch.clone(),
-                        ),
-                    },
-                );
-                updates.push(target.clone());
-            }
+        if tip_identity.is_some() {
+            chain.push(tip.clone());
         }
-        if updates.is_empty() {
-            return Ok(());
-        }
-
-        match db
-            .coordinator
-            .write()
-            .await
-            .commit_updates_with_actor_with_expected(&updates, &expected, None)
-            .await
-        {
-            Ok(_) => return Ok(()),
-            Err(error) if is_retryable_manifest_conflict(&error) => last_conflict = Some(error),
-            Err(error) => return Err(error),
-        }
+        let (indexed, identity) = db
+            .storage()
+            .commit_staged_detached(tip, staged, &witness)
+            .await?;
+        tip = indexed;
+        tip_identity = Some(identity);
+        fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
     }
-
-    let current = db.fresh_snapshot_for_branch(None).await?;
-    if targets.iter().all(|target| {
-        current.dataset(&target.type_key).is_some_and(|entry| {
-            entry.identity == target.identity
-                && entry.published_dataset_version >= target.published_dataset_version
-        })
-    }) {
-        return Ok(());
-    }
-    Err(last_conflict.unwrap_or_else(|| {
-        OmniError::manifest_conflict(format!(
-            "graph-wide optimize publish exhausted {COMPACTION_RETRY_BUDGET} retries"
-        ))
-    }))
-}
-
-fn optimize_recovery_required(
-    handle: &crate::db::manifest::RecoverySidecarHandle,
-    error: OmniError,
-) -> OmniError {
-    OmniError::recovery_required(
-        handle.operation_id.clone(),
-        format!(
-            "graph-wide optimize failed after arming recovery; reopen read-write to converge it: {error}"
-        ),
-    )
-}
-
-/// Final recovery-ownership check for main-branch Optimize.
-///
-/// The caller must hold main's branch-writer gate and retain it through all data
-/// effects and graph-head publishes. The top-level probe stays deliberately
-/// conservative and refuses any pre-existing sidecar; this final check rejects
-/// every late main-target intent plus graph-global SchemaApply. Table-disjoint
-/// intents still overlap because each fixed recovery authority includes the
-/// shared `graph_head:main` that Optimize advances.
-///
-/// This is a process-local gate proof, matching the repository's documented
-/// single-writer-process boundary. Separate processes remain governed by Lance
-/// OCC and recovery classification; this helper is not a distributed lock.
-async fn ensure_no_pending_recovery_for_optimize_under_main_gate(db: &Omnigraph) -> Result<()> {
-    let sidecars = crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter()).await?;
-    let blocking = sidecars.iter().find(|sidecar| {
-        sidecar.writer_kind == crate::db::manifest::SidecarKind::SchemaApply
-            || sidecar
-                .branch
-                .as_deref()
-                .filter(|branch| *branch != "main")
-                .is_none()
-    });
-    if let Some(sidecar) = blocking {
-        return Err(OmniError::recovery_required(
-            sidecar.operation_id.clone(),
-            format!(
-                "pending {:?} recovery operation on branch '{}' blocks optimize",
-                sidecar.writer_kind,
-                sidecar.branch.as_deref().unwrap_or("main"),
-            ),
-        ));
-    }
-    Ok(())
+    let Some(identity) = tip_identity else {
+        let mut stat = DatasetOptimizeStats::compacted(table_key, &metrics, false);
+        stat.pending_indexes = index_work.pending;
+        append_deferred_full_text_indexes(&tip, &stat.type_key, &mut stat.pending_indexes).await?;
+        return Ok(OptimizeEffectOutcome { stat, effect: None });
+    };
+    let mut stat = DatasetOptimizeStats::compacted(table_key.clone(), &metrics, true);
+    stat.pending_indexes = index_work.pending;
+    append_deferred_full_text_indexes(&tip, &stat.type_key, &mut stat.pending_indexes).await?;
+    let state = db.storage().table_state(&full_path, &tip).await?;
+    let published_dataset_version = work.expected_version + 1 + chain.len() as u64;
+    let version_metadata = state
+        .version_metadata
+        .with_staged(state.version, identity.uuid.clone())
+        .with_last_linear_version(work.last_linear_version);
+    let update = crate::db::DatasetUpdate {
+        identity: work.identity,
+        type_key: table_key,
+        published_dataset_version,
+        native_dataset_branch: None,
+        entity_count: state.row_count,
+        version_metadata,
+    };
+    Ok(OptimizeEffectOutcome {
+        stat,
+        effect: Some(OptimizeTableEffect {
+            update,
+            expected_version: work.expected_version,
+        }),
+    })
 }
 
 /// Bound on the app-level retry of an internal-table compaction against a
@@ -1011,41 +709,9 @@ fn is_retryable_lance_conflict(err: &lance::Error) -> bool {
     )
 }
 
-/// A manifest publish conflict that optimize's monotonic Phase-C loop re-evaluates
-/// (re-read the current version, then no-op or fast-forward). Both shapes that reach
-/// here are `Conflict`-kind and mean "the manifest moved under us; reconsider," never
-/// a lost update: the typed `PublishedDatasetVersionMismatch` (a concurrent writer advanced
-/// the table) and the publisher's exhausted row-level CAS (`manifest_conflict`).
-fn is_retryable_manifest_conflict(err: &OmniError) -> bool {
-    matches!(
-        err,
-        OmniError::Manifest(m) if m.kind == crate::error::ManifestErrorKind::Conflict
-    )
-}
-
-/// Remove any stored `lance.auto_cleanup.*` config from a table so compaction
-/// stays **non-destructive by construction**. Used by both the internal-table
-/// path ([`compact_internal_table`]) and the data-table path
-/// ([`apply_optimize_table_effects`]).
-///
-/// `compact_files` / `optimize_indices` commit with a default `CommitConfig`
-/// (`skip_auto_cleanup = false`) and `CompactionOptions` exposes no override, so on
-/// a dataset whose stored config has `lance.auto_cleanup.interval` set, the
-/// compaction/reindex commit would fire Lance's auto-cleanup hook (version GC) —
-/// deletion of old versions, including ones `__manifest` pins for snapshots /
-/// time-travel (data tables) or that hold lineage/time-travel state (internal
-/// tables). New graphs create tables with `auto_cleanup: None` (`manifest/graph.rs`,
-/// `commit_graph.rs`, and the data-table create path) so there is nothing to clear;
-/// only pre-`auto_cleanup`-fix *upgraded* graphs carry the config. OmniGraph owns
-/// version cleanup explicitly (`cleanup`), so Lance's hook is unwanted regardless —
-/// clearing it both makes `optimize` non-destructive and aligns the table with the
-/// new-graph posture. The `delete_config_keys` commit itself does not GC: the
-/// resulting manifest no longer has the `interval` key, so the post-commit hook is a
-/// no-op. Returns whether any config was cleared (it advances Lance HEAD iff so).
-/// Recovery coverage differs by caller: the data-table path runs this inside the
-/// Optimize sidecar window; the internal-table path needs none (it commits at HEAD
-/// and is read at HEAD — the strip is a content-preserving config commit, so a crash
-/// leaves the table readable and content-identical, see [`compact_internal_table`]).
+/// Strip a stored `lance.auto_cleanup.*` config so an internal table's linear
+/// `compact_files` commit cannot fire Lance's version GC; returns whether a
+/// config commit (which advances Lance HEAD) cleared anything.
 async fn clear_stale_auto_cleanup_config(
     ds: &mut lance::Dataset,
 ) -> std::result::Result<bool, lance::Error> {
@@ -1073,10 +739,10 @@ async fn clear_stale_auto_cleanup_config(
 /// their latest Lance HEAD, so compaction just advances that HEAD and the next
 /// reader transparently observes the compacted version. That makes this path much
 /// simpler than [`apply_optimize_table_effects`] — no manifest publish (nothing to publish
-/// to), and no recovery sidecar. The sidecar-free claim does NOT rest on
+/// to), and no detached staging. Crash safety does NOT rest on
 /// single-commit atomicity: `compact_files` can emit a `ReserveFragments` commit
 /// before the final `Rewrite` (and the config strip is a separate commit before
-/// both), so this advances HEAD over one or more commits. It needs no sidecar
+/// both), so this advances HEAD over one or more commits. That is safe
 /// because every one of those commits is content-preserving and the table is read
 /// at HEAD — a crash at any point leaves the table readable and content-identical,
 /// and the next `optimize` re-plans. Internal tables carry no Lance index (only
@@ -1159,12 +825,23 @@ async fn compact_internal_table(
     )))
 }
 
+decide_seam! {
+    pub static CLEANUP_TABLE_GC = ("cleanup.table_gc", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// After cleanup's entry checks, before it captures authority and
+    /// acquires its schema/branch/table GC gate set: the one window where a
+    /// failure aborts the whole run (per-table GC failures are isolated).
+    pub static CLEANUP_PRE_GATES = ("cleanup.pre_gates", Unreachable, [Fail]);
+}
+
 /// Run Lance `cleanup_old_versions` on every node + edge dataset on `main`,
 /// using [`CleanupPolicyOptions`]. The latest manifest is always preserved
 /// regardless (Lance invariant), and the requested cutoff is capped at the
 /// oldest main-dataset version inherited by a live lazy graph branch.
 pub async fn cleanup_all_datasets(
-    db: &mut Omnigraph,
+    db: &Omnigraph,
     options: CleanupPolicyOptions,
 ) -> Result<Vec<DatasetCleanupStats>> {
     if options.keep_versions.is_none() && options.older_than.is_none() {
@@ -1176,35 +853,13 @@ pub async fn cleanup_all_datasets(
     let _export_exclusion = db.reserve_export_destructive_control()?;
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("cleanup").await?;
-
-    // Version GC must never run while recovery still needs exact Lance
-    // transaction/version history to prove effect ownership or resume an
-    // interrupted compensation. Refuse before orphan reconciliation or any
-    // per-table cleanup so this operation is all-or-nothing with respect to the
-    // recovery-history floor. A read-write reopen resolves the sidecar first.
-    if !crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter())
-        .await?
-        .is_empty()
-    {
-        return Err(OmniError::manifest_conflict(
-            "cleanup requires a clean recovery state; reopen the graph to run the \
-             recovery sweep before garbage-collecting versions",
-        ));
-    }
-    crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_POST_RECOVERY_CHECK_PRE_GATES)?;
+    fail(&CLEANUP_PRE_GATES)?;
 
     // GC must be bound to one accepted graph view. Capture before acquiring
     // writer gates, and revalidate after the complete schema/branch/table
     // envelope before deleting any version history.
     let authority_txn = db.open_write_txn(None).await?;
 
-    // Close the empty-check -> GC race. Mutation/load take schema then branch
-    // then table gates; current legacy sidecar writers take at least their table
-    // gates. Cleanup takes the conservative superset and holds it through every
-    // `cleanup_old_versions` call, then performs the authoritative sidecar check
-    // under those gates. Without this envelope a writer can arm+commit+fail after
-    // the fast check and GC can delete the exact transaction/version history
-    // Full recovery needs to prove ownership or Restore.
     let _cleanup_schema_guard = db
         .write_queue()
         .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
@@ -1228,81 +883,103 @@ pub async fn cleanup_all_datasets(
     let gc_queue_keys = db.table_queue_keys_for_branches(&graph_branches, &cleanup_catalog);
     let _cleanup_table_guards = db.write_queue().acquire_many(&gc_queue_keys).await;
 
-    if !crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter())
-        .await?
-        .is_empty()
-    {
-        return Err(OmniError::manifest_conflict(
-            "cleanup observed a recovery sidecar after acquiring its GC gates; reopen the graph \
-             read-write to recover before garbage-collecting versions",
-        ));
-    }
     db.revalidate_write_txn(&authority_txn).await?;
 
-    // Lance protects versions referenced by its own per-dataset branches, but
-    // an OmniGraph branch is lazy: until a table is first written on that
-    // branch its manifest entry points directly at an older MAIN version and
-    // no Lance branch ref exists on the data table. Resolve every live graph
-    // branch from fresh authority while schema + all branch/table gates are
-    // held, then cap each main dataset's GC cutoff at its oldest such pin.
-    // Main itself participates: its manifest-visible version must open and
-    // equal Lance HEAD, so uncovered drift is repaired before cleanup rather
-    // than letting HEAD-based GC collect graph-visible authority.
-    // Any branch snapshot read failure aborts before the first table GC: an
-    // unknown live reference is never evidence that a version is disposable.
-    let mut oldest_live_main_version_by_path = std::collections::HashMap::<String, u64>::new();
-    for branch_target in &graph_branches {
-        if branch_target
-            .as_deref()
-            .is_some_and(crate::db::is_internal_system_branch)
-        {
-            continue;
-        }
-        let branch_label = branch_target.as_deref().unwrap_or("main");
-        let branch_snapshot = db
-            .fresh_snapshot_for_branch(branch_target.as_deref())
-            .await
-            .map_err(|err| {
-                OmniError::manifest_conflict(format!(
-                    "cleanup could not classify live branch '{branch_label}'; refusing version GC: {err}"
-                ))
-            })?;
-        for entry in branch_snapshot.datasets() {
-            // Validate that the exact protected version is still openable
-            // before GC starts. This catches pre-existing damage from an older
-            // cleanup implementation and keeps the sweep fail-closed instead
-            // of deleting unrelated history around an already-broken branch.
-            entry.open(db.root_uri(), None).await.map_err(|err| {
-                OmniError::manifest_conflict(format!(
-                    "cleanup could not classify live branch '{branch_label}' {} at published dataset version {}; refusing version GC: {err}",
-                    dataset_subject(&entry.type_key), entry.published_dataset_version
-                ))
-            })?;
-            if entry.native_dataset_branch.is_some() {
-                continue;
-            }
-            let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
-            if branch_target.is_none() {
-                let head = db.storage().open_dataset_head(&full_path, None).await?;
-                if head.version() != entry.published_dataset_version {
-                    return Err(OmniError::manifest_conflict(format!(
-                        "cleanup found uncovered HEAD drift for {}: published dataset version {}, \
-                         Lance HEAD version {}; run `omnigraph repair` before version GC",
-                        dataset_subject(&entry.type_key),
-                        entry.published_dataset_version,
-                        head.version()
-                    )));
-                }
-            }
-            oldest_live_main_version_by_path
-                .entry(full_path)
-                .and_modify(|oldest| *oldest = (*oldest).min(entry.published_dataset_version))
-                .or_insert(entry.published_dataset_version);
+    cleanup_detached_only(db, &options, &graph_branches, &table_tasks).await
+}
+
+/// The detached-only `cleanup` (RFC "Detached-only tables"): plan the collector
+/// under the gates held, reconcile orphaned forks, perform each table's plan;
+/// an unfinished trace keeps its table whole and its row says why.
+async fn cleanup_detached_only(
+    db: &Omnigraph,
+    options: &CleanupPolicyOptions,
+    graph_branches: &[Option<String>],
+    table_tasks: &[(String, String)],
+) -> Result<Vec<DatasetCleanupStats>> {
+    let before_timestamp = options
+        .older_than
+        .map(|duration| crate::dst_clock::now_utc() - duration);
+    let native_plan = prepare_native_fork_reconciliation(db, before_timestamp).await?;
+    let plan = super::collector::plan_collection(db, options, graph_branches).await?;
+    let mut table_tasks = table_tasks.to_vec();
+    let mut scheduled_paths = table_tasks
+        .iter()
+        .map(|(_, path)| path.clone())
+        .collect::<std::collections::HashSet<_>>();
+    for planned in &plan.tables {
+        if scheduled_paths.insert(planned.full_path.clone()) {
+            table_tasks.push((planned.table_key.clone(), planned.full_path.clone()));
         }
     }
-
-    let before_timestamp = options.older_than.map(|d| crate::dst_clock::now_utc() - d);
-    let reconciled = reconcile_orphaned_branches_under_control_gates(db, before_timestamp).await?;
+    let concurrency = maint_concurrency().min(table_tasks.len()).max(1);
+    let plan = &plan;
+    let results: Vec<DatasetCleanupStats> = futures::stream::iter(table_tasks)
+        .map(|(table_key, full_path)| async move {
+            let summary = plan.row_summary(&full_path);
+            let mut swept = super::collector::SweepStats::default();
+            let outcome: Result<()> = async {
+                fail(&CLEANUP_TABLE_GC)?;
+                let locations = plan
+                    .tables
+                    .iter()
+                    .filter(|location| location.full_path == full_path)
+                    .collect::<Vec<_>>();
+                let unfinished = locations
+                    .iter()
+                    .flat_map(|location| location.errors.iter().cloned())
+                    .collect::<Vec<_>>();
+                if !unfinished.is_empty() {
+                    return Err(OmniError::manifest_conflict(format!(
+                        "the collector's trace did not finish; nothing is deleted for this \
+                         table: {}",
+                        unfinished.join("; ")
+                    )));
+                }
+                for location in locations {
+                    super::collector::sweep_table(db, location, &mut swept).await?;
+                }
+                Ok(())
+            }
+            .await;
+            let error = outcome.err().map(|err| {
+                tracing::warn!(
+                    target: "omnigraph::cleanup",
+                    table = %table_key,
+                    error = %err,
+                    "collection failed for dataset; other datasets unaffected",
+                );
+                err.to_string()
+            });
+            DatasetCleanupStats {
+                type_key: table_key,
+                bytes_removed: swept.bytes_removed,
+                old_versions_removed: swept.manifests_removed,
+                error,
+                manifests_removed: swept.manifests_removed,
+                unpublished_manifests: summary.unpublished_manifests,
+                unpublished_bytes: summary.unpublished_bytes,
+                foreign_versions: summary.foreign_versions,
+            }
+        })
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
+    if !plan.expired_merge_input_tags.is_empty() {
+        let manifest =
+            crate::db::manifest::ManifestCoordinator::collector_branch_under_control_gates(
+                db.root_uri(),
+                None,
+                &db.control_session(),
+            )
+            .await?;
+        crate::db::manifest::retention::release_merge_input_tags(
+            manifest.dataset(),
+            &plan.expired_merge_input_tags,
+        )
+        .await?;
+    }
+    let reconciled = reconcile_frozen_native_forks(db, native_plan, plan).await?;
     if !reconciled.reclaimed.is_empty() {
         tracing::info!(
             count = reconciled.reclaimed.len(),
@@ -1317,106 +994,6 @@ pub async fn cleanup_all_datasets(
             "cleanup could not reconcile some orphaned forks; will retry next cleanup"
         );
     }
-
-    let keep_versions = options.keep_versions;
-    let table_tasks = table_tasks
-        .into_iter()
-        .map(|(table_key, full_path)| {
-            let live_main_floor = oldest_live_main_version_by_path.get(&full_path).copied();
-            (table_key, full_path, live_main_floor)
-        })
-        .collect::<Vec<_>>();
-
-    if table_tasks.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let concurrency = maint_concurrency().min(table_tasks.len()).max(1);
-    let storage = db.storage();
-
-    // Fault-isolated per table: a single table's GC failure is recorded on its
-    // stats row (`error: Some`) and logged, never aborting the healthy tables.
-    // cleanup is the convergence backstop, so it must do as much as it can and
-    // converge on re-run rather than fail wholesale (invariant 13).
-    let results: Vec<DatasetCleanupStats> = futures::stream::iter(table_tasks)
-        .map(|(table_key, full_path, live_main_floor)| async move {
-            let outcome: Result<RemovalStats> = async {
-                crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_TABLE_GC)?;
-                // `cleanup_old_versions` is a Lance-only maintenance API not
-                // surfaced through `TableStorage` — see the optimize path
-                // above for the same rationale. It only needs a raw read borrow.
-                let handle = storage.open_dataset_head(&full_path, None).await?;
-                let ds = handle.dataset();
-                let requested_before_version = if let Some(keep) = keep_versions {
-                    // Lance versions are not safely derivable from HEAD
-                    // arithmetic after prior GC. Use the actual ordered
-                    // version list so `keep=N` retains exactly the newest N
-                    // available versions (with HEAD as the unavoidable floor
-                    // when N=0).
-                    // Only version numbers are needed: avoid fetching every
-                    // historical manifest and its summary metadata.
-                    let versions = ds.version_refs().await.map_err(OmniError::storage)?;
-                    let retain = (keep as usize).max(1);
-                    let cutoff = if versions.len() <= retain {
-                        versions.first()
-                    } else {
-                        versions.get(versions.len() - retain)
-                    }
-                    .ok_or_else(|| {
-                        OmniError::manifest_internal(format!(
-                            "cleanup found no versions for open {}",
-                            dataset_subject(&table_key)
-                        ))
-                    })?;
-                    Some(cutoff.version)
-                } else {
-                    None
-                };
-                let before_version = match (requested_before_version, live_main_floor) {
-                    (Some(requested), Some(floor)) => Some(requested.min(floor)),
-                    (None, Some(floor)) => Some(floor),
-                    (requested, None) => requested,
-                };
-                let policy = CleanupPolicy {
-                    before_timestamp,
-                    before_version,
-                    delete_unverified: false,
-                    error_if_tagged_old_versions: false,
-                    clean_referenced_branches: false,
-                    delete_rate_limit: None,
-                };
-                lance::dataset::cleanup::cleanup_old_versions(ds, policy)
-                    .await
-                    .map_err(OmniError::storage)
-            }
-            .await;
-            match outcome {
-                Ok(removed) => DatasetCleanupStats {
-                    type_key: table_key,
-                    bytes_removed: removed.bytes_removed,
-                    old_versions_removed: removed.old_versions,
-                    error: None,
-                },
-                Err(err) => {
-                    tracing::warn!(
-                        target: "omnigraph::cleanup",
-                        table = %table_key,
-                        error = %err,
-                        "version GC failed for dataset; other datasets unaffected",
-                    );
-                    DatasetCleanupStats {
-                        type_key: table_key,
-                        bytes_removed: 0,
-                        old_versions_removed: 0,
-                        error: Some(err.to_string()),
-                    }
-                }
-            }
-        })
-        .buffer_unordered(concurrency)
-        .collect()
-        .await;
-
     Ok(results)
 }
 
@@ -1445,7 +1022,7 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
     reconcile_orphaned_branches_under_control_gates(db, None).await
 }
 
-async fn cleanup_graph_branches(db: &Omnigraph) -> Result<Vec<Option<String>>> {
+pub(crate) async fn cleanup_graph_branches(db: &Omnigraph) -> Result<Vec<Option<String>>> {
     let mut branches = db
         .coordinator
         .read()
@@ -1542,7 +1119,24 @@ async fn native_fork_inventory(
     dataset: &lance::Dataset,
     before_timestamp: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<NativeForkInventory> {
-    let refs = crate::branch_control::list_all_branch_contents(dataset).await?;
+    let mut refs = crate::branch_control::list_all_branch_contents(dataset).await?;
+    let active_refs = refs
+        .keys()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    for (branch, archived) in
+        crate::branch_control::list_archived_manifest_branches(dataset).await?
+    {
+        if refs
+            .get(&branch)
+            .is_some_and(|active| active.identifier != archived.identifier)
+        {
+            return Err(OmniError::manifest_conflict(format!(
+                "native ref and retirement archive disagree for '{branch}'"
+            )));
+        }
+        refs.entry(branch).or_insert(archived);
+    }
     let tagged = dataset
         .tags()
         .list()
@@ -1579,6 +1173,22 @@ async fn native_fork_inventory(
                     "cleanup listed native tree object outside '{tree}'"
                 ))
             })?;
+        if file.location.filename() == Some(crate::branch_control::RETIRED_BRANCH_ARCHIVE) {
+            let suffix = format!("/{}", crate::branch_control::RETIRED_BRANCH_ARCHIVE);
+            let branch = relative.strip_suffix(&suffix).ok_or_else(|| {
+                OmniError::manifest_conflict("retirement archive has no native tree")
+            })?;
+            if !refs.contains_key(branch) {
+                return Err(OmniError::manifest_conflict(format!(
+                    "retirement archive for '{branch}' appeared during tree inventory"
+                )));
+            }
+            trees.insert(branch.to_string());
+            if before_timestamp.is_some_and(|cutoff| file.last_modified >= cutoff) {
+                age_retained.insert(branch.to_string());
+            }
+            continue;
+        }
         let matching_refs = refs
             .keys()
             .filter(|branch| {
@@ -1610,9 +1220,14 @@ async fn native_fork_inventory(
         let mut observed_refs = std::collections::HashSet::new();
         {
             let directory = root.clone().join("_refs").join("branches");
-            let expected = refs
-                .keys()
-                .map(|name| (directory.clone().join(format!("{name}.json")), name))
+            let expected = active_refs
+                .iter()
+                .map(|name| {
+                    (
+                        lance::dataset::refs::branch_contents_path(&root, name),
+                        name,
+                    )
+                })
                 .collect::<std::collections::HashMap<_, _>>();
             let mut objects = store.read_dir_all(&directory, None);
             while let Some(object) = objects.next().await {
@@ -1632,7 +1247,10 @@ async fn native_fork_inventory(
                 }
             }
         }
-        if let Some(missing) = refs.keys().find(|name| !observed_refs.contains(*name)) {
+        if let Some(missing) = active_refs
+            .iter()
+            .find(|name| !observed_refs.contains(*name))
+        {
             return Err(OmniError::manifest_conflict(format!(
                 "cleanup age census cannot locate native ref '{missing}'"
             )));
@@ -1646,10 +1264,26 @@ async fn native_fork_inventory(
     })
 }
 
-async fn reconcile_orphaned_branches_under_control_gates(
+decide_seam! {
+    pub static CLASSIFY_FRESH_READ = ("classify.fresh_read", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    pub static CLEANUP_RESOLVE_BRANCH_SNAPSHOT = ("cleanup.resolve_branch_snapshot", Unreachable, [Fail]);
+}
+
+struct NativeForkReconciliationPlan {
+    manifest: Option<NativeForkInventory>,
+    tables: Vec<(String, String, String, NativeForkInventory)>,
+    stats: BranchReconcileStats,
+}
+
+/// Inventory before the collector's root cut. A later publication can only
+/// add roots for these candidates, never introduce a new deletion candidate.
+async fn prepare_native_fork_reconciliation(
     db: &Omnigraph,
     before_timestamp: Option<chrono::DateTime<chrono::Utc>>,
-) -> Result<BranchReconcileStats> {
+) -> Result<NativeForkReconciliationPlan> {
     let resolved = db.resolved_branch_target(None).await?;
     let live_identities = resolved
         .snapshot
@@ -1663,20 +1297,32 @@ async fn reconcile_orphaned_branches_under_control_gates(
         )
         .await?;
     registrations.sort_by_key(|registration| registration.identity);
-    let table_targets = registrations.into_iter().map(|registration| {
+    let mut plan = NativeForkReconciliationPlan {
+        manifest: None,
+        tables: Vec::new(),
+        stats: BranchReconcileStats::default(),
+    };
+    let manifest_inventory = async {
+        let full_path = crate::db::manifest::manifest_uri(db.root_uri());
+        let handle = db.storage().open_dataset_head(&full_path, None).await?;
+        crate::branch_control::archive_retired_manifest_branches(handle.dataset()).await?;
+        native_fork_inventory(handle.dataset(), before_timestamp).await
+    }
+    .await;
+    match manifest_inventory {
+        Ok(inventory) => plan.manifest = Some(inventory),
+        Err(error) => plan
+            .stats
+            .failures
+            .push(("__manifest".to_string(), error.to_string())),
+    }
+    for registration in registrations {
         let full_path = format!("{}/{}", db.root_uri, registration.table_path);
-        (registration.identity, registration.table_key, full_path)
-    });
-    let mut stats = BranchReconcileStats::default();
-    let mut references = None;
-    let sidecars = crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter()).await?;
-    let storage = db.storage();
-    for (identity, table_key, full_path) in table_targets {
         let inventory = async {
-            let handle = match storage.open_dataset_head(&full_path, None).await {
+            let handle = match db.storage().open_dataset_head(&full_path, None).await {
                 Ok(handle) => handle,
                 Err(error)
-                    if !live_identities.contains(&identity)
+                    if !live_identities.contains(&registration.identity)
                         && error.storage_failure().is_some_and(|failure| {
                             failure.kind == omnigraph_storage::StorageFailureKind::NotFound
                         }) =>
@@ -1685,70 +1331,179 @@ async fn reconcile_orphaned_branches_under_control_gates(
                 }
                 Err(error) => return Err(error),
             };
+            let object_base = handle.dataset().branch_location().path.to_string();
             native_fork_inventory(handle.dataset(), before_timestamp)
                 .await
-                .map(Some)
+                .map(|inventory| Some((object_base, inventory)))
         }
         .await;
-        let inventory = match inventory {
-            Ok(Some(inventory)) => inventory,
-            Ok(None) => continue,
-            Err(error) => {
-                stats.failures.push((table_key.clone(), error.to_string()));
-                continue;
+        match inventory {
+            Ok(Some((object_base, inventory))) => {
+                plan.tables
+                    .push((registration.table_key, full_path, object_base, inventory))
             }
-        };
+            Ok(None) => {}
+            Err(error) => plan
+                .stats
+                .failures
+                .push((registration.table_key, error.to_string())),
+        }
+    }
+    Ok(plan)
+}
+
+/// Roots, unreadable locations and live staging from one validated collector
+/// plan protect complete native trees, including their dependency ancestors.
+fn collector_retains_native_tree(
+    plan: &super::collector::CollectorReport,
+    full_path: &str,
+    object_base: &str,
+    native: &str,
+) -> bool {
+    if plan.tables.iter().any(|table| !table.errors.is_empty()) {
+        return true;
+    }
+    let mut physical = object_store::path::Path::from(object_base).join("tree");
+    for segment in native.split('/') {
+        physical = physical.join(segment);
+    }
+    if plan
+        .tables
+        .iter()
+        .flat_map(|table| &table.borrowed_origins)
+        .chain(plan.auxiliary_file_origins.iter())
+        .any(|origin| {
+            origin == physical.as_ref()
+                || origin
+                    .strip_prefix(physical.as_ref())
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+    {
+        return true;
+    }
+    let tree = super::promotion::table_location(full_path, Some(native));
+    plan.tables
+        .iter()
+        .filter(|table| table.full_path == full_path)
+        .any(|table| {
+            let retained = !table.roots.is_empty()
+                || !table.linear_roots.is_empty()
+                || !table.foreign_versions.is_empty()
+                || table.unpublished.iter().any(|manifest| {
+                    !matches!(manifest.verdict, super::collector::StagingVerdict::Dead(_))
+                });
+            retained
+                && (table.location == tree
+                    || table
+                        .location
+                        .strip_prefix(&tree)
+                        .is_some_and(|suffix| suffix.starts_with('/')))
+        })
+}
+
+fn native_table_retention_roots(
+    inventory: &NativeForkInventory,
+    plan: &super::collector::CollectorReport,
+    full_path: &str,
+    object_base: &str,
+) -> std::collections::HashSet<String> {
+    let mut retained = inventory.tagged.clone();
+    retained.extend(
+        inventory
+            .trees
+            .iter()
+            .filter(|native| {
+                native.as_str() == "main"
+                    || crate::db::is_internal_system_branch(native)
+                    || collector_retains_native_tree(plan, full_path, object_base, native)
+                    || crate::branch_names::retain_unpublished_table_fork(native, |incarnation| {
+                        plan.live_branch_incarnations.contains(incarnation)
+                    })
+            })
+            .cloned(),
+    );
+    retained.extend(inventory.age_retained.iter().cloned());
+    inventory.retain_dependencies(&mut retained);
+    retained
+}
+
+/// Auxiliary files are retained only by native trees with an independent root.
+pub(crate) async fn auxiliary_native_tree_roots(
+    dataset: &lance::Dataset,
+    full_path: &str,
+    plan: &super::collector::CollectorReport,
+    before_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<std::collections::HashSet<String>> {
+    let inventory = native_fork_inventory(dataset, before_timestamp).await?;
+    let base = dataset.branch_location().path.to_string();
+    Ok(native_table_retention_roots(
+        &inventory, plan, full_path, &base,
+    ))
+}
+
+async fn reconcile_frozen_native_forks(
+    db: &Omnigraph,
+    frozen: NativeForkReconciliationPlan,
+    plan: &super::collector::CollectorReport,
+) -> Result<BranchReconcileStats> {
+    let mut stats = frozen.stats;
+    let mut classification_checked = false;
+    for (table_key, full_path, object_base, inventory) in frozen.tables {
         if inventory.trees.is_empty() {
             continue;
         }
-        if references.is_none() {
-            let captured = match crate::failpoints::maybe_fail(
-                crate::failpoints::names::CLEANUP_RESOLVE_BRANCH_SNAPSHOT,
-            ).and_then(|()| crate::failpoints::maybe_fail(crate::failpoints::names::CLASSIFY_FRESH_READ)) {
-                Ok(()) => {
-                    crate::db::manifest::ManifestCoordinator::native_fork_references_under_control_gates(
-                        db.root_uri(),
-                        &db.control_session(),
-                    )
-                    .await
-                }
-                Err(error) => Err(error),
-            };
-            match captured {
-                Ok(captured) => references = Some(captured),
-                Err(error) => {
-                    stats
-                        .failures
-                        .push(("__manifest".to_string(), error.to_string()));
-                    return Ok(stats);
-                }
+        if !classification_checked {
+            classification_checked = true;
+            if let Err(error) =
+                fail(&CLEANUP_RESOLVE_BRANCH_SNAPSHOT).and_then(|()| fail(&CLASSIFY_FRESH_READ))
+            {
+                stats
+                    .failures
+                    .push(("__manifest".to_string(), error.to_string()));
+                return Ok(stats);
             }
         }
-        let references = references
-            .as_ref()
-            .expect("native trees require live roots");
-        let mut retained = inventory.tagged.clone();
-        retained.extend(
-            inventory
-                .trees
-                .iter()
-                .filter(|native| {
-                    native.as_str() == "main"
-                        || crate::db::is_internal_system_branch(native)
-                        || references.contains_tree(identity, native)
-                        || sidecars.iter().any(|sidecar| {
-                            sidecar.tables.iter().any(|pin| {
-                                pin.identity == identity
-                                    && pin.table_branch.as_deref() == Some(native.as_str())
-                            })
-                        })
-                })
-                .cloned(),
-        );
+        let retained = native_table_retention_roots(&inventory, plan, &full_path, &object_base);
         collect_native_forks(db, &full_path, &table_key, inventory, retained, &mut stats).await;
     }
-    reconcile_retired_manifest_forks(db, before_timestamp, &mut stats).await;
+    if let Some(inventory) = frozen.manifest {
+        let full_path = crate::db::manifest::manifest_uri(db.root_uri());
+        let mut retained = plan.protected_manifest_branches.clone();
+        retained.extend(inventory.tagged.iter().cloned());
+        collect_native_forks(
+            db,
+            &full_path,
+            "__manifest",
+            inventory,
+            retained,
+            &mut stats,
+        )
+        .await;
+    }
     Ok(stats)
+}
+
+#[cfg(all(test, feature = "failpoints"))]
+async fn reconcile_orphaned_branches_under_control_gates(
+    db: &Omnigraph,
+    before_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<BranchReconcileStats> {
+    let frozen = prepare_native_fork_reconciliation(db, before_timestamp).await?;
+    let branches = cleanup_graph_branches(db).await?;
+    let plan = super::collector::plan_collection(
+        db,
+        &CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        &branches,
+    )
+    .await?;
+    reconcile_frozen_native_forks(db, frozen, &plan).await
+}
+
+decide_seam! {
+    pub static CLEANUP_RECONCILE_FORK = ("cleanup.reconcile_fork", Unreachable, [Fail]);
 }
 
 async fn collect_native_forks(
@@ -1801,9 +1556,7 @@ async fn collect_native_forks(
         }
         for branch in leaves {
             candidates.remove(&branch);
-            let outcome = match crate::failpoints::maybe_fail(
-                crate::failpoints::names::CLEANUP_RECONCILE_FORK,
-            ) {
+            let outcome = match fail(&CLEANUP_RECONCILE_FORK) {
                 Ok(()) => db.storage().force_delete_branch(full_path, &branch).await,
                 Err(injected) => Err(injected),
             };
@@ -1829,34 +1582,6 @@ async fn collect_native_forks(
     }
 }
 
-async fn reconcile_retired_manifest_forks(
-    db: &Omnigraph,
-    before_timestamp: Option<chrono::DateTime<chrono::Utc>>,
-    stats: &mut BranchReconcileStats,
-) {
-    let full_path = crate::db::manifest::manifest_uri(db.root_uri());
-    let captured = async {
-        let handle = db.storage().open_dataset_head(&full_path, None).await?;
-        let mut retained =
-            crate::branch_control::list_live_manifest_branch_contents(handle.dataset())
-                .await?
-                .into_keys()
-                .collect::<std::collections::HashSet<_>>();
-        let inventory = native_fork_inventory(handle.dataset(), before_timestamp).await?;
-        retained.extend(inventory.tagged.iter().cloned());
-        Ok::<_, OmniError>((inventory, retained))
-    }
-    .await;
-    match captured {
-        Ok((inventory, retained)) => {
-            collect_native_forks(db, &full_path, "__manifest", inventory, retained, stats).await;
-        }
-        Err(error) => stats
-            .failures
-            .push(("__manifest".to_string(), error.to_string())),
-    }
-}
-
 pub(super) fn all_table_keys(catalog: &omnigraph_compiler::catalog::Catalog) -> Vec<String> {
     let mut keys: Vec<String> = catalog
         .node_types
@@ -1871,8 +1596,7 @@ pub(super) fn all_table_keys(catalog: &omnigraph_compiler::catalog::Catalog) -> 
 #[cfg(all(test, feature = "failpoints"))]
 mod tests {
     use super::*;
-    use crate::failpoints::ScopedFailPoint;
-    use crate::loader::{LoadMode, load_jsonl};
+    use crate::loader::LoadMode;
 
     /// The internal-table compaction retry classifier: a concurrent live writer
     /// preempting our `Rewrite` is retryable (Lance prescribes app-rerun, and
@@ -1919,13 +1643,15 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_caches_live_branch_snapshot_resolution_failure() {
-        let _scenario = crate::failpoints::FailScenario::setup();
+        let _scenario = crate::seams::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let schema = "node Person { name: String @key }\nnode Company { name: String @key }\n";
-        let db = Omnigraph::init(uri, schema).await.unwrap();
-        load_jsonl(
-            &db,
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(Omnigraph::init(uri, schema).await.unwrap()),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
+        db.load_jsonl(
             "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\"}}\n\
              {\"type\":\"Company\",\"data\":{\"name\":\"Acme\"}}",
             LoadMode::Merge,
@@ -1943,10 +1669,7 @@ mod tests {
             ds.create_branch(&feature_native, base, None).await.unwrap();
         }
 
-        let _fp = ScopedFailPoint::new(
-            crate::failpoints::names::CLEANUP_RESOLVE_BRANCH_SNAPSHOT,
-            "return",
-        );
+        let _fp = CLEANUP_RESOLVE_BRANCH_SNAPSHOT.fire_always();
         let stats = reconcile_orphaned_branches(&db).await.unwrap();
 
         assert_eq!(
@@ -1966,6 +1689,102 @@ mod tests {
         assert!(
             stats.reclaimed.is_empty(),
             "unreadable live-branch refs must be left for the next cleanup run"
+        );
+
+        drop(_fp);
+        db.branch_delete("feature").await.unwrap();
+        let stats = reconcile_orphaned_branches(&db).await.unwrap();
+        assert!(stats.failures.is_empty(), "{stats:?}");
+        assert!(
+            stats
+                .reclaimed
+                .iter()
+                .any(|(table, native)| table == "__manifest" && native == &feature_native),
+            "an unreferenced retired tree is reclaimable: {stats:?}"
+        );
+        assert!(
+            !dir.path()
+                .join("__manifest/_refs/branches")
+                .join(format!("{feature_native}.json"))
+                .exists()
+        );
+        assert!(
+            !dir.path()
+                .join("__manifest/tree")
+                .join(feature_native)
+                .exists()
+        );
+    }
+    #[tokio::test]
+    async fn incomplete_origin_trace_preserves_other_tables_native_trees() {
+        use object_store::ObjectStoreExt;
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(
+                Omnigraph::init(
+                    uri,
+                    "node Person { name: String @key }\nnode Company { name: String @key }",
+                )
+                .await
+                .unwrap(),
+            ),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
+        db.load_jsonl(
+            r#"{"type":"Person","data":{"name":"p"}}
+{"type":"Company","data":{"name":"c"}}"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+        let company_uri = node_table_uri(&db, "Company").await;
+        // forbidden-api-allow: test-only unregistered native tree for the incomplete-origin deletion barrier
+        let mut company = lance::Dataset::open(&company_uri).await.unwrap();
+        let version = company.version().version;
+        company
+            .create_branch("unknown-origin", version, None)
+            .await
+            .unwrap();
+        let tree = std::path::Path::new(&company_uri).join("tree/unknown-origin");
+        assert!(tree.exists());
+        let snapshot = db
+            .snapshot_of(crate::db::ReadTarget::branch("main"))
+            .await
+            .unwrap();
+        let person = snapshot.open_lance_dataset("node:Person").await.unwrap();
+        let store = person.object_store(None).await.unwrap();
+        let path = person.manifest_location().path.clone();
+        let bytes = store.inner.get(&path).await.unwrap().bytes().await.unwrap();
+        store.delete(&path).await.unwrap();
+        let rows = db
+            .cleanup(CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row.type_key == "node:Person" && row.error.is_some()),
+            "{rows:?}"
+        );
+        assert!(
+            tree.exists(),
+            "an unreadable retained image may borrow this tree's files"
+        );
+        store.inner.put(&path, bytes.into()).await.unwrap();
+        let rows = db
+            .cleanup(CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            })
+            .await
+            .unwrap();
+        assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
+        assert!(
+            !tree.exists(),
+            "complete origin evidence allows orphan reclamation"
         );
     }
 }

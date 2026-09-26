@@ -4,13 +4,17 @@
 
 use super::*;
 use futures::StreamExt;
+use omnigraph::Session;
 use omnigraph::db::MergeOutcome;
-use omnigraph_compiler::query::ast::{BranchStmt, QueryDecl, QueryFile};
+use omnigraph::settings::{SettingId, SettingValue};
+use omnigraph_compiler::query::ast::{BranchStmt, EmptyFile, FileBody, QueryDecl, QueryFile};
 
 mod dispatch;
 use dispatch::{
-    Door, ReadDispatch, classify, control_write_at_read_door, read_at_write_door,
-    refuse_statement_envelope, refuse_wrong_door, run_branch_statement,
+    Door, ReadDispatch, classify, control_write_at_read_door, explain_at_write_door,
+    read_at_write_door, refuse_empty_file, refuse_explain, refuse_process_settings,
+    refuse_settings_at_deprecated_route, refuse_statement_envelope, refuse_wrong_door,
+    run_branch_statement, session_with_prefix, show_at_write_door,
 };
 
 /// Liveness probe.
@@ -41,7 +45,7 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
 /// Unauthenticated, and therefore minimal: it reports whether this replica
 /// is serving or draining, the applied `config_digest` it booted from, the
 /// ledger revision and CAS it read, and how many graphs it serves and does
-/// not serve. Graph ids are topology and stay behind `GET /graphs`. Answers
+/// not serve. Graph ids stay behind authenticated catalog endpoints. Answers
 /// 503 once shutdown has begun; `/healthz` stays 200 while the process is
 /// alive.
 #[utoipa::path(
@@ -147,6 +151,49 @@ pub(crate) async fn server_graphs_list(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/graphs/discovery",
+    tag = "management",
+    operation_id = "discoverGraphs",
+    responses(
+        (status = 200, description = "Authenticated minimal graph inventory", body = GraphDiscoveryResponse),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Identity credential required", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+pub(crate) async fn server_graphs_discovery(
+    State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
+) -> std::result::Result<Json<GraphDiscoveryResponse>, ApiError> {
+    let actor = actor.ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
+    if !actor.is_identity() {
+        return Err(ApiError::forbidden(
+            "graph discovery requires an admitted identity credential",
+        ));
+    }
+    // Both sets come from the accepted boot inventory. Never scan storage or
+    // include per-graph status, roots, diagnostics, schema, or policy contents.
+    let ids: std::collections::BTreeSet<String> = state
+        .routing()
+        .registry
+        .list()
+        .into_iter()
+        .map(|handle| handle.key.graph_id.as_str().to_owned())
+        .chain(state.quarantined_graphs())
+        .collect();
+    Ok(Json(GraphDiscoveryResponse {
+        graphs: ids
+            .into_iter()
+            .map(|graph_id| GraphDiscoveryEntry {
+                display_name: graph_id.clone(),
+                graph_id,
+            })
+            .collect(),
+    }))
+}
+
 pub(crate) async fn server_openapi(
     State(state): State<AppState>,
 ) -> Json<utoipa::openapi::OpenApi> {
@@ -177,7 +224,13 @@ const CLUSTER_OPERATION_ID_PREFIX: &str = "cluster_";
 /// always-flat endpoints. `/graphs` is the management enumeration —
 /// it lives at the root in both single mode (405) and multi mode, and
 /// must never be rewritten to `/graphs/{graph_id}/graphs`.
-const ALWAYS_FLAT_PATHS: &[&str] = &["/healthz", "/readyz", "/graphs"];
+const ALWAYS_FLAT_PATHS: &[&str] = &[
+    "/healthz",
+    "/readyz",
+    "/graphs",
+    "/graphs/discovery",
+    "/.well-known/oauth-protected-resource",
+];
 
 /// In multi-mode `server_openapi`, every protected path-item is
 /// reattached under the cluster prefix. Operation IDs gain the
@@ -285,6 +338,10 @@ pub(crate) async fn require_bearer_auth(
     request.extensions_mut().remove::<AuthenticatedActor>();
     if !state.requires_bearer_auth() {
         return Ok(next.run(request).await);
+    }
+
+    if request.headers().get_all(AUTHORIZATION).iter().count() != 1 {
+        return Err(ApiError::unauthorized("one bearer credential is required"));
     }
 
     let Some(header) = request
@@ -605,19 +662,29 @@ pub(crate) fn deprecation_headers(successor_link: &'static str) -> [(HeaderName,
 /// **Deprecated** — use [`POST /query`](#tag/queries/operation/query) instead.
 ///
 /// Execute a GQ read query. The route is kept indefinitely with a byte-stable
-/// envelope; cell spelling follows the JSON writer. New integrations
+/// envelope; cell spelling follows the JSON writer. A `settings` field, and
+/// a `set` or `reset` prefix in the source, are refused: the route runs under
+/// the process defaults alone. New integrations
 /// should target `POST /query`, which has clean field names (`query` /
 /// `name`) and a 400-on-mutation guard. Responses from this route include
 /// `Deprecation: true` and `Link: <query>; rel="successor-version"`
 /// headers per RFC 9745 / RFC 8288 so SDKs and proxies can surface the
 /// signal.
 pub(crate) async fn server_read(
+    State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<ReadRequest>,
 ) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<LegacyReadOutput>), ApiError> {
+    if request.settings.is_some() {
+        return Err(ApiError::bad_request(
+            crate::api::query_file_refusals::SETTINGS_AT_DEPRECATED_ROUTE,
+        ));
+    }
+    let session = state.session(&handle, None)?;
     let output = run_query(
         handle,
+        session,
         actor.as_ref().map(|Extension(actor)| actor),
         Door::Read,
         &request.query_source,
@@ -660,17 +727,28 @@ pub(crate) async fn server_read(
 /// additionally carries the pinned graph-commit token.
 ///
 /// The GQ statement `branch list` is also served here, with no `branch`,
-/// `snapshot`, `name`, or `params`: it answers one row per branch (column
+/// `snapshot`, `name`, or `params`: it answers one result per branch (field
 /// `name`, byte order) under the same `read` check as `GET /branches`.
 /// `branch create`, `branch delete`, and `branch merge` are rejected with
 /// 400; send them to `POST /mutate`.
+///
+/// The GQ statement `explain query …` is served here too: the query is not
+/// run, and the result describes its v2 logical, physical and available
+/// DataFusion trees, one result per node (fields `tree`, `depth`, `node`, `detail`), followed by
+/// `plan` entries for the passes and the document's other fields, under the
+/// request's target and `params`.
 pub(crate) async fn server_query(
+    State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<AuthenticatedActor>>,
-    Json(request): Json<QueryRequest>,
+    request: std::result::Result<Json<QueryRequest>, JsonRejection>,
 ) -> std::result::Result<Json<ReadOutput>, ApiError> {
+    let Json(request) = request
+        .map_err(|rejection| ApiError::json_rejection("invalid query request", rejection))?;
+    let session = state.session(&handle, request.settings.as_ref())?;
     let output = run_query(
         handle,
+        session,
         actor.as_ref().map(|Extension(actor)| actor),
         Door::Query,
         &request.query,
@@ -1078,6 +1156,7 @@ fn reject_graph_commit_expected_head(
 pub(crate) async fn run_mutate(
     state: AppState,
     handle: Arc<GraphHandle>,
+    session: Session,
     actor: Option<&AuthenticatedActor>,
     door: Door,
     query: &str,
@@ -1086,9 +1165,13 @@ pub(crate) async fn run_mutate(
     branch: Option<String>,
     expected_head: Option<&str>,
 ) -> std::result::Result<ChangeOutput, ApiError> {
-    let queries = match classify(query)? {
-        QueryFile::Queries(queries) => queries,
-        QueryFile::Branch(stmt) => {
+    let file = classify(query)?;
+    refuse_settings_at_deprecated_route(door, &file.settings)?;
+    refuse_process_settings(&file.settings)?;
+    refuse_empty_file(&file)?;
+    let queries = match file.body {
+        FileBody::Queries(queries) => queries,
+        FileBody::Branch(stmt) => {
             refuse_wrong_door(door, &stmt)?;
             refuse_statement_envelope(
                 branch.is_some(),
@@ -1097,10 +1180,16 @@ pub(crate) async fn run_mutate(
             )?;
             return match stmt {
                 BranchStmt::Write(write) => {
-                    run_branch_statement(&state, &handle, actor, write).await
+                    let session = session_with_prefix(&session, &file.settings)?;
+                    run_branch_statement(&state, &handle, &session, actor, write).await
                 }
                 BranchStmt::List => Err(read_at_write_door()),
             };
+        }
+        FileBody::Show(id) => return Err(show_at_write_door(id)),
+        FileBody::Explain(_) => {
+            refuse_explain(door)?;
+            return Err(explain_at_write_door());
         }
     };
     let branch = branch.unwrap_or_else(|| "main".to_string());
@@ -1132,9 +1221,8 @@ pub(crate) async fn run_mutate(
     let params = query_params_from_json(&query_params, params_json)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
-    let receipt = {
-        let db = &handle.engine;
-        db.mutate_as_with_expected_head_receipt(
+    let receipt = session
+        .mutate_as_with_expected_head_receipt(
             &branch,
             query,
             &selected_name,
@@ -1143,8 +1231,7 @@ pub(crate) async fn run_mutate(
             expected_head,
         )
         .await
-        .map_err(ApiError::from_omni)?
-    };
+        .map_err(ApiError::from_omni)?;
     Ok(ChangeOutput {
         branch,
         query_name: selected_name,
@@ -1161,7 +1248,12 @@ pub(crate) async fn run_mutate(
 ///
 /// Order: parse and classify first; `branch list` then passes
 /// [`refuse_wrong_door`] and [`refuse_statement_envelope`], and otherwise runs
-/// the handler body of `GET /branches` (a scope-free `read` check). A
+/// the handler body of `GET /branches` (a scope-free `read` check); `show`
+/// passes the same refusals and the same scope-free `read` check before it
+/// reads the session's effective settings. At the deprecated `Read` door a
+/// `set` or `reset` prefix is refused by
+/// [`refuse_settings_at_deprecated_route`] before any of that, as the
+/// `settings` field of `/read` is. A
 /// declared query resolves and authorizes its read target, is refused at
 /// every door but `Read` when it contains mutations, and runs.
 ///
@@ -1169,6 +1261,7 @@ pub(crate) async fn run_mutate(
 /// reads are not admission-gated, so there is no `state.workload` consumer.
 pub(crate) async fn run_query(
     handle: Arc<GraphHandle>,
+    session: Session,
     actor: Option<&AuthenticatedActor>,
     door: Door,
     query: &str,
@@ -1177,9 +1270,13 @@ pub(crate) async fn run_query(
     branch: Option<String>,
     snapshot: Option<String>,
 ) -> std::result::Result<ReadDispatch, ApiError> {
-    let queries = match classify(query)? {
-        QueryFile::Queries(queries) => queries,
-        QueryFile::Branch(stmt) => {
+    let file = classify(query)?;
+    refuse_settings_at_deprecated_route(door, &file.settings)?;
+    refuse_process_settings(&file.settings)?;
+    refuse_empty_file(&file)?;
+    let queries = match file.body {
+        FileBody::Queries(queries) => queries,
+        FileBody::Branch(stmt) => {
             refuse_wrong_door(door, &stmt)?;
             refuse_statement_envelope(
                 branch.is_some() || snapshot.is_some(),
@@ -1192,6 +1289,26 @@ pub(crate) async fn run_query(
                 )),
                 BranchStmt::Write(write) => Err(control_write_at_read_door(&write)),
             };
+        }
+        FileBody::Show(id) => {
+            if matches!(door, Door::Read | Door::Change) {
+                return Err(ApiError::bad_request(
+                    crate::api::branch_statement_refusals::DEPRECATED_ROUTE,
+                ));
+            }
+            refuse_statement_envelope(
+                branch.is_some() || snapshot.is_some(),
+                name.is_some() || params_json.is_some(),
+                false,
+            )?;
+            authorize_scope_free_read(&handle, actor)?;
+            let session = session_with_prefix(&session, &file.settings)?;
+            return Ok(ReadDispatch::Show(session.show(id)));
+        }
+        body @ FileBody::Explain(_) => {
+            refuse_explain(door)?;
+            body.into_read_declarations()
+                .map_err(ApiError::bad_request)?
         }
     };
     let target = resolve_authorized_read_target(&handle, actor, branch, snapshot).await?;
@@ -1207,12 +1324,10 @@ pub(crate) async fn run_query(
     let params = query_params_from_json(&query_decl.params, params_json)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
-    let (result, graph_commit_id) = {
-        let db = &handle.engine;
-        db.query_with_head(target.clone(), query, &selected_name, &params)
-            .await
-            .map_err(ApiError::from_omni)?
-    };
+    let (result, graph_commit_id) = session
+        .query_with_head(target.clone(), query, &selected_name, &params)
+        .await
+        .map_err(ApiError::from_omni)?;
     Ok(ReadDispatch::Rows {
         query_name: selected_name,
         target,
@@ -1285,21 +1400,31 @@ pub(crate) async fn resolve_authorized_read_target(
 ///
 /// Apply a GQ mutation to a branch. The deprecated route retains its request
 /// and execution semantics, while its response uses the current canonical
-/// vocabulary. New integrations should target `POST /mutate`. Responses include
-/// `Deprecation: true` and `Link: <mutate>; rel="successor-version"`
-/// headers per RFC 9745 / RFC 8288 so SDKs and proxies can surface the
-/// signal.
+/// vocabulary; a `settings` field is refused, since the route runs under the
+/// process defaults alone. New integrations should target `POST /mutate`.
+/// Responses include `Deprecation: true` and
+/// `Link: <mutate>; rel="successor-version"` headers per RFC 9745 / RFC 8288
+/// so SDKs and proxies can surface the signal.
 pub(crate) async fn server_change(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<AuthenticatedActor>>,
     headers: axum::http::HeaderMap,
-    Json(request): Json<ChangeRequest>,
+    request: std::result::Result<Json<ChangeRequest>, JsonRejection>,
 ) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<ChangeOutput>), ApiError> {
+    let Json(request) = request
+        .map_err(|rejection| ApiError::json_rejection("invalid mutation request", rejection))?;
     reject_graph_commit_expected_head(&headers, "/mutate/if-graph-commit")?;
+    if request.settings.is_some() {
+        return Err(ApiError::bad_request(
+            crate::api::query_file_refusals::SETTINGS_AT_DEPRECATED_ROUTE,
+        ));
+    }
+    let session = state.session(&handle, None)?;
     let output = run_mutate(
         state,
         handle,
+        session,
         actor.as_ref().map(|Extension(actor)| actor),
         Door::Change,
         &request.query,
@@ -1363,13 +1488,17 @@ pub(crate) async fn server_mutate(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<AuthenticatedActor>>,
     headers: axum::http::HeaderMap,
-    Json(request): Json<ChangeRequest>,
+    request: std::result::Result<Json<ChangeRequest>, JsonRejection>,
 ) -> std::result::Result<Json<ChangeOutput>, ApiError> {
+    let Json(request) = request
+        .map_err(|rejection| ApiError::json_rejection("invalid mutation request", rejection))?;
     reject_graph_commit_expected_head(&headers, "/mutate/if-graph-commit")?;
+    let session = state.session(&handle, request.settings.as_ref())?;
     Ok(Json(
         run_mutate(
             state,
             handle,
+            session,
             actor.as_ref().map(|Extension(actor)| actor),
             Door::Mutate,
             &request.query,
@@ -1415,13 +1544,17 @@ pub(crate) async fn server_mutate_if_graph_commit(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<AuthenticatedActor>>,
     headers: axum::http::HeaderMap,
-    Json(request): Json<ChangeRequest>,
+    request: std::result::Result<Json<ChangeRequest>, JsonRejection>,
 ) -> std::result::Result<Json<ChangeOutput>, ApiError> {
+    let Json(request) = request
+        .map_err(|rejection| ApiError::json_rejection("invalid mutation request", rejection))?;
     let expected_head = require_graph_commit_expected_head(&headers)?;
+    let session = state.session(&handle, request.settings.as_ref())?;
     Ok(Json(
         run_mutate(
             state,
             handle,
+            session,
             actor.as_ref().map(|Extension(actor)| actor),
             Door::Mutate,
             &request.query,
@@ -1437,7 +1570,7 @@ pub(crate) async fn server_mutate_if_graph_commit(
 /// Path parameter for `POST /queries/{name}`.
 #[derive(Deserialize)]
 pub(crate) struct QueryNamePath {
-    name: String,
+    pub(crate) name: String,
 }
 
 pub(crate) fn parse_optional_invoke_body(
@@ -1617,6 +1750,7 @@ async fn invoke_stored_query(
         "stored query invoked"
     );
 
+    let session = state.session(&handle, None)?;
     if is_mutation {
         if req.snapshot.is_some() {
             return Err(ApiError::bad_request(
@@ -1626,6 +1760,7 @@ async fn invoke_stored_query(
         let output = run_mutate(
             state,
             handle,
+            session,
             actor_ref,
             Door::Mutate,
             &source,
@@ -1644,6 +1779,7 @@ async fn invoke_stored_query(
         }
         let output = run_query(
             handle,
+            session,
             actor_ref,
             Door::Query,
             &source,
@@ -1912,12 +2048,11 @@ async fn run_ingest(
         .try_admit(&actor_arc, est_bytes)
         .map_err(ApiError::from_workload_reject)?;
 
-    let receipt = {
-        let db = &handle.engine;
-        db.load_as_with_receipt(&branch, from.as_deref(), &request.data, mode, actor_id)
-            .await
-            .map_err(ApiError::from_omni)?
-    };
+    let receipt = state
+        .session(&handle, None)?
+        .load_as_with_receipt(&branch, from.as_deref(), &request.data, mode, actor_id)
+        .await
+        .map_err(ApiError::from_omni)?;
 
     Ok(ingest_receipt_output(
         handle.uri.as_str(),
@@ -2091,8 +2226,8 @@ pub(crate) async fn server_load_ndjson(
         .try_admit(&actor_arc, data.len() as u64)
         .map_err(ApiError::from_workload_reject)?;
 
-    let receipt = handle
-        .engine
+    let receipt = state
+        .session(&handle, None)?
         .load_graph_batch_as_with_receipt(&branch, from.as_deref(), data, mode, actor_id)
         .await
         .map_err(ApiError::from_omni)?;
@@ -2173,12 +2308,12 @@ pub(crate) async fn server_branch_list(
     Ok(Json(BranchListOutput { branches }))
 }
 
-/// Body shared by `GET /branches` and the `branch list` statement: one
-/// scope-free `read` check, then the names in byte order.
-async fn branch_list_body(
+/// The scope-free `read` decision shared by `GET /branches`, `branch list`,
+/// and `show`: the graph's Cedar `read` gate with no branch in the request.
+fn authorize_scope_free_read(
     handle: &GraphHandle,
     actor: Option<&AuthenticatedActor>,
-) -> std::result::Result<Vec<String>, ApiError> {
+) -> std::result::Result<(), ApiError> {
     authorize_request(
         actor,
         handle.policy.as_deref(),
@@ -2187,7 +2322,16 @@ async fn branch_list_body(
             branch: None,
             target_branch: None,
         },
-    )?;
+    )
+}
+
+/// Body shared by `GET /branches` and the `branch list` statement: one
+/// scope-free `read` check, then the names in byte order.
+async fn branch_list_body(
+    handle: &GraphHandle,
+    actor: Option<&AuthenticatedActor>,
+) -> std::result::Result<Vec<String>, ApiError> {
+    authorize_scope_free_read(handle, actor)?;
     let mut branches = handle
         .engine
         .branch_list()
@@ -2404,11 +2548,22 @@ pub(crate) async fn server_branch_merge(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<AuthenticatedActor>>,
-    Json(request): Json<BranchMergeRequest>,
+    request: std::result::Result<Json<BranchMergeRequest>, JsonRejection>,
 ) -> std::result::Result<Json<BranchMergeOutput>, ApiError> {
+    let Json(request) = request
+        .map_err(|rejection| ApiError::json_rejection("invalid branch merge request", rejection))?;
     let target = request.target.unwrap_or_else(|| "main".to_string());
     let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
-    let outcome = branch_merge_body(&state, &handle, actor_ref, &request.source, &target).await?;
+    let session = state.session(&handle, request.settings.as_ref())?;
+    let outcome = branch_merge_body(
+        &state,
+        &handle,
+        &session,
+        actor_ref,
+        &request.source,
+        &target,
+    )
+    .await?;
     let (branch_deleted, branch_delete_error) = if request.delete_branch {
         match delete_merged_source_branch(&handle, actor_ref, &request.source).await {
             Ok(()) => (Some(true), None),
@@ -2433,6 +2588,7 @@ pub(crate) async fn server_branch_merge(
 async fn branch_merge_body(
     state: &AppState,
     handle: &GraphHandle,
+    session: &Session,
     actor: Option<&AuthenticatedActor>,
     source: &str,
     target: &str,
@@ -2456,8 +2612,7 @@ async fn branch_merge_body(
         .workload
         .try_admit(&actor_arc, 256)
         .map_err(ApiError::from_workload_reject)?;
-    handle
-        .engine
+    session
         .branch_merge_as(source, target, actor.map(|actor| actor.actor_id.as_ref()))
         .await
         .map_err(ApiError::from_omni)
@@ -2811,9 +2966,30 @@ pub(crate) struct ParsedChangeParams {
     pub kinds: Vec<api::EntityKindOutput>,
     pub types: Vec<String>,
     pub ops: Vec<api::ChangeOpOutput>,
+    /// The `set=<name>=<value>` parameters, each checked against the settings
+    /// definition and the `process` scope rule: validated here; consulted by
+    /// nothing until the change feed's planner entry reads `engine` (the
+    /// Session settings RFC's rollout step 2).
+    pub settings: Vec<(SettingId, SettingValue)>,
 }
 
-pub(crate) const COMMIT_CHANGES_PARAMS: &[&str] = &["page_token", "limit", "kind", "type", "op"];
+/// Parse one `set=<name>=<value>` query parameter: a known `request`-scope
+/// setting with a value its row accepts.
+fn parse_set_parameter(raw: &str) -> std::result::Result<(SettingId, SettingValue), ApiError> {
+    let bad_request =
+        |error: omnigraph::settings::SessionSettingsError| ApiError::bad_request(error.to_string());
+    let Some((name, value)) = raw.split_once('=') else {
+        return Err(ApiError::bad_request(format!(
+            "query parameter 'set' takes <name>=<value>, got '{raw}'"
+        )));
+    };
+    let (id, value) = SettingId::parse_assignment(name, value).map_err(bad_request)?;
+    id.refuse_from_request().map_err(bad_request)?;
+    Ok((id, value))
+}
+
+pub(crate) const COMMIT_CHANGES_PARAMS: &[&str] =
+    &["page_token", "limit", "kind", "type", "op", "set"];
 pub(crate) fn parse_change_query(
     raw: Option<&str>,
     allowed: &[&str],
@@ -2874,6 +3050,7 @@ pub(crate) fn parse_change_query(
                         "unknown op '{value}' (expected insert | update | delete)"
                     ))
                 })?),
+            "set" => params.settings.push(parse_set_parameter(&value)?),
             _ => unreachable!("allow-list covers every match arm"),
         }
     }
@@ -2908,7 +3085,8 @@ pub(crate) fn parse_change_query(
 /// Entity changes one commit made relative to its first parent.
 ///
 /// Read-only, in graph vocabulary with exact before/after images. Bounded:
-/// a large commit continues via the opaque `page_token`.
+/// a large commit continues via the opaque `page_token`. `set=` values are
+/// validated and select nothing in this release.
 pub(crate) async fn server_commit_changes(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -3060,6 +3238,7 @@ pub(crate) const CHANGE_FEED_PARAMS: &[&str] = &[
     "kind",
     "type",
     "op",
+    "set",
 ];
 
 fn parse_change_feed_start(
@@ -3120,7 +3299,7 @@ fn normalize_change_branch(branch: Option<&str>) -> std::result::Result<String, 
 /// At-least-once: retrying a cursor may replay the complete next commit, so
 /// consumers apply blocks idempotently by `graph_commit_id` and persist the
 /// terminal cursor together with its blocks. The server holds no consumer
-/// state.
+/// state. `set=` values are validated and select nothing in this release.
 pub(crate) async fn server_changes_feed(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<AuthenticatedActor>>,

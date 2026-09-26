@@ -1,0 +1,158 @@
+# issue: 703
+# red_on: 2026-09-18, the read-path planner before this fix: grouped rows pass; Expand carries no projection
+# notes: The destination scan hydrates only destination columns used by the query. Fanout
+# notes: keeps edge multiplicity, hidden filter/order dependencies survive,
+# notes: and a bare destination retains its non-Blob, non-Vector properties.
+# notes: physical memory coverage: omnigraph/tests/engine_v2_memory.rs;
+# notes: overflow geometry: omnigraph/tests/repro_issue_703.rs.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Segment {
+    slug: String @key
+}
+node Artifact {
+    slug: String @key
+    content: String
+    state: String
+    rank: I64
+    embedding: Vector(2)?
+    payload: Blob?
+}
+edge SegmentOf: Segment -> Artifact
+
+--- seed
+{"type":"Segment","data":{"slug":"s1"}}
+{"type":"Segment","data":{"slug":"s2"}}
+{"type":"Segment","data":{"slug":"orphan"}}
+{"type":"Artifact","data":{"slug":"a","content":"first payload","state":"open","rank":2,"embedding":[1.0,2.0]}}
+{"type":"Artifact","data":{"slug":"b","content":"second payload","state":"open","rank":1}}
+{"type":"Artifact","data":{"slug":"c","content":"closed payload","state":"closed","rank":3,"embedding":[3.0,4.0]}}
+{"edge":"SegmentOf","from":"s1","to":"a"}
+{"edge":"SegmentOf","from":"s2","to":"a"}
+{"edge":"SegmentOf","from":"s1","to":"b"}
+{"edge":"SegmentOf","from":"s2","to":"c"}
+
+--- query
+set engine = v2;
+query grouped_fanout() {
+    match { $s: Segment $s segmentOf $t }
+    return { $t.slug, count($s) as segments }
+    order { segments desc, $t.slug }
+    limit 2
+}
+--- expect unordered
+{"t.slug":"a","segments":2}
+{"t.slug":"b","segments":1}
+--- expect shape
+t.slug: String
+segments: I64
+--- expect plan
+scan Artifact as $t: columns [__id, slug]
+pass projection_pushdown
+
+--- query
+set engine = v2;
+query destination_count() {
+    match { $s: Segment $s segmentOf $t }
+    return { count($t) as targets }
+}
+--- expect unordered
+{"targets":4}
+--- expect shape
+targets: I64
+--- expect plan
+scan Artifact as $t: columns [__id, slug]
+
+--- query
+set engine = v2;
+query hidden_dependencies() {
+    match {
+        $s: Segment
+        $s segmentOf $t
+        $t: Artifact { state: "open" }
+    }
+    return { $t.slug }
+    order { $t.rank, $t.slug }
+}
+--- expect ordered
+{"t.slug":"b"}
+{"t.slug":"a"}
+{"t.slug":"a"}
+--- expect shape
+t.slug: String
+--- expect plan
+scan Artifact as $t: columns [__id, slug, state, rank]
+
+--- query
+set engine = v2;
+query bare_destination() {
+    match { $s: Segment { slug: "s1" } $s segmentOf $t }
+    return { $t }
+    order { $t.slug }
+}
+--- expect ordered
+{"t":{"@id":"a","slug":"a","content":"first payload","state":"open","rank":2}}
+{"t":{"@id":"b","slug":"b","content":"second payload","state":"open","rank":1}}
+--- expect shape
+t: Artifact
+--- expect plan
+scan Artifact as $t: columns [__id, slug, content, state, rank]
+
+--- query
+set engine = v2;
+query empty_expansion() {
+    match { $s: Segment { slug: "orphan" } $s segmentOf $t }
+    return { $t.slug }
+}
+--- expect unordered
+--- expect shape
+t.slug: String
+--- expect plan
+scan Artifact as $t: columns [__id, slug]
+
+--- query
+set engine = v2;
+query filtered_destinations_are_empty() {
+    match {
+        $s: Segment
+        $s segmentOf $t
+        $t: Artifact { state: "absent" }
+    }
+    return { $t.slug }
+}
+--- expect unordered
+--- expect shape
+t.slug: String
+--- expect plan
+scan Artifact as $t: columns [__id, slug, state]
+
+--- query
+set engine = v2;
+query empty_source() {
+    match { $s: Segment { slug: "absent" } $s segmentOf $t }
+    return { $t.slug }
+}
+--- expect unordered
+--- expect shape
+t.slug: String
+--- expect plan
+scan Artifact as $t: columns [__id, slug]
+
+--- query
+set engine = v2;
+query unused_destination() {
+    match { $s: Segment $s segmentOf $t }
+    return { count($s) as segments }
+}
+--- expect unordered
+{"segments":4}
+--- expect shape
+segments: I64
+--- expect plan
+scan Artifact as $t: columns [__id, slug]

@@ -5,15 +5,28 @@ COMMENT = _{ LINE_COMMENT | BLOCK_COMMENT }
 LINE_COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
 BLOCK_COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
 
-query_file = { SOI ~ (branch_stmt ~ statement_trailer? | query_decl*) ~ EOI }
+query_file = { SOI ~ setting_stmt* ~ (show_stmt ~ statement_trailer? | branch_stmt ~ ";"? ~ statement_trailer? | explain_stmt ~ statement_trailer? | query_decl*) ~ EOI }
 
-// Branch statements: one per file, never beside a query declaration. Each
-// keyword is atomic and closed by a word boundary: an identifier character
-// may not follow it (`branch createb0` is a parse error), a quoted name may.
+// Settings statements stand at the head of a file, before its one statement
+// or its declarations; `show` is itself the one statement. Names are looked
+// up against the settings definition after the keyword, so `set`, `reset`,
+// `show`, `all` and every setting name stay identifiers inside a body.
+setting_stmt  = { set_stmt | reset_stmt }
+set_stmt      = { kw_set ~ setting_name ~ "=" ~ setting_value ~ ";" }
+reset_stmt    = { kw_reset ~ (kw_all | setting_name) ~ ";" }
+show_stmt     = { kw_show ~ (kw_all | setting_name) ~ ";" }
+setting_name  = @{ ident ~ ("." ~ ident)* }
+setting_value = { integer | ident | string_lit }
+
+// Statements: one per file, never beside a query declaration. Each keyword
+// is atomic and closed by a word boundary: an identifier character may not
+// follow it (`branch createb0` is a parse error), a quoted name may.
 branch_stmt   = { kw_branch ~ (branch_create | branch_delete | branch_merge | branch_list) }
-// Anything the file holds after its branch statement, matched so the parser
+// `explain` wraps the one read declaration whose plan is answered as rows.
+explain_stmt  = { kw_explain ~ query_decl }
+// Anything the file holds after its one statement, matched so the parser
 // refuses it by name instead of leaving `EOI` to report the expected tokens.
-statement_trailer = { (branch_stmt | query_decl)+ }
+statement_trailer = { (setting_stmt | show_stmt | branch_stmt | explain_stmt | query_decl)+ }
 branch_create = { kw_create ~ branch_name ~ (kw_from ~ branch_name)? }
 branch_delete = { kw_delete ~ branch_name }
 branch_merge  = { kw_merge ~ branch_name ~ (kw_into ~ branch_name)? }
@@ -21,12 +34,17 @@ branch_list   = { kw_list }
 branch_name   = { ident | string_lit }
 
 kw_branch = @{ "branch" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_explain = @{ "explain" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_create = @{ "create" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_delete = @{ "delete" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_merge  = @{ "merge" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_list   = @{ "list" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_from   = @{ "from" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_into   = @{ "into" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_set    = @{ "set" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_reset  = @{ "reset" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_show   = @{ "show" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_all    = @{ "all" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 query_decl = {
     "query" ~ ident ~ "(" ~ param_list? ~ ")" ~ query_annotation* ~ "{"
@@ -50,8 +68,8 @@ mutation_stmt = { insert_stmt | update_stmt | delete_stmt }
 insert_stmt = { "insert" ~ type_name ~ "{" ~ mutation_assignment+ ~ "}" }
 update_stmt = { "update" ~ type_name ~ "set" ~ "{" ~ mutation_assignment+ ~ "}" ~ "where" ~ mutation_predicate }
 delete_stmt = { "delete" ~ type_name ~ "where" ~ mutation_predicate }
-mutation_assignment = { ident ~ ":" ~ match_value ~ ","? }
-mutation_predicate = { (meta_field | ident) ~ comp_op ~ match_value }
+mutation_assignment = { ident ~ ":" ~ expr ~ ","? }
+mutation_predicate = { expr }
 
 param_list = { param ~ ("," ~ param)* }
 param = { variable ~ ":" ~ type_ref }
@@ -63,14 +81,16 @@ base_type = { "String" | "Blob" | "Bool" | "I32" | "I64" | "U32" | "U64" | "F32"
 
 match_clause = { "match" ~ "{" ~ clause+ ~ "}" }
 
-clause = { negation | binding | traversal | filter | text_search_clause }
+clause = { negation | subquery_predicate | exists_block | binding | traversal | filter }
+// Deprecated and unreferenced, kept for one release (compatibility surfaces RFC, deprecate before remove).
 text_search_clause = { search_call | fuzzy_call | match_text_call }
 
 // Binding: $p: Person { name: "Alice" }
 binding = { variable ~ ":" ~ type_name ~ ("{" ~ prop_match_list ~ "}")? }
 
 prop_match_list = { prop_match ~ ("," ~ prop_match)* ~ ","? }
-prop_match = { ident ~ ":" ~ match_value }
+prop_match = { ident ~ ":" ~ expr }
+// Deprecated and unreferenced, kept for one release (compatibility surfaces RFC, deprecate before remove).
 match_value = { literal | variable | now_call }
 
 // Traversal: $p knows $f (directional) or $p <knows> $f (undirected —
@@ -83,15 +103,22 @@ edge_binding = { variable ~ ":" }
 undirected_edge = { "<" ~ edge_ident ~ ">" }
 traversal_bounds = { "{" ~ integer ~ "," ~ integer? ~ "}" }
 
-// Filter: $f.age > 25
-filter = { expr ~ filter_op ~ expr }
+// Filter: a Boolean expression, `$f.age > 25 and not $f.retired`
+filter = { expr }
 
 // Negation: not { ... }
 negation = { "not" ~ "{" ~ clause+ ~ "}" }
 
+// Correlated subquery predicates: the aggregate over the block's matches
+// per outer row, compared with a scalar. `count { ... } > 2`,
+// `sum($m.size) { ... } > 100`, and `exists { ... }` (`count { ... } > 0`).
+subquery_predicate = { agg_func ~ ("(" ~ expr ~ ")")? ~ subquery_block ~ comp_op ~ expr }
+exists_block = { "exists" ~ subquery_block }
+subquery_block = { "{" ~ clause+ ~ "}" }
+
 // Return clause — projections separated by commas or newlines
 return_clause = { "return" ~ "{" ~ projection+ ~ "}" }
-projection = { expr ~ ("as" ~ ident)? ~ ","? }
+projection = { expr ~ ("as" ~ (reserved_alias | expr_ident))? ~ ","? }
 
 // Order clause
 order_clause = { "order" ~ "{" ~ ordering ~ ("," ~ ordering)* ~ "}" }
@@ -102,8 +129,31 @@ order_dir = { "asc" | "desc" }
 // Limit clause
 limit_clause = { "limit" ~ integer }
 
-// Expressions
-expr = { now_call | nearest_ordering | search_call | fuzzy_call | match_text_call | bm25_call | rrf_call | agg_call | prop_access | variable | literal | ident }
+// Expressions: a precedence ladder, lowest binding first. A comparison is
+// non-associative, so `$a < $b < $c` fails in the enclosing rule. Every
+// keyword is word-bounded like `kw_set`, so `nothing` and `android` stay
+// identifiers; the five keywords are reserved in operand position and as a
+// return alias (`reserved_property`, `reserved_alias` name the collision).
+expr              = { or_expr }
+or_expr           = { and_expr ~ (kw_or ~ and_expr)* }
+and_expr          = { not_expr ~ (kw_and ~ not_expr)* }
+not_expr          = { (kw_not ~ not_expr) | comparison }
+comparison        = { operand ~ ((filter_op ~ operand) | null_test)? }
+null_test         = { kw_is ~ kw_not? ~ kw_null }
+operand           = { "(" ~ expr ~ ")" | now_call | nearest_ordering | search_call
+                    | fuzzy_call | match_text_call | bm25_call | rrf_call | agg_call
+                    | prop_access | meta_field | variable | literal
+                    | reserved_property | expr_ident }
+kw_and            = @{ "and" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_or             = @{ "or" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_not            = @{ "not" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_is             = @{ "is" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_null           = @{ "null" ~ !(ASCII_ALPHANUMERIC | "_") }
+reserved          = { kw_and | kw_or | kw_not | kw_is | kw_null }
+reserved_property = { reserved }
+reserved_alias    = { reserved }
+expr_ident        = @{ !reserved ~ ident }
+
 now_call = { "now" ~ "(" ~ ")" }
 search_call = { "search" ~ "(" ~ expr ~ "," ~ expr ~ ")" }
 fuzzy_call = { "fuzzy" ~ "(" ~ expr ~ "," ~ expr ~ ("," ~ expr)? ~ ")" }
@@ -127,9 +177,10 @@ filter_op = { "starts_with" | "contains" | comp_op }
 variable = @{ "$" ~ (ident_chars | "_") }
 ident_chars = @{ (ASCII_ALPHA_LOWER | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
-// Edge identifier — lowercase start, same as ident but used in traversal context
-// Must not match keywords
-edge_ident = @{ !("not" ~ !ASCII_ALPHANUMERIC) ~ (ASCII_ALPHA_LOWER | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+// Edge identifier — lowercase start, same as ident but used in traversal
+// context. Never a reserved word, so `$a and $b` over Boolean parameters
+// falls through `traversal` to `filter` instead of naming an edge `and`.
+edge_ident = @{ !reserved ~ (ASCII_ALPHA_LOWER | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
 type_name = @{ ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "_")* }
 ident = @{ (ASCII_ALPHA_LOWER | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
@@ -142,4 +193,4 @@ string_lit = @{ "\"" ~ string_char* ~ "\"" }
 string_char = @{ !("\"" | "\\") ~ ANY | "\\" ~ ANY }
 float_lit = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 integer = @{ ASCII_DIGIT+ }
-bool_lit = { "true" | "false" }
+bool_lit = @{ ("true" | "false") ~ !(ASCII_ALPHANUMERIC | "_") }

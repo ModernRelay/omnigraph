@@ -43,7 +43,7 @@ use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy
 /// per-version resolution).
 #[tokio::test]
 async fn data_table_opener_is_flat_in_history_on_s3() {
-    let Some(mut db) = s3_graph("write-cost-opener").await else {
+    let Some(db) = s3_graph("write-cost-opener").await else {
         eprintln!(
             "SKIP data_table_opener_is_flat_in_history_on_s3: OMNIGRAPH_S3_TEST_BUCKET \
              unset (or store unreachable) — the S3 opener gate needs an object store"
@@ -55,10 +55,10 @@ async fn data_table_opener_is_flat_in_history_on_s3() {
     let mut current = 0u64;
     for d in [10u64, 50] {
         if d > current {
-            commit_many(&mut db, (d - current) as usize).await;
+            commit_many(&db, (d - current) as usize).await;
             current = d;
         }
-        let io = measure_insert(&mut db, &format!("s3_{d}")).await;
+        let io = measure_insert(&db, &format!("s3_{d}")).await;
         current += 1;
         eprintln!(
             "depth~{d}: opener={} scan={} data_total={} __manifest={}",
@@ -105,11 +105,13 @@ node Document {
     ])
     .unwrap();
     let graph_uri = format!("{uri}/graph");
-    let db = Omnigraph::init(&graph_uri, SCHEMA)
-        .await
-        .expect("configured S3 graph init must succeed")
-        .with_external_blob_policy(policy)
-        .unwrap();
+    let db = helpers::session(
+        Omnigraph::init(&graph_uri, SCHEMA)
+            .await
+            .expect("configured S3 graph init must succeed")
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
     let encoded_alias = external_uri.replace("~source", "%7Esource");
     let rows = (0..REFERENCES)
         .map(|index| {

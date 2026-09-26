@@ -13,7 +13,7 @@ mod helpers;
 
 use arrow_array::{Array, Int64Array};
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::result::QueryResult;
 
@@ -58,7 +58,7 @@ async fn composite_flow_canonical_lifecycle() {
     // ─────────────────────────────────────────────────────────────────
     // Step 1: init a fresh graph with the standard test schema.
     // ─────────────────────────────────────────────────────────────────
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
     let v_init = version_branch(&db, "main").await.unwrap();
     assert!(
         v_init >= 1,
@@ -70,7 +70,7 @@ async fn composite_flow_canonical_lifecycle() {
     // Step 2: load JSONL seed data (Person + Company nodes,
     // Knows + WorksAt edges).
     // ─────────────────────────────────────────────────────────────────
-    load_jsonl(&db, TEST_DATA, LoadMode::Append).await.unwrap();
+    db.load_jsonl(TEST_DATA, LoadMode::Append).await.unwrap();
     let v_after_load = version_branch(&db, "main").await.unwrap();
     assert!(
         v_after_load > v_init,
@@ -105,7 +105,7 @@ async fn composite_flow_canonical_lifecycle() {
     // multi-statement (insert + insert).
     // ─────────────────────────────────────────────────────────────────
     mutate_branch(
-        &mut db,
+        &db,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -115,7 +115,7 @@ async fn composite_flow_canonical_lifecycle() {
     .expect("single-statement insert on feature");
 
     mutate_branch(
-        &mut db,
+        &db,
         "feature",
         MUTATION_QUERIES,
         "insert_person_and_friend",
@@ -146,7 +146,7 @@ async fn composite_flow_canonical_lifecycle() {
     // (friends_of), aggregation (friend_counts, total_people, age_stats).
     // ─────────────────────────────────────────────────────────────────
     let total_people = query_branch(
-        &mut db,
+        &db,
         "feature",
         TEST_QUERIES,
         "total_people",
@@ -160,7 +160,7 @@ async fn composite_flow_canonical_lifecycle() {
     );
 
     let friends_of_alice = query_branch(
-        &mut db,
+        &db,
         "feature",
         TEST_QUERIES,
         "friends_of",
@@ -174,7 +174,7 @@ async fn composite_flow_canonical_lifecycle() {
     );
 
     let unemployed = query_branch(
-        &mut db,
+        &db,
         "feature",
         TEST_QUERIES,
         "unemployed",
@@ -188,7 +188,7 @@ async fn composite_flow_canonical_lifecycle() {
     );
 
     let friend_counts = query_branch(
-        &mut db,
+        &db,
         "feature",
         TEST_QUERIES,
         "friend_counts",
@@ -209,7 +209,7 @@ async fn composite_flow_canonical_lifecycle() {
     // wasn't changed on feature.)
     // ─────────────────────────────────────────────────────────────────
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Bob")], &[("$age", 26)]),
@@ -248,7 +248,7 @@ async fn composite_flow_canonical_lifecycle() {
 
     // Verify Bob's age update from main carried through the merge.
     let bob_after = query_main(
-        &mut db,
+        &db,
         TEST_QUERIES,
         "get_person",
         &mixed_params(&[("$name", "Bob")], &[]),
@@ -262,7 +262,7 @@ async fn composite_flow_canonical_lifecycle() {
 
     // Verify Eve (from feature) is now visible on main.
     let eve_after = query_main(
-        &mut db,
+        &db,
         TEST_QUERIES,
         "get_person",
         &mixed_params(&[("$name", "Eve")], &[]),
@@ -316,10 +316,9 @@ async fn composite_flow_canonical_lifecycle() {
     );
 
     // Re-run a query to verify post-optimize correctness.
-    let post_optimize_total =
-        query_main(&mut db, TEST_QUERIES, "total_people", &ParamMap::default())
-            .await
-            .unwrap();
+    let post_optimize_total = query_main(&db, TEST_QUERIES, "total_people", &ParamMap::default())
+        .await
+        .unwrap();
     assert!(
         !post_optimize_total.batches().is_empty(),
         "queries must still work after optimize"
@@ -335,7 +334,7 @@ async fn composite_flow_canonical_lifecycle() {
     // It must now commit (Alice is one of the seed Persons; an update
     // leaves the row count at 6).
     let post_optimize_update = mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Alice")], &[("$age", 41)]),
@@ -374,7 +373,7 @@ async fn composite_flow_canonical_lifecycle() {
     // Step 12: reopen the engine — verify post-cleanup state is consistent.
     // ─────────────────────────────────────────────────────────────────
     drop(db);
-    let mut db = Omnigraph::open(uri).await.unwrap();
+    let db = helpers::session(Omnigraph::open(uri).await.unwrap());
     assert_eq!(
         count_rows(&db, "node:Person").await,
         6,
@@ -398,13 +397,13 @@ async fn composite_flow_canonical_lifecycle() {
     // post-cleanup. (The post-cleanup mutation was previously omitted
     // pending resolution of the optimize-vs-manifest-pin interaction in
     // Step 10; that is now fixed, so a strict write here must commit.)
-    let final_total = query_main(&mut db, TEST_QUERIES, "total_people", &ParamMap::default())
+    let final_total = query_main(&db, TEST_QUERIES, "total_people", &ParamMap::default())
         .await
         .unwrap();
     assert!(!final_total.batches().is_empty());
 
     let post_reopen_update = mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Alice")], &[("$age", 42)]),
@@ -451,15 +450,13 @@ async fn composite_flow_schema_apply_then_branch_ops_no_deadlock_in_refresh() {
     let uri = dir.path().to_str().unwrap();
 
     // Step 1: init + load on handle A.
-    let db_a = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&db_a, TEST_DATA, LoadMode::Append)
-        .await
-        .unwrap();
+    let db_a = helpers::session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    db_a.load_jsonl(TEST_DATA, LoadMode::Append).await.unwrap();
     assert_eq!(count_rows(&db_a, "node:Person").await, 4);
 
     // Step 2: open handle B on the same graph. B's in-memory schema_source
     // cache is now a snapshot of `_schema.pg` at open time.
-    let db_b = Omnigraph::open(uri).await.unwrap();
+    let db_b = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     // Step 3: A applies a schema that adds a nullable property to Person.
     // A's on-disk `_schema.pg` is rewritten; A's in-memory cache is updated
@@ -583,8 +580,8 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // Step 1: init + load baseline (4 Person, 2 Company, 3 Knows, 2 WorksAt
     // edges from test.jsonl).
     // ─────────────────────────────────────────────────────────────────
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&db, TEST_DATA, LoadMode::Append).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    db.load_jsonl(TEST_DATA, LoadMode::Append).await.unwrap();
     assert_eq!(count_rows(&db, "node:Person").await, 4);
     assert_eq!(count_rows(&db, "edge:Knows").await, 3);
 
@@ -595,7 +592,7 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // Keep the six large mutation futures out of this long test driver's
     // state while its later merges exercise the nested Lance writer.
     Box::pin(mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Alice2")], &[("$age", 31)]),
@@ -616,7 +613,7 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // and feat-a now diverge: main has Bob2, feat-a does not.
     // ─────────────────────────────────────────────────────────────────
     Box::pin(mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Bob2")], &[("$age", 26)]),
@@ -635,7 +632,7 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // but the *sixth* is Eve, not Bob2.
     // ─────────────────────────────────────────────────────────────────
     Box::pin(mutate_branch(
-        &mut db,
+        &db,
         "feat-a",
         MUTATION_QUERIES,
         "insert_person",
@@ -654,7 +651,7 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // the same query on main finds nothing. Catches regressions where the
     // planner resolves the wrong snapshot for branch-targeted reads.
     let eve_on_feat_a = query_branch(
-        &mut db,
+        &db,
         "feat-a",
         TEST_QUERIES,
         "get_person",
@@ -668,7 +665,7 @@ async fn composite_flow_multi_branch_sequential_merges() {
         "get_person(Eve) on feat-a must return 1 row through the query engine"
     );
     let eve_on_main = query_main(
-        &mut db,
+        &db,
         TEST_QUERIES,
         "get_person",
         &mixed_params(&[("$name", "Eve")], &[]),
@@ -693,7 +690,7 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // Step 7: mutate feat-b — insert "Frank".
     // ─────────────────────────────────────────────────────────────────
     Box::pin(mutate_branch(
-        &mut db,
+        &db,
         "feat-b",
         MUTATION_QUERIES,
         "insert_person",
@@ -708,7 +705,7 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // feat-a now has 7 Persons and 4 Knows edges.
     // ─────────────────────────────────────────────────────────────────
     Box::pin(mutate_branch(
-        &mut db,
+        &db,
         "feat-a",
         MUTATION_QUERIES,
         "insert_person_and_friend",
@@ -727,7 +724,7 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // exercises the Knows topology + index from feat-a's snapshot. Catches
     // regressions in graph-index lookup against branch-local edge tables.
     let graces_friends = query_branch(
-        &mut db,
+        &db,
         "feat-a",
         TEST_QUERIES,
         "friends_of",
@@ -769,7 +766,7 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // load-bearing check that `publish_rewritten_merge_table`'s Phase 3
     // index rebuild produced a queryable result, not just data on disk.
     let eve_on_main_post_merge = query_main(
-        &mut db,
+        &db,
         TEST_QUERIES,
         "get_person",
         &mixed_params(&[("$name", "Eve")], &[]),
@@ -782,7 +779,7 @@ async fn composite_flow_multi_branch_sequential_merges() {
         "Eve must be findable on main post-merge through the BTree index"
     );
     let graces_friends_on_main = query_main(
-        &mut db,
+        &db,
         TEST_QUERIES,
         "friends_of",
         &mixed_params(&[("$name", "Grace")], &[]),
@@ -802,7 +799,7 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // main now has all three on top of Bob2.
     // ─────────────────────────────────────────────────────────────────
     Box::pin(mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Helen")], &[("$age", 44)]),
@@ -843,7 +840,7 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // `total_people` returns count(Person) = 10. Catches regressions in
     // group-by/count execution against a multi-fragment table whose
     // current shape was produced by two sequential merges.
-    let total_post_merges = query_main(&mut db, TEST_QUERIES, "total_people", &ParamMap::default())
+    let total_post_merges = query_main(&db, TEST_QUERIES, "total_people", &ParamMap::default())
         .await
         .unwrap();
     assert_total(
@@ -993,7 +990,7 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // whose base predates a completed merge (feat-b's base is pre-feat-a).
     // ─────────────────────────────────────────────────────────────────
     let frank_on_feat_b = query_branch(
-        &mut db,
+        &db,
         "feat-b",
         TEST_QUERIES,
         "get_person",
@@ -1011,7 +1008,7 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // disk, manifest replays cleanly, all branches and tables visible.
     // ─────────────────────────────────────────────────────────────────
     drop(db);
-    let db = Omnigraph::open(uri).await.unwrap();
+    let db = helpers::session(Omnigraph::open(uri).await.unwrap());
     assert_eq!(
         count_rows(&db, "node:Person").await,
         10,
@@ -1047,8 +1044,8 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // reopened engine — catches regressions where indices serialize
     // correctly to disk but the reopened catalog can't bind them.
     // ─────────────────────────────────────────────────────────────────
-    let mut db = db;
-    let post_reopen_total = query_main(&mut db, TEST_QUERIES, "total_people", &ParamMap::default())
+    let db = db;
+    let post_reopen_total = query_main(&db, TEST_QUERIES, "total_people", &ParamMap::default())
         .await
         .unwrap();
     assert_total(
@@ -1059,7 +1056,7 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // Edge-traversal post-reopen: Grace's Knows(Grace → Eve) survived
     // both the merge and the reopen as a queryable graph edge.
     let graces_friends_post_reopen = query_main(
-        &mut db,
+        &db,
         TEST_QUERIES,
         "friends_of",
         &mixed_params(&[("$name", "Grace")], &[]),

@@ -1,0 +1,90 @@
+# issue: 624
+# red_on: 2026-09-15, pre-fix build at 379d8ed1 (the parent of #695's f0dcd2e6): step 7, the `value = 0` scalar read on tgt, failed with `storage: LanceError(IO): … Not found: …/nodes/<dataset>/tree/a.<ULID>/_indices/<uuid>/page_lookup.lance`; steps 1-6 green; green at f0dcd2e6 (#695) itself.
+# notes: After fast-forward, the target's first write must preserve inherited
+# notes: scalar and text indexes. A later merge must still succeed.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    value: I64 @index
+    text: String @index
+}
+
+--- seed
+{"type":"Person","data":{"name":"p000","value":0,"text":"needle"}}
+
+--- mutate
+branch create tgt
+
+--- expect ok
+
+--- mutate
+branch create a
+
+--- expect ok
+
+--- mutate
+branch create b
+
+--- expect ok
+
+--- mutate branch: a
+query ins_a() { insert Person { name: "a1", value: 1000, text: "needle" } }
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge a into tgt
+
+--- expect outcome: fast_forward
+
+--- mutate branch: tgt
+query ins_t() { insert Person { name: "t1", value: 2000, text: "needle" } }
+
+--- expect affected: nodes=1 edges=0
+
+--- query branch: tgt
+query scalar_read() {
+    match {
+        $p: Person
+        $p.value = 0
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "p000"}
+
+--- expect shape
+p.name: String
+
+--- query branch: tgt
+query text_read() {
+    match {
+        $p: Person
+        search($p.text, "needle")
+    }
+    return { count($p) as n }
+}
+
+--- expect unordered
+{"n": 3}
+
+--- expect shape
+n: I64
+
+--- mutate branch: b
+query ins_b() { insert Person { name: "b1", value: 3000, text: "needle" } }
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge b into tgt
+
+--- expect outcome: merged

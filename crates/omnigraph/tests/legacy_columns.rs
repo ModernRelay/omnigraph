@@ -9,7 +9,7 @@ use arrow_array::{StringArray, StructArray};
 use omnigraph::changes::{ChangeFeedScope, ChangeFilter, ChangeOp, ChangeOpKind};
 
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::{Literal, SCHEMA_IR_VERSION};
 
@@ -39,9 +39,11 @@ async fn legacy_vintage_graph_works_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    let mut db = Omnigraph::init_with_legacy_system_columns_for_tests(uri, LEGACY_SCHEMA)
-        .await
-        .unwrap();
+    let db = helpers::session(
+        Omnigraph::init_with_legacy_system_columns_for_tests(uri, LEGACY_SCHEMA)
+            .await
+            .unwrap(),
+    );
 
     let ir: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dir.path().join("_schema.ir.json")).unwrap())
@@ -55,8 +57,8 @@ async fn legacy_vintage_graph_works_end_to_end() {
         db.internal_schema_version_of(ReadTarget::branch("main"))
             .await
             .unwrap(),
-        8,
-        "a legacy-vintage graph is born at `__manifest` stamp 8 (RFC 0040 Compatibility)"
+        11,
+        "a legacy-vintage graph is born at the current `__manifest` stamp; the vintage lives in the schema IR (RFC 0040 Compatibility, RFC 0067, detached-only tables)"
     );
     let snap = snapshot_main(&db).await.unwrap();
     for table_key in ["node:Person", "node:Company", "edge:WorksAt"] {
@@ -87,14 +89,14 @@ async fn legacy_vintage_graph_works_end_to_end() {
         "a legacy edge table carries no current-vintage `__src` column"
     );
 
-    load_jsonl(&db, LEGACY_DATA, LoadMode::Overwrite)
+    db.load_jsonl(LEGACY_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
     let loaded_version = version_main(&db).await.unwrap();
     let loaded_commit = snapshot_id(&db, "main").await.unwrap();
     let company_result = query_main(
-        &mut db,
+        &db,
         "query company_identity() { match { $c: Company } return { $c.@id, $c.name } }",
         "company_identity",
         &ParamMap::new(),
@@ -119,7 +121,7 @@ async fn legacy_vintage_graph_works_end_to_end() {
         r#"{"edge":"WorksAt","id":"other","from":"Alice","to":"company-1","data":{"id":"duplicate"}}"#,
         r#"{"edge":"WorksAt","id":17,"from":"Alice","to":"company-1","data":{}}"#,
     ] {
-        assert!(load_jsonl(&db, invalid, LoadMode::Append).await.is_err());
+        assert!(db.load_jsonl(invalid, LoadMode::Append).await.is_err());
         assert_eq!(version_main(&db).await.unwrap(), loaded_version);
         assert_eq!(snapshot_id(&db, "main").await.unwrap(), loaded_commit);
         assert_eq!(count_rows(&db, "node:Company").await, 1);
@@ -209,14 +211,15 @@ async fn legacy_vintage_graph_works_end_to_end() {
     for legacy in [true, false] {
         let imported_dir = tempfile::tempdir().unwrap();
         let imported_uri = imported_dir.path().to_str().unwrap();
-        let imported = if legacy {
+        let imported = helpers::session(if legacy {
             Omnigraph::init_with_legacy_system_columns_for_tests(imported_uri, LEGACY_SCHEMA)
                 .await
                 .unwrap()
         } else {
             Omnigraph::init(imported_uri, LEGACY_SCHEMA).await.unwrap()
-        };
-        load_jsonl(&imported, &exported, LoadMode::Overwrite)
+        });
+        imported
+            .load_jsonl(&exported, LoadMode::Overwrite)
             .await
             .unwrap();
         let columns = imported.catalog().system_columns;
@@ -260,7 +263,7 @@ async fn legacy_vintage_graph_works_end_to_end() {
     );
 
     let result = query_main(
-        &mut db,
+        &db,
         "query coworkers() {\n    match {\n        $p: Person\n        $p worksat $c\n    }\n    return { $p.name, $c.name }\n}",
         "coworkers",
         &ParamMap::new(),
@@ -274,7 +277,7 @@ async fn legacy_vintage_graph_works_end_to_end() {
     );
 
     let result = query_main(
-        &mut db,
+        &db,
         "query ids() {\n    match {\n        $p: Person\n        $p $w:worksat $c\n    }\n    return { $p.@id, $w.@src, $w.@dst }\n    order { $p.@id asc }\n}",
         "ids",
         &ParamMap::new(),
@@ -297,7 +300,7 @@ async fn legacy_vintage_graph_works_end_to_end() {
     );
 
     let objects_result = query_main(
-        &mut db,
+        &db,
         "query objects() { match { $p: Person } return { $p } order { $p.@id asc } }",
         "objects",
         &ParamMap::new(),
@@ -322,7 +325,7 @@ async fn legacy_vintage_graph_works_end_to_end() {
     assert!(objects.column_by_name("__id").is_none());
 
     mutate_main(
-        &mut db,
+        &db,
         "query raise($name: String, $age: I32) {\n    update Person set { age: $age } where @id = $name\n}",
         "raise",
         &{
@@ -335,7 +338,7 @@ async fn legacy_vintage_graph_works_end_to_end() {
     .await
     .unwrap();
     mutate_main(
-        &mut db,
+        &db,
         "query fire($name: String) {\n    delete Person where @id = $name\n}",
         "fire",
         &{
@@ -504,7 +507,7 @@ edge WorksAt: Person -> Company {
     );
 
     drop(db);
-    let mut reopened = Omnigraph::open(uri).await.unwrap();
+    let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
     assert_eq!(
         reopened.catalog().system_columns.id,
         "id",
@@ -512,7 +515,7 @@ edge WorksAt: Person -> Company {
     );
     assert_eq!(reopened.catalog().system_columns.src, "src");
     let result = query_main(
-        &mut reopened,
+        &reopened,
         "query people() {\n    match {\n        $p: Person\n    }\n    return { $p.name }\n}",
         "people",
         &ParamMap::new(),
@@ -530,9 +533,11 @@ async fn legacy_endpoint_constraints_keep_the_accepted_shape_hash() {
         let source = format!(
             "node Person {{ name: String @key }}\nedge Knows: Person -> Person {{\n since: I32?\n {constraint}\n @unique(dst, since)\n}}"
         );
-        let db = Omnigraph::init_with_legacy_system_columns_for_tests(uri, &source)
-            .await
-            .unwrap();
+        let db = helpers::session(
+            Omnigraph::init_with_legacy_system_columns_for_tests(uri, &source)
+                .await
+                .unwrap(),
+        );
         let old_state: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(dir.path().join("__schema_state.json")).unwrap(),
         )
@@ -553,9 +558,8 @@ async fn legacy_endpoint_constraints_keep_the_accepted_shape_hash() {
             omnigraph_compiler::schema_shape_hash_from_ir(&old_ir).unwrap()
         );
         drop(db);
-        let db = Omnigraph::open(uri).await.unwrap();
-        load_jsonl(
-            &db,
+        let db = helpers::session(Omnigraph::open(uri).await.unwrap());
+        db.load_jsonl(
             r#"{"type":"Person","data":{"name":"alice"}}
 {"type":"Person","data":{"name":"bob"}}
 {"edge":"Knows","from":"alice","to":"bob","data":{"since":2020}}"#,
@@ -572,9 +576,7 @@ async fn legacy_endpoint_constraints_keep_the_accepted_shape_hash() {
         if constraint.starts_with("@unique") {
             let before = version_main(&db).await.unwrap();
             let head = snapshot_id(&db, "main").await.unwrap();
-            let error = load_jsonl(&db,
-                r#"{"edge":"Knows","id":"duplicate","from":"alice","to":"bob","data":{"since":2021}}"#,
-                LoadMode::Append).await.unwrap_err();
+            let error = db.load_jsonl(r#"{"edge":"Knows","id":"duplicate","from":"alice","to":"bob","data":{"since":2021}}"#, LoadMode::Append).await.unwrap_err();
             assert!(
                 error.to_string().to_lowercase().contains("unique"),
                 "{error}"
@@ -591,8 +593,8 @@ async fn legacy_endpoint_constraints_keep_the_accepted_shape_hash() {
             assert!(!dir.path().join(file).exists());
         }
         drop(db);
-        let mut db = Omnigraph::open(uri).await.unwrap();
-        let result = query_main(&mut db,
+        let db = helpers::session(Omnigraph::open(uri).await.unwrap());
+        let result = query_main(&db,
             "query endpoints() { match { $p: Person\n        $p $e:knows $f } return { min($e.@src), max($e.@dst) } }",
             "endpoints", &ParamMap::new()).await.unwrap();
         assert_eq!(

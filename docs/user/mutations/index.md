@@ -24,7 +24,39 @@ update Person set { display_name: $name } where email = $email
 delete Person where email = $email
 ```
 
-Assignment values can be literals, parameters, or `now()`.
+A `where` on `update` or `delete` takes the same expressions as a read filter
+(see [Boolean expressions and nulls](../queries/index.md#boolean-expressions-and-nulls)):
+`and`, `or`, `not`, parentheses, the six comparisons, `starts_with`,
+`contains`, `is null` and `is not null`. Its operands are the target type's
+properties, named bare, the system fields `@id`, `@src` and `@dst`, literals,
+parameters, and `now()`; `from` and `to` stay accepted for `@src` and `@dst`.
+It keeps only the rows whose expression is true. On four `Knows` edges, `ab1`
+and `ab2` from `a` to `b`, `ac`, and `db`:
+
+```gq
+query exact() { delete Knows where @src = "a" and @dst = "b" }
+```
+
+removes `ab1` and `ab2` and nothing else: `affected: nodes=0 edges=2`. A
+binding variable in a `where` is refused at compile time (`T14`); an
+aggregate, search, or ranking call is `T44`, for example ``T44: `count` cannot
+appear in a mutation where; a where compares the row's own properties,
+parameters and now()``. A compound `where` runs under either `engine` setting.
+
+Assignment values are constants: literals, parameters, `now()`, and
+comparisons or Boolean operators over them, such as `adult: true or $flag`.
+A constant's value is fixed per invocation: parameters and `now()` are bound
+once before any retry, so a retried mutation computes the same value. It follows the read rules
+for null: with `$flag` null, `true or $flag` is `true` and `false and $flag`
+is `false`, and `$age > 30` with `$age` null is null. A null result assigned
+to a nullable property writes null, with one exception that predates this
+release: an `update` that assigns null to a nullable `Blob` property keeps
+the old value instead of clearing it. Assigned to a non-nullable property a
+null result is refused with a typed error that names the property, never
+written as a default. A
+property or system field in a value is refused, for example ``T45: `age`
+cannot appear in an assignment value; assignments and binding matches are
+constants per invocation``.
 
 A mutation query may contain several inserts and updates, or several deletes,
 but it cannot mix inserts or updates with deletes. Split that workflow into two
@@ -113,9 +145,13 @@ representation exceeds 32 MiB. Split a larger import into explicit commits; use
 one initial overwrite only when it fits, followed by merge chunks.
 
 Independent existing constructive datasets stage concurrently. The
-`OMNIGRAPH_LOAD_CONCURRENCY` environment variable controls that width for both
-Load and insert/update mutations (default 8); first-touch branch effects are
-deferred and delete staging remains serial. This affects preparation only—one
+`stage_write_concurrency` [session setting](../queries/index.md#session-settings)
+controls that width for both Load and insert/update mutations (default 8,
+range `1..=64`); it is `process` scope, so the server takes it from
+`OMNIGRAPH_LOAD_CONCURRENCY` and a direct CLI run from that variable or from
+`--set` on `load`, `ingest` or `mutate` (a JSONL input carries no `set` line),
+and an invalid or `0` value refuses startup instead of running the default.
+Delete staging remains serial. This affects preparation only—one
 request still publishes exactly one graph commit.
 
 A stale strict update, delete, or overwrite can return `read_set_conflict`.

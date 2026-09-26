@@ -6,8 +6,9 @@ use arrow_array::{Array, Int64Array, StringArray};
 use lance_index::is_system_index;
 use serial_test::serial;
 
+use omnigraph::Session;
 use omnigraph::db::Omnigraph;
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph_compiler::query::ast::Literal;
 use omnigraph_compiler::result::QueryResult;
 
@@ -265,39 +266,39 @@ fn starvation_seed_data() -> String {
     rows.join("\n")
 }
 
-async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
+async fn init_search_db(dir: &tempfile::TempDir) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, SEARCH_SCHEMA).await.unwrap();
-    load_jsonl(&db, SEARCH_DATA, LoadMode::Overwrite)
+    let db = session(Omnigraph::init(uri, SEARCH_SCHEMA).await.unwrap());
+    db.load_jsonl(SEARCH_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
     db
 }
 
-async fn init_ranked_edge_db(dir: &tempfile::TempDir) -> Omnigraph {
+async fn init_ranked_edge_db(dir: &tempfile::TempDir) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, RANKED_EDGE_SCHEMA).await.unwrap();
-    load_jsonl(&db, RANKED_EDGE_DATA, LoadMode::Overwrite)
+    let db = session(Omnigraph::init(uri, RANKED_EDGE_SCHEMA).await.unwrap());
+    db.load_jsonl(RANKED_EDGE_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     db
 }
 
-async fn init_mock_embedding_search_db(dir: &tempfile::TempDir) -> Omnigraph {
+async fn init_mock_embedding_search_db(dir: &tempfile::TempDir) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, MOCK_SEARCH_SCHEMA).await.unwrap();
-    load_jsonl(&db, &mock_embedding_seed_data(), LoadMode::Overwrite)
+    let db = session(Omnigraph::init(uri, MOCK_SEARCH_SCHEMA).await.unwrap());
+    db.load_jsonl(&mock_embedding_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
     db
 }
 
-async fn init_model_recorded_search_db(dir: &tempfile::TempDir) -> Omnigraph {
+async fn init_model_recorded_search_db(dir: &tempfile::TempDir) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, MODEL_RECORDED_SCHEMA).await.unwrap();
-    load_jsonl(&db, &mock_embedding_seed_data(), LoadMode::Overwrite)
+    let db = session(Omnigraph::init(uri, MODEL_RECORDED_SCHEMA).await.unwrap());
+    db.load_jsonl(&mock_embedding_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
@@ -425,8 +426,8 @@ async fn doc_user_index_count(db: &Omnigraph) -> usize {
 async fn deferred_indexes_do_not_block_hybrid_reads() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, MOCK_SEARCH_SCHEMA).await.unwrap();
-    load_jsonl(&db, &mock_embedding_seed_data(), LoadMode::Overwrite)
+    let db = session(Omnigraph::init(uri, MOCK_SEARCH_SCHEMA).await.unwrap());
+    db.load_jsonl(&mock_embedding_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -436,7 +437,7 @@ async fn deferred_indexes_do_not_block_hybrid_reads() {
         "load must leave declared physical indexes to the reconciler"
     );
     let result = query_main(
-        &mut db,
+        &db,
         MOCK_SEARCH_QUERIES,
         "hybrid_search_vector",
         &vector_and_string_params("$vq", &mock_embedding("alpha", 4), "$tq", "alpha"),
@@ -487,11 +488,11 @@ impl Drop for EnvGuard {
 #[serial]
 async fn text_search_filters_results() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_search_db(&dir).await;
+    let db = init_search_db(&dir).await;
 
     // "Learning" appears in: ml-intro, dl-basics, rl-intro titles
     let result = query_main(
-        &mut db,
+        &db,
         SEARCH_QUERIES,
         "text_search",
         &params(&[("$q", "Learning")]),
@@ -522,10 +523,10 @@ async fn text_search_filters_results() {
 #[serial]
 async fn text_search_no_results() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_search_db(&dir).await;
+    let db = init_search_db(&dir).await;
 
     let result = query_main(
-        &mut db,
+        &db,
         SEARCH_QUERIES,
         "text_search",
         &params(&[("$q", "xyznonexistent")]),
@@ -542,11 +543,11 @@ async fn text_search_no_results() {
 #[serial]
 async fn fuzzy_search_tolerates_typos() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_search_db(&dir).await;
+    let db = init_search_db(&dir).await;
 
     // "Introductio" (missing 'n') should fuzzy-match "Introduction" with max_edits=2
     let result = query_main(
-        &mut db,
+        &db,
         SEARCH_QUERIES,
         "fuzzy_search",
         &params(&[("$q", "Introductio")]),
@@ -566,11 +567,11 @@ async fn fuzzy_search_tolerates_typos() {
 #[serial]
 async fn phrase_search_matches_exact_phrase() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_search_db(&dir).await;
+    let db = init_search_db(&dir).await;
 
     // "neural networks" appears in dl-basics body
     let result = query_main(
-        &mut db,
+        &db,
         SEARCH_QUERIES,
         "phrase_search",
         &params(&[("$q", "neural networks")]),
@@ -600,10 +601,10 @@ async fn phrase_search_matches_exact_phrase() {
 #[serial]
 async fn phrase_search_is_documented_fts_fallback() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_search_db(&dir).await;
+    let db = init_search_db(&dir).await;
 
     let result = query_main(
-        &mut db,
+        &db,
         SEARCH_QUERIES,
         "phrase_search",
         &params(&[("$q", "networks layers")]),
@@ -677,13 +678,13 @@ query filtered_nearest_clause_range($q: Vector(4)) {
 async fn assert_filtered_nearest_returns_hits(query_name: &str) {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, FILTERED_NEAREST_SCHEMA).await.unwrap();
-    load_jsonl(&db, FILTERED_NEAREST_DATA, LoadMode::Overwrite)
+    let db = session(Omnigraph::init(uri, FILTERED_NEAREST_SCHEMA).await.unwrap());
+    db.load_jsonl(FILTERED_NEAREST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
     let result = query_main(
-        &mut db,
+        &db,
         FILTERED_NEAREST_QUERIES,
         query_name,
         &vector_param("$q", &[1.0, 0.0, 0.0, 0.0]),
@@ -738,17 +739,23 @@ async fn filtered_nearest_clause_spelling_prefilters_like_inline() {
 /// The #567 fixture shared by the `issue_567_*` probe-ladder tests: 20,000
 /// docs on a line, `keep` on the last thousand, the middle 3,000 deleted,
 /// then the optimize that splits one IVF_FLAT partition into several.
+#[cfg(feature = "failpoints")]
 const ISSUE_567_ROWS: usize = 20_000;
+#[cfg(feature = "failpoints")]
 const ISSUE_567_DELETED: usize = 3_000;
+#[cfg(feature = "failpoints")]
 const ISSUE_567_EDGE_DOCS: usize = 5;
 /// Docs that carry a `Far` edge and `far: true`: five, split across the
 /// optimized index's two partitions (four low on the line, one high). See
 /// `ISSUE_567_FAR_QUERY`.
+#[cfg(feature = "failpoints")]
 const ISSUE_567_FAR_DOCS: [usize; 5] = [0, 2_000, 4_000, 6_000, 15_000];
 /// Query point for the far docs: inside the high partition, near its
 /// centroid, so Lance's initial probe reads that partition alone and the
 /// late search emits the four low docs at `_distance = +inf`.
+#[cfg(feature = "failpoints")]
 const ISSUE_567_FAR_QUERY: [f32; 4] = [13_300.0, 0.0, 0.0, 0.0];
+#[cfg(feature = "failpoints")]
 const ISSUE_567_QUERIES: &str = r#"
 query filtered_nearest($q: Vector(4)) {
     match { $d: Doc { keep: true } }
@@ -813,7 +820,11 @@ query nearest_all_17000($q: Vector(4)) {
 }
 "#;
 
-async fn issue_567_optimized_docs(uri: &str) -> Omnigraph {
+/// A four-partition IVF index on fixed centroids (the engine builds one-partition
+/// flat ones), built on the `node:Doc` pin restored onto the linear HEAD and
+/// published through the failpoint hook; a delete then tombstones rows under it.
+#[cfg(feature = "failpoints")]
+async fn issue_567_partitioned_docs(uri: &str) -> Session {
     let mut lines = (0..ISSUE_567_ROWS)
         .map(|row| {
             let keep = row >= 19_000;
@@ -857,36 +868,91 @@ query delete_middle() {
     delete Doc where drop = true
 }
 "#;
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&db, &seed, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::init(uri, schema).await.unwrap());
+    db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
     db.ensure_indices().await.unwrap();
-    let deleted = mutate_main(&mut db, delete_query, "delete_middle", &params(&[]))
+    helpers::forge_linear_head_from_pin(&db, "main", "node:Doc", 0).await;
+    {
+        use lance::index::DatasetIndexExt;
+        let doc_path = db
+            .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .dataset("node:Doc")
+            .unwrap()
+            .dataset_path
+            .clone();
+        let doc_uri = format!("{}/{}", uri.trim_end_matches('/'), doc_path);
+        // forbidden-api-allow: test builds a partitioned vector index directly on the Lance dataset.
+        let mut ds = lance::Dataset::open(&doc_uri).await.unwrap();
+        let partitions = 4usize;
+        let step = ISSUE_567_ROWS as f32 / partitions as f32;
+        let mut values = Vec::with_capacity(partitions * 4);
+        for partition in 0..partitions {
+            values.extend([step * (partition as f32 + 0.5), 0.0, 0.0, 0.0]);
+        }
+        let centroids = arrow_array::FixedSizeListArray::try_new(
+            std::sync::Arc::new(arrow_schema::Field::new(
+                "item",
+                arrow_schema::DataType::Float32,
+                true,
+            )),
+            4,
+            std::sync::Arc::new(arrow_array::Float32Array::from(values)),
+            None,
+        )
+        .unwrap();
+        let ivf = lance_index::vector::ivf::IvfBuildParams::try_with_centroids(
+            partitions,
+            std::sync::Arc::new(centroids),
+        )
+        .unwrap();
+        let params = lance::index::vector::VectorIndexParams::with_ivf_flat_params(
+            lance_linalg::distance::MetricType::L2,
+            ivf,
+        );
+        ds.create_index(
+            &["embedding"],
+            lance_index::IndexType::Vector,
+            Some("embedding_idx".to_string()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    }
+    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Doc", None)
+        .await
+        .unwrap();
+    // The delete leaves the partitioned index with tombstoned rows: the
+    // underfilled partitions the ladder and rescan cases exercise.
+    let deleted = mutate_main(&db, delete_query, "delete_middle", &params(&[]))
         .await
         .unwrap();
     assert_eq!(deleted.affected_nodes, ISSUE_567_DELETED);
-    db.optimize().await.unwrap();
     db
 }
 
 /// The engine's maximum-only IVF guard must not lower the requested candidate
-/// count. Under a pushed prefilter and `OMNIGRAPH_ANN_NPROBES=1` the capped
+/// count. Under a pushed prefilter and `ann_nprobes = 1` the capped
 /// scan is short of `k` and the scan-site ladder widens it until `limit` fills.
+#[cfg(feature = "failpoints")]
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn issue_567_bounded_nearest_and_rrf_retry_after_optimized_ivf_underfill() {
+async fn issue_567_bounded_nearest_and_rrf_retry_after_partitioned_ivf_underfill() {
     const ROWS: usize = ISSUE_567_ROWS;
     let queries = ISSUE_567_QUERIES;
 
-    let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", Some("1"))]);
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = issue_567_optimized_docs(uri).await;
+    let db = issue_567_partitioned_docs(uri).await;
+    let db = with_setting(&db, "ann_nprobes", "1");
 
     use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
     let probes = QueryIoProbes::default();
     let result = with_query_io_probes(probes.clone(), async {
         query_main(
-            &mut db,
+            &db,
             queries,
             "filtered_nearest",
             &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
@@ -942,7 +1008,7 @@ async fn issue_567_bounded_nearest_and_rrf_retry_after_optimized_ivf_underfill()
     let rrf_keep_probes = QueryIoProbes::default();
     let rrf_keep = with_query_io_probes(rrf_keep_probes.clone(), async {
         query_main(
-            &mut db,
+            &db,
             queries,
             "rrf_keep",
             &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
@@ -980,7 +1046,7 @@ async fn issue_567_bounded_nearest_and_rrf_retry_after_optimized_ivf_underfill()
     let rrf_probes = QueryIoProbes::default();
     let rrf = with_query_io_probes(rrf_probes.clone(), async {
         query_main(
-            &mut db,
+            &db,
             queries,
             "rrf_all",
             &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
@@ -1017,6 +1083,7 @@ async fn issue_567_bounded_nearest_and_rrf_retry_after_optimized_ivf_underfill()
 /// Asserts `rungs` (the `ann_rung_partitions_searched` probe) forms exactly
 /// `ladders` strictly increasing runs: a new ladder starts wherever the
 /// searched-partition count does not grow.
+#[cfg(feature = "failpoints")]
 fn assert_rungs_climb(rungs: &[u64], ladders: usize, context: &str) {
     let runs = 1 + rungs.windows(2).filter(|pair| pair[1] <= pair[0]).count();
     assert_eq!(
@@ -1026,22 +1093,23 @@ fn assert_rungs_climb(rungs: &[u64], ladders: usize, context: &str) {
 }
 
 /// Follow-up to #591 (issue #567): a standalone `nearest` whose `limit`
-/// equals the corpus, under `OMNIGRAPH_ANN_NPROBES=1`. The ladder climbs
+/// equals the corpus, under `ann_nprobes = 1`. The ladder climbs
 /// until every ranked partition is read and the answer is the whole corpus.
+#[cfg(feature = "failpoints")]
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn issue_567_unfiltered_nearest_climbs_the_ladder_to_the_whole_corpus() {
     use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
 
-    let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", Some("1"))]);
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = issue_567_optimized_docs(uri).await;
+    let db = issue_567_partitioned_docs(uri).await;
+    let db = with_setting(&db, "ann_nprobes", "1");
 
     let probes = QueryIoProbes::default();
     let result = with_query_io_probes(probes.clone(), async {
         query_main(
-            &mut db,
+            &db,
             ISSUE_567_QUERIES,
             "nearest_all_17000",
             &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
@@ -1088,22 +1156,23 @@ async fn issue_567_unfiltered_nearest_climbs_the_ladder_to_the_whole_corpus() {
 }
 
 /// Follow-up to #591 (issue #567): the probe cap is for the UNFILTERED scan.
-/// A plain `nearest` under `OMNIGRAPH_ANN_NPROBES=1` fills `limit` in one
+/// A plain `nearest` under `ann_nprobes = 1` fills `limit` in one
 /// scan, so the ladder never fires.
+#[cfg(feature = "failpoints")]
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn issue_567_unfiltered_nearest_keeps_the_probe_cap() {
     use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
 
-    let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", Some("1"))]);
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = issue_567_optimized_docs(uri).await;
+    let db = issue_567_partitioned_docs(uri).await;
+    let db = with_setting(&db, "ann_nprobes", "1");
 
     let probes = QueryIoProbes::default();
     let result = with_query_io_probes(probes.clone(), async {
         query_main(
-            &mut db,
+            &db,
             ISSUE_567_QUERIES,
             "nearest_all",
             &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
@@ -1150,20 +1219,20 @@ async fn issue_567_unfiltered_nearest_keeps_the_probe_cap() {
 /// Follow-up to #591 (issue #567): the gate's `id IN` list admits fewer rows
 /// than `k`, so the engine answers from ONE flat exact kNN over the admitted
 /// rows (`use_index(false)`) instead of the IVF plan.
+#[cfg(feature = "failpoints")]
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn issue_567_ladder_stops_when_the_prefilter_admits_fewer_rows_than_k() {
     use omnigraph::instrumentation::{QueryIoProbes, RrfGatePlan, with_query_io_probes};
 
-    let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", None)]);
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = issue_567_optimized_docs(uri).await;
+    let db = issue_567_partitioned_docs(uri).await;
 
     let probes = QueryIoProbes::default();
     let result = with_query_io_probes(probes.clone(), async {
         query_main(
-            &mut db,
+            &db,
             ISSUE_567_QUERIES,
             "nearest_friends",
             &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
@@ -1232,15 +1301,15 @@ async fn issue_567_ladder_stops_when_the_prefilter_admits_fewer_rows_than_k() {
 /// Follow-up to #591 (issue #567), the order defect: a prefilter admitting at
 /// most `k` rows split across partitions. Both routes to the flat exact kNN
 /// return the exact filtered kNN, in order.
+#[cfg(feature = "failpoints")]
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn issue_567_flat_scan_returns_the_admitted_rows_in_nearest_order() {
     use omnigraph::instrumentation::{QueryIoProbes, RrfGatePlan, with_query_io_probes};
 
-    let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", None)]);
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = issue_567_optimized_docs(uri).await;
+    let db = issue_567_partitioned_docs(uri).await;
     let q = vector_param("$q", &ISSUE_567_FAR_QUERY);
     let mut expected = ISSUE_567_FAR_DOCS
         .iter()
@@ -1268,7 +1337,7 @@ async fn issue_567_flat_scan_returns_the_admitted_rows_in_nearest_order() {
 
     let probes = QueryIoProbes::default();
     let gated = with_query_io_probes(probes.clone(), async {
-        query_main(&mut db, ISSUE_567_QUERIES, "nearest_far_friends", &q).await
+        query_main(&db, ISSUE_567_QUERIES, "nearest_far_friends", &q).await
     })
     .await
     .unwrap();
@@ -1317,7 +1386,7 @@ async fn issue_567_flat_scan_returns_the_admitted_rows_in_nearest_order() {
 
     let probes = QueryIoProbes::default();
     let flagged = with_query_io_probes(probes.clone(), async {
-        query_main(&mut db, ISSUE_567_QUERIES, "nearest_far_flag", &q).await
+        query_main(&db, ISSUE_567_QUERIES, "nearest_far_flag", &q).await
     })
     .await
     .unwrap();
@@ -1389,18 +1458,18 @@ query nearest_all($q: Vector(4)) {
     limit 5000
 }
 "#;
-    let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", Some("100000"))]);
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&db, &rows, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::init(uri, schema).await.unwrap());
+    db.load_jsonl(&rows, LoadMode::Overwrite).await.unwrap();
     db.ensure_indices().await.unwrap();
+    let db = with_setting(&db, "ann_nprobes", "100000");
 
     use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
     let probes = QueryIoProbes::default();
     let result = with_query_io_probes(probes.clone(), async {
         query_main(
-            &mut db,
+            &db,
             queries,
             "nearest_all",
             &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
@@ -1470,17 +1539,16 @@ query nearest_all($q: Vector(4)) {
     limit 10
 }
 "#;
-    let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", None)]);
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&db, &rows, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::init(uri, schema).await.unwrap());
+    db.load_jsonl(&rows, LoadMode::Overwrite).await.unwrap();
     db.ensure_indices().await.unwrap();
 
     let probes = QueryIoProbes::default();
     let result = with_query_io_probes(probes.clone(), async {
         query_main(
-            &mut db,
+            &db,
             queries,
             "nearest_all",
             &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
@@ -1562,7 +1630,7 @@ query nearest_friends_count($q: Vector(4)) {
 }
 "#;
 
-async fn issue_567_line_docs(uri: &str, rows: usize, edge_every: Option<usize>) -> Omnigraph {
+async fn issue_567_line_docs(uri: &str, rows: usize, edge_every: Option<usize>) -> Session {
     let mut lines: Vec<String> = (0..rows)
         .map(|row| {
             format!(
@@ -1578,8 +1646,8 @@ async fn issue_567_line_docs(uri: &str, rows: usize, edge_every: Option<usize>) 
             ));
         }
     }
-    let db = Omnigraph::init(uri, ISSUE_567_LINE_SCHEMA).await.unwrap();
-    load_jsonl(&db, &lines.join("\n"), LoadMode::Overwrite)
+    let db = session(Omnigraph::init(uri, ISSUE_567_LINE_SCHEMA).await.unwrap());
+    db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
@@ -1604,18 +1672,18 @@ fn count_total(result: &QueryResult) -> i64 {
 #[serial]
 async fn issue_567_nearest_traversal_prefilters_then_overfetches() {
     use omnigraph::instrumentation::{
-        QueryIoProbes, RrfGateFallback, RrfGatePlan, with_query_io_probes, with_rrf_plan,
+        QueryIoProbes, RrfGateFallback, RrfGatePlan, with_query_io_probes,
     };
     const ROWS: usize = 2_000;
     let queries = ISSUE_567_LINE_QUERIES;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = issue_567_line_docs(uri, ROWS, Some(20)).await;
+    let db = issue_567_line_docs(uri, ROWS, Some(20)).await;
     let q = vector_param("$q", &[0.0, 0.0, 0.0, 0.0]);
 
     let probes = QueryIoProbes::default();
     let prefiltered = with_query_io_probes(probes.clone(), async {
-        query_main(&mut db, queries, "nearest_friends", &q).await
+        query_main(&db, queries, "nearest_friends", &q).await
     })
     .await
     .unwrap();
@@ -1677,12 +1745,10 @@ async fn issue_567_nearest_traversal_prefilters_then_overfetches() {
     );
 
     let probes = QueryIoProbes::default();
-    let unfiltered = with_query_io_probes(
-        probes.clone(),
-        with_rrf_plan("force_postfilter", async {
-            query_main(&mut db, queries, "nearest_friends", &q).await
-        }),
-    )
+    let postfilter_db = with_setting(&db, "rrf_plan", "force_postfilter");
+    let unfiltered = with_query_io_probes(probes.clone(), async {
+        query_main(&postfilter_db, queries, "nearest_friends", &q).await
+    })
     .await
     .unwrap();
     assert_eq!(
@@ -1750,12 +1816,12 @@ async fn issue_567_proven_empty_eligible_set_runs_no_scan_and_no_overfetch() {
     const ROWS: usize = 2_000;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = issue_567_line_docs(uri, ROWS, None).await;
+    let db = issue_567_line_docs(uri, ROWS, None).await;
     let q = vector_param("$q", &[0.0, 0.0, 0.0, 0.0]);
 
     let probes = QueryIoProbes::default();
     let result = with_query_io_probes(probes.clone(), async {
-        query_main(&mut db, ISSUE_567_LINE_QUERIES, "nearest_friends", &q).await
+        query_main(&db, ISSUE_567_LINE_QUERIES, "nearest_friends", &q).await
     })
     .await
     .unwrap();
@@ -1811,20 +1877,24 @@ async fn issue_567_proven_empty_eligible_set_runs_no_scan_and_no_overfetch() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn issue_567_aggregate_over_a_nearest_traversal_counts_the_window() {
-    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_rrf_plan};
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
     const ROWS: usize = 2_000;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = issue_567_line_docs(uri, ROWS, Some(20)).await;
+    let db = issue_567_line_docs(uri, ROWS, Some(20)).await;
+    let postfilter_db = with_setting(&db, "rrf_plan", "force_postfilter");
     let q = vector_param("$q", &[0.0, 0.0, 0.0, 0.0]);
 
     let probes = QueryIoProbes::default();
-    let unfiltered = with_query_io_probes(
-        probes.clone(),
-        with_rrf_plan("force_postfilter", async {
-            query_main(&mut db, ISSUE_567_LINE_QUERIES, "nearest_friends_count", &q).await
-        }),
-    )
+    let unfiltered = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &postfilter_db,
+            ISSUE_567_LINE_QUERIES,
+            "nearest_friends_count",
+            &q,
+        )
+        .await
+    })
     .await
     .unwrap();
     assert_eq!(
@@ -1848,7 +1918,7 @@ async fn issue_567_aggregate_over_a_nearest_traversal_counts_the_window() {
 
     let probes = QueryIoProbes::default();
     let gated = with_query_io_probes(probes.clone(), async {
-        query_main(&mut db, ISSUE_567_LINE_QUERIES, "nearest_friends_count", &q).await
+        query_main(&db, ISSUE_567_LINE_QUERIES, "nearest_friends_count", &q).await
     })
     .await
     .unwrap();
@@ -1877,12 +1947,12 @@ async fn issue_567_nearest_gate_falls_back_above_the_ratio() {
     const ROWS: usize = 2_000;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = issue_567_line_docs(uri, ROWS, Some(2)).await;
+    let db = issue_567_line_docs(uri, ROWS, Some(2)).await;
     let q = vector_param("$q", &[0.0, 0.0, 0.0, 0.0]);
 
     let probes = QueryIoProbes::default();
     let result = with_query_io_probes(probes.clone(), async {
-        query_main(&mut db, ISSUE_567_LINE_QUERIES, "nearest_friends", &q).await
+        query_main(&db, ISSUE_567_LINE_QUERIES, "nearest_friends", &q).await
     })
     .await
     .unwrap();
@@ -1920,28 +1990,26 @@ async fn issue_567_nearest_gate_falls_back_above_the_ratio() {
     );
 }
 
-/// Follow-up to #591 (issue #567): `OMNIGRAPH_RRF_PLAN=force_prefilter` skips
+/// Follow-up to #591 (issue #567): `rrf_plan = force_prefilter` skips
 /// the threshold, so the gate prefilters, records `forced`, and one scan
 /// fills the limit with the answer the overfetch rerun reaches naturally.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn issue_567_forced_prefilter_skips_the_nearest_gate_threshold() {
     use omnigraph::instrumentation::{
-        QueryIoProbes, RrfGatePlan, RrfGateVerdict, with_query_io_probes, with_rrf_plan,
+        QueryIoProbes, RrfGatePlan, RrfGateVerdict, with_query_io_probes,
     };
     const ROWS: usize = 2_000;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = issue_567_line_docs(uri, ROWS, Some(2)).await;
+    let db = issue_567_line_docs(uri, ROWS, Some(2)).await;
+    let prefilter_db = with_setting(&db, "rrf_plan", "force_prefilter");
     let q = vector_param("$q", &[0.0, 0.0, 0.0, 0.0]);
 
     let probes = QueryIoProbes::default();
-    let result = with_query_io_probes(
-        probes.clone(),
-        with_rrf_plan("force_prefilter", async {
-            query_main(&mut db, ISSUE_567_LINE_QUERIES, "nearest_friends", &q).await
-        }),
-    )
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(&prefilter_db, ISSUE_567_LINE_QUERIES, "nearest_friends", &q).await
+    })
     .await
     .unwrap();
     let verdicts = probes.ann_prefilter_verdicts.lock().unwrap().clone();
@@ -2048,8 +2116,8 @@ query f_flipped($q: Vector(4)) {
 "#;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&db, &rows, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::init(uri, schema).await.unwrap());
+    db.load_jsonl(&rows, LoadMode::Overwrite).await.unwrap();
     db.ensure_indices().await.unwrap();
     let mut q = vector_param("$q", &[0.0, 0.0, 0.0, 0.0]);
     q.insert("n".to_string(), Literal::Integer(7));
@@ -2069,7 +2137,7 @@ query f_flipped($q: Vector(4)) {
     for (name, expected) in table {
         let probes = QueryIoProbes::default();
         let result = with_query_io_probes(probes.clone(), async {
-            query_main(&mut db, queries, name, &q).await
+            query_main(&db, queries, name, &q).await
         })
         .await
         .unwrap();
@@ -2092,11 +2160,11 @@ query f_flipped($q: Vector(4)) {
 #[serial]
 async fn nearest_returns_k_closest() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_search_db(&dir).await;
+    let db = init_search_db(&dir).await;
 
     // Query vector [0.1, 0.2, 0.3, 0.4] is identical to ml-intro's embedding
     let result = query_main(
-        &mut db,
+        &db,
         SEARCH_QUERIES,
         "vector_search",
         &vector_param("$q", &[0.1, 0.2, 0.3, 0.4]),
@@ -2157,16 +2225,14 @@ query ranked($q: Vector(4)) {{
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&db, &rows(0), LoadMode::Overwrite)
-        .await
-        .unwrap();
-    load_jsonl(&db, &rows(ROWS_PER_FRAGMENT), LoadMode::Append)
+    let db = session(Omnigraph::init(uri, schema).await.unwrap());
+    db.load_jsonl(&rows(0), LoadMode::Overwrite).await.unwrap();
+    db.load_jsonl(&rows(ROWS_PER_FRAGMENT), LoadMode::Append)
         .await
         .unwrap();
 
     let result = query_main(
-        &mut db,
+        &db,
         &query,
         "ranked",
         &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
@@ -2189,10 +2255,10 @@ async fn nearest_string_param_matches_explicit_vector_under_mock_embeddings() {
     ]);
 
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_mock_embedding_search_db(&dir).await;
+    let db = init_mock_embedding_search_db(&dir).await;
 
     let explicit = query_main(
-        &mut db,
+        &db,
         MOCK_SEARCH_QUERIES,
         "vector_search_vector",
         &vector_param("$q", &mock_embedding("alpha", 4)),
@@ -2200,7 +2266,7 @@ async fn nearest_string_param_matches_explicit_vector_under_mock_embeddings() {
     .await
     .unwrap();
     let embedded = query_main(
-        &mut db,
+        &db,
         MOCK_SEARCH_QUERIES,
         "vector_search_string",
         &params(&[("$q", "alpha")]),
@@ -2221,10 +2287,10 @@ async fn nearest_string_literal_works_under_mock_embeddings() {
     ]);
 
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_mock_embedding_search_db(&dir).await;
+    let db = init_mock_embedding_search_db(&dir).await;
 
     let result = query_main(
-        &mut db,
+        &db,
         MOCK_SEARCH_QUERIES,
         "vector_search_literal",
         &params(&[]),
@@ -2244,10 +2310,10 @@ async fn rrf_with_string_nearest_matches_explicit_vector_under_mock_embeddings()
     ]);
 
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_mock_embedding_search_db(&dir).await;
+    let db = init_mock_embedding_search_db(&dir).await;
 
     let explicit = query_main(
-        &mut db,
+        &db,
         MOCK_SEARCH_QUERIES,
         "hybrid_search_vector",
         &vector_and_string_params("$vq", &mock_embedding("alpha", 4), "$tq", "alpha"),
@@ -2255,7 +2321,7 @@ async fn rrf_with_string_nearest_matches_explicit_vector_under_mock_embeddings()
     .await
     .unwrap();
     let embedded = query_main(
-        &mut db,
+        &db,
         MOCK_SEARCH_QUERIES,
         "hybrid_search_string",
         &params(&[("$vq", "alpha"), ("$tq", "alpha")]),
@@ -2276,10 +2342,10 @@ async fn explicit_vector_nearest_does_not_require_gemini_credentials() {
     ]);
 
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_mock_embedding_search_db(&dir).await;
+    let db = init_mock_embedding_search_db(&dir).await;
 
     let result = query_main(
-        &mut db,
+        &db,
         MOCK_SEARCH_QUERIES,
         "vector_search_vector",
         &vector_param("$q", &mock_embedding("alpha", 4)),
@@ -2304,10 +2370,10 @@ async fn string_nearest_requires_provider_credentials_when_mock_is_disabled() {
     ]);
 
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_mock_embedding_search_db(&dir).await;
+    let db = init_mock_embedding_search_db(&dir).await;
 
     let err = query_main(
-        &mut db,
+        &db,
         MOCK_SEARCH_QUERIES,
         "vector_search_string",
         &params(&[("$q", "alpha")]),
@@ -2335,10 +2401,10 @@ async fn nearest_string_passes_when_query_model_matches_recorded_model() {
     ]);
 
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_model_recorded_search_db(&dir).await;
+    let db = init_model_recorded_search_db(&dir).await;
 
     let result = query_main(
-        &mut db,
+        &db,
         MOCK_SEARCH_QUERIES,
         "vector_search_string",
         &params(&[("$q", "alpha")]),
@@ -2362,10 +2428,10 @@ async fn nearest_string_errors_when_query_model_differs_from_recorded_model() {
     ]);
 
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_model_recorded_search_db(&dir).await;
+    let db = init_model_recorded_search_db(&dir).await;
 
     let err = query_main(
-        &mut db,
+        &db,
         MOCK_SEARCH_QUERIES,
         "vector_search_string",
         &params(&[("$q", "alpha")]),
@@ -2395,17 +2461,25 @@ async fn injected_embedding_config_is_used_instead_of_env() {
     ]);
 
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_model_recorded_search_db(&dir)
+    let uri = dir.path().to_str().unwrap();
+    let db = session(
+        Omnigraph::init(uri, MODEL_RECORDED_SCHEMA)
+            .await
+            .unwrap()
+            .with_embedding_config(std::sync::Arc::new(omnigraph::embedding::EmbeddingConfig {
+                provider: omnigraph::embedding::Provider::Mock,
+                model: "test-model-a".to_string(),
+                base_url: String::new(),
+                api_key: String::new(),
+            })),
+    );
+    db.load_jsonl(&mock_embedding_seed_data(), LoadMode::Overwrite)
         .await
-        .with_embedding_config(std::sync::Arc::new(omnigraph::embedding::EmbeddingConfig {
-            provider: omnigraph::embedding::Provider::Mock,
-            model: "test-model-a".to_string(),
-            base_url: String::new(),
-            api_key: String::new(),
-        }));
+        .unwrap();
+    db.ensure_indices().await.unwrap();
 
     let result = query_main(
-        &mut db,
+        &db,
         MOCK_SEARCH_QUERIES,
         "vector_search_string",
         &params(&[("$q", "alpha")]),
@@ -2422,11 +2496,11 @@ async fn injected_embedding_config_is_used_instead_of_env() {
 #[serial]
 async fn bm25_returns_ranked_results() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_search_db(&dir).await;
+    let db = init_search_db(&dir).await;
 
     // "Learning" appears in multiple titles
     let result = query_main(
-        &mut db,
+        &db,
         SEARCH_QUERIES,
         "bm25_search",
         &params(&[("$q", "Learning")]),
@@ -2449,9 +2523,9 @@ async fn bm25_returns_ranked_results() {
 #[serial]
 async fn nearest_full_rank_order() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_search_db(&dir).await;
+    let db = init_search_db(&dir).await;
     let result = query_main(
-        &mut db,
+        &db,
         SEARCH_QUERIES,
         "vector_search",
         &vector_param("$q", &[0.1, 0.2, 0.3, 0.4]),
@@ -2469,9 +2543,9 @@ async fn nearest_full_rank_order() {
 #[serial]
 async fn bm25_full_rank_order() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_search_db(&dir).await;
+    let db = init_search_db(&dir).await;
     let result = query_main(
-        &mut db,
+        &db,
         SEARCH_QUERIES,
         "bm25_search",
         &params(&[("$q", "Learning")]),
@@ -2496,9 +2570,9 @@ async fn bm25_full_rank_order() {
 #[serial]
 async fn nearest_rank_survives_bound_edge_fanout() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_ranked_edge_db(&dir).await;
+    let db = init_ranked_edge_db(&dir).await;
     let result = query_main(
-        &mut db,
+        &db,
         RANKED_EDGE_QUERIES,
         "nearest_edges",
         &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
@@ -2530,9 +2604,9 @@ async fn nearest_rank_survives_bound_edge_fanout() {
 #[serial]
 async fn nearest_rank_survives_multi_hop_expansion() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_ranked_edge_db(&dir).await;
+    let db = init_ranked_edge_db(&dir).await;
     let result = query_main(
-        &mut db,
+        &db,
         RANKED_EDGE_QUERIES,
         "nearest_hops",
         &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
@@ -2570,15 +2644,10 @@ query bm25_then_slug($q: String) {
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_search_db(&dir).await;
-    let result = query_main(
-        &mut db,
-        QUERY,
-        "bm25_then_slug",
-        &params(&[("$q", "Learning")]),
-    )
-    .await
-    .unwrap();
+    let db = init_search_db(&dir).await;
+    let result = query_main(&db, QUERY, "bm25_then_slug", &params(&[("$q", "Learning")]))
+        .await
+        .unwrap();
     assert_eq!(
         result_slugs(&result),
         vec!["rl-intro", "ml-intro", "dl-basics"],
@@ -2613,10 +2682,10 @@ query bm25_ranked($q: String) {
 "#;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
-    load_jsonl(&db, DATA, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::init(uri, SCHEMA).await.unwrap());
+    db.load_jsonl(DATA, LoadMode::Overwrite).await.unwrap();
     db.ensure_indices().await.unwrap();
-    let result = query_main(&mut db, QUERY, "bm25_ranked", &params(&[("$q", "tensor")]))
+    let result = query_main(&db, QUERY, "bm25_ranked", &params(&[("$q", "tensor")]))
         .await
         .unwrap();
     assert_eq!(
@@ -2630,9 +2699,9 @@ query bm25_ranked($q: String) {
 #[serial]
 async fn rrf_rank_preserves_every_bound_edge_row_once() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_ranked_edge_db(&dir).await;
+    let db = init_ranked_edge_db(&dir).await;
     let result = query_main(
-        &mut db,
+        &db,
         RANKED_EDGE_QUERIES,
         "rrf_edges",
         &two_vector_params("$q1", &[0.0, 0.0, 0.0, 0.0], "$q2", &[0.0, 0.0, 0.0, 0.0]),
@@ -2661,23 +2730,17 @@ async fn rrf_rank_preserves_every_bound_edge_row_once() {
 async fn bm25_join_fills_limit_when_capped_scan_underfills_issue_563() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, UNDERFILL_SCHEMA).await.unwrap();
-    load_jsonl(&db, &underfill_seed_data(), LoadMode::Overwrite)
+    let db = session(Omnigraph::init(uri, UNDERFILL_SCHEMA).await.unwrap());
+    db.load_jsonl(&underfill_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
-    let mut db = db;
+    let db = db;
 
     use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
     let probes = QueryIoProbes::default();
     let result = with_query_io_probes(probes.clone(), async {
-        query_main(
-            &mut db,
-            UNDERFILL_QUERY,
-            "recall",
-            &params(&[("$q", "needle")]),
-        )
-        .await
+        query_main(&db, UNDERFILL_QUERY, "recall", &params(&[("$q", "needle")])).await
     })
     .await
     .unwrap();
@@ -2718,18 +2781,18 @@ async fn bm25_join_fills_limit_when_capped_scan_underfills_issue_563() {
 async fn bm25_ordered_aggregate_counts_all_matches_not_the_capped_scan() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, UNDERFILL_SCHEMA).await.unwrap();
-    load_jsonl(&db, &underfill_seed_data(), LoadMode::Overwrite)
+    let db = session(Omnigraph::init(uri, UNDERFILL_SCHEMA).await.unwrap());
+    db.load_jsonl(&underfill_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
-    let mut db = db;
+    let db = db;
 
     use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
     let probes = QueryIoProbes::default();
     let result = with_query_io_probes(probes.clone(), async {
         query_main(
-            &mut db,
+            &db,
             UNDERFILL_AGG_QUERY,
             "recall_count",
             &params(&[("$q", "needle")]),
@@ -2778,32 +2841,29 @@ async fn bm25_ordered_aggregate_counts_all_matches_not_the_capped_scan() {
 async fn rrf_arms_scan_uncapped_in_one_pass() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, UNDERFILL_SCHEMA).await.unwrap();
-    load_jsonl(&db, &underfill_seed_data(), LoadMode::Overwrite)
+    let db = session(Omnigraph::init(uri, UNDERFILL_SCHEMA).await.unwrap());
+    db.load_jsonl(&underfill_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
-    let mut db = db;
 
-    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_rrf_plan};
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
     // This test pins the POSTFILTER plan's invariants (uncapped one-pass
     // corpus-wide arms). Force that plan: un-forced, the assertion couples
     // to the prefilter gate's threshold (4/20 eligible merely happens to
-    // exceed the default ratio), and a retune or ambient OMNIGRAPH_RRF_PLAN
-    // would flip it with a misleading cap-regression message.
+    // exceed the default ratio), and a retune or a different `rrf_plan`
+    // setting would flip it with a misleading cap-regression message.
+    let postfilter_db = with_setting(&db, "rrf_plan", "force_postfilter");
     let probes = QueryIoProbes::default();
-    let result = with_query_io_probes(
-        probes.clone(),
-        with_rrf_plan("force_postfilter", async {
-            query_main(
-                &mut db,
-                UNDERFILL_RRF_QUERY,
-                "recall_rrf",
-                &params(&[("$q", "needle")]),
-            )
-            .await
-        }),
-    )
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &postfilter_db,
+            UNDERFILL_RRF_QUERY,
+            "recall_rrf",
+            &params(&[("$q", "needle")]),
+        )
+        .await
+    })
     .await
     .unwrap();
 
@@ -2843,30 +2903,27 @@ async fn rrf_arms_scan_uncapped_in_one_pass() {
 async fn rrf_decoy_flood_does_not_flip_the_fused_winner() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, UNDERFILL_SCHEMA).await.unwrap();
-    load_jsonl(&db, &starvation_seed_data(), LoadMode::Overwrite)
+    let db = session(Omnigraph::init(uri, UNDERFILL_SCHEMA).await.unwrap());
+    db.load_jsonl(&starvation_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
-    let mut db = db;
 
-    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_rrf_plan};
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
     // Pins the POSTFILTER plan (see rrf_arms_scan_uncapped_in_one_pass for
     // why the plan is forced); the gate's decoy-flood acceptance under BOTH
     // plans lives in tests/rrf_prefilter_gate.rs.
+    let postfilter_db = with_setting(&db, "rrf_plan", "force_postfilter");
     let probes = QueryIoProbes::default();
-    let result = with_query_io_probes(
-        probes.clone(),
-        with_rrf_plan("force_postfilter", async {
-            query_main(
-                &mut db,
-                STARVATION_RRF_QUERY,
-                "recall_two_terms",
-                &params(&[("$q1", "alpha"), ("$q2", "beta")]),
-            )
-            .await
-        }),
-    )
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(
+            &postfilter_db,
+            STARVATION_RRF_QUERY,
+            "recall_two_terms",
+            &params(&[("$q1", "alpha"), ("$q2", "beta")]),
+        )
+        .await
+    })
     .await
     .unwrap();
 
@@ -2926,8 +2983,8 @@ query uncapped_all($q: String) {
 "#;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, UNDERFILL_SCHEMA).await.unwrap();
-    load_jsonl(&db, &underfill_seed_data(), LoadMode::Overwrite)
+    let db = session(Omnigraph::init(uri, UNDERFILL_SCHEMA).await.unwrap());
+    db.load_jsonl(&underfill_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
@@ -2943,19 +3000,14 @@ query uncapped_all($q: String) {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    load_jsonl(&db, &appended, LoadMode::Append).await.unwrap();
-    let mut db = db;
+    db.load_jsonl(&appended, LoadMode::Append).await.unwrap();
+    let db = db;
 
-    let capped = query_main(
-        &mut db,
-        PREFIX_QUERIES,
-        "capped",
-        &params(&[("$q", "needle")]),
-    )
-    .await
-    .unwrap();
+    let capped = query_main(&db, PREFIX_QUERIES, "capped", &params(&[("$q", "needle")]))
+        .await
+        .unwrap();
     let uncapped = query_main(
-        &mut db,
+        &db,
         PREFIX_QUERIES,
         "uncapped_all",
         &params(&[("$q", "needle")]),
@@ -3000,9 +3052,9 @@ query uncapped_all($q: String) {
 #[serial]
 async fn fuzzy_does_not_match_under_default_tokenizer() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_search_db(&dir).await;
+    let db = init_search_db(&dir).await;
     let r = query_main(
-        &mut db,
+        &db,
         SEARCH_QUERIES,
         "fuzzy_search",
         &params(&[("$q", "Introductio")]),
@@ -3020,10 +3072,10 @@ async fn fuzzy_does_not_match_under_default_tokenizer() {
 #[serial]
 async fn match_text_matches_exact_set_excludes_unrelated() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_search_db(&dir).await;
+    let db = init_search_db(&dir).await;
     // "neural" appears only in dl-basics's body ("neural networks").
     let r = query_main(
-        &mut db,
+        &db,
         SEARCH_QUERIES,
         "phrase_search",
         &params(&[("$q", "neural")]),
@@ -3045,9 +3097,9 @@ async fn match_text_matches_exact_set_excludes_unrelated() {
 #[serial]
 async fn rrf_fuses_two_fts_fields() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_search_db(&dir).await;
+    let db = init_search_db(&dir).await;
     let r = query_main(
-        &mut db,
+        &db,
         SEARCH_QUERIES,
         "rrf_two_fts",
         &params(&[("$q", "learning")]),
@@ -3063,9 +3115,9 @@ async fn rrf_fuses_two_fts_fields() {
 #[serial]
 async fn rrf_fuses_two_vector_queries() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_search_db(&dir).await;
+    let db = init_search_db(&dir).await;
     let r = query_main(
-        &mut db,
+        &db,
         SEARCH_QUERIES,
         "rrf_two_vectors",
         &two_vector_params("$q1", &[0.1, 0.2, 0.3, 0.4], "$q2", &[0.5, 0.6, 0.7, 0.8]),
@@ -3079,7 +3131,7 @@ async fn rrf_fuses_two_vector_queries() {
 #[serial]
 async fn mutation_with_deferred_index_coverage_remains_searchable() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_search_db(&dir).await;
+    let db = init_search_db(&dir).await;
     assert_eq!(doc_user_index_count(&db).await, 4);
 
     let mut mutation_params = vector_param("$embedding", &[0.9, 0.1, 0.1, 0.1]);
@@ -3107,7 +3159,7 @@ async fn mutation_with_deferred_index_coverage_remains_searchable() {
     );
 
     let result = query_main(
-        &mut db,
+        &db,
         SEARCH_QUERIES,
         "text_search",
         &params(&[("$q", "Quasar")]),
@@ -3124,14 +3176,9 @@ async fn mutation_with_deferred_index_coverage_remains_searchable() {
     // searchable after data compaction and unrelated index maintenance.
     db.optimize().await.unwrap();
     for (term, slug) in [("Quasar", "quasar-notes"), ("Learning", "ml-intro")] {
-        let result = query_main(
-            &mut db,
-            SEARCH_QUERIES,
-            "text_search",
-            &params(&[("$q", term)]),
-        )
-        .await
-        .unwrap();
+        let result = query_main(&db, SEARCH_QUERIES, "text_search", &params(&[("$q", term)]))
+            .await
+            .unwrap();
         assert!(result_slugs(&result).contains(&slug.to_string()));
     }
 }
@@ -3174,10 +3221,10 @@ async fn uncertified_full_text_refuses_all_search_routes_but_not_ordinary_reads(
         std::fs::remove_file(&path).unwrap();
         // A fresh session must observe this deliberate out-of-band removal;
         // immutable proofs already verified by a session may remain cached.
-        db = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+        db = session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
         assert!(
             query_main(
-                &mut db,
+                &db,
                 SEARCH_QUERIES,
                 healthy_query,
                 &params(&[("$q", "Learning")])
@@ -3188,7 +3235,7 @@ async fn uncertified_full_text_refuses_all_search_routes_but_not_ordinary_reads(
                 > 0
         );
         let error = query_main(
-            &mut db,
+            &db,
             SEARCH_QUERIES,
             "rrf_two_fts",
             &params(&[("$q", "Learning")]),
@@ -3202,7 +3249,7 @@ async fn uncertified_full_text_refuses_all_search_routes_but_not_ordinary_reads(
         std::fs::write(path, certificate).unwrap();
         assert!(
             query_main(
-                &mut db,
+                &db,
                 SEARCH_QUERIES,
                 "rrf_two_fts",
                 &params(&[("$q", "Learning")])
@@ -3232,7 +3279,7 @@ async fn uncertified_full_text_refuses_all_search_routes_but_not_ordinary_reads(
         )
         .unwrap();
     }
-    db = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+    db = session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
     let original_rows = dataset.count_rows(None).await.unwrap();
     assert!(original_rows > 0);
     for query in [
@@ -3242,21 +3289,16 @@ async fn uncertified_full_text_refuses_all_search_routes_but_not_ordinary_reads(
         "bm25_search",
         "rrf_two_fts",
     ] {
-        let error = query_main(
-            &mut db,
-            SEARCH_QUERIES,
-            query,
-            &params(&[("$q", "Learning")]),
-        )
-        .await
-        .unwrap_err();
+        let error = query_main(&db, SEARCH_QUERIES, query, &params(&[("$q", "Learning")]))
+            .await
+            .unwrap_err();
         assert!(
             matches!(error, OmniError::FullTextIndexRebuildRequired { .. }),
             "{query}: {error}"
         );
     }
     let error = query_main(
-        &mut db,
+        &db,
         SEARCH_QUERIES,
         "hybrid_search",
         &vector_and_string_params("$vq", &[0.1, 0.2, 0.3, 0.4], "$tq", "Learning"),
@@ -3269,7 +3311,7 @@ async fn uncertified_full_text_refuses_all_search_routes_but_not_ordinary_reads(
     );
     assert!(
         query_main(
-            &mut db,
+            &db,
             SEARCH_QUERIES,
             "vector_search",
             &vector_param("$q", &[0.1, 0.2, 0.3, 0.4])
@@ -3297,7 +3339,7 @@ async fn uncertified_full_text_refuses_all_search_routes_but_not_ordinary_reads(
     assert!(!rebuilt.rebuilt_indexes.is_empty());
     assert!(
         query_main(
-            &mut db,
+            &db,
             SEARCH_QUERIES,
             "text_search",
             &params(&[("$q", "Learning")])
@@ -3333,12 +3375,12 @@ async fn plain_nearest_skips_the_full_text_validation() {
     use std::sync::atomic::Ordering;
 
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_search_db(&dir).await;
+    let db = init_search_db(&dir).await;
 
     let probes = QueryIoProbes::default();
     let nearest = with_query_io_probes(probes.clone(), async {
         query_main(
-            &mut db,
+            &db,
             SEARCH_QUERIES,
             "vector_search",
             &vector_param("$q", &[0.1, 0.2, 0.3, 0.4]),
@@ -3357,7 +3399,7 @@ async fn plain_nearest_skips_the_full_text_validation() {
     let probes = QueryIoProbes::default();
     let text = with_query_io_probes(probes.clone(), async {
         query_main(
-            &mut db,
+            &db,
             SEARCH_QUERIES,
             "text_search",
             &params(&[("$q", "Learning")]),
@@ -3379,10 +3421,10 @@ async fn plain_nearest_skips_the_full_text_validation() {
 #[serial]
 async fn rrf_fuses_vector_and_text() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_search_db(&dir).await;
+    let db = init_search_db(&dir).await;
 
     let result = query_main(
-        &mut db,
+        &db,
         SEARCH_QUERIES,
         "hybrid_search",
         &vector_and_string_params("$vq", &[0.1, 0.2, 0.3, 0.4], "$tq", "Learning"),
@@ -3408,8 +3450,8 @@ node Doc {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::init(uri, schema).await.unwrap());
+    db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
     assert_eq!(
         doc_user_index_count(&db).await,
         0,
@@ -3502,8 +3544,8 @@ query nearest_whole($q: Vector(4)) {
 "#;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&db, &seed, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::init(uri, schema).await.unwrap());
+    db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
     db.ensure_indices().await.unwrap();
 
     fn sorted(columns: &Option<Vec<String>>) -> Option<Vec<String>> {
@@ -3520,7 +3562,7 @@ query nearest_whole($q: Vector(4)) {
     let probes = QueryIoProbes::default();
     let result = with_query_io_probes(probes.clone(), async {
         query_main(
-            &mut db,
+            &db,
             queries,
             "nearest_slug",
             &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
@@ -3548,7 +3590,7 @@ query nearest_whole($q: Vector(4)) {
 
     let probes = QueryIoProbes::default();
     let result = with_query_io_probes(probes.clone(), async {
-        query_main(&mut db, queries, "bm25_slug", &params(&[("$q", "alpha")])).await
+        query_main(&db, queries, "bm25_slug", &params(&[("$q", "alpha")])).await
     })
     .await
     .unwrap();
@@ -3575,7 +3617,7 @@ query nearest_whole($q: Vector(4)) {
     let probes = QueryIoProbes::default();
     let result = with_query_io_probes(probes.clone(), async {
         query_main(
-            &mut db,
+            &db,
             queries,
             "nearest_whole",
             &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),

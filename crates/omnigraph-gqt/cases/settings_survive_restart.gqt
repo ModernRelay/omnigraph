@@ -1,0 +1,43 @@
+# issue: none
+# notes: Restart preserves the selected setting and its file source.
+# notes: Reset still restores the original baseline (verify in debug builds).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+
+--- mutate
+set merge_lineage = off;
+
+--- expect ok
+
+--- restart
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "off", "default": "on", "source": "file", "scope": "request"}
+
+--- mutate
+reset all;
+
+--- expect ok
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}

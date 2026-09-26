@@ -1,0 +1,79 @@
+# issue: none
+# notes: Two conjuncts that each read both bindings stay residual and live in
+# notes: one Filter node reading the union of their columns, whether written
+# notes: as two match clauses or joined with `and` in one clause. Neither scan
+# notes: takes a pushed filter.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    age: I64
+    score: I64
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a","age":40,"score":10}}
+{"type":"Person","data":{"slug":"b","age":20,"score":30}}
+{"type":"Person","data":{"slug":"c","age":35,"score":5}}
+{"type":"Person","data":{"slug":"d","age":50,"score":50}}
+
+--- query
+set engine = v2;
+query two_clauses() {
+    match {
+        $p: Person
+        $q: Person
+        $p.age > $q.age
+        $p.score > $q.score
+    }
+    return { $p.slug, $q.slug }
+}
+
+--- expect unordered
+{"p.slug": "a", "q.slug": "c"}
+{"p.slug": "d", "q.slug": "a"}
+{"p.slug": "d", "q.slug": "b"}
+{"p.slug": "d", "q.slug": "c"}
+
+--- expect shape
+p.slug: String
+q.slug: String
+
+--- expect plan
+filter reads [p.age, p.score, q.age, q.score]
+scan Person as $p: no filter
+scan Person as $q: no filter
+not pass predicate_pushdown
+
+--- query
+set engine = v2;
+query joined_with_and() {
+    match {
+        $p: Person
+        $q: Person
+        $p.age > $q.age and $p.score > $q.score
+    }
+    return { $p.slug, $q.slug }
+}
+
+--- expect unordered
+{"p.slug": "a", "q.slug": "c"}
+{"p.slug": "d", "q.slug": "a"}
+{"p.slug": "d", "q.slug": "b"}
+{"p.slug": "d", "q.slug": "c"}
+
+--- expect shape
+p.slug: String
+q.slug: String
+
+--- expect plan
+filter reads [p.age, p.score, q.age, q.score]
+scan Person as $p: no filter
+scan Person as $q: no filter
+not pass predicate_pushdown

@@ -104,11 +104,11 @@ query all_replacement_persons() {
 #[tokio::test]
 async fn run_query_at_returns_historical_data() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let v_before = version_main(&db).await.unwrap();
 
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
@@ -120,7 +120,7 @@ async fn run_query_at_returns_historical_data() {
         .run_query_at(v_before, ALL_PERSONS_QUERY, "all_persons", &ParamMap::new())
         .await
         .unwrap();
-    let current = query_main(&mut db, ALL_PERSONS_QUERY, "all_persons", &ParamMap::new())
+    let current = query_main(&db, ALL_PERSONS_QUERY, "all_persons", &ParamMap::new())
         .await
         .unwrap();
 
@@ -138,12 +138,14 @@ async fn run_query_at_returns_historical_data() {
 async fn historical_query_resolves_rename_by_identity_but_rejects_reincarnation() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(
-        uri,
-        "node Person { name: String @key }\nnode Anchor { name: String @key }\n",
-    )
-    .await
-    .unwrap();
+    let db = session(
+        Omnigraph::init(
+            uri,
+            "node Person { name: String @key }\nnode Anchor { name: String @key }\n",
+        )
+        .await
+        .unwrap(),
+    );
     db.load(
         "main",
         r#"{"type":"Person","data":{"name":"Alice"}}"#,
@@ -214,11 +216,11 @@ async fn historical_query_resolves_rename_by_identity_but_rejects_reincarnation(
 #[tokio::test]
 async fn run_query_at_traversal_uses_historical_graph_index() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let v_before = version_main(&db).await.unwrap();
 
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
@@ -226,7 +228,7 @@ async fn run_query_at_traversal_uses_historical_graph_index() {
     .await
     .unwrap();
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "add_friend",
         &params(&[("$from", "Eve"), ("$to", "Alice")]),
@@ -244,7 +246,7 @@ async fn run_query_at_traversal_uses_historical_graph_index() {
         .await
         .unwrap();
     let current = query_main(
-        &mut db,
+        &db,
         FRIENDS_QUERY,
         "friends_of",
         &params(&[("$name", "Eve")]),
@@ -274,11 +276,11 @@ async fn snapshot_at_graph_manifest_version_fails_for_nonexistent_version() {
 #[tokio::test]
 async fn run_query_at_multiple_versions_sees_correct_state() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let v1 = version_main(&db).await.unwrap();
 
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
@@ -288,7 +290,7 @@ async fn run_query_at_multiple_versions_sees_correct_state() {
     let v2 = version_main(&db).await.unwrap();
 
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Frank")], &[("$age", 40)]),
@@ -312,7 +314,7 @@ async fn run_query_at_multiple_versions_sees_correct_state() {
     let v2_names = collect_column_strings(at_v2.batches(), "p.name");
     assert!(!v2_names.contains(&"Frank".to_string()));
 
-    let current = query_main(&mut db, ALL_PERSONS_QUERY, "all_persons", &ParamMap::new())
+    let current = query_main(&db, ALL_PERSONS_QUERY, "all_persons", &ParamMap::new())
         .await
         .unwrap();
     assert_eq!(current.num_rows(), 5, "current should have 5 persons");
@@ -325,12 +327,12 @@ async fn run_query_at_multiple_versions_sees_correct_state() {
 #[tokio::test]
 async fn tabular_delete_node_invisible_at_historical_version() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     // Fixture: Alice, Bob, Charlie, Diana
     let v_before = version_main(&db).await.unwrap();
 
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "remove_person",
         &params(&[("$name", "Charlie")]),
@@ -348,7 +350,7 @@ async fn tabular_delete_node_invisible_at_historical_version() {
     assert!(hist_names.contains(&"Charlie".to_string()));
 
     // Current: Charlie is gone
-    let current = query_main(&mut db, ALL_PERSONS_QUERY, "all_persons", &ParamMap::new())
+    let current = query_main(&db, ALL_PERSONS_QUERY, "all_persons", &ParamMap::new())
         .await
         .unwrap();
     let cur_names = collect_column_strings(current.batches(), "p.name");
@@ -361,13 +363,13 @@ async fn tabular_delete_node_invisible_at_historical_version() {
 #[tokio::test]
 async fn traversal_delete_edge_invisible_at_historical_version() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     // Fixture: Alice knows Bob, Alice knows Charlie
     let v_before = version_main(&db).await.unwrap();
 
     // Remove all Knows edges FROM Alice
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "remove_friendship",
         &params(&[("$from", "Alice")]),
@@ -392,7 +394,7 @@ async fn traversal_delete_edge_invisible_at_historical_version() {
 
     // Current: Alice has no friends (edges deleted)
     let current = query_main(
-        &mut db,
+        &db,
         FRIENDS_QUERY,
         "friends_of",
         &params(&[("$name", "Alice")]),
@@ -411,14 +413,14 @@ async fn traversal_delete_edge_invisible_at_historical_version() {
 #[tokio::test]
 async fn negation_insert_shrinks_antijoin_result() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     // Fixture: Alice worksAt Acme, Bob worksAt Globex
     // Unemployed: Charlie, Diana
     let v_before = version_main(&db).await.unwrap();
 
     // Give Charlie a job
     mutate_main(
-        &mut db,
+        &db,
         r#"
 query hire($from: String, $to: String) {
     insert WorksAt { from: $from, to: $to }
@@ -441,7 +443,7 @@ query hire($from: String, $to: String) {
     assert!(hist_names.contains(&"Diana".to_string()));
 
     // Current: only Diana is unemployed
-    let current = query_main(&mut db, UNEMPLOYED_QUERY, "unemployed", &ParamMap::new())
+    let current = query_main(&db, UNEMPLOYED_QUERY, "unemployed", &ParamMap::new())
         .await
         .unwrap();
     let cur_names = collect_column_strings(current.batches(), "p.name");
@@ -455,14 +457,14 @@ query hire($from: String, $to: String) {
 #[tokio::test]
 async fn negation_delete_edge_grows_antijoin_result() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     // Fixture: Alice worksAt Acme, Bob worksAt Globex
     // Unemployed at start: Charlie, Diana
     let v_before = version_main(&db).await.unwrap();
 
     // Fire Alice (delete WorksAt edge)
     mutate_main(
-        &mut db,
+        &db,
         r#"
 query fire($from: String) {
     delete WorksAt where from = $from
@@ -484,7 +486,7 @@ query fire($from: String) {
     assert!(!hist_names.contains(&"Alice".to_string()));
 
     // Current: 3 unemployed (Alice, Charlie, Diana)
-    let current = query_main(&mut db, UNEMPLOYED_QUERY, "unemployed", &ParamMap::new())
+    let current = query_main(&db, UNEMPLOYED_QUERY, "unemployed", &ParamMap::new())
         .await
         .unwrap();
     assert_eq!(current.num_rows(), 3);
@@ -497,14 +499,14 @@ query fire($from: String) {
 #[tokio::test]
 async fn filtered_update_entity_crosses_filter_boundary() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     // Fixture: Alice(30), Bob(25), Charlie(35), Diana(28)
     // older_than(30): Charlie(35) only
     let v_before = version_main(&db).await.unwrap();
 
     // Update Bob's age from 25 to 40 → enters the filter
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Bob")], &[("$age", 40)]),
@@ -528,7 +530,7 @@ async fn filtered_update_entity_crosses_filter_boundary() {
 
     // Current: Bob(40) and Charlie(35) are older than 30
     let current = query_main(
-        &mut db,
+        &db,
         FILTERED_QUERY,
         "older_than",
         &int_params(&[("$min_age", 30)]),
@@ -546,7 +548,7 @@ async fn filtered_update_entity_crosses_filter_boundary() {
 #[tokio::test]
 async fn multi_hop_traversal_historical_version() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     // Fixture: Alice→Bob, Alice→Charlie, Bob→Diana
     // friends_of_friends(Alice) = Diana (Alice→Bob→Diana)
     let v_before = version_main(&db).await.unwrap();
@@ -554,7 +556,7 @@ async fn multi_hop_traversal_historical_version() {
     // Insert Eve and edge: Charlie→Eve
     // Now friends_of_friends(Alice) = Diana + Eve (Alice→Charlie→Eve)
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
@@ -562,7 +564,7 @@ async fn multi_hop_traversal_historical_version() {
     .await
     .unwrap();
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "add_friend",
         &params(&[("$from", "Charlie"), ("$to", "Eve")]),
@@ -592,7 +594,7 @@ query fof($name: String) {
     assert_eq!(hist_names, vec!["Diana"]);
 
     // Current: friends-of-friends of Alice = Diana + Eve
-    let current = query_main(&mut db, fof_query, "fof", &params(&[("$name", "Alice")]))
+    let current = query_main(&db, fof_query, "fof", &params(&[("$name", "Alice")]))
         .await
         .unwrap();
     assert_eq!(current.num_rows(), 2);
@@ -606,13 +608,13 @@ query fof($name: String) {
 #[tokio::test]
 async fn traversal_delete_node_cascade_removes_edges() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     // Fixture: Alice knows Bob, Alice knows Charlie, Bob knows Diana
     let v_before = version_main(&db).await.unwrap();
 
     // Delete Bob → cascades to Knows edges involving Bob
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "remove_person",
         &params(&[("$name", "Bob")]),
@@ -637,7 +639,7 @@ async fn traversal_delete_node_cascade_removes_edges() {
 
     // Current: Alice's friends = Charlie only (Bob was deleted, edge cascaded)
     let current = query_main(
-        &mut db,
+        &db,
         FRIENDS_QUERY,
         "friends_of",
         &params(&[("$name", "Alice")]),
@@ -655,14 +657,14 @@ async fn traversal_delete_node_cascade_removes_edges() {
 async fn branch_point_in_time_isolated_from_main() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
 
     main.branch_create("feature").await.unwrap();
     let v_main_before = version_main(&main).await.unwrap();
 
     // Insert Eve on main
     mutate_main(
-        &mut main,
+        &main,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
@@ -671,9 +673,9 @@ async fn branch_point_in_time_isolated_from_main() {
     .unwrap();
 
     // Insert Frank on feature branch
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -698,14 +700,9 @@ async fn branch_point_in_time_isolated_from_main() {
     assert!(!hist_names.contains(&"Frank".to_string()));
 
     // Current main: 5 persons (Eve present, Frank not visible on main)
-    let cur_main = query_main(
-        &mut main,
-        ALL_PERSONS_QUERY,
-        "all_persons",
-        &ParamMap::new(),
-    )
-    .await
-    .unwrap();
+    let cur_main = query_main(&main, ALL_PERSONS_QUERY, "all_persons", &ParamMap::new())
+        .await
+        .unwrap();
     assert_eq!(cur_main.num_rows(), 5);
     let cur_names = collect_column_strings(cur_main.batches(), "p.name");
     assert!(cur_names.contains(&"Eve".to_string()));
@@ -713,7 +710,7 @@ async fn branch_point_in_time_isolated_from_main() {
 
     // Feature branch: 5 persons (Frank present, Eve not visible on feature)
     let cur_feature = query_branch(
-        &mut feature,
+        &feature,
         "feature",
         ALL_PERSONS_QUERY,
         "all_persons",
@@ -732,14 +729,14 @@ async fn branch_point_in_time_isolated_from_main() {
 #[tokio::test]
 async fn four_version_chain_insert_update_delete() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // v1: baseline (Alice=30, Bob=25, Charlie=35, Diana=28)
     let v1 = version_main(&db).await.unwrap();
 
     // v2: insert Eve(22)
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
@@ -750,7 +747,7 @@ async fn four_version_chain_insert_update_delete() {
 
     // v3: update Eve's age to 50
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Eve")], &[("$age", 50)]),
@@ -761,7 +758,7 @@ async fn four_version_chain_insert_update_delete() {
 
     // v4: delete Eve
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "remove_person",
         &params(&[("$name", "Eve")]),
@@ -819,7 +816,7 @@ async fn four_version_chain_insert_update_delete() {
     assert_eq!(v3_ages.value(0), 50);
 
     // v4 (current): Eve is gone, back to 4
-    let current = query_main(&mut db, ALL_PERSONS_QUERY, "all_persons", &ParamMap::new())
+    let current = query_main(&db, ALL_PERSONS_QUERY, "all_persons", &ParamMap::new())
         .await
         .unwrap();
     assert_eq!(current.num_rows(), 4);
@@ -835,13 +832,10 @@ async fn four_version_chain_insert_update_delete() {
 /// caller would have to parse.
 #[tokio::test]
 async fn historical_read_of_reclaimed_version_is_typed() {
-    use lance::Dataset;
-    use lance::dataset::cleanup::{CleanupPolicy, cleanup_old_versions};
-    use omnigraph::db::ReadTarget;
     use omnigraph::error::OmniError;
 
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let v1 = version_main(&db).await.unwrap();
 
     // Sanity: the historical entity read works while the version is retained.
@@ -850,7 +844,7 @@ async fn historical_read_of_reclaimed_version_is_typed() {
 
     // Advance the Person table so v1's pin becomes an old Lance version…
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
@@ -858,28 +852,14 @@ async fn historical_read_of_reclaimed_version_is_typed() {
     .await
     .unwrap();
 
-    // …then reclaim every pre-current Person version directly.
-    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let person_path = &snapshot.dataset("node:Person").unwrap().dataset_path;
-    let person_uri = format!(
-        "{}/{}",
-        db.uri().trim_end_matches('/'),
-        person_path.trim_start_matches('/')
-    );
-    let person = Dataset::open(&person_uri).await.unwrap();
-    let removed = cleanup_old_versions(
-        &person,
-        CleanupPolicy {
-            before_version: Some(person.version().version),
-            delete_unverified: true,
-            error_if_tagged_old_versions: false,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
+    let stats = db.cleanup(helpers::collector::keep_one()).await.unwrap();
+    let person = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .expect("Person cleanup row");
+    assert!(person.error.is_none(), "{person:?}");
     assert!(
-        removed.old_versions > 0,
+        person.old_versions_removed > 0,
         "precondition: history was reclaimed"
     );
 

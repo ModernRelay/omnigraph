@@ -29,15 +29,17 @@ Tools that support `@` imports include these automatically:
 
 ## Repository snapshot
 
-- Version surveyed: 0.10.0
+- Version surveyed: 0.11.0
 - Rust stable, edition 2024; toolchain pinned in `rust-toolchain.toml`
 - Storage substrate: Lance 11.0.0
-- Workspace: compiler, storage, engine (`omnigraph-engine` package), policy,
-  API types, cluster, CLI, server, Azure admission wrapper, benchmark harness,
+- Workspace: compiler, planner (logical/physical plans and optimizer), storage, `omnigraph-seams` (the one seam type every
+  test-time substitution uses; RFC 0066), engine (`omnigraph-engine`
+  package), policy, API types, cluster, CLI, server, Azure admission
+  wrapper, benchmark harness,
   `omnigraph-gqt` (the `.gqt` logic-test corpus and its runner; one libtest
   test per case), and `omnigraph-dst` (deterministic simulation testing; needs
-  `--cfg tokio_unstable`, set by its crate-local `.cargo/config.toml` when
-  cargo runs from the crate dir — compiles empty without it)
+  `--cfg tokio_unstable`, set by the workspace `.cargo/config.toml` for every
+  build — the workspace test gate excludes the crate by name)
 - License: MIT
 
 OmniGraph is a typed property-graph engine coordinating many versioned Lance
@@ -84,6 +86,9 @@ The decision lens is ongoing liability: ask what a design looks like after five
 more changes of the same kind. Prefer one source of truth with cheap derived
 views. Correctness outranks simplicity, which outranks performance. Demand more
 evidence for irreversible format, protocol, and substrate decisions.
+Always validate your assumptions and don't assume a certain function/modules/symbol will work in a certain way. Especially always validate your assumptions about Lance internals by reading the implementations in the upstream code.
+Reason from first principles about OmniGraph instead of in arbitrary database categories.
+Fundamentally, a database is **an observable contract, implemented by physical mechanisms optimized for an expected distribution of work**. Therefore, you should always be explicit and aware what observable contract and distribution of work you are implementing for and what tradeoffs you are making. Read [first principles data systems](docs/dev/systems.md)
 
 The full rules live in [invariants](docs/dev/invariants.md). Keep these in
 working memory:
@@ -93,8 +98,9 @@ working memory:
 2. A query or write attempt uses one coherent accepted snapshot. A retry starts
    fresh rather than mixing old and new authority.
 3. A mutation, load, schema apply, merge, or maintenance batch publishes once.
-4. Independently durable pre-publication effects require enough recovery
-   identity and authority to converge safely; ambiguity fails closed.
+4. Pre-publication durable effects stay unreachable (detached commits, staged
+   files); what is published carries the identity that finishes it (pins,
+   the staged contract's publishing commit); ambiguity fails closed.
 5. Stable schema identity survives supported renames, not drop/re-add. Never
    infer identity from names, paths, versions, field IDs, or branch refs.
 6. Indexes, caches, topology, fragment layout, and compaction are derived
@@ -106,10 +112,7 @@ working memory:
    Never acknowledge before durable graph visibility or return silent partial
    results.
 
-Do not add a custom WAL/transaction manager, a queue for manifest-derived work,
-inline vector/FTS rebuilds, raw public Lance writers, string-built query
-semantics, process-local locks advertised as distributed fencing, cloud-only
-correctness paths, or a shadow source of truth without an accepted RFC that
+Do not add a queue for manifest-derived work, inline vector/FTS rebuilds, raw public Lance writers, string-built query semantics, process-local locks advertised as distributed fencing, cloud-only correctness paths, or a shadow source of truth without an accepted RFC that
 changes the invariant.
 
 ## Build and test
@@ -121,7 +124,7 @@ its Cargo package is `omnigraph-engine`.
 cargo build --workspace --locked
 
 # Canonical CI test graph
-cargo test --workspace --exclude omnigraph-gqt --locked \
+cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 
@@ -137,14 +140,23 @@ cargo clippy --workspace --all-targets --locked -- \
 bash scripts/check-agents-md.sh
 python3 scripts/check-docs.py
 python3 scripts/check-workflow-action-pins.py
+python3 scripts/check-dependency-sources.py   # no path copy, [patch] table, or source replacement
+cargo deny --locked check               # from the repository root, after Cargo.lock is current; allowlist in deny.toml
+python3 scripts/check-merge-group-triggers.py --self-test   # after a workflow or branch-protection.json edit
+python3 scripts/check-ci-cells.py --self-test   # after deleting or renaming a test a workflow requires by name
 typos                                   # from the repository root; version pinned in ci.yml; exemptions in .typos.toml
 ```
 
-The separate `GQ Logic Tests` context owns the complete GQT corpus. From
-`crates/omnigraph-gqt`, also run `cargo test -p omnigraph-gqt --locked` and
-`cargo clippy -p omnigraph-gqt --all-targets --locked -- -D warnings -W clippy::dbg_macro`.
-Its crate-local Cargo configuration enables DST; an unconfigured build must
-refuse requested DST execution, not skip those cases.
+The separate `GQ Logic Tests` context owns the complete GQT corpus. Also run
+`cargo test -p omnigraph-gqt --locked` and
+`cargo clippy -p omnigraph-gqt --all-targets --locked -- -D warnings -W clippy::dbg_macro`
+from any directory inside the checkout: the workspace `.cargo/config.toml`
+enables DST by default there. `CARGO_ENCODED_RUSTFLAGS`, `RUSTFLAGS` (empty
+included) or a `target.*.rustflags` config entry replaces that list, and a
+cargo run outside the checkout (`--manifest-path`) never reads it; such a
+build must refuse requested DST execution, not skip those cases. The DST suite itself runs from
+`crates/omnigraph-dst` (`cargo test`): its `[env]`-only Cargo configuration
+supplies the pool trio the suite asserts at process start.
 
 S3 suites require `OMNIGRAPH_S3_TEST_BUCKET` and the documented `AWS_*`
 environment. Azure suites require `OMNIGRAPH_AZURE_TEST_CONTAINER` and the
@@ -174,6 +186,12 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   (`instrument:`, `hunt:`, `heavy-repro:`, or the environment it needs);
   expensive regression repros use `heavy-repro:` and thereby enroll in the
   nightly job.
+- Engine v1 is frozen: `crates/omnigraph/src/exec/query.rs`,
+  `exec/projection.rs`, `tests/traversal.rs` and `tests/search.rs` are
+  upstream's bytes, pinned by `crates/omnigraph/tests/v1_frozen.rs`. A defect
+  seen on v1 is fixed on v2 (`crates/omnigraph/src/engine/`), which the
+  session setting `engine = v2` selects; a v1 edit needs the pin updated in
+  the same PR and a reviewer's eyes.
 - Update user-visible docs in the same change as a flag, endpoint, format,
   schema construct, behavior, or limit.
 - Update current developer guides when architecture or support boundaries

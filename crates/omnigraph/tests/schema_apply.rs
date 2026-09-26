@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestErrorKind, OmniError};
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph::{BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
 
@@ -147,7 +147,7 @@ async fn long_lived_handle_uses_the_schema_catalog_bound_to_its_write_token() {
     let schema_owner = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     // Open before the migration: this handle's process-local ArcSwap catalog is
     // intentionally stale after `schema_owner` completes the apply.
-    let stale_handle = Omnigraph::open(uri).await.unwrap();
+    let stale_handle = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     let desired = format!(
         "{}\nnode Project {{\n    name: String @key\n}}\n",
@@ -228,27 +228,35 @@ query insert_project($name: String) {
         )
         .await
         .expect("source write must use the token-bound post-apply catalog");
-    let project_before_indices = stale_handle
-        .snapshot_of(ReadTarget::branch("source"))
-        .await
-        .unwrap()
-        .dataset("node:Project")
-        .unwrap()
-        .published_dataset_version;
+    let project_uri = helpers::collector::table_uri(&stale_handle, "Project").await;
+    let project_published = |snapshot: omnigraph::db::Snapshot| {
+        snapshot
+            .dataset("node:Project")
+            .unwrap()
+            .published_dataset_version
+    };
+    let project_before_indices = project_published(
+        stale_handle
+            .snapshot_of(ReadTarget::branch("source"))
+            .await
+            .unwrap(),
+    );
+    let detached_before_indices = helpers::collector::detached_versions(&project_uri).await;
     stale_handle
         .ensure_indices_on("source")
         .await
         .expect("index planning must use the same token-bound post-apply catalog");
-    let project_after_indices = stale_handle
-        .snapshot_of(ReadTarget::branch("source"))
-        .await
-        .unwrap()
-        .dataset("node:Project")
-        .unwrap()
-        .published_dataset_version;
+    let project_after_indices = project_published(
+        stale_handle
+            .snapshot_of(ReadTarget::branch("source"))
+            .await
+            .unwrap(),
+    );
+    let detached_after_indices = helpers::collector::detached_versions(&project_uri).await;
     assert!(
-        project_after_indices > project_before_indices,
-        "the stale handle must discover and build Project's declared key index"
+        project_after_indices > project_before_indices
+            || detached_after_indices != detached_before_indices,
+        "the stale handle must discover and build Project's declared key index, publishing a higher pin and a new detached commit on the inherited location: {project_before_indices} -> {project_after_indices}, {detached_before_indices:?} -> {detached_after_indices:?}"
     );
     assert_eq!(
         stale_handle
@@ -271,11 +279,11 @@ query insert_project($name: String) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn stale_handle_branch_delete_gates_tables_added_by_schema_apply() {
-    use omnigraph::failpoints::names;
+    use omnigraph::seams::catalog;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let schema_owner = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let schema_owner = helpers::session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
     let stale_control = Arc::new(Omnigraph::open(uri).await.unwrap());
     let desired = format!("{TEST_SCHEMA}\nnode Project {{\n    name: String @key\n}}\n");
     schema_owner.apply_schema(&desired).await.unwrap();
@@ -291,7 +299,7 @@ async fn stale_handle_branch_delete_gates_tables_added_by_schema_apply() {
     let index_reconciler = Arc::new(Omnigraph::open(uri).await.unwrap());
 
     let delete_rv =
-        helpers::failpoint::Rendezvous::park_first(names::BRANCH_DELETE_POST_TABLE_GATES);
+        helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_DELETE_POST_TABLE_GATES);
     let delete_handle = Arc::clone(&stale_control);
     let delete_task = tokio::spawn(async move { delete_handle.branch_delete("target").await });
     delete_rv.wait_until_reached().await;
@@ -324,7 +332,7 @@ async fn stale_handle_branch_delete_gates_tables_added_by_schema_apply() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn mutation_waits_for_mid_apply_schema_gate_then_reprepares() {
-    use omnigraph::failpoints::names;
+    use omnigraph::seams::catalog;
 
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(init_and_load(&dir).await);
@@ -337,7 +345,7 @@ async fn mutation_waits_for_mid_apply_schema_gate_then_reprepares() {
     // the schema→branch→table effect gates. This fixes the otherwise tiny race
     // window deterministically.
     let mutation_rv =
-        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
     let mutation_db = Arc::clone(&db);
     let mutation_task = tokio::spawn(async move {
         mutation_db
@@ -355,7 +363,7 @@ async fn mutation_waits_for_mid_apply_schema_gate_then_reprepares() {
     // rewrite) exist but before manifest/schema promotion. The outer apply owns
     // the schema-control gate throughout this window.
     let schema_rv =
-        helpers::failpoint::Rendezvous::park_first(names::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE);
     let schema_db = Arc::clone(&db);
     let schema_task = tokio::spawn(async move { schema_db.apply_schema(&desired).await });
     schema_rv.wait_until_reached().await;
@@ -393,7 +401,7 @@ async fn mutation_waits_for_mid_apply_schema_gate_then_reprepares() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn read_only_open_holds_schema_gate_through_catalog_capture() {
-    use omnigraph::failpoints::names;
+    use omnigraph::seams::catalog;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
@@ -404,13 +412,13 @@ async fn read_only_open_holds_schema_gate_through_catalog_capture() {
     );
 
     let open_rv =
-        helpers::failpoint::Rendezvous::park_first(names::OPEN_BEFORE_SCHEMA_CONTRACT_READ);
+        helpers::failpoint::Rendezvous::park_first(&catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ);
     let open_uri = uri.clone();
     let open_task = tokio::spawn(async move { Omnigraph::open_read_only(&open_uri).await });
     open_rv.wait_until_reached().await;
 
     let apply_rv =
-        helpers::failpoint::Rendezvous::park_first(names::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE);
     let apply_owner = Arc::clone(&owner);
     let apply_task = tokio::spawn(async move { apply_owner.apply_schema(&desired).await });
     assert!(
@@ -450,7 +458,7 @@ async fn read_only_open_holds_schema_gate_through_catalog_capture() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn refresh_holds_schema_gate_through_catalog_publication() {
-    use omnigraph::failpoints::names;
+    use omnigraph::seams::catalog;
 
     let dir = tempfile::tempdir().unwrap();
     let owner = Arc::new(init_and_load(&dir).await);
@@ -461,13 +469,13 @@ async fn refresh_holds_schema_gate_through_catalog_publication() {
     );
 
     let reload_rv =
-        helpers::failpoint::Rendezvous::park_first(names::SCHEMA_RELOAD_BEFORE_CONTRACT_READ);
+        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_RELOAD_BEFORE_CONTRACT_READ);
     let refresh_handle = Arc::clone(&stale);
     let refresh_task = tokio::spawn(async move { refresh_handle.refresh().await });
     reload_rv.wait_until_reached().await;
 
     let apply_rv =
-        helpers::failpoint::Rendezvous::park_first(names::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE);
     let apply_owner = Arc::clone(&owner);
     let apply_task = tokio::spawn(async move { apply_owner.apply_schema(&desired).await });
     assert!(
@@ -612,11 +620,13 @@ node Document {
     note: String?
 }
 "#;
-    let db = Omnigraph::init(uri, initial)
-        .await
-        .unwrap()
-        .with_external_blob_policy(external_policy)
-        .unwrap();
+    let db = helpers::session(
+        Omnigraph::init(uri, initial)
+            .await
+            .unwrap()
+            .with_external_blob_policy(external_policy)
+            .unwrap(),
+    );
     let data = [
         serde_json::json!({
             "type": "Document",
@@ -647,7 +657,7 @@ node Document {
     .map(|row| row.to_string())
     .collect::<Vec<_>>()
     .join("\n");
-    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
+    db.load_jsonl(&data, LoadMode::Overwrite).await.unwrap();
 
     // Admission policy is not durable graph data. Reopen with the default
     // deny policy so the rewrite proves that a historical descriptor is
@@ -851,7 +861,7 @@ node Document {
     note: String?
 }
 "#;
-    let mut db = Omnigraph::init(uri, initial).await.unwrap();
+    let db = Omnigraph::init(uri, initial).await.unwrap();
     let entry = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -1173,10 +1183,8 @@ async fn plan_schema_for_property_type_narrowing_is_not_supported() {
     let uri = dir.path().to_str().unwrap();
 
     let initial = TEST_SCHEMA.replace("age: I32?", "age: I64?");
-    let db = Omnigraph::init(uri, &initial).await.unwrap();
-    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = helpers::session(Omnigraph::init(uri, &initial).await.unwrap());
+    db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
 
     let plan = db.plan_schema(TEST_SCHEMA).await.unwrap();
     assert!(
@@ -1200,8 +1208,8 @@ async fn apply_schema_pure_type_rename_preserves_identity_path_and_version() {
         r#"{"name": "Alice", "age": 30}"#,
         r#"{"name": "Alice", "age": 30, "avatar": "base64:QXZhdGFy"}"#,
     );
-    let db = Omnigraph::init(uri, &initial).await.unwrap();
-    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, &initial).await.unwrap());
+    db.load_jsonl(&data, LoadMode::Overwrite).await.unwrap();
     db.ensure_indices().await.unwrap();
     let before_snapshot_id = db.resolve_snapshot("main").await.unwrap();
     let before_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
@@ -1394,6 +1402,7 @@ edge WorksAt: Human -> Company
     assert_eq!(after.dataset_path, before.dataset_path);
     assert!(after.published_dataset_version > before.published_dataset_version);
     assert!(after_snapshot.dataset("node:Person").is_none());
+    reclaim_hard_dropped_history(&db).await;
     assert!(
         db.snapshot_at_graph_manifest_version(before_manifest_version)
             .await
@@ -1403,6 +1412,21 @@ edge WorksAt: Human -> Company
             .is_err(),
         "hard cleanup must reclaim the renamed source incarnation's prior version"
     );
+}
+
+/// A hard drop's prior version is a pin that `cleanup` reclaims once `--keep`
+/// prunes the `__manifest` version naming it.
+async fn reclaim_hard_dropped_history(db: &Session) {
+    let stats = db
+        .cleanup(omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .unwrap();
+    for row in &stats {
+        assert!(row.error.is_none(), "{row:?}");
+    }
 }
 
 #[tokio::test]
@@ -1420,8 +1444,8 @@ async fn apply_schema_renames_node_type_via_rename_from_and_preserves_rows() {
         r#"{"name": "Alice", "age": 30}"#,
         r#"{"name": "Alice", "age": 30, "avatar": "base64:QXZhdGFy"}"#,
     );
-    let db = Omnigraph::init(uri, &initial).await.unwrap();
-    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, &initial).await.unwrap());
+    db.load_jsonl(&data, LoadMode::Overwrite).await.unwrap();
     let before_snapshot_id = db.resolve_snapshot("main").await.unwrap();
     let before = db
         .snapshot_of(ReadTarget::branch("main"))
@@ -1587,11 +1611,12 @@ query put_pair($aaaa: String, $zzzz: String, $label: String) {
 "#;
 
     let dir = tempfile::tempdir().unwrap();
-    let db = Omnigraph::init(dir.path().to_str().unwrap(), initial)
-        .await
-        .unwrap();
-    load_jsonl(
-        &db,
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), initial)
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(
         r#"{"type":"Pair","data":{"alpha":"A","zeta":"Z","label":"before"}}"#,
         LoadMode::Append,
     )
@@ -1813,6 +1838,7 @@ async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
     // the dataset at that snapshot should fail (Lance can't load the
     // dropped version). This is the Hard-mode contract — the prior
     // data is unreachable.
+    reclaim_hard_dropped_history(&db).await;
     let pre_drop = db
         .snapshot_at_graph_manifest_version(before_version)
         .await
@@ -1932,7 +1958,7 @@ async fn apply_schema_defers_vector_index_on_empty_table() {
         body: String?\n    \
         embedding: Vector(8) @index\n\
         }\n";
-    let db = Omnigraph::init(uri, v1).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, v1).await.unwrap());
 
     // Add an unrelated scalar @index on `body`. Schema apply must record both
     // declarations without trying to build either one or train the empty vector.
@@ -1949,11 +1975,7 @@ async fn apply_schema_defers_vector_index_on_empty_table() {
 
     // The deferred declarations are not dropped: after data arrives, the
     // explicit reconciler materializes every buildable index without error.
-    load_jsonl(
-        &db,
-        r#"{"type":"Doc","data":{"slug":"d1","body":"hello","embedding":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]}}"#,
-        LoadMode::Merge,
-    )
+    db.load_jsonl(r#"{"type":"Doc","data":{"slug":"d1","body":"hello","embedding":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]}}"#, LoadMode::Merge, )
     .await
     .expect("loading a Doc with an embedding must succeed");
     db.ensure_indices()
@@ -1973,9 +1995,8 @@ async fn index_only_constraint_apply_touches_no_table_data() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let v1 = "node Doc {\n    slug: String @key\n    n: I64\n}\n";
-    let db = Omnigraph::init(uri, v1).await.unwrap();
-    load_jsonl(
-        &db,
+    let db = helpers::session(Omnigraph::init(uri, v1).await.unwrap());
+    db.load_jsonl(
         r#"{"type":"Doc","data":{"slug":"d1","n":1}}"#,
         LoadMode::Merge,
     )
@@ -2028,9 +2049,8 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let v1 = "node Ticket {\n    slug: String @key\n    status: enum(todo, doing, done)\n}\n";
-    let db = Omnigraph::init(uri, v1).await.unwrap();
-    load_jsonl(
-        &db,
+    let db = helpers::session(Omnigraph::init(uri, v1).await.unwrap());
+    db.load_jsonl(
         r#"{"type":"Ticket","data":{"slug":"t1","status":"todo"}}"#,
         LoadMode::Merge,
     )
@@ -2071,16 +2091,14 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
     );
 
     // The NEW variant is accepted on the write path...
-    load_jsonl(
-        &db,
+    db.load_jsonl(
         r#"{"type":"Ticket","data":{"slug":"t2","status":"blocked"}}"#,
         LoadMode::Merge,
     )
     .await
     .expect("new variant must be accepted after widening");
     // ...an original variant still is...
-    load_jsonl(
-        &db,
+    db.load_jsonl(
         r#"{"type":"Ticket","data":{"slug":"t3","status":"done"}}"#,
         LoadMode::Merge,
     )
@@ -2088,12 +2106,12 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
     .expect("original variant must remain accepted");
     // ...and an out-of-set value is still rejected (the fence didn't widen to
     // free text).
-    let err = load_jsonl(
-        &db,
-        r#"{"type":"Ticket","data":{"slug":"t4","status":"bogus"}}"#,
-        LoadMode::Merge,
-    )
-    .await;
+    let err = db
+        .load_jsonl(
+            r#"{"type":"Ticket","data":{"slug":"t4","status":"bogus"}}"#,
+            LoadMode::Merge,
+        )
+        .await;
     assert!(err.is_err(), "out-of-set enum value must still be rejected");
 }
 
@@ -2103,7 +2121,7 @@ async fn enum_narrowing_apply_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let v1 = "node Ticket {\n    slug: String @key\n    status: enum(todo, doing, done)\n}\n";
-    let db = Omnigraph::init(uri, v1).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, v1).await.unwrap());
 
     let narrowed = "node Ticket {\n    slug: String @key\n    status: enum(todo, done)\n}\n";
     let err = db.apply_schema(narrowed).await;
@@ -2115,8 +2133,7 @@ async fn enum_narrowing_apply_is_refused() {
     );
 
     // The graph stays healthy and writable on the original schema.
-    load_jsonl(
-        &db,
+    db.load_jsonl(
         r#"{"type":"Ticket","data":{"slug":"t1","status":"doing"}}"#,
         LoadMode::Merge,
     )

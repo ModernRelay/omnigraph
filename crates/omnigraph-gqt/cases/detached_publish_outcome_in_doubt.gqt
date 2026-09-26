@@ -1,0 +1,81 @@
+# issue: none
+# notes: Lost publication acknowledgement plus unavailable readback returns an in-doubt outcome. The operation is not resubmitted; an unkeyed edge makes extra application observable before and after restart, and a distinct next write succeeds.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+}
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- seam
+at: publish.post_merge_pre_ack
+occurrence: 1
+action: fail
+scope: next_step
+--- seam
+at: publish.read_back
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+query ambiguous_write() {
+    insert Person { name: "bob" }
+    insert Knows { from: "alice", to: "alice" }
+}
+--- expect error: outcome is in doubt
+
+--- query
+query exactly_once() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+--- expect shape
+p.name: String
+
+--- query
+query edge_exactly_once() {
+    match { $p: Person $p $e:knows $q }
+    return { $p.name, $q.name }
+}
+--- expect unordered
+{"p.name":"alice","q.name":"alice"}
+--- expect shape
+p.name: String
+q.name: String
+
+--- mutate
+query distinct_next_write() { insert Person { name: "carol" } }
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- query
+query durable_rows() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+{"p.name":"carol"}
+--- expect shape
+p.name: String
+
+--- query
+query durable_edge_exactly_once() {
+    match { $p: Person $p $e:knows $q }
+    return { $p.name, $q.name }
+}
+--- expect unordered
+{"p.name":"alice","q.name":"alice"}
+--- expect shape
+p.name: String
+q.name: String

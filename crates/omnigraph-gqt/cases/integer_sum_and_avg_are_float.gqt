@@ -1,0 +1,85 @@
+# issue: none
+# notes: Integer sum and avg return floating-point values. An all-null group
+# notes: or an empty input returns null aggregates; count still includes null rows.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    team: String
+    age: I64?
+    birthdate: Date?
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","team":"a","age":30,"birthdate":"1990-01-01"}}
+{"type":"Person","data":{"name":"bob","team":"a","age":21,"birthdate":"1985-06-22"}}
+{"type":"Person","data":{"name":"carol","team":"b"}}
+{"type":"Person","data":{"name":"dave","team":"b"}}
+
+--- query
+query totals() {
+    match { $p: Person }
+    return { sum($p.age) as total, avg($p.age) as mean, count($p) as n }
+}
+
+--- expect unordered
+{"total": 51.0, "mean": 25.5, "n": 4}
+
+--- expect shape
+total: F64
+mean: F64
+n: I64
+
+--- query
+query totals_by_team() {
+    match { $p: Person }
+    return { $p.team, sum($p.age) as total, avg($p.age) as mean, count($p) as n }
+}
+
+--- expect unordered
+{"p.team": "a", "total": 51.0, "mean": 25.5, "n": 2}
+{"p.team": "b", "n": 2}
+
+--- expect shape
+p.team: String
+total: F64?
+mean: F64?
+n: I64
+
+--- query
+query totals_of_nobody() {
+    match {
+        $p: Person
+        $p.name = "nobody"
+    }
+    return { count($p) as n, sum($p.age) as total, avg($p.age) as mean }
+}
+
+--- expect unordered
+{"n": 0}
+
+--- expect shape
+n: I64
+total: F64?
+mean: F64?
+
+--- query
+query birthdates_by_team() {
+    match { $p: Person }
+    return { $p.team, min($p.birthdate) as first, max($p.birthdate) as last }
+}
+
+--- expect unordered
+{"p.team": "a", "first": "1985-06-22", "last": "1990-01-01"}
+{"p.team": "b"}
+
+--- expect shape
+p.team: String
+first: Date?
+last: Date?

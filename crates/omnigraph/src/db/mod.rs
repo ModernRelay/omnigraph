@@ -1,8 +1,7 @@
 pub mod commit_graph;
-mod graph_coordinator;
+pub(crate) mod graph_coordinator;
 pub mod manifest;
-mod omnigraph;
-mod recovery_audit;
+pub(crate) mod omnigraph;
 mod schema_state;
 pub(crate) mod write_queue;
 
@@ -15,12 +14,16 @@ pub use manifest::{
 };
 pub(crate) use omnigraph::ensure_public_branch_ref;
 pub use omnigraph::{
-    CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats,
+    CleanupPolicyOptions, CollectorCost, CollectorPathSnapshot, CollectorReport,
+    CollectorRowSummary, DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats,
     EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult, InitOptions, MergeOutcome,
     Omnigraph, OpenMode, PendingIndex, RebuiltFullTextIndex, RepairAction, RepairClassification,
-    RepairOptions, RepairStats, SchemaApplyOptions, SchemaApplyResult, SkipReason,
+    RepairOptions, RepairStats, RetainedManifestVersions, SYSTEM_COLUMNS_PREFLIGHT,
+    SchemaApplyOptions, SchemaApplyResult, SkipReason, StagingVerdict, SystemColumnUpgradeFinding,
+    SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome, SystemColumnUpgradeReport,
+    TableCollectionPlan, UnpublishedManifest,
 };
-pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
+pub(crate) use omnigraph::{WriteAuthorityToken, WriteTxn};
 pub(crate) use omnigraph::{export_blob_values, logical_row_image};
 pub(crate) use schema_state::SchemaContractText;
 
@@ -110,7 +113,7 @@ pub(crate) fn is_internal_system_branch(name: &str) -> bool {
 }
 
 /// Microseconds since the UNIX epoch — the `created_at` stamp threaded through
-/// every graph-lineage / recovery-audit / commit-graph row. One canonical
+/// every graph-lineage / commit-graph row. One canonical
 /// helper so the clock-error mapping (variant + message) cannot drift across
 /// the call sites that record those timestamps.
 pub(crate) fn now_micros() -> Result<i64> {

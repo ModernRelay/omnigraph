@@ -1,8 +1,6 @@
 # issue: none
-# notes: `$d knows $t` over 20 docs with one edge, leaving d015: 1 of 20 eligible
-# notes: (5%, under the fence with a row to spare), so the gate pushes one id.
-# notes: Limit 3 with 1 eligible (1 < 3): the prefiltered scan admits fewer rows
-# notes: than k and the answer is that one row, no padding, no error.
+# notes: Only d015 has an edge; limit 3 must return that one source.
+# notes: Keep 20 docs: 1/20 eligible sources selects the gate prefilter.
 
 --- runner
 timeout_ms: 10000
@@ -45,7 +43,7 @@ edge Knows: Doc -> Doc {
 {"edge":"Knows","id":"e015_0","from":"d015","to":"d016","data":{}}
 
 --- query
-query scenario($q: Vector(4)) {
+query nearest_single_source($q: Vector(4)) {
     match {
         $d: Doc
         $d knows $t

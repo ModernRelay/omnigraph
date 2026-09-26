@@ -69,6 +69,23 @@ macro_rules! declare_engine_cargo_features {
 // registry from Cargo.toml and refuses execution on any mismatch.
 declare_engine_cargo_features!("default", "dst", "failpoints");
 
+/// The distinct Lance `ObjectStore`s one probe plane opened datasets on.
+#[derive(Clone, Default)]
+pub struct ProbedStores(Arc<Mutex<Vec<Arc<lance::io::ObjectStore>>>>);
+
+impl ProbedStores {
+    fn register(&self, store: Arc<lance::io::ObjectStore>) {
+        let mut stores = self.0.lock().unwrap();
+        if !stores.iter().any(|known| Arc::ptr_eq(known, &store)) {
+            stores.push(store);
+        }
+    }
+
+    pub fn stores(&self) -> Vec<Arc<lance::io::ObjectStore>> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
 /// Per-query IO probes, installed for a query's task via [`with_query_io_probes`].
 ///
 /// Each wrapper is attached (when present) to the datasets that category opens,
@@ -175,6 +192,17 @@ pub struct QueryIoProbes {
     /// This must equal the newly deleted offset count; a fragment scan would
     /// make it grow with the compacted catalog's history instead.
     pub projection_identity_rows: Arc<AtomicU64>,
+    /// Pre-effect reprepares `Omnigraph::mutate` took after a `ReadSetChanged`
+    /// (bounded by `MAX_PRE_EFFECT_REPREPARES`). The caller sees only the
+    /// exhaustion of that loop, so this is the one view of the attempts behind
+    /// an acknowledged write.
+    pub mutation_reprepares: Arc<AtomicU64>,
+    /// The Lance `ObjectStore`s behind the opens that carried
+    /// `manifest_wrapper` / `table_wrapper`. A store's own `io_tracker` also
+    /// sees Lance's direct local reader and writer, which on `file://` never
+    /// reach a `WrappingObjectStore`; read it for backend-complete counts.
+    pub manifest_stores: ProbedStores,
+    pub table_stores: ProbedStores,
     /// Uncapped retries taken after a capped BM25 scan under-filled. Only a
     /// standalone `bm25()` ordering carries a cap (`rrf()` arms are never
     /// capped — see `execute_rrf_fusion`); its capped and uncapped runs are
@@ -204,7 +232,7 @@ pub struct QueryIoProbes {
     pub ann_flat_rescans: Arc<AtomicU64>,
     /// Requested maximum probe budget of the most recent nearest scan. Zero
     /// represents no maximum (the ladder's last rung, the overfetch loop's
-    /// exact pass, or `OMNIGRAPH_ANN_NPROBES=0`). Lance applies the value per
+    /// exact pass, or the setting `ann_nprobes = 0`). Lance applies the value per
     /// index delta, so the partitions read may be a multiple.
     pub ann_max_nprobes: Arc<AtomicU64>,
     /// Rows the most recent nearest scan returned (its `k` when full).
@@ -305,7 +333,7 @@ pub enum RrfGateFallback {
     /// The eligible set is empty: the postfilter plan yields the same empty
     /// join and `IN ()` edge semantics never arise (correctness fence).
     EmptyEligible,
-    /// `OMNIGRAPH_RRF_PLAN=force_postfilter` (or the scoped override) chose.
+    /// The setting `rrf_plan = force_postfilter` chose.
     Forced,
 }
 
@@ -341,60 +369,320 @@ where
     QUERY_IO_PROBES.scope(probes, fut).await
 }
 
+/// Capture the observer before moving query work to a blocking task. That task
+/// reinstalls it with `with_query_io_probes`; Tokio does not inherit task locals.
+pub(crate) fn capture_query_io_probes() -> Option<QueryIoProbes> {
+    QUERY_IO_PROBES.try_with(Clone::clone).ok()
+}
+
 fn current<R>(f: impl FnOnce(&QueryIoProbes) -> R) -> Option<R> {
     QUERY_IO_PROBES.try_with(f).ok()
 }
 
 tokio::task_local! {
-    static TRAVERSAL_MODE_OVERRIDE: Option<&'static str>;
+    static QUERY_MEMORY_LIMIT: u64;
 }
 
-/// Force the Expand execution mode (`"indexed"` | `"csr"`) for the scope of `fut`
-/// WITHOUT mutating the process-global `OMNIGRAPH_TRAVERSAL_MODE` env var. This is
-/// the general traversal-mode test seam: scope-bound (so it cannot leak — the
-/// override is gone when `fut` resolves or unwinds) and process-safe (it never
-/// touches shared state, so a forced-mode test never affects a concurrent test in
-/// the same binary, removing the need for `#[serial]` + a dedicated all-serial
-/// binary). Mirrors [`with_query_io_probes`]. The env var stays the production/ops
-/// escape hatch; this scoped override takes precedence over it
-/// (`exec::query::traversal_indexed_override`).
-pub async fn with_traversal_mode<F>(mode: &'static str, fut: F) -> F::Output
+/// Run `fut` with the engine v2 read route's memory pool capped at `bytes`
+/// for every query it runs. Test-only entry point; nothing in production
+/// sets it, so the pool takes its constant.
+pub async fn with_query_memory_limit<F>(bytes: u64, fut: F) -> F::Output
 where
     F: std::future::Future,
 {
-    TRAVERSAL_MODE_OVERRIDE.scope(Some(mode), fut).await
+    QUERY_MEMORY_LIMIT.scope(bytes, fut).await
 }
 
-/// The scoped traversal-mode override active for this task, if any. `None` in
-/// production (no scope installed), so the env var is consulted instead.
-pub(crate) fn traversal_mode_override() -> Option<&'static str> {
-    TRAVERSAL_MODE_OVERRIDE.try_with(|m| *m).ok().flatten()
+/// The pool cap a test installed for this task, if any; `None` in production.
+pub(crate) fn query_memory_limit() -> Option<u64> {
+    QUERY_MEMORY_LIMIT.try_with(|bytes| *bytes).ok()
+}
+
+/// Reservations and execution metrics observed by v2 acceptance tests.
+/// Holding a pool here keeps the observer alive without retaining reservations.
+#[derive(Clone, Debug, Default)]
+pub struct QueryMemoryProbes {
+    pools: Arc<Mutex<Vec<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>>>,
+    metrics: Arc<Mutex<Vec<QueryExecutionMetrics>>>,
+    ladder_reports: Arc<Mutex<Vec<QueryLadderReport>>>,
+    blocking_started: Arc<AtomicU64>,
+    active_blocking: Arc<AtomicU64>,
+    refusals: Arc<Mutex<Vec<String>>>,
+    pause: Arc<Mutex<Option<Arc<QueryBlockingPause>>>>,
+}
+
+/// A completed DataFusion node's metrics, captured before its plan is dropped.
+#[derive(Clone, Debug)]
+pub struct QueryExecutionMetrics {
+    pub operator: String,
+    pub spill_count: usize,
+    pub spilled_rows: usize,
+    pub spilled_bytes: usize,
+    pub output_rows: usize,
+    pub values: std::collections::BTreeMap<String, usize>,
+}
+
+impl QueryMemoryProbes {
+    pub fn reserved_bytes(&self) -> usize {
+        self.pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|pool| pool.reserved())
+            .sum()
+    }
+
+    pub fn pools_created(&self) -> usize {
+        self.pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    pub fn blocking_started(&self) -> u64 {
+        self.blocking_started.load(Ordering::SeqCst)
+    }
+
+    pub fn active_blocking_work(&self) -> u64 {
+        self.active_blocking.load(Ordering::SeqCst)
+    }
+
+    pub fn refusals(&self) -> Vec<String> {
+        self.refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn record_refusal(&self, name: &str) {
+        self.refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(name.to_string());
+    }
+
+    /// Pause a blocking body's first charged-work checkpoint. The bounded wait
+    /// prevents an incorrectly inline body from hanging the test runtime.
+    #[doc(hidden)]
+    pub fn pause_blocking_work(&self) -> QueryBlockingPauseGuard {
+        let pause = Arc::new(QueryBlockingPause::default());
+        *self
+            .pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&pause));
+        QueryBlockingPauseGuard(pause)
+    }
+
+    pub fn ladder_reports(&self) -> Vec<QueryLadderReport> {
+        self.ladder_reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn execution_metrics(&self) -> Vec<QueryExecutionMetrics> {
+        self.metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 tokio::task_local! {
-    static RRF_PLAN_OVERRIDE: Option<&'static str>;
+    static QUERY_MEMORY_PROBES: QueryMemoryProbes;
 }
 
-/// Force the rrf prefilter gate's plan (`"force_prefilter"` |
-/// `"force_postfilter"`) for the scope of `fut` WITHOUT mutating the
-/// process-global `OMNIGRAPH_RRF_PLAN` env var. Mirrors
-/// [`with_traversal_mode`]: scope-bound (cannot leak) and process-safe (a
-/// forced-plan test never affects a concurrent test in the same binary). The
-/// force overrides only the gate's THRESHOLD decision, never a correctness
-/// fence — a forced-prefilter query rejected by a fence (shape, coverage,
-/// build error, empty eligible set) runs postfilter, and the
-/// `rrf_gate_verdicts` probe records why.
-pub async fn with_rrf_plan<F>(mode: &'static str, fut: F) -> F::Output
+/// Observe pools, blocking bodies, and completed plan metrics within `fut`.
+pub async fn with_query_memory_probes<F>(probes: QueryMemoryProbes, fut: F) -> F::Output
 where
     F: std::future::Future,
 {
-    RRF_PLAN_OVERRIDE.scope(Some(mode), fut).await
+    QUERY_MEMORY_PROBES.scope(probes, fut).await
 }
 
-/// The scoped rrf-plan override active for this task, if any. `None` in
-/// production (no scope installed), so the env var is consulted instead.
-pub(crate) fn rrf_plan_override() -> Option<&'static str> {
-    RRF_PLAN_OVERRIDE.try_with(|m| *m).ok().flatten()
+#[derive(Debug, Default)]
+struct QueryBlockingPause {
+    released: Mutex<bool>,
+    wake: std::sync::Condvar,
+    entered: AtomicU64,
+    waiting: AtomicU64,
+}
+
+/// Releases the test checkpoint even when an assertion unwinds.
+#[doc(hidden)]
+pub struct QueryBlockingPauseGuard(Arc<QueryBlockingPause>);
+
+impl QueryBlockingPauseGuard {
+    pub fn entered(&self) -> bool {
+        self.0.entered.load(Ordering::SeqCst) > 0
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.0.waiting.load(Ordering::SeqCst) > 0
+    }
+
+    pub fn release(&self) {
+        *self
+            .0
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.0.wake.notify_all();
+    }
+}
+
+impl Drop for QueryBlockingPauseGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+pub(crate) fn current_query_memory_probes() -> Option<QueryMemoryProbes> {
+    QUERY_MEMORY_PROBES.try_with(Clone::clone).ok()
+}
+
+/// Facts consumed by the query-level nearest overfetch decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueryLadderReport {
+    pub rows: usize,
+    pub k: usize,
+    pub maximum_nprobes: Option<usize>,
+    pub exhausted: bool,
+    pub dataset_rows: u64,
+}
+
+pub(crate) fn record_query_ladder_report(report: QueryLadderReport) {
+    let _ = QUERY_MEMORY_PROBES.try_with(|probes| {
+        probes
+            .ladder_reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(report);
+    });
+}
+
+pub(crate) fn record_query_memory_pool(
+    pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+) {
+    let _ = QUERY_MEMORY_PROBES.try_with(|probes| {
+        probes
+            .pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Arc::clone(pool));
+    });
+}
+
+fn query_operator_metrics(
+    node: &dyn datafusion::physical_plan::ExecutionPlan,
+) -> Option<QueryExecutionMetrics> {
+    node.metrics().map(|metrics| QueryExecutionMetrics {
+        operator: node.name().to_string(),
+        spill_count: metrics.spill_count().unwrap_or(0),
+        spilled_rows: metrics.spilled_rows().unwrap_or(0),
+        spilled_bytes: metrics.spilled_bytes().unwrap_or(0),
+        output_rows: metrics.output_rows().unwrap_or(0),
+        values: metrics
+            .iter()
+            .fold(std::collections::BTreeMap::new(), |mut values, metric| {
+                *values.entry(metric.value().name().to_string()).or_default() +=
+                    metric.value().as_usize();
+                values
+            }),
+    })
+}
+
+pub(crate) fn record_query_execution_metrics(
+    root: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+) {
+    let _ = QUERY_MEMORY_PROBES.try_with(|probes| {
+        fn visit(
+            node: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+            visited: &mut std::collections::HashSet<*const ()>,
+            out: &mut Vec<QueryExecutionMetrics>,
+        ) {
+            if !visited.insert(Arc::as_ptr(node).cast::<()>()) {
+                return;
+            }
+            out.extend(query_operator_metrics(node.as_ref()));
+            for child in node.children() {
+                visit(child, visited, out);
+            }
+        }
+        visit(
+            root,
+            &mut std::collections::HashSet::new(),
+            &mut probes
+                .metrics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    });
+}
+
+/// Captured on the query task, then moved into its blocking closure. Tokio task
+/// locals are not inherited by `spawn_blocking`.
+pub(crate) struct QueryBlockingWorkGuard {
+    probes: Option<QueryMemoryProbes>,
+    started: bool,
+}
+
+pub(crate) fn query_blocking_work_guard() -> QueryBlockingWorkGuard {
+    QueryBlockingWorkGuard {
+        probes: QUERY_MEMORY_PROBES.try_with(Clone::clone).ok(),
+        started: false,
+    }
+}
+
+impl QueryBlockingWorkGuard {
+    pub(crate) fn checkpoint(&self) {
+        let Some(probes) = &self.probes else { return };
+        let Some(pause) = probes
+            .pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        else {
+            return;
+        };
+        if pause.entered.fetch_add(1, Ordering::SeqCst) > 0 {
+            return;
+        }
+        pause.waiting.store(1, Ordering::SeqCst);
+        let released = pause
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(
+            pause
+                .wake
+                .wait_timeout_while(released, std::time::Duration::from_secs(5), |released| {
+                    !*released
+                })
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        pause.waiting.store(0, Ordering::SeqCst);
+    }
+
+    pub(crate) fn started(&mut self) {
+        if !self.started {
+            self.started = true;
+            if let Some(probes) = &self.probes {
+                probes.active_blocking.fetch_add(1, Ordering::SeqCst);
+                probes.blocking_started.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+impl Drop for QueryBlockingWorkGuard {
+    fn drop(&mut self) {
+        if self.started {
+            if let Some(probes) = &self.probes {
+                probes.active_blocking.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -427,7 +715,6 @@ pub(crate) fn rrf_gate_subset_drop() -> Option<String> {
 }
 
 tokio::task_local! {
-    static STAGE_WRITE_CONCURRENCY_OVERRIDE: Option<usize>;
     static STAGE_WRITE_PROBES: StageWriteProbes;
 }
 
@@ -511,34 +798,6 @@ pub(crate) async fn enter_stage_write_probe() -> Option<StageWriteProbeGuard> {
     Some(guard)
 }
 
-/// Force the fragment-writing stage width for the scope of `fut` WITHOUT
-/// mutating the process-global `OMNIGRAPH_LOAD_CONCURRENCY` env var. Same seam
-/// as [`with_traversal_mode`], for the same reason: a width-forcing test stays
-/// scope-bound and process-safe, so it never perturbs a concurrent test in the
-/// same binary and needs no `#[serial]`. The env var stays the production/ops
-/// escape hatch; this scoped override takes precedence over it
-/// (`exec::staging::stage_write_concurrency`).
-///
-/// `0` is not a concurrency: it is ignored in favour of the default, matching
-/// the env parse rules.
-pub async fn with_stage_write_concurrency<F>(concurrency: usize, fut: F) -> F::Output
-where
-    F: std::future::Future,
-{
-    STAGE_WRITE_CONCURRENCY_OVERRIDE
-        .scope(Some(concurrency), fut)
-        .await
-}
-
-/// The scoped staging-width override active for this task, if any. `None` in
-/// production (no scope installed), so the env var is consulted instead.
-pub(crate) fn stage_write_concurrency_override() -> Option<usize> {
-    STAGE_WRITE_CONCURRENCY_OVERRIDE
-        .try_with(|c| *c)
-        .ok()
-        .flatten()
-}
-
 pub(crate) fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
     current(|p| p.manifest_wrapper.clone()).flatten()
 }
@@ -554,9 +813,9 @@ pub(crate) fn record_probe() {
 }
 
 /// Internal/system table directory names. An open of one of these is a metadata
-/// open (publisher CAS, recovery audit), NOT a data-table open. Kept in sync with
-/// the dir constants in `db/manifest/layout.rs` and `db/recovery_audit.rs`.
-const INTERNAL_TABLE_DIRS: [&str; 2] = ["__manifest", "_graph_commit_recoveries.lance"];
+/// open (publisher CAS), NOT a data-table open. Kept in sync with the dir
+/// constants in `db/manifest/layout.rs`.
+const INTERNAL_TABLE_DIRS: [&str; 1] = ["__manifest"];
 
 /// True when `uri`'s last path segment names an internal/system table.
 fn open_is_internal(uri: &str) -> bool {
@@ -584,6 +843,29 @@ pub(crate) fn record_open(uri: &str) {
 pub(crate) fn record_manifest_scan() {
     let _ = current(|p| {
         p.manifest_scan_count.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Register the store behind a probed open under the plane whose wrapper the
+/// open carried. No-op unless a cost probe is active.
+fn record_probed_store(wrapper: &Arc<dyn WrappingObjectStore>, store: Arc<lance::io::ObjectStore>) {
+    let _ = current(|p| {
+        let carried = |plane: &Option<Arc<dyn WrappingObjectStore>>| {
+            plane.as_ref().is_some_and(|w| Arc::ptr_eq(w, wrapper))
+        };
+        if carried(&p.manifest_wrapper) {
+            p.manifest_stores.register(store.clone());
+        }
+        if carried(&p.table_wrapper) {
+            p.table_stores.register(store);
+        }
+    });
+}
+
+/// Record one pre-effect mutation reprepare. No-op unless a cost probe is active.
+pub(crate) fn record_mutation_reprepare() {
+    let _ = current(|p| {
+        p.mutation_reprepares.fetch_add(1, Ordering::Relaxed);
     });
 }
 
@@ -838,18 +1120,15 @@ pub(crate) enum MergeTimingPhase {
     TableWalk,
     CandidateValidation,
     FinalRevalidation,
-    RecoveryArm,
     PhysicalPublish,
     KeyedStage,
     KeyedCommit,
-    RecoveryConfirm,
     ManifestPublish,
-    RecoveryCleanup,
     OuterRestoreRefresh,
 }
 
 impl MergeTimingPhase {
-    const COUNT: usize = 14;
+    const COUNT: usize = 11;
 
     const fn index(self) -> usize {
         self as usize
@@ -862,13 +1141,10 @@ impl MergeTimingPhase {
         Self::TableWalk,
         Self::CandidateValidation,
         Self::FinalRevalidation,
-        Self::RecoveryArm,
         Self::PhysicalPublish,
         Self::KeyedStage,
         Self::KeyedCommit,
-        Self::RecoveryConfirm,
         Self::ManifestPublish,
-        Self::RecoveryCleanup,
         Self::OuterRestoreRefresh,
     ];
 
@@ -880,13 +1156,10 @@ impl MergeTimingPhase {
             Self::TableWalk => "TableWalk",
             Self::CandidateValidation => "CandidateValidation",
             Self::FinalRevalidation => "FinalRevalidation",
-            Self::RecoveryArm => "RecoveryArm",
             Self::PhysicalPublish => "PhysicalPublish",
             Self::KeyedStage => "KeyedStage",
             Self::KeyedCommit => "KeyedCommit",
-            Self::RecoveryConfirm => "RecoveryConfirm",
             Self::ManifestPublish => "ManifestPublish",
-            Self::RecoveryCleanup => "RecoveryCleanup",
             Self::OuterRestoreRefresh => "OuterRestoreRefresh",
         }
     }
@@ -1156,9 +1429,6 @@ impl MergeWriteProbes {
     pub fn final_revalidation_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::FinalRevalidation)
     }
-    pub fn recovery_arm_us(&self) -> u64 {
-        self.merge_timing_total_us(MergeTimingPhase::RecoveryArm)
-    }
     pub fn physical_publish_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::PhysicalPublish)
     }
@@ -1174,14 +1444,8 @@ impl MergeWriteProbes {
     pub fn keyed_commit_max_us(&self) -> u64 {
         self.merge_timing_max_us(MergeTimingPhase::KeyedCommit)
     }
-    pub fn recovery_confirm_us(&self) -> u64 {
-        self.merge_timing_total_us(MergeTimingPhase::RecoveryConfirm)
-    }
     pub fn manifest_publish_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::ManifestPublish)
-    }
-    pub fn recovery_cleanup_us(&self) -> u64 {
-        self.merge_timing_total_us(MergeTimingPhase::RecoveryCleanup)
     }
     pub fn outer_restore_refresh_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::OuterRestoreRefresh)
@@ -1464,6 +1728,90 @@ pub(crate) enum VersionResolution {
     At(u64),
 }
 
+/// Open a table pin (RFC 0067): a pin without a staged version opens its
+/// target, a staged pin above `last_linear_version` opens its detached
+/// version, and any older pin keeps the v10 twin rule for historical rows.
+pub(crate) async fn open_pinned_dataset(
+    uri: &str,
+    target_version: u64,
+    staged_version: Option<u64>,
+    transaction_uuid: Option<&str>,
+    last_linear_version: Option<u64>,
+    session: Option<&Arc<lance::session::Session>>,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<Dataset> {
+    let Some(staged) = staged_version else {
+        return open_dataset(uri, VersionResolution::At(target_version), session, wrapper).await;
+    };
+    if last_linear_version.is_some_and(|last| target_version > last) {
+        return open_dataset(uri, VersionResolution::At(staged), session, wrapper).await;
+    }
+    match open_dataset(
+        uri,
+        VersionResolution::At(target_version),
+        session,
+        wrapper.clone(),
+    )
+    .await
+    {
+        Ok(dataset) => {
+            let ours = crate::table_store::StagedTransactionIdentity::recorded_by(&dataset)
+                .is_some_and(|identity| Some(identity.uuid.as_str()) == transaction_uuid);
+            if ours {
+                return Ok(dataset);
+            }
+            tracing::warn!(
+                uri,
+                target_version,
+                staged,
+                "pin target carries a foreign or unreadable transaction; resolving the staged version"
+            );
+            open_dataset(uri, VersionResolution::At(staged), session, wrapper).await
+        }
+        Err(error @ OmniError::HistoricalVersionReclaimed { .. }) => {
+            let latest = open_dataset(uri, VersionResolution::Latest, session, wrapper.clone())
+                .await?
+                .version()
+                .version;
+            if latest < target_version {
+                match open_dataset(uri, VersionResolution::At(staged), session, wrapper.clone())
+                    .await
+                {
+                    Ok(dataset) => return Ok(dataset),
+                    Err(OmniError::HistoricalVersionReclaimed { .. }) => {}
+                    Err(other) => return Err(other),
+                }
+            }
+            match open_dataset(
+                uri,
+                VersionResolution::At(target_version),
+                session,
+                wrapper.clone(),
+            )
+            .await
+            {
+                Ok(dataset) => {
+                    let ours = crate::table_store::StagedTransactionIdentity::recorded_by(&dataset)
+                        .is_some_and(|identity| Some(identity.uuid.as_str()) == transaction_uuid);
+                    if ours {
+                        return Ok(dataset);
+                    }
+                    tracing::warn!(
+                        uri,
+                        target_version,
+                        staged,
+                        "pin target carries a foreign or unreadable transaction; resolving the staged version"
+                    );
+                    open_dataset(uri, VersionResolution::At(staged), session, wrapper).await
+                }
+                Err(OmniError::HistoricalVersionReclaimed { .. }) => Err(error),
+                Err(other) => Err(other),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// THE dataset-open chokepoint. Every engine `Dataset` open routes through
 /// here so three things hold uniformly, on every path:
 ///
@@ -1475,7 +1823,7 @@ pub(crate) enum VersionResolution {
 ///    store). No wrapper (production) adds nothing.
 /// 3. A caller-provided graph data `Session` warms Lance's metadata/index
 ///    caches across data-table opens. When absent (for example a detached
-///    historical snapshot or recovery helper), the process-wide zero-cache
+///    historical snapshot), the process-wide zero-cache
 ///    control session is attached instead. Every open therefore reuses the
 ///    shared object-store registry/client pool without letting mutable control
 ///    metadata become stale in a session cache.
@@ -1495,8 +1843,8 @@ pub(crate) async fn open_dataset(
         .unwrap_or_else(crate::lance_access::control_session);
     builder = builder.with_session(session);
     let mut store_params = crate::storage::lance_store_params_for_uri(uri)?;
-    if let Some(wrapper) = wrapper {
-        store_params.object_store_wrapper = Some(wrapper);
+    if let Some(wrapper) = &wrapper {
+        store_params.object_store_wrapper = Some(wrapper.clone());
     }
     let handler = crate::storage_layer::lance_clone::configured_commit_handler(
         uri,
@@ -1508,7 +1856,7 @@ pub(crate) async fn open_dataset(
     builder = builder
         .with_store_params(store_params)
         .with_commit_handler(handler);
-    builder.load().await.map_err(|error| match error {
+    let dataset = builder.load().await.map_err(|error| match error {
         // Only the two shapes cleanup/drop legitimately leaves behind for a
         // pinned historical read count as reclaimed history:
         //   - VersionNotFound: the dataset exists, that version was GC'd.
@@ -1534,7 +1882,15 @@ pub(crate) async fn open_dataset(
             }
         }
         error => OmniError::storage(error),
-    })
+    })?;
+    if let Some(wrapper) = &wrapper {
+        let store = dataset
+            .object_store(None)
+            .await
+            .map_err(OmniError::storage)?;
+        record_probed_store(wrapper, store);
+    }
+    Ok(dataset)
 }
 
 /// Per-method call counts for [`CountingStorageAdapter`].

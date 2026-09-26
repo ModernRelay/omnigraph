@@ -11,14 +11,14 @@
 //! [`run_case_bounded`]. `OMNIGRAPH_GQ_BLESS=1` rewrites the failing
 //! step's `--- expect` rows in place.
 //!
-//! Layout of the `run_query_step` future (an engine query under the traversal
+//! Layout of the `run_query_step` future (an engine query under the probes
 //! task-local, the timeout, and `catch_unwind`) exceeds the default
 //! `recursion_limit` on Linux CI; the same raise the other engine
 //! integration tests carry.
 #![recursion_limit = "512"]
 
 use std::collections::{BTreeMap, HashSet};
-use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -27,14 +27,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use arrow_array::{RecordBatch, StringArray};
+use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use futures::FutureExt as _;
+use omnigraph::Session;
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
-use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_traversal_mode};
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+use omnigraph::loader::LoadMode;
 use omnigraph_compiler::query::ast::{
-    BranchStmt, BranchWrite, Clause, Expr, Literal, Param, QueryDecl, QueryFile,
+    BranchStmt, BranchWrite, Clause, EmptyFile, Expr, FileBody, Literal, Param, QueryDecl,
+    SettingStmt, show_statement_name,
 };
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::query::typecheck::{
@@ -42,7 +44,12 @@ use omnigraph_compiler::query::typecheck::{
 };
 use omnigraph_compiler::schema::ast::{Annotation, PropDecl, SchemaDecl};
 use omnigraph_compiler::schema::parser::parse_schema;
-use omnigraph_compiler::{JsonParamMode, QueryResult, json_params_to_param_map};
+use omnigraph_compiler::settings::{
+    DEFINITIONS, Engine, SessionSettings, SettingId, SettingRow, Traversal,
+};
+use omnigraph_compiler::{
+    JsonParamMode, PropType, QueryResult, ScalarType, json_params_to_param_map,
+};
 use serde_json::Value;
 
 mod dst_runner;
@@ -51,27 +58,39 @@ pub use dst_runner::{
     replay_report, report_cli_refusal, run_corpus_case, run_selected, run_worker_if_requested,
 };
 use omnigraph::storage::StorageAdapter;
-use runner_config::{
-    Execution, Fault, KnownFailure, RunnerConfig, parse_fault, parse_known_failure, parse_runner,
-};
+use runner_config::{Execution, RunnerConfig, SeamDirective, parse_runner, parse_seam};
 
+mod plan;
+mod report;
 mod shape;
-use shape::{ShapeExpect, bless_shape_lines, parse_shape_body, shape_mismatch};
+use plan::{PlanExpect, parse_plan_body, plan_mismatch, validate_plan_columns};
+
+mod discovery;
+pub use discovery::list_cases;
+use shape::{
+    ShapeExpect, ShapeLine, ShapeType, bless_shape_lines, parse_shape_body, shape_mismatch,
+    spell_shape_line,
+};
 
 pub const CASE_TIMEOUT_ENV: &str = "OMNIGRAPH_GQ_CASE_TIMEOUT_SECS";
 pub const DEFAULT_CASE_TIMEOUT_SECS: u64 = 10;
 pub const BLESS_ENV: &str = "OMNIGRAPH_GQ_BLESS";
+/// `OMNIGRAPH_GQ_ENGINE=v2` runs every query step of an embedded-engine case
+/// on the plan route; unset, empty, or `v1` runs the route production runs.
+/// A server target keeps the server's route; this runner setting selects
+/// embedded sessions only.
+pub const ENGINE_ENV: &str = "OMNIGRAPH_GQ_ENGINE";
 
 #[derive(Debug)]
 struct Case {
     input_text: String,
     runner: RunnerConfig,
-    known_failure: Option<KnownFailure>,
-    faults: BTreeMap<usize, Fault>,
+    seams: BTreeMap<usize, Vec<SeamDirective>>,
     source_lines: BTreeMap<usize, usize>,
     schema: String,
     seed: String,
-    /// The `# traversal:` pin; `None` runs the production path unscoped.
+    /// The `# traversal:` pin: the harness-only traversal field on the case
+    /// session plus the expand-path check; `None` leaves it at `auto`.
     traversal: Option<&'static str>,
     items: Vec<Item>,
     needs_indices: bool,
@@ -99,6 +118,8 @@ enum Step {
     Mutate(MutateStep),
     Control(ControlStep),
     List(ListStep),
+    Settings(SettingsStep),
+    Show(ShowStep),
     Restart { ordinal: usize },
 }
 
@@ -109,6 +130,8 @@ impl Step {
             Self::Mutate(s) => s.ordinal,
             Self::Control(s) => s.ordinal,
             Self::List(s) => s.ordinal,
+            Self::Settings(s) => s.ordinal,
+            Self::Show(s) => s.ordinal,
             Self::Restart { ordinal } => *ordinal,
         }
     }
@@ -119,7 +142,8 @@ impl Step {
         match self {
             Step::Query(step) => Some(&step.expect),
             Step::List(step) => Some(&step.expect),
-            Step::Mutate(_) | Step::Control(_) | Step::Restart { .. } => None,
+            Step::Show(step) => Some(&step.expect),
+            Step::Mutate(_) | Step::Control(_) | Step::Settings(_) | Step::Restart { .. } => None,
         }
     }
 
@@ -127,7 +151,8 @@ impl Step {
         match self {
             Step::Query(step) => Some(&mut step.expect),
             Step::List(step) => Some(&mut step.expect),
-            Step::Mutate(_) | Step::Control(_) | Step::Restart { .. } => None,
+            Step::Show(step) => Some(&mut step.expect),
+            Step::Mutate(_) | Step::Control(_) | Step::Settings(_) | Step::Restart { .. } => None,
         }
     }
 }
@@ -145,6 +170,9 @@ struct QueryStep {
     /// The match clause carries an unbound traversal, so a successful run
     /// must show at least one Expand on the pinned path.
     expects_expand: bool,
+    /// The `--- expect plan` section, checked against the engine's explain
+    /// document before the rows.
+    plan: Option<PlanExpect>,
 }
 
 #[derive(Debug)]
@@ -166,6 +194,8 @@ struct ControlStep {
     ordinal: usize,
     /// The statement's two words, from `BranchWrite::statement_name`.
     name: &'static str,
+    /// The section's `set` and `reset` lines, scoped to this one write.
+    prefix: Vec<SettingStmt>,
     write: ControlWrite,
 }
 
@@ -206,6 +236,25 @@ enum MergeExpect {
 #[derive(Debug)]
 struct ListStep {
     ordinal: usize,
+    expect: QueryExpect,
+}
+
+/// A `--- mutate` step of only `set` and `reset` lines: applied to the case
+/// session for the steps that follow, across a `--- restart`.
+#[derive(Debug)]
+struct SettingsStep {
+    ordinal: usize,
+    statements: Vec<SettingStmt>,
+}
+
+/// A `--- query` step holding `show`: the five `String` columns of
+/// `SettingRow::COLUMNS`, rows in definition order, so its expect is a read
+/// expect like a declaration's. The prefix is scoped to this one step.
+#[derive(Debug)]
+struct ShowStep {
+    ordinal: usize,
+    id: Option<SettingId>,
+    prefix: Vec<SettingStmt>,
     expect: QueryExpect,
 }
 
@@ -696,6 +745,15 @@ fn walk_expr(expr: &Expr, params: &[Param], needs_indices: &mut bool) -> Result<
         | Expr::Literal(_)
         | Expr::AliasRef(_) => {}
         Expr::Aggregate { func: _, arg } => walk_expr(arg, params, needs_indices)?,
+        Expr::Binary { left, op: _, right } => {
+            walk_expr(left, params, needs_indices)?;
+            walk_expr(right, params, needs_indices)?;
+        }
+        Expr::Not(inner)
+        | Expr::IsNull {
+            expr: inner,
+            negated: _,
+        } => walk_expr(inner, params, needs_indices)?,
         Expr::Search { field, query }
         | Expr::MatchText { field, query }
         | Expr::Bm25 { field, query } => {
@@ -769,24 +827,22 @@ fn walk_clauses(
     for clause in clauses {
         match clause {
             Clause::Binding(_) | Clause::Traversal(_) => {}
-            Clause::Filter(f) => {
-                walk_expr(&f.left, params, needs_indices)?;
-                walk_expr(&f.right, params, needs_indices)?;
+            Clause::Filter(f) => walk_expr(f, params, needs_indices)?,
+            Clause::Subquery(subquery) => {
+                walk_clauses(&subquery.clauses, params, needs_indices)?;
+                if let Some(arg) = &subquery.arg {
+                    walk_expr(arg, params, needs_indices)?;
+                }
+                walk_expr(&subquery.right, params, needs_indices)?;
             }
-            Clause::Negation(inner) => walk_clauses(inner, params, needs_indices)?,
         }
     }
     Ok(())
 }
 
-/// Why `expect ordered` is refused for this declaration, if it is. The
-/// engine's order is total only where `apply_ordering` appends the `<var>.id`
-/// tie-breaks (RFC 0045, Comparison semantics): no `order` clause, an
-/// `rrf()`-led one (fusion sorts by score alone), or an aggregate in the
-/// `return` list (group rows carry no `<var>.id`) each fail that condition.
-/// The tie-break is stable within a run only (ids are minted per load), so
-/// a case's `order` keys must be total over its rows: an authoring rule the
-/// parser cannot check.
+/// Why `expect ordered` is refused for this declaration, if it is: the order
+/// is total only where a sort appends `<var>.id` tie-breaks (RFC 0045), so no
+/// `order`, an `rrf()`-led one, or an aggregate `return` each refuse it.
 fn ordered_refusal(decl: &QueryDecl) -> Option<String> {
     if decl.order_clause.is_empty() {
         return Some("`expect ordered` is refused for a query without an `order` clause".into());
@@ -856,8 +912,55 @@ fn refuse_embed_schema(schema: &str, start_line: usize) -> Result<(), String> {
 /// A query or mutate section parsed and classified, awaiting its expect.
 enum Pending {
     Decl(PendingStep),
-    List { ordinal: usize },
-    Control { ordinal: usize, write: BranchWrite },
+    List {
+        ordinal: usize,
+    },
+    Control {
+        ordinal: usize,
+        prefix: Vec<SettingStmt>,
+        write: BranchWrite,
+    },
+    Settings {
+        ordinal: usize,
+        statements: Vec<SettingStmt>,
+    },
+    Show {
+        ordinal: usize,
+        id: Option<SettingId>,
+        prefix: Vec<SettingStmt>,
+    },
+}
+
+/// Whether `text` holds the statement `<statement> <name>` at any position:
+/// a `set` or `reset` that follows an earlier statement on the same line is
+/// still its own statement, and its line is the one to report.
+fn line_holds_statement(text: &str, statement: &str, name: &str) -> bool {
+    text.match_indices(statement)
+        .any(|(at, _)| text[at + statement.len()..].trim_start().starts_with(name))
+}
+
+/// The `process` scope rule at the runner (the Session settings RFC, Logic tests): a case
+/// body may `set` or `reset` a `request` setting only; the refusal names
+/// the offending statement's line.
+fn refuse_process_settings(
+    statements: &[SettingStmt],
+    body: &[(usize, &str)],
+) -> Result<(), String> {
+    for stmt in statements {
+        let Some(id) = stmt.id() else {
+            continue;
+        };
+        let Err(error) = id.refuse_from_request() else {
+            continue;
+        };
+        let line = body
+            .iter()
+            .find(|(_, text)| line_holds_statement(text, stmt.statement_name(), id.name()))
+            .or(body.first())
+            .map_or(0, |(idx, _)| idx + 1);
+        return Err(format!("line {line}: {error}"));
+    }
+    Ok(())
 }
 
 struct PendingStep {
@@ -929,6 +1032,104 @@ fn complete_list_step(
     Ok(ListStep { ordinal, expect })
 }
 
+/// The shape of `show`'s rows: the five [`SettingRow::COLUMNS`], each a
+/// non-null `String`. It is derived, so a `show` step carries no
+/// `--- expect shape` section and none is blessed into one.
+fn derived_show_shape() -> ShapeExpect {
+    ShapeExpect {
+        lines: SettingRow::COLUMNS
+            .map(|name| ShapeLine {
+                name: name.to_string(),
+                shape_type: ShapeType::Scalar(PropType::scalar(ScalarType::String, false)),
+            })
+            .to_vec(),
+        span: BodySpan {
+            start_line: 0,
+            len: 0,
+        },
+    }
+}
+
+/// A `show` step's explicit `--- expect shape`: the only shape `show` rows
+/// can have is the derived one, so any other spelling is refused and the
+/// refusal names the derivable shape.
+fn refuse_unequal_show_shape(lines: &[ShapeLine], line: usize) -> Result<(), String> {
+    let want: Vec<String> = derived_show_shape()
+        .lines
+        .iter()
+        .map(spell_shape_line)
+        .collect();
+    if lines.iter().map(spell_shape_line).eq(want.iter().cloned()) {
+        return Ok(());
+    }
+    Err(format!(
+        "line {line}: `show` derives its shape; drop the `--- expect shape` section, or write exactly `{}`",
+        want.join("`, `")
+    ))
+}
+
+/// The step a `show` section becomes under `mode`. The rows are total in
+/// definition order and the statement cannot fail, so `error:` is refused
+/// with the mutate modes. The shape comes from [`derived_show_shape`].
+fn complete_show_step(
+    ordinal: usize,
+    id: Option<SettingId>,
+    prefix: Vec<SettingStmt>,
+    mode: &ExpectHeader,
+    section: &Section<'_>,
+    loop_var: Option<&str>,
+) -> Result<ShowStep, String> {
+    let expect = match mode {
+        ExpectHeader::Unordered | ExpectHeader::Ordered => {
+            rows_expect(matches!(mode, ExpectHeader::Ordered), section, loop_var)?
+        }
+        ExpectHeader::Error(_)
+        | ExpectHeader::Ok
+        | ExpectHeader::Affected { .. }
+        | ExpectHeader::Outcome(_) => {
+            return Err(format!(
+                "`{}` takes `unordered` or `ordered`; it returns the settings rows and does not fail",
+                show_statement_name(id)
+            ));
+        }
+    };
+    let mut step = ShowStep {
+        ordinal,
+        id,
+        prefix,
+        expect,
+    };
+    if let QueryExpect::Rows { shape, .. } = &mut step.expect {
+        *shape = derived_show_shape();
+    }
+    Ok(step)
+}
+
+/// The step a section of only `set` and `reset` lines becomes under `mode`.
+fn complete_settings_step(
+    ordinal: usize,
+    statements: Vec<SettingStmt>,
+    mode: &ExpectHeader,
+    section: &Section<'_>,
+) -> Result<SettingsStep, String> {
+    match mode {
+        ExpectHeader::Ok => {
+            refuse_nonempty_body(&section.body, "an `expect ok` section")?;
+            Ok(SettingsStep {
+                ordinal,
+                statements,
+            })
+        }
+        ExpectHeader::Unordered
+        | ExpectHeader::Ordered
+        | ExpectHeader::Error(_)
+        | ExpectHeader::Affected { .. }
+        | ExpectHeader::Outcome(_) => {
+            Err("a settings step takes `ok`; `set` and `reset` return no rows and no counts".into())
+        }
+    }
+}
+
 fn affected_refusal(name: &str) -> String {
     format!("`expect affected:` is refused on a control write; `{name}` carries no counts")
 }
@@ -983,6 +1184,7 @@ fn complete_merge_expect(
 /// The step a control write becomes under `mode`.
 fn complete_control_step(
     ordinal: usize,
+    prefix: Vec<SettingStmt>,
     write: BranchWrite,
     mode: &ExpectHeader,
     section: &Section<'_>,
@@ -1007,6 +1209,7 @@ fn complete_control_step(
     Ok(ControlStep {
         ordinal,
         name,
+        prefix,
         write,
     })
 }
@@ -1044,6 +1247,7 @@ fn complete_decl_step(
                 params_raw: step.params_raw,
                 expects_expand: step.expects_expand,
                 expect: rows_expect(ordered, section, loop_var)?,
+                plan: None,
             }))
         }
         (ExpectHeader::Error(needle), is_mutation) => {
@@ -1069,6 +1273,7 @@ fn complete_decl_step(
                     params_raw: step.params_raw,
                     expects_expand: step.expects_expand,
                     expect: QueryExpect::Error { needle },
+                    plan: None,
                 })
             })
         }
@@ -1125,17 +1330,6 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                 .into(),
         );
     };
-    let (known_failure, sections) = if sections.first().is_some_and(|s| s.name == "known_failure") {
-        let body = sections[0]
-            .body
-            .iter()
-            .map(|(_, line)| *line)
-            .collect::<Vec<_>>()
-            .join("\n");
-        (Some(parse_known_failure(&body)?), &sections[1..])
-    } else {
-        (None, sections)
-    };
     if sections.first().map(|s| s.name.as_str()) != Some("schema") {
         return Err("the first section must be `--- schema`".into());
     }
@@ -1165,10 +1359,11 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
     let mut open_loop: Option<(String, Vec<String>, Vec<Step>)> = None;
     let mut pending: Option<Pending> = None;
     let mut awaiting_shape: Option<Step> = None;
+    let mut awaiting_plan: Option<Step> = None;
     let mut ordinal = 0usize;
-    let mut faults = BTreeMap::new();
+    let mut seams = BTreeMap::new();
     let mut source_lines = BTreeMap::new();
-    let mut awaiting_fault_step = false;
+    let mut awaiting_seam_step = false;
     let mut qm_steps = 0usize;
     let mut substitutable_lines: HashSet<usize> = HashSet::new();
 
@@ -1195,37 +1390,57 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         }
     }
 
+    /// A rows step whose `--- expect shape` did not arrive next: a `show`
+    /// step derives its shape and is complete, any other rows step is
+    /// refused.
+    fn settle_shape(
+        items: &mut Vec<Item>,
+        open_loop: &mut Option<(String, Vec<String>, Vec<Step>)>,
+        awaiting: Option<Step>,
+    ) -> Result<(), String> {
+        match awaiting {
+            Some(step) if matches!(step, Step::Show(_)) => {
+                push_step(items, open_loop, step);
+                Ok(())
+            }
+            Some(step) => Err(missing_shape(&step)),
+            None => Ok(()),
+        }
+    }
+
     for section in &sections[2..] {
         let (kind, rest) = match section.name.split_once([' ', '\t']) {
             Some((k, rest)) => (k, rest),
             None => (section.name.as_str(), ""),
         };
-        if let Some(waiting) = &awaiting_shape
-            && !(kind == "expect" && rest.trim().starts_with("shape"))
-        {
-            return Err(missing_shape(waiting));
+        if !(kind == "expect" && rest.trim().starts_with("shape")) {
+            settle_shape(&mut items, &mut open_loop, awaiting_shape.take())?;
         }
-        if awaiting_fault_step && !matches!(kind, "query" | "mutate") {
+        if let Some(step) = awaiting_plan.take_if(|_| !(kind == "expect" && rest.trim() == "plan"))
+        {
+            push_step(&mut items, &mut open_loop, step);
+        }
+        if awaiting_seam_step && !matches!(kind, "mutate" | "seam") {
             return Err(
-                "invalid_case: a fault must directly precede its query or mutate step".into(),
+                "invalid_case: a seam must directly precede its mutate step (a GQ mutation or a branch statement); no seam is crossed by a query step yet".into(),
             );
         }
         if matches!(kind, "query" | "mutate" | "restart") {
             source_lines.insert(ordinal + 1, section.header_line + 1);
-            awaiting_fault_step = false;
+            awaiting_seam_step = false;
         }
         match kind {
-            "fault" => {
+            "seam" => {
                 if open_loop.is_some() {
                     return Err(
-                        "invalid_case: fault directives inside loops are not supported".into(),
+                        "invalid_case: seam directives inside loops are not supported".into(),
                     );
                 }
-                if faults.len() >= 16 {
-                    return Err("invalid_case: a case admits at most 16 fault directives".into());
+                if seams.values().map(Vec::len).sum::<usize>() >= 16 {
+                    return Err("invalid_case: a case admits at most 16 seam directives".into());
                 }
                 if !rest.is_empty() || pending.is_some() {
-                    return Err("invalid_case: fault takes no header arguments and must precede a complete step".into());
+                    return Err("invalid_case: seam takes no header arguments and must precede a complete step".into());
                 }
                 let body = section
                     .body
@@ -1233,8 +1448,22 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     .map(|(_, line)| *line)
                     .collect::<Vec<_>>()
                     .join("\n");
-                faults.insert(ordinal + 1, parse_fault(&body)?);
-                awaiting_fault_step = true;
+                let seam = parse_seam(&body)?;
+                let step_seams: &mut Vec<SeamDirective> = seams.entry(ordinal + 1).or_default();
+                if step_seams.iter().any(|earlier| earlier.at == seam.at) {
+                    return Err(format!(
+                        "invalid_case: seam {} is declared twice before one step; one directive per seam per step",
+                        seam.at
+                    ));
+                }
+                step_seams.push(seam);
+                awaiting_seam_step = true;
+            }
+            "fault" => {
+                return Err(format!(
+                    "line {}: there is no `--- fault` section; a code seam is a `--- seam` with the same `at`, `occurrence` and `scope` and `action: fail` (was `return_error`) or `action: skip`, and a store fault is a `--- seam` naming a store place with `subject:` or a decision seam with a store action",
+                    section.header_line + 1
+                ));
             }
             "runner" | "schema" | "seed" => {
                 return Err(format!(
@@ -1262,9 +1491,53 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         section.header_line + 1
                     )
                 })?;
-                let decls = match file {
-                    QueryFile::Queries(decls) => decls,
-                    QueryFile::Branch(stmt) => {
+                refuse_process_settings(&file.settings, &section.body)?;
+                let empty = file.empty_kind();
+                let decls = match file.body {
+                    FileBody::Queries(_) if matches!(empty, Some(EmptyFile::SettingsOnly)) => {
+                        if kind == "query" {
+                            return Err(
+                                "a settings step is a `--- mutate` step; use `--- mutate`".into()
+                            );
+                        }
+                        if branch.is_some() {
+                            return Err(
+                                "a settings step changes the case session, not a branch; drop the `branch:` argument"
+                                    .into(),
+                            );
+                        }
+                        ordinal += 1;
+                        qm_steps += 1;
+                        pending = Some(Pending::Settings {
+                            ordinal,
+                            statements: file.settings,
+                        });
+                        continue;
+                    }
+                    FileBody::Queries(decls) => decls,
+                    FileBody::Show(id) => {
+                        if kind == "mutate" {
+                            return Err(format!(
+                                "`{}` under `--- mutate` is refused; use `--- query`",
+                                show_statement_name(id)
+                            ));
+                        }
+                        if branch.is_some() {
+                            return Err(
+                                "`show` reads the case session, not a branch; drop the `branch:` argument"
+                                    .into(),
+                            );
+                        }
+                        ordinal += 1;
+                        qm_steps += 1;
+                        pending = Some(Pending::Show {
+                            ordinal,
+                            id,
+                            prefix: file.settings,
+                        });
+                        continue;
+                    }
+                    FileBody::Branch(stmt) => {
                         if kind == "query" && stmt.is_write() {
                             return Err(
                                 "a control write under `--- query` is refused; use `--- mutate`"
@@ -1287,9 +1560,18 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         qm_steps += 1;
                         pending = Some(match stmt {
                             BranchStmt::List => Pending::List { ordinal },
-                            BranchStmt::Write(write) => Pending::Control { ordinal, write },
+                            BranchStmt::Write(write) => Pending::Control {
+                                ordinal,
+                                prefix: file.settings,
+                                write,
+                            },
                         });
                         continue;
+                    }
+                    FileBody::Explain(_) => {
+                        return Err(format!(
+                            "an `explain` statement under `--- {kind}` is refused; assert the plan with `--- expect plan`"
+                        ));
                     }
                 };
                 let [decl] = decls.as_slice() else {
@@ -1334,6 +1616,9 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     Some(Pending::List { .. } | Pending::Control { .. }) => {
                         return Err("a branch statement takes no params".into());
                     }
+                    Some(Pending::Settings { .. } | Pending::Show { .. }) => {
+                        return Err("a settings statement takes no params".into());
+                    }
                     None => {
                         return Err(format!(
                             "line {}: `--- params` must directly follow a query or mutate section",
@@ -1366,6 +1651,11 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         ));
                     };
                     let lines = parse_shape_body(&section.body)?;
+                    if matches!(step, Step::Show(_)) {
+                        refuse_unequal_show_shape(&lines, section.header_line + 1)?;
+                        push_step(&mut items, &mut open_loop, step);
+                        continue;
+                    }
                     let Some(QueryExpect::Rows { shape, .. }) = step.read_expect_mut() else {
                         return Err(format!(
                             "line {}: internal: the step awaiting a shape section carries no rows expect",
@@ -1379,6 +1669,25 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                             len: section.body.len(),
                         },
                     };
+                    awaiting_plan = Some(step);
+                    continue;
+                }
+                if rest.trim() == "plan" {
+                    let Some(mut step) = awaiting_plan.take() else {
+                        return Err(format!(
+                            "line {}: `--- expect plan` must directly follow a query step's `--- expect shape`",
+                            section.header_line + 1
+                        ));
+                    };
+                    let lines = parse_plan_body(&section.body)
+                        .map_err(|e| format!("line {}: {e}", section.header_line + 1))?;
+                    let Step::Query(query) = &mut step else {
+                        return Err(format!(
+                            "line {}: `--- expect plan` is supported only on query steps",
+                            section.header_line + 1
+                        ));
+                    };
+                    query.plan = Some(PlanExpect { lines });
                     push_step(&mut items, &mut open_loop, step);
                     continue;
                 }
@@ -1391,9 +1700,26 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     Some(Pending::List { ordinal }) => {
                         Step::List(complete_list_step(ordinal, &mode, section, loop_var)?)
                     }
-                    Some(Pending::Control { ordinal, write }) => {
-                        Step::Control(complete_control_step(ordinal, write, &mode, section)?)
+                    Some(Pending::Control {
+                        ordinal,
+                        prefix,
+                        write,
+                    }) => Step::Control(complete_control_step(
+                        ordinal, prefix, write, &mode, section,
+                    )?),
+                    Some(Pending::Settings {
+                        ordinal,
+                        statements,
+                    }) => {
+                        Step::Settings(complete_settings_step(ordinal, statements, &mode, section)?)
                     }
+                    Some(Pending::Show {
+                        ordinal,
+                        id,
+                        prefix,
+                    }) => Step::Show(complete_show_step(
+                        ordinal, id, prefix, &mode, section, loop_var,
+                    )?),
                     None => {
                         return Err(format!(
                             "line {}: `--- expect` has no query or mutate step to bind to",
@@ -1462,14 +1788,15 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
             _ => return Err(format!("unknown section `--- {}`", section.name)),
         }
     }
-    if awaiting_fault_step {
-        return Err("invalid_case: fault has no following operation".into());
+    if awaiting_seam_step {
+        return Err("invalid_case: seam has no following operation".into());
     }
     if pending.is_some() {
         return Err("the final step is missing its `--- expect`".into());
     }
-    if let Some(waiting) = &awaiting_shape {
-        return Err(missing_shape(waiting));
+    settle_shape(&mut items, &mut open_loop, awaiting_shape.take())?;
+    if let Some(step) = awaiting_plan.take() {
+        push_step(&mut items, &mut open_loop, step);
     }
     if open_loop.is_some() {
         return Err("a loop is not closed with `--- endloop`".into());
@@ -1490,8 +1817,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
     let case = Case {
         input_text: text.into(),
         runner,
-        known_failure,
-        faults,
+        seams,
         source_lines,
         schema,
         seed,
@@ -1499,7 +1825,6 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         items,
         needs_indices,
     };
-    dst_runner::validate_known_failure(&case)?;
     Ok(case)
 }
 
@@ -1667,17 +1992,25 @@ struct PathCounts {
     csr: Arc<AtomicU64>,
 }
 
-/// Runs `fut` under the case's `# traversal:` pin with expand-path probes
-/// attached, or unscoped on the production path when the case pins
-/// nothing. A pinned step gets its observed path counts back so the caller
-/// can check the pin took effect: the pin is a task-local override, and a
-/// step whose rows match its expect proves nothing about which path ran.
+/// The path a step is pinned to: the session's harness-only traversal field,
+/// which only the `# traversal:` header pin sets, `None` for `auto`.
+fn pinned_mode(session: &Session) -> Option<&'static str> {
+    match session.settings().traversal() {
+        Traversal::Indexed => Some("indexed"),
+        Traversal::Csr => Some("csr"),
+        Traversal::Auto => None,
+    }
+}
+
+/// Runs `fut` with expand-path probes attached when the case's `# traversal:`
+/// header pins a path (`pinned_mode`), so the caller can check the pin took
+/// effect; unprobed when it pins nothing.
 async fn under_traversal<F: Future>(
     mode: Option<&'static str>,
     fut: F,
 ) -> (F::Output, Option<PathCounts>) {
     match mode {
-        Some(mode) => {
+        Some(_) => {
             let counts = PathCounts {
                 indexed: Arc::new(AtomicU64::new(0)),
                 csr: Arc::new(AtomicU64::new(0)),
@@ -1687,7 +2020,7 @@ async fn under_traversal<F: Future>(
                 expand_csr_runs: Arc::clone(&counts.csr),
                 ..Default::default()
             };
-            let out = with_traversal_mode(mode, with_query_io_probes(probes, fut)).await;
+            let out = with_query_io_probes(probes, fut).await;
             (out, Some(counts))
         }
         None => (fut.await, None),
@@ -1737,16 +2070,13 @@ fn check_pin(
     )
 }
 
-/// Whether a match clause list runs at least one Expand: a traversal
-/// without an edge binding, outside `not { }`. A bound edge scans the edge
-/// dataset on a path of its own that no mode pins, and a single-hop
-/// negation runs as a CSR existence check that never reaches the expand
-/// dispatch; a multi-hop negation does expand, and the other-path check
-/// still covers it.
+/// Whether a match clause list runs at least one Expand: an unbound traversal
+/// outside a correlated block (a bound edge and a block take paths of their
+/// own that the other-path check covers).
 fn expects_expand(clauses: &[Clause]) -> bool {
     clauses.iter().any(|c| match c {
         Clause::Traversal(t) => t.edge_binding.is_none(),
-        Clause::Negation(_) | Clause::Binding(_) | Clause::Filter(_) => false,
+        Clause::Subquery(_) | Clause::Binding(_) | Clause::Filter(_) => false,
     })
 }
 
@@ -1795,8 +2125,16 @@ fn schema_drift(decl: &QueryDecl, inferred: &Schema, result: &QueryResult) -> Op
     None
 }
 
+/// What a v2 query step's `Executed` holds beyond its result: the explain
+/// document rendered from the bound plan the run executed, and its report
+/// rows.
+struct Inspection {
+    explain: Value,
+    rows: Result<Vec<report::Row>, String>,
+}
+
 async fn run_query_step(
-    db: &Omnigraph,
+    session: &Session,
     mode: Option<&'static str>,
     step: &QueryStep,
     binding: Option<(&str, &str)>,
@@ -1807,6 +2145,22 @@ async fn run_query_step(
         message,
         bless_lines: None,
     };
+    let settings = match session.effective(&step.source) {
+        Ok(settings) => Some(settings),
+        Err(error) if step.plan.is_some() => {
+            return Err(fail(format!("query settings failed: {error}")));
+        }
+        Err(_) => None,
+    };
+    let inspected = settings
+        .as_ref()
+        .is_some_and(|settings| settings.engine() == Engine::V2);
+    if step.plan.is_some() && !inspected {
+        return Err(fail(
+            "expect plan requires engine = v2; effective engine is v1, which produces no plan"
+                .into(),
+        ));
+    }
     // A params refusal is one of the ways "the query must fail": route it
     // into an `error:` expectation instead of always failing the step.
     let params = match build_params(step.params_raw.as_ref(), &step.decl.params, binding) {
@@ -1824,16 +2178,25 @@ async fn run_query_step(
             };
         }
     };
-    let (outcome, counts) = under_traversal(
-        mode,
-        db.query(
-            ReadTarget::branch(&step.branch),
-            &step.source,
-            &step.name,
-            &params,
-        ),
-    )
-    .await;
+    let target = ReadTarget::branch(&step.branch);
+    let (outcome, counts, inspection) = if inspected {
+        let door = session.query_inspected(target, &step.source, &step.name, &params);
+        let (outcome, counts) = under_traversal(mode, Box::pin(door)).await;
+        match outcome {
+            Ok(run) => {
+                let inspection = Inspection {
+                    explain: run.explain.to_value(),
+                    rows: report::report_rows(&run.report),
+                };
+                (Ok(run.result), counts, Some(inspection))
+            }
+            Err(error) => (Err(error), counts, None),
+        }
+    } else {
+        let query = session.query(target, &step.source, &step.name, &params);
+        let (outcome, counts) = under_traversal(mode, query).await;
+        (outcome, counts, None)
+    };
     dst_runner::observe_query(
         &outcome,
         matches!(step.expect, QueryExpect::Rows { ordered: true, .. }),
@@ -1843,6 +2206,9 @@ async fn run_query_step(
     if let Some(violation) = check_pin(mode, &counts, require_expand) {
         return Err(fail(violation));
     }
+    if let Some(run) = &inspection {
+        run.rows.as_ref().map_err(|error| fail(error.clone()))?;
+    }
     match &step.expect {
         QueryExpect::Rows {
             ordered,
@@ -1851,7 +2217,17 @@ async fn run_query_step(
             shape,
         } => {
             let result = outcome.map_err(|e| fail(format!("query failed: {e}")))?;
-            let catalog = db.catalog();
+            if let (Some(plan), Some(Inspection { explain, rows })) = (&step.plan, &inspection) {
+                validate_plan_columns(&plan.lines, &session.catalog()).map_err(&fail)?;
+                let report = rows.as_ref().ok().map(Vec::as_slice);
+                if let Some(mismatch) = plan_mismatch(&plan.lines, explain, report) {
+                    return Err(fail(format!(
+                        "{mismatch}\nexplain document:\n{}",
+                        serde_json::to_string_pretty(explain).unwrap_or_default()
+                    )));
+                }
+            }
+            let catalog = session.catalog();
             let inferred = typecheck_query(&catalog, &step.decl)
                 .and_then(|ctx| infer_query_result_schema(&catalog, &step.decl, &ctx))
                 .map_err(|e| fail(format!("result schema inference failed: {e}")))?;
@@ -1957,7 +2333,7 @@ fn list_result(mut names: Vec<String>) -> Result<QueryResult, String> {
 }
 
 async fn run_list_step(
-    db: &Omnigraph,
+    session: &Session,
     step: &ListStep,
     binding: Option<(&str, &str)>,
 ) -> Result<(), StepFail> {
@@ -1967,23 +2343,49 @@ async fn run_list_step(
         message,
         bless_lines: None,
     };
-    let outcome = match db.branch_list().await {
+    let outcome = match session.branch_list().await {
         Ok(names) => Ok(list_result(names).map_err(&fail)?),
         Err(error) => Err(error),
     };
+    check_synthetic_expect(
+        session,
+        &label,
+        &step.expect,
+        outcome,
+        "branch list",
+        binding,
+    )
+}
+
+/// Holds a read expect against a result the runner built itself (`branch
+/// list`, `show`): the result's own schema is the inferred one, so the
+/// shape check has no compiler to disagree with.
+fn check_synthetic_expect<E: std::fmt::Display>(
+    session: &Session,
+    label: &str,
+    expect: &QueryExpect,
+    outcome: Result<QueryResult, E>,
+    statement: &str,
+    binding: Option<(&str, &str)>,
+) -> Result<(), StepFail> {
+    let fail = |message: String| StepFail {
+        label: label.to_string(),
+        message,
+        bless_lines: None,
+    };
     dst_runner::observe_query(
         &outcome,
-        matches!(step.expect, QueryExpect::Rows { ordered: true, .. }),
+        matches!(expect, QueryExpect::Rows { ordered: true, .. }),
     );
-    match &step.expect {
+    match expect {
         QueryExpect::Rows {
             ordered,
             body_raw,
             span,
             shape,
         } => {
-            let result = outcome.map_err(|e| fail(format!("`branch list` failed: {e}")))?;
-            let catalog = db.catalog();
+            let result = outcome.map_err(|e| fail(format!("`{statement}` failed: {e}")))?;
+            let catalog = session.catalog();
             if let Some(mismatch) = shape_mismatch(&shape.lines, &result, result.schema(), &catalog)
             {
                 let (message, bless_lines) = match bless_shape_lines(&result, &catalog) {
@@ -1991,17 +2393,79 @@ async fn run_list_step(
                     Err(unspellable) => (format!("{mismatch}\n{unspellable}"), None),
                 };
                 return Err(StepFail {
-                    label: label.clone(),
+                    label: label.to_string(),
                     message,
                     bless_lines,
                 });
             }
-            check_rows(&label, &result, *ordered, body_raw, *span, binding)
+            check_rows(label, &result, *ordered, body_raw, *span, binding)
         }
         QueryExpect::Error { needle } => {
-            check_error_expect(needle, outcome, "`branch list` succeeded").map_err(fail)
+            check_error_expect(needle, outcome, &format!("`{statement}` succeeded")).map_err(fail)
         }
     }
+}
+
+/// `show`'s answer as a result: the five non-null `Utf8` columns of
+/// `SettingRow::COLUMNS`, rows in definition order, the shape a
+/// `--- expect shape` holds against.
+fn show_result(rows: &[SettingRow]) -> Result<QueryResult, String> {
+    let schema = Arc::new(Schema::new(
+        SettingRow::COLUMNS
+            .map(|name| Field::new(name, DataType::Utf8, false))
+            .to_vec(),
+    ));
+    let column = |cell: fn(&SettingRow) -> &str| -> ArrayRef {
+        Arc::new(StringArray::from(rows.iter().map(cell).collect::<Vec<_>>()))
+    };
+    let columns = vec![
+        column(|row| row.name),
+        column(|row| row.value.as_str()),
+        column(|row| row.default),
+        column(|row| row.source.as_str()),
+        column(|row| row.scope.as_str()),
+    ];
+    let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
+        .map_err(|e| format!("`show` rows failed to build: {e}"))?;
+    Ok(QueryResult::new(schema, vec![batch]))
+}
+
+/// The session one step runs under: the case session with the step's
+/// `set` and `reset` prefix applied to a copy, as the engine does for a
+/// declaration's prefix. The case session is unchanged.
+fn scoped_session(session: &Session, prefix: &[SettingStmt]) -> Result<Session, String> {
+    session.with_prefix(prefix).map_err(|e| e.to_string())
+}
+
+fn run_show_step(
+    session: &Session,
+    step: &ShowStep,
+    binding: Option<(&str, &str)>,
+) -> Result<(), StepFail> {
+    let name = show_statement_name(step.id);
+    let label = step_label(step.ordinal, &name, binding);
+    let outcome =
+        scoped_session(session, &step.prefix).and_then(|scoped| show_result(&scoped.show(step.id)));
+    check_synthetic_expect(session, &label, &step.expect, outcome, &name, binding)
+}
+
+/// Applies a settings step to the case session: every statement in order,
+/// for the steps that follow.
+fn run_settings_step(
+    session: &mut Session,
+    step: &SettingsStep,
+    binding: Option<(&str, &str)>,
+) -> Result<(), StepFail> {
+    let label = step_label(step.ordinal, "settings", binding);
+    for stmt in &step.statements {
+        session.apply(stmt).map_err(|e| StepFail {
+            label: label.clone(),
+            message: format!("`{}` failed: {e}", stmt.statement_name()),
+            bless_lines: None,
+        })?;
+    }
+    dst_runner::observe(|| format!("actual settings: {:?}", session.settings()));
+    Ok(())
 }
 
 fn check_write_expect<T, E: std::fmt::Display>(
@@ -2019,11 +2483,11 @@ fn check_write_expect<T, E: std::fmt::Display>(
     }
 }
 
-/// Runs a control write against the handle. A `branch delete` returns at
-/// the manifest flip and reclaims the branch's forks in a background task,
-/// so the step joins those before the next step runs.
+/// Runs a control write under the step's scoped session (the case session
+/// plus the section's prefix); a `branch delete` reclaims the branch's forks
+/// in a background task the step joins before the next step runs.
 async fn run_control_step(
-    db: &Omnigraph,
+    session: &Session,
     step: &ControlStep,
     binding: Option<(&str, &str)>,
 ) -> Result<(), StepFail> {
@@ -2034,6 +2498,7 @@ async fn run_control_step(
         message,
         bless_lines: None,
     };
+    let db = scoped_session(session, &step.prefix).map_err(&fail)?;
     match &step.write {
         ControlWrite::Create {
             name: branch,
@@ -2086,7 +2551,7 @@ async fn run_control_step(
 }
 
 async fn run_mutate_step(
-    db: &Omnigraph,
+    session: &Session,
     mode: Option<&'static str>,
     step: &MutateStep,
     binding: Option<(&str, &str)>,
@@ -2114,7 +2579,7 @@ async fn run_mutate_step(
     };
     let (outcome, counts) = under_traversal(
         mode,
-        db.mutate(&step.branch, &step.source, &step.name, &params),
+        session.mutate(&step.branch, &step.source, &step.name, &params),
     )
     .await;
     let outcome = outcome.inspect_err(dst_runner::observe_fault);
@@ -2158,10 +2623,13 @@ async fn run_mutate_step(
     }
 }
 
-/// A fresh store for one case: init from the schema, seed, and build indices
-/// when the case needs them. The tempdir rides along so the store outlives
-/// the call.
-async fn open_case_store(case: &Case) -> Result<(Omnigraph, String, tempfile::TempDir), String> {
+/// A fresh store for one case: init from the schema, the case session over
+/// it, seed, and build indices when the case needs them. The tempdir rides
+/// along so the store outlives the call.
+async fn open_case_store(
+    case: &Case,
+    engine: Engine,
+) -> Result<(Session, String, tempfile::TempDir), String> {
     let dir = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
     let uri = dir
         .path()
@@ -2171,18 +2639,37 @@ async fn open_case_store(case: &Case) -> Result<(Omnigraph, String, tempfile::Te
     let db = Omnigraph::init(&uri, &case.schema)
         .await
         .map_err(|e| format!("init failed: {e}"))?;
-    seed_case(&db, case).await?;
-    Ok((db, uri, dir))
+    let session = case_session(db, case, engine)?;
+    seed_case(&session, case).await?;
+    Ok((session, uri, dir))
 }
 
-async fn seed_case(db: &Omnigraph, case: &Case) -> Result<(), String> {
+/// The case session: the definition's defaults over the fresh handle, the
+/// runner's `engine` (`OMNIGRAPH_GQ_ENGINE`) as the baseline `engine` row,
+/// then the `# traversal:` pin on the harness-only field no `show` reports.
+fn case_session(db: Omnigraph, case: &Case, engine: Engine) -> Result<Session, String> {
+    let mut settings = SessionSettings::default()
+        .with("engine", engine.as_str())
+        .map_err(|e| format!("invalid_case: {e}"))?;
+    if let Some(mode) = case.traversal {
+        let pinned = Traversal::from_spelling(mode).ok_or_else(|| {
+            format!("`# traversal: {mode}` refused: expected one of auto, indexed, csr")
+        })?;
+        settings = settings.with_traversal(pinned);
+    }
+    Ok(Session::from_defaults(Arc::new(db), settings))
+}
+
+async fn seed_case(session: &Session, case: &Case) -> Result<(), String> {
     if !case.seed.trim().is_empty() {
-        load_jsonl(db, &case.seed, LoadMode::Overwrite)
+        session
+            .load_jsonl(&case.seed, LoadMode::Overwrite)
             .await
             .map_err(|e| format!("seed load failed: {e}"))?;
     }
     if case.needs_indices {
-        db.ensure_indices()
+        session
+            .ensure_indices()
             .await
             .map_err(|e| format!("ensure_indices failed: {e}"))?;
     }
@@ -2197,12 +2684,29 @@ fn execute_case<'a>(
     path: &'a Path,
     bless: bool,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
-    execute_case_inner(case, path, bless).boxed()
+    match engine_from_env() {
+        Ok(engine) => execute_case_on_engine(case, path, bless, engine),
+        Err(error) => futures::future::ready(Err(error)).boxed(),
+    }
 }
 
-async fn execute_case_inner(case: &Case, path: &Path, bless: bool) -> Result<(), String> {
-    let (db, uri, _dir) = open_case_store(case).await?;
-    execute_steps(case, path, bless, db, &uri, None).await
+fn execute_case_on_engine<'a>(
+    case: &'a Case,
+    path: &'a Path,
+    bless: bool,
+    engine: Engine,
+) -> futures::future::BoxFuture<'a, Result<(), String>> {
+    execute_case_inner(case, path, bless, engine).boxed()
+}
+
+async fn execute_case_inner(
+    case: &Case,
+    path: &Path,
+    bless: bool,
+    engine: Engine,
+) -> Result<(), String> {
+    let (session, uri, _dir) = open_case_store(case, engine).await?;
+    execute_steps(case, path, bless, session, &uri, None).await
 }
 
 #[cfg(tokio_unstable)]
@@ -2211,30 +2715,32 @@ async fn execute_case_with_storage(
     path: &Path,
     uri: &str,
     storage: Arc<dyn StorageAdapter>,
+    engine: Engine,
 ) -> Result<(), String> {
     let db = Omnigraph::init_with_storage(uri, &case.schema, storage.clone(), Default::default())
         .await
         .map_err(|e| format!("init failed: {e}"))?;
-    seed_case(&db, case).await?;
-    execute_steps(case, path, false, db, uri, Some(storage)).await
+    let session = case_session(db, case, engine)?;
+    seed_case(&session, case).await?;
+    execute_steps(case, path, false, session, uri, Some(storage)).await
 }
 
 fn execute_steps<'a>(
     case: &'a Case,
     path: &'a Path,
     bless: bool,
-    db: Omnigraph,
+    session: Session,
     uri: &'a str,
     storage: Option<Arc<dyn StorageAdapter>>,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
-    execute_steps_inner(case, path, bless, db, uri, storage).boxed()
+    execute_steps_inner(case, path, bless, session, uri, storage).boxed()
 }
 
 async fn execute_steps_inner(
     case: &Case,
     path: &Path,
     bless: bool,
-    mut db: Omnigraph,
+    mut session: Session,
     uri: &str,
     storage: Option<Arc<dyn StorageAdapter>>,
 ) -> Result<(), String> {
@@ -2266,7 +2772,13 @@ async fn execute_steps_inner(
                 dst_runner::record(
                     "expectation",
                     match step {
-                        Step::Query(q) => read_expect_evidence(&q.expect),
+                        Step::Query(q) => {
+                            let mut evidence = read_expect_evidence(&q.expect);
+                            if let Some(plan) = &q.plan {
+                                evidence["plan"] = serde_json::json!(plan.lines);
+                            }
+                            evidence
+                        }
                         Step::List(l) => read_expect_evidence(&l.expect),
                         Step::Mutate(m) => match &m.expect {
                             MutateExpect::Ok => serde_json::json!({"kind": "ok"}),
@@ -2280,42 +2792,79 @@ async fn execute_steps_inner(
                         Step::Control(c) => {
                             serde_json::json!({"control": c.name, "expectation": format!("{:?}", c.write)})
                         }
+                        Step::Settings(s) => {
+                            serde_json::json!({"kind": "settings", "statements": format!("{:?}", s.statements)})
+                        }
+                        Step::Show(s) => read_expect_evidence(&s.expect),
                         Step::Restart { .. } => {
                             serde_json::json!({"kind": "restart", "storage": "preserved"})
                         }
                     },
                 );
-                let fault = case.faults.get(&ordinal);
-                let guard = dst_runner::arm_fault(fault)?;
+                let seams = case.seams.get(&ordinal).map_or(&[][..], Vec::as_slice);
+                let armed = dst_runner::arm_seams(seams, step)?;
                 let lifetime_before = dst_runner::lifetime_counts();
                 let outcome = match step {
-                    Step::Query(q) => run_query_step(&db, case.traversal, q, binding).await,
-                    Step::Mutate(m) => run_mutate_step(&db, case.traversal, m, binding).await,
-                    Step::Control(c) => run_control_step(&db, c, binding).await,
-                    Step::List(l) => run_list_step(&db, l, binding).await,
+                    Step::Query(q) => {
+                        run_query_step(&session, pinned_mode(&session), q, binding).await
+                    }
+                    Step::Mutate(m) => {
+                        run_mutate_step(&session, pinned_mode(&session), m, binding).await
+                    }
+                    Step::Control(c) => run_control_step(&session, c, binding).await,
+                    Step::List(l) => run_list_step(&session, l, binding).await,
+                    Step::Settings(s) => run_settings_step(&mut session, s, binding),
+                    Step::Show(s) => run_show_step(&session, s, binding),
                     Step::Restart { ordinal } => {
-                        drop(db);
                         generation += 1;
                         dst_runner::observe(|| format!("lifetime: reopen generation {generation}"));
+                        let detached = session.detach();
                         let reopened = match &storage {
                             Some(storage) => {
                                 Omnigraph::open_with_storage(uri, storage.clone()).await
                             }
                             None => Omnigraph::open(uri).await,
                         };
-                        db = reopened.map_err(|e| {
-                            format!(
-                                "{}: reopen failed: {e}",
-                                step_label(*ordinal, "restart", binding)
-                            )
-                        })?;
+                        session = match reopened {
+                            Ok(db) => detached.attach(Arc::new(db)),
+                            Err(error) => {
+                                dst_runner::observe_fault(&error);
+                                let lifetime_after = dst_runner::lifetime_counts();
+                                dst_runner::record(
+                                    "engine_lifetime",
+                                    serde_json::json!({"before": lifetime_before, "after": lifetime_after}),
+                                );
+                                if let (Some(before), Some(after)) =
+                                    (lifetime_before, lifetime_after)
+                                    && (after[0] != before[0] || after[1] > before[1] + 1)
+                                {
+                                    return Err(format!(
+                                        "worker_failed: unexpected engine init/open call during step {ordinal}: {before:?} -> {after:?}"
+                                    ));
+                                }
+                                let fail = StepFail {
+                                    label: step_label(*ordinal, "restart", binding),
+                                    message: format!("reopen failed: {error}"),
+                                    bless_lines: None,
+                                };
+                                dst_runner::record(
+                                    "assertion",
+                                    serde_json::json!({"status": "failed", "code": "assertion_failed", "message": fail.message}),
+                                );
+                                dst_runner::observe(|| {
+                                    format!(
+                                        "operation result: Err({:?})",
+                                        (&fail.label, &fail.message)
+                                    )
+                                });
+                                first_fail = Some(fail);
+                                break 'run;
+                            }
+                        };
                         Ok(())
                     }
                 };
-                #[cfg(tokio_unstable)]
-                drop(guard);
-                #[cfg(not(tokio_unstable))]
-                let _ = guard;
+                let seam_result = dst_runner::finish_seams(armed);
                 let lifetime_after = dst_runner::lifetime_counts();
                 dst_runner::record(
                     "engine_lifetime",
@@ -2329,7 +2878,6 @@ async fn execute_steps_inner(
                         ));
                     }
                 }
-                let fault_result = dst_runner::finish_fault(fault);
                 dst_runner::record(
                     "assertion",
                     match &outcome {
@@ -2345,14 +2893,14 @@ async fn execute_steps_inner(
                         outcome.as_ref().map_err(|f| (&f.label, &f.message))
                     )
                 });
-                if let Err(error) = fault_result {
+                if let Err(error) = seam_result {
                     return Err(format!(
                         "{error}; operation result: {:?}",
                         outcome.as_ref().map_err(|f| (&f.label, &f.message))
                     ));
                 }
                 if storage.is_some() {
-                    let snapshot = db
+                    let snapshot = session
                         .resolve_snapshot("main")
                         .await
                         .map_err(|e| format!("observe main snapshot: {e}"))?;
@@ -2447,7 +2995,7 @@ pub async fn run_case(path: PathBuf, bless: bool) -> Result<(), String> {
     {
         return Err("DST cases require the file dispatcher; the async normal runner cannot execute mode: dst".into());
     }
-    case.runner.environments[0].admit(!case.faults.is_empty())?;
+    case.runner.environments[0].admit(!case.seams.is_empty())?;
     execute_case(&case, &path, bless).await
 }
 
@@ -2477,50 +3025,29 @@ pub fn bless_from_env() -> Result<bool, String> {
     }
 }
 
+/// The `engine` baseline of every case session, as `OMNIGRAPH_GQ_ENGINE`
+/// names it; `V1`, the definition's default, when unset.
+///
+/// # Errors
+///
+/// Refuses any value other than `v1`, `v2`, or empty.
+pub fn engine_from_env() -> Result<Engine, String> {
+    match std::env::var(ENGINE_ENV) {
+        Err(std::env::VarError::NotPresent) => Ok(Engine::V1),
+        Err(std::env::VarError::NotUnicode(v)) => Err(format!(
+            "invalid_case: {ENGINE_ENV} requires UTF-8, got {v:?}"
+        )),
+        Ok(v) if v.is_empty() => Ok(Engine::V1),
+        Ok(v) => Engine::from_spelling(&v).ok_or_else(|| {
+            format!("invalid_case: {ENGINE_ENV} takes v1 or v2 (or empty/unset), got `{v}`")
+        }),
+    }
+}
+
 /// The per-case wall-time budget: `OMNIGRAPH_GQ_CASE_TIMEOUT_SECS` or the
 /// default.
 pub fn case_budget_from_env() -> Duration {
     Duration::from_secs(env_positive(CASE_TIMEOUT_ENV).unwrap_or(DEFAULT_CASE_TIMEOUT_SECS))
-}
-
-/// Splits the corpus dir into `.gqt` case files and foreign entries; a
-/// foreign entry is a mis-renamed, nested, symlinked, dot-prefixed, or
-/// non-UTF-8-named case that would otherwise silently never run. The rule
-/// that RUNS a case is the test target's `datatest_stable::harness!` pattern
-/// (`tests/gq_logic_tests.rs`): a regular file (symlinks are not followed)
-/// with a UTF-8 name that ends in `.gqt` and does not start with `.`. This
-/// function mirrors that rule so `corpus_layout` refuses what the target
-/// would skip; `scripts/check-fix-regression.py` (`corpus_case`) mirrors
-/// the name half, and both self-tests walk one name battery. Dot-prefixed
-/// entries without a `.gqt` extension (`.DS_Store`, `.gitkeep`, and a file
-/// named exactly `.gqt`, which has no extension) are neither cases nor
-/// foreign: they are skipped, as the target skips every hidden file.
-pub fn list_cases(root: &Path) -> (Vec<PathBuf>, Vec<String>) {
-    let mut files = Vec::new();
-    let mut foreign = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                foreign.push(entry.file_name().to_string_lossy().into_owned());
-                continue;
-            };
-            let is_regular_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
-            let is_gqt =
-                is_regular_file && path.extension().and_then(|s| s.to_str()) == Some("gqt");
-            if name.starts_with('.') && !is_gqt {
-                continue;
-            }
-            if is_gqt && !name.starts_with('.') {
-                files.push(path);
-            } else {
-                foreign.push(name);
-            }
-        }
-    }
-    files.sort();
-    foreign.sort();
-    (files, foreign)
 }
 
 /// The case name: the file stem, or `<non-utf8>` for a name the corpus
@@ -2549,16 +3076,40 @@ pub fn env_positive(name: &str) -> Option<u64> {
     }
 }
 
-/// The production traversal path consults `OMNIGRAPH_TRAVERSAL_MODE`, so a set
-/// variable would silently decide which path an unpinned case exercises.
-pub fn traversal_override_refusal(value: Option<&OsStr>) -> Option<String> {
-    value.map(|v| {
-        format!(
-            "OMNIGRAPH_TRAVERSAL_MODE={} is set; logic tests run the production traversal \
-             path, unset it (a case that must run one path pins it with `# traversal:`)",
-            v.to_string_lossy()
-        )
-    })
+/// Variables that named a settings row once and name none now. A stale one in
+/// a CI environment decides nothing, and is refused anyway so no run reads as
+/// proof that its value took.
+pub(crate) const RETIRED_SETTING_ENVIRONMENT: [&str; 1] = ["OMNIGRAPH_TRAVERSAL_MODE"];
+
+/// A case runs under its own settings: `case_session` never reads the
+/// environment. The refusal keeps a stale variable in a CI environment from
+/// being mistaken for a live control, and keeps the retired names of
+/// [`RETIRED_SETTING_ENVIRONMENT`] from lingering. The first set variable, in
+/// definition order and then over the retired names, is the refusal.
+pub fn settings_override_refusal(
+    lookup: impl Fn(&'static str) -> Option<OsString>,
+) -> Option<String> {
+    DEFINITIONS
+        .iter()
+        .find_map(|spec| {
+            let value = lookup(spec.env)?;
+            Some(format!(
+                "{}={} is set; logic tests run under the case's own settings, unset it (a case \
+                 that must run one value writes `set {} = <value>;` in a `--- mutate` step)",
+                spec.env,
+                value.to_string_lossy(),
+                spec.name
+            ))
+        })
+        .or_else(|| {
+            RETIRED_SETTING_ENVIRONMENT.into_iter().find_map(|name| {
+                let value = lookup(name)?;
+                Some(format!(
+                    "{name}={} is set; it names no setting any more and decides nothing, unset it",
+                    value.to_string_lossy()
+                ))
+            })
+        })
 }
 
 pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {

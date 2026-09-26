@@ -17,9 +17,14 @@ on:
       - edited
       - labeled
       - unlabeled
+  # Required contexts must also report on the merge queue's branch; the gate
+  # passed on the pull request before it was queued, so the merge-group run
+  # reports without a check (docs/dev/branch-protection.md, Merge queue).
+  merge_group:
 
 concurrency:
-  group: fix-regression-gate-${{ github.event.pull_request.number }}
+  # A merge-group run has no pull request number; its ref is unique per entry.
+  group: fix-regression-gate-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -30,19 +35,26 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Report the merge-group run
+        if: github.event_name == 'merge_group'
+        run: echo "Merge-group run; the gate already passed on the pull request itself."
+
       # Base branch, full history: the checker and this diff's merge base.
       - name: Checkout base
+        if: github.event_name == 'pull_request_target'
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           fetch-depth: 0
 
       # The head as data only. `refs/pull/N/head` resolves for fork PRs too.
       - name: Fetch the pull request head
+        if: github.event_name == 'pull_request_target'
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
 
       - name: Check closed issues carry regressions
+        if: github.event_name == 'pull_request_target'
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
@@ -57,3 +69,9 @@ jobs:
             --labels "$PR_LABELS" \
             --repo "$GITHUB_REPOSITORY" \
             --range "$BASE_SHA...$HEAD_SHA"
+
+      - name: Refuse an event no step handles
+        if: github.event_name != 'pull_request_target' && github.event_name != 'merge_group'
+        run: |
+          echo "::error::Fix Regression Gate ran on ${GITHUB_EVENT_NAME}, which no step handles"
+          exit 1

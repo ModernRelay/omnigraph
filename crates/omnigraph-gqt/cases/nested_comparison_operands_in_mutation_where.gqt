@@ -1,0 +1,56 @@
+# issue: none
+# notes: A comparison, a null test or a `not` may be an operand of `=` in a mutation `where`, and each
+# notes: selects exactly the rows its Boolean value names.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    age: I64
+    nick: String?
+    adult: Bool
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a","age":40,"nick":"ann","adult":false}}
+{"type":"Person","data":{"slug":"b","age":20,"adult":false}}
+
+--- mutate
+query nested_comparison() {
+    update Person set { adult: true } where (age > 30) = true
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query nested_null_test() {
+    update Person set { nick: "bee" } where (nick is null) = true
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query nested_not() {
+    delete Person where (not (age > 30)) = true
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query remaining() {
+    match { $p: Person }
+    return { $p.slug, $p.nick, $p.adult }
+}
+
+--- expect unordered
+{"p.slug": "a", "p.nick": "ann", "p.adult": true}
+
+--- expect shape
+p.slug: String
+p.nick: String?
+p.adult: Bool

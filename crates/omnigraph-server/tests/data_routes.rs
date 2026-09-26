@@ -11,15 +11,17 @@ use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{HeaderValue, Method, Request, StatusCode};
 use futures::TryStreamExt;
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
 use omnigraph::{
     BLOB_READ_RANGE_MAX_BYTES, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy,
+    Session,
 };
 use omnigraph_server::api::{
     BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorCode, ErrorOutput, ExportRequest,
     GraphBatchLoadOutput, IngestRequest, QueryRequest, ReadRequest,
 };
-use omnigraph_server::{AppState, build_app};
+use omnigraph_server::{AppState, ProcessDefaults, build_app};
 use serde_json::{Value, json};
 use serial_test::serial;
 use tower::ServiceExt;
@@ -613,23 +615,27 @@ async fn blob_external_get_and_head_redirect_without_target_io() {
         ExternalBlobBase::new(external_base, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
     ])
     .unwrap();
-    let db = Omnigraph::init(graph.to_str().unwrap(), BLOB_HTTP_SCHEMA)
+    let db = Arc::new(
+        Omnigraph::init(graph.to_str().unwrap(), BLOB_HTTP_SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
+    Session::from_defaults(Arc::clone(&db), SessionSettings::default())
+        .load_jsonl(
+            &serde_json::json!({
+                "type": "Document",
+                "data": {"title": "external", "content": external_uri},
+            })
+            .to_string(),
+            LoadMode::Overwrite,
+        )
         .await
-        .unwrap()
-        .with_external_blob_policy(policy)
         .unwrap();
-    load_jsonl(
-        &db,
-        &serde_json::json!({
-            "type": "Document",
-            "data": {"title": "external", "content": external_uri},
-        })
-        .to_string(),
-        LoadMode::Overwrite,
-    )
-    .await
-    .unwrap();
     fs::remove_file(&external_path).unwrap();
+    let db = Arc::try_unwrap(db)
+        .unwrap_or_else(|_| panic!("the loading session is the only other holder and is gone"));
 
     let app = build_app(AppState::new(graph.to_string_lossy().to_string(), db));
     let uri = blob_uri("node", "Document", "external", "content", "");
@@ -746,7 +752,7 @@ async fn export_route_returns_jsonl_for_branch_snapshot() {
     let token = "demo-token";
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
-    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
     db.branch_create_from(ReadTarget::branch("main"), "feature")
         .await
         .unwrap();
@@ -1296,7 +1302,7 @@ async fn ingest_rejects_payloads_over_32_mib() {
 async fn divergent_alice_graph() -> tempfile::TempDir {
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
-    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
     db.branch_create_from(ReadTarget::branch("main"), "feature")
         .await
         .unwrap();
@@ -1347,6 +1353,7 @@ async fn branch_merge_conflict_response_includes_structured_conflicts() {
         source: "feature".to_string(),
         target: Some("main".to_string()),
         delete_branch: false,
+        settings: None,
     };
     let (status, body) = json_response(
         &app,
@@ -1657,6 +1664,21 @@ async fn branch_statement_refusals_name_the_door_and_the_envelope() {
             target_refusal,
         ),
         (
+            "/mutate",
+            json!({"query": EXPLAIN_ADULTS}),
+            "statement 'explain' is a read; use POST /query",
+        ),
+        (
+            "/change",
+            json!({"query": EXPLAIN_ADULTS}),
+            "the explain statement is not served on deprecated routes; use POST /query",
+        ),
+        (
+            "/read",
+            json!({"query_source": EXPLAIN_ADULTS}),
+            "the explain statement is not served on deprecated routes; use POST /query",
+        ),
+        (
             "/read",
             json!({"query_source": "branch list"}),
             deprecated_refusal,
@@ -1840,6 +1862,7 @@ async fn branch_merge_statement_conflict_matches_the_route_409() {
         source: "feature".to_string(),
         target: Some("main".to_string()),
         delete_branch: false,
+        settings: None,
     };
     let (route_status, route_body) = json_response(
         &app,
@@ -1873,6 +1896,595 @@ async fn branch_merge_statement_conflict_matches_the_route_409() {
     assert!(!error.merge_conflicts.is_empty());
 }
 
+const PROCESS_SETTING_NEEDLE: &str = "is a process setting";
+const UNKNOWN_VALUE_NEEDLE: &str = "expected one of off, on, verify";
+const UNKNOWN_SETTING_NEEDLE: &str = "unknown setting `turbo`";
+const SET_PARAMETER_SHAPE: &str = "query parameter 'set' takes <name>=<value>, got 'merge_lineage'";
+const NO_STATEMENT_NEEDLE: &str = "carries no statement";
+const SHOW_AT_WRITE_DOOR: &str = "statement 'show merge_lineage' is a read; use POST /query";
+const STATEMENT_AT_DEPRECATED_ROUTE: &str =
+    "branch statements are not served on deprecated routes; use POST /mutate or POST /query";
+const SETTINGS_AT_DEPRECATED_ROUTE: &str = "the deprecated /read and /change routes take no settings, neither a settings field nor a set or reset prefix; use POST /query or POST /mutate";
+const SHOW_COLUMNS: [&str; 5] = ["name", "value", "default", "source", "scope"];
+
+/// Every settings refusal is `ApiError::bad_request`: the message, the code,
+/// and nothing else in the body.
+fn assert_settings_refusal(status: StatusCode, body: &Value, error: &str) {
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body, &json!({"error": error, "code": "bad_request"}));
+}
+
+/// A refusal whose sentence the settings definition owns: the 400 and the
+/// claim, never the whole message, which the definition's own tests pin.
+fn assert_settings_refusal_needle(status: StatusCode, body: &Value, needle: &str) {
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "bad_request", "{body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(error.contains(needle), "{needle} not in {error}");
+}
+
+/// A `settings` field naming a `process` setting is serde's unknown-field
+/// refusal, projected into the same 400 body shape.
+async fn assert_unknown_settings_field(app: &axum::Router, request: Request<Body>) {
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let text = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{status}: {text}");
+    let body: Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("not a JSON error body: {text}"));
+    assert_eq!(body["code"], "bad_request", "{body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(error.contains("unknown field"), "{error}");
+    assert_eq!(body.as_object().unwrap().len(), 2, "{body}");
+}
+
+fn show_row(name: &str, value: &str, default: &str, source: &str, scope: &str) -> Value {
+    json!({"name": name, "value": value, "default": default, "source": source, "scope": scope})
+}
+
+/// The `show` answer for `rows`: `query_name` `show`, no target, the five
+/// string columns, no graph commit.
+fn show_output(rows: &[Value]) -> Value {
+    json!({
+        "query_name": "show",
+        "target": {"branch": null, "snapshot": null},
+        "row_count": rows.len(),
+        "columns": SHOW_COLUMNS,
+        "rows": rows,
+    })
+}
+
+/// The `merge_lineage` value the definition's defaults carry: `verify` in
+/// a debug build, the row's `on` otherwise.
+fn default_merge_lineage() -> &'static str {
+    if cfg!(debug_assertions) {
+        "verify"
+    } else {
+        "on"
+    }
+}
+
+/// The head of `main`: the commit with the largest graph manifest version.
+async fn main_head_commit_id(app: &axum::Router) -> String {
+    let (status, out) = get_json(app, g("/commits?branch=main")).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    out["commits"]
+        .as_array()
+        .expect("commit list")
+        .iter()
+        .max_by_key(|commit| commit["graph_manifest_version"].as_u64().unwrap())
+        .expect("loaded graph has at least one commit")["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// `branch create <name>` then one insert on it, so a merge into `main`
+/// fast-forwards.
+async fn branch_one_commit_ahead(app: &axum::Router, name: &str, person: &str) {
+    let (status, body) = json_response(
+        app,
+        json_post(
+            "/mutate",
+            &json!({"query": format!("branch create {name}")}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = json_response(
+        app,
+        json_post(
+            "/mutate",
+            &json!({
+                "query": MUTATION_QUERIES,
+                "name": "insert_person",
+                "params": {"name": person, "age": 30},
+                "branch": name
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_process_setting_in_request_text_is_refused_at_both_doors() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({
+                "query": format!("set stage_write_concurrency = 8;\n{FIND_PERSON_GQ}"),
+                "params": {"name": "Alice"}
+            }),
+        ),
+    )
+    .await;
+    assert_settings_refusal_needle(status, &body, PROCESS_SETTING_NEEDLE);
+
+    let (status, body) = json_response(
+        &app,
+        json_post("/query", &json!({"query": "reset rrf_plan;\nshow all;"})),
+    )
+    .await;
+    assert_settings_refusal_needle(status, &body, PROCESS_SETTING_NEEDLE);
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/mutate",
+            &json!({
+                "query": format!("set stage_write_concurrency = 8;\n{MUTATION_QUERIES}"),
+                "name": "insert_person",
+                "params": {"name": "Pat", "age": 1}
+            }),
+        ),
+    )
+    .await;
+    assert_settings_refusal_needle(status, &body, PROCESS_SETTING_NEEDLE);
+}
+
+/// A `process` name in the `settings` field is refused, never dropped: the
+/// conditional mutation route, where the refusal must also leave the branch
+/// head where it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_field_with_a_process_name_is_an_unknown_field() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let head = main_head_commit_id(&app).await;
+    assert_unknown_settings_field(
+        &app,
+        Request::builder()
+            .uri(g("/mutate/if-graph-commit"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .header("omnigraph-if-graph-commit", &head)
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "query": MUTATION_QUERIES,
+                    "name": "set_age",
+                    "params": {"name": "Alice", "age": 42},
+                    "branch": "main",
+                    "settings": {"stage_write_concurrency": 8}
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        main_head_commit_id(&app).await,
+        head,
+        "a refused request has no effect"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_field_round_trips_through_show_and_text_overrides_it() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({"query": "show merge_lineage;", "settings": {"merge_lineage": "verify"}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        show_output(&[show_row(
+            "merge_lineage",
+            "verify",
+            "on",
+            "request",
+            "request"
+        )])
+    );
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({"query": "show merge_lineage;", "settings": {"merge_lineage": "off"}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        show_output(&[show_row("merge_lineage", "off", "on", "request", "request")])
+    );
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({
+                "query": "set merge_lineage = off;\nshow merge_lineage;",
+                "settings": {"merge_lineage": "verify"}
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        show_output(&[show_row("merge_lineage", "off", "on", "file", "request")])
+    );
+}
+
+/// `reset` in the text drops the field's value with it: the row returns to
+/// the process baseline, not to what the request asked for.
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_reset_in_text_returns_to_the_baseline_not_the_request_value() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({
+                "query": "reset merge_lineage;\nshow merge_lineage;",
+                "settings": {"merge_lineage": "off"}
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        show_output(&[show_row(
+            "merge_lineage",
+            default_merge_lineage(),
+            "on",
+            "default",
+            "request"
+        )])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_field_carries_ann_nprobes_into_the_session() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({"query": "show ann_nprobes;", "settings": {"ann_nprobes": 1}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        show_output(&[show_row("ann_nprobes", "1", "20", "request", "request")])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_show_all_lists_the_definition_in_order() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let (status, body) =
+        json_response(&app, json_post("/query", &json!({"query": "show all;"}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        show_output(&[
+            show_row("engine", "v1", "v1", "default", "request"),
+            show_row("rrf_plan", "auto", "auto", "default", "process"),
+            show_row(
+                "merge_lineage",
+                default_merge_lineage(),
+                "on",
+                "default",
+                "request"
+            ),
+            show_row("ann_nprobes", "20", "20", "default", "request"),
+            show_row("stage_write_concurrency", "8", "8", "default", "process"),
+        ])
+    );
+}
+
+/// The field is accepted and the conditional mutation lands; that the mode
+/// it names selects a classifier is the mode oracle's claim, pinned by
+/// `crates/omnigraph/tests/merge_cost.rs::merge_lineage_setting_selects_the_completed_classifier`.
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_field_is_accepted_at_the_conditional_mutation_route() {
+    fn conditional(body: &Value, expected_commit: &str) -> Request<Body> {
+        Request::builder()
+            .uri(g("/mutate/if-graph-commit"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .header("omnigraph-if-graph-commit", expected_commit)
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    }
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let head = main_head_commit_id(&app).await;
+    let (status, body) = json_response(
+        &app,
+        conditional(
+            &json!({
+                "query": MUTATION_QUERIES,
+                "name": "set_age",
+                "params": {"name": "Alice", "age": 41},
+                "branch": "main",
+                "settings": {"merge_lineage": "off"}
+            }),
+            &head,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["affected_nodes"], 1, "{body}");
+    assert_ne!(
+        main_head_commit_id(&app).await,
+        head,
+        "the conditional mutation landed a commit"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_show_is_refused_at_the_write_door_and_the_deprecated_read_door() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let (status, body) = json_response(
+        &app,
+        json_post("/mutate", &json!({"query": "show merge_lineage;"})),
+    )
+    .await;
+    assert_settings_refusal(status, &body, SHOW_AT_WRITE_DOOR);
+
+    let (status, body) = json_response(
+        &app,
+        json_post("/read", &json!({"query_source": "show merge_lineage;"})),
+    )
+    .await;
+    assert_settings_refusal(status, &body, STATEMENT_AT_DEPRECATED_ROUTE);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_field_is_refused_at_the_deprecated_change_route() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let mutation = "mutation add_person($name: String) {\n    insert Person { name: $name }\n}";
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/change",
+            &json!({
+                "query_source": mutation,
+                "params": {"name": "Zed"},
+                "settings": {"merge_lineage": "off"}
+            }),
+        ),
+    )
+    .await;
+    assert_settings_refusal(status, &body, SETTINGS_AT_DEPRECATED_ROUTE);
+
+    assert_unknown_settings_field(
+        &app,
+        json_post(
+            "/change",
+            &json!({
+                "query_source": mutation,
+                "params": {"name": "Zed"},
+                "settings": {"stage_write_concurrency": 64}
+            }),
+        ),
+    )
+    .await;
+}
+
+/// Both carriers meet the same refusal at both deprecated routes, which
+/// serve their legacy bodies under the process defaults alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_field_and_prefix_are_refused_at_the_deprecated_routes() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/read",
+            &json!({
+                "query_source": FIND_PERSON_GQ,
+                "params": {"name": "Alice"},
+                "settings": {"merge_lineage": "off"}
+            }),
+        ),
+    )
+    .await;
+    assert_settings_refusal(status, &body, SETTINGS_AT_DEPRECATED_ROUTE);
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/read",
+            &json!({
+                "query_source": format!("set merge_lineage = off;\n{FIND_PERSON_GQ}"),
+                "params": {"name": "Alice"}
+            }),
+        ),
+    )
+    .await;
+    assert_settings_refusal(status, &body, SETTINGS_AT_DEPRECATED_ROUTE);
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/change",
+            &json!({
+                "query": format!("set merge_lineage = off;\n{MUTATION_QUERIES}"),
+                "name": "insert_person",
+                "params": {"name": "Dep", "age": 2}
+            }),
+        ),
+    )
+    .await;
+    assert_settings_refusal(status, &body, SETTINGS_AT_DEPRECATED_ROUTE);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_a_file_of_only_set_lines_is_refused_at_both_doors() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    for door in ["/query", "/mutate"] {
+        let (status, body) = json_response(
+            &app,
+            json_post(door, &json!({"query": "set merge_lineage = off;"})),
+        )
+        .await;
+        assert_settings_refusal_needle(status, &body, NO_STATEMENT_NEEDLE);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_set_parameter_on_the_change_routes_follows_the_definition() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let commit_id = load_commit(&app, r#"{"type":"Person","data":{"name":"S1","age":1}}"#).await;
+
+    let cases: [(&str, Option<&str>); 6] = [
+        ("set=merge_lineage=off", None),
+        ("set=engine=v2", None),
+        ("set=merge_lineage=both", Some(UNKNOWN_VALUE_NEEDLE)),
+        (
+            "set=stage_write_concurrency=8",
+            Some(PROCESS_SETTING_NEEDLE),
+        ),
+        ("set=turbo=v2", Some(UNKNOWN_SETTING_NEEDLE)),
+        ("set=merge_lineage", Some(SET_PARAMETER_SHAPE)),
+    ];
+    for (query, refusal) in cases {
+        let uri = format!("/changes?start=now&{query}");
+        let (status, body) = get_json(&app, g(&uri)).await;
+        match refusal {
+            None => assert_eq!(status, StatusCode::OK, "{uri}: {body}"),
+            Some(needle) => assert_settings_refusal_needle(status, &body, needle),
+        }
+    }
+
+    let uri = format!("/commits/{commit_id}/changes?set=merge_lineage=off");
+    let (status, body) = get_json(&app, g(&uri)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the commit-diff route takes the same parameter: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_reset_all_at_the_http_door_returns_to_the_process_defaults() {
+    let (settings, sources) = omnigraph::settings::from_env_with(|variable| {
+        (variable == "OMNIGRAPH_ANN_NPROBES").then(|| "5".to_string())
+    })
+    .unwrap();
+    let (_temp, app) =
+        app_for_loaded_graph_with_process_defaults(ProcessDefaults { settings, sources }).await;
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({"query": "set engine = v2;\nset merge_lineage = off;\nreset all;\nshow all;"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["rows"][0],
+        show_row("engine", "v1", "v1", "default", "request"),
+        "{body}"
+    );
+    assert_eq!(
+        body["rows"][2],
+        show_row(
+            "merge_lineage",
+            default_merge_lineage(),
+            "on",
+            "default",
+            "request"
+        ),
+        "{body}"
+    );
+    assert_eq!(
+        body["rows"][3],
+        show_row("ann_nprobes", "5", "20", "env", "request"),
+        "reset all returns to the process value, not the definition's: {body}"
+    );
+}
+
+/// Both carriers are accepted at `branch merge` and the merge runs; that the
+/// mode they name selects a classifier is the mode oracle's claim, pinned by
+/// `crates/omnigraph/tests/merge_cost.rs::merge_lineage_setting_selects_the_completed_classifier`.
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_field_and_prefix_are_accepted_at_branch_merge() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    branch_one_commit_ahead(&app, "feature", "Fay").await;
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/branches/merge",
+            &json!({"source": "feature", "target": "main", "settings": {"merge_lineage": "off"}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "fast_forward", "{body}");
+
+    branch_one_commit_ahead(&app, "feature2", "Gus").await;
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/mutate",
+            &json!({"query": "set merge_lineage = off;\nbranch merge feature2 into main;"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["branch"], "main");
+    assert_eq!(body["query_name"], "branch merge");
+    assert_eq!(
+        body["outcome"],
+        json!({"kind": "merged", "source": "feature2", "target": "main", "merge": "fast_forward"})
+    );
+    assert!(
+        body["commit"]["graph_commit_id"].is_string(),
+        "a fast-forward moves main to the commit authored on feature2: {body}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn repeated_read_after_change_sees_updated_state_from_same_app() {
     let (_temp, app) = app_for_loaded_graph().await;
@@ -1882,6 +2494,7 @@ async fn repeated_read_after_change_sees_updated_state_from_same_app() {
         name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Mina", "age": 28 })),
         branch: Some("main".to_string()),
+        settings: None,
     };
     let (change_status, change_body) = json_response(
         &app,
@@ -1902,6 +2515,7 @@ async fn repeated_read_after_change_sees_updated_state_from_same_app() {
         params: Some(json!({ "name": "Mina" })),
         branch: Some("main".to_string()),
         snapshot: None,
+        settings: None,
     };
     let (read_status, read_body) = json_response(
         &app,
@@ -1928,6 +2542,7 @@ async fn query_endpoint_runs_inline_read() {
         params: Some(json!({ "name": "Alice" })),
         branch: Some("main".to_string()),
         snapshot: None,
+        settings: None,
     };
     let (status, body) = json_response(
         &app,
@@ -1945,6 +2560,196 @@ async fn query_endpoint_runs_inline_read() {
     assert_eq!(body["rows"][0]["p.name"], "Alice");
 }
 
+const EXPLAIN_ADULTS: &str = "explain query adults() {\n    match {\n        $p: Person\n        $p.age > 30\n    }\n    return { $p.name }\n}\n";
+
+/// One tree of an `explain` answer, rebuilt from its pre-order rows: a node
+/// is its `detail` fields plus `node`, its children the rows one level deeper
+/// that follow it.
+fn explain_tree(body: &Value, tree: &str) -> Value {
+    fn build(rows: &[&Value], index: &mut usize, depth: i64) -> Value {
+        let row = rows[*index];
+        *index += 1;
+        let mut node: serde_json::Map<String, Value> =
+            serde_json::from_str(row["detail"].as_str().unwrap())
+                .unwrap_or_else(|err| panic!("{err}: {row}"));
+        node.insert("node".to_string(), row["node"].clone());
+        let mut inputs = Vec::new();
+        while *index < rows.len() && rows[*index]["depth"] == depth + 1 {
+            inputs.push(build(rows, index, depth + 1));
+        }
+        node.insert("inputs".to_string(), Value::Array(inputs));
+        Value::Object(node)
+    }
+    let rows: Vec<&Value> = body["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("rows: {body}"))
+        .iter()
+        .filter(|row| row["tree"] == tree)
+        .collect();
+    assert!(!rows.is_empty(), "no `{tree}` rows: {body}");
+    assert_eq!(rows[0]["depth"], 0, "{body}");
+    let mut index = 0;
+    let root = build(&rows, &mut index, 0);
+    assert_eq!(
+        index,
+        rows.len(),
+        "every `{tree}` row hangs off the root: {body}"
+    );
+    root
+}
+
+/// The `plan` rows of an `explain` answer whose `node` is `name`, as details.
+fn explain_plan_rows<'a>(body: &'a Value, name: &str) -> Vec<&'a str> {
+    body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["tree"] == "plan" && row["node"] == name)
+        .map(|row| {
+            assert!(row.get("depth").is_none(), "{row}");
+            row["detail"].as_str().unwrap()
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_endpoint_answers_an_explain_statement_as_rows() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({"query": EXPLAIN_ADULTS, "branch": "main"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["query_name"], "adults");
+    assert_eq!(body["columns"], json!(["tree", "depth", "node", "detail"]));
+    assert_eq!(body["rows"][0]["tree"], "logical", "{body}");
+    let logical = explain_tree(&body, "logical");
+    assert!(logical["node"].is_string(), "{logical}");
+    assert_eq!(
+        logical["inputs"][0]["table"], "node:Person",
+        "the logical tree scans Person: {logical}"
+    );
+    assert_eq!(
+        logical["inputs"][0]["filter"]["reads"],
+        json!([{"binding": "p", "property": "age"}]),
+        "the age filter is pushed into the scan: {logical}"
+    );
+    assert_eq!(
+        logical["inputs"][0]["filter"]["text"], "$p.age > 30",
+        "the filter prints as GQ: {logical}"
+    );
+    assert!(
+        logical["inputs"][0].get("side").is_none()
+            && logical["inputs"][0].get("fragments").is_none(),
+        "a query scan carries no diff-side or substrate fields: {logical}"
+    );
+    let physical = explain_tree(&body, "physical");
+    assert!(physical["node"].is_string(), "{physical}");
+    assert!(
+        !explain_plan_rows(&body, "pass").is_empty(),
+        "one plan row per fired pass: {body}"
+    );
+    assert_eq!(explain_plan_rows(&body, "route"), vec!["engine"], "{body}");
+    assert!(
+        explain_plan_rows(&body, "logical_hash")[0].len() == 16,
+        "{body}"
+    );
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({"query": EXPLAIN_ADULTS, "name": "adults", "snapshot": "0123456789abcdef"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({"query": EXPLAIN_INSERT_PERSON, "name": "insert_person"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"], "`explain` applies to a read query; 'insert_person' contains mutations",
+        "{body}"
+    );
+}
+
+const EXPLAIN_INSERT_PERSON: &str = "explain query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}\n";
+
+const EXPLAIN_OLDER_PAIRS: &str = "explain query older_pairs() {\n    match {\n        $a: Person\n        $b: Person\n        $a.age > $b.age\n    }\n    return { $a.name, $b.name }\n}\n";
+
+/// The `explain` answer lists the lowered DataFusion tree after the physical
+/// tree: a filter over two bindings, which no scan can take, is a
+/// `FilterExec` over the `CrossJoinExec` of the two `ScanExec` rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_endpoint_explain_lists_the_lowered_datafusion_tree() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({"query": EXPLAIN_OLDER_PAIRS, "branch": "main"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body["rows"].as_array().unwrap();
+    let mut trees: Vec<&str> = Vec::new();
+    for row in rows {
+        let tree = row["tree"].as_str().unwrap();
+        if trees.last() != Some(&tree) {
+            trees.push(tree);
+        }
+    }
+    assert_eq!(
+        trees,
+        vec!["logical", "physical", "datafusion", "plan"],
+        "the three trees then the plan rows: {body}"
+    );
+    let datafusion: Vec<&Value> = rows
+        .iter()
+        .filter(|row| row["tree"] == "datafusion")
+        .collect();
+    assert_eq!(datafusion[0]["depth"], 0, "{body}");
+    let filter = datafusion
+        .iter()
+        .find(|row| row["node"] == "FilterExec")
+        .unwrap_or_else(|| panic!("a filter over two bindings is a FilterExec row: {body}"));
+    let predicate = filter["detail"].as_str().unwrap();
+    assert!(
+        predicate.contains("a.age") && predicate.contains("b.age"),
+        "the predicate reads both bindings: {predicate}"
+    );
+    assert_eq!(
+        datafusion
+            .iter()
+            .filter(|row| row["node"] == "ScanExec")
+            .count(),
+        2,
+        "one ScanExec per binding: {body}"
+    );
+    assert!(
+        datafusion.iter().any(|row| row["node"] == "CrossJoinExec"),
+        "{body}"
+    );
+    assert!(
+        explain_plan_rows(&body, "datafusion").is_empty(),
+        "the tree is available, so no `datafusion` plan row: {body}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn query_endpoint_rejects_mutation_with_400() {
     let (_temp, app) = app_for_loaded_graph().await;
@@ -1955,6 +2760,7 @@ async fn query_endpoint_rejects_mutation_with_400() {
         params: Some(json!({ "name": "Should", "age": 1 })),
         branch: Some("main".to_string()),
         snapshot: None,
+        settings: None,
     };
     let (status, body) = json_response(
         &app,
@@ -2425,6 +3231,7 @@ async fn read_endpoint_emits_deprecation_headers() {
         params: Some(json!({ "name": "Alice" })),
         branch: Some("main".to_string()),
         snapshot: None,
+        settings: None,
     };
     let response = app
         .clone()
@@ -2479,6 +3286,7 @@ async fn query_endpoint_does_not_emit_deprecation_headers() {
         params: Some(json!({ "name": "Alice" })),
         branch: Some("main".to_string()),
         snapshot: None,
+        settings: None,
     };
     let response = app
         .clone()
@@ -2517,6 +3325,7 @@ async fn query_rows_omit_null_cells() {
         params: None,
         branch: Some("main".to_string()),
         snapshot: None,
+        settings: None,
     };
     let response = app
         .clone()
@@ -2640,6 +3449,7 @@ async fn remote_branch_list_create_merge_flow_works() {
         name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Zoe", "age": 33 })),
         branch: Some("feature".to_string()),
+        settings: None,
     };
     let (change_status, change_body) = json_response(
         &app,
@@ -2661,6 +3471,7 @@ async fn remote_branch_list_create_merge_flow_works() {
         params: Some(json!({ "name": "Zoe" })),
         branch: Some("main".to_string()),
         snapshot: None,
+        settings: None,
     };
     let (read_status, read_body) = json_response(
         &app,
@@ -2679,6 +3490,7 @@ async fn remote_branch_list_create_merge_flow_works() {
         source: "feature".to_string(),
         target: Some("main".to_string()),
         delete_branch: false,
+        settings: None,
     };
     let (merge_status, merge_body) = json_response(
         &app,
@@ -2701,6 +3513,7 @@ async fn remote_branch_list_create_merge_flow_works() {
         params: Some(json!({ "name": "Zoe" })),
         branch: Some("main".to_string()),
         snapshot: None,
+        settings: None,
     };
     let (read_status, read_body) = json_response(
         &app,
@@ -2787,6 +3600,7 @@ async fn branch_merge_delete_branch_retires_parent_with_live_child() {
         name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Zoe", "age": 33 })),
         branch: Some("feature".to_string()),
+        settings: None,
     };
     let (change_status, _) = json_response(
         &app,
@@ -2820,6 +3634,7 @@ async fn branch_merge_delete_branch_retires_parent_with_live_child() {
         source: "feature".to_string(),
         target: Some("main".to_string()),
         delete_branch: true,
+        settings: None,
     };
     let (merge_status, merge_body) = json_response(
         &app,
@@ -2873,6 +3688,7 @@ async fn branch_merge_delete_branch_refusal_is_non_fatal() {
         source: "main".to_string(),
         target: Some("feature".to_string()),
         delete_branch: true,
+        settings: None,
     };
     let (merge_status, merge_body) = json_response(
         &app,
@@ -2993,6 +3809,7 @@ query vector_search_string($q: String) {
         params: Some(json!({ "q": "alpha" })),
         branch: Some("main".to_string()),
         snapshot: None,
+        settings: None,
     };
     let (status, body) = json_response(
         &app,
@@ -3026,7 +3843,7 @@ async fn change_long_lived_handle_refreshes_before_preparing_write() {
     let app = build_app(state);
 
     {
-        let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+        let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
         db.mutate(
             "main",
             MUTATION_QUERIES,
@@ -3056,6 +3873,7 @@ async fn change_long_lived_handle_refreshes_before_preparing_write() {
                     name: Some("set_age".to_string()),
                     params: Some(json!({ "name": "Alice", "age": 33 })),
                     branch: Some("main".to_string()),
+                    settings: None,
                 })
                 .unwrap(),
             ))
@@ -3099,6 +3917,7 @@ async fn change_concurrent_inserts_same_key_serialize_without_409() {
                 name: Some("insert_person".to_string()),
                 params: Some(json!({ "name": format!("racer-{i}"), "age": i as i32 })),
                 branch: Some("main".to_string()),
+                settings: None,
             })
             .unwrap();
             let req = Request::builder()
@@ -3187,6 +4006,7 @@ async fn change_concurrent_updates_same_key_return_typed_pre_effect_conflicts() 
                 name: Some("set_age".to_string()),
                 params: Some(json!({ "name": "Alice", "age": target_age })),
                 branch: Some("main".to_string()),
+                settings: None,
             })
             .unwrap();
             let req = Request::builder()
@@ -3257,7 +4077,15 @@ async fn change_concurrent_updates_same_key_return_typed_pre_effect_conflicts() 
         let conflict = error
             .read_set_conflict
             .expect("strict OCC loser must include structured read-set authority");
-        assert_eq!(conflict.member, "graph_head:main");
+        assert!(
+            matches!(
+                conflict.member.as_str(),
+                "graph_head:main" | "published_dataset_version:node:Person"
+            ),
+            "a strict loser is refused by the branch head, or by the table pin when it \
+             revalidates between the winner's detached table commit and its publish; got {}",
+            conflict.member
+        );
         assert_ne!(conflict.actual, conflict.expected);
         assert!(error.published_dataset_version_conflict.is_none());
         assert!(error.recovery_required.is_none());
@@ -3306,6 +4134,7 @@ query insert_c($name: String) {
                 name: Some("insert_p".to_string()),
                 params: Some(json!({ "name": format!("p-{i}"), "age": i as i32 })),
                 branch: Some("main".to_string()),
+                settings: None,
             })
             .unwrap();
             let req = Request::builder()
@@ -3323,6 +4152,7 @@ query insert_c($name: String) {
                 name: Some("insert_c".to_string()),
                 params: Some(json!({ "name": format!("c-{i}") })),
                 branch: Some("main".to_string()),
+                settings: None,
             })
             .unwrap();
             let req = Request::builder()

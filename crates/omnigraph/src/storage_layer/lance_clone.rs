@@ -26,6 +26,8 @@ tokio::task_local! {
 struct CloneContext {
     operation: transaction::Clone,
     target: Path,
+    source: Path,
+    source_location: ManifestLocation,
     source_indices: Vec<IndexMetadata>,
     inline_fragment_reuse_details: HashMap<usize, Vec<u8>>,
     expected_bases: HashMap<u32, BasePath>,
@@ -79,11 +81,29 @@ impl CloneContext {
         Ok(Self {
             operation,
             target: source.branch_location().find_branch(Some(branch))?.path,
+            source: source.branch_location().path,
+            source_location: source.manifest_location().clone(),
             source_indices,
             inline_fragment_reuse_details,
             expected_bases,
             new_base_id,
         })
+    }
+
+    /// Reuse only canonical, immutable main-version metadata within this clone.
+    /// Lance still reads the source bytes and verifies existence before ref publication.
+    fn main_source_location(&self, base_path: &Path, version: u64) -> Option<ManifestLocation> {
+        let location = &self.source_location;
+        (self.operation.ref_name.is_none()
+            && self.source == *base_path
+            && self.operation.ref_version == version
+            && location.version == version
+            && !lance_table::format::is_detached_version(version)
+            && location.naming_scheme == ManifestNamingScheme::V2
+            && location.path == ManifestNamingScheme::V2.manifest_path(base_path, version)
+            && location.size.is_some()
+            && location.e_tag.is_some())
+        .then(|| location.clone())
     }
 
     fn correct(
@@ -221,10 +241,14 @@ fn fragment_reuse_range(
 #[derive(Debug)]
 struct IndexOriginCommitHandler {
     inner: Arc<dyn CommitHandler>,
+    reuse_main_source_location: bool,
 }
 
 pub(crate) fn wrap_commit_handler(inner: Arc<dyn CommitHandler>) -> Arc<dyn CommitHandler> {
-    Arc::new(IndexOriginCommitHandler { inner })
+    Arc::new(IndexOriginCommitHandler {
+        inner,
+        reuse_main_source_location: false,
+    })
 }
 
 pub(crate) async fn configured_commit_handler(
@@ -232,11 +256,29 @@ pub(crate) async fn configured_commit_handler(
     params: &Option<lance::io::ObjectStoreParams>,
     existing: Option<Arc<dyn CommitHandler>>,
 ) -> Result<Arc<dyn CommitHandler>> {
-    let handler = match existing {
-        Some(handler) => handler,
-        None => lance_table::io::commit::commit_handler_from_url(uri, params).await?,
-    };
-    Ok(wrap_commit_handler(handler))
+    if let Some(handler) = existing {
+        return Ok(wrap_commit_handler(handler));
+    }
+    let reuse_main_source_location = url::Url::parse(uri).map_or(true, |url| {
+        matches!(
+            url.scheme(),
+            "file"
+                | "file-object-store"
+                | "s3"
+                | "gs"
+                | "az"
+                | "abfss"
+                | "memory"
+                | "oss"
+                | "tos"
+                | "shared-memory"
+                | "goosefs"
+        )
+    });
+    Ok(Arc::new(IndexOriginCommitHandler {
+        inner: lance_table::io::commit::commit_handler_from_url(uri, params).await?,
+        reuse_main_source_location,
+    }))
 }
 
 pub(crate) async fn write_params(
@@ -286,6 +328,12 @@ impl CommitHandler for IndexOriginCommitHandler {
         version: u64,
         object_store: &dyn RawObjectStore,
     ) -> Result<ManifestLocation> {
+        if self.reuse_main_source_location
+            && let Ok(Some(location)) =
+                CLONE_CONTEXT.try_with(|context| context.main_source_location(base_path, version))
+        {
+            return Ok(location);
+        }
         self.inner
             .resolve_version_location(base_path, version, object_store)
             .await
@@ -443,6 +491,27 @@ mod tests {
         assert!(error.to_string().contains("configured resolver"));
         let dir = tempfile::tempdir().unwrap();
         let mut source = fresh_dataset(dir.path().join("init.lance").to_str().unwrap()).await;
+        let context = CloneContext::capture(&source, "child", source.version().version)
+            .await
+            .unwrap();
+        let location = source.manifest_location();
+        assert!(
+            context
+                .main_source_location(&source.branch_location().path, location.version)
+                .is_some()
+        );
+        let error = CLONE_CONTEXT
+            .scope(
+                context,
+                handler.resolve_version_location(
+                    &source.branch_location().path,
+                    location.version,
+                    &backend,
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("configured resolver"));
         let error = handler
             .commit(
                 Arc::make_mut(&mut source.manifest),
@@ -505,6 +574,7 @@ mod tests {
     use lance_index::IndexType;
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
     use lance_linalg::distance::MetricType;
+    use object_store::ObjectStoreExt;
     async fn fresh_dataset(uri: &str) -> Dataset {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
@@ -879,6 +949,27 @@ mod tests {
             (raw_cost.read_iops, raw_cost.write_iops),
             "raw={raw_cost:?}, engine={engine_cost:?}"
         );
+        assert!(engine.manifest_location().e_tag.is_some());
+        raw_store.io_stats_incremental();
+        engine_store.io_stats_incremental();
+        let raw_child = raw
+            .create_branch("read_cost", raw.version().version, None)
+            .await
+            .unwrap();
+        let raw_clone_cost = raw_store.io_stats_incremental();
+        let version = engine.version().version;
+        let engine_child = create_branch(&mut engine, "read_cost", version)
+            .await
+            .unwrap();
+        let engine_clone_cost = engine_store.io_stats_incremental();
+        assert_eq!(
+            engine_clone_cost.read_iops + 2,
+            raw_clone_cost.read_iops,
+            "raw={raw_clone_cost:?}, engine={engine_clone_cost:?}"
+        );
+        assert_eq!(engine_clone_cost.write_iops, raw_clone_cost.write_iops);
+        assert_eq!(raw_child.count_rows(None).await.unwrap(), 3);
+        assert_eq!(engine_child.count_rows(None).await.unwrap(), 3);
         for source in [&mut raw, &mut engine] {
             source
                 .create_index_builder(&["value"], IndexType::BTree, &ScalarIndexParams::default())
@@ -904,6 +995,51 @@ mod tests {
             );
         }
         assert!(CLONE_CONTEXT.try_with(|_| ()).is_err());
+    }
+
+    #[tokio::test]
+    async fn scoped_main_source_location_keeps_fallbacks_and_missing_source_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("source.lance");
+        let uri = uri.to_str().unwrap();
+        let mut source = fresh_dataset(uri).await;
+        let version = source.version().version;
+        let base = source.branch_location().path;
+        let mut context = CloneContext::capture(&source, "child", version)
+            .await
+            .unwrap();
+        let original = context.source_location.clone();
+        assert!(context.main_source_location(&base, version).is_some());
+        assert!(
+            context
+                .main_source_location(&Path::from("other"), version)
+                .is_none()
+        );
+        assert!(context.main_source_location(&base, version + 1).is_none());
+        context.source_location.e_tag = None;
+        assert!(context.main_source_location(&base, version).is_none());
+        context.source_location = original.clone();
+        context.source_location.size = None;
+        assert!(context.main_source_location(&base, version).is_none());
+        context.source_location = original.clone();
+        context.source_location.naming_scheme = ManifestNamingScheme::V1;
+        context.source_location.path = ManifestNamingScheme::V1.manifest_path(&base, version);
+        assert!(context.main_source_location(&base, version).is_none());
+        context.source_location = original.clone();
+        context.source_location.path = Path::from("custom/manifest");
+        assert!(context.main_source_location(&base, version).is_none());
+        context.source_location = original.clone();
+        for native in ["legacy", "feature.01ARZ3NDEKTSV4RRFFQ69G5FAV"] {
+            context.operation.ref_name = Some(native.to_string());
+            assert!(context.main_source_location(&base, version).is_none());
+        }
+        let store = source.object_store(None).await.unwrap();
+        store.inner.delete(&original.path).await.unwrap();
+        let error = create_branch(&mut source, "missing_source", version)
+            .await
+            .unwrap_err();
+        assert!(error.is_not_found(), "{error:?}");
+        assert!(source.list_branches().await.unwrap().is_empty());
     }
 
     async fn external_fragment_reuse_source(

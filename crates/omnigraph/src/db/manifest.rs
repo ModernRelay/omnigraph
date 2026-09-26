@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::branch_control::list_live_manifest_branch_contents;
 use crate::error::{OmniError, Result, missing_graph_type_at_snapshot};
+use crate::seams::{decide_seam, fail};
 use datafusion::logical_expr::Expr;
 use lance::Dataset;
 use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner};
@@ -14,7 +15,7 @@ use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::{SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_V3, SystemColumns};
 
 #[path = "manifest/graph.rs"]
-mod graph;
+pub(crate) mod graph;
 #[path = "manifest/layout.rs"]
 mod layout;
 #[path = "manifest/metadata.rs"]
@@ -24,17 +25,20 @@ mod migrations;
 // Entirely test-only since RFC-013 step 3a: with both reads (Fix 2) and writes
 // bypassing the Lance namespace, nothing in production routes through it; the
 // `LanceNamespace` impls are retained only to validate the contract in unit tests.
+#[path = "manifest/legacy_sidecars.rs"]
+mod legacy_sidecars;
 #[cfg(test)]
 #[path = "manifest/namespace.rs"]
 mod namespace;
 #[path = "manifest/publisher.rs"]
-mod publisher;
-#[path = "manifest/recovery.rs"]
-mod recovery;
+pub(crate) mod publisher;
+#[path = "manifest/retention.rs"]
+pub(crate) mod retention;
 #[path = "manifest/state.rs"]
 mod state;
+pub(crate) use retention::is_merge_input_tag;
 #[path = "manifest/upgrade.rs"]
-mod upgrade;
+pub(crate) mod upgrade;
 pub use upgrade::{
     UpgradeFinding, UpgradeMode, UpgradeOptions, UpgradeOutcome, UpgradeRecovery, UpgradeReport,
     UpgradeWork, upgrade_storage, upgrade_storage_as,
@@ -53,6 +57,9 @@ use layout::{
     open_manifest_dataset_native_with_session, open_manifest_dataset_with_identifier_with_session,
     open_manifest_dataset_with_session, resolve_native_manifest_branch, table_uri_for_path,
 };
+pub(crate) use legacy_sidecars::{
+    pending_legacy_sidecars, refuse_legacy_sidecars, refuse_pending_recovery,
+};
 pub(crate) use metadata::TableVersionMetadata;
 #[cfg(test)]
 use metadata::{
@@ -63,21 +70,6 @@ pub(crate) use migrations::stamp_for_system_columns;
 use namespace::{branch_manifest_namespace, staged_table_namespace};
 pub(crate) use publisher::{GraphHeadExpectation, LineageIntent, PublishPrecondition};
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome};
-#[cfg(test)]
-pub(crate) use recovery::MAX_EFFECT_IDENTITY_SCAN_VERSIONS;
-pub(crate) use recovery::{
-    HealPendingOutcome, MAX_BRANCH_MERGE_DATA_TRANSACTIONS, RecoveryAuthorityToken,
-    RecoveryBranchMergeEffect, RecoveryBranchMergeEffectKind, RecoveryLineageIntent,
-    RecoveryManifestDelta, RecoveryMode, RecoverySchemaApplyEffect, RecoverySchemaApplyEffectKind,
-    RecoverySidecar, RecoverySidecarHandle, RecoveryTableUpdateSlot, SidecarKind, SidecarTablePin,
-    SidecarTableRegistration, SidecarTableRename, SidecarTombstone,
-    confirm_branch_merge_sidecar_v9, confirm_ensure_indices_sidecar_v9, confirm_occ_sidecar_v9,
-    confirm_schema_apply_sidecar_v9, delete_sidecar, ensure_read_only_schema_coherent,
-    finalize_effect_free_occ_sidecar, heal_pending_sidecars_roll_forward, list_sidecars,
-    new_branch_merge_sidecar_v9, new_ensure_indices_sidecar_v9, new_occ_sidecar_v9,
-    new_optimize_sidecar_v9, new_schema_apply_sidecar_v9, recover_failed_branch_merge_under_gates,
-    recover_manifest_drift, schema_apply_serial_queue_key, write_sidecar,
-};
 pub use state::DatasetEntry;
 #[cfg(test)]
 use state::string_column;
@@ -241,35 +233,6 @@ pub(crate) fn system_columns_at_image(
         )));
     }
     Ok(vintage)
-}
-
-/// Ephemeral native-table liveness proof derived from every live graph branch.
-/// Never persist or reuse this across the control-gate envelope that captured it.
-pub(crate) struct NativeForkReferences {
-    referenced: HashSet<(TableIdentity, String)>,
-    owned: HashSet<(TableIdentity, String)>,
-}
-
-impl NativeForkReferences {
-    #[cfg(test)]
-    pub(crate) fn contains(&self, identity: TableIdentity, native: &str) -> bool {
-        self.referenced.contains(&(identity, native.to_string()))
-    }
-
-    pub(crate) fn contains_tree(&self, identity: TableIdentity, tree: &str) -> bool {
-        self.referenced.iter().any(|(table, native)| {
-            *table == identity
-                && (native == tree
-                    || native
-                        .strip_prefix(tree)
-                        .is_some_and(|suffix| suffix.starts_with('/')))
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn owner_contains(&self, identity: TableIdentity, native: &str) -> bool {
-        self.owned.contains(&(identity, native.to_string()))
-    }
 }
 
 /// Read-only view of one backing dataset pinned by a [`Snapshot`].
@@ -575,6 +538,9 @@ impl Snapshot {
                         entry.native_dataset_branch.as_deref(),
                         entry.published_dataset_version,
                         entry.version_metadata.e_tag(),
+                        entry.version_metadata.staged_version(),
+                        entry.version_metadata.transaction_uuid(),
+                        entry.version_metadata.last_linear_version(),
                         &location,
                         Some(&caches.session),
                     )
@@ -709,33 +675,17 @@ async fn probe_dataset_latest_incarnation(
         })
     }
     .await;
-    let error = match held {
+    match held {
         Ok(incarnation) => return Ok(incarnation),
-        Err(error @ (OmniError::BranchNotFound { .. } | OmniError::Storage(_))) => error,
+        Err(OmniError::BranchNotFound { .. } | OmniError::Storage(_)) => {}
         Err(error) => return Err(error),
-    };
-    // The held native ref or its tree is gone. Under incarnation-suffixed refs
-    // a recreated branch lives at a new native ref, so re-resolve the logical
-    // name through the live registry: the replacement's identity is a
-    // guaranteed mismatch, and a deleted branch is a typed absence. Only a
-    // registry that still names the held ref makes the miss a real failure.
-    let live = crate::branch_control::list_live_manifest_branch_contents(dataset).await?;
-    let Some(native) =
-        crate::branch_names::resolve_native_branch(live.keys().map(String::as_str), branch)?
-    else {
-        return Err(OmniError::BranchNotFound {
-            branch: branch.to_string(),
-        });
-    };
-    if dataset.manifest().branch.as_deref() == Some(native.as_str()) {
-        return Err(error);
     }
+    let native = resolve_native_manifest_branch(dataset, branch).await?;
     let replacement = dataset
         .checkout_branch(&native)
         .await
         .map_err(|error| branch_ref_error(error, branch))?;
-    let branch_identifier = replacement
-        .branch_identifier()
+    let branch_identifier = crate::branch_control::dataset_branch_identifier(&replacement)
         .await
         .map_err(|error| branch_ref_error(error, branch))?;
     Ok(ManifestIncarnation {
@@ -816,6 +766,85 @@ pub(crate) struct TableTombstone {
     pub(crate) identity: TableIdentity,
     pub(crate) table_key: String,
     pub(crate) tombstone_version: u64,
+}
+
+/// A live graph branch's `__manifest` as the collector reads it: one open,
+/// every observation from that open, so a publication is visible to all of
+/// them or to none.
+#[derive(Clone)]
+pub(crate) struct CollectorBranch {
+    root_uri: String,
+    branch: Option<String>,
+    dataset: Dataset,
+    identifier: lance::dataset::refs::BranchIdentifier,
+}
+
+impl CollectorBranch {
+    pub(crate) fn head_version(&self) -> u64 {
+        self.dataset.version().version
+    }
+
+    pub(crate) fn identifier(&self) -> &lance::dataset::refs::BranchIdentifier {
+        &self.identifier
+    }
+
+    /// A fresh authority inventory; the held dataset caches no branch refs.
+    pub(crate) async fn live_identifiers(
+        &self,
+    ) -> Result<Vec<lance::dataset::refs::BranchIdentifier>> {
+        let mut identifiers =
+            crate::branch_control::list_live_manifest_branch_contents(&self.dataset)
+                .await?
+                .into_values()
+                .map(|contents| contents.identifier)
+                .collect::<Vec<_>>();
+        identifiers.push(lance::dataset::refs::BranchIdentifier::main());
+        Ok(identifiers)
+    }
+
+    pub(crate) fn dataset(&self) -> &Dataset {
+        &self.dataset
+    }
+
+    /// Capture lineage from the same immutable dataset as the table roots.
+    pub(crate) async fn commit_graph(&self) -> Result<crate::db::commit_graph::CommitGraph> {
+        let (rows, _) = read_graph_lineage(&self.dataset).await?;
+        Ok(crate::db::commit_graph::CommitGraph::from_manifest_rows(
+            &self.root_uri,
+            self.branch.as_deref(),
+            rows,
+        ))
+    }
+
+    /// The version history up to the opened version; a version published
+    /// after the open is listed by the store and dropped here.
+    pub(crate) async fn versions(&self) -> Result<Vec<lance::dataset::Version>> {
+        let head = self.head_version();
+        Ok(self
+            .dataset
+            .versions()
+            .await
+            .map_err(OmniError::storage)?
+            .into_iter()
+            .filter(|version| version.version <= head)
+            .collect())
+    }
+
+    /// Every registration row at the opened version, historical rows included.
+    pub(crate) async fn rows(&self) -> Result<Vec<DatasetEntry>> {
+        state::read_manifest_entries(&self.dataset).await
+    }
+
+    /// The snapshot at the opened version.
+    pub(crate) async fn snapshot(&self) -> Result<Snapshot> {
+        let mut snapshot = ManifestCoordinator::snapshot_from_state(
+            &self.root_uri,
+            read_manifest_state(&self.dataset).await?,
+        );
+        snapshot.graph_branch = self.branch.clone();
+        snapshot.native_branch = self.dataset.manifest().branch.clone();
+        Ok(snapshot)
+    }
 }
 
 /// Metadata-only rebinding of one live table identity to a new alias.
@@ -900,9 +929,12 @@ impl DatasetEntry {
         // cached path (`Snapshot::open_lance_dataset` → handle cache) calls the same opener on
         // a miss with the shared session, so both paths count on the per-query
         // `table_wrapper`.
-        crate::instrumentation::open_dataset(
+        crate::instrumentation::open_pinned_dataset(
             &location,
-            crate::instrumentation::VersionResolution::At(self.published_dataset_version),
+            self.published_dataset_version,
+            self.version_metadata.staged_version(),
+            self.version_metadata.transaction_uuid(),
+            self.version_metadata.last_linear_version(),
             session,
             crate::instrumentation::table_wrapper(),
         )
@@ -992,6 +1024,14 @@ pub(crate) struct ManifestCoordinator {
 pub(crate) enum LineageRefresh {
     Replace(Vec<GraphLineageRow>),
     Append(Vec<GraphLineageRow>),
+}
+
+decide_seam! {
+    /// A stale live read has opened and decoded a replacement manifest whose
+    /// exact branch-head row is absent, but has not yet decoded the inherited
+    /// lineage fallback. Failure here must leave the old coordinator coherent.
+    /// Crossed by reads only, which no case step kind names yet.
+    pub static READ_REFRESH_POST_STATE_PRE_LINEAGE = ("read.refresh_post_state_pre_lineage", Unreachable, [Fail]);
 }
 
 impl ManifestCoordinator {
@@ -1286,75 +1326,24 @@ impl ManifestCoordinator {
         Ok(snapshot)
     }
 
-    /// Read one exact native manifest ref for a control-plane liveness proof.
-    /// The caller must hold the schema-control gate (and the target's ordinary
-    /// branch/table gates before destroying it), or full recovery quiescence.
-    /// Native refs must come from a listing in that same envelope. This does
-    /// not capture a BranchIdentifier and must not serve general reads or OCC.
-    pub(crate) async fn snapshot_native_under_control_gates(
+    /// One live graph branch's `__manifest` opened once for the collector,
+    /// under the cleanup control gates: every version, registration row and
+    /// head the run compares for that branch comes from this open.
+    pub(crate) async fn collector_branch_under_control_gates(
         root_uri: &str,
-        candidate_native: Option<&str>,
+        branch: Option<&str>,
         control_session: &Arc<lance::session::Session>,
-    ) -> Result<Snapshot> {
-        let root = root_uri.trim_end_matches('/');
-        // The caller resolved every candidate from one listing; open the
-        // native ref directly rather than paying a listing per branch.
-        let dataset =
-            open_manifest_dataset_native_with_session(root, candidate_native, control_session)
-                .await?;
-        let mut snapshot = Self::snapshot_from_state(root, read_manifest_state(&dataset).await?);
-        snapshot.graph_branch = candidate_native
-            .filter(|branch| *branch != "main")
-            .map(crate::branch_names::logical_branch_name)
-            .map(str::to_string);
-        Ok(snapshot)
-    }
-
-    /// Prove native-table liveness from main and every live branch, including
-    /// lazy borrowers whose logical owner no longer uses the ref. Any unreadable
-    /// branch fails the entire proof closed. See the control-envelope contract
-    /// on `snapshot_native_under_control_gates`.
-    pub(crate) async fn native_fork_references_under_control_gates(
-        root_uri: &str,
-        control_session: &Arc<lance::session::Session>,
-    ) -> Result<NativeForkReferences> {
-        let root = root_uri.trim_end_matches('/');
-        let main = open_manifest_dataset_native_with_session(root, None, control_session).await?;
-        let mut branches: Vec<_> = list_live_manifest_branch_contents(&main)
-            .await?
-            .into_keys()
-            .filter(|name| name != "main")
-            .collect();
-        branches.sort();
-        let mut references = NativeForkReferences {
-            referenced: HashSet::new(),
-            owned: HashSet::new(),
-        };
-        let mut add = |native: Option<&str>, snapshot: Snapshot| {
-            for entry in snapshot.datasets() {
-                if let Some(table_native) = entry.native_dataset_branch.as_deref() {
-                    let key = (entry.identity, table_native.to_string());
-                    references.referenced.insert(key.clone());
-                    if native.is_some_and(|owner| {
-                        entry.version_metadata.is_table_fork_of(table_native, owner)
-                    }) {
-                        references.owned.insert(key);
-                    }
-                }
-            }
-        };
-        add(
-            None,
-            Self::snapshot_from_state(root, read_manifest_state(&main).await?),
-        );
-        for native in branches {
-            add(
-                Some(&native),
-                Self::snapshot_native_under_control_gates(root, Some(&native), control_session)
-                    .await?,
-            );
-        }
-        Ok(references)
+    ) -> Result<CollectorBranch> {
+        let (dataset, identifier, _native) =
+            open_manifest_branch_with_identifier(root_uri, branch, control_session).await?;
+        Ok(CollectorBranch {
+            root_uri: root_uri.trim_end_matches('/').to_string(),
+            branch: branch
+                .filter(|branch| *branch != "main")
+                .map(str::to_string),
+            dataset,
+            identifier,
+        })
     }
 
     /// Inventory registered table lifetimes, including soft-dropped tables, under cleanup's gates.
@@ -1604,9 +1593,7 @@ impl ManifestCoordinator {
         let lineage_rows = match known_state.graph_heads.get(branch_key) {
             Some(head) if projection_has_head(head) => None,
             _ => {
-                crate::failpoints::maybe_fail(
-                    crate::failpoints::names::READ_REFRESH_POST_STATE_PRE_LINEAGE,
-                )?;
+                fail(&READ_REFRESH_POST_STATE_PRE_LINEAGE)?;
                 Some(read_graph_lineage(&dataset).await?.0)
             }
         };
@@ -1840,15 +1827,7 @@ impl ManifestCoordinator {
     pub(crate) async fn create_branch(&mut self, name: &str) -> Result<()> {
         crate::branch_names::ensure_logical_branch_name(name)?;
         let mut ds = self.dataset.clone();
-        let live = list_live_manifest_branch_contents(&ds).await?;
-        if crate::branch_names::resolve_native_branch(live.keys().map(String::as_str), name)?
-            .is_some()
-        {
-            return Err(OmniError::manifest_conflict(format!(
-                "branch '{}' already exists",
-                name
-            )));
-        }
+        crate::branch_control::ensure_manifest_branch_create_namespace(&ds, name).await?;
         let native =
             crate::branch_names::native_branch_name(name, &crate::branch_names::mint_incarnation());
         match crate::branch_control::create_branch_recoverably(&mut ds, &native, self.version())
@@ -1908,6 +1887,10 @@ impl ManifestCoordinator {
         crate::branch_control::retire_branch_recoverably(&ds, &native, expected_identifier).await
     }
 
+    pub(crate) async fn schema_apply_locked(&self) -> Result<bool> {
+        crate::branch_control::schema_apply_locked(&self.dataset).await
+    }
+
     /// Logical graph branches, `main` first. Each live native ref maps to
     /// exactly one logical name; a duplicate incarnation fails loudly.
     pub async fn list_graph_branches(&self) -> Result<Vec<String>> {
@@ -1937,3 +1920,12 @@ mod system_roles_tests;
 #[cfg(test)]
 #[path = "manifest/tests.rs"]
 mod tests;
+
+/// The write-queue key that serializes every graph-global schema writer
+/// (schema apply and the system-column upgrade) against each other and
+/// against the passes that install or discard a staged schema contract. The
+/// name cannot collide with real table keys (those are `node:`/`edge:`
+/// prefixed).
+pub(crate) fn schema_apply_serial_queue_key() -> crate::db::write_queue::TableQueueKey {
+    ("__schema_apply__".to_string(), None)
+}

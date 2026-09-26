@@ -1002,60 +1002,46 @@ fn rebuild_full_text_indexes_json_noops_without_full_text_properties() {
 }
 
 #[test]
-fn repair_confirm_json_refuses_suspicious_drift_with_nonzero_exit_then_force_succeeds() {
+fn repair_confirm_json_reports_foreign_drift_and_publishes_nothing_even_when_forced() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     init_graph(&graph);
     load_fixture(&graph);
     let graph_manifest_before = manifest_dataset_version(&graph);
-    let (table_manifest_before, table_head_before) = forge_person_delete_drift(&graph);
+    let (table_manifest_before, table_head_before) = forge_person_foreign_commit(&graph);
 
-    let refused = output_failure(
-        cli()
-            .arg("repair")
-            .arg("--confirm")
-            .arg("--json")
-            .arg(&graph),
-    );
-    let refused_payload: Value = serde_json::from_slice(&refused.stdout).unwrap();
-    assert_eq!(refused_payload["graph_manifest_version"], Value::Null);
-    let person = refused_payload["datasets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|dataset| dataset["type_key"] == "node:Person")
-        .unwrap();
-    assert_eq!(person["classification"], "suspicious");
-    assert_eq!(person["action"], "refused");
-    assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("repair refused"),
-        "stderr should explain the non-zero exit; got: {}",
-        String::from_utf8_lossy(&refused.stderr)
-    );
-    assert_eq!(manifest_dataset_version(&graph), graph_manifest_before);
-
-    let forced = output_success(
-        cli()
-            .arg("repair")
-            .arg("--force")
-            .arg("--confirm")
-            .arg("--json")
-            .arg(&graph),
-    );
-    let forced_payload: Value = serde_json::from_slice(&forced.stdout).unwrap();
-    let forced_manifest = forced_payload["graph_manifest_version"].as_u64().unwrap();
-    assert!(forced_manifest > graph_manifest_before);
-    let person = forced_payload["datasets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|dataset| dataset["type_key"] == "node:Person")
-        .unwrap();
-    assert_eq!(person["classification"], "suspicious");
-    assert_eq!(person["action"], "forced");
-    assert_eq!(person["published_dataset_version"], table_manifest_before);
-    assert_eq!(person["lance_head_version"], table_head_before);
-    assert_eq!(manifest_dataset_version(&graph), forced_manifest);
+    for force in [false, true] {
+        let mut command = cli();
+        command.arg("repair").arg("--confirm");
+        if force {
+            command.arg("--force");
+        }
+        let output = output_success(command.arg("--json").arg(&graph));
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            payload["graph_manifest_version"],
+            Value::Null,
+            "force {force}"
+        );
+        let person = payload["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|dataset| dataset["type_key"] == "node:Person")
+            .unwrap();
+        assert_eq!(person["classification"], "foreign_drift", "force {force}");
+        assert_eq!(person["action"], "no_op", "force {force}");
+        assert_eq!(person["published_dataset_version"], table_manifest_before);
+        assert_eq!(person["lance_head_version"], table_head_before);
+        assert!(
+            person["operations"][0]
+                .as_str()
+                .is_some_and(|operation| operation.contains("foreign linear version")),
+            "force {force}: {}",
+            person["operations"]
+        );
+        assert_eq!(manifest_dataset_version(&graph), graph_manifest_before);
+    }
 }
 
 #[test]
@@ -1582,9 +1568,14 @@ fn load_json_outputs_summary_for_main_branch() {
     let graph = graph_path(temp.path());
     init_graph(&graph);
     let data = fixture("test.jsonl");
+    // A positional URI remains an explicit ordinary target, even beside a
+    // broken managed context. It must not consult the managed keychain.
+    fs::create_dir(temp.path().join(".omnigraph")).unwrap();
+    fs::write(temp.path().join(".omnigraph/context"), "invalid").unwrap();
 
     let output = output_success(
         cli()
+            .current_dir(temp.path())
             .arg("load")
             .arg("--mode")
             .arg("overwrite")
@@ -2105,6 +2096,68 @@ query insert_person($name: String, $age: I32) {
     );
 }
 
+/// The `explain` statement through the embedded `query` door: the plan as
+/// one row per node (`tree`, `depth`, `node`, `detail`), and the `mutate`
+/// door's refusal.
+#[test]
+fn explain_statement_answers_the_plan_as_rows() {
+    const EXPLAIN_ADULTS: &str = "explain query adults() {\n    match {\n        $p: Person\n        $p.age > 30\n    }\n    return { $p.name }\n}\n";
+
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+
+    let payload = parse_stdout_json(&output_success(
+        cli()
+            .arg("query")
+            .arg("--store")
+            .arg(&graph)
+            .arg("-e")
+            .arg(EXPLAIN_ADULTS)
+            .arg("--json"),
+    ));
+    assert_eq!(payload["query_name"], "adults");
+    assert_eq!(payload["columns"][0], "tree");
+    assert_eq!(payload["columns"][1], "depth");
+    assert_eq!(payload["columns"][2], "node");
+    assert_eq!(payload["columns"][3], "detail");
+    let rows = payload["rows"].as_array().unwrap();
+    let root = rows
+        .iter()
+        .find(|row| row["tree"] == "logical" && row["depth"] == 0)
+        .unwrap_or_else(|| panic!("no logical root row: {payload}"));
+    assert!(root["node"].is_string(), "{root}");
+    let detail: Value = serde_json::from_str(root["detail"].as_str().unwrap())
+        .expect("detail holds the node's own fields as JSON");
+    assert!(detail.is_object(), "{detail}");
+    assert!(
+        rows.iter().any(|row| row["tree"] == "physical"),
+        "{payload}"
+    );
+    assert!(
+        rows.iter().any(|row| row["tree"] == "plan"
+            && row["node"] == "route"
+            && row["detail"] == "engine"),
+        "{payload}"
+    );
+
+    let refused = output_failure(
+        cli()
+            .arg("mutate")
+            .arg("--store")
+            .arg(&graph)
+            .arg("-e")
+            .arg(EXPLAIN_ADULTS)
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("statement 'explain' is a read; use POST /query"),
+        "{stderr}"
+    );
+}
+
 /// GitHub #365: the embedded transport must preserve the typed stale-head
 /// outcome all the way through the CLI boundary. This is deliberately local
 /// and non-ignored so exit code 4 cannot depend on loopback/server coverage.
@@ -2238,6 +2291,127 @@ fn remote_if_commit_fails_closed_against_an_older_server() {
         "POST /graphs/legacy/mutate/if-graph-commit HTTP/1.1",
         "the CLI must not send a conditional write to an older server's ordinary mutation route"
     );
+}
+
+#[test]
+fn remote_json_errors_preserve_server_codes_and_details() {
+    use support::managed_http::{IntentApiFixture, IntentReply};
+
+    for (arguments, status, body, exit) in [
+        (
+            vec!["query", "restricted"],
+            403,
+            serde_json::json!({"error":"read denied by current policy","code":"forbidden"}),
+            1,
+        ),
+        (
+            vec!["mutate", "restricted"],
+            403,
+            serde_json::json!({"error":"change denied by current policy","code":"forbidden"}),
+            1,
+        ),
+        (
+            vec!["schema", "show"],
+            403,
+            serde_json::json!({"error":"schema read denied by current policy","code":"forbidden"}),
+            1,
+        ),
+        (
+            vec!["mutate", "restricted"],
+            409,
+            serde_json::json!({
+                "error":"request exceeds the write budget",
+                "resource_limit":{"resource":"entities","limit":100,"actual":101}
+            }),
+            1,
+        ),
+        (
+            vec!["mutate", "restricted", "--if-commit", "head-before"],
+            412,
+            serde_json::json!({
+                "error":"graph head changed",
+                "precondition_failure":{"expected":"head-before","actual":"head-after"}
+            }),
+            4,
+        ),
+    ] {
+        let formats: &[&[&str]] = if arguments[0] == "query" {
+            &[&["--json"], &["--format", "json"]]
+        } else {
+            &[&["--json"]]
+        };
+        for format in formats {
+            let server = IntentApiFixture::new(vec![IntentReply::json(status, body.clone())]);
+            let output = cli()
+                .env_remove("OMNIGRAPH_BEARER_TOKEN")
+                .args(["--server", &server.origin, "--graph", "knowledge"])
+                .args(&arguments)
+                .args(*format)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(exit),
+                "{arguments:?} {format:?}: {output:?}"
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&output.stdout).unwrap_or_else(|error| {
+                    panic!("{arguments:?} {format:?} lost structured HTTP {status}: {error}; {output:?}")
+                }),
+                body,
+                "{arguments:?} {format:?} must preserve the server's complete error contract"
+            );
+            assert!(
+                output.stderr.is_empty(),
+                "{arguments:?} {format:?}: {output:?}"
+            );
+            server.assert_complete();
+        }
+    }
+}
+
+#[test]
+fn remote_human_and_invalid_json_errors_remain_diagnostics() {
+    use support::managed_http::{IntentApiFixture, IntentReply};
+
+    for (json, body, expected) in [
+        (
+            false,
+            r#"{"error":"read denied by current policy","code":"forbidden"}"#,
+            "read denied by current policy",
+        ),
+        (
+            true,
+            "upstream temporarily unavailable",
+            "server returned 403",
+        ),
+    ] {
+        let server = IntentApiFixture::new(vec![IntentReply {
+            status: 403,
+            headers: Vec::new(),
+            body: body.as_bytes().to_vec(),
+        }]);
+        let mut command = cli();
+        command.env_remove("OMNIGRAPH_BEARER_TOKEN").args([
+            "--server",
+            &server.origin,
+            "--graph",
+            "knowledge",
+            "query",
+            "restricted",
+        ]);
+        if json {
+            command.arg("--json");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{output:?}"
+        );
+        server.assert_complete();
+    }
 }
 
 #[test]

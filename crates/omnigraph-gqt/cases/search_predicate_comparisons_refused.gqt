@@ -1,0 +1,172 @@
+# issue: none
+# notes: Search membership calls accept only the positive predicate form on either engine; the accepted
+# notes: form joined by `and` is a compound predicate at engine v1's door and returns rows on v2.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    text: String @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d","text":"needle"}}
+
+--- query
+set engine = v1;
+query refused_0() {
+    match { $d: Doc search($d.text, "needle") = false }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+
+--- query
+set engine = v1;
+query refused_1() {
+    match { $d: Doc search($d.text, "needle") != true }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+
+--- query
+set engine = v1;
+query refused_2() {
+    match { $d: Doc search($d.text, "needle") < true }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+
+--- query
+set engine = v1;
+query refused_3($enabled: Bool) {
+    match { $d: Doc search($d.text, "needle") = $enabled }
+    return { $d.slug }
+}
+
+--- params
+{"enabled":true}
+
+--- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+
+--- query
+set engine = v1;
+query refused_4() {
+    match { $d: Doc true = search($d.text, "needle") }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+
+--- query
+set engine = v1;
+query refused_5() {
+    match { $d: Doc match_text($d.text, "needle") = false }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+
+--- query
+set engine = v1;
+query refused_6() {
+    match { $d: Doc fuzzy($d.text, "needle") = false }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+
+--- query
+set engine = v2;
+query refused_0() {
+    match { $d: Doc search($d.text, "needle") = false }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+
+--- query
+set engine = v2;
+query refused_1() {
+    match { $d: Doc search($d.text, "needle") != true }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+
+--- query
+set engine = v2;
+query refused_2() {
+    match { $d: Doc search($d.text, "needle") < true }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+
+--- query
+set engine = v2;
+query refused_3($enabled: Bool) {
+    match { $d: Doc search($d.text, "needle") = $enabled }
+    return { $d.slug }
+}
+
+--- params
+{"enabled":true}
+
+--- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+
+--- query
+set engine = v2;
+query refused_4() {
+    match { $d: Doc true = search($d.text, "needle") }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+
+--- query
+set engine = v2;
+query refused_5() {
+    match { $d: Doc match_text($d.text, "needle") = false }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+
+--- query
+set engine = v2;
+query refused_6() {
+    match { $d: Doc fuzzy($d.text, "needle") = false }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+
+--- query
+set engine = v1;
+query accepted_joined_by_and() {
+    match { $d: Doc  search($d.text, "needle") and $d.slug = "d" }
+    return { $d.slug }
+}
+
+--- expect error: plan error: compound predicates (and, or, not, is null) are not supported on engine v1; engine v2 runs them: add "set engine = v2;" before the query, or start the server with OMNIGRAPH_ENGINE=v2
+
+--- query
+set engine = v2;
+query accepted_joined_by_and() {
+    match { $d: Doc  search($d.text, "needle") and $d.slug = "d" }
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d"}
+
+--- expect shape
+d.slug: String

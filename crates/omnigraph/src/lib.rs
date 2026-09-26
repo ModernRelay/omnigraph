@@ -8,7 +8,7 @@
 #![recursion_limit = "256"]
 
 pub(crate) mod blob;
-mod branch_control;
+pub(crate) mod branch_control;
 mod branch_names;
 pub mod changes;
 pub mod db;
@@ -25,14 +25,16 @@ pub mod dst_ids;
 #[cfg(not(feature = "dst"))]
 pub(crate) mod dst_ids;
 pub mod embedding;
+pub(crate) mod engine;
 pub mod error;
-mod exec;
-pub mod failpoints;
+pub(crate) mod exec;
 pub mod graph_index;
 pub mod instrumentation;
 pub(crate) mod lance_access;
 pub mod loader;
 pub(crate) mod runtime_cache;
+pub mod seams;
+pub mod session;
 pub mod storage;
 pub(crate) mod storage_layer;
 pub(crate) mod table_store;
@@ -44,6 +46,8 @@ pub use blob::{
     ExternalBlobRef,
 };
 pub use changes::EntityKind;
+pub use omnigraph_compiler::settings;
+pub use session::Session;
 pub use table_store::IndexCoverage;
 
 /// Result of one mutation together with the exact commit published by it.
@@ -62,3 +66,7 @@ pub struct MutationReceipt {
 #[cfg(feature = "dst")]
 #[doc(hidden)]
 pub use lance_access::store_registry as dst_lance_store_registry;
+
+/// The Lance-realm object-store seam; see `lance_access::object_store_seam`.
+#[cfg(feature = "dst")]
+pub use lance_access::object_store_seam;

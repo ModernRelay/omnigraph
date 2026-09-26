@@ -14,6 +14,19 @@ The desired bundle is input, not runtime authority. A server reads the applied r
 
 The storage root defaults to the configuration directory and may instead be a local path, `file://`, `s3://`, or `az://` root. Graph roots are derived as `graphs/<graph_id>.omni` beneath it.
 
+## Managed CLI sessions
+
+The CLI's managed HTTP adapter obtains current access before each new request,
+including status polls. A rotating credential pair lives only in the OS
+keychain, independently of configuration directories and graph credentials.
+Local origin-scoped locking and a persisted pending marker prevent duplicate
+client exchanges; the provider owns credential rotation and session authority.
+The API verifies provider access and maps it to a stable principal. An uncertain
+exchange never authorizes a write replay.
+The protocol and cache compatibility boundaries are specified in
+[the identity and applied-policy RFC](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients); user behavior and limits
+are in the [CLI reference](../user/cli/reference.md#managed-cluster-commands).
+
 ## Durable layout
 
 | Path | Role |
@@ -67,27 +80,54 @@ A directory lets the server resolve the storage root from `cluster.yaml`; a URI 
 
 Serving verifies ledger/resource digests, builds each graph's query registry and embedding provider, projects external-Blob policy to the server-safe subset, and binds at most one Cedar bundle per graph plus one cluster-level bundle. A graph-local open or registry failure quarantines that graph while healthy graphs may continue. `--require-all-graphs` makes any quarantine a startup failure; zero healthy graphs always fails.
 
-Servers do not hot-reload. Apply the new revision and restart every server that should serve it.
+Servers do not hot-reload applied graph configuration. Apply the new revision and restart every server that should serve it. Explicit OIDC public-admission snapshots have a separate bounded refresh contract below.
 
 Bearer authentication is a server concern. Cedar mutation enforcement also lives in the engine's `_as` APIs so embedded and CLI writers cannot bypass it. Cluster policy application publishes the bundles and bindings; it does not replace either enforcement layer.
 
-The optional [offline data-token profile](../rfcs/0053-offline-data-token-verification.md)
+The optional [offline signed-token trust](../rfcs/0053-offline-data-token-verification.md)
 uses immutable public trust loaded before graph open. The Core's opt-in
 root-bound serving snapshot supplies the canonical storage root from the same
 resolution as the applied revision; the server checks that root against trust
 without reading a managed identity marker. The verifier resolves
-`principal:<sub>` and retains per-graph action ceilings. Graph selection checks the ceiling before registry
-lookup; the common authorization gate checks actions before Cedar, which must
-explicitly permit signed identities even when no static credentials exist.
-Static credential authority remains unchanged. Issuer reachability is outside
-the serving request path.
+`principal:<sub>` and retains a private, verified credential profile:
+
+- Version 1 keeps its existing per-graph action ceilings. Graph selection
+  checks the ceiling before registry lookup; the common authorization gate
+  checks actions before Cedar.
+- Version 2 authenticates a cluster-bound identity and rejects permission
+  fields. The same common gate requires applied Cedar policy for protected
+  operations, with no token-derived graph/action ceiling.
+
+Cedar must explicitly permit either signed profile even when no static
+credentials exist. Static credential authority remains unchanged. Issuer
+reachability is outside the serving request path. The profile boundary and
+applied-policy ownership are described in
+[Identity credentials and applied policy authorization](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md).
+
+`GET /graphs/discovery` accepts only the verified identity profile and returns
+IDs and display names for the opened and quarantined graph inventory captured
+at boot. It neither scans storage nor discloses availability, paths, policy,
+schema, or query definitions. It needs no policy membership. The separate
+`GET /graphs` metadata response and its `graph_list` gate are unchanged;
+version 1 filtering remains an additional restriction. Typed discovery
+responses are additive to the existing public catalog types.
+
+The CLI's versioned keychain cache records the issuance profile and verifies
+its endpoint and identity bindings before replacement. A legacy issuance
+request cannot return an identity profile, and restricted caches are never
+silently upgraded. The provider-native client acquires missing/expired identity
+credentials before an operation and selects discovery in a managed folder.
+Explicit server addressing keeps the
+existing catalog unless `graphs list --discovery` is requested; the CLI never
+infers routing from an arbitrary bearer token's unverified shape.
 
 A replica reports what it booted from on `GET /readyz` (RFC 0049): the
 applied `config_digest` as `booted_serving_digest`, the ledger revision and
 CAS, and how many applied graphs it serves and does not; it answers 503 from
-the shutdown signal on. Graph ids stay on the authenticated `GET /graphs`,
-which also lists the quarantined ones. Graceful shutdown is bounded by one
-deadline (`--shutdown-grace-seconds`, default 25), kept by a thread and armed
+the shutdown signal on. Graph IDs stay on the authenticated catalog routes,
+which include quarantined graphs under their respective disclosure contracts.
+Graceful shutdown is bounded by one deadline (`--shutdown-grace-seconds`,
+default 25), kept by a thread and armed
 by a listener installed before graphs open, after which the process exits 2
 without claiming success.
 
@@ -115,6 +155,15 @@ state carries verified claims and graph selection. `DataTokenTrust::verify_at`
 returns the identity projection for existing callers;
 `verify_authenticated_at` returns the opaque authenticated result used by the
 server. Public actor construction cannot grant signed-token permissions.
+`DataTokenClaims` and `DataGrant` keep their version-1 shapes;
+`IdentityTokenClaims` is a separate strict type. Read-only claim accessors on
+`AuthenticatedActor` expose only the matching verified profile.
+
+Policy embedders must handle `PolicyAction::ConfigManage`,
+`PolicyResourceKind::Cluster`, and `PolicyEngineKind::Cluster`. These public
+enums are exhaustive, so an external exhaustive match must add the relevant
+arm when upgrading. Preserving existing constructors and direct storage-holder
+behavior does not remove that source compatibility requirement.
 
 In-process hosts that assemble `AppState` and call its existing
 `with_data_token_trust` method continue to own their graph/root binding. Use
@@ -139,3 +188,22 @@ Every mutation-capable Azure server, apply job, direct writer, and maintenance p
 - Azure lease wrapper: `crates/omnigraph-azure-admission/`.
 
 The public operating loop and configuration schema live in [Operating a cluster](../user/clusters/index.md) and its [configuration reference](../user/clusters/config.md).
+
+## OIDC resource identity and MCP
+
+The optional `--oidc-identity-trust FILE` profile validates the same canonical
+serving root before opening graphs. Public JSON binds exact issuer, audience,
+organization, account, cluster and incarnation, plus RSA keys and explicit
+subject-to-stable-principal admission. Cedar remains the graph/schema authority.
+The server reads no provider secret and performs no request-time network calls.
+An external publisher refreshes a bounded, revisioned snapshot; local checks
+run every five seconds and access refuses at the original 300-second snapshot
+or token expiry. The exact format and limits are in
+[Identity credentials and applied policy authorization](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients).
+
+This profile enables `/.well-known/oauth-protected-resource` and `/mcp`. MCP
+uses the official Rust SDK and the existing stored-query/discovery handlers.
+The initial tools are read-only; invocation checks the stored query kind and
+the same Cedar policy as HTTP. A registered resource or listed tool is never
+a permission grant. Static-token deployments and the native signed-token
+profiles retain their existing behavior.

@@ -1,0 +1,141 @@
+# issue: 566
+# red_on: 545176bd; `order { count($d) desc }` is `unsupported ordering expression` on v2 and the door's order-key refusal on v1; `$p.age > 30 as adult` in return is `unsupported projection expression` on v2.
+# notes: Part 3 of issue 566: an order key that is not a property access binds
+# notes: against the return list. `order { count($d) desc }` sorts by the
+# notes: `count($d) as deals` column; an unaliased aggregate written the same way
+# notes: in return matches as a tree and sorts by its own column; a key that
+# notes: matches no return item is T42 with the key quoted as written. A Boolean
+# notes: key binds the same way to its aliased return item. Group rows have no
+# notes: tie-break, so the sort direction is shown through `limit 1`.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    age: I64?
+}
+node Deal {
+    slug: String @key
+    amount: I64
+}
+node Market {
+    name: String @key
+}
+edge LedByPerson: Deal -> Person {}
+edge RelevantMarket: Deal -> Market {}
+
+--- seed
+{"type":"Person","data":{"slug":"alice","age":40}}
+{"type":"Person","data":{"slug":"bob","age":20}}
+{"type":"Person","data":{"slug":"carol"}}
+{"type":"Market","data":{"name":"eu"}}
+{"type":"Market","data":{"name":"us"}}
+{"type":"Deal","data":{"slug":"d1","amount":100}}
+{"type":"Deal","data":{"slug":"d2","amount":50}}
+{"type":"Deal","data":{"slug":"d3","amount":70}}
+{"edge":"LedByPerson","from":"d1","to":"alice"}
+{"edge":"LedByPerson","from":"d2","to":"alice"}
+{"edge":"LedByPerson","from":"d3","to":"alice"}
+{"edge":"RelevantMarket","from":"d1","to":"eu"}
+{"edge":"RelevantMarket","from":"d2","to":"eu"}
+{"edge":"RelevantMarket","from":"d3","to":"us"}
+
+--- query
+set engine = v2;
+query per_market($slug: String) {
+    match { $p: Person { slug: $slug }  $d: Deal  $d ledByPerson $p  $d relevantMarket $m }
+    return { $m.name, count($d) as deals }
+    order { count($d) desc }
+    limit 25
+}
+
+--- params
+{"slug": "alice"}
+
+--- expect unordered
+{"m.name": "eu", "deals": 2}
+{"m.name": "us", "deals": 1}
+
+--- expect shape
+m.name: String
+deals: I64
+
+--- query
+set engine = v2;
+query top_market($slug: String) {
+    match { $p: Person { slug: $slug }  $d: Deal  $d ledByPerson $p  $d relevantMarket $m }
+    return { $m.name, count($d) as deals }
+    order { count($d) desc }
+    limit 1
+}
+
+--- params
+{"slug": "alice"}
+
+--- expect unordered
+{"m.name": "eu", "deals": 2}
+
+--- expect shape
+m.name: String
+deals: I64
+
+--- query
+set engine = v2;
+query smallest_market_unaliased($slug: String) {
+    match { $p: Person { slug: $slug }  $d: Deal  $d ledByPerson $p  $d relevantMarket $m }
+    return { $m.name, count($d) }
+    order { count($d) }
+    limit 1
+}
+
+--- params
+{"slug": "alice"}
+
+--- expect unordered
+{"m.name": "us", "d": 1}
+
+--- expect shape
+m.name: String
+d: I64
+
+--- query
+set engine = v2;
+query per_market_by_max() {
+    match { $d: Deal  $d relevantMarket $m }
+    return { $m.name, count($d) as deals }
+    order { max($d.amount) }
+}
+
+--- expect error: T42: order key `max($d.amount)` does not appear in return; add it to return or order by its alias
+
+--- query
+set engine = v2;
+query adults_first() {
+    match { $p: Person }
+    return { $p.slug, $p.age > 30 as adult }
+    order { $p.age > 30 desc, $p.slug }
+}
+
+--- expect ordered
+{"p.slug": "alice", "adult": true}
+{"p.slug": "bob", "adult": false}
+{"p.slug": "carol"}
+
+--- expect shape
+p.slug: String
+adult: Bool?
+
+--- query
+set engine = v2;
+query boolean_key_unbound() {
+    match { $p: Person }
+    return { $p.slug }
+    order { $p.age > 30 }
+}
+
+--- expect error: T42: order key `$p.age > 30` does not appear in return; add it to return or order by its alias

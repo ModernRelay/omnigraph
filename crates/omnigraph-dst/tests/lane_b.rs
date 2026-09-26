@@ -103,13 +103,18 @@ async fn open_fresh(
     root: &str,
 ) -> (
     std::sync::Arc<dyn omnigraph::storage::StorageAdapter>,
-    omnigraph::db::Omnigraph,
+    omnigraph::Session,
 ) {
     let storage: std::sync::Arc<dyn omnigraph::storage::StorageAdapter> =
         std::sync::Arc::new(omnigraph::storage::ObjectStorageAdapter::local());
-    let db = omnigraph::db::Omnigraph::open_with_storage(root, storage.clone())
-        .await
-        .expect("post-kill open+recovery must succeed");
+    let db = omnigraph::Session::from_defaults(
+        std::sync::Arc::new(
+            omnigraph::db::Omnigraph::open_with_storage(root, storage.clone())
+                .await
+                .expect("post-kill open+recovery must succeed"),
+        ),
+        omnigraph::settings::SessionSettings::default(),
+    );
     (storage, db)
 }
 
@@ -289,20 +294,16 @@ fn dst_lane_b_whitebox_kill() {
     }
 }
 
-/// INSTRUMENT — real kill-during-recovery. Every rung recreates its own
-/// mess (fresh root, fresh child #1 killed at its completion cut) and
-/// cuts THAT recovery at completion #j — a rung must never reuse a root
-/// an earlier recovery already healed, or it cuts clean-open
-/// housekeeping while reporting a recovery kill. A rung whose recovery
-/// completes below j ends the ladder. At least one real recovery kill
-/// is asserted — fail, not skip.
-/// Run: cargo test -p omnigraph-dst --test lane_b dst_lane_b_kill_during_recovery -- --ignored --nocapture
+/// Kill recovery at successive completion cuts of freshly killed workloads.
+/// Every completed recovery, including zero-write recovery, receives exact
+/// replay judgment before the ladder stops.
 #[test]
 #[serial]
 #[ignore = "instrument: lane B real kill-during-recovery (spawns child processes)"]
 fn dst_lane_b_kill_during_recovery() {
     let seed = 11u64;
     let mut recovery_kills = 0usize;
+    let mut completed_recovery = None;
     let mut j = 1usize;
     let mut rung_retries = 0usize;
     while j <= 8 {
@@ -364,28 +365,29 @@ fn dst_lane_b_kill_during_recovery() {
             let rec_n = oplog::parse(&read_log(&rec_log), &format!("recovery-done j={j} log"))
                 .recover_n
                 .expect("completed recovery child logs its recover-done N line");
-            println!(
-                "dst lane B recovery: j={j} recovery completed below the cut \
-                 (its own completion count: {rec_n}); ladder ends \
-                 ({recovery_kills} recovery kills)"
+            assert!(
+                rec_n < j,
+                "recovery completed past its armed cut: {rec_n} >= {j}"
             );
-            std::fs::remove_dir_all(&dir).ok();
-            break;
+            completed_recovery = Some(rec_n);
+            println!(
+                "dst lane B recovery: j={j} completed with {rec_n} writes; \
+                 judging the workload before ending the ladder ({recovery_kills} recovery kills)"
+            );
+        } else {
+            assert_eq!(
+                rec_status.signal(),
+                Some(9),
+                "j={j}: recovery child must be killed at its barrier"
+            );
+            let rec_summary = oplog::parse(&read_log(&rec_log), &format!("recovery-cut j={j} log"));
+            assert_eq!(
+                rec_summary.barrier_c,
+                Some(j),
+                "j={j}: recovery barrier records a different ordinal"
+            );
+            recovery_kills += 1;
         }
-        assert_eq!(
-            rec_status.signal(),
-            Some(9),
-            "j={j}: recovery child must be killed at its barrier"
-        );
-        // The recovery barrier line is evidence too: field-check it like
-        // the whitebox arm does (a garbled line must not count as a kill).
-        let rec_summary = oplog::parse(&read_log(&rec_log), &format!("recovery-cut j={j} log"));
-        assert_eq!(
-            rec_summary.barrier_c,
-            Some(j),
-            "j={j}: recovery barrier records a different ordinal"
-        );
-        recovery_kills += 1;
 
         // A clean recovery must now succeed, and the original workload log
         // must judge exactly against the doubly-recovered world.
@@ -406,17 +408,19 @@ fn dst_lane_b_kill_during_recovery() {
             )
             .await;
             println!(
-                "dst lane B recovery: j={j} workload cut #{k}, recovery killed at #{j}, \
-                 final world {verdict}, replay-exact"
+                "dst lane B recovery: j={j} workload cut #{k}, recovery kills={recovery_kills}, \
+                 completed={completed_recovery:?}, final world {verdict}, replay-exact"
             );
         });
         std::fs::remove_dir_all(&dir).ok();
+        if completed_recovery.is_some() {
+            break;
+        }
         j += 1;
     }
     assert!(
-        recovery_kills >= 1,
-        "the ladder performed zero real recovery kills — the cell tested nothing \
-         (every rung was a control); investigate recovery's completion count"
+        recovery_kills > 0 || completed_recovery == Some(0),
+        "the killed workload had neither a recovery kill nor a completed zero-write reopen"
     );
 }
 
@@ -441,7 +445,7 @@ fn dst_lane_b_judge_goes_red_under_seeded_blindness() {
     let root_str = root.to_str().expect("utf8 root").to_string();
 
     rt().block_on(async {
-        let (_storage, mut db) = open_fresh(&root_str).await;
+        let (_storage, db) = open_fresh(&root_str).await;
         let verdict = lane_b_replay_judge(&db, &log, "lb-7-", "red-proof baseline", false).await;
         assert_eq!(verdict, "without-op", "complete log must judge clean");
 
@@ -486,7 +490,7 @@ fn dst_lane_b_judge_goes_red_under_seeded_blindness() {
 
         // (3) Phantom row planted behind the log's back.
         mutate_main(
-            &mut db,
+            &db,
             MUTATION_QUERIES,
             "insert_person",
             &mixed_params(&[("$name", "lb-7-phantom")], &[("$age", 44)]),
@@ -514,7 +518,7 @@ fn dst_lane_b_judge_goes_red_under_seeded_blindness() {
             .collect();
         if names.len() >= 2 {
             mutate_main(
-                &mut db,
+                &db,
                 MUTATION_QUERIES,
                 "add_friend",
                 &mixed_params(
@@ -551,7 +555,7 @@ fn dst_lane_b_judge_goes_red_under_seeded_blindness() {
     let root_str = root.to_str().expect("utf8 root").to_string();
 
     rt().block_on(async {
-        let (_storage, mut db) = open_fresh(&root_str).await;
+        let (_storage, db) = open_fresh(&root_str).await;
         let verdict =
             lane_b_replay_judge(&db, &log, "lb-9-", "weather red-proof baseline", true).await;
         assert_eq!(verdict, "weather-resolved");
@@ -568,7 +572,7 @@ fn dst_lane_b_judge_goes_red_under_seeded_blindness() {
             "weather judge stayed GREEN on a forged ack"
         );
         mutate_main(
-            &mut db,
+            &db,
             MUTATION_QUERIES,
             "insert_person",
             &mixed_params(&[("$name", "lb-9-phantom")], &[("$age", 44)]),

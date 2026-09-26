@@ -1,7 +1,6 @@
 // The crate is `#![cfg(tokio_unstable)]`-gated (tokio's seeded scheduler
 // RNG); without the flag the lib compiles EMPTY, so this file must vanish
-// with it or the workspace gate fails on unresolved imports. CI sets
-// RUSTFLAGS in .github/workflows/dst.yml.
+// with it or the build fails on unresolved imports.
 #![cfg(tokio_unstable)]
 
 //! Single-commit-birth pin (#487): a CRASH during `init` immediately after
@@ -24,7 +23,6 @@ use std::sync::Arc;
 use serial_test::serial;
 
 use omnigraph::db::{InitOptions, Omnigraph};
-use omnigraph::failpoints::{ScopedFailPoint, names};
 use omnigraph::storage::{ObjectStorageAdapter, StorageAdapter};
 use omnigraph_dst::fixtures::TEST_SCHEMA;
 
@@ -44,7 +42,7 @@ fn crash_after_manifest_create_leaves_openable_store() {
         // death; the durable state is the Create commit and everything
         // written before it.
         {
-            let _fp = ScopedFailPoint::new(names::INIT_POST_MANIFEST_CREATE, "panic");
+            let _fp = omnigraph::seams::catalog::INIT_POST_MANIFEST_CREATE.panic_at();
             let died = std::panic::AssertUnwindSafe(Omnigraph::init_with_storage(
                 root,
                 TEST_SCHEMA,
@@ -56,7 +54,7 @@ fn crash_after_manifest_create_leaves_openable_store() {
         }
         println!(
             "[phase 1] init crashed at {}",
-            names::INIT_POST_MANIFEST_CREATE
+            omnigraph::seams::catalog::INIT_POST_MANIFEST_CREATE.name()
         );
 
         // ---- Phase 2: read-write reopen SUCCEEDS — the store was born

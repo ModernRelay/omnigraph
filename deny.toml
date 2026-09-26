@@ -1,0 +1,75 @@
+# cargo-deny configuration: the pull-request gate on what the dependency
+# graph may contain. Reference: https://embarkstudios.github.io/cargo-deny/checks/cfg.html
+# A change to what the graph may contain (a new source, license, or advisory
+# exemption) is an edit to this file in the same pull request; every `ignore`
+# entry is a reviewed exemption. Needs cargo-deny 0.19 or newer (`unsound` scope,
+# `unused-ignored-advisory`).
+
+[graph]
+# Include feature-gated dependencies (the `aws` SDK crates ship in the
+# AWS-feature artifacts), so the gate sees the whole shippable tree.
+all-features = true
+
+[advisories]
+# A yanked version still builds from a lockfile; the gate refuses it.
+yanked = "deny"
+# Unsound advisories fail on every crate in the graph, not only on direct
+# workspace dependencies (the default `workspace` scope skips transitive ones).
+unsound = "all"
+# Each ignore names the crate, the dependency path that pins it, and what
+# clears it. An ignore covers the advisory on every version of the crate, so a
+# reason that names one version is a statement of intent, not a constraint.
+# An ignore that matches nothing fails the check, so the bump that clears an
+# advisory also removes its row here.
+unused-ignored-advisory = "deny"
+ignore = [
+  { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 via hyper 0.14 inside aws-smithy-http-client (aws feature only); the 0.3 line carries no patch, cleared when the AWS SDK leaves hyper 0.14" },
+  { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 via rustls 0.21 inside aws-smithy-http-client (aws feature only); no patch in the 0.101 line, same clearing event as RUSTSEC-2026-0258; the 0.103 line in the tree is patched, and this ignore would also hide a regression there" },
+  { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7, same path and clearing event as RUSTSEC-2026-0098" },
+  { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7, same path and clearing event as RUSTSEC-2026-0098" },
+  { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39.4 via object_store 0.13.2 (DataFusion 54, Lance 11); patched only in 0.41, cleared when object_store bumps quick-xml" },
+  { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39.4, same path and clearing event as RUSTSEC-2026-0194" },
+  { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; a proc-macro pulled by lance-bitpacking 11.0.0, cleared when Lance replaces it" },
+  { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 Marvin timing side channel via reqsign (lance-io, opendal); RustSec lists no patched version" },
+]
+
+[licenses]
+# An allowed license no crate carries fails the check: the list is exactly
+# what the tree needs, and a bump that drops the last holder also drops the entry.
+unused-allowed-license = "deny"
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "CC0-1.0",
+  "BSL-1.0",
+  "Zlib",
+  # File-level copyleft: obligations attach only to modified MPL files, none
+  # ship here. Holders: `colored`, `option-ext` (via `dirs`).
+  "MPL-2.0",
+  # Mozilla's root-certificate bundle data (`webpki-roots`, `webpki-root-certs`).
+  "CDLA-Permissive-2.0",
+]
+
+[bans]
+# An 839-crate tree cannot avoid two versions of one crate; that is hygiene,
+# not integrity, so it stays out of the gate.
+multiple-versions = "allow"
+# `foo = "*"` is never acceptable. A wildcard path dependency is exempt only in a
+# `publish = false` crate or as a dev-dependency (cargo-deny `bans.rs`).
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# crates.io is the only registry and no dependency comes from git; a fork enters
+# through `allow-git` (a git-form `[patch]` entry included). A `path` copy, bare or
+# behind `[patch]`, and a `.cargo/config.toml` source replacement keep no source
+# cargo-deny checks: the diff review is that gate.
+unknown-registry = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+unknown-git = "deny"
+allow-git = []

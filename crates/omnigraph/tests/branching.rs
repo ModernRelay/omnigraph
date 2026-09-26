@@ -13,10 +13,10 @@ use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestErrorKind, MergeConflictKind, OmniError};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph::{
     BLOB_READ_RANGE_MAX_BYTES, BlobContent, ExternalBlobBase, ExternalBlobExecutionScope,
-    ExternalBlobPolicy,
+    ExternalBlobPolicy, Session,
 };
 
 use helpers::*;
@@ -150,10 +150,10 @@ fn write_sized_external_blob(path: &std::path::Path, bytes: u64) {
     file.flush().unwrap();
 }
 
-async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
+async fn init_search_db(dir: &tempfile::TempDir) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, SEARCH_SCHEMA).await.unwrap();
-    load_jsonl(&db, SEARCH_DATA, LoadMode::Overwrite)
+    let db = helpers::session(Omnigraph::init(uri, SEARCH_SCHEMA).await.unwrap());
+    db.load_jsonl(SEARCH_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
@@ -164,10 +164,10 @@ async fn init_db_from_schema_and_data(
     dir: &tempfile::TempDir,
     schema: &str,
     data: &str,
-) -> Omnigraph {
+) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, schema).await.unwrap());
+    db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
     db
 }
 
@@ -218,7 +218,7 @@ async fn branch_create_open_list_and_lazy_branching_work() {
     main.branch_create("feature").await.unwrap();
     assert_eq!(main.branch_list().await.unwrap(), vec!["main", "feature"]);
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     assert_eq!(
         count_rows_branch(&feature, "feature", "node:Person").await,
         4
@@ -237,7 +237,7 @@ async fn branch_create_open_list_and_lazy_branching_work() {
     assert_exact_id_primary_key_on_branch(&feature, "feature", "node:Person").await;
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -250,14 +250,26 @@ async fn branch_create_open_list_and_lazy_branching_work() {
     assert_eq!(
         snap.dataset("node:Person").unwrap().dataset_path,
         main_person.dataset_path,
-        "the first lazy fork must preserve the logical table identity/path"
+        "the first branch write must preserve the logical table identity/path"
     );
-    helpers::assert_native_branch_of(
+    assert_eq!(
         snap.dataset("node:Person")
             .unwrap()
             .native_dataset_branch
             .as_deref(),
-        "feature",
+        None,
+        "a branch write stages on the inherited dataset without forking it"
+    );
+    let feature_pin = pinned_version(&feature, "feature", "node:Person").await;
+    assert!(is_detached_version(feature_pin), "{feature_pin}");
+    assert_ne!(
+        feature_pin,
+        pinned_version(&feature, "main", "node:Person").await,
+        "the branch write stages a new detached pin"
+    );
+    assert_eq!(
+        count_rows_branch(&feature, "feature", "node:Person").await,
+        5
     );
     assert_eq!(
         snap.dataset("edge:Knows")
@@ -265,6 +277,11 @@ async fn branch_create_open_list_and_lazy_branching_work() {
             .native_dataset_branch
             .as_deref(),
         None
+    );
+    assert_eq!(
+        pinned_version(&feature, "feature", "edge:Knows").await,
+        pinned_version(&feature, "main", "edge:Knows").await,
+        "an unwritten table keeps the inherited pin"
     );
     assert_exact_id_primary_key_on_branch(&feature, "feature", "node:Person").await;
 
@@ -313,11 +330,11 @@ async fn explicit_target_query_reads_multiple_branches_from_one_handle() {
 #[tokio::test]
 async fn resolved_snapshot_stays_pinned_after_branch_advances() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let snapshot_id = db.resolve_snapshot("main").await.unwrap();
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
@@ -389,12 +406,12 @@ async fn explicit_target_load_writes_to_named_branch() {
 async fn branch_merge_updates_main_traversal() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "add_friend",
@@ -404,7 +421,7 @@ async fn branch_merge_updates_main_traversal() {
     .unwrap();
 
     let feature_qr = query_branch(
-        &mut feature,
+        &feature,
         "feature",
         TEST_QUERIES,
         "friends_of",
@@ -415,7 +432,7 @@ async fn branch_merge_updates_main_traversal() {
     assert_eq!(feature_qr.num_rows(), 3);
 
     let main_before = query_main(
-        &mut main,
+        &main,
         TEST_QUERIES,
         "friends_of",
         &params(&[("$name", "Alice")]),
@@ -428,7 +445,7 @@ async fn branch_merge_updates_main_traversal() {
     assert_eq!(outcome, MergeOutcome::FastForward);
 
     let merged = query_main(
-        &mut main,
+        &main,
         TEST_QUERIES,
         "friends_of",
         &params(&[("$name", "Alice")]),
@@ -442,9 +459,8 @@ async fn branch_merge_updates_main_traversal() {
 async fn branch_merge_with_blob_columns_preserves_blob_data() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
-    load_jsonl(
-        &main,
+    let main = helpers::session(Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap());
+    main.load_jsonl(
         concat!(
             "{\"type\":\"Document\",\"data\":{\"title\":\"seed\",\"content\":\"base64:\",\"note\":\"original\"}}\n",
             "{\"type\":\"Document\",\"data\":{\"title\":\"main-doc\",\"content\":\"base64:TWFpbg==\",\"note\":\"main\"}}",
@@ -471,9 +487,9 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
 
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_main(
-        &mut main,
+        &main,
         BLOB_MUTATIONS,
         "update_doc_note",
         &params(&[("$title", "main-doc"), ("$note", "updated on main")]),
@@ -482,7 +498,7 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         BLOB_MUTATIONS,
         "insert_doc",
@@ -496,7 +512,7 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         BLOB_MUTATIONS,
         "update_doc_note",
@@ -515,7 +531,7 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
     );
     let deletion_value = format!("base64:{deletion_encoded}");
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         BLOB_MUTATIONS,
         "insert_doc",
@@ -701,7 +717,7 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
     );
 
     mutate_main(
-        &mut main,
+        &main,
         BLOB_MUTATIONS,
         "delete_doc",
         &params(&[("$title", "readme")]),
@@ -736,9 +752,8 @@ async fn blob_named_branch_delete_recreate_never_retargets_cached_or_snapshot_re
     // would be needed to prove its path/version still denotes the old tree.
     let aba_dir = tempfile::tempdir().unwrap();
     let aba_uri = aba_dir.path().to_str().unwrap();
-    let aba = Omnigraph::init(aba_uri, BLOB_SCHEMA).await.unwrap();
-    load_jsonl(
-        &aba,
+    let aba = helpers::session(Omnigraph::init(aba_uri, BLOB_SCHEMA).await.unwrap());
+    aba.load_jsonl(
         r#"{"type":"Document","data":{"title":"aba","content":"base64:QmFzZQ==","note":"base"}}"#,
         LoadMode::Overwrite,
     )
@@ -759,6 +774,7 @@ async fn blob_named_branch_delete_recreate_never_retargets_cached_or_snapshot_re
         .dataset("node:Document")
         .unwrap()
         .clone();
+    let old_pin = pinned_version(&aba, "feature", "node:Document").await;
     let live_aba_reader = Omnigraph::open(aba_uri).await.unwrap();
     let stale_aba = Omnigraph::open(aba_uri).await.unwrap();
     stale_aba.sync_branch("feature").await.unwrap();
@@ -814,9 +830,13 @@ async fn blob_named_branch_delete_recreate_never_retargets_cached_or_snapshot_re
         .unwrap()
         .clone();
     assert_eq!(new_entry.dataset_path, old_entry.dataset_path);
+    assert_eq!(new_entry.native_dataset_branch, None);
+    assert_eq!(old_entry.native_dataset_branch, None);
+    let new_pin = pinned_version(&aba, "feature", "node:Document").await;
+    assert!(is_detached_version(old_pin) && is_detached_version(new_pin));
     assert_ne!(
-        new_entry.native_dataset_branch,
-        old_entry.native_dataset_branch
+        new_pin, old_pin,
+        "each incarnation's write stages its own detached pin"
     );
     assert_eq!(
         new_entry.published_dataset_version, old_entry.published_dataset_version,
@@ -887,9 +907,8 @@ node Marker {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
-    load_jsonl(
-        &db,
+    let db = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
+    db.load_jsonl(
         concat!(
             "{\"type\":\"Document\",\"data\":{\"title\":\"doc\",\"content\":\"base64:T2xk\"}}\n",
             "{\"type\":\"Marker\",\"data\":{\"name\":\"base\"}}",
@@ -1043,11 +1062,13 @@ async fn branch_merge_with_external_blob_uri_materializes_payload_body() {
     let encoded_alias = external_uri.replace("~source", "%7Esource");
     assert_ne!(encoded_alias, external_uri);
 
-    let setup = Omnigraph::init(uri, MULTI_TABLE_EXTERNAL_BLOB_SCHEMA)
-        .await
-        .unwrap()
-        .with_external_blob_policy(policy.clone())
-        .unwrap();
+    let setup = helpers::session(
+        Omnigraph::init(uri, MULTI_TABLE_EXTERNAL_BLOB_SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy.clone())
+            .unwrap(),
+    );
     let converged_base = serde_json::json!({
         "type": "Document",
         "data": {
@@ -1063,16 +1084,20 @@ async fn branch_merge_with_external_blob_uri_materializes_payload_body() {
         .unwrap();
     setup.branch_create("feature").await.unwrap();
 
-    let feature = Omnigraph::open(uri)
-        .await
-        .unwrap()
-        .with_external_blob_policy(policy.clone())
-        .unwrap();
-    let configured_main = Omnigraph::open(uri)
-        .await
-        .unwrap()
-        .with_external_blob_policy(policy.clone())
-        .unwrap();
+    let feature = helpers::session(
+        Omnigraph::open(uri)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy.clone())
+            .unwrap(),
+    );
+    let configured_main = helpers::session(
+        Omnigraph::open(uri)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy.clone())
+            .unwrap(),
+    );
     let target_data = format!(
         "{}\n{}",
         serde_json::json!({
@@ -1096,7 +1121,7 @@ async fn branch_merge_with_external_blob_uri_materializes_payload_body() {
         .load("main", &target_data, LoadMode::Overwrite)
         .await
         .unwrap();
-    let main = Omnigraph::open(uri).await.unwrap();
+    let main = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     let external_data = format!(
         "{}\n{}\n{}\n{}",
@@ -1232,7 +1257,14 @@ async fn branch_merge_with_external_blob_uri_materializes_payload_body() {
         "denied merge must fail before recovery is armed"
     );
 
-    let main = main.with_external_blob_policy(policy.clone()).unwrap();
+    drop(main);
+    let main = helpers::session(
+        Omnigraph::open(uri)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy.clone())
+            .unwrap(),
+    );
     let probes = MergeWriteProbes::default();
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
@@ -1240,18 +1272,18 @@ async fn branch_merge_with_external_blob_uri_materializes_payload_body() {
     assert_eq!(outcome, MergeOutcome::Merged);
     assert_eq!(
         probes.external_blob_probe_inputs(),
-        3,
-        "every selected URI cell across both tables must join the merge-wide external preflight"
+        2,
+        "the three-way Document table's two selected URI cells join the external preflight; the unadvanced Asset table is a pointer switch"
     );
     assert_eq!(
         probes.external_blob_probe_calls(),
         1,
-        "normalized-equivalent URIs across tables must cause one HEAD"
+        "normalized-equivalent URIs must cause one HEAD"
     );
     assert_eq!(
         probes.external_blob_payload_read_calls(),
-        2,
-        "equivalent aliases must share one payload GET in the Document chunk; the separate Asset chunk owns one bounded GET"
+        1,
+        "equivalent aliases must share one payload GET in the Document chunk; the switched Asset pin reads none"
     );
 
     let external_bytes = read_managed_blob_bytes(
@@ -1261,13 +1293,19 @@ async fn branch_merge_with_external_blob_uri_materializes_payload_body() {
     )
     .await;
     assert_eq!(&external_bytes[..], b"External");
-    let asset_bytes = read_managed_blob_bytes(
-        &main,
-        ReadTarget::branch("main"),
-        node_blob_cell("Asset", "external-asset", "payload"),
-    )
-    .await;
-    assert_eq!(&asset_bytes[..], b"External");
+    let asset = main
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Asset", "external-asset", "payload"),
+        )
+        .await
+        .unwrap();
+    let BlobContent::External(asset) = asset.content else {
+        panic!("a pointer switch keeps the Asset descriptor external on main")
+    };
+    assert_eq!(asset.uri, canonical_external_uri);
+    assert_eq!(asset.offset, 0);
+    assert_eq!(asset.length, None);
     let external_two_bytes = read_managed_blob_bytes(
         &main,
         ReadTarget::branch("main"),
@@ -1320,11 +1358,13 @@ async fn branch_merge_pointer_only_external_blob_needs_no_source_io_body() {
         ExternalBlobBase::new(base_uri, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
     ])
     .unwrap();
-    let main = Omnigraph::init(uri, MULTI_TABLE_EXTERNAL_BLOB_SCHEMA)
-        .await
-        .unwrap()
-        .with_external_blob_policy(policy)
-        .unwrap();
+    let main = helpers::session(
+        Omnigraph::init(uri, MULTI_TABLE_EXTERNAL_BLOB_SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
     main.branch_create("pointer-target").await.unwrap();
     let pointer_data = serde_json::json!({
         "type": "Document",
@@ -1359,7 +1399,7 @@ async fn branch_merge_pointer_only_external_blob_needs_no_source_io_body() {
     assert_eq!(pointer.length, None);
     fs::remove_file(&pointer_path).unwrap();
 
-    let deny = Omnigraph::open(uri).await.unwrap();
+    let deny = helpers::session(Omnigraph::open(uri).await.unwrap());
     let outcome = deny.branch_merge("main", "pointer-target").await.unwrap();
     assert_eq!(outcome, MergeOutcome::FastForward);
     let target_entry = snapshot_branch(&deny, "pointer-target")
@@ -1401,34 +1441,21 @@ async fn branch_merge_pointer_only_external_blob_needs_no_source_io_body() {
     assert_eq!(read_probes.external_blob_payload_read_calls(), 0);
 }
 
-/// Blob descriptors are tiny even when their referenced payload is not. The
-/// merge planner must account from `BlobFile::size()` before reading bytes,
-/// both for one over-limit cell and for several individually-valid cells whose
-/// row total exceeds 32 MiB. Both failures are entirely pre-effect.
+/// External payloads past the 32 MiB materialization ceiling, in one cell,
+/// one row, or two tables, merge onto main by pointer switch: no payload is
+/// read and the descriptors stay external.
 #[tokio::test]
-async fn branch_merge_rejects_oversized_blob_payloads_pre_effect() {
-    Box::pin(branch_merge_rejects_external_blob_payloads_pre_effect_body()).await;
+async fn branch_merge_onto_main_switches_oversized_external_blob_pointers() {
+    Box::pin(branch_merge_onto_main_switches_oversized_external_blob_pointers_body()).await;
 }
 
-async fn branch_merge_rejects_external_blob_payloads_pre_effect_body() {
+async fn branch_merge_onto_main_switches_oversized_external_blob_pointers_body() {
     const LIMIT: u64 = 32 * 1024 * 1024;
 
-    for (case, first_bytes, second_bytes, split_across_tables, expected_actual) in [
-        ("single", LIMIT + 1, None, false, LIMIT + 1),
-        (
-            "cumulative",
-            LIMIT / 2 + 1,
-            Some(LIMIT / 2 + 1),
-            false,
-            LIMIT + 2,
-        ),
-        (
-            "cross-table",
-            LIMIT / 2 + 1,
-            Some(LIMIT / 2 + 1),
-            true,
-            LIMIT + 2,
-        ),
+    for (case, first_bytes, second_bytes, split_across_tables) in [
+        ("single", LIMIT + 1, None, false),
+        ("cumulative", LIMIT / 2 + 1, Some(LIMIT / 2 + 1), false),
+        ("cross-table", LIMIT / 2 + 1, Some(LIMIT / 2 + 1), true),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let graph_path = dir.path().join("graph");
@@ -1481,13 +1508,15 @@ async fn branch_merge_rejects_external_blob_payloads_pre_effect_body() {
             ExternalBlobBase::new(base_uri, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
         ])
         .unwrap();
-        let db = Omnigraph::init(graph_uri, WIDE_BLOB_SCHEMA)
-            .await
-            .unwrap()
-            .with_external_blob_policy(policy)
-            .unwrap();
+        let db = helpers::session(
+            Omnigraph::init(graph_uri, WIDE_BLOB_SCHEMA)
+                .await
+                .unwrap()
+                .with_external_blob_policy(policy)
+                .unwrap(),
+        );
         let base = r#"{"type":"Document","data":{"title":"base"}}"#;
-        load_jsonl(&db, base, LoadMode::Overwrite).await.unwrap();
+        db.load_jsonl(base, LoadMode::Overwrite).await.unwrap();
         db.branch_create("feature").await.unwrap();
         db.load(
             "feature",
@@ -1497,101 +1526,119 @@ async fn branch_merge_rejects_external_blob_payloads_pre_effect_body() {
         .await
         .unwrap();
 
-        let before = snapshot_main(&db).await.unwrap();
-        let before_manifest = before.graph_manifest_version();
-        let mut before_tables = Vec::new();
-        for table_key in ["node:Document", "node:Asset"] {
-            let entry = before.dataset(table_key).unwrap();
-            let table_uri = format!(
-                "{}/{}",
-                db.uri().trim_end_matches('/'),
-                entry.dataset_path.trim_start_matches('/')
-            );
-            before_tables.push((
-                table_key,
-                entry.published_dataset_version,
-                Dataset::open(&table_uri).await.unwrap().version().version,
-                table_uri,
-            ));
-        }
-        let before_commits = db.list_commits(Some("main")).await.unwrap().len();
-
+        let before_tables = pointer_switch_tables(&db).await;
         let probes = MergeWriteProbes::default();
-        let error = with_merge_write_probes(probes.clone(), db.branch_merge("feature", "main"))
+        let outcome = with_merge_write_probes(probes.clone(), db.branch_merge("feature", "main"))
             .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                OmniError::ResourceLimitExceeded {
-                    ref resource,
-                    limit: LIMIT,
-                    actual,
-                } if resource == "materialized blob payload bytes"
-                    && actual == expected_actual
-            ),
-            "{case}: oversized blob merge must return the typed pre-read limit, got {error:?}"
-        );
+            .unwrap();
+        assert_eq!(outcome, MergeOutcome::FastForward, "{case}");
+        assert_pointer_switch_onto_main(&db, &probes, before_tables, case).await;
+        assert_eq!(count_rows(&db, "node:Document").await, 2);
         assert_eq!(
-            probes.external_blob_payload_read_calls(),
-            0,
-            "{case}: external overflow must be rejected before payload GET"
+            count_rows(&db, "node:Asset").await,
+            usize::from(split_across_tables)
         );
+        let first = db
+            .read_blob_at(
+                ReadTarget::branch("main"),
+                node_blob_cell("Document", format!("wide-{case}"), "first"),
+            )
+            .await
+            .unwrap();
+        let BlobContent::External(first) = first.content else {
+            panic!("{case}: a pointer switch keeps the external descriptor as written")
+        };
         assert_eq!(
-            probes.blob_payload_read_calls(),
-            0,
-            "{case}: overflow must be rejected before any Blob payload read"
+            first.uri,
+            url::Url::from_file_path(fs::canonicalize(&first_path).unwrap())
+                .unwrap()
+                .to_string()
         );
-        let after = snapshot_main(&db).await.unwrap();
-        assert_eq!(
-            after.graph_manifest_version(),
-            before_manifest,
-            "{case}: manifest moved"
-        );
-        for (table_key, before_table, before_head, table_uri) in before_tables {
-            assert_eq!(
-                after.dataset(table_key).unwrap().published_dataset_version,
-                before_table,
-                "{case}: {table_key} main table pointer moved"
-            );
-            assert_eq!(
-                Dataset::open(&table_uri).await.unwrap().version().version,
-                before_head,
-                "{case}: {table_key} main Lance HEAD moved"
-            );
-        }
-        assert_eq!(count_rows(&db, "node:Document").await, 1);
-        assert_eq!(count_rows(&db, "node:Asset").await, 0);
-        assert_eq!(
-            db.list_commits(Some("main")).await.unwrap().len(),
-            before_commits,
-            "{case}: main lineage moved"
-        );
+        assert_eq!(first.offset, 0);
         let recovery_dir = graph_path.join("__recovery");
         assert!(
             !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
-            "{case}: pre-effect rejection must not leave a recovery sidecar"
+            "{case}: a pointer switch leaves no recovery sidecar"
         );
     }
 }
 
-/// Managed descriptors need no external HEAD, but their carried payload is
-/// still one operation-wide merge budget. Load each row in its own valid
-/// source operation so only the merge's aggregate can exceed the ceiling.
-#[tokio::test]
-async fn branch_merge_rejects_managed_blob_payloads_pre_effect() {
-    Box::pin(branch_merge_rejects_managed_blob_payloads_pre_effect_body()).await;
+/// Main's `node:Document` and `node:Asset` before a merge from `feature`:
+/// key, `dataset_path`, feature's pin, linear HEAD, table uri.
+async fn pointer_switch_tables(db: &Omnigraph) -> Vec<(&'static str, String, u64, u64, String)> {
+    let before = snapshot_main(db).await.unwrap();
+    let mut tables = Vec::new();
+    for table_key in ["node:Document", "node:Asset"] {
+        let entry = before.dataset(table_key).unwrap();
+        let table_uri = format!(
+            "{}/{}",
+            db.uri().trim_end_matches('/'),
+            entry.dataset_path.trim_start_matches('/')
+        );
+        tables.push((
+            table_key,
+            entry.dataset_path.clone(),
+            pinned_version(db, "feature", table_key).await,
+            Dataset::open(&table_uri).await.unwrap().version().version,
+            table_uri,
+        ));
+    }
+    tables
 }
 
-async fn branch_merge_rejects_managed_blob_payloads_pre_effect_body() {
+/// A merge onto an unadvanced main is not Blob ingress: no policy check, no
+/// payload read, nothing staged; main takes each source pin in place.
+async fn assert_pointer_switch_onto_main(
+    db: &Omnigraph,
+    probes: &MergeWriteProbes,
+    tables: Vec<(&'static str, String, u64, u64, String)>,
+    case: &str,
+) {
+    assert_eq!(probes.external_blob_probe_inputs(), 0, "{case}");
+    assert_eq!(probes.external_blob_probe_calls(), 0, "{case}");
+    assert_eq!(probes.external_blob_payload_read_calls(), 0, "{case}");
+    assert_eq!(probes.blob_payload_read_calls(), 0, "{case}");
+    assert_eq!(probes.stage_append_calls(), 0, "{case}");
+    assert_eq!(probes.stage_merge_insert_calls(), 0, "{case}");
+    assert_eq!(probes.stage_fenced_insert_calls(), 0, "{case}");
+    assert_eq!(probes.stage_known_present_update_calls(), 0, "{case}");
+    let after = snapshot_main(db).await.unwrap();
+    for (table_key, dataset_path, source_pin, linear_head, table_uri) in tables {
+        assert_eq!(
+            after.dataset(table_key).unwrap().dataset_path,
+            dataset_path,
+            "{case}: {table_key}"
+        );
+        assert_eq!(
+            pinned_version(db, "main", table_key).await,
+            source_pin,
+            "{case}: {table_key} main takes the source's pin"
+        );
+        assert_eq!(
+            Dataset::open(&table_uri).await.unwrap().version().version,
+            linear_head,
+            "{case}: {table_key} linear HEAD moved"
+        );
+    }
+}
+
+/// Two managed payloads whose sum passes the 32 MiB materialization ceiling
+/// merge onto main by pointer switch: no payload is read or copied, and both
+/// managed descriptors read back through main.
+#[tokio::test]
+async fn branch_merge_onto_main_switches_managed_blob_pointers() {
+    Box::pin(branch_merge_onto_main_switches_managed_blob_pointers_body()).await;
+}
+
+async fn branch_merge_onto_main_switches_managed_blob_pointers_body() {
     const LIMIT: u64 = 32 * 1024 * 1024;
 
     let dir = tempfile::tempdir().unwrap();
     let graph_path = dir.path().join("managed-aggregate-graph");
     let graph_uri = graph_path.to_str().unwrap();
-    let db = Omnigraph::init(graph_uri, WIDE_BLOB_SCHEMA).await.unwrap();
+    let db = helpers::session(Omnigraph::init(graph_uri, WIDE_BLOB_SCHEMA).await.unwrap());
     let base = r#"{"type":"Document","data":{"title":"base"}}"#;
-    load_jsonl(&db, base, LoadMode::Overwrite).await.unwrap();
+    db.load_jsonl(base, LoadMode::Overwrite).await.unwrap();
     db.branch_create("feature").await.unwrap();
     let payload_bytes = LIMIT / 2 + 1;
     for index in 0..2 {
@@ -1610,74 +1657,40 @@ async fn branch_merge_rejects_managed_blob_payloads_pre_effect_body() {
         db.load("feature", &row, LoadMode::Append).await.unwrap();
     }
 
-    let before = snapshot_main(&db).await.unwrap();
-    let before_manifest = before.graph_manifest_version();
-    let entry = before.dataset("node:Document").unwrap();
-    let before_table = entry.published_dataset_version;
-    let table_uri = format!(
-        "{}/{}",
-        db.uri().trim_end_matches('/'),
-        entry.dataset_path.trim_start_matches('/')
-    );
-    let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
-    let before_commits = db.list_commits(Some("main")).await.unwrap().len();
+    let before_tables = pointer_switch_tables(&db).await;
     let probes = MergeWriteProbes::default();
-    let error = with_merge_write_probes(probes.clone(), db.branch_merge("feature", "main"))
+    let outcome = with_merge_write_probes(probes.clone(), db.branch_merge("feature", "main"))
         .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            error,
-            OmniError::ResourceLimitExceeded {
-                ref resource,
-                limit: LIMIT,
-                actual,
-            } if resource == "materialized blob payload bytes" && actual == LIMIT + 2
-        ),
-        "managed aggregate must return the typed pre-read operation limit, got {error:?}"
-    );
-    assert_eq!(probes.external_blob_probe_calls(), 0);
-    assert_eq!(
-        probes.external_blob_payload_read_calls(),
-        0,
-        "managed aggregate refusal must not perform an external payload GET"
-    );
-    assert_eq!(
-        probes.blob_payload_read_calls(),
-        0,
-        "managed aggregate refusal must happen from descriptor lengths before payload reads"
-    );
-    let after = snapshot_main(&db).await.unwrap();
-    assert_eq!(after.graph_manifest_version(), before_manifest);
-    assert_eq!(
-        after
-            .dataset("node:Document")
-            .unwrap()
-            .published_dataset_version,
-        before_table
-    );
-    assert_eq!(
-        Dataset::open(&table_uri).await.unwrap().version().version,
-        before_head
-    );
-    assert_eq!(
-        db.list_commits(Some("main")).await.unwrap().len(),
-        before_commits
-    );
+        .unwrap();
+    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_pointer_switch_onto_main(&db, &probes, before_tables, "managed").await;
+    assert_eq!(count_rows(&db, "node:Document").await, 3);
+    for index in 0..2 {
+        let read = db
+            .read_blob_at(
+                ReadTarget::branch("main"),
+                node_blob_cell("Document", format!("managed-{index}"), "first"),
+            )
+            .await
+            .unwrap();
+        let BlobContent::Managed { reader, .. } = read.content else {
+            panic!("managed-{index}: the switched pin keeps the managed descriptor")
+        };
+        assert_eq!(reader.len(), payload_bytes);
+    }
     let recovery_dir = graph_path.join("__recovery");
     assert!(!recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none());
 }
 
-/// The descriptor pass owns one operation-wide cell bound. Assemble a source
-/// image with two separate Overwrites that are each legal on their own, then
-/// prove the merge refuses their 8,193 selected external cells before the
-/// first external HEAD, payload GET, recovery arm, or target effect.
+/// Two source Overwrites, each legal alone, hold 8,193 external cells, one
+/// past the ingress cell bound; the merge onto main switches their pointers
+/// with no external HEAD or payload GET, and every descriptor stays external.
 #[tokio::test]
-async fn branch_merge_rejects_external_blob_reference_cells_pre_effect() {
-    Box::pin(branch_merge_rejects_external_blob_reference_cells_pre_effect_body()).await;
+async fn branch_merge_onto_main_switches_external_blob_reference_cells() {
+    Box::pin(branch_merge_onto_main_switches_external_blob_reference_cells_body()).await;
 }
 
-async fn branch_merge_rejects_external_blob_reference_cells_pre_effect_body() {
+async fn branch_merge_onto_main_switches_external_blob_reference_cells_body() {
     const REFERENCE_LIMIT: usize = 8192;
     let dir = tempfile::tempdir().unwrap();
     let graph_path = dir.path().join("external-cell-aggregate-graph");
@@ -1693,11 +1706,13 @@ async fn branch_merge_rejects_external_blob_reference_cells_pre_effect_body() {
         ExternalBlobBase::new(base_uri, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
     ])
     .unwrap();
-    let db = Omnigraph::init(graph_path.to_str().unwrap(), WIDE_BLOB_SCHEMA)
-        .await
-        .unwrap()
-        .with_external_blob_policy(policy)
-        .unwrap();
+    let db = helpers::session(
+        Omnigraph::init(graph_path.to_str().unwrap(), WIDE_BLOB_SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
     db.branch_create("feature").await.unwrap();
 
     let external_rows = |table: &str, key: &str, blob: &str, rows: usize, prefix: &str| {
@@ -1752,73 +1767,46 @@ async fn branch_merge_rejects_external_blob_reference_cells_pre_effect_body() {
         REFERENCE_LIMIT / 2 + 1
     );
 
-    let before = snapshot_main(&db).await.unwrap();
-    let before_manifest = before.graph_manifest_version();
     let source_before = snapshot_branch(&db, "feature").await.unwrap();
-    let mut before_tables = Vec::new();
-    for table_key in ["node:Document", "node:Asset"] {
-        let entry = before.dataset(table_key).unwrap();
-        let table_uri = format!(
-            "{}/{}",
-            db.uri().trim_end_matches('/'),
-            entry.dataset_path.trim_start_matches('/')
-        );
-        before_tables.push((
-            table_key,
-            entry.published_dataset_version,
-            Dataset::open(&table_uri).await.unwrap().version().version,
-            source_before
-                .dataset(table_key)
-                .unwrap()
-                .published_dataset_version,
-            table_uri,
-        ));
-    }
-    let before_commits = db.list_commits(Some("main")).await.unwrap().len();
+    let before_tables = pointer_switch_tables(&db).await;
     let merge_probes = MergeWriteProbes::default();
-    let error = with_merge_write_probes(merge_probes.clone(), db.branch_merge("feature", "main"))
+    let outcome = with_merge_write_probes(merge_probes.clone(), db.branch_merge("feature", "main"))
         .await
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        OmniError::ResourceLimitExceeded {
-            ref resource,
-            limit,
-            actual,
-        } if resource == "external Blob reference cells"
-            && limit == REFERENCE_LIMIT as u64
-            && actual == REFERENCE_LIMIT as u64 + 1
-    ));
-    assert_eq!(merge_probes.external_blob_probe_inputs(), 0);
-    assert_eq!(merge_probes.external_blob_probe_calls(), 0);
-    assert_eq!(merge_probes.external_blob_payload_read_calls(), 0);
-    assert_eq!(merge_probes.blob_payload_read_calls(), 0);
-
-    let after = snapshot_main(&db).await.unwrap();
+        .unwrap();
+    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_pointer_switch_onto_main(&db, &merge_probes, before_tables, "reference cells").await;
+    assert_eq!(count_rows(&db, "node:Document").await, REFERENCE_LIMIT / 2);
+    assert_eq!(count_rows(&db, "node:Asset").await, REFERENCE_LIMIT / 2 + 1);
     let source_after = snapshot_branch(&db, "feature").await.unwrap();
-    assert_eq!(after.graph_manifest_version(), before_manifest);
-    for (table_key, before_table, before_head, before_source, table_uri) in before_tables {
-        assert_eq!(
-            after.dataset(table_key).unwrap().published_dataset_version,
-            before_table
-        );
-        assert_eq!(
-            Dataset::open(&table_uri).await.unwrap().version().version,
-            before_head
-        );
-        assert_eq!(
+    for table_key in ["node:Document", "node:Asset"] {
+        assert!(
             source_after
                 .dataset(table_key)
                 .unwrap()
-                .published_dataset_version,
-            before_source,
-            "refused merge must not move the source table pointer"
+                .same_registration(source_before.dataset(table_key).unwrap()),
+            "the merge must not move the source table pointer"
         );
     }
-    assert_eq!(
-        db.list_commits(Some("main")).await.unwrap().len(),
-        before_commits
-    );
+    let canonical_external_uri =
+        url::Url::from_file_path(fs::canonicalize(&external_path).unwrap())
+            .unwrap()
+            .to_string();
+    for (type_name, id, property) in [
+        ("Document", "document-0", "first"),
+        ("Asset", "asset-0", "payload"),
+    ] {
+        let read = db
+            .read_blob_at(
+                ReadTarget::branch("main"),
+                node_blob_cell(type_name, id, property),
+            )
+            .await
+            .unwrap();
+        let BlobContent::External(reference) = read.content else {
+            panic!("{type_name}: a pointer switch keeps the external descriptor as written")
+        };
+        assert_eq!(reference.uri, canonical_external_uri);
+    }
     let recovery_dir = graph_path.join("__recovery");
     assert!(!recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none());
 }
@@ -1830,9 +1818,9 @@ async fn branch_merge_applies_node_insert_to_main() {
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -1844,9 +1832,9 @@ async fn branch_merge_applies_node_insert_to_main() {
     let outcome = feature.branch_merge("feature", "main").await.unwrap();
     assert_eq!(outcome, MergeOutcome::FastForward);
 
-    let mut reopened = Omnigraph::open(uri).await.unwrap();
+    let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
     let qr = query_main(
-        &mut reopened,
+        &reopened,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Eve")]),
@@ -1856,11 +1844,11 @@ async fn branch_merge_applies_node_insert_to_main() {
     assert_eq!(qr.num_rows(), 1);
 }
 
-/// Rust because the pins are native table versions, the target ref's physical
-/// HEAD, and the entry retained on an empty delta; the row-visible half is
+/// Rust because the pins are detached table versions, the linear HEAD, and the
+/// entry retained on an empty delta; the row-visible half is
 /// `merge_adopt_*.gqt`. Both named targets adopt the exact source registration.
 #[tokio::test]
-async fn branch_merge_preserves_state_when_native_versions_differ() {
+async fn branch_merge_preserves_state_when_pins_differ() {
     for lazy_target in [false, true] {
         assert_native_version_case(8, lazy_target).await;
     }
@@ -1948,30 +1936,23 @@ fn assert_native_version_case(
             .dataset("node:Person")
             .unwrap()
             .clone();
-        if branch_updates == 2 {
-            assert_eq!(
-                source_entry.published_dataset_version, target_entry.published_dataset_version,
-                "fixture must exercise equal numeric versions on different refs"
-            );
-        } else if branch_updates > 2 {
-            assert!(
-                source_entry.published_dataset_version < target_entry.published_dataset_version,
-                "fixture must exercise a lower source version"
-            );
-        } else {
-            assert!(
-                source_entry.published_dataset_version > target_entry.published_dataset_version,
-                "fixture must exercise a higher source version"
-            );
-        }
+        let source_pin = pinned_version(&main, source, "node:Person").await;
+        let target_pin = pinned_version(&main, target, "node:Person").await;
+        assert!(is_detached_version(source_pin) && is_detached_version(target_pin));
         assert_ne!(
-            source_entry.native_dataset_branch,
-            target_entry.native_dataset_branch
+            source_pin, target_pin,
+            "fixture must exercise different pins on the two sides"
         );
-        assert_eq!(target_entry.native_dataset_branch.is_some(), !lazy_target);
+        assert_eq!(source_entry.native_dataset_branch, None);
+        assert_eq!(target_entry.native_dataset_branch, None);
         assert_eq!(
             main.branch_merge(source, target).await.unwrap(),
             MergeOutcome::FastForward
+        );
+        assert_eq!(
+            pinned_version(&main, target, "node:Person").await,
+            source_pin,
+            "{target}: adoption takes the source's pin"
         );
         let merged_entry = snapshot_branch(&main, target)
             .await
@@ -1990,7 +1971,7 @@ fn assert_native_version_case(
             ),
             "{target}, {branch_updates} updates: adoption preserves the exact source ref and version"
         );
-        let reopened = Omnigraph::open(uri).await.unwrap();
+        let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
         for handle in [&main, &reopened] {
             let result = handle
                 .query(
@@ -2100,7 +2081,7 @@ fn assert_native_version_case(
             head_before,
             "empty adoption must not advance the physical target HEAD"
         );
-        let mut maintenance = Omnigraph::open(uri).await.unwrap();
+        let maintenance = Omnigraph::open(uri).await.unwrap();
         maintenance
             .cleanup(omnigraph::db::CleanupPolicyOptions {
                 keep_versions: Some(100),
@@ -2118,15 +2099,15 @@ fn assert_native_version_case(
         .unwrap();
         let written = snapshot_branch(&main, target).await.unwrap();
         let written = written.dataset("node:Person").unwrap();
+        assert_eq!(written.native_dataset_branch, None);
+        let written_pin = pinned_version(&main, target, "node:Person").await;
+        assert!(is_detached_version(written_pin), "{written_pin}");
         assert_ne!(
-            written.native_dataset_branch,
-            before_empty.native_dataset_branch
+            written_pin,
+            pinned_version(&main, "main", "node:Person").await
         );
-        assert_ne!(
-            written.native_dataset_branch,
-            target_entry.native_dataset_branch
-        );
-        let reopened = Omnigraph::open(uri).await.unwrap();
+        assert_ne!(written_pin, target_pin);
+        let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
         for handle in [&main, &reopened] {
             for (branch, age) in [
                 ("borrower", 39 + branch_updates as i32),
@@ -2151,7 +2132,7 @@ fn assert_native_version_case(
                         .unwrap()
                         .value(0),
                     age,
-                    "{branch}: cleanup and a fresh target fork preserve independent branch values"
+                    "{branch}: cleanup and a fresh target pin preserve independent branch values"
                 );
             }
         }
@@ -2159,7 +2140,7 @@ fn assert_native_version_case(
 }
 
 #[tokio::test]
-async fn branch_write_after_adoption_keeps_borrowers_and_uses_fresh_forks() {
+async fn branch_write_after_adoption_keeps_borrowers_and_stages_fresh_pins() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     db.branch_create("feature").await.unwrap();
@@ -2181,6 +2162,9 @@ async fn branch_write_after_adoption_keeps_borrowers_and_uses_fresh_forks() {
         .dataset("node:Company")
         .unwrap()
         .clone();
+    assert_eq!(borrowed.native_dataset_branch, None);
+    let borrowed_pin = pinned_version(&db, "child", "node:Company").await;
+    assert!(is_detached_version(borrowed_pin), "{borrowed_pin}");
     assert_eq!(
         db.branch_merge("feature", "main").await.unwrap(),
         MergeOutcome::FastForward
@@ -2199,18 +2183,12 @@ async fn branch_write_after_adoption_keeps_borrowers_and_uses_fresh_forks() {
         MergeOutcome::FastForward
     );
     let owner_before = snapshot_branch(&db, "feature").await.unwrap();
+    let owner_pin_before = pinned_version(&db, "feature", "node:Company").await;
     let table_uri = format!("{}/{}", db.uri(), borrowed.dataset_path);
-    let native = borrowed.native_dataset_branch.as_deref().unwrap();
-    let head_before = open_dataset_head_exact(&table_uri, Some(native))
+    let head_before = open_dataset_head_exact(&table_uri, None)
         .await
         .version()
         .version;
-    let branches_before = Dataset::open(&table_uri)
-        .await
-        .unwrap()
-        .list_branches()
-        .await
-        .unwrap();
 
     db.load_as(
         "feature",
@@ -2223,34 +2201,25 @@ async fn branch_write_after_adoption_keeps_borrowers_and_uses_fresh_forks() {
     .unwrap();
     let owner_after = snapshot_branch(&db, "feature").await.unwrap();
     let written = owner_after.dataset("node:Company").unwrap();
-    assert_ne!(
-        written.native_dataset_branch,
-        borrowed.native_dataset_branch
-    );
-    assert_ne!(
-        written.native_dataset_branch,
-        owner_before
-            .dataset("node:Company")
-            .unwrap()
-            .native_dataset_branch
-    );
+    assert_eq!(written.dataset_path, borrowed.dataset_path);
+    assert_eq!(written.native_dataset_branch, None);
+    let written_pin = pinned_version(&db, "feature", "node:Company").await;
+    assert!(is_detached_version(written_pin), "{written_pin}");
+    assert_ne!(written_pin, borrowed_pin);
+    assert_ne!(written_pin, owner_pin_before);
     assert_eq!(
-        open_dataset_head_exact(&table_uri, Some(native))
+        open_dataset_head_exact(&table_uri, None)
             .await
             .version()
             .version,
-        head_before
+        head_before,
+        "a branch write never moves the linear HEAD"
     );
-    let branches_after = Dataset::open(&table_uri)
-        .await
-        .unwrap()
-        .list_branches()
-        .await
-        .unwrap();
-    assert_eq!(
-        branches_after.get(native).unwrap().identifier,
-        branches_before.get(native).unwrap().identifier,
-        "a fresh write must not recreate the borrowed native ref"
+    assert!(
+        helpers::collector::detached_versions(&table_uri)
+            .await
+            .contains(&borrowed_pin),
+        "a fresh write must leave the borrowed pin in place"
     );
     db.branch_create_from(ReadTarget::branch("feature"), "replacement")
         .await
@@ -2266,9 +2235,15 @@ async fn branch_write_after_adoption_keeps_borrowers_and_uses_fresh_forks() {
     .unwrap();
     let replacement = snapshot_branch(&db, "replacement").await.unwrap();
     let replacement_entry = replacement.dataset("node:Company").unwrap();
+    let replacement_pin = pinned_version(&db, "replacement", "node:Company").await;
     assert_eq!(
         db.branch_merge("replacement", "feature").await.unwrap(),
         MergeOutcome::FastForward
+    );
+    assert_eq!(
+        pinned_version(&db, "feature", "node:Company").await,
+        replacement_pin,
+        "adoption takes the replacement's pin"
     );
     let adopted = snapshot_branch(&db, "feature").await.unwrap();
     let adopted_entry = adopted.dataset("node:Company").unwrap();
@@ -2300,14 +2275,11 @@ async fn branch_write_after_adoption_keeps_borrowers_and_uses_fresh_forks() {
     .unwrap();
     let after_adopt_write = snapshot_branch(&db, "feature").await.unwrap();
     let after_adopt_entry = after_adopt_write.dataset("node:Company").unwrap();
-    assert_ne!(
-        after_adopt_entry.native_dataset_branch,
-        replacement_entry.native_dataset_branch
-    );
-    assert_ne!(
-        after_adopt_entry.native_dataset_branch,
-        written.native_dataset_branch
-    );
+    assert_eq!(after_adopt_entry.native_dataset_branch, None);
+    let after_adopt_pin = pinned_version(&db, "feature", "node:Company").await;
+    assert!(is_detached_version(after_adopt_pin), "{after_adopt_pin}");
+    assert_ne!(after_adopt_pin, replacement_pin);
+    assert_ne!(after_adopt_pin, written_pin);
     let replacement_after = snapshot_branch(&db, "replacement").await.unwrap();
     assert!(
         replacement_after
@@ -2345,6 +2317,11 @@ async fn branch_write_after_adoption_keeps_borrowers_and_uses_fresh_forks() {
         child.published_dataset_version,
         borrowed.published_dataset_version
     );
+    assert_eq!(
+        pinned_version(&db, "child", "node:Company").await,
+        borrowed_pin,
+        "the borrower keeps its pin across every later write"
+    );
     assert_ne!(
         snapshot_branch(&db, "feature")
             .await
@@ -2361,9 +2338,9 @@ async fn branch_merge_records_single_latest_commit_with_two_parents() {
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -2436,7 +2413,7 @@ async fn same_branch_insert_after_external_commit_is_linear() {
 
     // Handle A: a long-lived writer whose coordinator head stays pinned at the
     // load commit (C0) — it never refreshes before its own write below.
-    let mut a = init_and_load(&dir).await;
+    let a = init_and_load(&dir).await;
     let c0 = CommitGraph::open(uri)
         .await
         .unwrap()
@@ -2446,9 +2423,9 @@ async fn same_branch_insert_after_external_commit_is_linear() {
         .unwrap();
 
     // External writer B advances main: commit C1, parent C0.
-    let mut b = Omnigraph::open(uri).await.unwrap();
+    let b = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_main(
-        &mut b,
+        &b,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "ext_b")], &[("$age", 30)]),
@@ -2471,7 +2448,7 @@ async fn same_branch_insert_after_external_commit_is_linear() {
     // A writes to main WITHOUT refreshing. A's coordinator still thinks the head
     // is C0, so a pre-fix append parents the new commit on C0 instead of C1.
     mutate_main(
-        &mut a,
+        &a,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "local_a")], &[("$age", 40)]),
@@ -2516,9 +2493,9 @@ async fn same_branch_update_after_external_commit_and_read_is_linear() {
 
     // A inserts the row it will later update; this is A's own commit (Ca), so
     // A's coordinator head is Ca.
-    let mut a = init_and_load(&dir).await;
+    let a = init_and_load(&dir).await;
     mutate_main(
-        &mut a,
+        &a,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "target")], &[("$age", 40)]),
@@ -2534,9 +2511,9 @@ async fn same_branch_update_after_external_commit_and_read_is_linear() {
         .unwrap();
 
     // External writer B advances main: commit Cb, parent Ca.
-    let mut b = Omnigraph::open(uri).await.unwrap();
+    let b = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_main(
-        &mut b,
+        &b,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "ext_b")], &[("$age", 30)]),
@@ -2557,14 +2534,14 @@ async fn same_branch_update_after_external_commit_and_read_is_linear() {
 
     // A reads main: the stale-probe path refreshes A's exact manifest head and
     // table pins while deliberately leaving the derived lineage cache warm.
-    query_main(&mut a, TEST_QUERIES, "total_people", &params(&[]))
+    query_main(&a, TEST_QUERIES, "total_people", &params(&[]))
         .await
         .unwrap();
 
     // Strict update, no explicit refresh: pre-fix it appends off the stale head
     // Ca instead of Cb.
     mutate_main(
-        &mut a,
+        &a,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "target")], &[("$age", 99)]),
@@ -2605,9 +2582,9 @@ async fn branch_merge_records_actor_on_latest_commit() {
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -2676,13 +2653,13 @@ async fn already_up_to_date_branch_merge_returns_without_new_commit() {
 async fn branch_merge_returns_merged_for_non_fast_forward_auto_merge() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Bob")], &[("$age", 26)]),
@@ -2691,7 +2668,7 @@ async fn branch_merge_returns_merged_for_non_fast_forward_auto_merge() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -2704,7 +2681,7 @@ async fn branch_merge_returns_merged_for_non_fast_forward_auto_merge() {
     assert_eq!(outcome, MergeOutcome::Merged);
 
     let bob = query_main(
-        &mut main,
+        &main,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Bob")]),
@@ -2717,7 +2694,7 @@ async fn branch_merge_returns_merged_for_non_fast_forward_auto_merge() {
     assert_eq!(bob_ages.value(0), 26);
 
     let eve = query_main(
-        &mut main,
+        &main,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Eve")]),
@@ -2737,7 +2714,7 @@ async fn branch_merge_detects_nested_list_value_change() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let schema = "node Doc {\n    slug: String @key\n    tags: [String]\n}";
-    let mut main = Omnigraph::init(uri, schema).await.unwrap();
+    let main = helpers::session(Omnigraph::init(uri, schema).await.unwrap());
     // Base: one element containing a comma.
     main.load_with_receipt(
         "main",
@@ -2748,7 +2725,7 @@ async fn branch_merge_detects_nested_list_value_change() {
     .unwrap();
 
     main.branch_create("feature").await.unwrap();
-    let feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     // Feature changes it to two elements — displays identically to the base.
     feature
         .load_with_receipt(
@@ -2780,14 +2757,9 @@ query docs_with_tag($tag: String) {
     return { $d.slug }
 }
 "#;
-    let result = query_main(
-        &mut main,
-        queries,
-        "docs_with_tag",
-        &params(&[("$tag", "b")]),
-    )
-    .await
-    .unwrap();
+    let result = query_main(&main, queries, "docs_with_tag", &params(&[("$tag", "b")]))
+        .await
+        .unwrap();
     let batch = result.concat_batches().unwrap();
     let slugs = batch
         .column(0)
@@ -2805,13 +2777,13 @@ query docs_with_tag($tag: String) {
 async fn branch_merge_allows_identical_updates_on_both_sides() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
@@ -2820,7 +2792,7 @@ async fn branch_merge_allows_identical_updates_on_both_sides() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "set_age",
@@ -2833,7 +2805,7 @@ async fn branch_merge_allows_identical_updates_on_both_sides() {
     assert_eq!(outcome, MergeOutcome::Merged);
 
     let alice = query_main(
-        &mut main,
+        &main,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Alice")]),
@@ -2854,13 +2826,13 @@ async fn branch_merge_allows_identical_updates_on_both_sides() {
 async fn merged_rewritten_indexed_table_is_searchable_immediately() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_search_db(&dir).await;
+    let main = init_search_db(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         SEARCH_MUTATIONS,
         "set_doc_title",
         &params(&[("$slug", "ml-intro"), ("$title", "Orion ML Intro")]),
@@ -2869,7 +2841,7 @@ async fn merged_rewritten_indexed_table_is_searchable_immediately() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         SEARCH_MUTATIONS,
         "set_doc_title",
@@ -2882,7 +2854,7 @@ async fn merged_rewritten_indexed_table_is_searchable_immediately() {
     assert_eq!(outcome, MergeOutcome::Merged);
 
     let result = query_main(
-        &mut main,
+        &main,
         SEARCH_QUERIES,
         "text_search",
         &params(&[("$q", "Orion")]),
@@ -2921,12 +2893,12 @@ async fn explicit_target_reads_see_branch_local_writes_without_refresh() {
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut writer = Omnigraph::open(uri).await.unwrap();
-    let mut reader = Omnigraph::open(uri).await.unwrap();
-    let mut main_reader = Omnigraph::open(uri).await.unwrap();
+    let writer = helpers::session(Omnigraph::open(uri).await.unwrap());
+    let reader = helpers::session(Omnigraph::open(uri).await.unwrap());
+    let main_reader = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_branch(
-        &mut writer,
+        &writer,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -2936,7 +2908,7 @@ async fn explicit_target_reads_see_branch_local_writes_without_refresh() {
     .unwrap();
 
     let visible = query_branch(
-        &mut reader,
+        &reader,
         "feature",
         TEST_QUERIES,
         "get_person",
@@ -2947,7 +2919,7 @@ async fn explicit_target_reads_see_branch_local_writes_without_refresh() {
     assert_eq!(visible.num_rows(), 1);
 
     let main_result = query_main(
-        &mut main_reader,
+        &main_reader,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Eve")]),
@@ -2964,9 +2936,9 @@ async fn branch_created_from_non_main_inherits_branch_state() {
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -2999,9 +2971,9 @@ async fn branch_created_from_non_main_inherits_branch_state() {
         vec!["main", "experiment", "feature"]
     );
 
-    let mut experiment = Omnigraph::open(uri).await.unwrap();
+    let experiment = helpers::session(Omnigraph::open(uri).await.unwrap());
     let qr = query_branch(
-        &mut experiment,
+        &experiment,
         "experiment",
         TEST_QUERIES,
         "get_person",
@@ -3011,9 +2983,9 @@ async fn branch_created_from_non_main_inherits_branch_state() {
     .unwrap();
     assert_eq!(qr.num_rows(), 1);
 
-    let mut reopened_main = Omnigraph::open(uri).await.unwrap();
+    let reopened_main = helpers::session(Omnigraph::open(uri).await.unwrap());
     let main_qr = query_main(
-        &mut reopened_main,
+        &reopened_main,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Eve")]),
@@ -3030,9 +3002,9 @@ async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_ne
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -3047,13 +3019,20 @@ async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_ne
 
     let experiment = Omnigraph::open(uri).await.unwrap();
     let experiment_inherited = snapshot_branch(&experiment, "experiment").await.unwrap();
-    helpers::assert_native_branch_of(
+    assert_eq!(
         experiment_inherited
             .dataset("node:Person")
             .unwrap()
             .native_dataset_branch
             .as_deref(),
-        "feature",
+        None
+    );
+    let feature_pin = pinned_version(&experiment, "feature", "node:Person").await;
+    assert!(is_detached_version(feature_pin), "{feature_pin}");
+    assert_eq!(
+        pinned_version(&experiment, "experiment", "node:Person").await,
+        feature_pin,
+        "the child branch inherits feature's pin"
     );
 
     experiment.ensure_indices_on("experiment").await.unwrap();
@@ -3071,6 +3050,11 @@ async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_ne
         "index reconciliation must preserve the exact inherited table ref when no work is needed"
     );
     assert_eq!(
+        pinned_version(&experiment, "experiment", "node:Person").await,
+        feature_pin,
+        "index reconciliation must keep the inherited pin when no work is needed"
+    );
+    assert_eq!(
         experiment_snap
             .dataset("edge:Knows")
             .unwrap()
@@ -3080,13 +3064,18 @@ async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_ne
     );
 
     let feature_snap = snapshot_branch(&feature, "feature").await.unwrap();
-    helpers::assert_native_branch_of(
+    assert_eq!(
         feature_snap
             .dataset("node:Person")
             .unwrap()
             .native_dataset_branch
             .as_deref(),
-        "feature",
+        None
+    );
+    assert_ne!(
+        feature_pin,
+        pinned_version(&feature, "main", "node:Person").await,
+        "feature's write staged its own pin"
     );
     assert_eq!(
         count_rows_branch(&feature, "feature", "node:Person").await,
@@ -3097,36 +3086,38 @@ async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_ne
         5
     );
 
-    // A lazy descendant retains its ancestor's physical Lance ref. Native
-    // branch controls must fence main-only Phase-A enrollment without assuming
-    // the logical source name is also the resolved physical ref.
     experiment
         .branch_create_from(ReadTarget::branch("experiment"), "grandchild")
         .await
         .unwrap();
     let grandchild = snapshot_branch(&experiment, "grandchild").await.unwrap();
-    helpers::assert_native_branch_of(
+    assert_eq!(
         grandchild
             .dataset("node:Person")
             .unwrap()
             .native_dataset_branch
             .as_deref(),
-        "feature",
+        None
+    );
+    assert_eq!(
+        pinned_version(&experiment, "grandchild", "node:Person").await,
+        feature_pin,
+        "a lazy descendant keeps its ancestor's pin"
     );
     experiment.branch_delete("grandchild").await.unwrap();
     experiment.branch_delete("experiment").await.unwrap();
 }
 
 #[tokio::test]
-async fn branch_edge_only_write_only_branches_edge_table() {
+async fn branch_edge_only_write_only_moves_edge_table_pin() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "add_friend",
@@ -3136,30 +3127,29 @@ async fn branch_edge_only_write_only_branches_edge_table() {
     .unwrap();
 
     let snap = snapshot_branch(&feature, "feature").await.unwrap();
-    assert_eq!(
-        snap.dataset("node:Person")
-            .unwrap()
-            .native_dataset_branch
-            .as_deref(),
-        None
-    );
-    helpers::assert_native_branch_of(
-        snap.dataset("edge:Knows")
-            .unwrap()
-            .native_dataset_branch
-            .as_deref(),
-        "feature",
-    );
-    assert_eq!(
-        snap.dataset("edge:WorksAt")
-            .unwrap()
-            .native_dataset_branch
-            .as_deref(),
-        None
-    );
+    for table_key in ["node:Person", "edge:Knows", "edge:WorksAt"] {
+        assert_eq!(
+            snap.dataset(table_key)
+                .unwrap()
+                .native_dataset_branch
+                .as_deref(),
+            None,
+            "{table_key}: a branch write never forks a table"
+        );
+        let branch_pin = pinned_version(&feature, "feature", table_key).await;
+        let main_pin = pinned_version(&feature, "main", table_key).await;
+        assert_eq!(
+            branch_pin != main_pin,
+            table_key == "edge:Knows",
+            "{table_key}: only the written edge table takes a new pin"
+        );
+    }
+    assert!(is_detached_version(
+        pinned_version(&feature, "feature", "edge:Knows").await
+    ));
 
     let feature_qr = query_branch(
-        &mut feature,
+        &feature,
         "feature",
         TEST_QUERIES,
         "friends_of",
@@ -3169,9 +3159,9 @@ async fn branch_edge_only_write_only_branches_edge_table() {
     .unwrap();
     assert_eq!(feature_qr.num_rows(), 3);
 
-    let mut reopened_main = Omnigraph::open(uri).await.unwrap();
+    let reopened_main = helpers::session(Omnigraph::open(uri).await.unwrap());
     let main_qr = query_main(
-        &mut reopened_main,
+        &reopened_main,
         TEST_QUERIES,
         "friends_of",
         &params(&[("$name", "Alice")]),
@@ -3188,9 +3178,9 @@ async fn branch_merge_into_non_main_target_works() {
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -3204,7 +3194,7 @@ async fn branch_merge_into_non_main_target_works() {
         .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "set_age",
@@ -3235,9 +3225,9 @@ async fn branch_merge_into_non_main_target_works() {
         "merging into another branch must preserve main's graph lineage"
     );
 
-    let mut experiment = Omnigraph::open(uri).await.unwrap();
+    let experiment = helpers::session(Omnigraph::open(uri).await.unwrap());
     let bob = query_branch(
-        &mut experiment,
+        &experiment,
         "experiment",
         TEST_QUERIES,
         "get_person",
@@ -3254,7 +3244,7 @@ async fn branch_merge_into_non_main_target_works() {
     assert_eq!(bob_ages.value(0), 26);
 
     let eve = query_branch(
-        &mut experiment,
+        &experiment,
         "experiment",
         TEST_QUERIES,
         "get_person",
@@ -3283,9 +3273,9 @@ async fn branch_merge_into_non_main_target_works() {
         "the named target must adopt the exact source table pointer"
     );
 
-    let mut reopened_main = Omnigraph::open(uri).await.unwrap();
+    let reopened_main = helpers::session(Omnigraph::open(uri).await.unwrap());
     let main_bob = query_main(
-        &mut reopened_main,
+        &reopened_main,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Bob")]),
@@ -3305,13 +3295,13 @@ async fn branch_merge_into_non_main_target_works() {
 async fn branch_merge_reports_unique_violation_conflict() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_db_from_schema_and_data(&dir, UNIQUE_SCHEMA, UNIQUE_DATA).await;
+    let main = init_db_from_schema_and_data(&dir, UNIQUE_SCHEMA, UNIQUE_DATA).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         UNIQUE_MUTATIONS,
         "insert_user",
         &params(&[("$name", "Bob"), ("$email", "dup@example.com")]),
@@ -3320,7 +3310,7 @@ async fn branch_merge_reports_unique_violation_conflict() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         UNIQUE_MUTATIONS,
         "insert_user",
@@ -3348,13 +3338,13 @@ async fn branch_merge_reports_unique_violation_conflict() {
 async fn branch_merge_reports_composite_unique_violation_conflict() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_db_from_schema_and_data(&dir, EDGE_UNIQUE_SCHEMA, EDGE_UNIQUE_DATA).await;
+    let main = init_db_from_schema_and_data(&dir, EDGE_UNIQUE_SCHEMA, EDGE_UNIQUE_DATA).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         EDGE_UNIQUE_MUTATIONS,
         "add_knows",
         &params(&[("$from", "Alice"), ("$to", "Bob")]),
@@ -3363,7 +3353,7 @@ async fn branch_merge_reports_composite_unique_violation_conflict() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         EDGE_UNIQUE_MUTATIONS,
         "add_knows",
@@ -3391,13 +3381,13 @@ async fn branch_merge_reports_composite_unique_violation_conflict() {
 async fn branch_merge_allows_distinct_composite_unique_pairs() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_db_from_schema_and_data(&dir, EDGE_UNIQUE_SCHEMA, EDGE_UNIQUE_DATA).await;
+    let main = init_db_from_schema_and_data(&dir, EDGE_UNIQUE_SCHEMA, EDGE_UNIQUE_DATA).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         EDGE_UNIQUE_MUTATIONS,
         "add_knows",
         &params(&[("$from", "Alice"), ("$to", "Bob")]),
@@ -3406,7 +3396,7 @@ async fn branch_merge_allows_distinct_composite_unique_pairs() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         EDGE_UNIQUE_MUTATIONS,
         "add_knows",
@@ -3425,13 +3415,13 @@ async fn branch_merge_allows_distinct_composite_unique_pairs() {
 async fn branch_merge_reports_cardinality_violation_conflict() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_db_from_schema_and_data(&dir, CARDINALITY_SCHEMA, CARDINALITY_DATA).await;
+    let main = init_db_from_schema_and_data(&dir, CARDINALITY_SCHEMA, CARDINALITY_DATA).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         CARDINALITY_MUTATIONS,
         "add_employment",
         &params(&[("$person", "Alice"), ("$company", "Acme")]),
@@ -3440,7 +3430,7 @@ async fn branch_merge_reports_cardinality_violation_conflict() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         CARDINALITY_MUTATIONS,
         "add_employment",
@@ -3481,13 +3471,13 @@ query delete_person($name: String) {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_db_from_schema_and_data(&dir, EDGE_UNIQUE_SCHEMA, EDGE_UNIQUE_DATA).await;
+    let main = init_db_from_schema_and_data(&dir, EDGE_UNIQUE_SCHEMA, EDGE_UNIQUE_DATA).await;
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     // main (merge source): add an edge referencing Bob.
     mutate_main(
-        &mut main,
+        &main,
         MUTATIONS,
         "add_knows",
         &params(&[("$from", "Alice"), ("$to", "Bob")]),
@@ -3497,7 +3487,7 @@ query delete_person($name: String) {
 
     // feature (merge target): delete Bob.
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATIONS,
         "delete_person",
@@ -3558,15 +3548,15 @@ async fn branch_api_rejects_reserved_main_and_same_source_target_merge() {
 }
 
 #[tokio::test]
-async fn branch_delete_defers_owned_fork_cleanup_and_allows_recreate() {
+async fn branch_delete_defers_pin_collection_and_allows_recreate() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
 
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -3575,37 +3565,27 @@ async fn branch_delete_defers_owned_fork_cleanup_and_allows_recreate() {
     .await
     .unwrap();
 
-    let first_fork = snapshot_branch(&main, "feature")
+    let first_entry = snapshot_branch(&main, "feature")
         .await
         .unwrap()
         .dataset("node:Person")
         .unwrap()
-        .native_dataset_branch
-        .clone()
-        .unwrap();
-    let person_path = snapshot_branch(&main, "feature")
-        .await
-        .unwrap()
-        .dataset("node:Person")
-        .unwrap()
-        .dataset_path
         .clone();
-    let person_uri = format!("{uri}/{person_path}");
+    assert_eq!(first_entry.native_dataset_branch, None);
+    let first_pin = pinned_version(&main, "feature", "node:Person").await;
+    assert!(is_detached_version(first_pin), "{first_pin}");
+    let person_uri = format!("{uri}/{}", first_entry.dataset_path);
     main.branch_delete("feature").await.unwrap();
     assert_eq!(main.branch_list().await.unwrap(), vec!["main"]);
-    let branches = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .list_branches()
-        .await
-        .unwrap();
     assert!(
-        branches.contains_key(&first_fork),
-        "delete defers physical fork collection"
+        helpers::collector::detached_versions(&person_uri)
+            .await
+            .contains(&first_pin),
+        "delete defers collection of the deleted branch's pin"
     );
     main.branch_create("feature").await.unwrap();
     mutate_branch(
-        &mut main,
+        &main,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -3613,43 +3593,38 @@ async fn branch_delete_defers_owned_fork_cleanup_and_allows_recreate() {
     )
     .await
     .unwrap();
-    let second_fork = snapshot_branch(&main, "feature")
+    let second_entry = snapshot_branch(&main, "feature")
         .await
         .unwrap()
         .dataset("node:Person")
         .unwrap()
-        .native_dataset_branch
-        .clone()
-        .unwrap();
-    assert_ne!(first_fork, second_fork);
+        .clone();
+    assert_eq!(second_entry.dataset_path, first_entry.dataset_path);
+    assert_eq!(second_entry.native_dataset_branch, None);
+    let second_pin = pinned_version(&main, "feature", "node:Person").await;
+    assert!(is_detached_version(second_pin), "{second_pin}");
+    assert_ne!(first_pin, second_pin);
     assert_eq!(count_rows_branch(&main, "feature", "node:Person").await, 5);
-    let branches = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .list_branches()
-        .await
-        .unwrap();
+    let detached = helpers::collector::detached_versions(&person_uri).await;
     assert!(
-        branches.contains_key(&first_fork),
-        "recreated writes leave the former fork intact"
+        detached.contains(&first_pin),
+        "recreated writes leave the former pin intact"
     );
-    assert!(branches.contains_key(&second_fork));
+    assert!(detached.contains(&second_pin));
     main.cleanup(omnigraph::db::CleanupPolicyOptions {
         keep_versions: Some(1),
         older_than: None,
     })
     .await
     .unwrap();
-    let branches = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .list_branches()
-        .await
-        .unwrap();
-    assert!(!branches.contains_key(&first_fork));
+    let detached = helpers::collector::detached_versions(&person_uri).await;
     assert!(
-        branches.contains_key(&second_fork),
-        "cleanup preserves the recreated branch's fork"
+        !detached.contains(&first_pin),
+        "cleanup reclaims the deleted incarnation's pin"
+    );
+    assert!(
+        detached.contains(&second_pin),
+        "cleanup preserves the recreated branch's pin"
     );
     drop(feature);
     let reopened = Omnigraph::open(uri).await.unwrap();
@@ -3694,12 +3669,27 @@ async fn branch_namespace_rejects_live_physical_path_prefix_collisions() {
     let db = init_and_load(&dir).await;
 
     db.branch_create("feature").await.unwrap();
-    let err = db.branch_create("feature/child").await.unwrap_err();
-    assert!(
-        err.to_string().contains("physical Lance path")
-            && err.to_string().contains("ancestors or descendants"),
-        "prefix collision must be actionable; got: {err}"
-    );
+    for result in [
+        db.branch_create("feature").await,
+        db.branch_create_from("main", "feature").await,
+    ] {
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("already exists"),
+            "both creation routes must reject a duplicate: {error}"
+        );
+    }
+    for result in [
+        db.branch_create("feature/child").await,
+        db.branch_create_from("main", "feature/child").await,
+    ] {
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("physical Lance path")
+                && error.to_string().contains("ancestors or descendants"),
+            "prefix collision must be actionable: {error}"
+        );
+    }
     assert!(
         !dir.path()
             .join("__manifest")
@@ -3717,14 +3707,17 @@ async fn branch_namespace_rejects_live_physical_path_prefix_collisions() {
     db.branch_delete("feature").await.unwrap();
     db.branch_create("feature/child").await.unwrap();
     let refs_before_refusal = manifest.list_branches().await.unwrap();
-    assert_eq!(
-        refs_before_refusal[&ancestor_native].identifier,
-        ancestor.identifier
-    );
-    let retirement: serde_json::Value = serde_json::from_str(
-        &refs_before_refusal[&ancestor_native].metadata["omnigraph.retired_manifest_branch"],
-    )
-    .unwrap();
+    assert!(!refs_before_refusal.contains_key(&ancestor_native));
+    let ancestor_archive = dir
+        .path()
+        .join("__manifest/tree")
+        .join(&ancestor_native)
+        .join("_omnigraph_retired_branch.json");
+    let archived: lance::dataset::refs::BranchContents =
+        serde_json::from_slice(&std::fs::read(&ancestor_archive).unwrap()).unwrap();
+    assert_eq!(archived.identifier, ancestor.identifier);
+    let retirement: serde_json::Value =
+        serde_json::from_str(&archived.metadata["omnigraph.retired_manifest_branch"]).unwrap();
     assert_eq!(
         retirement,
         serde_json::json!({
@@ -3733,12 +3726,17 @@ async fn branch_namespace_rejects_live_physical_path_prefix_collisions() {
             "identifier": ancestor.identifier,
         })
     );
-    let err = db.branch_create("feature").await.unwrap_err();
-    assert!(
-        err.to_string().contains("physical Lance path")
-            && err.to_string().contains("feature/child"),
-        "ancestor creation must reject the inverse prefix collision; got: {err}"
-    );
+    for result in [
+        db.branch_create("feature").await,
+        db.branch_create_from("main", "feature").await,
+    ] {
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("physical Lance path")
+                && error.to_string().contains("feature/child"),
+            "ancestor creation must reject the inverse prefix collision: {error}"
+        );
+    }
     assert_eq!(
         serde_json::to_value(manifest.list_branches().await.unwrap()).unwrap(),
         serde_json::to_value(refs_before_refusal).unwrap(),
@@ -3753,6 +3751,19 @@ async fn branch_namespace_rejects_live_physical_path_prefix_collisions() {
         db.branch_list().await.unwrap(),
         vec!["main", "feature/child"]
     );
+    db.branch_delete("feature/child").await.unwrap();
+    db.branch_create_from("main", "feature").await.unwrap();
+    let recreated_native = helpers::native_ref_for(&manifest, "feature").await.unwrap();
+    assert_ne!(recreated_native, ancestor_native);
+    assert!(manifest.branches().get(&ancestor_native).await.is_err());
+    assert!(ancestor_archive.exists());
+    db.branch_create("feature-2").await.unwrap();
+    assert_eq!(
+        db.branch_list().await.unwrap(),
+        vec!["main", "feature", "feature-2"],
+        "an unrelated string prefix is not a hierarchy collision"
+    );
+    assert_eq!(count_rows_branch(&db, "feature", "node:Person").await, 4);
 }
 
 #[tokio::test]
@@ -3780,25 +3791,48 @@ async fn branch_delete_retires_legacy_physical_path_parents() {
             .await
             .is_none()
     );
-    assert!(manifest.branches().get("feature").await.is_ok());
+    assert!(manifest.branches().get("feature").await.is_err());
+    let archive = dir
+        .path()
+        .join("__manifest/tree/feature/_omnigraph_retired_branch.json");
+    assert!(archive.exists());
     assert_eq!(
         count_rows_branch(&db, "feature/child", "node:Person").await,
         4
     );
     db.branch_delete("feature/child").await.unwrap();
     assert_eq!(db.branch_list().await.unwrap(), vec!["main"]);
+    let refused = db.branch_create("feature/new-child").await.unwrap_err();
+    assert!(
+        refused.to_string().contains("retired branch 'feature'"),
+        "{refused}"
+    );
+    let rows = db
+        .cleanup(omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .unwrap();
+    assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
+    assert!(!archive.exists());
+    db.branch_create("feature/new-child").await.unwrap();
+    assert_eq!(
+        count_rows_branch(&db, "feature/new-child", "node:Person").await,
+        4
+    );
 }
 
 #[tokio::test]
 async fn branch_delete_retires_native_parent_and_cleanup_preserves_live_child() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
 
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -3894,20 +3928,23 @@ async fn branch_delete_retires_native_parent_and_cleanup_preserves_live_child() 
             .unwrap()
             .contains(&"feature".to_string())
     );
-    assert_eq!(
-        manifest.branches().get(&native).await.unwrap().identifier,
-        identifier
-    );
-    assert_eq!(
-        manifest.branches().get(&native).await.unwrap().metadata["external-owner"],
-        "preserved"
-    );
-    assert_eq!(retained.branch_identifier().await.unwrap(), identifier);
+    assert!(manifest.branches().get(&native).await.is_err());
+    assert!(retained.branch_identifier().await.is_err());
     let ref_path = dir
         .path()
         .join("__manifest/_refs/branches")
         .join(format!("{native}.json"));
-    let retired_bytes = std::fs::read(&ref_path).unwrap();
+    let archive_path = dir
+        .path()
+        .join("__manifest/tree")
+        .join(&native)
+        .join("_omnigraph_retired_branch.json");
+    assert!(!ref_path.exists());
+    let retired_bytes = std::fs::read(&archive_path).unwrap();
+    let archived: lance::dataset::refs::BranchContents =
+        serde_json::from_slice(&retired_bytes).unwrap();
+    assert_eq!(archived.identifier, identifier);
+    assert_eq!(archived.metadata["external-owner"], "preserved");
     let retired_contents: serde_json::Value = serde_json::from_slice(&retired_bytes).unwrap();
     let marker = &retired_contents["metadata"]["omnigraph.retired_manifest_branch"];
     let retirement: serde_json::Value = serde_json::from_str(marker.as_str().unwrap()).unwrap();
@@ -3973,14 +4010,14 @@ async fn branch_delete_retires_native_parent_and_cleanup_preserves_live_child() 
         5
     );
 
-    let mut reopened = Omnigraph::open(uri).await.unwrap();
+    let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
     reopened.branch_create("feature").await.unwrap();
     assert_eq!(
         count_rows_branch(&reopened, "feature", "node:Person").await,
         4
     );
     mutate_branch(
-        &mut reopened,
+        &reopened,
         "experiment",
         MUTATION_QUERIES,
         "insert_person",
@@ -3995,9 +4032,10 @@ async fn branch_delete_retires_native_parent_and_cleanup_preserves_live_child() 
         })
         .await
         .unwrap();
+    assert!(manifest.branches().get(&native).await.is_err());
     assert!(
-        manifest.branches().get(&native).await.is_ok(),
-        "a live child retains its native ancestor"
+        archive_path.exists(),
+        "a live child retains its archived native ancestor"
     );
     assert_eq!(
         count_rows_branch(&reopened, "experiment", "node:Person").await,
@@ -4011,19 +4049,22 @@ async fn branch_delete_retires_native_parent_and_cleanup_preserves_live_child() 
         })
         .await
         .unwrap();
+    assert!(manifest.branches().get(&native).await.is_err());
+    assert!(!ref_path.exists());
     assert!(
-        manifest.branches().get(&native).await.is_err(),
-        "cleanup reclaims unreferenced retired parents"
+        !archive_path.exists(),
+        "cleanup removes unreferenced retirement history with its tree"
     );
+    assert!(!dir.path().join("__manifest/tree").join(&native).exists());
     assert_eq!(
-        count_rows_branch(
-            &Omnigraph::open(uri).await.unwrap(),
-            "feature",
-            "node:Person"
-        )
-        .await,
-        4
+        reopened.branch_list().await.unwrap(),
+        vec!["main".to_string(), "feature".to_string()],
+        "retained retirement evidence must not expose deleted branches"
     );
+    assert!(snapshot_branch(&reopened, "experiment").await.is_err());
+    let fresh = Omnigraph::open(uri).await.unwrap();
+    assert_eq!(count_rows_branch(&fresh, "main", "node:Person").await, 4);
+    assert_eq!(count_rows_branch(&fresh, "feature", "node:Person").await, 4);
 }
 
 // ─── Step 9b: Surgical merge publish tests ──────────────────────────────────
@@ -4033,15 +4074,15 @@ async fn merged_table_preserves_row_version_for_unchanged_rows() {
     // After a non-FF merge, unchanged rows retain their original _row_created_at_version.
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.ensure_indices().await.unwrap();
 
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     // Main updates Bob's age → changes one row
     mutate_main(
-        &mut main,
+        &main,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Bob")], &[("$age", 26)]),
@@ -4051,7 +4092,7 @@ async fn merged_table_preserves_row_version_for_unchanged_rows() {
 
     // Feature inserts Eve → adds one row
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -4138,15 +4179,15 @@ async fn merge_delta_only_bumps_changed_rows() {
     // bumped. Only rows that were actually modified should get new version stamps.
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.ensure_indices().await.unwrap();
 
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     // Main updates Bob's age → changes one Person row
     mutate_main(
-        &mut main,
+        &main,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Bob")], &[("$age", 26)]),
@@ -4156,7 +4197,7 @@ async fn merge_delta_only_bumps_changed_rows() {
 
     // Feature inserts Eve → adds one Person row (makes it non-FF)
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -4276,14 +4317,13 @@ query friend_edges() {
 async fn branch_merge_converges_born_on_both_keyed_edge() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main =
-        init_db_from_schema_and_data(&dir, EDGE_KEY_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
+    let main = init_db_from_schema_and_data(&dir, EDGE_KEY_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         EDGE_KEY_MERGE_MUTATIONS,
         "add_knows",
         &params(&[("$from", "Alice"), ("$to", "Bob")]),
@@ -4292,7 +4332,7 @@ async fn branch_merge_converges_born_on_both_keyed_edge() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         EDGE_KEY_MERGE_MUTATIONS,
         "add_knows",
@@ -4306,18 +4346,13 @@ async fn branch_merge_converges_born_on_both_keyed_edge() {
         .expect("identical born-on-both keyed edges converge without conflict");
 
     assert_eq!(count_rows(&main, "edge:Knows").await, 4);
-    let plain = query_main(&mut main, EDGE_KEY_MERGE_QUERIES, "friends", &params(&[]))
+    let plain = query_main(&main, EDGE_KEY_MERGE_QUERIES, "friends", &params(&[]))
         .await
         .unwrap();
     assert_eq!(first_column_sorted(&plain).len(), 4);
-    let bound = query_main(
-        &mut main,
-        EDGE_KEY_MERGE_QUERIES,
-        "friend_edges",
-        &params(&[]),
-    )
-    .await
-    .unwrap();
+    let bound = query_main(&main, EDGE_KEY_MERGE_QUERIES, "friend_edges", &params(&[]))
+        .await
+        .unwrap();
     assert_eq!(first_column_sorted(&bound).len(), 4);
 }
 
@@ -4329,14 +4364,14 @@ async fn branch_merge_converges_born_on_both_keyed_edge() {
 async fn branch_merge_keeps_both_born_on_both_unkeyed_edges() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main =
+    let main =
         init_db_from_schema_and_data(&dir, EDGE_UNKEYED_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         EDGE_KEY_MERGE_MUTATIONS,
         "add_knows",
         &params(&[("$from", "Alice"), ("$to", "Bob")]),
@@ -4345,7 +4380,7 @@ async fn branch_merge_keeps_both_born_on_both_unkeyed_edges() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         EDGE_KEY_MERGE_MUTATIONS,
         "add_knows",
@@ -4359,18 +4394,13 @@ async fn branch_merge_keeps_both_born_on_both_unkeyed_edges() {
         .expect("unkeyed born-on-both edges keep the documented multiset outcome");
 
     assert_eq!(count_rows(&main, "edge:Knows").await, 5);
-    let plain = query_main(&mut main, EDGE_KEY_MERGE_QUERIES, "friends", &params(&[]))
+    let plain = query_main(&main, EDGE_KEY_MERGE_QUERIES, "friends", &params(&[]))
         .await
         .unwrap();
     assert_eq!(first_column_sorted(&plain).len(), 4);
-    let bound = query_main(
-        &mut main,
-        EDGE_KEY_MERGE_QUERIES,
-        "friend_edges",
-        &params(&[]),
-    )
-    .await
-    .unwrap();
+    let bound = query_main(&main, EDGE_KEY_MERGE_QUERIES, "friend_edges", &params(&[]))
+        .await
+        .unwrap();
     assert_eq!(first_column_sorted(&bound).len(), 5);
 }
 
@@ -4380,14 +4410,13 @@ async fn branch_merge_keeps_both_born_on_both_unkeyed_edges() {
 async fn branch_merge_keeps_distinct_keyed_pairs() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main =
-        init_db_from_schema_and_data(&dir, EDGE_KEY_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
+    let main = init_db_from_schema_and_data(&dir, EDGE_KEY_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         EDGE_KEY_MERGE_MUTATIONS,
         "add_knows",
         &params(&[("$from", "Alice"), ("$to", "Bob")]),
@@ -4396,7 +4425,7 @@ async fn branch_merge_keeps_distinct_keyed_pairs() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         EDGE_KEY_MERGE_MUTATIONS,
         "add_knows",
@@ -4418,14 +4447,13 @@ async fn branch_merge_keeps_distinct_keyed_pairs() {
 async fn branch_merge_reports_divergent_insert_for_keyed_edge() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main =
-        init_db_from_schema_and_data(&dir, EDGE_KEY_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
+    let main = init_db_from_schema_and_data(&dir, EDGE_KEY_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         EDGE_KEY_MERGE_MUTATIONS,
         "add_knows_since",
         &params(&[("$from", "Alice"), ("$to", "Bob"), ("$since", "2020")]),
@@ -4434,7 +4462,7 @@ async fn branch_merge_reports_divergent_insert_for_keyed_edge() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         EDGE_KEY_MERGE_MUTATIONS,
         "add_knows_since",

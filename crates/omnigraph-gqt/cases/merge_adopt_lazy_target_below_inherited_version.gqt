@@ -1,9 +1,7 @@
 # issue: none
-# notes: from PR 630, the lazy-target arm. `main` writes its node table four
-# notes: times; `feature` writes once, takes `main` by a three-way merge, then
-# notes: sets a's age; `child` forks from `main` and never writes, so its node
-# notes: table is `main`'s at a version above `feature`'s. Merging `feature`
-# notes: into `child` must show feature's value on child.
+# notes: Four main writes put its table version above feature's. Keep these writes separate.
+# notes: An untouched child inherits main, then adopts feature's lower-version table.
+# notes: The child must read feature's values (the lazy-target case from PR 630).
 
 --- runner
 timeout_ms: 10000

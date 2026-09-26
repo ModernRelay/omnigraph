@@ -2,7 +2,7 @@
 # red_on: ed3ea500 (2026-09-09): step 6 rejects the unrelated write with pending BranchMerge
 # notes: The runner section injects one merge failure under DST.
 # notes: Reads and the next unrelated write use the same Omnigraph without reopening.
-# notes: The failed merge compensates its own unconfirmed effects before returning, so step 6 succeeds and the merge retry lands.
+# notes: The failed merge's detached chunk chain is reclaimable garbage that never moved the target's linear HEAD, so step 6 succeeds and the merge retry lands.
 
 --- runner
 timeout_ms: 10000
@@ -43,16 +43,16 @@ query advance_target() {
 
 --- expect affected: nodes=1 edges=0
 
---- fault
-at: branch_merge.post_effects_pre_confirm
+--- seam
+at: branch_merge.post_table_effect
 occurrence: 1
-action: return_error
+action: fail
 scope: next_step
 
 --- mutate
 branch merge source into main
 
---- expect error: injected failpoint triggered: branch_merge.post_effects_pre_confirm
+--- expect error: injected failpoint triggered: branch_merge.post_table_effect
 
 --- query branch: main
 query read_after_failure() {

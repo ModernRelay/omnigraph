@@ -14,7 +14,7 @@ superseded_by: []
 blocked_on:
   - Upstream Lance entropy and mock-time seams
   - Pool-thread identity propagation
-  - Per-instance failpoint registries
+  - Per-instance failpoint registries (superseded by RFC 0066's per-seam slots)
 ---
 
 # RFC 0037: Deterministic simulation harness
@@ -543,7 +543,10 @@ judge's dump), not as transcripts.
    unlocks in-process parallel universes. Verification rides with it:
    order-swap and first-versus-last position tests (the #503 table's
    AB/BA row) stand guard in CI so no future shared state quietly
-   reintroduces a leak between universes.
+   reintroduces a leak between universes. Superseded by RFC 0066: the
+   registry became one slot per seam behind an RAII guard (process-wide
+   for decision and storage seams, thread-local for clock, ids and gate);
+   in-process parallel universes stay out of scope.
 
 ## Reference-level design
 
@@ -806,7 +809,7 @@ lists the seven with one.
 | Modeled death is not process death | P1-1 | vocabulary rescope (the two delivery lanes above); lane B preview in-tree with six judge red-proofs | lane B qualification: PRE_ACK/ACK cells, no-kill baselines, sensitivity fixture, second backend, lane A agreement check | #TBD-1 |
 | Multipart writes bypass completion hooks | P1-3 | tripwire: census gate reds on first multipart use; typed exclusion row | harness-owned MultipartUpload wrapper, part-level cuts | #TBD-2 |
 | Adapter collapses rename/delete_prefix stages | P1-4 | typed exclusion rows + census never-fired report | shared DurableEventSequencer below both realms | #TBD-3 |
-| DST seams reachable via feature flag only | P1-5 | non-default `dst` cargo feature; passthroughs compile to direct calls when off | instance-owned builder injection, no feature flag | #TBD-4 |
+| DST seams reachable via feature flag only | P1-5 | non-default `dst` cargo feature; passthroughs compile to direct calls when off | instance-owned builder injection, no feature flag. Superseded by RFC 0066: one slot per seam behind an RAII guard, process-wide for the decision and storage seams (serialized by the scenario gate) and thread-local for the clock, id source and gate; per-instance registries are not pursued | #TBD-4 |
 | Nightly seed identity derived, not declared | P1-6 | evidence note in the nightly workflow; failures carry the literal seed row | versioned RunPlan/RunResult manifest artifact | #TBD-5 |
 | Scheduler escapes tolerated outside strict cells | P1-7 | replay-honesty labels: wild arms declared non-replayable | logical turns for finish/timeouts; readers gated | #TBD-6 |
 | Strict replay compares a report projection | P1-9 | claim rescoped to report-projection replay; ambient ID/clock sites routed through seams | full-trace and object-inventory comparison; ambient-source guard | #TBD-7 |

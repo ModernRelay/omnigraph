@@ -1,0 +1,82 @@
+# issue: none
+# notes: inventory sweep, input class `index build state`: a traversal the cost
+# notes: model sends down the indexed path takes that path and returns the
+# notes: same rows before and after another query realized the CSR in the
+# notes: cross-query cache. The run may start on the CSR an earlier operator
+# notes: of the same run built; a fresh handle starts empty, so step 3 stays
+# notes: on the indexed scan.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"hub"}}
+{"type":"Person","data":{"name":"leaf0000"}}
+{"type":"Person","data":{"name":"leaf0001"}}
+{"type":"Person","data":{"name":"leaf0002"}}
+{"edge":"Knows","from":"hub","to":"leaf0000"}
+{"edge":"Knows","from":"hub","to":"leaf0001"}
+{"edge":"Knows","from":"hub","to":"leaf0002"}
+
+--- query
+set engine = v2;
+query one_hop() {
+    match {
+        $a: Person
+        $a knows $b
+    }
+    return { $b.name }
+}
+--- expect unordered
+{"b.name":"leaf0000"}
+{"b.name":"leaf0001"}
+{"b.name":"leaf0002"}
+--- expect shape
+b.name: String
+--- expect plan
+expand $a Knows $b: mode indexed_scan ran indexed_scan
+
+--- query
+set engine = v2;
+query two_hops() {
+    match {
+        $a: Person
+        $a knows{1,2} $b
+    }
+    return { $b.name }
+}
+--- expect unordered
+{"b.name":"leaf0000"}
+{"b.name":"leaf0001"}
+{"b.name":"leaf0002"}
+--- expect shape
+b.name: String
+--- expect plan
+expand $a Knows $b: mode csr ran csr
+
+--- query
+set engine = v2;
+query one_hop() {
+    match {
+        $a: Person
+        $a knows $b
+    }
+    return { $b.name }
+}
+--- expect unordered
+{"b.name":"leaf0000"}
+{"b.name":"leaf0001"}
+{"b.name":"leaf0002"}
+--- expect shape
+b.name: String
+--- expect plan
+expand $a Knows $b: mode indexed_scan ran indexed_scan

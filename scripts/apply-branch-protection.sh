@@ -60,3 +60,7 @@ gh api "repos/$REPO/branches/$BRANCH/protection" \
         deletions_allowed: .allow_deletions.enabled,
         conversation_resolution_required: .required_conversation_resolution.enabled
     }'
+
+echo
+echo "The merge queue is not carried by this endpoint: open the rule page and"
+echo "confirm Require merge queue (Squash and merge) and its values are still set."

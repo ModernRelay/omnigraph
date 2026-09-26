@@ -1,0 +1,48 @@
+# issue: none
+# notes: A compound filter on a traversal destination is placed on the
+# notes: destination's scan by the pushdown pass, reading both of its columns,
+# notes: and selects the same rows a single comparison per clause would.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    name: String
+    age: I64
+}
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"slug":"r","name":"root","age":60}}
+{"type":"Person","data":{"slug":"a1","name":"alice","age":40}}
+{"type":"Person","data":{"slug":"a2","name":"anna","age":20}}
+{"type":"Person","data":{"slug":"b1","name":"bob","age":45}}
+{"edge":"Knows","from":"r","to":"a1"}
+{"edge":"Knows","from":"r","to":"a2"}
+{"edge":"Knows","from":"r","to":"b1"}
+
+--- query
+set engine = v2;
+query adult_friends_named_a() {
+    match {
+        $p: Person { slug: "r" }
+        $p knows $f
+        $f.age > 30 and $f.name starts_with "a"
+    }
+    return { $f.slug }
+}
+
+--- expect unordered
+{"f.slug": "a1"}
+
+--- expect shape
+f.slug: String
+
+--- expect plan
+scan Person as $f: filter reads [f.age, f.name]
+pass predicate_pushdown

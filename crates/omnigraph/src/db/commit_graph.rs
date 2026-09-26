@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::error::Result;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphCommit {
     pub graph_commit_id: String,
     pub graph_branch: Option<String>,
@@ -69,6 +69,110 @@ pub(crate) struct MergeBaseSearch {
     pub(crate) base: Option<GraphCommit>,
     pub(crate) unresolved_source: Vec<String>,
     pub(crate) unresolved_target: Vec<String>,
+}
+
+/// One incremental merge-base walk. Both merge and cleanup feed other
+/// captured lineages in the same order and stop at the same resolved frontier.
+pub(crate) struct MergeBaseResolver<'a> {
+    source: &'a CommitGraphSnapshot,
+    target: &'a CommitGraphSnapshot,
+    source_head: &'a str,
+    target_head: &'a str,
+    imported: HashMap<String, GraphCommit>,
+    retired_owners: HashMap<String, String>,
+}
+
+impl<'a> MergeBaseResolver<'a> {
+    pub(crate) fn new(
+        source: &'a CommitGraphSnapshot,
+        target: &'a CommitGraphSnapshot,
+        source_head: &'a str,
+        target_head: &'a str,
+    ) -> Self {
+        Self {
+            source,
+            target,
+            source_head,
+            target_head,
+            imported: HashMap::new(),
+            retired_owners: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn search(&self) -> MergeBaseSearch {
+        CommitGraph::merge_base_search(
+            self.source,
+            self.target,
+            &self.imported,
+            self.source_head,
+            self.target_head,
+        )
+    }
+
+    pub(crate) fn import_retired(&mut self, commits: Vec<GraphCommit>, owner: &str) -> Result<()> {
+        for commit in &commits {
+            let id = &commit.graph_commit_id;
+            if !self.source.commit_by_id.contains_key(id)
+                && !self.target.commit_by_id.contains_key(id)
+                && !self.imported.contains_key(id)
+            {
+                self.retired_owners.insert(id.clone(), owner.to_string());
+            }
+        }
+        self.import(commits)
+    }
+
+    /// Retain only providers of imported records reached by the actual ancestry walks.
+    pub(crate) fn retained_import_owners(&self) -> BTreeSet<String> {
+        let get = |id: &str| {
+            self.source
+                .commit_by_id
+                .get(id)
+                .or_else(|| self.target.commit_by_id.get(id))
+                .or_else(|| self.imported.get(id))
+        };
+        let mut unresolved = BTreeSet::new();
+        let mut owners = BTreeSet::new();
+        for head in [self.source_head, self.target_head] {
+            let reached = ancestor_distances_from(head, &get, &|_| false, &mut unresolved);
+            owners.extend(
+                reached
+                    .keys()
+                    .filter_map(|id| self.retired_owners.get(id))
+                    .cloned(),
+            );
+        }
+        owners
+    }
+
+    pub(crate) fn import(
+        &mut self,
+        commits: impl IntoIterator<Item = GraphCommit>,
+    ) -> crate::error::Result<()> {
+        for commit in commits {
+            let previous = self
+                .source
+                .commit_by_id
+                .get(&commit.graph_commit_id)
+                .or_else(|| self.target.commit_by_id.get(&commit.graph_commit_id))
+                .or_else(|| self.imported.get(&commit.graph_commit_id));
+            if previous.is_some_and(|previous| previous != &commit) {
+                return Err(crate::error::OmniError::manifest_internal(
+                    "one graph commit id has conflicting lineage records",
+                ));
+            }
+            self.imported
+                .entry(commit.graph_commit_id.clone())
+                .or_insert(commit);
+        }
+        Ok(())
+    }
+}
+
+impl MergeBaseSearch {
+    pub(crate) fn needs_import(&self) -> bool {
+        !self.unresolved_source.is_empty() || !self.unresolved_target.is_empty()
+    }
 }
 
 impl CommitGraph {
@@ -207,21 +311,6 @@ impl CommitGraph {
         Ok(commits)
     }
 
-    /// The maximal commit (by [`GraphCommit::lineage_key`]) satisfying `pred`.
-    /// Callers wanting "the latest X" use this instead of consuming
-    /// `load_commits` positionally, so no caller couples to iteration
-    /// direction.
-    pub(crate) fn latest_commit_matching(
-        &self,
-        pred: impl Fn(&GraphCommit) -> bool,
-    ) -> Option<GraphCommit> {
-        self.commit_by_id
-            .values()
-            .filter(|commit| pred(commit))
-            .max_by(|a, b| a.lineage_key().cmp(&b.lineage_key()))
-            .cloned()
-    }
-
     pub fn get_commit(&self, commit_id: &str) -> Option<GraphCommit> {
         self.commit_by_id.get(commit_id).cloned()
     }
@@ -356,13 +445,14 @@ fn merge_base_from_maps(
                         (
                             *source_distance + *target_distance,
                             u64::MAX - commit.graph_manifest_version,
+                            commit.graph_commit_id.clone(),
                         ),
                         commit.clone(),
                     )
                 })
             })
         })
-        .min_by_key(|(score, _)| *score)
+        .min_by(|(left, _), (right, _)| left.cmp(right))
         .map(|(_, commit)| commit);
     MergeBaseSearch {
         base,

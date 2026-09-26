@@ -7,9 +7,30 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.10.0"
+    "version": "0.11.0"
   },
   "paths": {
+    "/.well-known/oauth-protected-resource": {
+      "get": {
+        "tags": [
+          "management"
+        ],
+        "operationId": "oauthProtectedResourceMetadata",
+        "responses": {
+          "200": {
+            "description": "Public OAuth protected resource metadata",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "404": {
+            "description": "OAuth resource identity is not configured"
+          }
+        }
+      }
+    },
     "/graphs": {
       "get": {
         "tags": [
@@ -51,6 +72,51 @@
           },
           "405": {
             "description": "Method not allowed (single-graph mode)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/discovery": {
+      "get": {
+        "tags": [
+          "management"
+        ],
+        "operationId": "discoverGraphs",
+        "responses": {
+          "200": {
+            "description": "Authenticated minimal graph inventory",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GraphDiscoveryResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Identity credential required",
             "content": {
               "application/json": {
                 "schema": {
@@ -1079,7 +1145,7 @@
           "mutations"
         ],
         "summary": "**Deprecated** — use [`POST /mutate`](#tag/mutations/operation/mutate) instead.",
-        "description": "Apply a GQ mutation to a branch. The deprecated route retains its request\nand execution semantics, while its response uses the current canonical\nvocabulary. New integrations should target `POST /mutate`. Responses include\n`Deprecation: true` and `Link: <mutate>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the\nsignal.",
+        "description": "Apply a GQ mutation to a branch. The deprecated route retains its request\nand execution semantics, while its response uses the current canonical\nvocabulary; a `settings` field is refused, since the route runs under the\nprocess defaults alone. New integrations should target `POST /mutate`.\nResponses include `Deprecation: true` and\n`Link: <mutate>; rel=\"successor-version\"` headers per RFC 9745 / RFC 8288\nso SDKs and proxies can surface the signal.",
         "operationId": "cluster_change",
         "parameters": [
           {
@@ -1208,7 +1274,7 @@
           "changes"
         ],
         "summary": "Poll the change feed of one branch.",
-        "description": "At-least-once: retrying a cursor may replay the complete next commit, so\nconsumers apply blocks idempotently by `graph_commit_id` and persist the\nterminal cursor together with its blocks. The server holds no consumer\nstate.",
+        "description": "At-least-once: retrying a cursor may replay the complete next commit, so\nconsumers apply blocks idempotently by `graph_commit_id` and persist the\nterminal cursor together with its blocks. The server holds no consumer\nstate. `set=` values are validated and select nothing in this release.",
         "operationId": "cluster_pollChanges",
         "parameters": [
           {
@@ -1295,6 +1361,18 @@
               "type": "array",
               "items": {
                 "$ref": "#/components/schemas/ChangeOpOutput"
+              }
+            }
+          },
+          {
+            "name": "set",
+            "in": "query",
+            "description": "Repeatable session setting, `name=value` in GQ spelling\n(`set=merge_lineage=off`); only `request`-scope settings are accepted.\nValues are validated as session settings; `engine` does not change\nchange-feed execution.",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
               }
             }
           }
@@ -1678,7 +1756,7 @@
           "changes"
         ],
         "summary": "Entity changes one commit made relative to its first parent.",
-        "description": "Read-only, in graph vocabulary with exact before/after images. Bounded:\na large commit continues via the opaque `page_token`.",
+        "description": "Read-only, in graph vocabulary with exact before/after images. Bounded:\na large commit continues via the opaque `page_token`. `set=` values are\nvalidated and select nothing in this release.",
         "operationId": "cluster_getCommitChanges",
         "parameters": [
           {
@@ -1751,6 +1829,18 @@
               "type": "array",
               "items": {
                 "$ref": "#/components/schemas/ChangeOpOutput"
+              }
+            }
+          },
+          {
+            "name": "set",
+            "in": "query",
+            "description": "Repeatable session setting, `name=value` in GQ spelling\n(`set=merge_lineage=off`); only `request`-scope settings are accepted.\nValues are validated as session settings; `engine` does not change\nchange-feed execution.",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
               }
             }
           }
@@ -3118,7 +3208,7 @@
           "queries"
         ],
         "summary": "Execute an inline read query (friendlier-named alternative to `POST /read`).",
-        "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /mutate` (or its deprecated alias `POST /change`) for\nwrite queries. It shares `POST /read` target semantics (branch xor\nsnapshot) and the same Cedar action (Read), while its canonical response\nadditionally carries the pinned graph-commit token.\n\nThe GQ statement `branch list` is also served here, with no `branch`,\n`snapshot`, `name`, or `params`: it answers one row per branch (column\n`name`, byte order) under the same `read` check as `GET /branches`.\n`branch create`, `branch delete`, and `branch merge` are rejected with\n400; send them to `POST /mutate`.",
+        "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /mutate` (or its deprecated alias `POST /change`) for\nwrite queries. It shares `POST /read` target semantics (branch xor\nsnapshot) and the same Cedar action (Read), while its canonical response\nadditionally carries the pinned graph-commit token.\n\nThe GQ statement `branch list` is also served here, with no `branch`,\n`snapshot`, `name`, or `params`: it answers one result per branch (field\n`name`, byte order) under the same `read` check as `GET /branches`.\n`branch create`, `branch delete`, and `branch merge` are rejected with\n400; send them to `POST /mutate`.\n\nThe GQ statement `explain query …` is served here too: the query is not\nrun, and the result describes its v2 logical, physical and available\nDataFusion trees, one result per node (fields `tree`, `depth`, `node`, `detail`), followed by\n`plan` entries for the passes and the document's other fields, under the\nrequest's target and `params`.",
         "operationId": "cluster_query",
         "parameters": [
           {
@@ -3206,7 +3296,7 @@
           "queries"
         ],
         "summary": "**Deprecated** — use [`POST /query`](#tag/queries/operation/query) instead.",
-        "description": "Execute a GQ read query. The route is kept indefinitely with a byte-stable\nenvelope; cell spelling follows the JSON writer. New integrations\nshould target `POST /query`, which has clean field names (`query` /\n`name`) and a 400-on-mutation guard. Responses from this route include\n`Deprecation: true` and `Link: <query>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the\nsignal.",
+        "description": "Execute a GQ read query. The route is kept indefinitely with a byte-stable\nenvelope; cell spelling follows the JSON writer. A `settings` field, and\na `set` or `reset` prefix in the source, are refused: the route runs under\nthe process defaults alone. New integrations\nshould target `POST /query`, which has clean field names (`query` /\n`name`) and a 400-on-mutation guard. Responses from this route include\n`Deprecation: true` and `Link: <query>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the\nsignal.",
         "operationId": "cluster_read",
         "parameters": [
           {
@@ -3542,7 +3632,7 @@
           "health"
         ],
         "summary": "Readiness witness (RFC 0049).",
-        "description": "Unauthenticated, and therefore minimal: it reports whether this replica\nis serving or draining, the applied `config_digest` it booted from, the\nledger revision and CAS it read, and how many graphs it serves and does\nnot serve. Graph ids are topology and stay behind `GET /graphs`. Answers\n503 once shutdown has begun; `/healthz` stays 200 while the process is\nalive.",
+        "description": "Unauthenticated, and therefore minimal: it reports whether this replica\nis serving or draining, the applied `config_digest` it booted from, the\nledger revision and CAS it read, and how many graphs it serves and does\nnot serve. Graph ids stay behind authenticated catalog endpoints. Answers\n503 once shutdown has begun; `/healthz` stays 200 while the process is\nalive.",
         "operationId": "readiness",
         "responses": {
           "200": {
@@ -3740,6 +3830,17 @@
           "delete_branch": {
             "type": "boolean",
             "description": "Delete the source branch after a successful merge. The deletion runs\nunder its own `branch_delete` policy check; a refusal or failure is\nreported via `branch_deleted` / `branch_delete_error` on the response\nand never fails the already-landed merge."
+          },
+          "settings": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SettingsRequest",
+                "description": "Session settings for this request (the Session settings RFC); see [`SettingsRequest`]."
+              }
+            ]
           },
           "source": {
             "type": "string",
@@ -4233,6 +4334,17 @@
             "type": "string",
             "description": "GQ mutation source containing `insert`, `update`, or `delete` statements.\nMay declare multiple named mutations; pick one with `name`. May instead\nbe one branch statement (grammar: `BranchStmt` in `omnigraph-compiler`),\nsent with no `name`, `params`, or `branch`.\n\nAccepts the legacy field name `query_source` as a deserialization alias.",
             "example": "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}"
+          },
+          "settings": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SettingsRequest",
+                "description": "Session settings for this request (the Session settings RFC); see [`SettingsRequest`]."
+              }
+            ]
           }
         }
       },
@@ -4547,7 +4659,7 @@
               },
               {
                 "$ref": "#/components/schemas/ResourceLimitOutput",
-                "description": "Set when the request must be split into smaller graph commits. The\nrejected attempt has no durable sidecar and no dataset effect."
+                "description": "Set when the request must be split into smaller graph commits. The\nrejected attempt has no durable effect."
               }
             ]
           }
@@ -4689,9 +4801,43 @@
           }
         }
       },
+      "GraphDiscoveryEntry": {
+        "type": "object",
+        "description": "A graph's existence, without storage, schema, data, or serving metadata.",
+        "required": [
+          "graph_id",
+          "display_name"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string",
+            "description": "Currently the graph identifier; no separate display name is configured."
+          },
+          "graph_id": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "GraphDiscoveryResponse": {
+        "type": "object",
+        "description": "Authenticated minimal inventory from `GET /graphs/discovery`.",
+        "required": [
+          "graphs"
+        ],
+        "properties": {
+          "graphs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GraphDiscoveryEntry"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
       "GraphInfo": {
         "type": "object",
-        "description": "One entry in the response from `GET /graphs`. Cluster operators\nconsume this list to discover which graphs the server is currently\nserving. The shape is intentionally minimal — `graph_id` and `uri`\nare the only fields a routing client needs.",
+        "description": "One entry in the response from `GET /graphs`. Cluster operators\nconsume this list to discover which graphs the server is currently\nserving. This legacy metadata includes the storage `uri`; identity-only\nexistence discovery uses [`GraphDiscoveryEntry`] instead.",
         "required": [
           "graph_id",
           "uri"
@@ -4738,7 +4884,7 @@
           "internal_schema_version": {
             "type": "integer",
             "format": "int32",
-            "description": "The newest internal-schema (storage-format) version this binary serves;\nit also reads and writes the preceding legacy-vintage version.",
+            "description": "The internal-schema (storage-format) version this binary serves; a\ngraph at any other stamp is refused until an explicit upgrade.",
             "minimum": 0
           },
           "source_version": {
@@ -5188,8 +5334,19 @@
           },
           "query": {
             "type": "string",
-            "description": "GQ read-query source. May declare one or more named queries; pick one\nwith `name` when more than one is declared. Mutations\n(`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its\ndeprecated alias `POST /change`) instead. May instead be the branch\nstatement `branch list`, sent with no `name`, `params`, `branch`, or\n`snapshot`.",
+            "description": "GQ read-query source. May declare one or more named queries; pick one\nwith `name` when more than one is declared. Mutations\n(`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its\ndeprecated alias `POST /change`) instead. May instead be the branch\nstatement `branch list`, sent with no `name`, `params`, `branch`, or\n`snapshot`; or one `explain` statement (`explain query …`), which\nanswers the v2 plan instead of\nrunning it, as one result per plan node (fields `tree`, `depth`, `node`,\n`detail`: the logical, physical and available DataFusion trees, then `plan` entries for\nthe passes and the document's other fields), under the same `params`,\n`branch`, or `snapshot` as the query itself.",
             "example": "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
+          },
+          "settings": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SettingsRequest",
+                "description": "Session settings for this request (the Session settings RFC); see [`SettingsRequest`]."
+              }
+            ]
           },
           "snapshot": {
             "type": [
@@ -5262,6 +5419,9 @@
             "type": "string",
             "description": "GQ query source. May declare one or more named queries; pick one with\n`query_name` if there is more than one.",
             "example": "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
+          },
+          "settings": {
+            "description": "Refused when present: the deprecated route runs under the process\ndefaults. Typed as raw JSON so the refusal names the field instead of\na deserialization error."
           },
           "snapshot": {
             "type": [
@@ -5479,6 +5639,35 @@
             ]
           }
         }
+      },
+      "SettingsRequest": {
+        "type": "object",
+        "description": "The `settings` field of a request: one optional value per `request`-scope\nsetting of the definition, applied to the request's session before the\nsource's own `set` lines, so a `set` line in the request's text overrides\nthe field. An absent field is empty. A `process` setting has no field\nhere, so `{\"stage_write_concurrency\": 64}` is refused as an unknown field.",
+        "properties": {
+          "ann_nprobes": {
+            "type": "integer",
+            "description": "the partition cap per index delta of a `nearest` scan; `0` is no cap",
+            "minimum": 0
+          },
+          "engine": {
+            "type": "string",
+            "description": "whether a read query runs through engine version 2, the plan runner; this setting does not change change-feed or merge execution",
+            "enum": [
+              "v1",
+              "v2"
+            ]
+          },
+          "merge_lineage": {
+            "type": "string",
+            "description": "how a merge finds the entities it classifies: the full-scan walk, the lineage path, or both compared",
+            "enum": [
+              "off",
+              "on",
+              "verify"
+            ]
+          }
+        },
+        "additionalProperties": false
       },
       "SnapshotDatasetOutput": {
         "type": "object",

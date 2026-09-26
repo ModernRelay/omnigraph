@@ -10,7 +10,7 @@
 //! 3. **Persisted adjacency artifact** — `optimize` writes it, traversals load
 //!    it, staleness and corruption are rejected fail-open.
 //!
-//! Mode forcing uses the scoped `with_traversal_mode` seam, never the env var.
+//! Mode forcing uses the `traversal` session setting, never an env var.
 
 mod helpers;
 
@@ -20,8 +20,9 @@ use omnigraph::db::Omnigraph;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_traversal_mode};
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::Session;
+use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+use omnigraph::loader::LoadMode;
 
 use helpers::*;
 
@@ -75,10 +76,10 @@ query reach_capped($name: String) {
 }
 "#;
 
-async fn clique_db(dir: &tempfile::TempDir) -> Omnigraph {
+async fn clique_db(dir: &tempfile::TempDir) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&db, &clique_jsonl(50), LoadMode::Overwrite)
+    let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    db.load_jsonl(&clique_jsonl(50), LoadMode::Overwrite)
         .await
         .unwrap();
     // The endpoint BTREEs must exist, or dispatch prices a degraded scan and
@@ -94,19 +95,14 @@ async fn clique_db(dir: &tempfile::TempDir) -> Omnigraph {
 #[tokio::test]
 async fn adaptive_switch_returns_identical_rows() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = clique_db(&dir).await;
+    let db = clique_db(&dir).await;
     let p = params(&[("$name", "p0")]);
 
-    let csr = first_column_sorted(
-        &with_traversal_mode("csr", query_main(&mut db, REACH_3, "reach", &p))
-            .await
-            .unwrap(),
-    );
-    let indexed = first_column_sorted(
-        &with_traversal_mode("indexed", query_main(&mut db, REACH_3, "reach", &p))
-            .await
-            .unwrap(),
-    );
+    let csr_db = with_traversal(&db, Traversal::Csr);
+    let indexed_db = with_traversal(&db, Traversal::Indexed);
+    let csr = first_column_sorted(&query_main(&csr_db, REACH_3, "reach", &p).await.unwrap());
+    let indexed =
+        first_column_sorted(&query_main(&indexed_db, REACH_3, "reach", &p).await.unwrap());
     // Probe the switch itself: mode equivalence alone stays green with the
     // re-decision disabled (all three paths would agree on the same rows), so
     // this counter is what proves the mechanism ran.
@@ -116,7 +112,7 @@ async fn adaptive_switch_returns_identical_rows() {
         ..Default::default()
     };
     let auto = first_column_sorted(
-        &with_query_io_probes(probes, query_main(&mut db, REACH_3, "reach", &p))
+        &with_query_io_probes(probes, query_main(&db, REACH_3, "reach", &p))
             .await
             .unwrap(),
     );
@@ -148,18 +144,16 @@ query reach_u($name: String) {
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
-    let mut db = clique_db(&dir).await;
+    let db = clique_db(&dir).await;
     let p = params(&[("$name", "p0")]);
+    let csr_db = with_traversal(&db, Traversal::Csr);
     let csr = first_column_sorted(
-        &with_traversal_mode(
-            "csr",
-            query_main(&mut db, REACH_3_UNDIRECTED, "reach_u", &p),
-        )
-        .await
-        .unwrap(),
+        &query_main(&csr_db, REACH_3_UNDIRECTED, "reach_u", &p)
+            .await
+            .unwrap(),
     );
     let auto = first_column_sorted(
-        &query_main(&mut db, REACH_3_UNDIRECTED, "reach_u", &p)
+        &query_main(&db, REACH_3_UNDIRECTED, "reach_u", &p)
             .await
             .unwrap(),
     );
@@ -194,22 +188,17 @@ query far($name: String) {
     jsonl.push('\n');
     jsonl.push_str(r#"{"edge":"Knows","from":"q1","to":"q2"}"#);
     jsonl.push('\n');
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&db, &jsonl, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    db.load_jsonl(&jsonl, LoadMode::Overwrite).await.unwrap();
     db.optimize().await.unwrap();
 
     let p = params(&[("$name", "p0")]);
-    let csr = first_column_sorted(
-        &with_traversal_mode("csr", query_main(&mut db, REACH_2_3, "far", &p))
-            .await
-            .unwrap(),
-    );
-    let indexed = first_column_sorted(
-        &with_traversal_mode("indexed", query_main(&mut db, REACH_2_3, "far", &p))
-            .await
-            .unwrap(),
-    );
-    let auto = first_column_sorted(&query_main(&mut db, REACH_2_3, "far", &p).await.unwrap());
+    let csr_db = with_traversal(&db, Traversal::Csr);
+    let indexed_db = with_traversal(&db, Traversal::Indexed);
+    let csr = first_column_sorted(&query_main(&csr_db, REACH_2_3, "far", &p).await.unwrap());
+    let indexed =
+        first_column_sorted(&query_main(&indexed_db, REACH_2_3, "far", &p).await.unwrap());
+    let auto = first_column_sorted(&query_main(&db, REACH_2_3, "far", &p).await.unwrap());
     // Every clique member is 1 hop from p0 (excluded); q1 is 2 hops (via p1),
     // q2 is 3 hops.
     assert_eq!(csr, vec!["q1", "q2"]);
@@ -223,11 +212,11 @@ query far($name: String) {
 #[tokio::test]
 async fn capped_unordered_limit_returns_valid_subset() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = clique_db(&dir).await;
+    let db = clique_db(&dir).await;
     let p = params(&[("$name", "p0")]);
 
     let full: HashSet<String> =
-        first_column_sorted(&query_main(&mut db, REACH_3, "reach", &p).await.unwrap())
+        first_column_sorted(&query_main(&db, REACH_3, "reach", &p).await.unwrap())
             .into_iter()
             .collect();
     assert_eq!(full.len(), 49);
@@ -240,14 +229,16 @@ async fn capped_unordered_limit_returns_valid_subset() {
             expand_cap_stops: Arc::clone(&cap_stops),
             ..Default::default()
         };
-        let fut = with_query_io_probes(
-            probes,
-            query_main(&mut db, REACH_3_CAPPED, "reach_capped", &p),
-        );
-        let result = match mode {
-            Some(m) => with_traversal_mode(m, fut).await.unwrap(),
-            None => fut.await.unwrap(),
+        let run_db = match mode {
+            Some(m) => with_traversal(&db, Traversal::from_spelling(m).unwrap()),
+            None => db.clone(),
         };
+        let result = with_query_io_probes(
+            probes,
+            query_main(&run_db, REACH_3_CAPPED, "reach_capped", &p),
+        )
+        .await
+        .unwrap();
         assert!(
             cap_stops.load(Ordering::Relaxed) >= 1,
             "the pushed-down limit must stop the traversal early (mode {mode:?})"
@@ -281,10 +272,10 @@ query reach_big($name: String) {
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
-    let mut db = clique_db(&dir).await;
+    let db = clique_db(&dir).await;
     let p = params(&[("$name", "p0")]);
     let rows = first_column_sorted(
-        &query_main(&mut db, REACH_BIG_LIMIT, "reach_big", &p)
+        &query_main(&db, REACH_BIG_LIMIT, "reach_big", &p)
             .await
             .unwrap(),
     );
@@ -306,14 +297,15 @@ async fn optimize_persists_the_graph_index_artifact() {
     assert_eq!(&body[..8], b"OGCSRIDX", "binary artifact magic");
     assert_eq!(
         u32::from_le_bytes(body[8..12].try_into().unwrap()),
-        2,
-        "format version 2 (self-describing section preludes)"
+        3,
+        "format version 3 (detached pins in table identity stamps)"
     );
     // The header is JSON and carries the digest + identity stamps.
     let header_len = u64::from_le_bytes(body[12..20].try_into().unwrap()) as usize;
     let header = std::str::from_utf8(&body[20..20 + header_len]).unwrap();
     assert!(header.contains("\"payload_sha256_b64\""));
     assert!(header.contains("\"tables\""));
+    assert!(header.contains("\"staged_version\""));
 }
 
 // Fail-open: a corrupt artifact must be rejected and rebuilt around, never
@@ -321,13 +313,10 @@ async fn optimize_persists_the_graph_index_artifact() {
 #[tokio::test]
 async fn corrupt_artifact_falls_back_to_the_scan_build() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = clique_db(&dir).await;
+    let db = clique_db(&dir).await;
     let p = params(&[("$name", "p0")]);
-    let before = first_column_sorted(
-        &with_traversal_mode("csr", query_main(&mut db, REACH_3, "reach", &p))
-            .await
-            .unwrap(),
-    );
+    let csr_db = with_traversal(&db, Traversal::Csr);
+    let before = first_column_sorted(&query_main(&csr_db, REACH_3, "reach", &p).await.unwrap());
 
     let artifact = dir.path().join("__graph_index/csr-current.bin");
     // Truncate mid-body: the section walk overruns, the loader logs and
@@ -336,12 +325,9 @@ async fn corrupt_artifact_falls_back_to_the_scan_build() {
     std::fs::write(&artifact, &body[..body.len() / 2]).unwrap();
 
     // Fresh handle so no in-memory cached index masks the artifact read.
-    let mut db2 = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
-    let after = first_column_sorted(
-        &with_traversal_mode("csr", query_main(&mut db2, REACH_3, "reach", &p))
-            .await
-            .unwrap(),
-    );
+    let db2 = session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
+    let csr_db2 = with_traversal(&db2, Traversal::Csr);
+    let after = first_column_sorted(&query_main(&csr_db2, REACH_3, "reach", &p).await.unwrap());
     assert_eq!(after, before, "corrupt artifact must not change results");
 }
 
@@ -351,14 +337,14 @@ async fn corrupt_artifact_falls_back_to_the_scan_build() {
 #[tokio::test]
 async fn stale_artifact_is_rejected_after_an_edge_write() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     db.optimize().await.unwrap();
     let artifact = dir.path().join("__graph_index/csr-current.bin");
     assert!(artifact.is_file());
 
     // Alice knows Bob, Charlie. Append Alice -> Diana AFTER the artifact.
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "add_friend",
         &params(&[("$from", "Alice"), ("$to", "Diana")]),
@@ -367,16 +353,14 @@ async fn stale_artifact_is_rejected_after_an_edge_write() {
     .unwrap();
 
     // Fresh handle: the artifact on the store is now stale for edge:Knows.
-    let mut db2 = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+    let db2 = session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
+    let csr_db2 = with_traversal(&db2, Traversal::Csr);
     let got = first_column_sorted(
-        &with_traversal_mode(
-            "csr",
-            query_main(
-                &mut db2,
-                TEST_QUERIES,
-                "friends_of",
-                &params(&[("$name", "Alice")]),
-            ),
+        &query_main(
+            &csr_db2,
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Alice")]),
         )
         .await
         .unwrap(),

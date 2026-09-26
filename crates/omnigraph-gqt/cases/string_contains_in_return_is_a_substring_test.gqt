@@ -1,0 +1,36 @@
+# issue: none
+# notes: `contains` projected in `return` is the substring test on a String property and
+# notes: list membership on a list property, side by side.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    name: String
+    tags: [String]?
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a","name":"Alice","tags":["rust"]}}
+{"type":"Person","data":{"slug":"b","name":"Bob","tags":["go"]}}
+
+--- query
+set engine = v2;
+query substring_and_membership() {
+    match { $p: Person }
+    return { $p.slug, $p.name contains "li" as hit, $p.tags contains "rust" as tagged }
+}
+
+--- expect unordered
+{"p.slug": "a", "hit": true, "tagged": true}
+{"p.slug": "b", "hit": false, "tagged": false}
+
+--- expect shape
+p.slug: String
+hit: Bool
+tagged: Bool?

@@ -12,11 +12,14 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use omnigraph::Session;
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget, Snapshot};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
 use omnigraph_compiler::catalog::schema_ir::SYSTEM_COLUMNS_META;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -639,12 +642,15 @@ fn diagnostics_error(code: &'static str, diagnostics: Vec<Diagnostic>) -> RealGr
 
 async fn prepare_finbench_delta(root: &Path) -> Result<(), RealGraphRunError> {
     let uri = path_utf8(root)?;
-    let db = Omnigraph::open(uri).await.map_err(|error| {
-        RealGraphRunError::new(
-            "real_graph_prepare_failed",
-            format!("open disposable FinGraph copy: {error}"),
-        )
-    })?;
+    let db = Session::from_defaults(
+        Arc::new(Omnigraph::open(uri).await.map_err(|error| {
+            RealGraphRunError::new(
+                "real_graph_prepare_failed",
+                format!("open disposable FinGraph copy: {error}"),
+            )
+        })?),
+        SessionSettings::default(),
+    );
     let mut branches = db.branch_list().await.map_err(engine_prepare_error)?;
     branches.sort();
     if branches != ["main"] {
@@ -880,9 +886,14 @@ async fn execute_worker(
             "worker operation deadline is out of range",
         ));
     }
-    let db = Omnigraph::open(path_utf8(&request.root)?)
-        .await
-        .map_err(engine_worker_error)?;
+    let db = Session::from_defaults(
+        Arc::new(
+            Omnigraph::open(path_utf8(&request.root)?)
+                .await
+                .map_err(engine_worker_error)?,
+        ),
+        SessionSettings::default(),
+    );
     let main_before = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -1416,7 +1427,6 @@ fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omnigraph::loader::load_jsonl;
 
     #[test]
     fn run_spec_is_strict_and_bounded() {
@@ -1576,10 +1586,15 @@ mod tests {
 {"edge":"AccountTransferAccount","id":"existing-transfer","from":"existing-a","to":"existing-b","data":{"amount":9.0,"createTime":"2019-01-01T00:00:00Z","orderNum":"existing-order","payType":"bank_transfer","goodsType":"bank_transfer"}}"#;
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("active");
-        let db = Omnigraph::init(root.to_str().unwrap(), SCHEMA)
-            .await
-            .unwrap();
-        load_jsonl(&db, BASE, LoadMode::Overwrite).await.unwrap();
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init(root.to_str().unwrap(), SCHEMA)
+                    .await
+                    .unwrap(),
+            ),
+            SessionSettings::default(),
+        );
+        db.load_jsonl(BASE, LoadMode::Overwrite).await.unwrap();
         drop(db);
 
         prepare_finbench_delta(&root).await.unwrap();

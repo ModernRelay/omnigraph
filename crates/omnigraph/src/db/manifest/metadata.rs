@@ -15,6 +15,12 @@ use super::layout::table_id_to_key;
 pub(super) const OMNIGRAPH_ROW_COUNT_KEY: &str = "omnigraph.row_count";
 const OMNIGRAPH_TABLE_BRANCH_KEY: &str = "omnigraph.table_branch";
 const OMNIGRAPH_TABLE_FORK_OWNER_KEY: &str = "omnigraph.table_fork_owner";
+/// RFC 0067 prototype pin fields, carried like the fork owner.
+const OMNIGRAPH_STAGED_VERSION_KEY: &str = "omnigraph.staged_version";
+const OMNIGRAPH_TRANSACTION_UUID_KEY: &str = "omnigraph.transaction_uuid";
+/// RFC "Detached-only tables": the table's last linear version, carried
+/// forward by every writer once the v11 upgrade records it.
+const OMNIGRAPH_LAST_LINEAR_VERSION_KEY: &str = "omnigraph.last_linear_version";
 
 pub(super) fn namespace_version_metadata(
     row_count: u64,
@@ -56,6 +62,13 @@ pub(super) fn parse_namespace_version_request(
         e_tag: request.e_tag.clone(),
         naming_scheme: request.naming_scheme.clone(),
         table_fork_owner: metadata.get(OMNIGRAPH_TABLE_FORK_OWNER_KEY).cloned(),
+        staged_version: metadata
+            .get(OMNIGRAPH_STAGED_VERSION_KEY)
+            .and_then(|value| value.parse::<u64>().ok()),
+        transaction_uuid: metadata.get(OMNIGRAPH_TRANSACTION_UUID_KEY).cloned(),
+        last_linear_version: metadata
+            .get(OMNIGRAPH_LAST_LINEAR_VERSION_KEY)
+            .and_then(|value| value.parse::<u64>().ok()),
     };
 
     Ok((
@@ -75,6 +88,19 @@ pub(crate) struct TableVersionMetadata {
     naming_scheme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     table_fork_owner: Option<String>,
+    /// RFC 0067: the detached Lance version this pin was staged
+    /// as before publication. `None` on a linear pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    staged_version: Option<u64>,
+    /// RFC 0067: the uuid of the staged transaction, which readers check
+    /// at a v10 pin's linear twin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transaction_uuid: Option<String>,
+    /// RFC "Detached-only tables": the table's last linear version, recorded
+    /// by the v11 upgrade or `1` at creation and copied forward by every
+    /// writer; `None` only on a row older than the upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_linear_version: Option<u64>,
 }
 
 impl TableVersionMetadata {
@@ -93,7 +119,77 @@ impl TableVersionMetadata {
             e_tag: dataset.manifest_location().e_tag.clone(),
             naming_scheme: Some(format!("{:?}", dataset.manifest_location().naming_scheme)),
             table_fork_owner: None,
+            staged_version: None,
+            transaction_uuid: None,
+            last_linear_version: None,
         })
+    }
+
+    pub(crate) fn staged_version(&self) -> Option<u64> {
+        self.staged_version
+    }
+
+    pub(crate) fn last_linear_version(&self) -> Option<u64> {
+        self.last_linear_version
+    }
+
+    /// Carry the base row's last linear version onto a rebuilt row.
+    pub(crate) fn with_last_linear_version(mut self, version: Option<u64>) -> Self {
+        self.last_linear_version = version;
+        self
+    }
+
+    pub(crate) fn transaction_uuid(&self) -> Option<&str> {
+        self.transaction_uuid.as_deref()
+    }
+
+    /// RFC 0067: mark this pin as staged at a detached version committed
+    /// under `uuid`.
+    pub(crate) fn with_staged(mut self, staged_version: u64, transaction_uuid: String) -> Self {
+        self.staged_version = Some(staged_version);
+        self.transaction_uuid = Some(transaction_uuid);
+        self
+    }
+
+    /// RFC 0067: whether `dataset` is the manifest this pin
+    /// witnesses. The e_tag identifies the exact manifest object; a pin that
+    /// carries a transaction uuid also accepts a v10 pin's linear twin, whose
+    /// manifest differs but whose transaction is the same.
+    pub(crate) fn witnesses(&self, dataset: &Dataset) -> bool {
+        match self.e_tag.as_deref() {
+            None => return true,
+            Some(expected) if dataset.manifest_location().e_tag.as_deref() == Some(expected) => {
+                return true;
+            }
+            Some(_) => {}
+        }
+        match self.transaction_uuid.as_deref() {
+            Some(uuid) => crate::table_store::StagedTransactionIdentity::recorded_by(dataset)
+                .is_some_and(|identity| identity.uuid == uuid),
+            None => false,
+        }
+    }
+
+    /// Compare read evidence; the linear boundary affects only staged pins.
+    pub(crate) fn same_read_witness(&self, other: &Self) -> bool {
+        let Self {
+            manifest_path,
+            manifest_size,
+            e_tag,
+            naming_scheme,
+            table_fork_owner,
+            staged_version,
+            transaction_uuid,
+            last_linear_version,
+        } = self;
+        manifest_path == &other.manifest_path
+            && manifest_size == &other.manifest_size
+            && e_tag == &other.e_tag
+            && naming_scheme == &other.naming_scheme
+            && table_fork_owner == &other.table_fork_owner
+            && staged_version == &other.staged_version
+            && transaction_uuid == &other.transaction_uuid
+            && (staged_version.is_none() || last_linear_version == &other.last_linear_version)
     }
 
     pub(crate) fn table_fork_owner(&self) -> Option<&str> {
@@ -105,6 +201,7 @@ impl TableVersionMetadata {
         self
     }
 
+    #[cfg(any(test, feature = "failpoints"))]
     pub(crate) fn is_table_fork_of(&self, fork: &str, owner: &str) -> bool {
         self.table_fork_owner
             .as_deref()
@@ -158,6 +255,18 @@ impl TableVersionMetadata {
         let mut metadata = namespace_version_metadata(row_count, table_branch);
         if let Some(owner) = &self.table_fork_owner {
             metadata.insert(OMNIGRAPH_TABLE_FORK_OWNER_KEY.to_string(), owner.clone());
+        }
+        if let Some(staged) = self.staged_version {
+            metadata.insert(OMNIGRAPH_STAGED_VERSION_KEY.to_string(), staged.to_string());
+        }
+        if let Some(uuid) = &self.transaction_uuid {
+            metadata.insert(OMNIGRAPH_TRANSACTION_UUID_KEY.to_string(), uuid.clone());
+        }
+        if let Some(last) = self.last_linear_version {
+            metadata.insert(
+                OMNIGRAPH_LAST_LINEAR_VERSION_KEY.to_string(),
+                last.to_string(),
+            );
         }
         request.metadata = Some(metadata);
         request
@@ -322,6 +431,58 @@ mod tests {
     const TARGET: &str = "target.01ARZ3NDEKTSV4RRFFQ69G5FAW";
     const FORK: &str = "fork.01ARZ3NDEKTSV4RRFFQ69G5FAV.m42.01ARZ3NDEKTSV4RRFFQ69G5FAX";
 
+    /// GQT cannot vary persisted registration metadata independently of table bytes.
+    #[test]
+    fn unstaged_blob_read_witness_ignores_only_linear_boundary() {
+        let legacy = TableVersionMetadata::from_json_str(LEGACY_JSON).unwrap();
+        let upgraded = legacy.clone().with_last_linear_version(Some(7));
+        assert_ne!(legacy, upgraded);
+        assert!(legacy.same_read_witness(&upgraded));
+        assert!(upgraded.same_read_witness(&legacy));
+        for changed in [
+            TableVersionMetadata {
+                manifest_path: "other/7.manifest".to_string(),
+                ..upgraded.clone()
+            },
+            TableVersionMetadata {
+                manifest_size: None,
+                ..upgraded.clone()
+            },
+            TableVersionMetadata {
+                e_tag: None,
+                ..upgraded.clone()
+            },
+            TableVersionMetadata {
+                naming_scheme: None,
+                ..upgraded.clone()
+            },
+            upgraded.clone().with_table_fork_owner(Some(OWNER)),
+            TableVersionMetadata {
+                staged_version: Some(9_223_372_036_854_775_815),
+                ..upgraded.clone()
+            },
+            TableVersionMetadata {
+                transaction_uuid: Some("different-transaction".to_string()),
+                ..upgraded.clone()
+            },
+        ] {
+            assert!(!legacy.same_read_witness(&changed), "{changed:?}");
+            assert!(!changed.same_read_witness(&legacy), "{changed:?}");
+        }
+    }
+
+    /// Staged resolution can choose a detached pin or its linear twin.
+    #[test]
+    fn staged_blob_read_witness_keeps_linear_boundary() {
+        let staged = TableVersionMetadata::from_json_str(LEGACY_JSON)
+            .unwrap()
+            .with_staged(9_223_372_036_854_775_815, "staged-transaction".to_string());
+        assert!(staged.same_read_witness(&staged));
+        let changed = staged.clone().with_last_linear_version(Some(7));
+        assert!(!staged.same_read_witness(&changed));
+        assert!(!changed.same_read_witness(&staged));
+    }
+
     /// GQT cannot inject absent owner metadata or inspect its serialized omission.
     #[test]
     fn legacy_metadata_owns_only_the_exact_native_ref() {
@@ -377,10 +538,27 @@ mod tests {
     /// GQT does not expose the namespace registration request and response metadata.
     #[test]
     fn namespace_pointer_roundtrip_keeps_source_ownership() {
-        let source = TableVersionMetadata::from_json_str(LEGACY_JSON)
-            .unwrap()
-            .with_table_fork_owner(Some(OWNER));
+        let source = TableVersionMetadata {
+            staged_version: Some(9_223_372_036_854_775_815),
+            transaction_uuid: Some("8b8d7a1e-6f2c-4f0e-9d3a-1c2b3a4d5e6f".to_string()),
+            ..TableVersionMetadata::from_json_str(LEGACY_JSON)
+                .unwrap()
+                .with_table_fork_owner(Some(OWNER))
+        };
         let request = source.to_create_table_version_request("node:Person", 7, 3, Some(FORK));
+        let request_metadata = request.metadata.as_ref().unwrap();
+        assert_eq!(
+            request_metadata
+                .get(OMNIGRAPH_STAGED_VERSION_KEY)
+                .map(String::as_str),
+            Some("9223372036854775815")
+        );
+        assert_eq!(
+            request_metadata
+                .get(OMNIGRAPH_TRANSACTION_UUID_KEY)
+                .map(String::as_str),
+            Some("8b8d7a1e-6f2c-4f0e-9d3a-1c2b3a4d5e6f")
+        );
         assert_eq!(
             request
                 .metadata
@@ -397,6 +575,14 @@ mod tests {
         assert_eq!(rows, 3);
         assert_eq!(native_ref.as_deref(), Some(FORK));
         assert_eq!(target_registration, source);
+        assert_eq!(
+            target_registration.staged_version(),
+            Some(9_223_372_036_854_775_815)
+        );
+        assert_eq!(
+            target_registration.transaction_uuid(),
+            Some("8b8d7a1e-6f2c-4f0e-9d3a-1c2b3a4d5e6f")
+        );
         assert!(target_registration.is_table_fork_of(FORK, OWNER));
         assert!(!target_registration.is_table_fork_of(FORK, TARGET));
 

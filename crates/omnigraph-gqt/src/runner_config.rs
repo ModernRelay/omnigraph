@@ -71,11 +71,11 @@ impl Environment {
         }
     }
 
-    pub(crate) fn admit(&self, has_faults: bool) -> Result<(), String> {
+    pub(crate) fn admit(&self, has_seams: bool) -> Result<(), String> {
         match self.execution {
             Execution::Engine {
                 storage: Storage::LocalFilesystem,
-            } if !has_faults => Ok(()),
+            } if !has_seams => Ok(()),
             Execution::Dst {
                 storage: Storage::InMemoryObjectStore,
                 ..
@@ -83,11 +83,11 @@ impl Environment {
                 if cfg!(tokio_unstable) {
                     Ok(())
                 } else {
-                    Err("unsupported_environment: DST runner is unavailable in this build; build from crates/omnigraph-gqt".into())
+                    Err("unsupported_environment: DST runner is unavailable in this build; the workspace .cargo/config.toml sets --cfg tokio_unstable, an env RUSTFLAGS without it overrides that".into())
                 }
             }
             _ => Err(format!(
-                "unsupported_environment: {} requests an unavailable combination; implemented combinations are omnigraph-engine/local-filesystem without faults and omnigraph-engine-dst/in-memory-object-store",
+                "unsupported_environment: {} requests an unavailable combination; implemented combinations are omnigraph-engine/local-filesystem without seams and omnigraph-engine-dst/in-memory-object-store",
                 self
             )),
         }
@@ -96,41 +96,119 @@ impl Environment {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Fault {
+pub(crate) struct SeamDirective {
     pub(crate) at: String,
     pub(crate) occurrence: usize,
-    pub(crate) action: FaultAction,
-    pub(crate) scope: FaultScope,
+    pub(crate) action: SeamAction,
+    pub(crate) scope: SeamScope,
+    /// A glob over the object's root-relative name; required on a store
+    /// place, refused on an entry that declares no subject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) subject: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct KnownFailure {
-    pub(crate) step: usize,
-    #[serde(rename = "match")]
-    pub(crate) matcher: ErrorMatch,
+/// What the site does when the installed decision fires; must match an
+/// effect the seam declares in the engine's catalog, or, for a store action,
+/// a store effect the entry declares or an action the store place admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SeamAction {
+    Fail,
+    Contention,
+    Skip,
+    Hold,
+    /// A store action, spelled and parsed by `StoreAction` itself, so the
+    /// store vocabulary has one home.
+    Store(omnigraph_dst::store_places::StoreAction),
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "error", deny_unknown_fields)]
-pub(crate) enum ErrorMatch {
-    RecoveryRequired { reason: String },
+impl SeamAction {
+    /// The spelling a case file uses.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SeamAction::Fail => "fail",
+            SeamAction::Contention => "contention",
+            SeamAction::Skip => "skip",
+            SeamAction::Hold => "hold",
+            SeamAction::Store(action) => action.as_str(),
+        }
+    }
+
+    /// The store action this spelling names, or `None` for an engine action.
+    pub(crate) fn store_action(self) -> Option<omnigraph_dst::store_places::StoreAction> {
+        match self {
+            SeamAction::Store(action) => Some(action),
+            SeamAction::Fail | SeamAction::Contention | SeamAction::Skip | SeamAction::Hold => None,
+        }
+    }
+}
+
+impl Serialize for SeamAction {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SeamAction {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let spelling = String::deserialize(deserializer)?;
+        match spelling.as_str() {
+            "fail" => Ok(SeamAction::Fail),
+            "contention" => Ok(SeamAction::Contention),
+            "skip" => Ok(SeamAction::Skip),
+            "hold" => Ok(SeamAction::Hold),
+            other => omnigraph_dst::store_places::StoreAction::parse(other)
+                .map(SeamAction::Store)
+                .ok_or_else(|| {
+                    <D::Error as serde::de::Error>::custom(format!(
+                        "unknown action `{other}`; engine actions are fail, contention, skip, hold; store actions are misdirect, lose, error, corrupt, delay"
+                    ))
+                }),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum FaultAction {
-    ReturnError,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum FaultScope {
+pub(crate) enum SeamScope {
     NextStep,
 }
 
+/// `body` with every quoted scalar replaced by one space, so the token scan
+/// below reads YAML syntax and never a quoted glob's own punctuation.
+fn outside_quotes(body: &str) -> String {
+    let chars: Vec<char> = body.chars().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut at = 0;
+    while at < chars.len() {
+        let quote = chars[at];
+        if quote != '"' && quote != '\'' {
+            out.push(quote);
+            at += 1;
+            continue;
+        }
+        out.push(' ');
+        at += 1;
+        while at < chars.len() {
+            if quote == '"' && chars[at] == '\\' {
+                at += 2;
+                continue;
+            }
+            if chars[at] == quote {
+                if quote == '\'' && chars.get(at + 1) == Some(&'\'') {
+                    at += 2;
+                    continue;
+                }
+                at += 1;
+                break;
+            }
+            at += 1;
+        }
+    }
+    out
+}
+
 fn yaml<T: serde::de::DeserializeOwned>(body: &str) -> Result<T, String> {
-    if body
+    if outside_quotes(body)
         .split(|c: char| c.is_whitespace() || "[]{},:".contains(c))
         .any(|word| word.starts_with(['&', '*', '!']) || word == "<<")
     {
@@ -166,21 +244,21 @@ pub(crate) fn parse_runner(body: &str) -> Result<RunnerConfig, String> {
     Ok(config)
 }
 
-pub(crate) fn parse_fault(body: &str) -> Result<Fault, String> {
-    let fault: Fault = yaml(body)?;
-    if !(1..=1_000_000).contains(&fault.occurrence) {
-        return Err("invalid_case: fault occurrence must be between 1 and 1000000".into());
+pub(crate) fn parse_seam(body: &str) -> Result<SeamDirective, String> {
+    let seam: SeamDirective = yaml(body)?;
+    if !(1..=1_000_000).contains(&seam.occurrence) {
+        return Err("invalid_case: seam occurrence must be between 1 and 1000000".into());
     }
-    Ok(fault)
-}
-
-pub(crate) fn parse_known_failure(body: &str) -> Result<KnownFailure, String> {
-    let known_failure: KnownFailure = yaml(body)?;
-    let ErrorMatch::RecoveryRequired { reason } = &known_failure.matcher;
-    if known_failure.step == 0 || reason.trim().is_empty() || reason.len() > 2048 {
-        return Err("invalid_case: known_failure requires a positive step and a nonempty RecoveryRequired reason (at most 2048 bytes)".into());
+    if seam.action == SeamAction::Hold {
+        return Err(
+            "invalid_case: `action: hold` is refused until a case can express two concurrent steps"
+                .into(),
+        );
     }
-    Ok(known_failure)
+    if let Some(subject) = &seam.subject {
+        omnigraph_dst::store_places::Subject::parse(subject)?;
+    }
+    Ok(seam)
 }
 
 #[cfg(test)]
@@ -264,16 +342,56 @@ mod tests {
     }
 
     #[test]
-    fn fault_fields_are_required_and_closed() {
-        let fault = "at: branch_merge.post_authority_capture\noccurrence: 1\naction: return_error\nscope: next_step";
-        assert!(parse_fault(fault).is_ok());
+    fn seam_fields_are_required_and_closed() {
+        let seam = "at: branch_merge.post_authority_capture\noccurrence: 1\naction: fail\nscope: next_step";
+        assert!(parse_seam(seam).is_ok());
+        assert!(parse_seam(&seam.replace("action: fail", "action: skip")).is_ok());
+        let contention = parse_seam(&seam.replace("action: fail", "action: contention")).unwrap();
+        assert_eq!(contention.action, SeamAction::Contention);
+        assert_eq!(contention.action.as_str(), "contention");
         for text in [
-            fault.replace("scope: next_step", ""),
-            fault.replace("next_step", "workload"),
-            fault.replace("occurrence: 1", "occurrence: 0"),
-            fault.replace("return_error", "panic"),
+            seam.replace("scope: next_step", ""),
+            seam.replace("next_step", "workload"),
+            seam.replace("occurrence: 1", "occurrence: 0"),
+            seam.replace("action: fail", "action: return_error"),
+            seam.replace("action: fail", "action: panic"),
+            seam.replace("action: fail", "action: hold"),
         ] {
-            assert!(parse_fault(&text).is_err());
+            assert!(parse_seam(&text).is_err());
         }
+    }
+
+    #[test]
+    fn quoted_subjects_are_scalars_not_yaml_syntax() {
+        let store = "at: storage.put\noccurrence: 1\naction: misdirect\nscope: next_step\n";
+        for subject in [
+            "subject: \"__recovery/{*.json,*.bin}\"\n",
+            "subject: \"__recovery/[!x]*\"\n",
+            "subject: '__recovery/*'\n",
+        ] {
+            let body = format!("{store}{subject}");
+            assert!(parse_seam(&body).is_ok(), "refused {body}");
+        }
+        for body in [
+            format!("{store}subject: *.json\n"),
+            format!("{store}subject: \"__recovery/*\"\n")
+                .replace("at: storage.put", "at: &anchor storage.put"),
+            format!("{store}subject: \"__recovery/*\"\n")
+                .replace("scope: next_step", "scope: !tag next_step"),
+        ] {
+            assert_eq!(
+                parse_seam(&body).unwrap_err(),
+                "invalid_case: YAML aliases, anchors, tags and merge keys are refused",
+                "accepted {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_brace_subject_is_refused_not_a_panic() {
+        let store = "at: storage.put\noccurrence: 1\naction: misdirect\nscope: next_step\n";
+        let subject = "{".repeat(300) + "x" + &"}".repeat(300);
+        let error = parse_seam(&format!("{store}subject: \"{subject}\"\n")).unwrap_err();
+        assert!(error.starts_with("invalid_case:"), "{error}");
     }
 }

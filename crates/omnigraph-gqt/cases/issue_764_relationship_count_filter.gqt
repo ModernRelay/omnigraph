@@ -1,0 +1,285 @@
+# issue: 764
+# red_on: e588815a; `invalid_case: --- query section starting at line 71 does not parse: expected comp_op` at `count {`, so no step runs; the bare `count($m) > 2` form was rejected with T7 on the same revision.
+# notes: A correlated count block keeps the outer row by a predicate on the number of inner matches, before limit.
+# notes: The bare aggregate in match stays rejected: it names no key.
+# notes: `count { … } = 0` must agree with `not { … }`.
+# notes: An unbound block counts distinct neighbours (a4 → three is seeded twice); a bound edge counts edge rows.
+# notes: The right side is a literal, now() or a parameter; an outer property is refused at typecheck.
+# notes: Shared row/error steps inherit the CI engine baseline; only plan assertions select v2.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Actor {
+    slug: String @key
+    followers: I64
+}
+node Artifact {
+    slug: String @key
+}
+edge ArtifactOwnedByActor: Artifact -> Actor {}
+edge Knows: Actor -> Actor {}
+
+--- seed
+{"type":"Actor","data":{"slug":"zero","followers":0}}
+{"type":"Actor","data":{"slug":"one","followers":1}}
+{"type":"Actor","data":{"slug":"two","followers":2}}
+{"type":"Actor","data":{"slug":"three","followers":3}}
+{"edge":"Knows","from":"one","to":"two"}
+{"edge":"Knows","from":"two","to":"three"}
+{"type":"Artifact","data":{"slug":"a1"}}
+{"type":"Artifact","data":{"slug":"a2"}}
+{"type":"Artifact","data":{"slug":"a3"}}
+{"type":"Artifact","data":{"slug":"a4"}}
+{"type":"Artifact","data":{"slug":"a5"}}
+{"type":"Artifact","data":{"slug":"a6"}}
+{"edge":"ArtifactOwnedByActor","from":"a1","to":"one"}
+{"edge":"ArtifactOwnedByActor","from":"a2","to":"two"}
+{"edge":"ArtifactOwnedByActor","from":"a3","to":"two"}
+{"edge":"ArtifactOwnedByActor","from":"a4","to":"three"}
+{"edge":"ArtifactOwnedByActor","from":"a4","to":"three"}
+{"edge":"ArtifactOwnedByActor","from":"a5","to":"three"}
+{"edge":"ArtifactOwnedByActor","from":"a6","to":"three"}
+
+--- query
+query bare_aggregate_in_match_stays_rejected() {
+    match {
+        $n: Actor
+        $m: Artifact
+        $m artifactOwnedByActor $n
+        count($m) > 2
+    }
+    return { $n.slug }
+}
+--- expect error: T7: filter comparisons require scalar operands, got aggregate and I64
+
+--- query
+query more_than_two() {
+    match {
+        $n: Actor
+        count {
+            $m: Artifact
+            $m artifactOwnedByActor $n
+        } > 2
+    }
+    return { $n.slug }
+    limit 5
+}
+--- expect unordered
+{"n.slug":"three"}
+--- expect shape
+n.slug: String
+
+--- query
+query at_most_one() {
+    match {
+        $n: Actor
+        count {
+            $m artifactOwnedByActor $n
+        } <= 1
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"zero"}
+{"n.slug":"one"}
+--- expect shape
+n.slug: String
+
+--- loop $degree 0 4
+--- query
+query exact_degree($degree: I64) {
+    match {
+        $n: Actor
+        count {
+            $m artifactOwnedByActor $n
+        } = $degree
+    }
+    return { $n.followers }
+}
+--- params
+{"degree": ${degree}}
+--- expect unordered
+{"n.followers": ${degree}}
+--- expect shape
+n.followers: I64
+--- endloop
+
+--- query
+query exactly_three_distinct_neighbours_off_the_bulk_path() {
+    match {
+        $n: Actor
+        count {
+            $m artifactOwnedByActor $n
+            $m.slug != "none"
+        } = 3
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"three"}
+--- expect shape
+n.slug: String
+
+--- query
+query bound_edge_counts_edge_rows() {
+    match {
+        $n: Actor
+        count {
+            $m $e:artifactOwnedByActor $n
+        } = 4
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"three"}
+--- expect shape
+n.slug: String
+
+--- query
+query undirected_degree_takes_the_slow_path() {
+    match {
+        $n: Actor
+        count {
+            $n <knows> $m
+        } = 2
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"two"}
+--- expect shape
+n.slug: String
+
+--- query
+query undirected_existence_reads_both_directions() {
+    match {
+        $n: Actor
+        count {
+            $n <knows> $m
+        } > 0
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"one"}
+{"n.slug":"two"}
+{"n.slug":"three"}
+--- expect shape
+n.slug: String
+
+--- query
+query outer_property_as_the_bound_is_refused() {
+    match {
+        $n: Actor
+        count {
+            $m artifactOwnedByActor $n
+        } >= $n.followers
+    }
+    return { $n.slug }
+}
+--- expect error: T40: count over a block compares with a literal, now() or a parameter
+
+--- query
+query not_equal_to_a_parameter($bound: I64) {
+    match {
+        $n: Actor
+        count {
+            $m artifactOwnedByActor $n
+        } != $bound
+    }
+    return { $n.slug }
+}
+--- params
+{"bound": 2}
+--- expect unordered
+{"n.slug":"zero"}
+{"n.slug":"one"}
+{"n.slug":"three"}
+--- expect shape
+n.slug: String
+
+--- query
+query predicate_narrows_before_limit() {
+    match {
+        $n: Actor
+        count {
+            $m artifactOwnedByActor $n
+        } >= 1
+    }
+    return { $n.slug }
+    order { $n.slug }
+    limit 2
+}
+--- expect ordered
+{"n.slug":"one"}
+{"n.slug":"three"}
+--- expect shape
+n.slug: String
+
+--- query
+query not_agrees_with_zero() {
+    match {
+        $n: Actor
+        not {
+            $m artifactOwnedByActor $n
+        }
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"zero"}
+--- expect shape
+n.slug: String
+
+--- query
+query count_cannot_be_negative() {
+    match {
+        $n: Actor
+        count {
+            $m artifactOwnedByActor $n
+        } < 0
+    }
+    return { $n.slug }
+}
+--- expect unordered
+--- expect shape
+n.slug: String
+
+--- query
+query null_count_bound_satisfies_nothing($bound: I64?) {
+    match {
+        $n: Actor
+        count {
+            $m artifactOwnedByActor $n
+        } != $bound
+    }
+    return { $n.slug }
+}
+--- params
+{"bound": null}
+--- expect unordered
+--- expect shape
+n.slug: String
+
+--- query
+query nested_count_is_correlated_to_each_peer() {
+    match {
+        $n: Actor
+        exists {
+            $n knows $peer
+            count {
+                $m artifactOwnedByActor $peer
+            } >= 3
+        }
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"two"}
+--- expect shape
+n.slug: String

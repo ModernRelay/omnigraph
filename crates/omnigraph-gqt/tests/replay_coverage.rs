@@ -53,6 +53,20 @@ fn replay_reports_only_current_attempts_after_refusal_or_mismatch() {
             .unwrap()
             .contains("OMNIGRAPH_TRAVERSAL_MODE")
     );
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg("--replay")
+        .arg(&prior_path)
+        .env("OMNIGRAPH_MERGE_LINEAGE", "off")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let (_, refused) = report(&output);
+    assert!(
+        refused["result"]["Err"]
+            .as_str()
+            .unwrap()
+            .contains("OMNIGRAPH_MERGE_LINEAGE")
+    );
 
     let mut changed = prior.clone();
     changed["attempts"][0]["outcome"]["Ok"]["observations"]

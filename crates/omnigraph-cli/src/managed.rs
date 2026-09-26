@@ -228,6 +228,7 @@ struct Api {
     client: Client,
     origin: String,
     token: Option<String>,
+    cached_session: bool,
 }
 
 struct Response {
@@ -253,7 +254,14 @@ impl Api {
             client,
             origin,
             token,
+            cached_session: false,
         })
+    }
+
+    fn authenticated(origin: String) -> Result<Self> {
+        let mut api = Self::new(origin, None)?;
+        api.cached_session = true;
+        Ok(api)
     }
 
     async fn raw(
@@ -263,10 +271,28 @@ impl Api {
         body: Option<&Value>,
         key: Option<&str>,
     ) -> Result<Response> {
+        self.raw_with_timeout(method, path, body, key, REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn raw_with_timeout(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+        key: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Response> {
+        let token = if self.cached_session {
+            Some(Box::pin(auth::credential(&self.origin)).await?)
+        } else {
+            self.token.clone()
+        };
         let mut request = self
             .client
-            .request(method, format!("{}{path}", self.origin));
-        if let Some(token) = &self.token {
+            .request(method, format!("{}{path}", self.origin))
+            .timeout(timeout);
+        if let Some(token) = &token {
             let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
                 .map_err(|_| {
                     Failure::refused("credential_invalid", "the managed credential is invalid")
@@ -317,7 +343,12 @@ impl Api {
             }
             bytes.extend_from_slice(&chunk);
         }
-        let body: Value = serde_json::from_slice(&bytes).map_err(|_| Failure::protocol())?;
+        let mut body: Value = serde_json::from_slice(&bytes).map_err(|_| Failure::protocol())?;
+        if self.cached_session
+            && let Some(token) = &token
+        {
+            auth::scrub_value(&mut body, token);
+        }
         if status.is_success() {
             if !body.get("data").is_some_and(Value::is_object)
                 || !body.get("meta").is_some_and(Value::is_object)
@@ -560,10 +591,7 @@ async fn cluster_command(
             ));
         }
     }
-    let api = Api::new(
-        context.api.clone(),
-        Some(auth::credential(&auth::CONTROL_STORE, &context.api)?),
-    )?;
+    let api = Api::authenticated(context.api.clone())?;
     let base = format!("/v1/clusters/{}", context.cluster);
     match command {
         ClusterCommand::Plan {
@@ -680,7 +708,7 @@ pub(crate) async fn dispatch(cli: &Cli) -> Option<Output> {
             ..
         } => {
             let result = match reject_scope(cli).and_then(|()| canonical_origin(api)) {
-                Ok(origin) => auth::login(&auth::CONTROL_STORE, origin).await,
+                Ok(origin) => auth::login(origin).await,
                 Err(err) => Err(err),
             };
             Some(Output::from_result(result, *json, 0))
@@ -691,7 +719,7 @@ pub(crate) async fn dispatch(cli: &Cli) -> Option<Output> {
             ..
         } => {
             let result = match reject_scope(cli).and_then(|()| canonical_origin(api)) {
-                Ok(origin) => auth::logout(&auth::CONTROL_STORE, origin).await,
+                Ok(origin) => auth::logout(origin).await,
                 Err(err) => Err(err),
             };
             Some(Output::from_result(result, *json, 0))
@@ -707,10 +735,7 @@ pub(crate) async fn dispatch(cli: &Cli) -> Option<Output> {
                 identifier(cluster_id)?;
                 read_context(config)?;
                 let origin = canonical_origin(api)?;
-                let client = Api::new(
-                    origin.clone(),
-                    Some(auth::credential(&auth::CONTROL_STORE, &origin)?),
-                )?;
+                let client = Api::authenticated(origin.clone())?;
                 let body = client
                     .request(
                         Method::GET,

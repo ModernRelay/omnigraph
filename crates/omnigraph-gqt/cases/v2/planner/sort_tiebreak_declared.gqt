@@ -1,0 +1,91 @@
+# issue: none
+# notes: A Sort declares the id tie-breaks it appends, and a scan reads its id only when something keys rows by it: a declared tie-break, a traversal, a count.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    name: String
+    age: I64
+}
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"slug":"p1","name":"alice","age":30}}
+{"type":"Person","data":{"slug":"p2","name":"bob","age":40}}
+{"type":"Person","data":{"slug":"p3","name":"alice","age":25}}
+{"edge":"Knows","from":"p1","to":"p2"}
+
+--- query
+set engine = v2;
+query names_only() {
+    match { $p: Person }
+    return { $p.name }
+    order { $p.name }
+    limit 10
+}
+--- expect ordered
+{"p.name":"alice"}
+{"p.name":"alice"}
+{"p.name":"bob"}
+--- expect shape
+p.name: String
+--- expect plan
+scan Person as $p: columns [slug, name]
+sort no tiebreak
+
+--- query
+set engine = v2;
+query names_and_ages() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+    order { $p.name }
+}
+--- expect unordered
+{"p.name":"alice","p.age":30}
+{"p.name":"alice","p.age":25}
+{"p.name":"bob","p.age":40}
+--- expect shape
+p.name: String
+p.age: I64
+--- expect plan
+scan Person as $p: columns [__id, slug, name, age]
+sort tiebreak [$p]
+
+--- query
+set engine = v2;
+query traversed() {
+    match { $p: Person $p knows $q }
+    return { $q.name }
+    order { $q.name }
+}
+--- expect ordered
+{"q.name":"bob"}
+--- expect shape
+q.name: String
+--- expect plan
+scan Person as $p: columns [__id, slug]
+scan Person as $q: columns [__id, slug, name]
+sort no tiebreak
+
+--- query
+set engine = v2;
+query counted() {
+    match { $p: Person }
+    return { $p.name, count($p) as n }
+    order { n desc }
+}
+--- expect unordered
+{"p.name":"alice","n":2}
+{"p.name":"bob","n":1}
+--- expect shape
+p.name: String
+n: I64
+--- expect plan
+scan Person as $p: columns [__id, slug, name]
+sort no tiebreak

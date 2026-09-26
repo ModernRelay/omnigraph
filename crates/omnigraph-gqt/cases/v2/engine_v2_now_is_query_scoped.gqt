@@ -1,0 +1,42 @@
+# issue: none
+# notes: Repeated now() expressions share one instant within a row.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Item {
+    name: String @key
+}
+
+--- seed
+{"type":"Item","data":{"name":"a"}}
+{"type":"Item","data":{"name":"b"}}
+{"type":"Item","data":{"name":"c"}}
+
+--- mutate
+set engine = v2;
+
+--- expect ok
+
+--- query
+query repeated_now_over_rows() {
+    match {
+        $i: Item
+        now() = now()
+    }
+    return { count(now()) as first, count(now()) as second }
+}
+
+--- expect unordered
+{"first":3,"second":3}
+
+--- expect shape
+first: I64
+second: I64
