@@ -300,42 +300,26 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn actor_admission_race_does_not_exceed_cap() {
-        // Pin master plan §"WorkloadController" Finding 6: independent
-        // atomic load + check + add allows two concurrent callers to
-        // both pass a cap-N check. The Semaphore-based gate is
-        // race-free — exactly cap_count callers succeed.
-        //
-        // Each task holds its admission guard until released via a
-        // oneshot channel; this forces real contention because guards
-        // can't drop and free permits before all 32 calls have raced.
         let controller = Arc::new(WorkloadController::new(16, u64::MAX / 4));
         let actor: Arc<str> = "racer".into();
 
-        let (release_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+        let all_attempted = Arc::new(tokio::sync::Barrier::new(33));
 
         let mut handles = Vec::with_capacity(32);
         for _ in 0..32 {
             let controller = Arc::clone(&controller);
             let actor = actor.clone();
-            let mut release_rx = release_tx.subscribe();
+            let all_attempted = Arc::clone(&all_attempted);
             handles.push(tokio::spawn(async move {
                 let result = controller.try_admit(&actor, 1);
                 let success = result.is_ok();
-                // Hold the guard (if any) until the test signals release,
-                // so the cap-16 contention is observable across all 32
-                // tasks instead of permits being recycled task-by-task.
                 let _guard = result.ok();
-                let _ = release_rx.recv().await;
+                all_attempted.wait().await;
                 success
             }));
         }
 
-        // Give all 32 tasks a chance to hit `try_admit` before any can
-        // drop their guard. 50ms is plenty for tokio's scheduler on a
-        // 4-worker runtime.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        // Release every task; collect succeed/reject counts.
-        let _ = release_tx.send(());
+        all_attempted.wait().await;
 
         let mut accepted = 0u32;
         let mut rejected = 0u32;

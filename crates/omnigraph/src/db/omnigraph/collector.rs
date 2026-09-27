@@ -2036,6 +2036,8 @@ mod borrowed_origin_tests {
     /// its graph fork point. Reclaim main's history while keeping its files.
     #[tokio::test]
     async fn cleanup_keeps_legacy_native_origins_and_reclaims_unrelated_payloads() {
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let schema = "node Person {\n    name: String @key\n    age: I32 @index\n}\nnode Company {\n    name: String @key\n}";
@@ -2236,6 +2238,8 @@ mod borrowed_origin_tests {
     }
     #[tokio::test]
     async fn cleanup_keeps_files_borrowed_by_unregistered_tagged_native_fork() {
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let db = Session::from_defaults(
@@ -2344,6 +2348,8 @@ mod overlay_retention_tests {
     }
 
     async fn overlay_snapshot(foreign: bool) {
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let db = Session::from_defaults(
@@ -2619,6 +2625,8 @@ mod native_table_tag_tests {
     }
 
     async fn tagged_old_version_survives(native: bool) {
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let db = Session::from_defaults(
             Arc::new(

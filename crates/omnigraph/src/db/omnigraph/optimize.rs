@@ -1713,6 +1713,7 @@ mod tests {
     #[tokio::test]
     async fn incomplete_origin_trace_preserves_other_tables_native_trees() {
         use object_store::ObjectStoreExt;
+        let _scenario = crate::seams::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let db = crate::Session::from_defaults(
