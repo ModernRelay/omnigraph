@@ -1030,3 +1030,583 @@ async fn wide_literal_projection_refuses_at_its_output_reservation() {
     );
     assert_released(&probes);
 }
+
+const CITATION_SCHEMA: &str = r#"
+node Matter {
+    mid: String @key
+    number: String
+}
+node Passage {
+    pid: String @key
+    text: String
+}
+"#;
+
+const CITED: &str = r#"query cited() {
+    match {
+        $m: Matter
+        $p: Passage
+        $p.text contains $m.number
+    }
+    return { $m.mid, $p.pid }
+}"#;
+
+/// The same pairs through a conjunct the join derives no needles from.
+const CITED_WITHOUT_NEEDLES: &str = r#"query cited() {
+    match {
+        $m: Matter
+        $p: Passage
+        $p.text contains $m.number or $p.text = $m.number
+    }
+    return { $m.mid, $p.pid }
+}"#;
+
+/// Three matters and `passages` passages of `text_bytes` each, of which
+/// passage 7 cites the first matter and passage 11 the third.
+async fn citation_fixture(dir: &tempfile::TempDir, passages: usize, text_bytes: usize) -> Session {
+    let matters = [
+        ("mN-0001", "N-0001"),
+        ("mN-0002", "N-0002"),
+        ("mN-0003", "N-0003"),
+    ];
+    citation_graph(dir, &matters, passages, text_bytes).await
+}
+
+/// One matter per `(mid, number)`, and the fixture's passages.
+async fn citation_graph(
+    dir: &tempfile::TempDir,
+    matters: &[(&str, &str)],
+    passages: usize,
+    text_bytes: usize,
+) -> Session {
+    let db = session(
+        Omnigraph::init(dir.path().to_str().unwrap(), CITATION_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let mut lines: Vec<String> = matters
+        .iter()
+        .map(|(mid, number)| {
+            serde_json::json!({"type":"Matter", "data":{"mid":mid, "number":number}}).to_string()
+        })
+        .collect();
+    for passage in 0..passages {
+        let cited = match passage {
+            7 => " N-0001",
+            11 => " N-0003",
+            _ => "",
+        };
+        let text = format!("{passage:06}{cited} {}", "x".repeat(text_bytes));
+        lines.push(
+            serde_json::json!({"type":"Passage", "data":{"pid":format!("p{passage:06}"), "text":text}})
+                .to_string(),
+        );
+    }
+    db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    with_setting(&db, "engine", "v2")
+}
+
+/// The `(matter, passage)` pairs of a `cited` answer, sorted.
+fn cited_pairs(batch: &arrow_array::RecordBatch) -> Vec<(String, String)> {
+    let column = |name: &str| {
+        batch
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone()
+    };
+    let (matters, passages) = (column("m.mid"), column("p.pid"));
+    let mut pairs: Vec<(String, String)> = (0..batch.num_rows())
+        .map(|row| {
+            (
+                matters.value(row).to_string(),
+                passages.value(row).to_string(),
+            )
+        })
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+/// The value of `name` on every `operator` that counts it.
+fn counter(probes: &QueryMemoryProbes, operator: &str, name: &str) -> Vec<usize> {
+    probes
+        .execution_metrics()
+        .iter()
+        .filter(|metric| metric.operator == operator)
+        .filter_map(|metric| metric.values.get(name).copied())
+        .collect()
+}
+
+fn scan_counter(probes: &QueryMemoryProbes, name: &str) -> Vec<usize> {
+    counter(probes, "ScanExec", name)
+}
+
+fn join_counter(probes: &QueryMemoryProbes, name: &str) -> Vec<usize> {
+    counter(probes, "ContainsJoinExec", name)
+}
+
+/// 64 MiB of passage text under a 48 MiB pool: the unfiltered Passage scan
+/// refuses, the filtered one holds a batch at a time and the two citing rows.
+/// Rust, not `.gqt`: rows cannot show the pool's cap or the refusing owner.
+#[tokio::test]
+#[serial]
+async fn a_text_contains_join_answers_where_the_unfiltered_scan_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let v2 = citation_fixture(&dir, 16_384, 4_096).await;
+    let limit = 48 * MIB;
+
+    let probes = QueryMemoryProbes::default();
+    let error = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(
+            limit,
+            query_main(&v2, CITED_WITHOUT_NEEDLES, "cited", &params(&[])),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_memory_refusal(error, limit);
+    assert!(
+        probes
+            .refusals()
+            .iter()
+            .any(|owner| owner == "v2 scan attempt"),
+        "the unfiltered Passage scan must refuse its own collection: {:?}",
+        probes.refusals()
+    );
+    assert_released(&probes);
+
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(limit, query_main(&v2, CITED, "cited", &params(&[]))),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
+    assert_eq!(
+        cited_pairs(&result.concat_batches().unwrap()),
+        [
+            ("mN-0001".to_string(), "p000007".to_string()),
+            ("mN-0003".to_string(), "p000011".to_string()),
+        ]
+    );
+    assert!(probes.refusals().is_empty(), "{:?}", probes.refusals());
+    assert_eq!(scan_counter(&probes, "runtime_filter_rows_read"), [16_384]);
+    assert_eq!(
+        scan_counter(&probes, "runtime_filter_rows_dropped"),
+        [16_382]
+    );
+    assert_eq!(scan_counter(&probes, "runtime_filter_inert"), [0]);
+    assert_released(&probes);
+}
+
+/// 64 MiB of passages, each holding the needle `x`, under a 32 MiB pool: the
+/// marked scan streams each sieved Lance batch instead of holding the table,
+/// so the query answers where the breaker refuses. GQT cannot set the pool.
+#[tokio::test]
+#[serial]
+async fn a_marked_scan_streams_a_passage_table_the_pool_cannot_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let v2 = citation_graph(&dir, &[("mN-0001", "N-0001"), ("m-x", "x")], 16_384, 4_096).await;
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(32 * MIB, query_main(&v2, CITED, "cited", &params(&[]))),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
+    let pairs = cited_pairs(&result.concat_batches().unwrap());
+    assert_eq!(
+        pairs.len(),
+        16_384 + 1,
+        "the `x` matter pairs with every passage and N-0001 with p000007"
+    );
+    assert!(pairs.contains(&("mN-0001".to_string(), "p000007".to_string())));
+    assert!(probes.refusals().is_empty(), "{:?}", probes.refusals());
+    assert_eq!(scan_counter(&probes, "runtime_filter_rows_read"), [16_384]);
+    assert_eq!(scan_counter(&probes, "runtime_filter_rows_dropped"), [0]);
+    assert_eq!(scan_counter(&probes, "runtime_filter_inert"), [0]);
+    assert_released(&probes);
+}
+
+/// The same 64 MiB under one empty number: the scan reads unfiltered yet still
+/// streams batches bounded like a sieved read's, so it answers under 32 MiB.
+/// GQT cannot set the pool that tells a bounded batch from a default one.
+#[tokio::test]
+#[serial]
+async fn an_empty_number_streams_a_passage_table_the_pool_cannot_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let v2 = citation_graph(&dir, &[("m", "")], 16_384, 4_096).await;
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(32 * MIB, query_main(&v2, CITED, "cited", &params(&[]))),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
+    assert_eq!(result.concat_batches().unwrap().num_rows(), 16_384);
+    assert!(probes.refusals().is_empty(), "{:?}", probes.refusals());
+    assert_eq!(scan_counter(&probes, "runtime_filter_inert"), [1]);
+    assert_released(&probes);
+}
+
+/// The matcher over three needles is charged its own size, so a 16 MiB pool
+/// builds it and the scan keeps only the two citing passages. GQT cannot set
+/// the pool or read the scan's counters.
+#[tokio::test]
+#[serial]
+async fn a_needle_matcher_filters_the_scan_under_a_16_mib_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let v2 = citation_fixture(&dir, 16, 16).await;
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(16 * MIB, query_main(&v2, CITED, "cited", &params(&[]))),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
+    assert_eq!(
+        cited_pairs(&result.concat_batches().unwrap()),
+        [
+            ("mN-0001".to_string(), "p000007".to_string()),
+            ("mN-0003".to_string(), "p000011".to_string()),
+        ]
+    );
+    assert!(probes.refusals().is_empty(), "{:?}", probes.refusals());
+    assert_eq!(scan_counter(&probes, "runtime_filter_rows_read"), [16]);
+    assert_eq!(scan_counter(&probes, "runtime_filter_rows_dropped"), [14]);
+    assert_eq!(scan_counter(&probes, "runtime_filter_inert"), [0]);
+    assert_released(&probes);
+}
+
+/// An empty number is in every passage, so no row can be dropped: the scan
+/// builds no matcher and reads every row as it does unfiltered, and the join
+/// pairs the empty number's row with each whole passage batch.
+#[tokio::test]
+#[serial]
+async fn an_empty_number_answers_with_the_scan_unfiltered() {
+    let dir = tempfile::tempdir().unwrap();
+    let v2 = citation_graph(&dir, &[("m", "")], 2_048, 4_096).await;
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(32 * MIB, query_main(&v2, CITED, "cited", &params(&[]))),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
+    assert_eq!(
+        result.concat_batches().unwrap().num_rows(),
+        2_048,
+        "the empty number pairs with every passage"
+    );
+    assert!(probes.refusals().is_empty(), "{:?}", probes.refusals());
+    assert_eq!(scan_counter(&probes, "runtime_filter_inert"), [1]);
+    assert_eq!(
+        scan_counter(&probes, "runtime_filter_rows_read"),
+        [2_048],
+        "an inert scan still reads every row, so it counts them"
+    );
+    assert_eq!(join_counter(&probes, "contains_join_matcher"), [1]);
+    assert_eq!(join_counter(&probes, "contains_join_pairs"), [0]);
+    assert_released(&probes);
+}
+
+/// Four empty numbers pair with 32 MiB of passages under 96 MiB: each output
+/// shares the passage batch, and the matcher finds the one citing passage.
+/// GQT cannot set the pool or read the join's counters.
+#[tokio::test]
+#[serial]
+async fn empty_numbers_pair_with_the_shared_passage_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut matters: Vec<(&str, &str)> = ["m-empty-1", "m-empty-2", "m-empty-3", "m-empty-4"]
+        .into_iter()
+        .map(|mid| (mid, ""))
+        .collect();
+    matters.push(("mN-0001", "N-0001"));
+    let v2 = citation_graph(&dir, &matters, 8_192, 4_096).await;
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(96 * MIB, query_main(&v2, CITED, "cited", &params(&[]))),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
+    let pairs = cited_pairs(&result.concat_batches().unwrap());
+    assert_eq!(pairs.len(), 4 * 8_192 + 1);
+    assert!(pairs.contains(&("mN-0001".to_string(), "p000007".to_string())));
+    assert!(probes.refusals().is_empty(), "{:?}", probes.refusals());
+    assert_eq!(join_counter(&probes, "contains_join_matcher"), [1]);
+    assert_eq!(join_counter(&probes, "contains_join_pairs"), [1]);
+    assert_released(&probes);
+}
+
+/// The scan's sieve and the join's needle rows share the fill's one automaton,
+/// so a 14.5 MiB pool that fits one build of the 102 numbers' automaton pairs
+/// through it while the scan, every batch kept and its channel full, holds it.
+#[tokio::test]
+#[serial]
+async fn the_scan_and_the_join_share_one_matcher() {
+    let dir = tempfile::tempdir().unwrap();
+    let long: Vec<(String, String)> = (0..100)
+        .map(|n| {
+            (
+                format!("m-long-{n:03}"),
+                format!("{n:03}{}", "z".repeat(1_021)),
+            )
+        })
+        .collect();
+    let mut matters = vec![("mN-0001", "N-0001"), ("m-x", "x")];
+    matters.extend(
+        long.iter()
+            .map(|(mid, number)| (mid.as_str(), number.as_str())),
+    );
+    let v2 = citation_graph(&dir, &matters, 2_048, 16).await;
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(29 * MIB / 2, query_main(&v2, CITED, "cited", &params(&[]))),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
+    let pairs = cited_pairs(&result.concat_batches().unwrap());
+    assert_eq!(
+        pairs.len(),
+        2_048 + 1,
+        "the `x` matter pairs with every passage and N-0001 with p000007"
+    );
+    assert!(pairs.contains(&("mN-0001".to_string(), "p000007".to_string())));
+    assert!(probes.refusals().is_empty(), "{:?}", probes.refusals());
+    assert_eq!(join_counter(&probes, "runtime_filter_needles"), [102]);
+    assert_eq!(scan_counter(&probes, "runtime_filter_rows_read"), [2_048]);
+    assert_eq!(scan_counter(&probes, "runtime_filter_rows_dropped"), [0]);
+    assert!(
+        join_counter(&probes, "input_batches")[0] > 2,
+        "the scan streams more batches than its channel holds: {:?}",
+        join_counter(&probes, "input_batches")
+    );
+    assert_eq!(join_counter(&probes, "contains_join_matcher"), [1]);
+    assert_released(&probes);
+}
+
+/// The empty number leaves the scan unfiltered, and the long numbers' matcher
+/// needs more than the 16 MiB pool: the join tests every pair and returns the
+/// same rows. GQT cannot set the pool or read the join's counters.
+#[tokio::test]
+#[serial]
+async fn needle_rows_the_pool_refuses_leave_the_join_testing_every_pair() {
+    let dir = tempfile::tempdir().unwrap();
+    let long: Vec<(String, String)> = (0..64)
+        .map(|n| {
+            (
+                format!("m-long-{n:02}"),
+                format!("{n:02}{}", "y".repeat(4_094)),
+            )
+        })
+        .collect();
+    let mut matters = vec![("m-empty", ""), ("mN-0001", "N-0001")];
+    matters.extend(
+        long.iter()
+            .map(|(mid, number)| (mid.as_str(), number.as_str())),
+    );
+    let v2 = citation_graph(&dir, &matters, 16, 16).await;
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(16 * MIB, query_main(&v2, CITED, "cited", &params(&[]))),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
+    let mut expected: Vec<(String, String)> = (0..16)
+        .map(|passage| ("m-empty".to_string(), format!("p{passage:06}")))
+        .collect();
+    expected.push(("mN-0001".to_string(), "p000007".to_string()));
+    expected.sort();
+    assert_eq!(cited_pairs(&result.concat_batches().unwrap()), expected);
+    assert!(probes.refusals().is_empty(), "{:?}", probes.refusals());
+    assert_eq!(scan_counter(&probes, "runtime_filter_inert"), [1]);
+    assert_eq!(join_counter(&probes, "contains_join_matcher"), [0]);
+    assert!(join_counter(&probes, "contains_join_pairs").is_empty());
+    assert_released(&probes);
+}
+
+const NULLABLE_CITATION_SCHEMA: &str = r#"
+node Matter {
+    mid: String @key
+    number: String?
+}
+node Passage {
+    pid: String @key
+    text: String?
+}
+"#;
+
+/// `conjunct` and `extra` over one Matter and one Passage.
+fn cited_by(conjunct: &str, extra: &str) -> String {
+    format!(
+        "query cited() {{\n    match {{\n        $m: Matter\n        $p: Passage\n        {conjunct}\n        {extra}\n    }}\n    return {{ $m.mid, $p.pid }}\n}}"
+    )
+}
+
+/// Rows of `(key, text)`: matter ids with numbers, or passage ids with texts.
+type KeyedTexts = Vec<(String, Option<String>)>;
+
+/// 1,200 passages over more than one Lance batch and numbers that nest
+/// (`16`, `016`, `1016`, `x1016`), repeat, equal a whole text, hold `é` or
+/// `日本`, are empty or null; texts are sometimes empty or null.
+fn generated_citations() -> (KeyedTexts, KeyedTexts) {
+    let mut matters: KeyedTexts = (50..80)
+        .map(|n| (format!("m-{n}"), Some(n.to_string())))
+        .collect();
+    for (mid, number) in [
+        ("m-16", "16"),
+        ("m-016", "016"),
+        ("m-1016", "1016"),
+        ("m-1016-again", "1016"),
+        ("m-x1016", "x1016"),
+        ("m-55-again", "55"),
+        ("m-whole", "whole text of one passage"),
+        ("m-e-acute", "é"),
+        ("m-nihon", "日本"),
+        ("m-empty", ""),
+    ] {
+        matters.push((mid.to_string(), Some(number.to_string())));
+    }
+    matters.push(("m-null".to_string(), None));
+    let passages = (0..1_200)
+        .map(|i: usize| {
+            let text = match i {
+                600 => Some("whole text of one passage".to_string()),
+                _ if i % 211 == 5 => None,
+                _ if i % 223 == 7 => Some(String::new()),
+                _ => {
+                    let reference = if i.is_multiple_of(4) {
+                        " ref 1016-00009"
+                    } else {
+                        ""
+                    };
+                    let accent = if i.is_multiple_of(5) { " café" } else { "" };
+                    let cjk = if i.is_multiple_of(17) {
+                        " 日本語"
+                    } else {
+                        ""
+                    };
+                    let suffix = if i % 50 == 3 { " x1016" } else { "" };
+                    Some(format!(
+                        "cites {}{reference}{accent}{cjk}{suffix}",
+                        10 + (i * 7) % 90
+                    ))
+                }
+            };
+            (format!("p{i:04}"), text)
+        })
+        .collect();
+    (matters, passages)
+}
+
+/// The contains join equals its `or` form (the filtered cross join) and
+/// `str::contains` over every pair, with and without the empty number. Rust,
+/// not `.gqt`: generated inputs at Lance-batch scale.
+#[tokio::test]
+#[serial]
+async fn a_contains_join_and_its_cross_join_agree_on_generated_texts_over_several_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = session(
+        Omnigraph::init(dir.path().to_str().unwrap(), NULLABLE_CITATION_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let (matters, passages) = generated_citations();
+    let mut lines: Vec<String> = matters
+        .iter()
+        .map(|(mid, number)| {
+            match number {
+                Some(number) => {
+                    serde_json::json!({"type":"Matter", "data":{"mid":mid, "number":number}})
+                }
+                None => serde_json::json!({"type":"Matter", "data":{"mid":mid}}),
+            }
+            .to_string()
+        })
+        .collect();
+    lines.extend(passages.iter().map(|(pid, text)| {
+        match text {
+            Some(text) => serde_json::json!({"type":"Passage", "data":{"pid":pid, "text":text}}),
+            None => serde_json::json!({"type":"Passage", "data":{"pid":pid}}),
+        }
+        .to_string()
+    }));
+    db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let v2 = with_setting(&db, "engine", "v2");
+    for (extra, keeps_empty) in [("", true), (r#"$m.mid != "m-empty""#, false)] {
+        let mut expected: Vec<(String, String)> = matters
+            .iter()
+            .filter(|(mid, _)| keeps_empty || mid != "m-empty")
+            .flat_map(|(mid, number)| {
+                passages
+                    .iter()
+                    .filter_map(move |(pid, text)| match (number, text) {
+                        (Some(number), Some(text)) if text.contains(number.as_str()) => {
+                            Some((mid.clone(), pid.clone()))
+                        }
+                        _ => None,
+                    })
+            })
+            .collect();
+        expected.sort();
+        let probes = QueryMemoryProbes::default();
+        let joined = with_query_memory_probes(
+            probes.clone(),
+            query_main(
+                &v2,
+                &cited_by("$p.text contains $m.number", extra),
+                "cited",
+                &params(&[]),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            join_counter(&probes, "contains_join_matcher"),
+            [1],
+            "{extra}"
+        );
+        assert!(join_counter(&probes, "input_batches")[0] > 1, "{extra}");
+        assert_eq!(
+            scan_counter(&probes, "runtime_filter_inert"),
+            [usize::from(keeps_empty)],
+            "{extra}"
+        );
+        if !keeps_empty {
+            assert!(scan_counter(&probes, "runtime_filter_rows_dropped")[0] > 0);
+        }
+        let probes = QueryMemoryProbes::default();
+        let crossed = with_query_memory_probes(
+            probes.clone(),
+            query_main(
+                &v2,
+                &cited_by("($p.text contains $m.number) or false", extra),
+                "cited",
+                &params(&[]),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(join_counter(&probes, "input_batches").is_empty(), "{extra}");
+        let joined = cited_pairs(&joined.concat_batches().unwrap());
+        let crossed = cited_pairs(&crossed.concat_batches().unwrap());
+        assert_eq!(
+            (joined.len(), crossed.len()),
+            (expected.len(), expected.len()),
+            "{extra}"
+        );
+        assert_eq!(joined, crossed, "{extra}");
+        assert_eq!(joined, expected, "{extra}");
+    }
+}

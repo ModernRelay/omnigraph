@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::bound::{BoundPlan, ValueTable};
 use crate::cost::{AccessPath, ExpandMode, ExpandPolicy};
 use crate::error::PlanError;
-use crate::logical::{ColumnRef, GqFilter, KeyJoinKind, Predicate, ScanSpec};
+use crate::logical::{ColumnRef, GqFilter, KeyJoinKind, Predicate, RuntimeFilterSpec, ScanSpec};
 use crate::operation::TableRef;
 use crate::physical::{
     Assumptions, Estimate, Hop, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter,
@@ -182,6 +182,20 @@ pub enum NodeMirror {
         left: NodeId,
         right: NodeId,
     },
+    /// A `CrossJoin` with conjuncts, under its own tag so a reader that knows
+    /// only the plain `CrossJoin` refuses it instead of dropping the filters.
+    FilteredCrossJoin {
+        left: NodeId,
+        right: NodeId,
+        filters: Vec<ExprMirror>,
+    },
+    ContainsJoin {
+        left: NodeId,
+        right: NodeId,
+        haystack: (String, String),
+        needle: (String, String),
+        residual: Vec<ExprMirror>,
+    },
     Filter {
         input: NodeId,
         filters: Vec<ExprMirror>,
@@ -309,9 +323,35 @@ impl From<&PhysicalNode> for NodeMirror {
                 bytes: *bytes,
                 resume: resume.clone(),
             },
-            PhysicalNode::CrossJoin { left, right } => Self::CrossJoin {
+            PhysicalNode::CrossJoin {
+                left,
+                right,
+                filters,
+            } if filters.is_empty() => Self::CrossJoin {
                 left: *left,
                 right: *right,
+            },
+            PhysicalNode::CrossJoin {
+                left,
+                right,
+                filters,
+            } => Self::FilteredCrossJoin {
+                left: *left,
+                right: *right,
+                filters: filters.iter().map(ExprMirror::from).collect(),
+            },
+            PhysicalNode::ContainsJoin {
+                left,
+                right,
+                haystack,
+                needle,
+                residual,
+            } => Self::ContainsJoin {
+                left: *left,
+                right: *right,
+                haystack: haystack.clone(),
+                needle: needle.clone(),
+                residual: residual.iter().map(ExprMirror::from).collect(),
             },
             PhysicalNode::Filter { input, filters } => Self::Filter {
                 input: *input,
@@ -463,7 +503,33 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 bytes,
                 resume,
             },
-            NodeMirror::CrossJoin { left, right } => Self::CrossJoin { left, right },
+            NodeMirror::CrossJoin { left, right } => Self::CrossJoin {
+                left,
+                right,
+                filters: Vec::new(),
+            },
+            NodeMirror::FilteredCrossJoin {
+                left,
+                right,
+                filters,
+            } => Self::CrossJoin {
+                left,
+                right,
+                filters: filters.into_iter().map(IRExpr::from).collect(),
+            },
+            NodeMirror::ContainsJoin {
+                left,
+                right,
+                haystack,
+                needle,
+                residual,
+            } => Self::ContainsJoin {
+                left,
+                right,
+                haystack,
+                needle,
+                residual: residual.into_iter().map(IRExpr::from).collect(),
+            },
             NodeMirror::Filter { input, filters } => Self::Filter {
                 input,
                 filters: filters.into_iter().map(IRExpr::from).collect(),
@@ -673,6 +739,8 @@ pub struct ScanSpecMirror {
     pub projection: Option<Vec<String>>,
     pub filter: Option<PredicateMirror>,
     pub binding: Option<String>,
+    #[serde(default)]
+    pub runtime_filter: Option<RuntimeFilterSpec>,
 }
 
 impl From<&ScanSpec> for ScanSpecMirror {
@@ -686,6 +754,7 @@ impl From<&ScanSpec> for ScanSpecMirror {
             projection: spec.projection.clone(),
             filter: spec.filter.as_ref().map(PredicateMirror::from),
             binding: spec.binding.clone(),
+            runtime_filter: spec.runtime_filter.clone(),
         }
     }
 }
@@ -703,6 +772,7 @@ impl TryFrom<ScanSpecMirror> for ScanSpec {
             projection: mirror.projection,
             filter: mirror.filter.map(Predicate::from),
             binding: mirror.binding,
+            runtime_filter: mirror.runtime_filter,
         })
     }
 }

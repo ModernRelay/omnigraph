@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use arrow_schema::SchemaRef;
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, SubqueryPredicate};
+use omnigraph_compiler::query::ast::{BinaryOp, CompOp};
 use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -343,7 +344,8 @@ impl Properties {
 /// The operator catalog. The change-feed and merge nodes (`Scan`,
 /// `SortMergeJoin`, `HydrateByAddress`, `RowCompare`, `ClassifyThreeWay`,
 /// `Page`) each have one push operator in the engine's `engine/push/`; the
-/// read nodes each have one arm in the engine's lowering
+/// read nodes (`CrossJoin` and `ContainsJoin` among them) each have one arm
+/// in the engine's lowering
 /// (`crates/omnigraph/src/engine/lower.rs`), whose exhaustive match is the
 /// proof. A read node carries the IR pieces its arm takes, so the lowering
 /// never re-derives from `QueryIR`.
@@ -407,10 +409,23 @@ pub enum PhysicalNode {
         bytes: u64,
         resume: Option<String>,
     },
-    /// Two `match` bindings with no edge between them: every pair.
+    /// Two `match` bindings with no edge between them: every pair, or only
+    /// the pairs every one of `filters` holds true for, the in-memory
+    /// conjuncts of the `Filter` that sat directly on the join.
     CrossJoin {
         left: NodeId,
         right: NodeId,
+        filters: Vec<IRExpr>,
+    },
+    /// Two `match` bindings joined on `haystack contains needle`, both text:
+    /// `left` is collected, its `needle` values filter `right` (the table
+    /// `Scan` of the `haystack` binding), and `residual` runs on the pairs.
+    ContainsJoin {
+        left: NodeId,
+        right: NodeId,
+        haystack: (String, String),
+        needle: (String, String),
+        residual: Vec<IRExpr>,
     },
     /// The in-memory arm of a GQ filter: the conjuncts the placement pass
     /// left where the query wrote them, each evaluated on its own.
@@ -486,6 +501,7 @@ impl PhysicalNode {
             Self::ClassifyThreeWay { .. } => "ClassifyThreeWay",
             Self::Page { .. } | Self::Limit { .. } => "Page",
             Self::CrossJoin { .. } => "CrossJoin",
+            Self::ContainsJoin { .. } => "ContainsJoin",
             Self::Filter { .. } => "Filter",
             Self::Expand { .. } => "Expand",
             Self::AntiJoin { .. } => "AntiJoin",
@@ -509,7 +525,9 @@ impl PhysicalNode {
             | Self::Projection { input, .. }
             | Self::Aggregate { input, .. }
             | Self::Sort { input, .. } => vec![*input],
-            Self::SortMergeJoin { left, right, .. } | Self::CrossJoin { left, right } => {
+            Self::SortMergeJoin { left, right, .. }
+            | Self::CrossJoin { left, right, .. }
+            | Self::ContainsJoin { left, right, .. } => {
                 vec![*left, *right]
             }
             Self::HashJoin { probe, build, .. } => vec![*probe, *build],
@@ -532,7 +550,9 @@ impl PhysicalNode {
             | Self::Projection { input, .. }
             | Self::Aggregate { input, .. }
             | Self::Sort { input, .. } => vec![input],
-            Self::SortMergeJoin { left, right, .. } | Self::CrossJoin { left, right } => {
+            Self::SortMergeJoin { left, right, .. }
+            | Self::CrossJoin { left, right, .. }
+            | Self::ContainsJoin { left, right, .. } => {
                 vec![left, right]
             }
             Self::HashJoin { probe, build, .. } => vec![probe, build],
@@ -555,6 +575,51 @@ impl PhysicalNode {
             Self::Scan { ranked, .. } => ranked.as_ref(),
             _ => None,
         }
+    }
+}
+
+/// A `(binding, property)` as GQ spells it: `$p.text`.
+pub(crate) fn column_text((binding, property): &(String, String)) -> String {
+    format!("${binding}.{property}")
+}
+
+/// A `$a.x contains $b.y` conjunct over two bindings: the `(binding,
+/// property)` whose text is searched and the one whose text is searched for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TextContains<'a> {
+    pub haystack: (&'a str, &'a str),
+    pub needle: (&'a str, &'a str),
+}
+
+impl<'a> TextContains<'a> {
+    /// `conjunct` when it is a string `contains` between properties of two
+    /// distinct bindings, `None` for any other shape.
+    pub(crate) fn of(conjunct: &'a IRExpr) -> Option<Self> {
+        let IRExpr::Binary {
+            left,
+            op: BinaryOp::Compare(CompOp::StringContains),
+            right,
+        } = conjunct
+        else {
+            return None;
+        };
+        let (
+            IRExpr::PropAccess {
+                variable: haystack,
+                property: searched,
+            },
+            IRExpr::PropAccess {
+                variable: needle,
+                property: sought,
+            },
+        ) = (left.as_ref(), right.as_ref())
+        else {
+            return None;
+        };
+        (haystack != needle).then_some(Self {
+            haystack: (haystack, searched),
+            needle: (needle, sought),
+        })
     }
 }
 
@@ -861,6 +926,21 @@ impl PhysicalPlan {
                 "fetch": fetch,
                 "tiebreak": crate::logical::tiebreak_text(tiebreak),
             }),
+            PhysicalNode::CrossJoin { filters, .. } if !filters.is_empty() => json!({
+                "node": "CrossJoin",
+                "filters": filters_json(filters),
+            }),
+            PhysicalNode::ContainsJoin {
+                haystack,
+                needle,
+                residual,
+                ..
+            } => json!({
+                "node": "ContainsJoin",
+                "haystack": column_text(haystack),
+                "needle": column_text(needle),
+                "residual": filters_json(residual),
+            }),
             other => json!({ "node": other.name() }),
         };
         value["id"] = json!(id);
@@ -977,8 +1057,13 @@ impl PhysicalPlan {
                 "left": self.side_json(*left, pipelines),
                 "right": self.side_json(*right, pipelines),
             }),
-            PhysicalNode::CrossJoin { left, right } => json!({
+            PhysicalNode::CrossJoin { left, right, .. } => json!({
                 "node": "CrossJoin",
+                "left": self.side_json(*left, pipelines),
+                "right": self.side_json(*right, pipelines),
+            }),
+            PhysicalNode::ContainsJoin { left, right, .. } => json!({
+                "node": "ContainsJoin",
                 "left": self.side_json(*left, pipelines),
                 "right": self.side_json(*right, pipelines),
             }),

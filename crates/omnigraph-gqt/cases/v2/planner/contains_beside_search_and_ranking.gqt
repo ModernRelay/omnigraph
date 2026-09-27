@@ -1,0 +1,151 @@
+# issue: none
+# notes: Search orders preserve contains and residual filters in cross joins over ranked scans.
+# notes: An unranked search filter on the texts, or a ranking of the needles, keeps the contains join.
+# red_on: 2026-09-26, pre-fix ranked contains join: `contains join 2: its right scan 1 carries no runtime filter`.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Matter {
+    number: String @key @index
+}
+node Passage {
+    pid: String @key
+    text: String @index
+    embedding: Vector(2) @index
+}
+
+--- seed
+{"type":"Matter","data":{"number":"case"}}
+{"type":"Passage","data":{"pid":"p","text":"law case","embedding":[1.0,0.0]}}
+{"type":"Passage","data":{"pid":"q","text":"law other","embedding":[0.0,1.0]}}
+{"type":"Passage","data":{"pid":"case","text":"law case","embedding":[0.5,0.5]}}
+
+--- query
+set engine = v2;
+query bm25_order() {
+    match {
+        $m: Matter
+        $p: Passage
+        $p.text contains $m.number
+        $m.number != $p.pid
+    }
+    return { $p.pid }
+    order { bm25($p.text, "law") }
+    limit 10
+}
+
+--- expect unordered
+{"p.pid":"p"}
+
+--- expect shape
+p.pid: String
+
+--- expect plan
+cross join $p.text contains $m.number
+scan Passage as $p: no runtime filter
+scan Passage as $p: ranked bm25
+
+--- query
+set engine = v2;
+query nearest_order() {
+    match {
+        $m: Matter
+        $p: Passage
+        $p.text contains $m.number
+        $m.number != $p.pid
+    }
+    return { $p.pid }
+    order { nearest($p.embedding, [1.0, 0.0]) }
+    limit 10
+}
+
+--- expect unordered
+{"p.pid":"p"}
+
+--- expect shape
+p.pid: String
+
+--- expect plan
+cross join $p.text contains $m.number
+scan Passage as $p: no runtime filter
+scan Passage as $p: ranked nearest fetch 10
+
+--- query
+set engine = v2;
+query rrf_order() {
+    match {
+        $m: Matter
+        $p: Passage
+        $p.text contains $m.number
+        $m.number != $p.pid
+    }
+    return { $p.pid }
+    order { rrf(nearest($p.embedding, [1.0, 0.0]), bm25($p.text, "law")) }
+    limit 10
+}
+
+--- expect unordered
+{"p.pid":"p"}
+
+--- expect shape
+p.pid: String
+
+--- expect plan
+cross join $p.text contains $m.number
+scan Passage as $p: no runtime filter
+scan Passage as $p: ranked nearest fetch 10
+scan Passage as $p: ranked bm25
+
+--- query
+set engine = v2;
+query search_filter_unranked() {
+    match {
+        $m: Matter
+        $p: Passage
+        $p.text contains $m.number
+        search($p.text, "law")
+        $m.number != $p.pid
+    }
+    return { $p.pid }
+}
+
+--- expect unordered
+{"p.pid":"p"}
+
+--- expect shape
+p.pid: String
+
+--- expect plan
+contains join $p.text contains $m.number
+scan Passage as $p: runtime filter text
+pass join_algorithm
+
+--- query
+set engine = v2;
+query bm25_order_on_the_needles() {
+    match {
+        $m: Matter
+        $p: Passage
+        $p.text contains $m.number
+        $m.number != $p.pid
+    }
+    return { $p.pid }
+    order { bm25($m.number, "case") }
+    limit 10
+}
+
+--- expect unordered
+{"p.pid":"p"}
+
+--- expect shape
+p.pid: String
+
+--- expect plan
+contains join $p.text contains $m.number
+scan Passage as $p: runtime filter text
+scan Matter as $m: ranked bm25

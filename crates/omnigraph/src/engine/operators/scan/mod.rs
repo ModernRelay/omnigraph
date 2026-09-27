@@ -1,6 +1,6 @@
-//! Executes a binding's scan under its `SearchMode`, prefixes its columns,
-//! and records its `ScanReport` for the search retry ladders. Lance plans
-//! execute under the query's shared `TaskContext`.
+//! `ScanExec`: a binding's scan under its `SearchMode`, columns prefixed, its
+//! `ScanReport` recorded for the search retry ladders; a breaker, except the
+//! marked plain table read (`pipelined`).
 
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use std::fmt;
@@ -15,15 +15,19 @@ use datafusion::physical_plan::{
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::{IRExpr, ParamMap};
 
-use super::{breaker_properties, breaker_stream, conform, external, polled};
+use super::{breaker_properties, breaker_stream, conform, external, polled, streaming_properties};
 use crate::db::Snapshot;
 use crate::engine::scan::{execute_node_scan, prefix_batch, scan_output_schema};
 use crate::engine::search::{NeededColumns, ScanReport, SearchMode};
 use crate::error::Result;
 
 mod input;
+mod pipelined;
+mod runtime_filter;
 
 pub(super) use input::lookup_candidates;
+pub(in crate::engine) use runtime_filter::RuntimeFilterSlot;
+pub(super) use runtime_filter::{Filled, Needles};
 
 pub(crate) enum ScanSource {
     Table {
@@ -44,11 +48,27 @@ pub(crate) struct ScanExec {
     params: Arc<ParamMap>,
     snapshot: Snapshot,
     catalog: Arc<Catalog>,
+    runtime_filter: Option<Arc<RuntimeFilterSlot>>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
 impl ScanExec {
+    /// This scan under the runtime filter its parent fills, when the plan
+    /// marked one; a marked table read that ranks nothing then streams.
+    pub(crate) fn with_runtime_filter(mut self, filter: Option<Arc<RuntimeFilterSlot>>) -> Self {
+        self.runtime_filter = filter;
+        if let ScanSource::Table { .. } = &self.source {
+            let schema = self.schema();
+            self.properties = if self.pipelines() {
+                streaming_properties(schema)
+            } else {
+                breaker_properties(schema)
+            };
+        }
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         source: ScanSource,
@@ -90,6 +110,7 @@ impl ScanExec {
             params,
             snapshot,
             catalog,
+            runtime_filter: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -120,6 +141,9 @@ impl DisplayAs for ScanExec {
         }
         if matches!(self.source, ScanSource::Dependent { .. }) {
             write!(f, ", id_restriction=input")?;
+        }
+        if let Some(filter) = &self.runtime_filter {
+            write!(f, ", runtime_filter={}", filter.display())?;
         }
         Ok(())
     }
@@ -172,7 +196,8 @@ impl ExecutionPlan for ScanExec {
                 self.snapshot.clone(),
                 Arc::clone(&self.catalog),
             )
-            .map_err(external)?,
+            .map_err(external)?
+            .with_runtime_filter(self.runtime_filter.clone()),
         ))
     }
 
@@ -190,6 +215,9 @@ impl ExecutionPlan for ScanExec {
             }
             ScanSource::Table { mode, report } => (mode.as_ref().clone(), Arc::clone(report)),
         };
+        if let Some(slot) = self.runtime_filter.as_ref().filter(|_| self.pipelines()) {
+            return self.execute_pipelined(mode, slot.take(), ctx);
+        }
         let schema: SchemaRef = self.schema();
         let type_name = self.type_name.clone();
         let binding = self.binding.clone();

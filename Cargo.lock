@@ -5705,6 +5705,7 @@ dependencies = [
 name = "omnigraph-engine"
 version = "0.11.0"
 dependencies = [
+ "aho-corasick",
  "arc-swap",
  "arrow-array",
  "arrow-cast",

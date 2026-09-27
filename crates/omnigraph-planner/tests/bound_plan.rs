@@ -8,7 +8,7 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field, Schema};
 use omnigraph_compiler::SYSTEM_COLUMNS_V3;
 use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::ast::{CompOp, Literal};
 use omnigraph_planner::{
     BoundPlan, Bounds, MemorySource, NodeTypeSpec, PhysicalNode, PhysicalPlan, RankKind, RankScope,
     TableRef, ValueTable, plan_query,
@@ -178,4 +178,178 @@ fn a_fused_plan_reads_back_with_both_arms() {
         ..back.clone()
     };
     assert_ne!(changed, bound, "the value table is part of equality");
+}
+
+fn doc_scan(variable: &str) -> IROp {
+    IROp::NodeScan {
+        variable: variable.to_string(),
+        type_name: "Doc".to_string(),
+        filters: vec![],
+    }
+}
+
+/// `$d` and `$e` over `Doc` under `filter`, returning `$d.slug`.
+fn two_docs(filter: Option<IRExpr>) -> PhysicalPlan {
+    let mut pipeline = vec![doc_scan("d"), doc_scan("e")];
+    pipeline.extend(filter.map(IROp::Filter));
+    let query = QueryIR {
+        name: "q".to_string(),
+        params: vec![],
+        pipeline,
+        return_exprs: vec![IRProjection {
+            expr: prop("d", "slug"),
+            alias: None,
+        }],
+        order_by: vec![],
+        limit: Some(3),
+    };
+    plan_query(&query, &source(), &fixture_bounds::BOUNDS).expect("the query plans")
+}
+
+fn bound(plan: PhysicalPlan) -> BoundPlan {
+    BoundPlan {
+        plan,
+        values: ValueTable {
+            params: Arc::new(Default::default()),
+            vectors: BTreeMap::new(),
+        },
+    }
+}
+
+/// `$e.text contains $d.slug and $d.slug != $e.slug` plans a `ContainsJoin` with its
+/// residual and a marked right scan: node and marker read back, a plan without the
+/// marker is another plan, and a document missing `residual` refuses.
+#[test]
+fn a_contains_join_plan_reads_back_with_its_scan_marker() {
+    let other = IRExpr::comparison(prop("d", "slug"), CompOp::Ne, prop("e", "slug"));
+    let plan = two_docs(Some(
+        IRExpr::and_all([
+            IRExpr::comparison(prop("e", "text"), CompOp::StringContains, prop("d", "slug")),
+            other.clone(),
+        ])
+        .expect("two conjuncts"),
+    ));
+    let (join, right) = plan
+        .live()
+        .find_map(|(id, node)| match node {
+            PhysicalNode::ContainsJoin {
+                right, residual, ..
+            } => {
+                assert_eq!(residual, std::slice::from_ref(&other));
+                Some((id, *right))
+            }
+            _ => None,
+        })
+        .expect("a ContainsJoin");
+    let bound = bound(plan);
+    let text = serde_json::to_string(&bound).expect("the bound plan serializes");
+    assert!(
+        text.contains(r#""node":"ContainsJoin""#) && text.contains(r#""runtime_filter":{"#),
+        "{text}"
+    );
+    let back = round_trip(&bound);
+    assert_eq!(back, bound);
+    let Some(PhysicalNode::ContainsJoin { residual, .. }) = back.plan.node(join) else {
+        panic!("the ContainsJoin reads back");
+    };
+    assert_eq!(residual, std::slice::from_ref(&other));
+    let mut unmarked = back.clone();
+    let Some(PhysicalNode::Scan { spec, .. }) = unmarked.plan.node_mut(right) else {
+        panic!("the right side is a scan");
+    };
+    assert_eq!(
+        spec.runtime_filter.take().map(|filter| filter.column),
+        Some("text".to_string())
+    );
+    assert_ne!(
+        unmarked, bound,
+        "the scan's runtime filter is part of equality"
+    );
+    let mut keyless = serde_json::to_value(&bound).expect("the bound plan serializes");
+    let join_slot = keyless["plan"]["slots"]
+        .as_array_mut()
+        .expect("the plan's slots")
+        .iter_mut()
+        .find(|slot| slot["node"] == "ContainsJoin")
+        .expect("the ContainsJoin slot");
+    join_slot
+        .as_object_mut()
+        .expect("a node object")
+        .remove("residual")
+        .expect("the residual key");
+    let refused = serde_json::from_value::<BoundPlan>(keyless)
+        .expect_err("a document missing `residual` refuses");
+    assert!(
+        refused.to_string().contains("missing field `residual`"),
+        "{refused}"
+    );
+}
+
+/// The `CrossJoin` node of the serialized `bound`, as JSON.
+fn cross_join_json(bound: &BoundPlan, tag: &str) -> serde_json::Value {
+    let value = serde_json::to_value(bound).expect("the bound plan serializes");
+    value["plan"]["slots"]
+        .as_array()
+        .expect("the plan's slots")
+        .iter()
+        .find(|slot| slot["node"] == tag)
+        .unwrap_or_else(|| panic!("no `{tag}` node in {value}"))
+        .clone()
+}
+
+/// A filtered product serializes as `FilteredCrossJoin`, which a reader that
+/// knows only `CrossJoin {left, right}` refuses, while a plain product keeps
+/// that reader's exact shape: no `filters` key.
+#[test]
+fn a_filtered_cross_join_has_its_own_tag_and_a_plain_one_the_old_shape() {
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "node")]
+    #[allow(dead_code)]
+    enum OldReader {
+        CrossJoin { left: usize, right: usize },
+    }
+    let ne = IRExpr::comparison(prop("d", "slug"), CompOp::Ne, prop("e", "slug"));
+    let filtered = bound(two_docs(Some(ne.clone())));
+    let planned = filtered
+        .plan
+        .live()
+        .find_map(|(_, node)| match node {
+            PhysicalNode::CrossJoin { filters, .. } => Some(filters.clone()),
+            _ => None,
+        })
+        .expect("a CrossJoin");
+    assert_eq!(planned, [ne]);
+    let node = cross_join_json(&filtered, "FilteredCrossJoin");
+    assert_eq!(
+        node["filters"],
+        serde_json::json!([{
+            "expr": "binary",
+            "left": {"expr": "prop_access", "variable": "d", "property": "slug"},
+            "op": {"compare": "ne"},
+            "right": {"expr": "prop_access", "variable": "e", "property": "slug"},
+        }])
+    );
+    let refused = serde_json::from_value::<OldReader>(node)
+        .err()
+        .expect("an old reader refuses");
+    assert!(
+        refused
+            .to_string()
+            .contains("unknown variant `FilteredCrossJoin`"),
+        "{refused}"
+    );
+    assert_eq!(round_trip(&filtered), filtered);
+
+    let plain = bound(two_docs(None));
+    let node = cross_join_json(&plain, "CrossJoin");
+    let (left, right) = (
+        node["left"].as_u64().unwrap(),
+        node["right"].as_u64().unwrap(),
+    );
+    let text = serde_json::to_string(&plain).expect("the bound plan serializes");
+    let shape = format!(r#"{{"node":"CrossJoin","left":{left},"right":{right}}}"#);
+    assert!(text.contains(&shape), "{shape} not in {text}");
+    let old = serde_json::from_value::<OldReader>(node).expect("the old reader reads it");
+    assert!(matches!(old, OldReader::CrossJoin { .. }));
+    assert_eq!(round_trip(&plain), plain);
 }

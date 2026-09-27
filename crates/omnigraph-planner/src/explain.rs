@@ -12,8 +12,10 @@ use crate::route::RouteOverride;
 
 /// Incremented when a field's meaning changes, or when a node kind is added
 /// or removed; additive keys do not bump it. Version 2: the logical `Filter`
-/// node's `predicate` key became `conjuncts`, one entry per conjunct.
-pub const EXPLAIN_VERSION: u32 = 2;
+/// node's `predicate` key became `conjuncts`, one entry per conjunct. Version
+/// 3: the physical `ContainsJoin` node kind was added, and a physical
+/// `CrossJoin` may carry `filters`, the conjuncts it tests on its pairs.
+pub const EXPLAIN_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EntrySummary {

@@ -287,6 +287,27 @@ pub struct ScanSpec {
     pub filter: Option<Predicate>,
     /// The GQ `match` variable this scan binds; `None` on a diff or merge side.
     pub binding: Option<String>,
+    /// The filter the join above this scan fills at run time, when the
+    /// physical plan chose one; always `None` on a logical scan.
+    pub runtime_filter: Option<RuntimeFilterSpec>,
+}
+
+/// A filter on a scan's own `column` whose values come from another binding
+/// at run time: the `needle` `(binding, property)` of the join the scan
+/// streams into, tested as `kind` says.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeFilterSpec {
+    pub column: String,
+    pub needle: (String, String),
+    pub kind: RuntimeFilterKind,
+}
+
+/// How a runtime filter tests a scanned value against the needles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeFilterKind {
+    /// The value holds at least one of the needles as a substring.
+    TextContainsAny,
 }
 
 /// One `nearest(...)` or `bm25(...)` arm of an `rrf()`, as the query wrote it.
@@ -596,6 +617,19 @@ impl LogicalPlan {
         }
     }
 
+    /// Point `parent`'s references to `from` at `to`; every other consumer
+    /// of `from` keeps it.
+    pub(crate) fn redirect_input(&mut self, parent: LogicalId, from: LogicalId, to: LogicalId) {
+        let Some(node) = self.node_mut(parent) else {
+            return;
+        };
+        for input in node.inputs_mut() {
+            if *input == from {
+                *input = to;
+            }
+        }
+    }
+
     pub fn live(&self) -> impl Iterator<Item = (LogicalId, &LogicalNode)> {
         self.slots
             .iter()
@@ -812,26 +846,30 @@ impl LogicalPlan {
 /// version and under what condition; a change-feed or merge scan prints its
 /// side too, which the diff and merge documents are read by.
 pub(crate) fn scan_json(name: &str, spec: &ScanSpec) -> Value {
-    if let Some(binding) = &spec.binding {
-        return json!({
+    let mut value = match &spec.binding {
+        Some(binding) => json!({
             "node": name,
             "binding": binding,
             "table": spec.table.type_key,
             "version": spec.version,
             "projection": spec.projection,
             "filter": spec.filter,
-        });
+        }),
+        None => json!({
+            "node": name,
+            "side": spec.side,
+            "table": spec.table.type_key,
+            "version": spec.version,
+            "id_column": spec.columns.id,
+            "fragments": spec.fragments,
+            "projection": spec.projection,
+            "filter": spec.filter,
+        }),
+    };
+    if let Some(runtime_filter) = &spec.runtime_filter {
+        value["runtime_filter"] = json!(runtime_filter);
     }
-    json!({
-        "node": name,
-        "side": spec.side,
-        "table": spec.table.type_key,
-        "version": spec.version,
-        "id_column": spec.columns.id,
-        "fragments": spec.fragments,
-        "projection": spec.projection,
-        "filter": spec.filter,
-    })
+    value
 }
 
 pub(crate) fn filters_json(filters: &[IRExpr]) -> Vec<String> {

@@ -1,0 +1,134 @@
+# issue: none
+# notes: Literal needles preserve null and empty semantics when filtering and pairing texts.
+# notes: A smaller needle side streams a haystack written first; contains inside OR marks no scan.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Matter {
+    mid: String @key
+    number: String?
+}
+node Passage {
+    pid: String @key
+    text: String?
+}
+
+--- seed
+{"type":"Matter","data":{"mid":"m-anchor","number":"^10"}}
+{"type":"Matter","data":{"mid":"m-class","number":"\\d"}}
+{"type":"Matter","data":{"mid":"m-dot","number":"10.1"}}
+{"type":"Matter","data":{"mid":"m-accent","number":"é"}}
+{"type":"Matter","data":{"mid":"m-null"}}
+{"type":"Matter","data":{"mid":"m-empty","number":""}}
+{"type":"Passage","data":{"pid":"p-anchor","text":"x^10y"}}
+{"type":"Passage","data":{"pid":"p-class","text":"a\\db"}}
+{"type":"Passage","data":{"pid":"p-digit","text":"a1b"}}
+{"type":"Passage","data":{"pid":"p-dot","text":"10x1"}}
+{"type":"Passage","data":{"pid":"p-accent","text":"café"}}
+{"type":"Passage","data":{"pid":"p-empty","text":""}}
+{"type":"Passage","data":{"pid":"p-null"}}
+
+--- query
+set engine = v2;
+query literal_needles_with_passage_written_first() {
+    match {
+        $p: Passage
+        $m: Matter
+        $p.text contains $m.number
+        $m.mid != "m-empty"
+    }
+    return { $m.mid, $p.pid }
+}
+
+--- expect unordered
+{"m.mid":"m-anchor","p.pid":"p-anchor"}
+{"m.mid":"m-class","p.pid":"p-class"}
+{"m.mid":"m-accent","p.pid":"p-accent"}
+
+--- expect shape
+m.mid: String
+p.pid: String
+
+--- expect plan
+contains join $p.text contains $m.number
+scan Passage as $p: runtime filter text
+scan Matter as $m: no runtime filter
+pass join_algorithm
+
+--- query
+set engine = v2;
+query empty_needle() {
+    match {
+        $m: Matter
+        $p: Passage
+        $p.text contains $m.number
+        $m.mid = "m-empty"
+    }
+    return { $m.mid, $p.pid }
+}
+
+--- expect unordered
+{"m.mid":"m-empty","p.pid":"p-anchor"}
+{"m.mid":"m-empty","p.pid":"p-class"}
+{"m.mid":"m-empty","p.pid":"p-digit"}
+{"m.mid":"m-empty","p.pid":"p-dot"}
+{"m.mid":"m-empty","p.pid":"p-accent"}
+{"m.mid":"m-empty","p.pid":"p-empty"}
+
+--- expect shape
+m.mid: String
+p.pid: String
+
+--- query
+set engine = v2;
+query null_needles_only() {
+    match {
+        $m: Matter
+        $p: Passage
+        $p.text contains $m.number
+        $m.mid = "m-null"
+    }
+    return { $m.mid, $p.pid }
+}
+
+--- expect unordered
+
+--- expect shape
+m.mid: String
+p.pid: String
+
+--- query
+set engine = v2;
+query contains_inside_an_or() {
+    match {
+        $m: Matter
+        $p: Passage
+        $p.text contains $m.number or $p.pid = "p-digit"
+        $m.mid != "m-empty"
+        $m.mid != "m-null"
+    }
+    return { $m.mid, $p.pid }
+}
+
+--- expect unordered
+{"m.mid":"m-anchor","p.pid":"p-anchor"}
+{"m.mid":"m-class","p.pid":"p-class"}
+{"m.mid":"m-accent","p.pid":"p-accent"}
+{"m.mid":"m-anchor","p.pid":"p-digit"}
+{"m.mid":"m-class","p.pid":"p-digit"}
+{"m.mid":"m-dot","p.pid":"p-digit"}
+{"m.mid":"m-accent","p.pid":"p-digit"}
+
+--- expect shape
+m.mid: String
+p.pid: String
+
+--- expect plan
+scan Passage as $p: no runtime filter
+scan Matter as $m: no runtime filter
+not pass join_algorithm

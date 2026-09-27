@@ -22,17 +22,17 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use omnigraph_compiler::ir::SubqueryPredicate;
 use omnigraph_planner::{
-    BoundPlan, ExpandFields, HashJoinFields, Lower, NodeId, PhysicalNode, PhysicalPlan, PlanError,
-    Predicate, RankArm, RankKind, RankedAccess, ScanInput, ScanSpec, SideId, SortMergeJoinFields,
-    ValueTable,
+    BoundPlan, ContainsJoinFields, ExpandFields, HashJoinFields, Lower, NodeId, PhysicalNode,
+    PhysicalPlan, PlanError, Predicate, RankArm, RankKind, RankedAccess, RuntimeFilterKind,
+    RuntimeFilterSpec, ScanInput, ScanSpec, SideId, SortMergeJoinFields, ValueTable,
 };
 
 use super::adapters::{GqProjectionExpr, LoweringId, Projected};
 use super::operators::{
-    AntiJoinMaskExec, ArmOrder, CrossJoinExec, ExpandExec, ExpandStep, FilterExec, GraphEnv,
-    HashJoinExec, LimitExec, LookupSpec, MetadataCountExec, OuterReferenceExec, OuterSlot,
-    ProjectionExec, RankFuseExec, ScanExec, ScanSource, SortExec, SortKey, fresh_tag_column,
-    tagged_schema,
+    AntiJoinMaskExec, ArmOrder, ContainsJoinExec, CrossJoinExec, ExpandExec, ExpandStep,
+    FilterExec, GraphEnv, HashJoinExec, LimitExec, LookupSpec, MetadataCountExec,
+    OuterReferenceExec, OuterSlot, ProjectionExec, RankFuseExec, RuntimeFilterSlot, ScanExec,
+    ScanSource, SortExec, SortKey, fresh_tag_column, tagged_schema,
 };
 use super::*;
 
@@ -109,6 +109,11 @@ impl<'a> Lowering<'a> {
             .plan
             .lower(&mut walk)
             .map_err(|LowerError(error)| error)?;
+        if let Some(scan) = walk.runtime_filters.keys().min() {
+            return Err(OmniError::manifest_internal(format!(
+                "scan {scan} carries a runtime filter no contains join fills"
+            )));
+        }
         Ok(Lowered {
             root,
             operators: walk.operators,
@@ -323,6 +328,9 @@ struct Walk<'l, 'a> {
     /// A scan below was proven empty by a gate, so the filters above it run
     /// on nothing and are not counted as applied.
     proven_empty: bool,
+    /// The runtime filter of each marked table scan, from that scan's
+    /// lowering until its `ContainsJoin`'s.
+    runtime_filters: HashMap<NodeId, Arc<RuntimeFilterSlot>>,
 }
 
 impl<'l, 'a> Walk<'l, 'a> {
@@ -344,7 +352,26 @@ impl<'l, 'a> Walk<'l, 'a> {
             operators: HashMap::new(),
             in_memory_filters: 0,
             proven_empty: false,
+            runtime_filters: HashMap::new(),
         }
+    }
+
+    /// The slot the table scan `id` of `spec` reads its runtime `filter` from,
+    /// as the plan marked it; the `ContainsJoin` above fills it.
+    fn runtime_scan_filter(
+        id: NodeId,
+        spec: &ScanSpec,
+        filter: &RuntimeFilterSpec,
+    ) -> Result<RuntimeFilterSlot> {
+        let binding = spec.binding.as_deref().ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "scan {id}: a runtime filter marks a scan bound to a match variable"
+            ))
+        })?;
+        let RuntimeFilterKind::TextContainsAny = filter.kind;
+        let (needle_binding, property) = &filter.needle;
+        let needle = format!("{needle_binding}.{property}");
+        Ok(RuntimeFilterSlot::new(binding, &filter.column, needle))
     }
 
     fn not_a_pipeline_node(name: &str) -> LowerError {
@@ -397,6 +424,12 @@ impl Lower for Walk<'_, '_> {
             ))
             .into());
         }
+        let runtime = match (source, ranked, &spec.runtime_filter) {
+            (ScanInput::Table, None, Some(filter)) => {
+                Some(Arc::new(Self::runtime_scan_filter(id, spec, filter)?))
+            }
+            _ => None,
+        };
         let source = match (input, source) {
             (Some(input), ScanInput::Dependent { .. }) => ScanSource::Dependent { input },
             (None, ScanInput::Table) => {
@@ -417,7 +450,11 @@ impl Lower for Walk<'_, '_> {
                 .into());
             }
         };
-        let scan = self.lowering.scan(source, spec)?;
+        let mut scan = self.lowering.scan(source, spec)?;
+        if let Some(filter) = runtime {
+            scan = scan.with_runtime_filter(Some(Arc::clone(&filter)));
+            self.runtime_filters.insert(id, filter);
+        }
         Ok(self.built(id, scan))
     }
 
@@ -477,8 +514,60 @@ impl Lower for Walk<'_, '_> {
         Err(Self::not_a_pipeline_node("Page"))
     }
 
-    fn cross_join(&mut self, id: NodeId, left: Plan, right: Plan) -> Lowers<Plan> {
-        let join = CrossJoinExec::try_new(left, right)?;
+    fn cross_join(
+        &mut self,
+        id: NodeId,
+        filters: &[IRExpr],
+        left: Plan,
+        right: Plan,
+    ) -> Lowers<Plan> {
+        if !self.proven_empty {
+            self.in_memory_filters += filters.len();
+        }
+        let join = CrossJoinExec::try_new(
+            left,
+            right,
+            filters.to_vec(),
+            Arc::clone(self.lowering.params()),
+        )?;
+        Ok(self.built(id, join))
+    }
+
+    /// The `contains` conjunct and the residual ones all run in the join.
+    fn contains_join(
+        &mut self,
+        id: NodeId,
+        fields: ContainsJoinFields<'_>,
+        left: Plan,
+        right: Plan,
+    ) -> Lowers<Plan> {
+        if !self.proven_empty {
+            self.in_memory_filters += fields.residual.len() + 1;
+        }
+        let PhysicalNode::ContainsJoin { right: scan, .. } = self.lowering.node(id)? else {
+            return Err(Self::not_a_pipeline_node("ContainsJoin"));
+        };
+        let filter = self.runtime_filters.remove(scan).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "contains join {id}: its right scan {scan} carries no runtime filter"
+            ))
+        })?;
+        let needle = format!("{}.{}", fields.needle.0, fields.needle.1);
+        if filter.column() != fields.haystack.1 || filter.needle() != needle {
+            return Err(OmniError::manifest_internal(format!(
+                "contains join {id} pairs `{}` by `{needle}`, but its right scan {scan} is marked `{}`",
+                fields.haystack.1,
+                filter.display()
+            ))
+            .into());
+        }
+        let join = ContainsJoinExec::try_new(
+            left,
+            right,
+            fields,
+            Arc::clone(self.lowering.params()),
+            filter,
+        )?;
         Ok(self.built(id, join))
     }
 

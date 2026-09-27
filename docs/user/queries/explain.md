@@ -65,7 +65,16 @@ partitions probed per index delta; `null` is no cap) and `scope` (`order`
 for the query's own order, `primary` or `secondary` for an arm of `rrf()`). A
 physical
 `RankFuse` row has two inputs, one subtree per arm, each with its own ranked
-`Scan`; it carries `arms` (binding and kind per arm), `k` and `limit`. Then one
+`Scan`; it carries `arms` (binding and kind per arm), `k` and `limit`. A
+physical `CrossJoin` row carries `filters`, the conjuncts over both bindings
+it keeps pairs by, when it has any. A physical `ContainsJoin` row is the
+planner's join for one `$r.x contains $l.y` conjunct: it carries `haystack`
+(`$r.x`, the text searched) and `needle` (`$l.y`, the text searched for) as
+GQ spells them, and `residual`, the other conjuncts of the same filter as
+text; its second input is the table `Scan` of `$r`, whose `runtime_filter`
+object names the `column` the join filters at run time (`x`), the `needle`
+as `[binding, property]` and the `kind` (`text_contains_any`). A `Scan` row
+carries no `runtime_filter` key unless a `ContainsJoin` marked it. Then one
 `plan` row per optimizer pass that fired (`node` `pass`), and one per
 remaining field of the explain document: `route` (the engine route the plan
 describes), `logical_hash` (the structural hash of the logical plan),
@@ -91,7 +100,8 @@ plans no `Sort`. A `Sort` row's `tiebreak` lists the id keys it appends after
 The `datafusion` tree is the plan the query executes on the `v2` route: the
 physical tree lowered to operators, every read operator omnigraph's own
 (`ScanExec`, `ExpandExec`, `HashJoinExec`, `FilterExec`, `ProjectionExec`,
-`SortExec`, `LimitExec`, `CrossJoinExec`, `AntiJoinMaskExec`, `RankFuseExec`,
+`SortExec`, `LimitExec`, `CrossJoinExec`, `ContainsJoinExec`,
+`AntiJoinMaskExec`, `RankFuseExec`,
 `MetadataCountExec`) except the aggregate, DataFusion's `AggregateExec`, one
 row per operator with `depth` from
 its nesting and `detail` the operator's own text (a filter's predicate, a
@@ -108,8 +118,8 @@ row `datafusion` reads `unavailable: …` with the reason.
 The third surface beside the rows and explain is `profile`: what each node
 of the plan a `v2` run executed did, written back as rows in the explain row
 schema (`tree`, `depth`, `node`, `detail`) with `tree` `profile`, no `depth`,
-`node` the plan node's kind (`Scan`, `HashJoin`, `Expand`, `Sort`, `Page`,
-…) and `detail` one JSON object per node of the run, from the one operator
+`node` the plan node's kind (`Scan`, `HashJoin`, `ContainsJoin`, `Expand`,
+`Sort`, `Page`, …) and `detail` one JSON object per node of the run, from the one operator
 the node built:
 
 | Key | Meaning |
@@ -125,7 +135,7 @@ operator of a declared switch it is the side that ran: `hash_join` or
 on the `ExpandExec` of an `Expand`, the mode the traversal ended on. Explain itself runs nothing and carries no `profile` row; the
 profile is returned beside the rows by the run that produced them
 (`Session::query_inspected`, the v2 inspection door, through
-`Executed::profile`). The row schema is `explain_version` 2.
+`Executed::profile`). The row schema is `explain_version` 3.
 
 An `explain` statement is served by `omnigraph query` and `POST /query`. It
 takes the same `--branch`/`--snapshot` target and `--params` as the query

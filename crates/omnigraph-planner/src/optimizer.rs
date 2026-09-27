@@ -19,12 +19,14 @@ use crate::cost::{
 use crate::error::PlanError;
 use crate::logical::{
     ColumnRef, GqFilter, IDENTITY_MEMBER, KeyJoinKind, LOGICAL_ID, LogicalId, LogicalNode,
-    LogicalPlan, Predicate, ScanSpec, SearchArm, ordering_text,
+    LogicalPlan, Predicate, RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, SearchArm,
+    ordering_text,
 };
+use crate::lower::ContainsJoinFields;
 use crate::operation::{Operation, Side};
 use crate::physical::{
     Estimate, Hop, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, Properties,
-    RankArm, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
+    RankArm, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource, TextContains,
 };
 use crate::source::{NodeTypeSpec, PlanSource, SideId};
 
@@ -284,6 +286,7 @@ fn resolve_pipeline(
                             projection: None,
                             filter: None,
                             binding: Some(variable.clone()),
+                            runtime_filter: None,
                         }),
                     },
                     schema.clone(),
@@ -360,6 +363,7 @@ fn resolve_pipeline(
                             projection: None,
                             filter: None,
                             binding: Some(dst_var.clone()),
+                            runtime_filter: None,
                         }),
                     },
                     schema.clone(),
@@ -749,6 +753,7 @@ fn scan(
                 projection: None,
                 filter: None,
                 binding: None,
+                runtime_filter: None,
             }),
         },
         schema,
@@ -1005,7 +1010,10 @@ pub fn physical_plan(
     if late_materialization {
         fired.push(PASS_LATE_MATERIALIZATION);
     }
-    if join_algorithm {
+    let contains_join = physical
+        .live()
+        .any(|(_, node)| matches!(node, PhysicalNode::ContainsJoin { .. }));
+    if join_algorithm || contains_join {
         fired.push(PASS_JOIN_ALGORITHM);
     }
     if expand_mode {
@@ -1107,8 +1115,8 @@ fn and_filter(existing: Option<Predicate>, added: Predicate) -> Predicate {
 }
 
 /// Stage 1, pass 2 on a query plan, per scope (the top-level tree and each
-/// `not { … }` inner tree): adjacent `Filter` nodes coalesce into one, each
-/// conjunct `placement_target` places moves into its scan, an emptied node goes.
+/// `not { … }` inner tree): adjacent `Filter` nodes coalesce, each conjunct moves
+/// into its `placement_target` scan or onto its `join_target`, an emptied node goes.
 fn place_query_filters(plan: &mut LogicalPlan, source: &dyn PlanSource) -> bool {
     let mut fired = false;
     let mut scopes = vec![plan.root()];
@@ -1149,6 +1157,7 @@ fn place_query_filters(plan: &mut LogicalPlan, source: &dyn PlanSource) -> bool 
                 continue;
             };
             let mut residual = Vec::with_capacity(conjuncts.len());
+            let mut moved: Vec<(LogicalId, Vec<IRExpr>)> = Vec::new();
             for conjunct in conjuncts {
                 let target = placement_target(&conjunct, &scans, &dependent_scans, source);
                 match target.and_then(|target| plan.node_mut(target)) {
@@ -1156,7 +1165,22 @@ fn place_query_filters(plan: &mut LogicalPlan, source: &dyn PlanSource) -> bool 
                         spec.filter = Some(and_filter(spec.filter.take(), gq_conjunct(&conjunct)));
                         fired = true;
                     }
-                    _ => residual.push(conjunct),
+                    _ => match join_target(plan, input, &conjunct) {
+                        Some(join) if join != input => {
+                            match moved.iter_mut().find(|(target, _)| *target == join) {
+                                Some((_, onto)) => onto.push(conjunct),
+                                None => moved.push((join, vec![conjunct])),
+                            }
+                        }
+                        _ => residual.push(conjunct),
+                    },
+                }
+            }
+            for (join, conjuncts) in moved {
+                if filter_onto_join(plan, join, &conjuncts) {
+                    fired = true;
+                } else {
+                    residual.extend(conjuncts);
                 }
             }
             if residual.is_empty() {
@@ -1237,6 +1261,116 @@ fn placement_target(
         .get(*binding)
         .or_else(|| dependent_scans.get(*binding))
         .copied()
+}
+
+/// Only a `CrossJoin` whose two sides together, neither alone, bind every
+/// binding a scalar `conjunct` reads; `None` for any other conjunct, one that
+/// also reads an `Expand` destination above that join included.
+fn join_target(plan: &LogicalPlan, mut id: LogicalId, conjunct: &IRExpr) -> Option<LogicalId> {
+    if search_filter_field(conjunct).is_some() {
+        return None;
+    }
+    let mut reads = Vec::new();
+    reads_of_expr(conjunct, &mut reads);
+    if reads.is_empty() {
+        return None;
+    }
+    let binds = |id: LogicalId| {
+        let bound = scope_bindings(plan, id);
+        reads.iter().all(|read| bound.contains(&read.binding))
+    };
+    loop {
+        id = match plan.node(id)? {
+            LogicalNode::CrossJoin { left, right } => {
+                if binds(*left) {
+                    *left
+                } else if binds(*right) {
+                    *right
+                } else {
+                    return binds(id).then_some(id);
+                }
+            }
+            LogicalNode::Filter { input, .. }
+            | LogicalNode::Expand { input, .. }
+            | LogicalNode::TableScan {
+                input: Some(input), ..
+            }
+            | LogicalNode::AntiJoin { input, .. }
+                if binds(*input) =>
+            {
+                *input
+            }
+            _ => return None,
+        };
+    }
+}
+
+/// `conjuncts` on `join` itself: into the `Filter` already there, else a new
+/// one between `join` and its one consumer; `false`, and the plan untouched,
+/// when `join` has no single consumer or no schema.
+fn filter_onto_join(plan: &mut LogicalPlan, join: LogicalId, conjuncts: &[IRExpr]) -> bool {
+    let Some(parent) = plan.parent_of(join) else {
+        return false;
+    };
+    if let Some(LogicalNode::Filter {
+        conjuncts: held, ..
+    }) = plan.node_mut(parent)
+    {
+        for conjunct in conjuncts {
+            if !held.contains(conjunct) {
+                held.push(conjunct.clone());
+            }
+        }
+        return true;
+    }
+    let Some(schema) = plan.schema(join).cloned() else {
+        return false;
+    };
+    let filter = filter_over(plan, join, conjuncts, schema);
+    plan.redirect_input(parent, join, filter);
+    true
+}
+
+/// A filtered `CrossJoin`'s sides, swapped when a `contains` searches only the
+/// left scan's text for the right's and the right's known rows are no more:
+/// the right side streams through the engine's needle filter.
+fn searched_side_right(
+    logical: &LogicalPlan,
+    source: &dyn PlanSource,
+    left: LogicalId,
+    right: LogicalId,
+    conjuncts: &[IRExpr],
+) -> (LogicalId, LogicalId) {
+    let scan = |id: LogicalId| match logical.node(id) {
+        Some(LogicalNode::TableScan { input: None, spec }) => Some(spec),
+        _ => None,
+    };
+    let (Some(left_scan), Some(right_scan)) = (scan(left), scan(right)) else {
+        return (left, right);
+    };
+    let (Some(on_left), Some(on_right)) =
+        (left_scan.binding.as_deref(), right_scan.binding.as_deref())
+    else {
+        return (left, right);
+    };
+    let searches = |haystack: &str, needle: &str| {
+        conjuncts
+            .iter()
+            .filter_map(TextContains::of)
+            .any(|shape| shape.haystack.0 == haystack && shape.needle.0 == needle)
+    };
+    let rows = |spec: &ScanSpec| {
+        scan_row_estimate(spec, source).map_or(Estimate::Unknown, Estimate::Known)
+    };
+    let needle_side_no_larger = matches!(
+        (rows(right_scan), rows(left_scan)),
+        (Estimate::Known(needles), Estimate::Known(haystacks)) if needles <= haystacks
+    );
+    if needle_side_no_larger && searches(on_left, on_right) && !searches(on_right, on_left) {
+        (right, left)
+    } else {
+        (left, right)
+    }
 }
 
 /// A dependent scan evaluates one-binding scalar predicates and exact text
@@ -1456,6 +1590,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
                 projection: _,
                 filter,
                 binding: _,
+                runtime_filter: _,
             } = spec.as_ref();
             if let Some(predicate) = filter {
                 predicate_reads(predicate, &mut out);
@@ -1721,6 +1856,7 @@ impl Lowering<'_> {
                 ),
             });
         }
+        self.unmark(scan);
         match self.physical.node_mut(scan) {
             Some(PhysicalNode::Scan { ranked, .. }) if ranked.is_none() => {
                 *ranked = Some(access);
@@ -1729,6 +1865,50 @@ impl Lowering<'_> {
             _ => Err(PlanError::Internal(format!(
                 "the scan of `${binding}` is ranked twice"
             ))),
+        }
+    }
+
+    /// A ranked scan runs under a search mode and takes no runtime filter: the
+    /// marker `filtered_cross_join` put on `scan` comes off, and the
+    /// `ContainsJoin` above it goes back to the `CrossJoin` of every conjunct.
+    fn unmark(&mut self, scan: NodeId) {
+        let Some(PhysicalNode::Scan { spec, .. }) = self.physical.node_mut(scan) else {
+            return;
+        };
+        if spec.runtime_filter.take().is_none() {
+            return;
+        }
+        let join = self.physical.live().find_map(|(id, node)| match node {
+            PhysicalNode::ContainsJoin { right, .. } if *right == scan => Some(id),
+            _ => None,
+        });
+        let Some(join) = join else {
+            return;
+        };
+        let Some(PhysicalNode::ContainsJoin {
+            left,
+            right,
+            haystack,
+            needle,
+            residual,
+        }) = self.physical.node(join).cloned()
+        else {
+            return;
+        };
+        let fields = ContainsJoinFields {
+            haystack: (&haystack.0, &haystack.1),
+            needle: (&needle.0, &needle.1),
+            residual: &residual,
+        };
+        let mut filters = Vec::with_capacity(residual.len() + 1);
+        filters.push(fields.conjunct());
+        filters.extend(residual);
+        if let Some(node) = self.physical.node_mut(join) {
+            *node = PhysicalNode::CrossJoin {
+                left,
+                right,
+                filters,
+            };
         }
     }
 
@@ -1809,6 +1989,106 @@ impl Lowering<'_> {
             hops,
             feeds,
         })
+    }
+
+    /// A `ContainsJoin` on the first conjunct `contains_join_applies` admits (pass 7), else a
+    /// `CrossJoin` of every conjunct. The haystack scan must be on the right: written second,
+    /// or swapped by `searched_side_right` (plain scans, `Known` rows, needles <= haystacks).
+    fn filtered_cross_join(
+        &mut self,
+        left: NodeId,
+        right: NodeId,
+        conjuncts: &[IRExpr],
+    ) -> Result<NodeId, PlanError> {
+        let mut chosen = None;
+        for (index, conjunct) in conjuncts.iter().enumerate() {
+            if let Some(shape) = TextContains::of(conjunct)
+                && self.contains_join_applies(left, right, shape)?
+            {
+                chosen = Some((index, shape));
+                break;
+            }
+        }
+        let Some((index, shape)) = chosen else {
+            return Ok(self.physical.add(PhysicalNode::CrossJoin {
+                left,
+                right,
+                filters: conjuncts.to_vec(),
+            }));
+        };
+        let haystack = (shape.haystack.0.to_string(), shape.haystack.1.to_string());
+        let needle = (shape.needle.0.to_string(), shape.needle.1.to_string());
+        let residual = conjuncts
+            .iter()
+            .enumerate()
+            .filter(|(other, _)| *other != index)
+            .map(|(_, conjunct)| conjunct.clone())
+            .collect();
+        let Some(PhysicalNode::Scan { spec, .. }) = self.physical.node_mut(right) else {
+            return Err(PlanError::Internal(format!(
+                "the right side {right} of a contains join is not a table scan"
+            )));
+        };
+        spec.runtime_filter = Some(RuntimeFilterSpec {
+            column: haystack.1.clone(),
+            needle: needle.clone(),
+            kind: RuntimeFilterKind::TextContainsAny,
+        });
+        Ok(self.physical.add(PhysicalNode::ContainsJoin {
+            left,
+            right,
+            haystack,
+            needle,
+            residual,
+        }))
+    }
+
+    /// Whether `right` is the unranked table scan of `shape`'s haystack
+    /// binding, the needle binding is scanned under `left`, and both
+    /// properties are `Utf8` in their node types' schemas.
+    fn contains_join_applies(
+        &self,
+        left: NodeId,
+        right: NodeId,
+        shape: TextContains<'_>,
+    ) -> Result<bool, PlanError> {
+        let Some(PhysicalNode::Scan {
+            source: ScanInput::Table,
+            ranked: None,
+            spec: haystack,
+            ..
+        }) = self.physical.node(right)
+        else {
+            return Ok(false);
+        };
+        if haystack.binding.as_deref() != Some(shape.haystack.0) {
+            return Ok(false);
+        }
+        let Some(needle) = self.scan_of_binding(left, shape.needle.0) else {
+            return Ok(false);
+        };
+        let text = |spec: &ScanSpec, property: &str| -> Result<bool, PlanError> {
+            Ok(node_type_of(spec, self.source)?
+                .schema
+                .field_with_name(property)
+                .is_ok_and(|field| field.data_type() == &DataType::Utf8))
+        };
+        Ok(text(haystack, shape.haystack.1)? && text(needle, shape.needle.1)?)
+    }
+
+    /// The spec of the scan bound to `binding` in the subtree under `id`.
+    fn scan_of_binding(&self, id: NodeId, binding: &str) -> Option<&ScanSpec> {
+        self.physical
+            .subtree(id)
+            .into_iter()
+            .find_map(|node| match self.physical.node(node) {
+                Some(PhysicalNode::Scan { spec, .. })
+                    if spec.binding.as_deref() == Some(binding) =>
+                {
+                    Some(spec.as_ref())
+                }
+                _ => None,
+            })
     }
 
     /// The `Sort` a query's return runs under: the user's keys, led by the
@@ -1903,9 +2183,17 @@ impl Lowering<'_> {
                 Ok(self.physical.add(PhysicalNode::CrossJoin {
                     left: left_lowered,
                     right: right_lowered,
+                    filters: Vec::new(),
                 }))
             }
             LogicalNode::Filter { input, conjuncts } => {
+                if let Some(LogicalNode::CrossJoin { left, right }) = logical.node(*input) {
+                    let (left, right) =
+                        searched_side_right(logical, self.source, *left, *right, conjuncts);
+                    let left_lowered = self.lower(left)?;
+                    let right_lowered = self.lower(right)?;
+                    return self.filtered_cross_join(left_lowered, right_lowered, conjuncts);
+                }
                 let lowered = self.lower(*input)?;
                 Ok(self.physical.add(PhysicalNode::Filter {
                     input: lowered,
@@ -2630,6 +2918,7 @@ pub fn declared_ordering(plan: &PhysicalPlan, id: NodeId) -> Option<Vec<String>>
         } => Some(sorted_ordering(declared_ordering(plan, *input), order_by)),
         PhysicalNode::MetadataCount { .. }
         | PhysicalNode::CrossJoin { .. }
+        | PhysicalNode::ContainsJoin { .. }
         | PhysicalNode::OuterReference { .. }
         | PhysicalNode::Filter { .. }
         | PhysicalNode::Expand { .. }
@@ -2845,11 +3134,15 @@ fn derive_properties(
                     sources: Vec::new(),
                 }
             }
-            PhysicalNode::CrossJoin { left, right } => {
+            PhysicalNode::CrossJoin {
+                left,
+                right,
+                filters,
+            } => {
                 let left_props = props(plan, *left)?;
                 let right_props = props(plan, *right)?;
                 let rows = match (left_props.rows, right_props.rows) {
-                    (Estimate::Known(left), Estimate::Known(right)) => {
+                    (Estimate::Known(left), Estimate::Known(right)) if filters.is_empty() => {
                         Estimate::Known(left.saturating_mul(right))
                     }
                     _ => Estimate::Unknown,
@@ -2863,6 +3156,23 @@ fn derive_properties(
                     ),
                     ordering: None,
                     rows,
+                    work_bytes: Estimate::Unknown,
+                    retained_limit: None,
+                    sources: Vec::new(),
+                }
+            }
+            PhysicalNode::ContainsJoin { left, right, .. } => {
+                let left_props = props(plan, *left)?;
+                let right_props = props(plan, *right)?;
+                Properties {
+                    schema: join_schema(
+                        &left_props.schema,
+                        physical_prefix(plan, *left),
+                        &right_props.schema,
+                        physical_prefix(plan, *right),
+                    ),
+                    ordering: None,
+                    rows: Estimate::Unknown,
                     work_bytes: Estimate::Unknown,
                     retained_limit: None,
                     sources: Vec::new(),

@@ -49,9 +49,9 @@ pub use explain::Explain;
 pub use gate::{Decision, Unrouted, plan_query, route};
 pub use logical::{
     Census, ColumnRef, JoinKind, KeyJoinKind, LogicalId, LogicalKind, LogicalNode, LogicalPlan,
-    Predicate, ScanSpec, SearchArm,
+    Predicate, RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, SearchArm,
 };
-pub use lower::{ExpandFields, HashJoinFields, Lower, SortMergeJoinFields};
+pub use lower::{ContainsJoinFields, ExpandFields, HashJoinFields, Lower, SortMergeJoinFields};
 pub use operation::{Operation, PageBudgetSpec, ScopeSpec, Side, TableRef};
 pub use optimizer::{Bounds, physical_plan, rewrite};
 pub use physical::{
