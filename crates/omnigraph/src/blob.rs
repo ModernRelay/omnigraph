@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::changes::EntityKind;
+use crate::db::manifest::open_dataset_entry;
 use crate::db::{Omnigraph, ReadTarget, ResolvedTarget};
 use crate::error::{OmniError, Result};
 use crate::seams::{decide_seam, fail};
@@ -1043,7 +1044,7 @@ impl Omnigraph {
             // same named branch and numeric table version. Blob reads need a
             // coherent physical-incarnation witness; bypass the held handle for
             // named-native-branch tables and prove the graph ref again below.
-            match entry.open(self.uri(), None).await {
+            match open_dataset_entry(entry, self.uri(), None).await {
                 Ok(dataset) => dataset,
                 Err(error @ OmniError::HistoricalVersionReclaimed { .. }) => {
                     // Incarnation-suffixed refs put a recreated branch on a new

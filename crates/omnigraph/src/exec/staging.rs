@@ -885,7 +885,7 @@ impl StagedMutation {
         // sorted per-table gates. Hold the full set through manifest publish.
         let schema_guard = db
             .write_queue()
-            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+            .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
             .await;
         let branch_guard = db.write_queue().acquire_branch(branch).await;
         let mut guards = vec![schema_guard, branch_guard];

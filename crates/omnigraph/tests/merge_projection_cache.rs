@@ -42,9 +42,9 @@ where
 /// shape that originally made a post-compaction refresh O(history).
 #[test]
 fn deleted_head_classifier_uses_physical_addresses_not_fragment_scan() {
-    let source = include_str!("../src/db/manifest/state.rs");
+    let source = include_str!("../../omnigraph-catalog/src/state.rs");
     let helper = source
-        .split("pub(super) async fn read_object_identities_at_offsets")
+        .split("pub(crate) async fn read_object_identities_at_offsets")
         .nth(1)
         .and_then(|tail| tail.split("/// Reduce raw manifest rows").next())
         .expect("read_object_identities_at_offsets source body");

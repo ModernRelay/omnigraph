@@ -8,29 +8,34 @@
 #![recursion_limit = "256"]
 
 pub(crate) mod blob;
-pub(crate) mod branch_control;
-mod branch_names;
+pub(crate) use omnigraph_core::branch_control;
+use omnigraph_core::branch_names;
 pub mod changes;
+#[cfg(test)]
+mod core_tests;
 pub mod db;
 #[cfg(feature = "dst")]
-pub mod dst_clock;
+pub use omnigraph_core::dst_clock;
 #[cfg(not(feature = "dst"))]
-pub(crate) mod dst_clock;
+pub(crate) use omnigraph_core::dst_clock;
 #[cfg(feature = "dst")]
-pub mod dst_gate;
+pub use omnigraph_core::dst_gate;
 #[cfg(not(feature = "dst"))]
-pub(crate) mod dst_gate;
+pub(crate) use omnigraph_core::dst_gate;
 #[cfg(feature = "dst")]
-pub mod dst_ids;
+pub use omnigraph_core::dst_ids;
 #[cfg(not(feature = "dst"))]
-pub(crate) mod dst_ids;
+pub(crate) use omnigraph_core::dst_ids;
 pub mod embedding;
 pub(crate) mod engine;
 pub mod error;
 pub(crate) mod exec;
 pub mod graph_index;
+#[cfg(test)]
+pub(crate) use omnigraph_core::handle_cache;
 pub mod instrumentation;
-pub(crate) mod lance_access;
+pub(crate) use omnigraph_core::lance_access;
+pub(crate) use omnigraph_core::{dataset_index, staging};
 pub mod loader;
 pub(crate) mod runtime_cache;
 pub mod seams;

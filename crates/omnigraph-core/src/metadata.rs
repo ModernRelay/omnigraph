@@ -3,16 +3,14 @@ use std::collections::HashMap;
 use lance::Dataset;
 use lance_namespace::Error as LanceNamespaceError;
 use lance_namespace::models::CreateTableVersionRequest;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 use lance_namespace::models::TableVersion;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{OmniError, Result};
 use crate::storage::{StorageKind, join_uri, storage_kind_for_uri};
 
-use super::layout::table_id_to_key;
-
-pub(super) const OMNIGRAPH_ROW_COUNT_KEY: &str = "omnigraph.row_count";
+pub const OMNIGRAPH_ROW_COUNT_KEY: &str = "omnigraph.row_count";
 const OMNIGRAPH_TABLE_BRANCH_KEY: &str = "omnigraph.table_branch";
 const OMNIGRAPH_TABLE_FORK_OWNER_KEY: &str = "omnigraph.table_fork_owner";
 /// RFC 0067 prototype pin fields, carried like the fork owner.
@@ -22,7 +20,31 @@ const OMNIGRAPH_TRANSACTION_UUID_KEY: &str = "omnigraph.transaction_uuid";
 /// forward by every writer once the v11 upgrade records it.
 const OMNIGRAPH_LAST_LINEAR_VERSION_KEY: &str = "omnigraph.last_linear_version";
 
-pub(super) fn namespace_version_metadata(
+/// Microseconds since the UNIX epoch — the `created_at` stamp threaded through
+/// every graph-lineage / commit-graph row. One canonical
+/// helper so the clock-error mapping (variant + message) cannot drift across
+/// the call sites that record those timestamps.
+pub fn now_micros() -> Result<i64> {
+    let duration = crate::dst_clock::system_time_now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| OmniError::manifest(format!("system clock before UNIX_EPOCH: {e}")))?;
+    Ok(duration.as_micros() as i64)
+}
+
+pub fn table_id_to_key(request_id: Option<&Vec<String>>) -> lance_namespace::Result<String> {
+    match request_id {
+        Some(request_id) if request_id.len() == 1 && !request_id[0].is_empty() => {
+            Ok(request_id[0].clone())
+        }
+        Some(request_id) => Err(LanceNamespaceError::invalid_input(format!(
+            "expected single table id component, got {:?}",
+            request_id
+        ))),
+        None => Err(LanceNamespaceError::invalid_input("table id is required")),
+    }
+}
+
+pub fn namespace_version_metadata(
     row_count: u64,
     table_branch: Option<&str>,
 ) -> HashMap<String, String> {
@@ -37,7 +59,7 @@ pub(super) fn namespace_version_metadata(
     metadata
 }
 
-pub(super) fn parse_namespace_version_request(
+pub fn parse_namespace_version_request(
     request: &CreateTableVersionRequest,
 ) -> lance_namespace::Result<(String, u64, u64, Option<String>, TableVersionMetadata)> {
     let table_key = table_id_to_key(request.id.as_ref())?;
@@ -81,7 +103,7 @@ pub(super) fn parse_namespace_version_request(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct TableVersionMetadata {
+pub struct TableVersionMetadata {
     manifest_path: String,
     manifest_size: Option<u64>,
     e_tag: Option<String>,
@@ -104,11 +126,7 @@ pub(crate) struct TableVersionMetadata {
 }
 
 impl TableVersionMetadata {
-    pub(crate) fn from_dataset(
-        root_uri: &str,
-        table_path: &str,
-        dataset: &Dataset,
-    ) -> Result<Self> {
+    pub fn from_dataset(root_uri: &str, table_path: &str, dataset: &Dataset) -> Result<Self> {
         Ok(Self {
             manifest_path: full_manifest_object_store_path(
                 root_uri,
@@ -125,27 +143,27 @@ impl TableVersionMetadata {
         })
     }
 
-    pub(crate) fn staged_version(&self) -> Option<u64> {
+    pub fn staged_version(&self) -> Option<u64> {
         self.staged_version
     }
 
-    pub(crate) fn last_linear_version(&self) -> Option<u64> {
+    pub fn last_linear_version(&self) -> Option<u64> {
         self.last_linear_version
     }
 
     /// Carry the base row's last linear version onto a rebuilt row.
-    pub(crate) fn with_last_linear_version(mut self, version: Option<u64>) -> Self {
+    pub fn with_last_linear_version(mut self, version: Option<u64>) -> Self {
         self.last_linear_version = version;
         self
     }
 
-    pub(crate) fn transaction_uuid(&self) -> Option<&str> {
+    pub fn transaction_uuid(&self) -> Option<&str> {
         self.transaction_uuid.as_deref()
     }
 
     /// RFC 0067: mark this pin as staged at a detached version committed
     /// under `uuid`.
-    pub(crate) fn with_staged(mut self, staged_version: u64, transaction_uuid: String) -> Self {
+    pub fn with_staged(mut self, staged_version: u64, transaction_uuid: String) -> Self {
         self.staged_version = Some(staged_version);
         self.transaction_uuid = Some(transaction_uuid);
         self
@@ -155,7 +173,7 @@ impl TableVersionMetadata {
     /// witnesses. The e_tag identifies the exact manifest object; a pin that
     /// carries a transaction uuid also accepts a v10 pin's linear twin, whose
     /// manifest differs but whose transaction is the same.
-    pub(crate) fn witnesses(&self, dataset: &Dataset) -> bool {
+    pub fn witnesses(&self, dataset: &Dataset) -> bool {
         match self.e_tag.as_deref() {
             None => return true,
             Some(expected) if dataset.manifest_location().e_tag.as_deref() == Some(expected) => {
@@ -164,14 +182,14 @@ impl TableVersionMetadata {
             Some(_) => {}
         }
         match self.transaction_uuid.as_deref() {
-            Some(uuid) => crate::table_store::StagedTransactionIdentity::recorded_by(dataset)
+            Some(uuid) => crate::staging::StagedTransactionIdentity::recorded_by(dataset)
                 .is_some_and(|identity| identity.uuid == uuid),
             None => false,
         }
     }
 
     /// Compare read evidence; the linear boundary affects only staged pins.
-    pub(crate) fn same_read_witness(&self, other: &Self) -> bool {
+    pub fn same_read_witness(&self, other: &Self) -> bool {
         let Self {
             manifest_path,
             manifest_size,
@@ -192,54 +210,54 @@ impl TableVersionMetadata {
             && (staged_version.is_none() || last_linear_version == &other.last_linear_version)
     }
 
-    pub(crate) fn table_fork_owner(&self) -> Option<&str> {
+    pub fn table_fork_owner(&self) -> Option<&str> {
         self.table_fork_owner.as_deref()
     }
 
-    pub(crate) fn with_table_fork_owner(mut self, owner: Option<&str>) -> Self {
+    pub fn with_table_fork_owner(mut self, owner: Option<&str>) -> Self {
         self.table_fork_owner = owner.map(str::to_string);
         self
     }
 
     #[cfg(any(test, feature = "failpoints"))]
-    pub(crate) fn is_table_fork_of(&self, fork: &str, owner: &str) -> bool {
+    pub fn is_table_fork_of(&self, fork: &str, owner: &str) -> bool {
         self.table_fork_owner
             .as_deref()
             .map_or(fork == owner, |recorded| recorded == owner)
     }
 
-    pub(super) fn from_json_str(value: &str) -> Result<Self> {
+    pub fn from_json_str(value: &str) -> Result<Self> {
         serde_json::from_str(value).map_err(|e| {
             OmniError::manifest_internal(format!("failed to decode manifest metadata: {e}"))
         })
     }
 
-    pub(super) fn to_json_string(&self) -> Result<String> {
+    pub fn to_json_string(&self) -> Result<String> {
         serde_json::to_string(self).map_err(|e| {
             OmniError::manifest_internal(format!("failed to encode manifest metadata: {e}"))
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn manifest_path(&self) -> &str {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn manifest_path(&self) -> &str {
         &self.manifest_path
     }
 
-    #[cfg(test)]
-    pub(crate) fn manifest_size(&self) -> Option<u64> {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn manifest_size(&self) -> Option<u64> {
         self.manifest_size
     }
 
-    pub(crate) fn e_tag(&self) -> Option<&str> {
+    pub fn e_tag(&self) -> Option<&str> {
         self.e_tag.as_deref()
     }
 
-    #[cfg(test)]
-    pub(crate) fn naming_scheme(&self) -> Option<&str> {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn naming_scheme(&self) -> Option<&str> {
         self.naming_scheme.as_deref()
     }
 
-    pub(crate) fn to_create_table_version_request(
+    pub fn to_create_table_version_request(
         &self,
         table_key: &str,
         table_version: u64,
@@ -272,13 +290,13 @@ impl TableVersionMetadata {
         request
     }
 
-    #[cfg(test)]
-    pub(super) fn to_namespace_version(&self, version: u64) -> TableVersion {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn to_namespace_version(&self, version: u64) -> TableVersion {
         self.to_namespace_version_with_details(version, None, None)
     }
 
-    #[cfg(test)]
-    pub(super) fn to_namespace_version_with_details(
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn to_namespace_version_with_details(
         &self,
         version: u64,
         timestamp_millis: Option<i64>,
@@ -303,7 +321,7 @@ impl TableVersionMetadata {
     }
 }
 
-pub(super) fn object_store_path_from_uri(uri: &str) -> Result<String> {
+pub fn object_store_path_from_uri(uri: &str) -> Result<String> {
     match storage_kind_for_uri(uri)? {
         StorageKind::Local => {
             if uri.strip_prefix("file://").is_some() {
@@ -388,8 +406,8 @@ fn full_manifest_object_store_path(
     ))
 }
 
-#[cfg(test)]
-pub(super) async fn table_version_metadata_for_state(
+#[cfg(any(test, feature = "test-util"))]
+pub async fn table_version_metadata_for_state(
     root_uri: &str,
     table_path: &str,
     branch: Option<&str>,

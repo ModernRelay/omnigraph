@@ -160,14 +160,19 @@ jobs:
           }
 
           # Order matters: each crate must precede anything that depends on it.
-          # omnigraph-compiler, omnigraph-policy, and omnigraph-storage have no
-          # internal deps; planner depends on compiler; engine depends on all four;
+          # omnigraph-compiler, omnigraph-policy, omnigraph-storage and
+          # omnigraph-seams have no internal deps; omnigraph-core depends on
+          # compiler, storage and seams; omnigraph-catalog adds core; planner
+          # depends on compiler; engine depends on all of the above;
           # omnigraph-api-types and omnigraph-cluster depend on engine
           # (+ compiler); server depends on engine + api-types + cluster; cli
           # depends on everything above it.
           publish_if_new omnigraph-compiler
           publish_if_new omnigraph-policy
           publish_if_new omnigraph-storage
+          publish_if_new omnigraph-seams
+          publish_if_new omnigraph-core
+          publish_if_new omnigraph-catalog
           publish_if_new omnigraph-planner
           publish_if_new omnigraph-engine
           publish_if_new omnigraph-api-types

@@ -16,21 +16,21 @@
 use crate::error::{OmniError, Result};
 
 /// Length of a Crockford-base32 ULID string.
-pub(crate) const INCARNATION_LEN: usize = 26;
+pub const INCARNATION_LEN: usize = 26;
 
 /// Mint a fresh branch incarnation.
-pub(crate) fn mint_incarnation() -> String {
+pub fn mint_incarnation() -> String {
     crate::dst_ids::new_ulid().to_string()
 }
 
 /// The native Lance ref name for one incarnation of a logical branch.
-pub(crate) fn native_branch_name(logical: &str, incarnation: &str) -> String {
+pub fn native_branch_name(logical: &str, incarnation: &str) -> String {
     format!("{logical}.{incarnation}")
 }
 
 /// Names can conservatively retain unpublished forks, never authorize ownership.
 /// Unknown generated names lack enough evidence to reclaim safely.
-pub(crate) fn retain_unpublished_table_fork(
+pub fn retain_unpublished_table_fork(
     native: &str,
     incarnation_is_live: impl FnOnce(&str) -> bool,
 ) -> bool {
@@ -67,7 +67,7 @@ fn is_incarnation(candidate: &str) -> bool {
 ///
 /// Only the final path segment may carry the suffix. Names without a
 /// well-formed suffix are legacy incarnations and split to `(name, None)`.
-pub(crate) fn split_native_branch_name(native: &str) -> (&str, Option<&str>) {
+pub fn split_native_branch_name(native: &str) -> (&str, Option<&str>) {
     if let Some(dot) = native.rfind('.') {
         let (logical, incarnation) = (&native[..dot], &native[dot + 1..]);
         if is_incarnation(incarnation) && !logical.is_empty() && !logical.ends_with('/') {
@@ -78,7 +78,7 @@ pub(crate) fn split_native_branch_name(native: &str) -> (&str, Option<&str>) {
 }
 
 /// The logical branch a native ref belongs to.
-pub(crate) fn logical_branch_name(native: &str) -> &str {
+pub fn logical_branch_name(native: &str) -> &str {
     split_native_branch_name(native).0
 }
 
@@ -87,7 +87,7 @@ pub(crate) fn logical_branch_name(native: &str) -> &str {
 /// inner one (`feature.<id>/child`) would place the child's tree under a
 /// native ref's physical path, reintroducing the ancestor/descendant overlap
 /// the suffix exists to remove.
-pub(crate) fn ensure_logical_branch_name(logical: &str) -> Result<()> {
+pub fn ensure_logical_branch_name(logical: &str) -> Result<()> {
     if logical
         .split('/')
         .any(|segment| split_native_branch_name(segment).1.is_some())
@@ -99,11 +99,95 @@ pub(crate) fn ensure_logical_branch_name(logical: &str) -> Result<()> {
     Ok(())
 }
 
+pub const MERGE_INPUT_PREFIX: &str = "__omnigraph_merge_input_v1_";
+
+/// Ownership encoded before the tag's single create-if-absent publication.
+/// The digest bounds name length even for deeply nested branch identifiers;
+/// the actual graph head remains available for the collector's ancestry test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeInputOwner {
+    pub incarnation_digest: String,
+    pub graph_head: Option<String>,
+}
+
+pub fn encode_head(head: Option<&str>) -> String {
+    match head {
+        None => "n".to_string(),
+        Some(head) => {
+            let mut encoded = String::from("s");
+            for byte in head.as_bytes() {
+                use std::fmt::Write;
+                write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+            }
+            encoded
+        }
+    }
+}
+
+pub fn decode_head(encoded: &str) -> Option<Option<String>> {
+    if encoded == "n" {
+        return Some(None);
+    }
+    let encoded = encoded.strip_prefix('s')?;
+    if encoded.is_empty() || encoded.len() % 2 != 0 || !encoded.is_ascii() {
+        return None;
+    }
+    let bytes = (0..encoded.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&encoded[index..index + 2], 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    let head = String::from_utf8(bytes).ok()?;
+    let id = head.parse::<ulid::Ulid>().ok()?;
+    if id.to_string() != head || encode_head(Some(&head)).strip_prefix('s') != Some(encoded) {
+        return None;
+    }
+    Some(Some(head))
+}
+
+pub fn merge_input_owner(name: &str) -> Result<Option<MergeInputOwner>> {
+    let Some(encoded) = name.strip_prefix(MERGE_INPUT_PREFIX) else {
+        return Ok(None);
+    };
+    let invalid = || OmniError::manifest_conflict("malformed merge input retention tag");
+    let mut parts = encoded.split('_');
+    let digest = parts.next().ok_or_else(invalid)?;
+    let head = parts.next().and_then(decode_head).ok_or_else(invalid)?;
+    let nonce = parts.next().ok_or_else(invalid)?;
+    if parts.next().is_some()
+        || digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || nonce
+            .parse::<ulid::Ulid>()
+            .ok()
+            .is_none_or(|id| id.to_string() != nonce)
+    {
+        return Err(invalid());
+    }
+    Ok(Some(MergeInputOwner {
+        incarnation_digest: digest.to_string(),
+        graph_head: head,
+    }))
+}
+
+/// Only valid engine-owned tags exempt logical retirement; arbitrary native
+/// tags retain Lance's existing refusal semantics.
+pub fn is_merge_input_tag(name: &str) -> bool {
+    matches!(merge_input_owner(name), Ok(Some(_)))
+}
+
+pub const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";
+
+pub fn is_schema_apply_lock_branch(name: &str) -> bool {
+    name.trim_start_matches('/') == SCHEMA_APPLY_LOCK_BRANCH
+}
+
 /// Resolve a logical branch to its single live native ref.
 ///
 /// `Ok(None)` means no incarnation exists. More than one live incarnation is a
 /// registry invariant violation and fails loudly rather than guessing.
-pub(crate) fn resolve_native_branch<'a>(
+pub fn resolve_native_branch<'a>(
     natives: impl IntoIterator<Item = &'a str>,
     logical: &str,
 ) -> Result<Option<String>> {

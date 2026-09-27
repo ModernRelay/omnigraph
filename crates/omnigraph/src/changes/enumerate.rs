@@ -27,8 +27,9 @@ use super::row_compare::{
 use super::token::{cursor_rejected, opaque_type_id};
 use super::{changed_table_intervals, parse_table_key};
 use crate::db::DatasetEntry;
+use crate::db::Snapshot;
 use crate::db::logical_row_image;
-use crate::db::manifest::{Snapshot, system_columns_at_image};
+use crate::db::manifest::system_columns_at_image;
 use crate::error::{OmniError, Result};
 use crate::seams::{decide_seam, fail};
 use crate::table_store::TableStore;

@@ -271,7 +271,7 @@ the CAS the merge is complete; nothing follows the publication.
 - `crates/omnigraph/tests/branching.rs` — branch identity and Blob behavior.
 - `crates/omnigraph/tests/merge_cost.rs` — delta scope and manifest-history
   cost contracts, not semantics.
-- `crates/omnigraph/src/instrumentation.rs` — route and timing probes.
+- `crates/omnigraph-core/src/instrumentation.rs` — route and timing probes.
 
 See [writes.md](writes.md), [recovery.md](recovery.md), and
 [RFC 0023](../rfcs/0023-key-conflict-fencing.md).

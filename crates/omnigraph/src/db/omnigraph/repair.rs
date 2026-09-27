@@ -160,7 +160,7 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
     // the replacement's same public alias and new identity.
     let _schema_guard = db
         .write_queue()
-        .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+        .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
         .await;
     db.refresh_coordinator_only().await?;
     db.ensure_schema_apply_not_locked("repair").await?;

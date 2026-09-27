@@ -32,7 +32,12 @@ Tools that support `@` imports include these automatically:
 - Version surveyed: 0.11.0
 - Rust stable, edition 2024; toolchain pinned in `rust-toolchain.toml`
 - Storage substrate: Lance 11.0.0
-- Workspace: compiler, planner (logical/physical plans and optimizer), storage, `omnigraph-seams` (the one seam type every
+- Workspace: compiler, planner (logical/physical plans and optimizer), storage,
+  `omnigraph-core` (the engine's shared base: `OmniError`, Lance dataset
+  access, request instrumentation, Lance native ref control
+  (`branch_control`), dataset addressing),
+  `omnigraph-catalog` (the `__manifest` catalog: graph branch registrations
+  and lineage, the publish), `omnigraph-seams` (the one seam type every
   test-time substitution uses; RFC 0066), engine (`omnigraph-engine`
   package), policy, API types, cluster, CLI, server, Azure admission
   wrapper, benchmark harness,

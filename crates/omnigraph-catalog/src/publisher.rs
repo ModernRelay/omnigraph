@@ -24,12 +24,12 @@ use lance::Dataset;
 use lance::Error as LanceError;
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
 use lance_namespace::NamespaceError;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 use lance_namespace::models::CreateTableVersionRequest;
 
 use crate::error::{OmniError, Result};
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 use super::DatasetUpdate;
 use super::layout::{
     open_manifest_dataset_with_session, table_object_id, tombstone_object_id, version_object_id,
@@ -62,7 +62,7 @@ const PUBLISHER_RETRY_BUDGET: u32 = 5;
 /// per attempt. An exact-head publish instead rejects a retry once that authority
 /// changed, so a prepared write can never be silently re-parented.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct LineageIntent {
+pub struct LineageIntent {
     /// ULID minted once before the publish loop; the graph commit's identity.
     pub graph_commit_id: String,
     /// The branch this commit lands on (`None` = main). Selects the
@@ -80,18 +80,18 @@ pub(crate) struct LineageIntent {
 /// row is first-class: a freshly-created named branch inherits lineage commits
 /// but has no `graph_head:<its-name>` until its first graph commit.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct GraphHeadExpectation {
+pub struct GraphHeadExpectation {
     /// `None` means main; `Some("main")` is normalized to `None` by [`new`].
-    pub(crate) branch: Option<String>,
+    pub branch: Option<String>,
     /// Lance-native stable branch identity. This detects delete/recreate ABA;
     /// manifest versions/eTags are deliberately not branch identity.
-    pub(crate) branch_identifier: lance::dataset::refs::BranchIdentifier,
+    pub branch_identifier: lance::dataset::refs::BranchIdentifier,
     /// Exact commit id stored in the branch's head row, or `None` when absent.
-    pub(crate) head_commit_id: Option<String>,
+    pub head_commit_id: Option<String>,
 }
 
 impl GraphHeadExpectation {
-    pub(crate) fn new(
+    pub fn new(
         branch: Option<&str>,
         branch_identifier: lance::dataset::refs::BranchIdentifier,
         head_commit_id: Option<String>,
@@ -120,14 +120,14 @@ impl GraphHeadExpectation {
 /// ref-control fence (Lance branch create/delete still lacks conditional CAS),
 /// so branch control remains within the documented single-writer-process bound.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum PublishPrecondition {
+pub enum PublishPrecondition {
     Any,
     ExactGraphHead(GraphHeadExpectation),
 }
 
 /// The result of a manifest publish that may have folded in a graph commit.
 #[derive(Debug)]
-pub(super) struct PublishOutcome {
+pub struct PublishOutcome {
     /// The advanced `__manifest` dataset (its version is the published version).
     pub dataset: Dataset,
     /// The parent the publisher resolved for the recorded commit, if a
@@ -149,11 +149,11 @@ pub(super) struct PublishOutcome {
 }
 
 #[async_trait]
-pub(super) trait ManifestBatchPublisher: Send + Sync {
+pub trait ManifestBatchPublisher: Send + Sync {
     /// Publish without a graph-head precondition. Every production writer
     /// calls `publish_with_precondition`; only the publisher's own tests use
     /// this shorthand.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     async fn publish(
         &self,
         changes: &[ManifestChange],
@@ -178,7 +178,7 @@ pub(super) trait ManifestBatchPublisher: Send + Sync {
     ) -> Result<PublishOutcome>;
 }
 
-pub(super) struct GraphNamespacePublisher {
+pub struct GraphNamespacePublisher {
     root_uri: String,
     branch: Option<String>,
     control_session: Arc<lance::session::Session>,
@@ -273,12 +273,12 @@ impl GraphNamespacePublisher {
         })
     }
 
-    #[cfg(test)]
-    pub(super) fn new(root_uri: &str, branch: Option<&str>) -> Self {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn new(root_uri: &str, branch: Option<&str>) -> Self {
         Self::new_with_session(root_uri, branch, crate::lance_access::control_session())
     }
 
-    pub(super) fn new_with_session(
+    pub(crate) fn new_with_session(
         root_uri: &str,
         branch: Option<&str>,
         control_session: Arc<lance::session::Session>,
@@ -997,8 +997,8 @@ impl GraphNamespacePublisher {
         Ok(Arc::try_unwrap(new_dataset).unwrap_or_else(|arc| (*arc).clone()))
     }
 
-    #[cfg(test)]
-    pub(super) async fn publish_requests(
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) async fn publish_requests(
         &self,
         requests: &[CreateTableVersionRequest],
     ) -> Result<Dataset> {
@@ -1056,7 +1056,7 @@ fn lineage_part_to_pending(part: GraphLineageRowPart) -> PendingVersionRow {
 /// `__manifest`). Translate it to a typed manifest conflict so callers can
 /// match without parsing strings; everything else is opaque storage.
 ///
-/// Shared (`pub(crate)`) with the v3→v4 lineage backfill
+/// Shared (`pub`) with the v3→v4 lineage backfill
 /// (`state::merge_lineage_rows`), which issues its own `__manifest` merge-insert
 /// outside the publisher and must surface the SAME typed
 /// `RowLevelCasContention` so the migration's re-open retry loop can recognize a
@@ -1065,7 +1065,7 @@ fn lineage_part_to_pending(part: GraphLineageRowPart) -> PendingVersionRow {
 /// also matches `CommitConflict`/`RetryableCommitConflict` from the COMPACTION
 /// commit path (`compact_files` -> `apply_commit`), which a row-level merge-insert
 /// never emits — folding it in here would match impossible variants.
-pub(crate) fn map_lance_publish_error(err: LanceError) -> OmniError {
+pub fn map_lance_publish_error(err: LanceError) -> OmniError {
     if matches!(err, LanceError::TooMuchWriteContention { .. }) {
         return OmniError::manifest_row_level_cas_contention(format!(
             "manifest publish lost a row-level CAS race: {}",
@@ -1377,7 +1377,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
 /// contention; if the caller's `expected_table_versions` still holds against
 /// the new manifest state, we re-attempt. Other conflict variants (notably
 /// `PublishedDatasetVersionMismatch`) propagate so the caller learns immediately.
-pub(crate) fn is_retryable_publish_conflict(err: &OmniError) -> bool {
+pub fn is_retryable_publish_conflict(err: &OmniError) -> bool {
     matches!(
         err,
         OmniError::Manifest(m)

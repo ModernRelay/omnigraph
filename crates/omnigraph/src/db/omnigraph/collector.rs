@@ -12,7 +12,7 @@ use lance::index::DatasetIndexExt;
 
 use crate::db::commit_graph::{CommitGraph, GraphCommit, MergeBaseResolver};
 use crate::db::manifest::retention::{ManifestTagInventory, incarnation_digest, merge_input_owner};
-use crate::db::manifest::{CollectorBranch, DatasetEntry, ManifestCoordinator, Snapshot};
+use crate::db::manifest::{CatalogSnapshot, CollectorBranch, DatasetEntry, ManifestCoordinator};
 use crate::db::omnigraph::Omnigraph;
 use crate::error::{OmniError, Result};
 use crate::seams::{decide_seam, fail};
@@ -692,7 +692,7 @@ type TableLocations = BTreeMap<String, (String, String, Option<String>)>;
 /// `(staged version, linear twin)`, a linear pin as its version.
 fn record_roots(
     db: &Omnigraph,
-    snapshot: &Snapshot,
+    snapshot: &CatalogSnapshot,
     roots: &mut PinRoots,
     tables: &mut TableLocations,
 ) {

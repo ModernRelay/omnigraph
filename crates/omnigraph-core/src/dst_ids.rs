@@ -80,13 +80,13 @@ omnigraph_seams::thread_local_seam! {
 /// thread-local probe, no override authority anywhere in the build.
 #[cfg(not(feature = "dst"))]
 #[inline(always)]
-pub(crate) fn new_ulid() -> ulid::Ulid {
+pub fn new_ulid() -> ulid::Ulid {
     ulid::Ulid::new()
 }
 
 /// Every production identity mint in this crate comes through here.
 #[cfg(feature = "dst")]
-pub(crate) fn new_ulid() -> ulid::Ulid {
+pub fn new_ulid() -> ulid::Ulid {
     match IDS.with(|source| source.next_ulid()) {
         Some(ulid) => ulid,
         None => ulid::Ulid::new(),

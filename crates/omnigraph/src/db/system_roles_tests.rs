@@ -12,7 +12,7 @@ use lance::dataset::{ColumnAlteration, WriteMode, WriteParams};
 use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 use omnigraph_compiler::{SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_V3};
 
-use super::system_columns_at_image;
+use crate::db::manifest::system_columns_at_image;
 
 const TABLE: &str = "edge:Knows";
 

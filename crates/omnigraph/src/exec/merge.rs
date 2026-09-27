@@ -5335,7 +5335,7 @@ impl Omnigraph {
         self.settle_pending_schema_install().await?;
         let _schema_guard = self
             .write_queue()
-            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+            .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
             .await;
         let _branch_guards = self
             .write_queue()
@@ -5388,7 +5388,7 @@ impl Omnigraph {
                 let base =
                     ManifestCoordinator::pinned_graph_commit(self.uri(), &base_commit).await?;
                 input_guard.pin(&base.dataset).await?;
-                base.snapshot
+                Snapshot::wrap(base.snapshot)
             };
             if !source_txn.manifest_probe.is_current().await?
                 || !target_txn.manifest_probe.is_current().await?

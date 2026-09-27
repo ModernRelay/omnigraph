@@ -14,6 +14,8 @@ ADMISSION = "omnigraph-azure-admission"
 STORAGE = "omnigraph-storage"
 FORBIDDEN_CONSUMERS = {
     "omnigraph-storage",
+    "omnigraph-core",
+    "omnigraph-catalog",
     "omnigraph-engine",
     "omnigraph-cluster",
     "omnigraph-server",
@@ -47,6 +49,10 @@ def dependency_path(
     return None
 
 
+def forbidden_upward(admission_dependencies: set[str]) -> list[str]:
+    return sorted(admission_dependencies & (FORBIDDEN_CONSUMERS - {STORAGE}))
+
+
 def check_path_finder() -> None:
     fixture = {
         "engine": {"middle"},
@@ -59,6 +65,11 @@ def check_path_finder() -> None:
         "admission",
     ]
     assert dependency_path(fixture, "storage", "admission") is None
+    assert forbidden_upward({STORAGE, "omnigraph-catalog", "omnigraph-core"}) == [
+        "omnigraph-catalog",
+        "omnigraph-core",
+    ]
+    assert forbidden_upward({STORAGE, "serde"}) == []
     assert RUST_ADMISSION_REFERENCE.search("use omnigraph_azure_admission::Lease;")
     assert RUST_ADMISSION_REFERENCE.search("omnigraph_azure_admission::run()")
     assert not RUST_ADMISSION_REFERENCE.search(
@@ -100,11 +111,9 @@ def main() -> int:
     admission_dependencies = graph[ADMISSION]
     if STORAGE not in admission_dependencies:
         failures.append(f"{ADMISSION} must depend downward on {STORAGE}")
-    forbidden_upward = sorted(admission_dependencies & (FORBIDDEN_CONSUMERS - {STORAGE}))
-    if forbidden_upward:
-        failures.append(
-            f"{ADMISSION} has forbidden upward dependencies: {forbidden_upward}"
-        )
+    upward = forbidden_upward(admission_dependencies)
+    if upward:
+        failures.append(f"{ADMISSION} has forbidden upward dependencies: {upward}")
 
     for consumer in sorted(FORBIDDEN_CONSUMERS):
         crate_root = Path(packages[consumer]["manifest_path"]).parent
@@ -129,7 +138,7 @@ def main() -> int:
 
     print(
         "Azure admission boundary OK: admission -> storage; "
-        "storage/engine/cluster/server/CLI cannot depend upward"
+        "storage/core/catalog/engine/cluster/server/CLI cannot depend upward"
     )
     return 0
 

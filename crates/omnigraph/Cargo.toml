@@ -13,7 +13,7 @@ name = "omnigraph"
 
 [features]
 default = []
-failpoints = ["omnigraph-seams/decide"]
+failpoints = ["omnigraph-seams/decide", "omnigraph-core/failpoints", "omnigraph-catalog/failpoints"]
 # Test-only authority (PR #527 review P1-5): the DST seams' INSTALLERS
 # (seeded IDs, logical clock, gate hook), the mutable Lance registry
 # re-export, the harness-added injected-storage constructors
@@ -26,13 +26,15 @@ failpoints = ["omnigraph-seams/decide"]
 # default-members); any `--workspace` invocation unifies this feature IN
 # through the omnigraph-dst dev crate — release artifacts build with
 # `-p` and stay clean, and dst.yml lints the `-p` shape per PR.
-dst = ["omnigraph-storage/dst", "omnigraph-seams/install", "dep:lance-io"]
+dst = ["omnigraph-storage/dst", "omnigraph-seams/install", "dep:lance-io", "omnigraph-core/dst", "omnigraph-catalog/dst"]
 
 [dependencies]
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.11.0" }
 omnigraph-policy = { path = "../omnigraph-policy", version = "0.11.0" }
 omnigraph-storage = { path = "../omnigraph-storage", version = "0.11.0" }
 omnigraph-seams = { path = "../omnigraph-seams", version = "0.11.0" }
+omnigraph-core = { path = "../omnigraph-core", version = "0.11.0" }
+omnigraph-catalog = { path = "../omnigraph-catalog", version = "0.11.0" }
 omnigraph-planner = { path = "../omnigraph-planner", version = "0.11.0" }
 lance = { workspace = true }
 lance-core = { workspace = true }
@@ -41,10 +43,6 @@ lance-datafusion = { workspace = true }
 datafusion = { workspace = true }
 lance-file = { workspace = true }
 lance-index = { workspace = true }
-frostem = { workspace = true }
-lance-tokenizer = { workspace = true }
-stop-words = { workspace = true }
-unicode-normalization = { workspace = true }
 lance-linalg = { workspace = true }
 lance-namespace = { workspace = true }
 lance-table = { workspace = true }
@@ -79,6 +77,8 @@ arc-swap = { workspace = true }
 
 [dev-dependencies]
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.11.0" }
+omnigraph-core = { path = "../omnigraph-core", version = "0.11.0", features = ["test-util"] }
+omnigraph-catalog = { path = "../omnigraph-catalog", version = "0.11.0", features = ["test-util"] }
 tokio = { workspace = true }
 lance-namespace-impls = { workspace = true }
 # test-util gates IoStats.requests + assert_io_eq! (failure diagnostics only); dev-dep,

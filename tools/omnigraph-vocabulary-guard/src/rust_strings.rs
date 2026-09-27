@@ -614,7 +614,7 @@ fn is_diagnostic_constructor(called: &str) -> bool {
 
 fn is_presentation_helper(path: &str, function: &str) -> bool {
     match path {
-        "crates/omnigraph/src/error.rs" => matches!(
+        "crates/omnigraph-core/src/error.rs" => matches!(
             function,
             "graph_type_subject"
                 | "dataset_subject"

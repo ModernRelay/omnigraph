@@ -29,13 +29,19 @@ static CONTROL_SESSION: LazyLock<Arc<Session>> =
 /// Data tables use a graph-scoped cached session. Control-plane metadata uses a
 /// zero-cache session. Both share the same object-store registry/client pool.
 #[derive(Clone)]
-pub(crate) struct LanceAccessContext {
+pub struct LanceAccessContext {
     data_session: Arc<Session>,
     control_session: Arc<Session>,
 }
 
+impl Default for LanceAccessContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LanceAccessContext {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             data_session: Arc::new(Session::new(
                 DEFAULT_INDEX_CACHE_SIZE,
@@ -46,16 +52,16 @@ impl LanceAccessContext {
         }
     }
 
-    pub(crate) fn data_session(&self) -> Arc<Session> {
+    pub fn data_session(&self) -> Arc<Session> {
         Arc::clone(&self.data_session)
     }
 
-    pub(crate) fn control_session(&self) -> Arc<Session> {
+    pub fn control_session(&self) -> Arc<Session> {
         Arc::clone(&self.control_session)
     }
 }
 
-pub(crate) fn control_session() -> Arc<Session> {
+pub fn control_session() -> Arc<Session> {
     Arc::clone(&CONTROL_SESSION)
 }
 
@@ -114,7 +120,7 @@ pub mod object_store_seam {
     ///
     /// When Lance's default registry lacks a hooked scheme: the seam would
     /// otherwise be silently unhooked after a Lance upgrade.
-    pub(super) fn hook(registry: &ObjectStoreRegistry) {
+    pub(crate) fn hook(registry: &ObjectStoreRegistry) {
         for scheme in HOOKED_SCHEMES {
             let inner = registry
                 .get_provider(scheme)

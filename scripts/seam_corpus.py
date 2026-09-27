@@ -22,7 +22,7 @@ import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-ENGINE_SRC = ROOT / "crates" / "omnigraph" / "src"
+SEAM_SRCS = [ROOT / "crates" / crate / "src" for crate in ("omnigraph", "omnigraph-core", "omnigraph-catalog")]
 STORE_PLACES = ROOT / "crates" / "omnigraph-dst" / "src" / "store_places.rs"
 CASES = ROOT / "crates" / "omnigraph-gqt" / "cases"
 
@@ -55,13 +55,13 @@ STORE_ACTIONS = {"misdirect", "lose", "error", "corrupt", "delay"}
 
 def catalog() -> tuple[dict[str, tuple[str, str, tuple[str, ...]]], set[str], list[str]]:
     """name -> (declared at `file:line`, op, effects), from every static under the
-    engine's src and every row of `STORE_PLACES`; a store effect or an admitted
+    engine, core and catalog srcs and every row of `STORE_PLACES`; a store effect or an admitted
     store action is spelled `store:<Name>`. Also the store-place names and the
     problems the two registries raise between them."""
     seams = {}
     places: set[str] = set()
     problems: list[str] = []
-    for path in sorted(ENGINE_SRC.rglob("*.rs")):
+    for path in sorted(path for src in SEAM_SRCS for path in src.rglob("*.rs")):
         text = path.read_text()
         for m in STATIC.finditer(text):
             line = text.count("\n", 0, m.start("invocation")) + 1

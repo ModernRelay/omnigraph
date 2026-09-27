@@ -13,8 +13,8 @@
 //! contract's `system-columns` feature.
 
 use super::*;
-use crate::db::manifest::UpgradeMode;
 use crate::db::schema_state::SchemaState;
+use crate::db::upgrade::UpgradeMode;
 use crate::seams::{catalog, fail};
 use omnigraph_compiler::{SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_V3};
 use serde::Serialize;
@@ -175,7 +175,7 @@ pub(super) async fn upgrade_system_columns(
     if !options.check {
         db.settle_pending_schema_install().await?;
     }
-    let schema_gate_key = crate::db::manifest::schema_apply_serial_queue_key();
+    let schema_gate_key = crate::db::write_queue::schema_apply_serial_queue_key();
     let _schema_gate = db.write_queue().acquire(&schema_gate_key).await;
     db.refresh_coordinator_only().await?;
     let stamp = crate::db::manifest::internal_schema_stamp_at(db.uri(), None)

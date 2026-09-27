@@ -38,11 +38,16 @@ crate::seams::
             src = root / "src"
             src.mkdir()
             (src / "seams.rs").write_text(source)
+            core_src = root / "core"
+            core_src.mkdir()
+            (core_src / "seams.rs").write_text(
+                'decide_seam! { pub static CORE = ("test.core", AnyWrite, [Fail]); }\n'
+            )
             store_places = root / "store_places.rs"
             store_places.write_text("pub static STORE_PLACES = [];\n")
             with (
                 patch.object(seam_corpus, "ROOT", root),
-                patch.object(seam_corpus, "ENGINE_SRC", src),
+                patch.object(seam_corpus, "SEAM_SRCS", [src, core_src]),
                 patch.object(seam_corpus, "STORE_PLACES", store_places),
             ):
                 seams, places, problems = seam_corpus.catalog()
@@ -52,6 +57,7 @@ crate::seams::
                     "test.first": ("src/seams.rs:2", "Mutation", ("Fail", "Skip")),
                     "test.second": ("src/seams.rs:12", "AnyWrite", ("Contention",)),
                     "test.third": ("src/seams.rs:16", "Mutation", ("Fail",)),
+                    "test.core": ("core/seams.rs:1", "AnyWrite", ("Fail",)),
                 })
 
     def test_nested_cases_exclude_hidden_paths_and_symlinks(self):

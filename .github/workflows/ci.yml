@@ -749,7 +749,7 @@ jobs:
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/storage-upgrade-engine.log"
-          cargo test --locked -p omnigraph-engine --lib --features failpoints db::manifest::upgrade::tests -- --test-threads=1 2>&1 | tee "$test_log"
+          cargo test --locked -p omnigraph-engine --lib --features failpoints db::upgrade::tests -- --test-threads=1 2>&1 | tee "$test_log"
           python3 scripts/check-storage-upgrade-ci.py --check-log engine "$test_log"
 
       - name: Run required storage upgrade lance tests

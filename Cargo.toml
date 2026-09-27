@@ -4,6 +4,8 @@ members = [
     "crates/omnigraph-compiler",
     "crates/omnigraph-storage",
     "crates/omnigraph-seams",
+    "crates/omnigraph-core",
+    "crates/omnigraph-catalog",
     "crates/omnigraph-planner",
     "crates/omnigraph",
     "crates/omnigraph-cli",

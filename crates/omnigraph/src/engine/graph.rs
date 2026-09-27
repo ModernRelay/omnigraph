@@ -533,15 +533,13 @@ pub(super) async fn decide_expand_start(
     }
 
     let edge_ds = snapshot.open_lance_dataset(&edge_table_key).await?;
-    let mut coverage =
-        crate::table_store::TableStore::key_column_index_coverage(&edge_ds, key_col).await;
+    let mut coverage = crate::dataset_index::key_column_index_coverage(&edge_ds, key_col).await;
     for orientation in endpoint_probes(step.direction, catalog.system_columns)
         .iter()
         .skip(1)
     {
         let extra =
-            crate::table_store::TableStore::key_column_index_coverage(&edge_ds, orientation.key)
-                .await;
+            crate::dataset_index::key_column_index_coverage(&edge_ds, orientation.key).await;
         coverage = match (coverage, extra) {
             (Ok(a), Ok(b)) => Ok(worse_coverage(a, b)),
             (Err(e), _) | (_, Err(e)) => Err(e),

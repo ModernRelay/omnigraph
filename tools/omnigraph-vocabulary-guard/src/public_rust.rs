@@ -29,6 +29,8 @@ const PUBLIC_LIBRARY_PACKAGES: &[&str] = &[
 const INTERNAL_LIBRARY_PACKAGES: &[&str] = &[
     "omnigraph-azure-admission",
     "omnigraph-bench",
+    "omnigraph-catalog",
+    "omnigraph-core",
     "omnigraph-dst",
     "omnigraph-gqt",
     "omnigraph-vocabulary-guard",
@@ -518,6 +520,8 @@ pub fn omnigraph::ordinary(value: usize)
             &[
                 "omnigraph-azure-admission",
                 "omnigraph-bench",
+                "omnigraph-catalog",
+                "omnigraph-core",
                 "omnigraph-dst",
                 "omnigraph-gqt",
                 "omnigraph-vocabulary-guard"

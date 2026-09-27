@@ -451,7 +451,7 @@ impl ObjectStore for PrefixCountingStore {
 // `incremental_stats()` per request (`rust/lance/src/dataset/tests/dataset_io.rs`).
 // We do the same for `__manifest`: `cost_harness` installs ONE persistent tracker for
 // a whole test body, so the graph opens UNDER it and every coordinator handle — the
-// init handle and each post-publish/refresh reassignment (`db/manifest.rs` keeps
+// init handle and each post-publish/refresh reassignment (`omnigraph-catalog/src/lib.rs` keeps
 // `self.dataset = …`) — carries the same tracker. `manifest_reads` is then ground
 // truth (warm probe + cold scans), handle-age-irrelevant, instead of only the reads
 // on handles a single measured op happened to open. Data/commit-graph/probe/open

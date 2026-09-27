@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use lance::Dataset;
 use lance::dataset::refs::BranchIdentifier;
+#[cfg(any(test, feature = "test-util"))]
 use lance_namespace::Error as LanceNamespaceError;
 
 use crate::error::{OmniError, Result};
@@ -12,7 +13,7 @@ use super::TableIdentity;
 const MANIFEST_DIR: &str = "__manifest";
 const BRANCH_IDENTIFIER_CAPTURE_ATTEMPTS: usize = 8;
 
-pub(super) fn branch_ref_error(error: lance::Error, branch: &str) -> OmniError {
+pub(crate) fn branch_ref_error(error: lance::Error, branch: &str) -> OmniError {
     match error {
         // Only Lance's typed ref miss proves logical branch absence. A generic
         // object miss can be the branch's manifest or another required object
@@ -24,7 +25,7 @@ pub(super) fn branch_ref_error(error: lance::Error, branch: &str) -> OmniError {
     }
 }
 
-pub(crate) fn manifest_uri(root: &str) -> String {
+pub fn manifest_uri(root: &str) -> String {
     format!("{}/{}", root.trim_end_matches('/'), MANIFEST_DIR)
 }
 
@@ -35,7 +36,7 @@ pub(crate) fn manifest_uri(root: &str) -> String {
 /// Only that branch's own refs are read, so another branch's concurrent
 /// retirement cannot fail this lookup. Absence is the typed public miss; more
 /// than one incarnation fails loudly.
-pub(super) async fn resolve_native_manifest_branch(
+pub(crate) async fn resolve_native_manifest_branch(
     dataset: &Dataset,
     logical: &str,
 ) -> Result<String> {
@@ -46,13 +47,13 @@ pub(super) async fn resolve_native_manifest_branch(
         })
 }
 
-#[cfg(test)]
-pub(super) async fn open_manifest_dataset(root_uri: &str, branch: Option<&str>) -> Result<Dataset> {
+#[cfg(any(test, feature = "test-util"))]
+pub async fn open_manifest_dataset(root_uri: &str, branch: Option<&str>) -> Result<Dataset> {
     let control_session = crate::lance_access::control_session();
     open_manifest_dataset_with_session(root_uri, branch, &control_session).await
 }
 
-pub(super) async fn open_manifest_dataset_with_session(
+pub async fn open_manifest_dataset_with_session(
     root_uri: &str,
     branch: Option<&str>,
     control_session: &Arc<lance::session::Session>,
@@ -80,7 +81,7 @@ pub(super) async fn open_manifest_dataset_with_session(
 /// Open one manifest branch by its NATIVE ref name, skipping resolution.
 /// For callers that already hold a fresh listing (branch-delete's per-branch
 /// dependency probe) and must not pay another per-branch listing.
-pub(super) async fn open_manifest_dataset_native_with_session(
+pub async fn open_manifest_dataset_native_with_session(
     root_uri: &str,
     native: Option<&str>,
     control_session: &Arc<lance::session::Session>,
@@ -112,7 +113,7 @@ pub(super) async fn open_manifest_dataset_native_with_session(
 /// A later recreation is harmless: the returned identifier remains the
 /// witness for this pinned dataset and the coordinator's freshness probe will
 /// observe the new identity.
-pub(super) async fn open_manifest_dataset_with_identifier_with_session(
+pub(crate) async fn open_manifest_dataset_with_identifier_with_session(
     root_uri: &str,
     branch: Option<&str>,
     control_session: &Arc<lance::session::Session>,
@@ -124,7 +125,7 @@ pub(super) async fn open_manifest_dataset_with_identifier_with_session(
 
 /// [`open_manifest_dataset_with_identifier_with_session`] that also returns
 /// the native ref name the logical branch resolved to (`None` for main).
-pub(super) async fn open_manifest_branch_with_identifier(
+pub(crate) async fn open_manifest_branch_with_identifier(
     root_uri: &str,
     branch: Option<&str>,
     control_session: &Arc<lance::session::Session>,
@@ -168,7 +169,7 @@ fn format_table_version(version: u64) -> String {
     format!("{version:020}")
 }
 
-pub(super) fn table_object_id(identity: TableIdentity) -> String {
+pub(crate) fn table_object_id(identity: TableIdentity) -> String {
     format!(
         "table:{:016x}:{:016x}",
         identity.stable_table_id, identity.table_incarnation_id
@@ -177,7 +178,7 @@ pub(super) fn table_object_id(identity: TableIdentity) -> String {
 
 /// Row key of a registration: the identity plus the `__manifest` version that
 /// wrote it (RFC 0062 amends RFC 0028 §4.5's trailing Lance data version).
-pub(super) fn version_object_id(identity: TableIdentity, manifest_version: u64) -> String {
+pub(crate) fn version_object_id(identity: TableIdentity, manifest_version: u64) -> String {
     format!(
         "table_version:{:016x}:{:016x}:{}",
         identity.stable_table_id,
@@ -186,7 +187,7 @@ pub(super) fn version_object_id(identity: TableIdentity, manifest_version: u64) 
     )
 }
 
-pub(super) fn tombstone_object_id(identity: TableIdentity, manifest_version: u64) -> String {
+pub(crate) fn tombstone_object_id(identity: TableIdentity, manifest_version: u64) -> String {
     format!(
         "table_tombstone:{:016x}:{:016x}:{}",
         identity.stable_table_id,
@@ -198,7 +199,7 @@ pub(super) fn tombstone_object_id(identity: TableIdentity, manifest_version: u64
 /// The manifest version a registration or tombstone row key carries: the
 /// trailing segment of `version_object_id` / `tombstone_object_id`, so the
 /// clock is read from the already-projected `object_id` and no column is added.
-pub(super) fn manifest_version_from_object_id(
+pub(crate) fn manifest_version_from_object_id(
     object_id: &str,
     identity: TableIdentity,
     object_type: &str,
@@ -218,20 +219,7 @@ pub(super) fn manifest_version_from_object_id(
         })
 }
 
-pub(super) fn table_id_to_key(request_id: Option<&Vec<String>>) -> lance_namespace::Result<String> {
-    match request_id {
-        Some(request_id) if request_id.len() == 1 && !request_id[0].is_empty() => {
-            Ok(request_id[0].clone())
-        }
-        Some(request_id) => Err(LanceNamespaceError::invalid_input(format!(
-            "expected single table id component, got {:?}",
-            request_id
-        ))),
-        None => Err(LanceNamespaceError::invalid_input("table id is required")),
-    }
-}
-
-pub(super) fn table_uri_for_path(
+pub(crate) fn table_uri_for_path(
     root_uri: &str,
     table_path: &str,
     branch: Option<&str>,
@@ -251,7 +239,7 @@ pub(super) fn table_uri_for_path(
     }
 }
 
-#[cfg(test)]
-pub(super) fn namespace_internal_error(message: impl Into<String>) -> LanceNamespaceError {
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) fn namespace_internal_error(message: impl Into<String>) -> LanceNamespaceError {
     LanceNamespaceError::namespace_source(Box::new(std::io::Error::other(message.into())))
 }

@@ -24,14 +24,14 @@ use object_store::{
 use crate::error::{OmniError, Result};
 
 use super::layout::{
-    namespace_internal_error, open_manifest_dataset_with_session, table_id_to_key,
-    table_uri_for_path,
+    namespace_internal_error, open_manifest_dataset_with_session, table_uri_for_path,
 };
 use super::metadata::{
     TableVersionMetadata, namespace_version_metadata, parse_namespace_version_request,
 };
 use super::publisher::GraphNamespacePublisher;
 use super::state::{DatasetEntry, ManifestState, read_manifest_entries, read_manifest_state};
+use crate::metadata::table_id_to_key;
 
 #[derive(Debug, Clone)]
 struct BranchManifestNamespace {
@@ -155,14 +155,11 @@ impl StagedTableNamespace {
     }
 }
 
-pub(crate) fn branch_manifest_namespace(
-    root_uri: &str,
-    branch: Option<&str>,
-) -> Arc<dyn LanceNamespace> {
+pub fn branch_manifest_namespace(root_uri: &str, branch: Option<&str>) -> Arc<dyn LanceNamespace> {
     Arc::new(BranchManifestNamespace::new(root_uri, branch))
 }
 
-pub(crate) fn staged_table_namespace(
+pub fn staged_table_namespace(
     root_uri: &str,
     table_key: &str,
     table_path: &str,

@@ -261,7 +261,7 @@ where
     // a table queue, causing that mutation to advance Lance HEAD and only then
     // discover the schema lock. The native sentinel remains the cross-handle /
     // crash-visible authority; this queue removes the avoidable same-handle race.
-    let schema_gate_key = crate::db::manifest::schema_apply_serial_queue_key();
+    let schema_gate_key = crate::db::write_queue::schema_apply_serial_queue_key();
     let _schema_gate = db.write_queue().acquire(&schema_gate_key).await;
     acquire_schema_apply_lock(db).await?;
     let result =
