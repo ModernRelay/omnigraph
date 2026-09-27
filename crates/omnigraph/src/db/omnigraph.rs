@@ -4561,6 +4561,8 @@ edge WorksAt: Person -> Company
 
     #[tokio::test]
     async fn test_apply_schema_adds_nullable_property_and_preserves_rows() {
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
@@ -4589,6 +4591,8 @@ edge WorksAt: Person -> Company
 
     #[tokio::test]
     async fn test_apply_schema_renames_property_and_preserves_values() {
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
@@ -4609,6 +4613,8 @@ edge WorksAt: Person -> Company
 
     #[tokio::test]
     async fn test_apply_schema_renames_type_and_preserves_historical_snapshot() {
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
@@ -4636,6 +4642,8 @@ edge WorksAt: Person -> Company
 
     #[tokio::test]
     async fn test_apply_schema_succeeds_after_load() {
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
         // Historical: schema apply used to be blocked by leftover
         // `__run__` branches. The Run state machine was removed in
         // MR-771, so a fresh graph never creates a `__run__` branch;
@@ -4673,6 +4681,8 @@ edge WorksAt: Person -> Company
 
     #[tokio::test]
     async fn test_apply_schema_defers_index_then_reconciler_builds_it() {
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
         // iss-848: schema apply records the @index intent but builds nothing
         // inline; a later ensure_indices materializes it once the table has
         // rows. (Use `age`, which is unindexed in TEST_SCHEMA — `name @key` is
@@ -4713,6 +4723,8 @@ edge WorksAt: Person -> Company
 
     #[tokio::test]
     async fn test_apply_schema_rewrite_defers_index_then_reconciler_restores() {
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
         // iss-848: an AddProperty rewrite writes a new dataset version without
         // rebuilding indexes inline (deferred); ensure_indices restores them.
         let dir = tempfile::tempdir().unwrap();
