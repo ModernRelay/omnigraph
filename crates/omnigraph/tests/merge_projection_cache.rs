@@ -164,10 +164,6 @@ fn repeated_merge_refreshes_projection_incrementally() {
                 io.manifest_reads,
             );
 
-            // Advance the source through a different handle. The measured
-            // handle's cached source is now stale, while its local target
-            // publication remains acknowledged. This keeps the physical-take
-            // cost fence non-vacuous after the local reuse optimization.
             let foreign = helpers::session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
             foreign.mutate(
                 "feature", MUTATION_QUERIES, "set_age",
@@ -180,11 +176,11 @@ fn repeated_merge_refreshes_projection_incrementally() {
             let (outcome, foreign_io) = measure(db.branch_merge("feature", "main")).await;
             assert_eq!(outcome.unwrap(), MergeOutcome::Merged);
             eprintln!("foreign publication refresh: {foreign_io:?}");
-            assert!(foreign_io.projection_incremental_refreshes >= 1);
-            assert_eq!(foreign_io.projection_full_refreshes, 0);
             assert_eq!(
-                foreign_io.projection_identity_rows, 1,
-                "one externally replaced feature head must hydrate one row by physical address",
+                (foreign_io.projection_full_refreshes, foreign_io.projection_identity_rows),
+                (1, 0),
+                "a foreign copy-on-write publish replaces the fragment set, so the refresh is one \
+                 full scan of the one live fragment and hydrates no row by physical address",
             );
             assert!(foreign_io.manifest_reads > 0 && foreign_io.manifest_read_bytes > 0);
             assert!(

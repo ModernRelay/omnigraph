@@ -840,20 +840,18 @@ async fn projection_refresh_matches_clean_full_reopen() {
     }
     let publisher = GraphNamespacePublisher::new(uri, None);
     let control_session = crate::lance_access::control_session();
-    let (mut reader, mut folded_lineage) =
-        ManifestCoordinator::open_with_lineage(uri, None, &control_session)
-            .await
-            .unwrap();
+    let (mut reader, _) = ManifestCoordinator::open_with_lineage(uri, None, &control_session)
+        .await
+        .unwrap();
     let old_head = reader.known_state.graph_heads[MAIN_BRANCH_HEAD_KEY].clone();
 
     for _ in 0..8 {
         publish_empty_commit(&publisher).await.unwrap();
     }
-    let LineageRefresh::Append(delta) = reader.refresh_with_lineage().await.unwrap() else {
-        panic!("append-only history must take the incremental refresh path");
+    let LineageRefresh::Replace(mut folded_lineage) = reader.refresh_with_lineage().await.unwrap()
+    else {
+        panic!("a copy-on-write publish replaces the fragment set, so refresh must replace");
     };
-    assert_eq!(delta.len(), 8, "refresh must return only new lineage rows");
-    folded_lineage.extend(delta);
     assert_ne!(
         reader.known_state.graph_heads[MAIN_BRANCH_HEAD_KEY], old_head,
         "the oracle must exercise mutable graph-head replacement, not only appends"

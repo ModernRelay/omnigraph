@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
@@ -6,6 +6,7 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
 use lance_namespace::LanceNamespace;
 use lance_namespace::models::{
     DescribeTableRequest, DescribeTableVersionRequest, ListTableVersionsRequest,
@@ -26,26 +27,119 @@ use omnigraph_compiler::{
 };
 
 #[test]
-fn publisher_retry_vocabulary_remains_row_level_cas_only() {
-    let row_cas = map_lance_publish_error(lance::Error::too_much_write_contention("contended"));
-    assert!(is_retryable_publish_conflict(&row_cas));
-    assert!(matches!(
-        row_cas,
-        OmniError::Manifest(ManifestError {
-            details: Some(ManifestConflictDetails::RowLevelCasContention),
-            ..
-        })
-    ));
+fn publisher_retry_vocabulary_is_the_version_cas() {
+    for lost in [
+        lance::Error::commit_conflict_source(
+            3,
+            Box::new(std::io::Error::other("next version already written")),
+        ),
+        lance::Error::too_much_write_contention("contended"),
+        lance::Error::retryable_commit_conflict_source(
+            3,
+            Box::new(std::io::Error::other("stale transaction")),
+        ),
+    ] {
+        let lost = map_lance_publish_error(lost);
+        assert!(is_retryable_publish_conflict(&lost));
+        assert!(matches!(
+            lost,
+            OmniError::Manifest(ManifestError {
+                details: Some(ManifestConflictDetails::RowLevelCasContention),
+                ..
+            })
+        ));
+    }
 
-    let generic = map_lance_publish_error(lance::Error::retryable_commit_conflict_source(
-        3,
-        Box::new(std::io::Error::other("stale transaction")),
-    ));
+    let generic = map_lance_publish_error(lance::Error::io_source(Box::new(
+        std::io::Error::other("disk gone"),
+    )));
     assert!(!is_retryable_publish_conflict(&generic));
-    assert_eq!(
-        generic.storage_failure().map(|failure| failure.kind),
-        Some(StorageFailureKind::Precondition)
-    );
+}
+
+/// A foreign append (an old binary's writer) takes the next `__manifest`
+/// version; Lance would rebase an overwrite over it, so only zero retries make
+/// the stale overwrite lose the version CAS instead of dropping the append.
+#[tokio::test]
+async fn stale_overwrite_loses_the_version_cas_without_replacing_the_winner() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let base = open_manifest_dataset(uri, None).await.unwrap();
+    let live_rows = read_publish_scan(&base).await.unwrap().live_rows;
+
+    let append = WriteParams {
+        mode: WriteMode::Append,
+        skip_auto_cleanup: true,
+        ..Default::default()
+    };
+    let winner = InsertBuilder::new(Arc::new(base.clone()))
+        .with_params(&append)
+        .execute(vec![relabelled_manifest_row(
+            &live_rows,
+            "cas_probe:winner",
+        )])
+        .await
+        .unwrap();
+    assert_eq!(winner.version().version, base.version().version + 1);
+
+    let lost = super::commit::overwrite(
+        base,
+        relabelled_manifest_row(&live_rows, "cas_probe:loser"),
+        live_rows,
+    )
+    .await
+    .expect_err("a stale overwrite must not land over the winner");
+    assert!(is_retryable_publish_conflict(&lost), "{lost}");
+
+    let head = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(head.version().version, winner.version().version);
+    let ids = manifest_object_ids(&head).await;
+    assert!(ids.contains("cas_probe:winner"), "{ids:?}");
+    assert!(!ids.contains("cas_probe:loser"), "{ids:?}");
+}
+
+/// One live `__manifest` row under a new `object_id`, so each published image
+/// carries one row that names it.
+fn relabelled_manifest_row(live_rows: &[RecordBatch], object_id: &str) -> RecordBatch {
+    let row = live_rows[0].slice(0, 1);
+    let schema = row.schema();
+    let columns = schema
+        .fields()
+        .iter()
+        .zip(row.columns())
+        .map(|(field, column)| {
+            if field.name() == "object_id" {
+                Arc::new(StringArray::from(vec![object_id])) as arrow_array::ArrayRef
+            } else {
+                column.clone()
+            }
+        })
+        .collect();
+    RecordBatch::try_new(schema, columns).unwrap()
+}
+
+async fn manifest_object_ids(dataset: &Dataset) -> HashSet<String> {
+    let batches: Vec<RecordBatch> = dataset
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    batches
+        .iter()
+        .flat_map(|batch| {
+            super::state::string_column(batch, "object_id")
+                .unwrap()
+                .iter()
+                .flatten()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn test_schema_source() -> &'static str {

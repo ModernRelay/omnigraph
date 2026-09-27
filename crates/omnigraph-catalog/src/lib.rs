@@ -16,6 +16,8 @@ pub(crate) use omnigraph_core::{
 };
 pub mod commit_graph;
 
+mod commit;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 

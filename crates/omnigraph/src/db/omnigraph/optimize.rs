@@ -367,12 +367,6 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
     // data-table stats only; each internal compaction does its own coordinator
     // refresh for cache coherence.
     let mut all = stats.into_iter().map(Ok).collect::<Vec<Result<_>>>();
-    // The only internal system table optimize compacts is `__manifest`: it
-    // accumulates one fragment per commit (both the table-version rows and the
-    // folded-in graph-lineage rows — RFC-013 Phase 7), so a long history leaves
-    // an O(history) scan on every read/write probe until it is compacted. Graph
-    // lineage no longer has its own datasets (`_graph_commits` /
-    // `_graph_commit_actors` are retired), so there is nothing else to compact.
     // `__manifest` is always present (created at init).
     let root = db.root_uri();
     let internal_tables: [(&str, String); 1] =

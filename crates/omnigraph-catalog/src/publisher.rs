@@ -18,11 +18,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::RecordBatchIterator;
 use async_trait::async_trait;
 use lance::Dataset;
 use lance::Error as LanceError;
-use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
 use lance_namespace::NamespaceError;
 #[cfg(any(test, feature = "test-util"))]
 use lance_namespace::models::CreateTableVersionRequest;
@@ -31,6 +29,7 @@ use crate::error::{OmniError, Result};
 
 #[cfg(any(test, feature = "test-util"))]
 use super::DatasetUpdate;
+use super::commit;
 use super::layout::{
     open_manifest_dataset_with_session, table_object_id, tombstone_object_id, version_object_id,
 };
@@ -39,7 +38,7 @@ use super::migrations::guard_stamp;
 use super::state::{
     GraphLineageRow, GraphLineageRowPart, ManifestState, ProjectionAccumulator,
     assemble_manifest_projection, graph_head_object_id, graph_lineage_row_parts, head_lineage_row,
-    manifest_rows_batch, manifest_schema, read_manifest_state, read_publish_scan,
+    manifest_rows_batch, read_manifest_state, read_publish_scan,
 };
 use super::{
     DatasetEntry, ExpectedTableVersions, MAIN_BRANCH_HEAD_KEY, ManifestChange, ManifestIncarnation,
@@ -48,11 +47,9 @@ use super::{
 };
 use crate::seams::{contention, decide_seam, fail};
 
-/// Bound on the publisher-level retry loop that wraps Lance's row-level CAS
-/// (`TooMuchWriteContention`). Lance's own `conflict_retries` is set to 0 in
-/// `merge_rows` because its auto-rebase is "transparent merge" semantics —
-/// wrong for an OCC contract — so retry is owned here instead, where each
-/// iteration re-runs `load_publish_state` and the expected-version pre-check.
+/// Retries around the version CAS of `commit::overwrite`, whose own Lance
+/// retries are 0 (a rebase would be transparent merge, wrong for OCC); each
+/// attempt re-runs `load_publish_state` and the expected-version pre-check.
 const PUBLISHER_RETRY_BUDGET: u32 = 5;
 
 /// The graph-lineage commit to record atomically with a manifest publish
@@ -112,7 +109,7 @@ impl GraphHeadExpectation {
 
 /// Authority checked by the manifest publisher on every CAS attempt.
 ///
-/// `Any` preserves the legacy dispatcher semantics: row-level contention may
+/// `Any` preserves the legacy dispatcher semantics: version-CAS contention may
 /// retry and re-parent a lineage intent. `ExactGraphHead` is the RFC-022
 /// foundation for prepared writes: after contention, any head movement becomes
 /// `ReadSetChanged` rather than a transparent re-parent. Its native branch-id
@@ -211,6 +208,8 @@ struct LoadedPublishState {
     existing_tombstones: HashMap<(TableIdentity, u64), u64>,
     lineage_rows: Vec<GraphLineageRow>,
     graph_heads: HashMap<String, String>,
+    /// The scanned rows, the input of the copy-on-write publish.
+    live_rows: Vec<arrow_array::RecordBatch>,
 }
 
 /// What `fold_inputs` folds a publish batch down to: the alias/path
@@ -229,14 +228,14 @@ decide_seam! {
 }
 
 decide_seam! {
-    /// Before the `__manifest` merge-insert is issued: nothing has landed, and
+    /// Before the `__manifest` overwrite is issued: nothing has landed, and
     /// the failure carries no conflict details, so the publish loop's ambiguity
     /// arm must prove the attempted version absent instead of reporting doubt.
     pub static PUBLISH_PRE_MERGE = ("publish.pre_merge", AnyWrite, [Fail]);
 }
 
 decide_seam! {
-    /// After the `__manifest` merge-insert committed durably and before the
+    /// After the `__manifest` overwrite committed durably and before the
     /// publisher acknowledges it: the graph is already published and visible,
     /// only the caller's acknowledgement is at risk (the lost-ack window). A
     /// failure here models a dropped acknowledgement of a durable commit; the
@@ -328,6 +327,7 @@ impl GraphNamespacePublisher {
             existing_tombstones,
             lineage_rows: scan.lineage_rows,
             graph_heads: scan.graph_heads,
+            live_rows: scan.live_rows,
         })
     }
 
@@ -880,11 +880,9 @@ impl GraphNamespacePublisher {
         Ok(())
     }
 
-    /// Check authority inside the publisher retry loop before pending rows are
-    /// built. The graph head comes from the SAME scan used to build this CAS
-    /// attempt; Lance's native branch identifier is re-read from the ref. Thus a
-    /// row-level-CAS loser with an exact expectation cannot silently re-parent
-    /// on its next attempt.
+    /// Check authority against this attempt's own scan (graph head) and ref
+    /// (native branch id) before pending rows are built, so a CAS loser with an
+    /// exact expectation cannot silently re-parent on its next attempt.
     async fn check_publish_precondition(
         &self,
         dataset: &Dataset,
@@ -962,39 +960,21 @@ impl GraphNamespacePublisher {
         Ok(())
     }
 
-    async fn merge_rows(&self, dataset: Dataset, rows: Vec<PendingVersionRow>) -> Result<Dataset> {
+    async fn merge_rows(
+        &self,
+        dataset: Dataset,
+        rows: Vec<PendingVersionRow>,
+        live_rows: Vec<arrow_array::RecordBatch>,
+    ) -> Result<Dataset> {
         fail(&PUBLISH_PRE_MERGE)?;
-        let batch = Self::pending_rows_to_batch(rows)?;
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], manifest_schema());
-        let dataset = Arc::new(dataset);
-        let mut merge_builder = MergeInsertBuilder::try_new(dataset, vec!["object_id".to_string()])
-            .map_err(OmniError::lance_internal)?;
-        merge_builder.when_matched(WhenMatched::UpdateAll);
-        merge_builder.when_not_matched(WhenNotMatched::InsertAll);
-        // 0 here is intentional: Lance's built-in retry uses transparent rebase,
-        // which would let a concurrent writer's row land alongside ours and
-        // silently break the OCC contract on `__manifest`. Retries are owned by
-        // the publisher loop above, where each attempt re-runs the pre-check.
-        merge_builder.conflict_retries(0);
-        merge_builder.use_index(false);
-        // Skip Lance's auto-cleanup hook: `__manifest` versions are the snapshot
-        // / time-travel authority and must never be GC'd by Lance's per-commit
-        // hook. A `__manifest` created before the v7 bump (6.0.1 defaulted
-        // auto_cleanup ON) still carries the stored config, so this skip is
-        // load-bearing on upgraded graphs, not just defensive.
-        merge_builder.skip_auto_cleanup(true);
-        let (new_dataset, _stats) = merge_builder
-            .try_build()
-            .map_err(OmniError::lance_internal)?
-            .execute_reader(Box::new(reader))
-            .await
-            .map_err(map_lance_publish_error)?;
+        let pending = Self::pending_rows_to_batch(rows)?;
+        let new_dataset = commit::overwrite(dataset, pending, live_rows).await?;
         // The commit is durable and the graph is published; a failure here
         // models the acknowledgement being lost after that (RFC 0067). It is
         // an opaque error with no conflict details, so the publish loop's
         // ambiguity arm reads the manifest back rather than reporting failure.
         fail(&PUBLISH_POST_MERGE_PRE_ACK)?;
-        Ok(Arc::try_unwrap(new_dataset).unwrap_or_else(|arc| (*arc).clone()))
+        Ok(new_dataset)
     }
 
     #[cfg(any(test, feature = "test-util"))]
@@ -1050,26 +1030,21 @@ fn lineage_part_to_pending(part: GraphLineageRowPart) -> PendingVersionRow {
     }
 }
 
-/// `Error::TooMuchWriteContention` from Lance's row-level CAS bubbles up here
-/// when a concurrent writer landed a row with the same `object_id` (the
-/// merge-insert join key, annotated as an unenforced primary key on
-/// `__manifest`). Translate it to a typed manifest conflict so callers can
-/// match without parsing strings; everything else is opaque storage.
-///
-/// Shared (`pub`) with the v3→v4 lineage backfill
-/// (`state::merge_lineage_rows`), which issues its own `__manifest` merge-insert
-/// outside the publisher and must surface the SAME typed
-/// `RowLevelCasContention` so the migration's re-open retry loop can recognize a
-/// CAS loss. This is the merge-insert (`execute_reader`) conflict vocabulary
-/// only. It is deliberately NOT `optimize::is_retryable_lance_conflict`: that one
-/// also matches `CommitConflict`/`RetryableCommitConflict` from the COMPACTION
-/// commit path (`compact_files` -> `apply_commit`), which a row-level merge-insert
-/// never emits — folding it in here would match impossible variants.
+/// The conflict vocabulary of the `__manifest` version CAS (`commit::overwrite`,
+/// a zero-retry Lance commit): the attempted version already exists, so this
+/// attempt landed nothing. Lance reports that as `CommitConflict`,
+/// `RetryableCommitConflict` or `TooMuchWriteContention`; each becomes the typed
+/// `RowLevelCasContention` the publish loop re-prepares on, so callers match
+/// without parsing strings. Everything else is opaque storage.
 pub fn map_lance_publish_error(err: LanceError) -> OmniError {
-    if matches!(err, LanceError::TooMuchWriteContention { .. }) {
+    if matches!(
+        err,
+        LanceError::CommitConflict { .. }
+            | LanceError::RetryableCommitConflict { .. }
+            | LanceError::TooMuchWriteContention { .. }
+    ) {
         return OmniError::manifest_row_level_cas_contention(format!(
-            "manifest publish lost a row-level CAS race: {}",
-            err
+            "manifest publish lost the version CAS: {err}"
         ));
     }
     OmniError::storage(err)
@@ -1141,6 +1116,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 existing_tombstones,
                 lineage_rows,
                 graph_heads,
+                live_rows,
             } = loaded;
 
             // Exact logical authority is checked on EVERY attempt from this
@@ -1234,7 +1210,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 fold_graph_heads,
             )?;
 
-            match self.merge_rows(dataset.clone(), rows).await {
+            match self.merge_rows(dataset.clone(), rows, live_rows).await {
                 Ok(new_dataset) => {
                     if new_dataset.version().version != new_manifest_version {
                         return Err(OmniError::manifest_internal(format!(
@@ -1259,7 +1235,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                     }
                     // Ambiguity resolution (RFC 0067): a typed conflict (details
                     // present) definitively did not land — surface it. An opaque
-                    // error may instead mean the `__manifest` merge-insert landed
+                    // error may instead mean the `__manifest` overwrite landed
                     // durably and only its acknowledgement was lost (a dropped S3
                     // 200), in which case the write is already graph-visible.
                     // Since the stable lineage commit id is durably written into
@@ -1370,9 +1346,9 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
     }
 }
 
-/// A retryable conflict here means: Lance's row-level CAS rejected our commit
-/// because someone else landed an `object_id` we were also inserting (mapped
-/// from `Error::TooMuchWriteContention` to
+/// A retryable conflict here means: the `__manifest` version CAS rejected our
+/// commit because another writer landed the version we attempted (mapped by
+/// `map_lance_publish_error` to
 /// `ManifestConflictDetails::RowLevelCasContention`). This is transparent
 /// contention; if the caller's `expected_table_versions` still holds against
 /// the new manifest state, we re-attempt. Other conflict variants (notably
