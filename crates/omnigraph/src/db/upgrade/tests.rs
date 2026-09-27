@@ -179,12 +179,12 @@ async fn restamp_all_manifests(root: &str, stamp: u32) {
         .collect();
     for native in refs {
         let mut branch = main.checkout_branch(&native).await.unwrap();
-        super::super::migrations::set_stamp_for_test(&mut branch, stamp)
+        crate::db::manifest::migrations::set_stamp_for_test(&mut branch, stamp)
             .await
             .unwrap();
     }
     let mut main = open(root, None).await.unwrap();
-    super::super::migrations::set_stamp_for_test(&mut main, stamp)
+    crate::db::manifest::migrations::set_stamp_for_test(&mut main, stamp)
         .await
         .unwrap();
 }
@@ -982,11 +982,11 @@ async fn storage_upgrade_preserves_prior_v6_to_v7_pending_intent_before_continui
             .snapshot_at_graph_manifest_version(source_version + 1)
             .await
             .unwrap();
-        assert_eq!(fence.version, source_version + 1);
-        assert_eq!(fence.graph_heads, before_fence.graph_heads);
-        assert_eq!(fence.entries.len(), before_fence.entries.len());
-        for (key, entry) in &before_fence.entries {
-            assert!(fence.entries[key].same_registration(entry));
+        assert_eq!(fence.raw().version, source_version + 1);
+        assert_eq!(fence.raw().graph_heads, before_fence.raw().graph_heads);
+        assert_eq!(fence.raw().entries.len(), before_fence.raw().entries.len());
+        for (key, entry) in &before_fence.raw().entries {
+            assert!(fence.raw().entries[key].same_registration(entry));
         }
         drop(reopened);
     }

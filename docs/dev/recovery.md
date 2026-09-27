@@ -32,7 +32,7 @@ carries `transaction_uuid`, nothing replays the commit onto the table's
 linear history, and the linear HEAD stays at the table's creation version.
 Each registration records that stopping point as
 `omnigraph.last_linear_version` (`TableVersionMetadata`,
-`db/manifest/metadata.rs`); a row at or below it that names no
+`crates/omnigraph-core/src/metadata.rs`); a row at or below it that names no
 `staged_version` is a linear pin and opens as before. A crash after the CAS
 leaves a table effect nothing to finish, so no writer, `cleanup` or open runs
 a reconciler over pins.

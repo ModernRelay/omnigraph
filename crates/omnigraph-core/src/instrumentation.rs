@@ -1,0 +1,2109 @@
+//! Read/write cost instrumentation (test and benchmark seam).
+//!
+//! Two boundary instruments let cost-budget tests assert that a warm read does
+//! no redundant IO, the way LanceDB's IO-counted tests do (see
+//! `docs/dev/testing.md`, "Cost-budget tests"):
+//!
+//! - **Lance object store** — a per-query [`WrappingObjectStore`] attached to the
+//!   datasets a query opens, so a test counts real `read_iops`. Delivered through
+//!   a task-local ([`QueryIoProbes`]) set by the test; production leaves it unset,
+//!   so the open helpers attach nothing (one unset-`Option` check per open).
+//! - **omnigraph `StorageAdapter`** — [`CountingStorageAdapter`], a decorator that
+//!   counts per-method calls (the schema-contract reads on the query path).
+//! - **branch merge** — [`MergeWriteProbes`] reports structural route counters
+//!   and completed timing intervals without reading the clock when unset.
+//!
+//! The probes themselves only observe, and the decorator delegates every call.
+//! The shared dataset opener also supplies the process control session when a
+//! caller has no graph-scoped data session, so detached opens still reuse the
+//! process object-store registry without caching mutable metadata. `IOTracker`
+//! (the concrete counter) lives in tests via the `lance-io` dev-dependency; this
+//! module stays generic over the `lance::io`-re-exported trait, so it adds no
+//! production dependency.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use async_trait::async_trait;
+use lance::Dataset;
+use lance::dataset::builder::DatasetBuilder;
+use lance::io::WrappingObjectStore;
+
+use crate::error::{OmniError, Result};
+use crate::storage::{ListDirBounds, StorageAdapter};
+
+#[macro_export]
+macro_rules! declare_engine_cargo_features {
+    ($($feature:literal),+ $(,)?) => {
+        /// Every Cargo feature declared by `omnigraph-engine`.
+        ///
+        /// Benchmark admission compares this registry to the crate manifest
+        /// captured by its build script. Adding a Cargo feature without adding
+        /// it here therefore fails closed instead of collapsing two builds into
+        /// one benchmark identity.
+        #[doc(hidden)]
+        pub const fn declared_engine_cargo_features() -> &'static [&'static str] {
+            &[$($feature),+]
+        }
+
+        /// Cargo features compiled into this exact `omnigraph-engine` artifact.
+        ///
+        /// This read-only build seam lets benchmark and diagnostic binaries
+        /// report dependency features from the crate that owns them. A
+        /// dependent crate's `cfg(feature = ...)` namespace cannot observe
+        /// features enabled directly on `omnigraph-engine` by Cargo's workspace
+        /// feature graph.
+        #[doc(hidden)]
+        pub const fn enabled_engine_cargo_features() -> &'static [&'static str] {
+            &[
+                $(
+                    #[cfg(feature = $feature)]
+                    $feature,
+                )+
+            ]
+        }
+    };
+}
+
+/// The distinct Lance `ObjectStore`s one probe plane opened datasets on.
+#[derive(Clone, Default)]
+pub struct ProbedStores(Arc<Mutex<Vec<Arc<lance::io::ObjectStore>>>>);
+
+impl ProbedStores {
+    fn register(&self, store: Arc<lance::io::ObjectStore>) {
+        let mut stores = self.0.lock().unwrap();
+        if !stores.iter().any(|known| Arc::ptr_eq(known, &store)) {
+            stores.push(store);
+        }
+    }
+
+    pub fn stores(&self) -> Vec<Arc<lance::io::ObjectStore>> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// Per-query IO probes, installed for a query's task via [`with_query_io_probes`].
+///
+/// Each wrapper is attached (when present) to the datasets that category opens,
+/// so a test reads `read_iops` off its own `IOTracker` handle. `probe_count`
+/// records calls to the version probe (which runs on the coordinator's already-open
+/// handle, so it is counted by invocation rather than by the per-query wrappers).
+#[derive(Clone, Default)]
+pub struct QueryIoProbes {
+    pub manifest_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+    /// Attached to the per-table data opens a query performs (the cache-miss
+    /// path in `DatasetEntry::open`). Lets a cost test assert how many tables
+    /// a query actually opened — N on a cold read, 0 on a warm repeat once the
+    /// handle cache (Fix 3) serves them.
+    pub table_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+    pub probe_count: Arc<AtomicU64>,
+    /// Counts DATA-table open CALLS through the one instrumented chokepoint
+    /// (`open_dataset`), classified by URI so the
+    /// internal/system tables (`__manifest`) are EXCLUDED — the publisher CAS
+    /// opens those every write, and counting them would make the
+    /// `data_open_count <= |touched_tables|` write gate
+    /// (RFC-013 step 3b) unreachable by threading alone. Unlike the opener-read
+    /// term (which mixes with the merge-insert/RI scan on the write path), this is
+    /// an exact open-invocation count. `forbidden_apis` keeps engine code OUTSIDE the
+    /// storage layer (`exec/`, `db/omnigraph/`, `loader/`, `changes/`) from opening
+    /// datasets except through these chokepoints, so the count is complete for the
+    /// keyed-write data path the gate measures. (Since the dataset-opener
+    /// unification, `table_store.rs`'s branch-management ops also route through
+    /// the one chokepoint, so the count covers them too.)
+    pub data_open_count: Arc<AtomicU64>,
+    /// Internal/system-table (`__manifest`) open CALLS — the complement of
+    /// `data_open_count`, kept for symmetry and debugging.
+    pub internal_open_count: Arc<AtomicU64>,
+    /// Full `__manifest` row-scan invocations. Counted at the shared state scan
+    /// and the dedicated lineage scan, so a coordinator that opens one handle
+    /// but scans state and lineage separately still reports two.
+    pub manifest_scan_count: Arc<AtomicU64>,
+    /// Counts topology-index builds (the `RuntimeCache::graph_index` cache-miss
+    /// path). A cost test asserts a fresh branch whose edge tables are unchanged
+    /// from main reuses main's cached index (0 builds) rather than rebuilding it.
+    pub graph_build_count: Arc<AtomicU64>,
+    /// Mid-traversal Indexed→CSR switches (the per-hop re-decision firing).
+    /// Lets the switch tests assert the mechanism actually ran — mode
+    /// equivalence alone stays green with the switch disabled.
+    pub traversal_mid_switches: Arc<AtomicU64>,
+    /// Path commitments per Expand: the indexed scan, the CSR walk chosen up
+    /// front, or the CSR walk switched to mid-traversal (an Expand that
+    /// switches counts once on each). A logic test pinned with
+    /// `# traversal:` asserts the other path's counter stayed zero and, for
+    /// a query that expands, the pinned one moved: the pin is a task-local
+    /// override, and mode equivalence alone cannot see a pin the executor
+    /// ignored or a scope that dropped it.
+    pub expand_indexed_runs: Arc<AtomicU64>,
+    pub expand_csr_runs: Arc<AtomicU64>,
+    /// Expand emissions stopped early by a pushed-down `limit` cap. Same
+    /// rationale: capped-subset validity alone cannot prove the cap fired.
+    pub expand_cap_stops: Arc<AtomicU64>,
+    /// Edge tables included in topology builds this query (summed over build
+    /// invocations). A cost test asserts a query referencing one edge builds only
+    /// that edge, not every catalog edge (the cold-build shrink A2 ships).
+    pub graph_edges_built: Arc<AtomicU64>,
+    /// IR filters lowered into a scan-level DataFusion `filter_expr` (summed
+    /// over `build_lance_filter_expr` calls). Lets a test assert a standalone
+    /// string-match predicate was HOISTED into the NodeScan (where Lance can
+    /// probe a covering index) rather than silently degrading to the
+    /// in-memory arm — a result-only assertion passes either way.
+    pub pushed_filter_exprs: Arc<AtomicU64>,
+    /// Filters evaluated by the in-memory arm (`projection.rs::apply_filter`),
+    /// the complement of `pushed_filter_exprs` for hoist assertions.
+    pub in_memory_filters: Arc<AtomicU64>,
+    /// Commits the change-feed poll walked into its first-parent chain (the
+    /// `chain_after` head→cursor clone). This is the CPU/allocation term that
+    /// grows with the *backlog* even when the page ceiling is small, and it is
+    /// invisible to the manifest/data IO counters — a cost test asserts it so a
+    /// future forward-child projection (the bounded-visit fix) is measurable.
+    pub feed_commits_visited: Arc<AtomicU64>,
+    /// Adjacent-version transaction files read while classifying CDC candidate
+    /// intervals. Wider intervals must fall back before incrementing this
+    /// counter, keeping stateless tiny-page resumes constant in history depth.
+    pub candidate_transaction_reads: Arc<AtomicU64>,
+    /// Manifest fragment entries compared or validated while deriving a CDC
+    /// candidate plan. This exposes the metadata CPU term that object-store I/O
+    /// counters cannot see.
+    pub candidate_fragment_metadata_steps: Arc<AtomicU64>,
+    /// Candidate child rows pulled by the pruned emitter. A max-changes=1 page
+    /// over all-changing rows should inspect only the emitted row plus one
+    /// continuation sentinel.
+    pub candidate_rows_examined: Arc<AtomicU64>,
+    /// Largest row/byte scanner target requested by a candidate emitter in the
+    /// measured operation. Both are maxima (not sums) because parent and child
+    /// streams use the same current-page target.
+    pub candidate_scan_target_rows_peak: Arc<AtomicU64>,
+    pub candidate_scan_target_bytes_peak: Arc<AtomicU64>,
+    /// Complete logical change images materialized (and therefore eligible to
+    /// read managed Blob payloads). A continuation sentinel must not increment
+    /// this counter.
+    pub change_images_materialized: Arc<AtomicU64>,
+    /// Manifest-projection refreshes served by the incremental projection fold
+    /// (only appended catalog fragments read) vs the full O(history) scan.
+    /// Cost tests assert the incremental path engages so a silent
+    /// always-full-scan regression is structurally visible.
+    pub projection_incremental_refreshes: Arc<AtomicU64>,
+    pub projection_full_refreshes: Arc<AtomicU64>,
+    /// Physical manifest rows hydrated to classify deletion-vector deltas.
+    /// This must equal the newly deleted offset count; a fragment scan would
+    /// make it grow with the compacted catalog's history instead.
+    pub projection_identity_rows: Arc<AtomicU64>,
+    /// Pre-effect reprepares `Omnigraph::mutate` took after a `ReadSetChanged`
+    /// (bounded by `MAX_PRE_EFFECT_REPREPARES`). The caller sees only the
+    /// exhaustion of that loop, so this is the one view of the attempts behind
+    /// an acknowledged write.
+    pub mutation_reprepares: Arc<AtomicU64>,
+    /// The Lance `ObjectStore`s behind the opens that carried
+    /// `manifest_wrapper` / `table_wrapper`. A store's own `io_tracker` also
+    /// sees Lance's direct local reader and writer, which on `file://` never
+    /// reach a `WrappingObjectStore`; read it for backend-complete counts.
+    pub manifest_stores: ProbedStores,
+    pub table_stores: ProbedStores,
+    /// Uncapped retries taken after a capped BM25 scan under-filled. Only a
+    /// standalone `bm25()` ordering carries a cap (`rrf()` arms are never
+    /// capped — see `execute_rrf_fusion`); its capped and uncapped runs are
+    /// result-identical up to score ties at the cap boundary (the capped
+    /// scan is the uncapped scan's score prefix), so result assertions
+    /// cannot see the cap; this counter and `bm25_scan_rows` below are how
+    /// tests assert it actually engaged.
+    pub bm25_uncapped_retries: Arc<AtomicU64>,
+    /// Rows returned by BM25-ranked scans, summed over scans (capped and
+    /// uncapped passes alike). Lets a test pin the cap's MAGNITUDE — a factor
+    /// regression changes this count while every result assertion still
+    /// passes.
+    pub bm25_scan_rows: Arc<AtomicU64>,
+    /// Rescans taken at the scan site after a maximum-bounded nearest scan
+    /// returned fewer than `k` rows with partitions left unsearched (the
+    /// probe ladder in `execute_node_scan`). Every scan of a nearest target
+    /// counts, RRF arms included.
+    pub ann_rescans: Arc<AtomicU64>,
+    /// The subset of `ann_rescans` that reran the scan as Lance's flat exact
+    /// kNN (`use_index(false)`) because the IVF scan held rows at
+    /// `_distance = +inf`: a pushed prefilter admitted fewer rows than `k`
+    /// and Lance emitted the admitted rows its probes never reached without
+    /// a distance, so the batches were out of `nearest` order (the ladder
+    /// comment in `execute_node_scan`). A scan that the engine ran flat from
+    /// the start (the gate's `id IN` list at most `k` long) is not a rescan
+    /// and increments neither.
+    pub ann_flat_rescans: Arc<AtomicU64>,
+    /// Requested maximum probe budget of the most recent nearest scan. Zero
+    /// represents no maximum (the ladder's last rung, the overfetch loop's
+    /// exact pass, or the setting `ann_nprobes = 0`). Lance applies the value per
+    /// index delta, so the partitions read may be a multiple.
+    pub ann_max_nprobes: Arc<AtomicU64>,
+    /// Rows the most recent nearest scan returned (its `k` when full).
+    pub ann_scan_rows: Arc<AtomicU64>,
+    /// `partitions_searched` of the most recent nearest scan, summed over
+    /// index deltas as Lance reports it through `scan_stats_callback`; left
+    /// untouched by a scan whose summary carried no partition counters (a
+    /// flat scan).
+    pub ann_partitions_searched: Arc<AtomicU64>,
+    /// `partitions_ranked` of the same scan (partition count summed over
+    /// index deltas).
+    pub ann_partitions_ranked: Arc<AtomicU64>,
+    /// `partitions_searched` of every nearest scan in scope order: one entry
+    /// per rung of every ladder, RRF arms included, so a test can read how
+    /// many partitions each rescan actually touched.
+    pub ann_rung_partitions_searched: Arc<Mutex<Vec<u64>>>,
+    /// Capped nearest scans that ended short of `k` without a usable Lance
+    /// execution summary (`scan_stats_callback` never fired, or exactly one
+    /// of the `partitions_searched` / `partitions_ranked` counters was
+    /// absent). Counts the ladder's fail-closed uncapped rescans; the
+    /// rationale for failing closed is the ladder comment in
+    /// `execute_node_scan`. A flat scan (summary fired, neither counter present) is
+    /// exhaustion, not a missing summary, and never increments this.
+    pub ann_summary_missing: Arc<AtomicU64>,
+    /// Query-level reruns with a larger `k` (×4, ×16, then the exact pass)
+    /// after a FULL nearest scan was cut short of `limit` by a later operator
+    /// (`execute_query`).
+    pub ann_overfetches: Arc<AtomicU64>,
+    /// Exact passes of the overfetch loop: the 16 × `k` scan was full and
+    /// the answer still short, so the query reran flat over every live row
+    /// of the type. Says nothing about whether the pass filled `limit`; a
+    /// scan that was not full never reaches it.
+    pub ann_exact_passes: Arc<AtomicU64>,
+    /// Plan verdicts recorded by the rrf prefilter gate
+    /// (`execute_rrf_fusion`), one per rrf execution in scope order. The
+    /// gate's two plans are answer-identical by design, so a gate that
+    /// silently always falls back to postfilter passes every result-level
+    /// test — admission and fence tests assert on this probe instead.
+    pub rrf_gate_verdicts: Arc<Mutex<Vec<RrfGateVerdict>>>,
+    /// Plan verdicts recorded by the nearest prefilter gate
+    /// (`nearest_prefilter_gate`), one per standalone `nearest` query whose
+    /// pipeline holds a top-level Expand leaving the ranked variable (a plain
+    /// nearest records none), in scope order; same record shape as the rrf
+    /// gate's. The prefiltered plan returns at least as many rows as the
+    /// unfiltered one when no operator above the Expand drops eligible rows
+    /// (the relation is `nearest_prefilter_gate`'s doc), and the same rows on
+    /// a single-partition fixture, so a gate that silently always falls back
+    /// passes every small-fixture result test: admission tests assert on this
+    /// probe.
+    pub ann_prefilter_verdicts: Arc<Mutex<Vec<RrfGateVerdict>>>,
+    /// The projection handed to `Scanner::project` by every NodeScan in scope
+    /// order (`execute_node_scan`): `None` when the scan took every column,
+    /// else the exact column list, including `_distance`/`_score` on a search
+    /// scan. Lets a test pin that a pruned search scan reads only its needed
+    /// columns and names Lance's scoring column explicitly.
+    pub node_scan_projections: Arc<Mutex<Vec<Option<Vec<String>>>>>,
+    /// Misses of `ReadCaches::accepted_catalog`, counted in
+    /// `Omnigraph::build_accepted_catalog_with_schema_gate_held`.
+    pub catalog_builds: Arc<AtomicU64>,
+    /// Misses of `ReadCaches::compiled_queries`, counted in
+    /// `Omnigraph::compile_named_query`.
+    pub query_compiles: Arc<AtomicU64>,
+    /// Full-text validations entered (`TableStore::validate_full_text_demand`):
+    /// scans with a full-text query, a SQL-string filter, or a `contains_tokens`
+    /// demand in a typed filter; other scans record nothing.
+    pub fts_validations: Arc<AtomicU64>,
+}
+
+/// The two candidate plans of the rrf prefilter gate. Over FTS-index-covered
+/// data and up to BM25 score ties they are answer-identical — the eligible-set
+/// cardinality decides cost only (`execute_rrf_fusion`'s gate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RrfGatePlan {
+    /// Selective plan: the uncapped bm25 arms rank only the traversal's
+    /// eligible ids (`id IN (...)` under `prefilter(true)`).
+    Prefilter,
+    /// Broad plan: the uncapped corpus-wide arms (v0.9 rrf semantics).
+    Postfilter,
+}
+
+/// Why the gate ran the postfilter plan. `None` on the verdict means the
+/// prefilter plan won naturally (or was forced).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RrfGateFallback {
+    /// Eligible set too large for the ratio or absolute-id-count threshold.
+    Threshold,
+    /// Query shape outside the admission table (no top-level Expand
+    /// constrains the ranked variable, the ranked variable is an Expand dst,
+    /// arms target different variables, or no bm25 arm exists).
+    Shape,
+    /// The ranked table's FTS index does not cover every fragment, so a
+    /// prefilter mask could change BM25 scores (filter-dependent scoring of
+    /// uncovered fragments) — a correctness fence, never overridden.
+    Coverage,
+    /// The graph index could not be built or is misaligned; a query must
+    /// never fail because an optimization could not start.
+    BuildErr,
+    /// The eligible set is empty: the postfilter plan yields the same empty
+    /// join and `IN ()` edge semantics never arise (correctness fence).
+    EmptyEligible,
+    /// The setting `rrf_plan = force_postfilter` chose.
+    Forced,
+}
+
+/// One rrf prefilter-gate decision, recorded via the `rrf_gate_verdicts`
+/// probe. `eligible`/`corpus` are `None` when the gate fell back before
+/// counting (forced postfilter, shape, coverage, build error).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RrfGateVerdict {
+    pub plan: RrfGatePlan,
+    pub fallback: Option<RrfGateFallback>,
+    /// A force was active for this decision (the threshold was not
+    /// consulted). NOT "the force won": a forced prefilter can still fall
+    /// back at a correctness fence — then `plan` is `Postfilter`, `fallback`
+    /// names the fence, and this stays `true`.
+    pub forced: bool,
+    /// |eligible| from the CSR degree walk (count only — ids are not built
+    /// unless the prefilter plan is chosen).
+    pub eligible: Option<u64>,
+    /// The ranked node type's manifest-resident `entity_count`.
+    pub corpus: Option<u64>,
+}
+
+tokio::task_local! {
+    static QUERY_IO_PROBES: QueryIoProbes;
+}
+
+/// Run `fut` with per-query IO probes installed. Test-only entry point; nothing
+/// in production sets the probes, so the accessors below return `None`/no-op.
+pub async fn with_query_io_probes<F>(probes: QueryIoProbes, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    QUERY_IO_PROBES.scope(probes, fut).await
+}
+
+/// Capture the observer before moving query work to a blocking task. That task
+/// reinstalls it with `with_query_io_probes`; Tokio does not inherit task locals.
+pub fn capture_query_io_probes() -> Option<QueryIoProbes> {
+    QUERY_IO_PROBES.try_with(Clone::clone).ok()
+}
+
+fn current<R>(f: impl FnOnce(&QueryIoProbes) -> R) -> Option<R> {
+    QUERY_IO_PROBES.try_with(f).ok()
+}
+
+tokio::task_local! {
+    static QUERY_MEMORY_LIMIT: u64;
+}
+
+/// Run `fut` with the engine v2 read route's memory pool capped at `bytes`
+/// for every query it runs. Test-only entry point; nothing in production
+/// sets it, so the pool takes its constant.
+pub async fn with_query_memory_limit<F>(bytes: u64, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    QUERY_MEMORY_LIMIT.scope(bytes, fut).await
+}
+
+/// The pool cap a test installed for this task, if any; `None` in production.
+pub fn query_memory_limit() -> Option<u64> {
+    QUERY_MEMORY_LIMIT.try_with(|bytes| *bytes).ok()
+}
+
+/// Reservations and execution metrics observed by v2 acceptance tests.
+/// Holding a pool here keeps the observer alive without retaining reservations.
+#[derive(Clone, Debug, Default)]
+pub struct QueryMemoryProbes {
+    pools: Arc<Mutex<Vec<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>>>,
+    metrics: Arc<Mutex<Vec<QueryExecutionMetrics>>>,
+    ladder_reports: Arc<Mutex<Vec<QueryLadderReport>>>,
+    blocking_started: Arc<AtomicU64>,
+    active_blocking: Arc<AtomicU64>,
+    refusals: Arc<Mutex<Vec<String>>>,
+    pause: Arc<Mutex<Option<Arc<QueryBlockingPause>>>>,
+}
+
+/// A completed DataFusion node's metrics, captured before its plan is dropped.
+#[derive(Clone, Debug)]
+pub struct QueryExecutionMetrics {
+    pub operator: String,
+    pub spill_count: usize,
+    pub spilled_rows: usize,
+    pub spilled_bytes: usize,
+    pub output_rows: usize,
+    pub values: std::collections::BTreeMap<String, usize>,
+}
+
+impl QueryMemoryProbes {
+    pub fn reserved_bytes(&self) -> usize {
+        self.pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|pool| pool.reserved())
+            .sum()
+    }
+
+    pub fn pools_created(&self) -> usize {
+        self.pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    pub fn blocking_started(&self) -> u64 {
+        self.blocking_started.load(Ordering::SeqCst)
+    }
+
+    pub fn active_blocking_work(&self) -> u64 {
+        self.active_blocking.load(Ordering::SeqCst)
+    }
+
+    pub fn refusals(&self) -> Vec<String> {
+        self.refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn record_refusal(&self, name: &str) {
+        self.refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(name.to_string());
+    }
+
+    /// Pause a blocking body's first charged-work checkpoint. The bounded wait
+    /// prevents an incorrectly inline body from hanging the test runtime.
+    #[doc(hidden)]
+    pub fn pause_blocking_work(&self) -> QueryBlockingPauseGuard {
+        let pause = Arc::new(QueryBlockingPause::default());
+        *self
+            .pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&pause));
+        QueryBlockingPauseGuard(pause)
+    }
+
+    pub fn ladder_reports(&self) -> Vec<QueryLadderReport> {
+        self.ladder_reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn execution_metrics(&self) -> Vec<QueryExecutionMetrics> {
+        self.metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+tokio::task_local! {
+    static QUERY_MEMORY_PROBES: QueryMemoryProbes;
+}
+
+/// Observe pools, blocking bodies, and completed plan metrics within `fut`.
+pub async fn with_query_memory_probes<F>(probes: QueryMemoryProbes, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    QUERY_MEMORY_PROBES.scope(probes, fut).await
+}
+
+#[derive(Debug, Default)]
+struct QueryBlockingPause {
+    released: Mutex<bool>,
+    wake: std::sync::Condvar,
+    entered: AtomicU64,
+    waiting: AtomicU64,
+}
+
+/// Releases the test checkpoint even when an assertion unwinds.
+#[doc(hidden)]
+pub struct QueryBlockingPauseGuard(Arc<QueryBlockingPause>);
+
+impl QueryBlockingPauseGuard {
+    pub fn entered(&self) -> bool {
+        self.0.entered.load(Ordering::SeqCst) > 0
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.0.waiting.load(Ordering::SeqCst) > 0
+    }
+
+    pub fn release(&self) {
+        *self
+            .0
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.0.wake.notify_all();
+    }
+}
+
+impl Drop for QueryBlockingPauseGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+pub fn current_query_memory_probes() -> Option<QueryMemoryProbes> {
+    QUERY_MEMORY_PROBES.try_with(Clone::clone).ok()
+}
+
+/// Facts consumed by the query-level nearest overfetch decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueryLadderReport {
+    pub rows: usize,
+    pub k: usize,
+    pub maximum_nprobes: Option<usize>,
+    pub exhausted: bool,
+    pub dataset_rows: u64,
+}
+
+pub fn record_query_ladder_report(report: QueryLadderReport) {
+    let _ = QUERY_MEMORY_PROBES.try_with(|probes| {
+        probes
+            .ladder_reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(report);
+    });
+}
+
+pub fn record_query_memory_pool(pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>) {
+    let _ = QUERY_MEMORY_PROBES.try_with(|probes| {
+        probes
+            .pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Arc::clone(pool));
+    });
+}
+
+fn query_operator_metrics(
+    node: &dyn datafusion::physical_plan::ExecutionPlan,
+) -> Option<QueryExecutionMetrics> {
+    node.metrics().map(|metrics| QueryExecutionMetrics {
+        operator: node.name().to_string(),
+        spill_count: metrics.spill_count().unwrap_or(0),
+        spilled_rows: metrics.spilled_rows().unwrap_or(0),
+        spilled_bytes: metrics.spilled_bytes().unwrap_or(0),
+        output_rows: metrics.output_rows().unwrap_or(0),
+        values: metrics
+            .iter()
+            .fold(std::collections::BTreeMap::new(), |mut values, metric| {
+                *values.entry(metric.value().name().to_string()).or_default() +=
+                    metric.value().as_usize();
+                values
+            }),
+    })
+}
+
+pub fn record_query_execution_metrics(root: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) {
+    let _ = QUERY_MEMORY_PROBES.try_with(|probes| {
+        fn visit(
+            node: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+            visited: &mut std::collections::HashSet<*const ()>,
+            out: &mut Vec<QueryExecutionMetrics>,
+        ) {
+            if !visited.insert(Arc::as_ptr(node).cast::<()>()) {
+                return;
+            }
+            out.extend(query_operator_metrics(node.as_ref()));
+            for child in node.children() {
+                visit(child, visited, out);
+            }
+        }
+        visit(
+            root,
+            &mut std::collections::HashSet::new(),
+            &mut probes
+                .metrics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    });
+}
+
+/// Captured on the query task, then moved into its blocking closure. Tokio task
+/// locals are not inherited by `spawn_blocking`.
+pub struct QueryBlockingWorkGuard {
+    probes: Option<QueryMemoryProbes>,
+    started: bool,
+}
+
+pub fn query_blocking_work_guard() -> QueryBlockingWorkGuard {
+    QueryBlockingWorkGuard {
+        probes: QUERY_MEMORY_PROBES.try_with(Clone::clone).ok(),
+        started: false,
+    }
+}
+
+impl QueryBlockingWorkGuard {
+    pub fn checkpoint(&self) {
+        let Some(probes) = &self.probes else { return };
+        let Some(pause) = probes
+            .pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        else {
+            return;
+        };
+        if pause.entered.fetch_add(1, Ordering::SeqCst) > 0 {
+            return;
+        }
+        pause.waiting.store(1, Ordering::SeqCst);
+        let released = pause
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(
+            pause
+                .wake
+                .wait_timeout_while(released, std::time::Duration::from_secs(5), |released| {
+                    !*released
+                })
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        pause.waiting.store(0, Ordering::SeqCst);
+    }
+
+    pub fn started(&mut self) {
+        if !self.started {
+            self.started = true;
+            if let Some(probes) = &self.probes {
+                probes.active_blocking.fetch_add(1, Ordering::SeqCst);
+                probes.blocking_started.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+impl Drop for QueryBlockingWorkGuard {
+    fn drop(&mut self) {
+        if self.started {
+            if let Some(probes) = &self.probes {
+                probes.active_blocking.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+tokio::task_local! {
+    static RRF_GATE_SUBSET_DROP: Option<String>;
+}
+
+/// RED CONTROL ONLY: drop `id` from the rrf prefilter gate's materialized
+/// eligible-id set for the scope of `fut` — a deliberate violation of the
+/// gate's superset rule (single owner: `exec::query::rrf_prefilter_gate`'s
+/// invariant doc; a subset changes answers). The differential oracle uses
+/// this to prove its equivalence relation can turn red: dropping one
+/// surviving id MUST make the forced-prefilter and forced-postfilter
+/// answers differ, or the oracle is vacuous. `cfg(debug_assertions)`: an
+/// answer-corrupting API must not exist in release binaries — dev-profile
+/// test runs (where the red control lives) keep it.
+#[cfg(debug_assertions)]
+pub async fn with_rrf_gate_subset_drop<F>(id: String, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    RRF_GATE_SUBSET_DROP.scope(Some(id), fut).await
+}
+
+/// The scoped subset-drop red control active for this task, if any. `None`
+/// in production (no scope installed).
+#[cfg(debug_assertions)]
+pub fn rrf_gate_subset_drop() -> Option<String> {
+    RRF_GATE_SUBSET_DROP.try_with(|m| m.clone()).ok().flatten()
+}
+
+tokio::task_local! {
+    static STAGE_WRITE_PROBES: StageWriteProbes;
+}
+
+/// Deterministic probe for the number of table-fragment staging futures that
+/// are inside their storage call at once.
+///
+/// `release_after` is a test rendezvous: the first staged tables wait until
+/// that many participants have entered. A concurrency regression therefore
+/// times out instead of passing from result equivalence alone. Production
+/// leaves this task-local unset, so staging only pays the unset lookup.
+#[derive(Clone)]
+pub struct StageWriteProbes {
+    state: Arc<StageWriteProbeState>,
+}
+
+struct StageWriteProbeState {
+    active: AtomicU64,
+    entered: AtomicU64,
+    peak: AtomicU64,
+    rendezvous: tokio::sync::Barrier,
+}
+
+impl StageWriteProbes {
+    /// Create a probe that releases each group after `release_after` staged
+    /// tables have entered the storage-call boundary.
+    pub fn rendezvous(release_after: usize) -> Self {
+        assert!(release_after > 0, "stage-write rendezvous must be non-zero");
+        Self {
+            state: Arc::new(StageWriteProbeState {
+                active: AtomicU64::new(0),
+                entered: AtomicU64::new(0),
+                peak: AtomicU64::new(0),
+                rendezvous: tokio::sync::Barrier::new(release_after),
+            }),
+        }
+    }
+
+    /// Number of table-storage staging calls that entered the probe.
+    pub fn entered(&self) -> u64 {
+        self.state.entered.load(Ordering::Relaxed)
+    }
+
+    /// Maximum table-storage staging calls simultaneously inside the probe.
+    pub fn peak_in_flight(&self) -> u64 {
+        self.state.peak.load(Ordering::Relaxed)
+    }
+}
+
+pub struct StageWriteProbeGuard {
+    state: Arc<StageWriteProbeState>,
+}
+
+impl Drop for StageWriteProbeGuard {
+    fn drop(&mut self) {
+        self.state.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Run `fut` with deterministic table-staging probes installed.
+pub async fn with_stage_write_probes<F>(probes: StageWriteProbes, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    STAGE_WRITE_PROBES.scope(probes, fut).await
+}
+
+pub async fn enter_stage_write_probe() -> Option<StageWriteProbeGuard> {
+    let state = STAGE_WRITE_PROBES
+        .try_with(|probes| probes.state.clone())
+        .ok()?;
+    state.entered.fetch_add(1, Ordering::Relaxed);
+    // Count only after every participant is released. The first staging call
+    // must then remain pending in its real storage future for a second call to
+    // raise the peak above one; parked rendezvous waiters do not count.
+    state.rendezvous.wait().await;
+    let active = state.active.fetch_add(1, Ordering::Relaxed) + 1;
+    state.peak.fetch_max(active, Ordering::Relaxed);
+    let guard = StageWriteProbeGuard {
+        state: state.clone(),
+    };
+    Some(guard)
+}
+
+pub fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
+    current(|p| p.manifest_wrapper.clone()).flatten()
+}
+
+pub fn table_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
+    current(|p| p.table_wrapper.clone()).flatten()
+}
+
+/// Record one version-probe invocation against the active per-query probes.
+/// No-op when no probes are installed (production).
+pub fn record_probe() {
+    let _ = current(|p| p.probe_count.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Internal/system table directory names. An open of one of these is a metadata
+/// open (publisher CAS), NOT a data-table open. Kept in sync with the dir
+/// constants in `omnigraph-catalog/src/layout.rs`.
+const INTERNAL_TABLE_DIRS: [&str; 1] = ["__manifest"];
+
+/// True when `uri`'s last path segment names an internal/system table.
+fn open_is_internal(uri: &str) -> bool {
+    let trimmed = uri.trim_end_matches('/');
+    let last = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    INTERNAL_TABLE_DIRS.contains(&last)
+}
+
+/// Record one table-open call against the active per-query probes, classified by
+/// table class (the URI's last segment) so the write gate counts DATA-table opens
+/// only and ignores the publisher metadata opens. No-op in production
+/// (the classification runs only inside the probe closure, which `current` skips
+/// when no probes are installed). Called at the open chokepoint.
+pub fn record_open(uri: &str) {
+    let _ = current(|p| {
+        if open_is_internal(uri) {
+            p.internal_open_count.fetch_add(1, Ordering::Relaxed);
+        } else {
+            p.data_open_count.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
+/// Record one full `__manifest` row scan. No-op unless a cost probe is active.
+pub fn record_manifest_scan() {
+    let _ = current(|p| {
+        p.manifest_scan_count.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Register the store behind a probed open under the plane whose wrapper the
+/// open carried. No-op unless a cost probe is active.
+fn record_probed_store(wrapper: &Arc<dyn WrappingObjectStore>, store: Arc<lance::io::ObjectStore>) {
+    let _ = current(|p| {
+        let carried = |plane: &Option<Arc<dyn WrappingObjectStore>>| {
+            plane.as_ref().is_some_and(|w| Arc::ptr_eq(w, wrapper))
+        };
+        if carried(&p.manifest_wrapper) {
+            p.manifest_stores.register(store.clone());
+        }
+        if carried(&p.table_wrapper) {
+            p.table_stores.register(store);
+        }
+    });
+}
+
+/// Record one pre-effect mutation reprepare. No-op unless a cost probe is active.
+pub fn record_mutation_reprepare() {
+    let _ = current(|p| {
+        p.mutation_reprepares.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one manifest-projection refresh served by the incremental
+/// fold. No-op unless a cost probe is active.
+pub fn record_projection_incremental_refresh() {
+    let _ = current(|p| {
+        p.projection_incremental_refreshes
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one manifest-projection refresh that fell back to (or started as)
+/// the full O(history) scan. No-op unless a cost probe is active.
+pub fn record_projection_full_refresh() {
+    let _ = current(|p| {
+        p.projection_full_refreshes.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record rows returned by the physical-address take used to classify newly
+/// deleted manifest rows. No-op unless a cost probe is active.
+pub fn record_projection_identity_rows(rows: usize) {
+    let _ = current(|p| {
+        p.projection_identity_rows
+            .fetch_add(rows as u64, Ordering::Relaxed);
+    });
+}
+
+/// Record one topology-index build over `edges` edge tables (the
+/// `RuntimeCache::graph_index` cache-miss path). No-op when no probes are
+/// installed (production).
+pub fn record_graph_build(edges: usize) {
+    let _ = current(|p| {
+        p.graph_build_count.fetch_add(1, Ordering::Relaxed);
+        p.graph_edges_built
+            .fetch_add(edges as u64, Ordering::Relaxed);
+    });
+}
+
+/// Record one mid-traversal Indexed→CSR switch. No-op when no probes are
+/// installed (production).
+pub fn record_traversal_mid_switch() {
+    let _ = current(|p| p.traversal_mid_switches.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record which path one Expand ran (`indexed` true = the indexed scan,
+/// false = the CSR walk). No-op when no probes are installed (production).
+pub fn record_expand_path(indexed: bool) {
+    let _ = current(|p| {
+        let counter = if indexed {
+            &p.expand_indexed_runs
+        } else {
+            &p.expand_csr_runs
+        };
+        counter.fetch_add(1, Ordering::Relaxed)
+    });
+}
+
+/// Record one Expand stopping early at its pushed-down limit cap. No-op when
+/// no probes are installed (production).
+pub fn record_expand_cap_stop() {
+    let _ = current(|p| p.expand_cap_stops.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record `n` IR filters lowered into a scan-level `filter_expr`. No-op when
+/// no probes are installed (production) and when nothing was pushed.
+pub fn record_pushed_filter_exprs(n: u64) {
+    if n > 0 {
+        let _ = current(|p| p.pushed_filter_exprs.fetch_add(n, Ordering::Relaxed));
+    }
+}
+
+/// Record one in-memory filter application (`apply_filter`). No-op when no
+/// probes are installed (production).
+pub fn record_in_memory_filter() {
+    let _ = current(|p| p.in_memory_filters.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record one uncapped retry after a capped BM25 scan under-filled. No-op when
+/// no probes are installed (production).
+pub fn record_bm25_uncapped_retry() {
+    let _ = current(|p| p.bm25_uncapped_retries.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record `rows` returned by one BM25-ranked scan. No-op when no probes are
+/// installed (production).
+pub fn record_bm25_scan_rows(rows: u64) {
+    let _ = current(|p| p.bm25_scan_rows.fetch_add(rows, Ordering::Relaxed));
+}
+
+/// Record the requested ANN maximum of a nearest scan (zero = none). No-op
+/// when no probes are installed.
+pub fn record_ann_probe_budget(maximum: Option<usize>) {
+    let _ = current(|p| {
+        p.ann_max_nprobes
+            .store(maximum.unwrap_or_default() as u64, Ordering::Relaxed);
+    });
+}
+
+/// Record one scan-site rescan of a starved bounded nearest scan. No-op when
+/// no probes are installed.
+pub fn record_ann_rescan() {
+    let _ = current(|p| p.ann_rescans.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record one scan-site rescan taken as the flat exact kNN after an IVF
+/// scan held `_distance = +inf` rows. Counted beside `record_ann_rescan`,
+/// never instead of it. No-op when no probes are installed.
+pub fn record_ann_flat_rescan() {
+    let _ = current(|p| p.ann_flat_rescans.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record the rows a nearest scan returned. No-op when no probes are installed.
+pub fn record_ann_scan_rows(rows: u64) {
+    let _ = current(|p| p.ann_scan_rows.store(rows, Ordering::Relaxed));
+}
+
+/// Record the partition counters Lance reported for one nearest scan
+/// (`partitions_searched` / `partitions_ranked`, summed over index deltas).
+/// No-op when no probes are installed.
+pub fn record_ann_partition_counters(searched: u64, ranked: u64) {
+    let _ = current(|p| {
+        p.ann_partitions_searched.store(searched, Ordering::Relaxed);
+        p.ann_partitions_ranked.store(ranked, Ordering::Relaxed);
+        p.ann_rung_partitions_searched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(searched);
+    });
+}
+
+/// Record one capped nearest scan that ended short without a usable Lance
+/// execution summary (the ladder's fail-closed uncapped rescan). No-op when
+/// no probes are installed.
+pub fn record_ann_summary_missing() {
+    let _ = current(|p| p.ann_summary_missing.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record one query-level overfetch rerun of a standalone nearest query.
+/// No-op when no probes are installed.
+pub fn record_ann_overfetch() {
+    let _ = current(|p| p.ann_overfetches.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record one exact pass of the overfetch loop. No-op when no probes are
+/// installed.
+pub fn record_ann_exact_pass() {
+    let _ = current(|p| p.ann_exact_passes.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record one rrf prefilter-gate verdict. No-op when no probes are installed
+/// (production).
+pub fn record_rrf_gate_verdict(verdict: RrfGateVerdict) {
+    let _ = current(|p| {
+        // Push through a poisoned lock: dropping verdicts after an unrelated
+        // panic would fail a fence test's `len() == 1` assert confusingly.
+        p.rrf_gate_verdicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(verdict);
+    });
+}
+
+/// Probe-only: the projection a NodeScan hands to `Scanner::project`.
+pub fn record_node_scan_projection(projection: Option<&[&str]>) {
+    let _ = current(|p| {
+        p.node_scan_projections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(projection.map(|columns| columns.iter().map(|c| c.to_string()).collect()));
+    });
+}
+
+/// Record one nearest prefilter-gate verdict. No-op when no probes are
+/// installed (production).
+pub fn record_ann_prefilter_verdict(verdict: RrfGateVerdict) {
+    let _ = current(|p| {
+        p.ann_prefilter_verdicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(verdict);
+    });
+}
+
+/// Probe-only: one accepted-catalog build (a memo miss).
+pub fn record_catalog_build() {
+    let _ = current(|p| p.catalog_builds.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Probe-only: one named-query compilation (a compiled-query cache miss).
+pub fn record_query_compile() {
+    let _ = current(|p| p.query_compiles.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Probe-only: one full-text validation entered by a scan.
+pub fn record_fts_validation() {
+    let _ = current(|p| p.fts_validations.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record `commits` walked into a change-feed poll's first-parent chain. No-op
+/// when no probes are installed (production).
+pub fn record_feed_commits_visited(commits: usize) {
+    let _ = current(|p| {
+        p.feed_commits_visited
+            .fetch_add(commits as u64, Ordering::Relaxed)
+    });
+}
+
+pub fn record_candidate_transaction_read() {
+    let _ = current(|p| {
+        p.candidate_transaction_reads
+            .fetch_add(1, Ordering::Relaxed)
+    });
+}
+
+pub fn record_candidate_fragment_metadata_steps(steps: u64) {
+    if steps > 0 {
+        let _ = current(|p| {
+            p.candidate_fragment_metadata_steps
+                .fetch_add(steps, Ordering::Relaxed)
+        });
+    }
+}
+
+pub fn record_candidate_row_examined() {
+    let _ = current(|p| p.candidate_rows_examined.fetch_add(1, Ordering::Relaxed));
+}
+
+pub fn record_candidate_scan_targets(rows: usize, bytes: u64) {
+    let _ = current(|p| {
+        p.candidate_scan_target_rows_peak
+            .fetch_max(rows as u64, Ordering::Relaxed);
+        p.candidate_scan_target_bytes_peak
+            .fetch_max(bytes, Ordering::Relaxed);
+    });
+}
+
+pub fn record_change_image_materialized() {
+    let _ = current(|p| p.change_images_materialized.fetch_add(1, Ordering::Relaxed));
+}
+
+/// One internal branch-merge timing bucket.
+#[derive(Debug, Clone, Copy)]
+pub enum MergeTimingPhase {
+    OuterPrepare,
+    ProvenInsertHistory,
+    ProvenInsertPlanScan,
+    /// One general three-way ordered table walk plus staging its merged rows.
+    /// Scalar and Blob tables each record one interval; proven-insert routes
+    /// bypass this phase entirely.
+    TableWalk,
+    CandidateValidation,
+    FinalRevalidation,
+    PhysicalPublish,
+    KeyedStage,
+    KeyedCommit,
+    ManifestPublish,
+    OuterRestoreRefresh,
+}
+
+impl MergeTimingPhase {
+    const COUNT: usize = 11;
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const ALL: [Self; Self::COUNT] = [
+        Self::OuterPrepare,
+        Self::ProvenInsertHistory,
+        Self::ProvenInsertPlanScan,
+        Self::TableWalk,
+        Self::CandidateValidation,
+        Self::FinalRevalidation,
+        Self::PhysicalPublish,
+        Self::KeyedStage,
+        Self::KeyedCommit,
+        Self::ManifestPublish,
+        Self::OuterRestoreRefresh,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::OuterPrepare => "OuterPrepare",
+            Self::ProvenInsertHistory => "ProvenInsertHistory",
+            Self::ProvenInsertPlanScan => "ProvenInsertPlanScan",
+            Self::TableWalk => "TableWalk",
+            Self::CandidateValidation => "CandidateValidation",
+            Self::FinalRevalidation => "FinalRevalidation",
+            Self::PhysicalPublish => "PhysicalPublish",
+            Self::KeyedStage => "KeyedStage",
+            Self::KeyedCommit => "KeyedCommit",
+            Self::ManifestPublish => "ManifestPublish",
+            Self::OuterRestoreRefresh => "OuterRestoreRefresh",
+        }
+    }
+}
+
+/// One diagnostic merge phase returned by
+/// [`MergeWriteProbes::merge_timing_snapshot`]. Times are accumulated in
+/// microseconds; `interval_count` remains exact even when a duration rounds
+/// down to zero microseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MergeTimingReading {
+    /// Stable, additive diagnostic identifier. Existing identifiers are never
+    /// renamed or repurposed; callers must tolerate new identifiers.
+    pub phase: &'static str,
+    /// Sum of every explicitly completed interval, rounded down to microseconds.
+    pub total_us: u64,
+    /// Largest explicitly completed interval, rounded down to microseconds.
+    pub max_us: u64,
+    /// Exact number of explicitly completed intervals. Failed and cancelled
+    /// phases drop their unfinished span and do not increment this count.
+    pub interval_count: u64,
+}
+
+#[derive(Default)]
+struct MergeTimingCounters {
+    total_ns: [AtomicU64; MergeTimingPhase::COUNT],
+    max_ns: [AtomicU64; MergeTimingPhase::COUNT],
+    interval_count: [AtomicU64; MergeTimingPhase::COUNT],
+}
+
+/// Per-operation branch-merge route and timing counters.
+///
+/// Install a fresh instance with [`with_merge_write_probes`] for each measured
+/// repetition. Counters accumulate for the lifetime of this value; read a
+/// timing snapshot after the scoped future completes.
+#[derive(Clone, Default)]
+pub struct MergeWriteProbes {
+    pub stage_append_calls: Arc<AtomicU64>,
+    pub stage_append_rows: Arc<AtomicU64>,
+    pub stage_merge_insert_calls: Arc<AtomicU64>,
+    pub stage_merge_insert_rows: Arc<AtomicU64>,
+    /// Update-only keyed stages whose ids were proven present by merge
+    /// classification. Kept separate from insertion-capable Upsert.
+    pub stage_known_present_update_calls: Arc<AtomicU64>,
+    pub stage_known_present_update_rows: Arc<AtomicU64>,
+    /// Strict-insert transactions that write new fragments directly and carry
+    /// Lance's inserted-row key filter without running a target merge join.
+    pub stage_fenced_insert_calls: Arc<AtomicU64>,
+    pub stage_fenced_insert_rows: Arc<AtomicU64>,
+    /// Exact target-absence probes performed before staging a strict insert.
+    /// Proven branch-merge inserts discharge this check from durable source
+    /// provenance; general strict writes must still invoke it.
+    pub strict_insert_preflight_calls: Arc<AtomicU64>,
+    /// Full-table vector-index (IVF) artifact builds. These count successful
+    /// staging, not HEAD publication; a stale prepared attempt may abandon the
+    /// immutable artifact before commit.
+    pub stage_vector_index_calls: Arc<AtomicU64>,
+    /// Legacy whole-delta materializations. RFC-023's bounded keyed path must
+    /// keep this at zero; retaining the probe makes regressions observable.
+    pub scan_staged_combined_calls: Arc<AtomicU64>,
+    /// Blob payload reads performed while rebuilding descriptor rows into a
+    /// logical keyed-write source. Resource-limit tests use this to prove an
+    /// oversized descriptor is rejected from `BlobFile::size()` before the
+    /// payload allocation/read begins.
+    pub blob_payload_read_calls: Arc<AtomicU64>,
+    /// Payload reads issued against external sources specifically. Unlike the
+    /// aggregate Blob counter, this excludes managed Lance `BlobFile::read`
+    /// calls so normalized-alias GET deduplication is directly observable.
+    pub external_blob_payload_read_calls: Arc<AtomicU64>,
+    /// External Blob cells presented to one operation-wide preflight and the
+    /// distinct normalized object metadata probes that preflight performed.
+    /// Their difference is the observable de-duplication contract: repeated
+    /// cells and equivalent URI spellings must not create one HEAD per row.
+    pub external_blob_probe_inputs: Arc<AtomicU64>,
+    pub external_blob_probe_calls: Arc<AtomicU64>,
+    /// Ordered branch-merge cursor scans and the exact per-batch limits they
+    /// requested. These make the production row/byte scanner configuration a
+    /// structural test assertion instead of an inferred memory claim.
+    pub ordered_cursor_scan_calls: Arc<AtomicU64>,
+    pub ordered_cursor_batch_rows: Arc<AtomicU64>,
+    pub ordered_cursor_batch_bytes: Arc<AtomicU64>,
+    /// Successfully completed table classifications, including no-op or
+    /// conflict results. Verify mode can complete both; a lineage gate miss
+    /// completes only the full walk. These report execution, not env intent.
+    pub completed_full_walk_classification_calls: Arc<AtomicU64>,
+    pub completed_lineage_classification_calls: Arc<AtomicU64>,
+    /// Physical identity discovery work, separate from logical candidates.
+    pub lineage_candidate_scan_rows: Arc<AtomicU64>,
+    pub lineage_candidate_address_take_calls: Arc<AtomicU64>,
+    pub lineage_candidate_address_take_rows: Arc<AtomicU64>,
+    pub lineage_candidate_address_take_max_rows: Arc<AtomicU64>,
+    pub lineage_candidate_budget_fallback_calls: Arc<AtomicU64>,
+    pub proven_insert_history_read_calls: Arc<AtomicU64>,
+    /// Bounded row hydrations the two-phase ordered merge cursor performs
+    /// after its narrow key sort: take calls, hydrated rows, and measured
+    /// hydrated bytes. Cost tests use these to prove payload bytes flow
+    /// through bounded takes, never through a SortExec input.
+    pub ordered_cursor_hydration_calls: Arc<AtomicU64>,
+    pub ordered_cursor_hydration_rows: Arc<AtomicU64>,
+    pub ordered_cursor_hydration_bytes: Arc<AtomicU64>,
+    /// Largest retained hydration chunk observed, in measured decoded bytes.
+    /// This is the cursor's per-chunk resident-memory contract: bounded-chunk
+    /// tests assert it stays under the hard hydration ceiling instead of
+    /// scaling with a table's planned row count or row widths.
+    pub ordered_cursor_hydration_max_chunk_bytes: Arc<AtomicU64>,
+    /// Projected scalar batches fetched by merge validation before the shared
+    /// aggregate-retention budget decides whether each one may be kept.
+    pub validation_scan_batches: Arc<AtomicU64>,
+    pub validation_scan_projected_bytes: Arc<AtomicU64>,
+    /// Raw batches returned by Lance before the proven-insert interval
+    /// normalizer copies/splits them. The byte maximum keeps the substrate's
+    /// approximate decode term visible instead of conflating it with the hard
+    /// normalized writer-chunk cap.
+    pub proven_insert_raw_batch_calls: Arc<AtomicU64>,
+    pub proven_insert_raw_batch_max_bytes: Arc<AtomicU64>,
+    /// Diagnostic-only elapsed-time buckets. They are non-overlapping at the
+    /// top level; `KeyedStage` and `KeyedCommit` are intentional sub-buckets of
+    /// `PhysicalPublish`. Production pays only the unset task-local probe.
+    merge_timing: Arc<MergeTimingCounters>,
+}
+
+impl MergeWriteProbes {
+    pub fn stage_append_calls(&self) -> u64 {
+        self.stage_append_calls.load(Ordering::Relaxed)
+    }
+    pub fn stage_append_rows(&self) -> u64 {
+        self.stage_append_rows.load(Ordering::Relaxed)
+    }
+    pub fn stage_merge_insert_calls(&self) -> u64 {
+        self.stage_merge_insert_calls.load(Ordering::Relaxed)
+    }
+    pub fn stage_merge_insert_rows(&self) -> u64 {
+        self.stage_merge_insert_rows.load(Ordering::Relaxed)
+    }
+    pub fn stage_known_present_update_calls(&self) -> u64 {
+        self.stage_known_present_update_calls
+            .load(Ordering::Relaxed)
+    }
+    pub fn stage_known_present_update_rows(&self) -> u64 {
+        self.stage_known_present_update_rows.load(Ordering::Relaxed)
+    }
+    pub fn stage_fenced_insert_calls(&self) -> u64 {
+        self.stage_fenced_insert_calls.load(Ordering::Relaxed)
+    }
+    pub fn stage_fenced_insert_rows(&self) -> u64 {
+        self.stage_fenced_insert_rows.load(Ordering::Relaxed)
+    }
+    pub fn strict_insert_preflight_calls(&self) -> u64 {
+        self.strict_insert_preflight_calls.load(Ordering::Relaxed)
+    }
+    pub fn stage_vector_index_calls(&self) -> u64 {
+        self.stage_vector_index_calls.load(Ordering::Relaxed)
+    }
+    pub fn scan_staged_combined_calls(&self) -> u64 {
+        self.scan_staged_combined_calls.load(Ordering::Relaxed)
+    }
+    pub fn blob_payload_read_calls(&self) -> u64 {
+        self.blob_payload_read_calls.load(Ordering::Relaxed)
+    }
+    pub fn external_blob_payload_read_calls(&self) -> u64 {
+        self.external_blob_payload_read_calls
+            .load(Ordering::Relaxed)
+    }
+    pub fn external_blob_probe_inputs(&self) -> u64 {
+        self.external_blob_probe_inputs.load(Ordering::Relaxed)
+    }
+    pub fn external_blob_probe_calls(&self) -> u64 {
+        self.external_blob_probe_calls.load(Ordering::Relaxed)
+    }
+    pub fn ordered_cursor_scan_calls(&self) -> u64 {
+        self.ordered_cursor_scan_calls.load(Ordering::Relaxed)
+    }
+    pub fn ordered_cursor_batch_rows(&self) -> u64 {
+        self.ordered_cursor_batch_rows.load(Ordering::Relaxed)
+    }
+    pub fn ordered_cursor_batch_bytes(&self) -> u64 {
+        self.ordered_cursor_batch_bytes.load(Ordering::Relaxed)
+    }
+    pub fn completed_full_walk_classification_calls(&self) -> u64 {
+        self.completed_full_walk_classification_calls
+            .load(Ordering::Relaxed)
+    }
+    pub fn completed_lineage_classification_calls(&self) -> u64 {
+        self.completed_lineage_classification_calls
+            .load(Ordering::Relaxed)
+    }
+    pub fn lineage_candidate_scan_rows(&self) -> u64 {
+        self.lineage_candidate_scan_rows.load(Ordering::Relaxed)
+    }
+    pub fn lineage_candidate_address_take_calls(&self) -> u64 {
+        self.lineage_candidate_address_take_calls
+            .load(Ordering::Relaxed)
+    }
+    pub fn lineage_candidate_address_take_rows(&self) -> u64 {
+        self.lineage_candidate_address_take_rows
+            .load(Ordering::Relaxed)
+    }
+    pub fn lineage_candidate_address_take_max_rows(&self) -> u64 {
+        self.lineage_candidate_address_take_max_rows
+            .load(Ordering::Relaxed)
+    }
+    pub fn lineage_candidate_budget_fallback_calls(&self) -> u64 {
+        self.lineage_candidate_budget_fallback_calls
+            .load(Ordering::Relaxed)
+    }
+    pub fn proven_insert_history_read_calls(&self) -> u64 {
+        self.proven_insert_history_read_calls
+            .load(Ordering::Relaxed)
+    }
+    pub fn ordered_cursor_hydration_calls(&self) -> u64 {
+        self.ordered_cursor_hydration_calls.load(Ordering::Relaxed)
+    }
+    pub fn ordered_cursor_hydration_rows(&self) -> u64 {
+        self.ordered_cursor_hydration_rows.load(Ordering::Relaxed)
+    }
+    pub fn ordered_cursor_hydration_bytes(&self) -> u64 {
+        self.ordered_cursor_hydration_bytes.load(Ordering::Relaxed)
+    }
+    pub fn ordered_cursor_hydration_max_chunk_bytes(&self) -> u64 {
+        self.ordered_cursor_hydration_max_chunk_bytes
+            .load(Ordering::Relaxed)
+    }
+    pub fn validation_scan_batches(&self) -> u64 {
+        self.validation_scan_batches.load(Ordering::Relaxed)
+    }
+    pub fn validation_scan_projected_bytes(&self) -> u64 {
+        self.validation_scan_projected_bytes.load(Ordering::Relaxed)
+    }
+    pub fn proven_insert_raw_batch_calls(&self) -> u64 {
+        self.proven_insert_raw_batch_calls.load(Ordering::Relaxed)
+    }
+    pub fn proven_insert_raw_batch_max_bytes(&self) -> u64 {
+        self.proven_insert_raw_batch_max_bytes
+            .load(Ordering::Relaxed)
+    }
+    fn merge_timing_total_us(&self, phase: MergeTimingPhase) -> u64 {
+        self.merge_timing.total_ns[phase.index()].load(Ordering::Relaxed) / 1_000
+    }
+    fn merge_timing_max_us(&self, phase: MergeTimingPhase) -> u64 {
+        self.merge_timing.max_ns[phase.index()].load(Ordering::Relaxed) / 1_000
+    }
+    fn merge_timing_interval_count(&self, phase: MergeTimingPhase) -> u64 {
+        self.merge_timing.interval_count[phase.index()].load(Ordering::Relaxed)
+    }
+    pub fn outer_prepare_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::OuterPrepare)
+    }
+    pub fn proven_insert_history_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::ProvenInsertHistory)
+    }
+    pub fn proven_insert_plan_scan_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::ProvenInsertPlanScan)
+    }
+    pub fn table_walk_total_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::TableWalk)
+    }
+    pub fn table_walk_max_us(&self) -> u64 {
+        self.merge_timing_max_us(MergeTimingPhase::TableWalk)
+    }
+    pub fn table_walk_interval_count(&self) -> u64 {
+        self.merge_timing_interval_count(MergeTimingPhase::TableWalk)
+    }
+    pub fn candidate_validation_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::CandidateValidation)
+    }
+    pub fn final_revalidation_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::FinalRevalidation)
+    }
+    pub fn physical_publish_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::PhysicalPublish)
+    }
+    pub fn keyed_stage_total_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::KeyedStage)
+    }
+    pub fn keyed_stage_max_us(&self) -> u64 {
+        self.merge_timing_max_us(MergeTimingPhase::KeyedStage)
+    }
+    pub fn keyed_commit_total_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::KeyedCommit)
+    }
+    pub fn keyed_commit_max_us(&self) -> u64 {
+        self.merge_timing_max_us(MergeTimingPhase::KeyedCommit)
+    }
+    pub fn manifest_publish_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::ManifestPublish)
+    }
+    pub fn outer_restore_refresh_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::OuterRestoreRefresh)
+    }
+
+    /// Snapshot all completed merge timing intervals in deterministic order.
+    ///
+    /// Take the snapshot after the [`with_merge_write_probes`] future completes.
+    /// `phase` is the stable identifier: callers must match by name rather than
+    /// position and tolerate additive phases. This observational read uses the
+    /// same relaxed counters as the individual accessors.
+    pub fn merge_timing_snapshot(&self) -> Vec<MergeTimingReading> {
+        MergeTimingPhase::ALL
+            .into_iter()
+            .map(|phase| MergeTimingReading {
+                phase: phase.name(),
+                total_us: self.merge_timing_total_us(phase),
+                max_us: self.merge_timing_max_us(phase),
+                interval_count: self.merge_timing_interval_count(phase),
+            })
+            .collect()
+    }
+}
+
+tokio::task_local! {
+    static MERGE_WRITE_PROBES: MergeWriteProbes;
+}
+
+/// Run `fut` with branch-merge test/benchmark probes installed.
+///
+/// Production leaves this scope unset. Use a fresh [`MergeWriteProbes`] per
+/// measured repetition and inspect it only after this future completes.
+pub async fn with_merge_write_probes<F>(probes: MergeWriteProbes, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    MERGE_WRITE_PROBES.scope(probes, fut).await
+}
+
+/// Record one `stage_append` of `rows` rows against the active probes. No-op in
+/// production (no probes installed).
+#[cfg(any(test, feature = "test-util"))]
+pub fn record_stage_append(rows: u64) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.stage_append_calls.fetch_add(1, Ordering::Relaxed);
+        p.stage_append_rows.fetch_add(rows, Ordering::Relaxed);
+    });
+}
+
+/// Record one `stage_merge_insert` of `rows` rows against the active probes.
+/// No-op in production (no probes installed).
+pub fn record_stage_merge_insert(rows: u64) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.stage_merge_insert_calls.fetch_add(1, Ordering::Relaxed);
+        p.stage_merge_insert_rows.fetch_add(rows, Ordering::Relaxed);
+    });
+}
+
+/// Record one update-only keyed stage whose ids were proven present by merge
+/// classification. No-op when no test or benchmark probe is installed.
+pub fn record_stage_known_present_update(rows: u64) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.stage_known_present_update_calls
+            .fetch_add(1, Ordering::Relaxed);
+        p.stage_known_present_update_rows
+            .fetch_add(rows, Ordering::Relaxed);
+    });
+}
+
+/// Record one join-free, filter-bearing strict insert of `rows` rows against
+/// the active probes. This is distinct from `stage_merge_insert`: both commit
+/// a fenced Lance `Operation::Update`, but only the latter runs a target join.
+pub fn record_stage_fenced_insert(rows: u64) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.stage_fenced_insert_calls.fetch_add(1, Ordering::Relaxed);
+        p.stage_fenced_insert_rows
+            .fetch_add(rows, Ordering::Relaxed);
+    });
+}
+
+/// Record one exact target-absence preflight for a strict insert. No-op when
+/// no test or benchmark probe is installed.
+pub fn record_strict_insert_preflight() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.strict_insert_preflight_calls
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one successfully staged vector-index artifact build against the
+/// active probes. No-op in production (no probes installed).
+pub fn record_stage_vector_index() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.stage_vector_index_calls.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one impending `BlobFile::read` while logical blob arrays are rebuilt.
+/// No-op in production (no probes installed).
+pub fn record_blob_payload_read() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.blob_payload_read_calls.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one external object payload read. Call this alongside the aggregate
+/// Blob read probe at the exact object-store request site.
+pub fn record_external_blob_payload_read() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.external_blob_payload_read_calls
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record the URI-bearing cells accepted by one bounded external-Blob
+/// admission pass. No-op unless a focused test or benchmark installed probes.
+pub fn record_external_blob_preflight_inputs(inputs: usize) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.external_blob_probe_inputs
+            .fetch_add(inputs as u64, Ordering::Relaxed);
+    });
+}
+
+/// Record one metadata request actually issued for a normalized external Blob
+/// object. Counting at the request site keeps fail-fast concurrent preflights
+/// from reporting planned-but-never-polled probes.
+pub fn record_external_blob_probe() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.external_blob_probe_calls.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record a completed table classifier, independently of its scan strategy.
+pub fn record_completed_merge_classification(lineage: bool) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        let counter = if lineage {
+            &p.completed_lineage_classification_calls
+        } else {
+            &p.completed_full_walk_classification_calls
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+pub fn record_lineage_candidate_scan_rows(rows: usize) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.lineage_candidate_scan_rows
+            .fetch_add(rows as u64, Ordering::Relaxed);
+    });
+}
+
+pub fn record_lineage_candidate_address_take(rows: usize) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.lineage_candidate_address_take_calls
+            .fetch_add(1, Ordering::Relaxed);
+        p.lineage_candidate_address_take_rows
+            .fetch_add(rows as u64, Ordering::Relaxed);
+        p.lineage_candidate_address_take_max_rows
+            .fetch_max(rows as u64, Ordering::Relaxed);
+    });
+}
+
+pub fn record_lineage_candidate_budget_fallback() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.lineage_candidate_budget_fallback_calls
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+pub fn record_proven_insert_history_read() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.proven_insert_history_read_calls
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one full ordered cursor and its requested scanner bounds.
+pub fn record_ordered_cursor_scan(batch_rows: usize, batch_bytes: u64) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.ordered_cursor_scan_calls.fetch_add(1, Ordering::Relaxed);
+        p.ordered_cursor_batch_rows
+            .store(batch_rows as u64, Ordering::Relaxed);
+        p.ordered_cursor_batch_bytes
+            .store(batch_bytes, Ordering::Relaxed);
+    });
+}
+
+/// Record one bounded hydration take performed by the two-phase ordered merge
+/// cursor, with the measured decoded size of the hydrated chunk. No-op when no
+/// test probe is installed.
+pub fn record_ordered_cursor_hydration(rows: usize, bytes: u64) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.ordered_cursor_hydration_calls
+            .fetch_add(1, Ordering::Relaxed);
+        p.ordered_cursor_hydration_rows
+            .fetch_add(rows as u64, Ordering::Relaxed);
+        p.ordered_cursor_hydration_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        p.ordered_cursor_hydration_max_chunk_bytes
+            .fetch_max(bytes, Ordering::Relaxed);
+    });
+}
+
+/// Record one projected scalar validation batch before it is charged to the
+/// operation-wide retention budget. No-op when no test probe is installed.
+pub fn record_merge_validation_batch(projected_bytes: u64) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.validation_scan_batches.fetch_add(1, Ordering::Relaxed);
+        p.validation_scan_projected_bytes
+            .fetch_add(projected_bytes, Ordering::Relaxed);
+    });
+}
+
+/// Record one raw Lance emission before the proven-insert interval normalizer.
+/// No-op when no test or benchmark probe is installed.
+pub fn record_proven_insert_raw_batch(bytes: u64) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.proven_insert_raw_batch_calls
+            .fetch_add(1, Ordering::Relaxed);
+        p.proven_insert_raw_batch_max_bytes
+            .fetch_max(bytes, Ordering::Relaxed);
+    });
+}
+
+/// An explicitly completed diagnostic timing interval. The disabled variant
+/// carries no timestamp, so production performs only the task-local probe.
+#[must_use = "call finish after the timed phase succeeds"]
+pub struct MergeTimingSpan {
+    active: Option<ActiveMergeTimingSpan>,
+}
+
+struct ActiveMergeTimingSpan {
+    phase: MergeTimingPhase,
+    started: Instant,
+    counters: Arc<MergeTimingCounters>,
+}
+
+impl MergeTimingSpan {
+    /// Record this interval. Dropping a span without finishing preserves the
+    /// existing success-only behavior for failed or cancelled phases.
+    pub fn finish(self) {
+        let Some(ActiveMergeTimingSpan {
+            phase,
+            started,
+            counters,
+        }) = self.active
+        else {
+            return;
+        };
+        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        counters.total_ns[phase.index()].fetch_add(nanos, Ordering::Relaxed);
+        counters.max_ns[phase.index()].fetch_max(nanos, Ordering::Relaxed);
+        counters.interval_count[phase.index()].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Start one diagnostic merge phase. No clock is read unless a test or
+/// benchmark installed merge probes for this task.
+pub fn start_merge_timing(phase: MergeTimingPhase) -> MergeTimingSpan {
+    let active = MERGE_WRITE_PROBES
+        .try_with(|probes| ActiveMergeTimingSpan {
+            phase,
+            counters: Arc::clone(&probes.merge_timing),
+            started: Instant::now(),
+        })
+        .ok();
+    MergeTimingSpan { active }
+}
+
+/// Which version [`open_dataset`] resolves.
+///
+/// `Latest` re-resolves the dataset's current head (the substrate's cheap
+/// latest-location probe); `At(v)` is a list-free pinned open. The choice is
+/// a correctness decision — strict read-modify-write ops need `Latest`,
+/// snapshot reads need `At(v)` — so it is an explicit parameter of the one
+/// opener rather than a property of which helper a caller happened to reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionResolution {
+    Latest,
+    At(u64),
+}
+
+/// Open a table pin (RFC 0067): a pin without a staged version opens its
+/// target, a staged pin above `last_linear_version` opens its detached
+/// version, and any older pin keeps the v10 twin rule for historical rows.
+pub async fn open_pinned_dataset(
+    uri: &str,
+    target_version: u64,
+    staged_version: Option<u64>,
+    transaction_uuid: Option<&str>,
+    last_linear_version: Option<u64>,
+    session: Option<&Arc<lance::session::Session>>,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<Dataset> {
+    let Some(staged) = staged_version else {
+        return open_dataset(uri, VersionResolution::At(target_version), session, wrapper).await;
+    };
+    if last_linear_version.is_some_and(|last| target_version > last) {
+        return open_dataset(uri, VersionResolution::At(staged), session, wrapper).await;
+    }
+    match open_dataset(
+        uri,
+        VersionResolution::At(target_version),
+        session,
+        wrapper.clone(),
+    )
+    .await
+    {
+        Ok(dataset) => {
+            let ours = crate::staging::StagedTransactionIdentity::recorded_by(&dataset)
+                .is_some_and(|identity| Some(identity.uuid.as_str()) == transaction_uuid);
+            if ours {
+                return Ok(dataset);
+            }
+            tracing::warn!(
+                uri,
+                target_version,
+                staged,
+                "pin target carries a foreign or unreadable transaction; resolving the staged version"
+            );
+            open_dataset(uri, VersionResolution::At(staged), session, wrapper).await
+        }
+        Err(error @ OmniError::HistoricalVersionReclaimed { .. }) => {
+            let latest = open_dataset(uri, VersionResolution::Latest, session, wrapper.clone())
+                .await?
+                .version()
+                .version;
+            if latest < target_version {
+                match open_dataset(uri, VersionResolution::At(staged), session, wrapper.clone())
+                    .await
+                {
+                    Ok(dataset) => return Ok(dataset),
+                    Err(OmniError::HistoricalVersionReclaimed { .. }) => {}
+                    Err(other) => return Err(other),
+                }
+            }
+            match open_dataset(
+                uri,
+                VersionResolution::At(target_version),
+                session,
+                wrapper.clone(),
+            )
+            .await
+            {
+                Ok(dataset) => {
+                    let ours = crate::staging::StagedTransactionIdentity::recorded_by(&dataset)
+                        .is_some_and(|identity| Some(identity.uuid.as_str()) == transaction_uuid);
+                    if ours {
+                        return Ok(dataset);
+                    }
+                    tracing::warn!(
+                        uri,
+                        target_version,
+                        staged,
+                        "pin target carries a foreign or unreadable transaction; resolving the staged version"
+                    );
+                    open_dataset(uri, VersionResolution::At(staged), session, wrapper).await
+                }
+                Err(OmniError::HistoricalVersionReclaimed { .. }) => Err(error),
+                Err(other) => Err(other),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// THE dataset-open chokepoint. Every engine `Dataset` open routes through
+/// here so three things hold uniformly, on every path:
+///
+/// 1. `record_open` feeds the per-query cost probes — an open that bypasses
+///    this function is invisible to the cost gates.
+/// 2. The per-query IO `wrapper` (manifest- or table-class) is set via
+///    `ObjectStoreParams` on the builder, so the open itself is counted
+///    (`Dataset::with_object_store_wrappers` only wraps an already-open
+///    store). No wrapper (production) adds nothing.
+/// 3. A caller-provided graph data `Session` warms Lance's metadata/index
+///    caches across data-table opens. When absent (for example a detached
+///    historical snapshot), the process-wide zero-cache
+///    control session is attached instead. Every open therefore reuses the
+///    shared object-store registry/client pool without letting mutable control
+///    metadata become stale in a session cache.
+pub async fn open_dataset(
+    uri: &str,
+    version: VersionResolution,
+    session: Option<&Arc<lance::session::Session>>,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<Dataset> {
+    record_open(uri);
+    let mut builder = DatasetBuilder::from_uri(uri);
+    if let VersionResolution::At(version) = version {
+        builder = builder.with_version(version);
+    }
+    let session = session
+        .cloned()
+        .unwrap_or_else(crate::lance_access::control_session);
+    builder = builder.with_session(session);
+    let mut store_params = crate::storage::lance_store_params_for_uri(uri)?;
+    if let Some(wrapper) = &wrapper {
+        store_params.object_store_wrapper = Some(wrapper.clone());
+    }
+    let handler =
+        crate::lance_clone::configured_commit_handler(uri, &Some(store_params.clone()), None)
+            .await
+            .map_err(OmniError::storage)?;
+    builder = builder
+        .with_store_params(store_params)
+        .with_commit_handler(handler);
+    let dataset = builder.load().await.map_err(|error| match error {
+        // Only the two shapes cleanup/drop legitimately leaves behind for a
+        // pinned historical read count as reclaimed history:
+        //   - VersionNotFound: the dataset exists, that version was GC'd.
+        //   - DatasetNotFound: the whole dataset directory is gone (a dropped
+        //     table's history fully GC'd).
+        // A bare NotFound is NOT a cleanup shape: it is a live manifest
+        // referencing a missing object — corruption or an object-store
+        // inconsistency — so it must stay loud rather than be masked as a benign
+        // retention gap (which the change feed would surface as a 410 "reset via
+        // baseline"). Residual: this cannot tell a corrupt CURRENT table's
+        // DatasetNotFound from a legitimately dropped historical table's; that
+        // needs caller context (whether the version is the table's current one),
+        // and the baseline handshake the gap points to still fails loudly on
+        // genuine current-state loss.
+        lance::Error::VersionNotFound { .. } | lance::Error::DatasetNotFound { .. }
+            if matches!(version, VersionResolution::At(_)) =>
+        {
+            OmniError::HistoricalVersionReclaimed {
+                published_dataset_version: match version {
+                    VersionResolution::At(version) => version,
+                    VersionResolution::Latest => 0,
+                },
+            }
+        }
+        error => OmniError::storage(error),
+    })?;
+    if let Some(wrapper) = &wrapper {
+        let store = dataset
+            .object_store(None)
+            .await
+            .map_err(OmniError::storage)?;
+        record_probed_store(wrapper, store);
+    }
+    Ok(dataset)
+}
+
+/// Per-method call counts for [`CountingStorageAdapter`].
+#[derive(Debug, Default)]
+pub struct StorageReadCounts {
+    pub read_text: AtomicU64,
+    pub read_text_if_exists: AtomicU64,
+    pub read_bytes_if_exists: AtomicU64,
+    pub exists: AtomicU64,
+    pub read_text_versioned: AtomicU64,
+    pub list_dir: AtomicU64,
+    pub mutation_calls: AtomicU64,
+    pub write_text: AtomicU64,
+    pub write_bytes: AtomicU64,
+    pub delete: AtomicU64,
+}
+
+impl StorageReadCounts {
+    pub fn read_text(&self) -> u64 {
+        self.read_text.load(Ordering::Relaxed)
+    }
+    pub fn read_text_if_exists(&self) -> u64 {
+        self.read_text_if_exists.load(Ordering::Relaxed)
+    }
+    pub fn read_bytes_if_exists(&self) -> u64 {
+        self.read_bytes_if_exists.load(Ordering::Relaxed)
+    }
+    pub fn exists(&self) -> u64 {
+        self.exists.load(Ordering::Relaxed)
+    }
+    pub fn read_text_versioned(&self) -> u64 {
+        self.read_text_versioned.load(Ordering::Relaxed)
+    }
+    pub fn list_dir(&self) -> u64 {
+        self.list_dir.load(Ordering::Relaxed)
+    }
+    pub fn mutation_calls(&self) -> u64 {
+        self.mutation_calls.load(Ordering::Relaxed)
+    }
+    pub fn write_text(&self) -> u64 {
+        self.write_text.load(Ordering::Relaxed)
+    }
+    pub fn write_bytes(&self) -> u64 {
+        self.write_bytes.load(Ordering::Relaxed)
+    }
+    pub fn delete(&self) -> u64 {
+        self.delete.load(Ordering::Relaxed)
+    }
+}
+
+/// Boundary decorator over a [`StorageAdapter`] that counts every method call.
+/// Calls delegate after incrementing. Construct with
+/// [`CountingStorageAdapter::new`] and open an engine via
+/// `Omnigraph::open_with_storage` to count its non-Lance storage IO.
+#[derive(Debug)]
+pub struct CountingStorageAdapter {
+    inner: Arc<dyn StorageAdapter>,
+    counts: Arc<StorageReadCounts>,
+}
+
+impl CountingStorageAdapter {
+    /// Wrap `inner`, returning the adapter and a shared handle to its counts.
+    // Returns the erased `Arc<dyn StorageAdapter>` the engine consumes plus the
+    // counts handle; a bare `Self` would leave the caller unable to read them.
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(
+        inner: Arc<dyn StorageAdapter>,
+    ) -> (Arc<dyn StorageAdapter>, Arc<StorageReadCounts>) {
+        let counts = Arc::new(StorageReadCounts::default());
+        let adapter: Arc<dyn StorageAdapter> = Arc::new(Self {
+            inner,
+            counts: Arc::clone(&counts),
+        });
+        (adapter, counts)
+    }
+}
+
+#[async_trait]
+impl StorageAdapter for CountingStorageAdapter {
+    async fn read_text(&self, uri: &str) -> Result<String> {
+        self.counts.read_text.fetch_add(1, Ordering::Relaxed);
+        self.inner.read_text(uri).await
+    }
+
+    async fn read_text_if_exists(&self, uri: &str) -> Result<Option<String>> {
+        self.counts
+            .read_text_if_exists
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.read_text_if_exists(uri).await
+    }
+
+    async fn read_text_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> Result<Option<String>> {
+        self.counts
+            .read_text_if_exists
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.read_text_if_exists_bounded(uri, max_bytes).await
+    }
+
+    async fn read_bytes_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        self.counts
+            .read_bytes_if_exists
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .read_bytes_if_exists_bounded(uri, max_bytes)
+            .await
+    }
+
+    async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
+        self.counts.write_text.fetch_add(1, Ordering::Relaxed);
+        self.inner.write_text(uri, contents).await
+    }
+
+    async fn write_bytes(&self, uri: &str, contents: &[u8]) -> Result<()> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
+        self.counts.write_bytes.fetch_add(1, Ordering::Relaxed);
+        self.inner.write_bytes(uri, contents).await
+    }
+
+    async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.write_text_if_absent(uri, contents).await
+    }
+
+    async fn exists(&self, uri: &str) -> Result<bool> {
+        self.counts.exists.fetch_add(1, Ordering::Relaxed);
+        self.inner.exists(uri).await
+    }
+
+    async fn rename_text(&self, from_uri: &str, to_uri: &str) -> Result<()> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.rename_text(from_uri, to_uri).await
+    }
+
+    async fn delete(&self, uri: &str) -> Result<()> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
+        self.counts.delete.fetch_add(1, Ordering::Relaxed);
+        self.inner.delete(uri).await
+    }
+
+    async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>> {
+        self.counts.list_dir.fetch_add(1, Ordering::Relaxed);
+        self.inner.list_dir(dir_uri).await
+    }
+
+    async fn list_dir_bounded(
+        &self,
+        dir_uri: &str,
+        matching_suffix: &str,
+        bounds: ListDirBounds,
+    ) -> Result<Vec<String>> {
+        self.counts.list_dir.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .list_dir_bounded(dir_uri, matching_suffix, bounds)
+            .await
+    }
+
+    async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)> {
+        self.counts
+            .read_text_versioned
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.read_text_versioned(uri).await
+    }
+
+    async fn write_text_if_match(
+        &self,
+        uri: &str,
+        contents: &str,
+        expected_version: &str,
+    ) -> Result<Option<String>> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .write_text_if_match(uri, contents, expected_version)
+            .await
+    }
+
+    async fn delete_prefix(&self, prefix_uri: &str) -> Result<()> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.delete_prefix(prefix_uri).await
+    }
+}
+
+#[cfg(test)]
+mod merge_timing_phase_tests {
+    use super::*;
+
+    #[test]
+    fn all_lists_every_phase_in_counter_order() {
+        for (index, phase) in MergeTimingPhase::ALL.into_iter().enumerate() {
+            assert_eq!(phase.index(), index);
+        }
+    }
+
+    #[tokio::test]
+    async fn timing_spans_record_only_when_explicitly_finished() {
+        assert!(
+            start_merge_timing(MergeTimingPhase::TableWalk)
+                .active
+                .is_none()
+        );
+
+        let probes = MergeWriteProbes::default();
+        with_merge_write_probes(probes.clone(), async {
+            start_merge_timing(MergeTimingPhase::TableWalk).finish();
+            drop(start_merge_timing(MergeTimingPhase::TableWalk));
+        })
+        .await;
+
+        assert_eq!(probes.table_walk_interval_count(), 1);
+        let readings = probes.merge_timing_snapshot();
+        assert_eq!(readings.len(), MergeTimingPhase::COUNT);
+        let table_walk = readings
+            .iter()
+            .find(|reading| reading.phase == "TableWalk")
+            .expect("TableWalk timing reading");
+        assert_eq!(table_walk.interval_count, 1);
+    }
+}

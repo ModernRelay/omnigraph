@@ -36,7 +36,7 @@ pub(super) struct DetachedOnlyWork {
 
 /// Judge every pin of every live branch without writing.
 pub(super) async fn preflight(root: &str) -> Result<Vec<String>> {
-    let _admission = super::super::migrations::admit_conversion_source(root, SOURCE_STAMP);
+    let _admission = crate::db::manifest::migrations::admit_conversion_source(root, SOURCE_STAMP);
     let db = Omnigraph::open_read_only(root).await?;
     blocked_pins(&db).await
 }
@@ -44,7 +44,7 @@ pub(super) async fn preflight(root: &str) -> Result<Vec<String>> {
 /// Promote, reap and record on every live branch; refuse before any write
 /// when a pin is blocked.
 pub(super) async fn execute(root: &str) -> Result<DetachedOnlyWork> {
-    let _admission = super::super::migrations::admit_conversion_source(root, SOURCE_STAMP);
+    let _admission = crate::db::manifest::migrations::admit_conversion_source(root, SOURCE_STAMP);
     let db = Omnigraph::open(root).await?;
     let mut work = DetachedOnlyWork {
         blocked: blocked_pins(&db).await?,

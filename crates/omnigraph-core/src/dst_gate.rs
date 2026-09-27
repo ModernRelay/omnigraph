@@ -53,12 +53,12 @@ omnigraph_seams::thread_local_seam! {
 /// hook call sites compile to nothing.
 #[cfg(not(feature = "dst"))]
 #[inline(always)]
-pub(crate) fn turn() -> Option<TurnToken> {
+pub fn turn() -> Option<TurnToken> {
     None
 }
 
 /// One scheduled attempt token, or `None` (uninstalled, or hook declined).
 #[cfg(feature = "dst")]
-pub(crate) fn turn() -> Option<TurnToken> {
+pub fn turn() -> Option<TurnToken> {
     GATE.with(|hook| hook.turn()).flatten()
 }

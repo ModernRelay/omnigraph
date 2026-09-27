@@ -35,6 +35,7 @@ use lance::dataset::optimize::{
 use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 
 use super::*;
+use crate::dataset_index::is_full_text_index;
 use crate::seams::{decide_seam, fail};
 
 /// How many datasets to optimize/cleanup concurrently. Each has separate
@@ -235,7 +236,7 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
     // Canonical writer order: schema -> branch -> sorted tables. Planning reads
     // catalog index intent, so it must use an operation-local accepted catalog
     // under the same schema gate as schema apply and the exact RFC-022 writers.
-    let schema_gate_key = crate::db::manifest::schema_apply_serial_queue_key();
+    let schema_gate_key = crate::db::write_queue::schema_apply_serial_queue_key();
     let schema_guard = db.write_queue().acquire(&schema_gate_key).await;
     db.refresh_coordinator_only().await?;
     db.ensure_schema_apply_not_locked("optimize").await?;
@@ -527,7 +528,7 @@ async fn append_deferred_full_text_indexes(
     let indices = ds.load_indices().await.map_err(OmniError::storage)?;
     let full_text: std::collections::BTreeMap<_, _> = indices
         .iter()
-        .filter(|index| TableStore::is_full_text_index(index))
+        .filter(|index| is_full_text_index(index))
         .map(|index| (index.name.as_str(), index))
         .collect();
     for (name, index) in full_text {
@@ -862,7 +863,7 @@ pub async fn cleanup_all_datasets(
 
     let _cleanup_schema_guard = db
         .write_queue()
-        .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+        .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
         .await;
     db.refresh_coordinator_only().await?;
     db.ensure_schema_apply_not_locked("cleanup").await?;
@@ -1012,7 +1013,7 @@ pub struct BranchReconcileStats {
 pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconcileStats> {
     let _schema = db
         .write_queue()
-        .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+        .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
         .await;
     let catalog = db.catalog();
     let graph_branches = cleanup_graph_branches(db).await?;

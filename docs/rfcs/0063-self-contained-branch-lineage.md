@@ -66,7 +66,7 @@ Lineage is stored per branch. A branch's `__manifest` holds its own
 Lance shallow clone of the parent's `__manifest` at the fork version, so the
 rows are shared, not copied. A merge publishes one `graph_commit` row on the target whose
 `merged_parent_commit_id` is the source head
-([publisher.rs](../../crates/omnigraph/src/db/manifest/publisher.rs)
+([publisher.rs](../../crates/omnigraph-catalog/src/publisher.rs)
 `resolve_lineage_rows`) and copies nothing else. The target then references a
 commit whose record lives only in the source's `__manifest`.
 
@@ -324,7 +324,7 @@ with no new obligation.
 **Explicit heads.** Today three selectors choose a manifest's head by the
 maximum `lineage_key = (graph_manifest_version, created_at,
 graph_commit_id)`: `head_lineage_row` in
-[state.rs](../../crates/omnigraph/src/db/manifest/state.rs) for the
+[state.rs](../../crates/omnigraph-catalog/src/state.rs) for the
 publisher's parent, `should_replace_head` (called from `build_commit_cache`,
 `append_manifest_rows`, and `insert_committed`) for the warm `CommitGraph`,
 and `latest_commit_matching` for the commit the recovery audit converges on.
@@ -528,7 +528,7 @@ Step 2 is a graph-storage format change. Imported rows change what the
 rows would select a foreign head through `should_replace_head` with no
 refusal, because refusal keys only on the stamp. So `INTERNAL_MANIFEST_SCHEMA_VERSION`
 and `MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION` in
-[migrations.rs](../../crates/omnigraph/src/db/manifest/migrations.rs) move
+[migrations.rs](../../crates/omnigraph-catalog/src/migrations.rs) move
 together, `release_for_internal_schema_version` gains the new arm naming the
 release that writes it, a lower stamp is refused with the export and rebuild
 message naming the 0.9.x or 0.10.x export binary, and a higher stamp is

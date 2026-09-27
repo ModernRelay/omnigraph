@@ -1,0 +1,48 @@
+[package]
+name = "omnigraph-catalog"
+version = "0.11.0"
+edition = "2024"
+description = "The `__manifest` catalog of an omnigraph store: table registrations, graph branch registrations and lineage, and the publish."
+license = "MIT"
+repository = "https://github.com/ModernRelay/omnigraph"
+
+[features]
+default = []
+failpoints = ["omnigraph-core/failpoints", "omnigraph-seams/decide"]
+dst = ["omnigraph-core/dst", "omnigraph-storage/dst", "omnigraph-seams/install"]
+# test helpers other crates' tests reach across the boundary (cfg(test) is crate-local)
+test-util = ["dep:object_store", "omnigraph-core/test-util"]
+
+[dependencies]
+omnigraph-core = { path = "../omnigraph-core", version = "0.11.0" }
+omnigraph-storage = { path = "../omnigraph-storage", version = "0.11.0" }
+omnigraph-seams = { path = "../omnigraph-seams", version = "0.11.0" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.11.0" }
+lance = { workspace = true }
+lance-core = { workspace = true }
+datafusion = { workspace = true }
+lance-file = { workspace = true }
+lance-namespace = { workspace = true }
+lance-table = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+ulid = { workspace = true }
+sha2 = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+url = { workspace = true }
+object_store = { workspace = true, optional = true }
+
+[dev-dependencies]
+omnigraph-core = { path = "../omnigraph-core", version = "0.11.0", features = ["test-util"] }
+tokio = { workspace = true }
+tempfile = { workspace = true }
+lance-namespace-impls = { workspace = true }
+object_store = { workspace = true }
+
+[lints]
+workspace = true

@@ -40,7 +40,7 @@
 //! staged-only. The exact EnsureIndices adapter later retired the final
 //! inline-commit residual. Phase 8 (index reconciler) is tracked as MR-848.
 
-pub(crate) mod lance_clone;
+pub(crate) use omnigraph_core::lance_clone;
 
 use std::fmt::Debug;
 use std::sync::Arc;

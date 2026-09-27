@@ -36,9 +36,9 @@ SCOPES = {
         "",
     ),
     "engine": (
-        "cargo test --locked -p omnigraph-engine --lib --features failpoints db::manifest::upgrade::tests -- --test-threads=1",
-        "crates/omnigraph/src/db/manifest/upgrade/tests.rs",
-        "db::manifest::upgrade::tests::",
+        "cargo test --locked -p omnigraph-engine --lib --features failpoints db::upgrade::tests -- --test-threads=1",
+        "crates/omnigraph/src/db/upgrade/tests.rs",
+        "db::upgrade::tests::",
     ),
     "lance": (
         "cargo test --locked -p omnigraph-engine --test lance_version_columns --features failpoints -- --test-threads=1",

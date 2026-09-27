@@ -1,4 +1,5 @@
 use super::*;
+use crate::dataset_index::is_full_text_index;
 use crate::error::missing_graph_type_at_snapshot;
 use crate::seams::{decide_seam, fail};
 use lance::index::DatasetIndexExt;
@@ -359,7 +360,7 @@ async fn maintain_indices_for_branch(
         .collect();
     let _schema_guard = db
         .write_queue()
-        .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+        .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
         .await;
     let _branch_guard = db
         .write_queue()
@@ -693,7 +694,7 @@ async fn plan_full_text_rebuild(
         }
     }
     for index in indexes.iter() {
-        if !TableStore::is_full_text_index(index) {
+        if !is_full_text_index(index) {
             continue;
         }
         let field = index

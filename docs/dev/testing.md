@@ -19,7 +19,9 @@ The invariants behind these rules are in [invariants.md](invariants.md). Lance-d
 | `omnigraph-compiler` | In-source parser, catalog, type-checking, lowering, and lint tests | Module-local fixtures |
 | `omnigraph-planner` | In-source optimizer/cost tests and `tests/query_plan.rs`, `tests/registry.rs`, `tests/lower_walk.rs`; plan assertions over real snapshots live in GQT | `PlanSource` fixtures for metadata and refusal states |
 | `omnigraph-storage` | In-source control-object storage, CAS, locking, and URI tests | Module-local fixtures |
-| `omnigraph-seams` | In-source tests of the seam type: slot scopes, the guard, the decision behaviors; `tests/failpoint_names_guard.rs`, the source walk over the engine, cluster and DST crates and the `.gqt` corpus that keeps every seam catalogued, crossed and armed | None |
+| `omnigraph-seams` | In-source tests of the seam type: slot scopes, the guard, the decision behaviors; `tests/failpoint_names_guard.rs`, the source walk over the engine, core, catalog, cluster and DST crates and the `.gqt` corpus that keeps every seam catalogued, crossed and armed | None |
+| `omnigraph-core` | In-file `#[cfg(test)]` tests (62 today) of the error type, branch names, branch control, Lance clone, metadata, full-text compatibility and instrumentation | Module-local fixtures |
+| `omnigraph-catalog` | In-source tests (52 today): `crates/omnigraph-catalog/src/tests.rs` for `__manifest` publication, state and lineage, plus in-file tests in `migrations.rs` and `retention.rs` | Module-local fixtures; `omnigraph-core`'s `test-util` helpers |
 | `omnigraph-engine` | `crates/omnigraph/tests/` plus focused in-source tests | `tests/helpers/` and `tests/fixtures/` |
 | `omnigraph-policy` | In-source Cedar policy parsing and evaluation tests | Module-local fixtures |
 | `omnigraph-cluster` | In-source lifecycle tests; `tests/failpoints.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
@@ -30,6 +32,10 @@ The invariants behind these rules are in [invariants.md](invariants.md). Lance-d
 | `omnigraph-gqt` | `tests/gq_logic_tests.rs`, one libtest test per `.gqt` case (`datatest-stable`, `harness = false`), plus in-source format self-tests and the corpus layout check | The `.gqt` corpus under `crates/omnigraph-gqt/cases/`; format in RFC 0045 |
 
 Do not copy server or CLI process setup into a new suite. Their support modules own hermetic configuration, binary startup, temporary roots, and common assertions.
+
+Test helpers that live in `omnigraph-core` or `omnigraph-catalog` and are reached by another crate's tests are gated `#[cfg(any(test, feature = "test-util"))]`. A plain `#[cfg(test)]` is not enough: `cfg(test)` is set per crate, so a dependent crate's test build compiles the base crate without it and cannot see the helper. The engine enables `test-util` on both crates through its dev-dependencies in `crates/omnigraph/Cargo.toml`, so the helpers exist only in test builds and never in a release artifact.
+
+`tests/forbidden_apis.rs` walks the engine, `omnigraph-core` and `omnigraph-catalog` sources; a line that carries the sentinel comment `// forbidden-api-allow: <reason>`, on the line itself or the line above, is exempt from the lexical deny-list only (the structural graph-write guard still counts it), so every exemption shows up in review.
 
 ## Engine ownership
 

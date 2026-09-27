@@ -237,6 +237,24 @@ fn engine_dir() -> PathBuf {
     seams_dir().join("../omnigraph")
 }
 
+fn core_dir() -> PathBuf {
+    seams_dir().join("../omnigraph-core")
+}
+
+fn catalog_dir() -> PathBuf {
+    seams_dir().join("../omnigraph-catalog")
+}
+
+/// The engine catalog indexes seams declared and crossed in the engine and in
+/// the two crates split out of it.
+fn engine_src_roots() -> Vec<PathBuf> {
+    vec![
+        engine_dir().join("src"),
+        core_dir().join("src"),
+        catalog_dir().join("src"),
+    ]
+}
+
 fn cluster_dir() -> PathBuf {
     seams_dir().join("../omnigraph-cluster")
 }
@@ -257,6 +275,10 @@ fn files_to_scan() -> Vec<PathBuf> {
     for root in [
         engine_dir().join("src"),
         engine_dir().join("tests"),
+        core_dir().join("src"),
+        core_dir().join("tests"),
+        catalog_dir().join("src"),
+        catalog_dir().join("tests"),
         cluster_dir().join("src"),
         cluster_dir().join("tests"),
     ] {
@@ -447,13 +469,15 @@ fn parse_index_text(contents: &str, label: &str) -> Catalog {
 }
 
 /// A crate's catalog: the index from `catalog_path`, the declarations from
-/// every other source file under `src_root`.
-fn parse_catalog(catalog_path: &Path, src_root: &Path, label: &str) -> Catalog {
+/// every other source file under `src_roots`.
+fn parse_catalog(catalog_path: &Path, src_roots: &[PathBuf], label: &str) -> Catalog {
     let contents = std::fs::read_to_string(catalog_path)
         .unwrap_or_else(|e| panic!("catalog {} is unreadable: {e}", catalog_path.display()));
     let mut catalog = parse_index_text(&contents, label);
     let mut files = Vec::new();
-    collect_ext(src_root, "rs", &mut files);
+    for root in src_roots {
+        collect_ext(root, "rs", &mut files);
+    }
     files.sort();
     for file in files {
         if file.canonicalize().ok() == catalog_path.canonicalize().ok() {
@@ -655,8 +679,10 @@ impl syn::parse::Parse for MacroNames {
 }
 
 /// Whether `attrs` carry a `#[cfg(…)]` that holds only under `cfg(test)`:
-/// `test` itself, an `all(…)` with such a member, or an `any(…)` whose
-/// members all are; `not(…)`, `feature = …` and other predicates never.
+/// `test` itself, an `all(…)` with such a member, an `any(…)` whose members
+/// all are, or an `any(…)` of `test` and `feature = "test-util"` only (the
+/// crate-boundary form of `cfg(test)`, the reading of `forbidden_apis.rs`);
+/// `not(…)`, a lone `feature = …` and other predicates never.
 fn cfg_requires_test(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
         attr.path().is_ident("cfg")
@@ -678,13 +704,31 @@ fn meta_requires_test(meta: &syn::Meta) -> bool {
             if list.path.is_ident("all") {
                 members.iter().any(meta_requires_test)
             } else if list.path.is_ident("any") {
-                !members.is_empty() && members.iter().all(meta_requires_test)
+                let is_test = |meta: &syn::Meta| matches!(meta, syn::Meta::Path(path) if path.is_ident("test"));
+                (!members.is_empty() && members.iter().all(meta_requires_test))
+                    || (members.iter().any(is_test)
+                        && members
+                            .iter()
+                            .all(|meta| is_test(meta) || is_test_util_feature(meta)))
             } else {
                 false
             }
         }
         syn::Meta::NameValue(_) => false,
     }
+}
+
+fn is_test_util_feature(meta: &syn::Meta) -> bool {
+    matches!(
+        meta,
+        syn::Meta::NameValue(name_value)
+            if name_value.path.is_ident("feature")
+                && matches!(
+                    &name_value.value,
+                    syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(value), .. })
+                        if value.value() == "test-util"
+                )
+    )
 }
 
 /// One file's names routed by `cfg`: every item, impl item, trait item,
@@ -1003,9 +1047,12 @@ fn crossing_files(src_root: &Path, catalog_path: &Path) -> Vec<PathBuf> {
 /// What production code names, its `cfg(test)` half, comments and
 /// declarations excluded: a static counts as crossed only when code under
 /// `src/` names it.
-fn production_names(src_root: &Path, catalog_path: &Path) -> Names {
+fn production_names(src_roots: &[PathBuf], catalog_path: &Path) -> Names {
     let mut names = Names::default();
-    for file in crossing_files(src_root, catalog_path) {
+    for file in src_roots
+        .iter()
+        .flat_map(|root| crossing_files(root, catalog_path))
+    {
         if let Ok(text) = std::fs::read_to_string(&file) {
             names.absorb(split_names(&text, &file.display().to_string()).production);
         }
@@ -1019,11 +1066,13 @@ fn production_names(src_root: &Path, catalog_path: &Path) -> Names {
 fn check_declaration_placement(
     catalog: &Catalog,
     catalog_path: &Path,
-    src_root: &Path,
+    src_roots: &[PathBuf],
     violations: &mut Vec<String>,
 ) {
     let mut files = Vec::new();
-    collect_ext(src_root, "rs", &mut files);
+    for root in src_roots {
+        collect_ext(root, "rs", &mut files);
+    }
     files.sort();
     for file in files {
         let Ok(text) = std::fs::read_to_string(&file) else {
@@ -1044,7 +1093,10 @@ fn check_declaration_placement(
         ));
     }
     for d in &catalog.declared {
-        if is_test_source(src_root, &d.file) {
+        let under_test = src_roots
+            .iter()
+            .any(|root| d.file.starts_with(root) && is_test_source(root, &d.file));
+        if under_test {
             violations.push(format!(
                 "{}: `{}` is declared under a test module and does not exist in a non-test build",
                 d.file.display(),
@@ -1169,14 +1221,18 @@ fn check_helper_pairing(catalogs: &[&Catalog], files: &[PathBuf], violations: &m
     }
 }
 
+/// The engine catalog's armers: the harness crates, plus the test modules of
+/// every `src` root that declares or crosses its seams (`engine_src_roots`).
 fn engine_arming_roots() -> ArmingRoots {
     ArmingRoots {
         harness: vec![
             engine_dir().join("tests"),
+            core_dir().join("tests"),
+            catalog_dir().join("tests"),
             dst_dir().join("src"),
             dst_dir().join("tests"),
         ],
-        src: vec![engine_dir().join("src")],
+        src: engine_src_roots(),
     }
 }
 
@@ -1222,23 +1278,25 @@ fn arming_calls() -> Vec<String> {
 fn catalogs_are_complete_unique_and_used() {
     let engine_catalog_path = engine_catalog_path();
     let cluster_catalog_path = cluster_catalog_path();
+    let engine_roots = engine_src_roots();
+    let cluster_roots = vec![cluster_dir().join("src")];
 
     let engine = parse_catalog(
         &engine_catalog_path,
-        &engine_dir().join("src"),
+        &engine_roots,
         "omnigraph::seams::catalog",
     );
     let cluster = parse_catalog(
         &cluster_catalog_path,
-        &cluster_dir().join("src"),
+        &cluster_roots,
         "omnigraph_cluster::seams::catalog",
     );
 
     let engine_armers = armers(&engine_arming_roots(), Some(&gqt_cases_dir()));
     let cluster_armers = armers(&cluster_arming_roots(), None);
 
-    let engine_src = production_names(&engine_dir().join("src"), &engine_catalog_path);
-    let cluster_src = production_names(&cluster_dir().join("src"), &cluster_catalog_path);
+    let engine_src = production_names(&engine_roots, &engine_catalog_path);
+    let cluster_src = production_names(&cluster_roots, &cluster_catalog_path);
 
     let mut violations = Vec::new();
     check_catalog(&engine, &engine_src, &engine_armers, &mut violations);
@@ -1246,13 +1304,13 @@ fn catalogs_are_complete_unique_and_used() {
     check_declaration_placement(
         &engine,
         &engine_catalog_path,
-        &engine_dir().join("src"),
+        &engine_roots,
         &mut violations,
     );
     check_declaration_placement(
         &cluster,
         &cluster_catalog_path,
-        &cluster_dir().join("src"),
+        &cluster_roots,
         &mut violations,
     );
     check_helper_pairing(&[&engine, &cluster], &files_to_scan(), &mut violations);
@@ -1270,8 +1328,14 @@ fn catalogs_are_complete_unique_and_used() {
 fn arming_files_never_cross() {
     let engine_src = engine_dir().join("src");
     let cluster_src = cluster_dir().join("src");
+    let split_srcs = [core_dir().join("src"), catalog_dir().join("src")];
     let crossing: BTreeSet<PathBuf> = crossing_files(&engine_src, &engine_catalog_path())
         .into_iter()
+        .chain(
+            split_srcs
+                .iter()
+                .flat_map(|root| crossing_files(root, &engine_catalog_path())),
+        )
         .chain(crossing_files(&cluster_src, &cluster_catalog_path()))
         .collect();
     let arming: BTreeSet<PathBuf> = arming_files(&engine_arming_roots())
@@ -1478,6 +1542,10 @@ fn guard_refuses_duplicates_and_mispaired_helpers() {
          fn after() { fail(&A); }\n\
          #[cfg(any(test, feature = \"failpoints\"))]\nmod maybe { fn m() { M.fire_always(); } }\n\
          #[cfg(any(test, all(test, feature = \"x\")))]\nmod only_tests { fn o() { O; } }\n\
+         #[cfg(any(test, feature = \"test-util\"))]\nmod util { fn u() { U; } }\n\
+         #[cfg(feature = \"test-util\")]\nmod lone { fn l() { L; } }\n\
+         #[cfg(any(feature = \"test-util\"))]\nmod lone_any { fn n() { N; } }\n\
+         #[cfg(any(test, feature = \"test-util\", feature = \"x\"))]\nmod mixed { fn q() { Q; } }\n\
          #[cfg(not(test))]\nmod live { fn c() { C; } }\n\
          impl Z {\n    #[cfg(test)]\n    fn helper(&self) { D.panic_at(); }\n    fn keep(&self) { E; }\n}\n\
          struct W {\n    #[cfg(test)]\n    probe: P,\n    keep: K,\n}\n\
@@ -1487,22 +1555,24 @@ fn guard_refuses_duplicates_and_mispaired_helpers() {
     );
     let has = |names: &Names, ident: &str| names.idents.contains(ident);
     assert!(
-        ["A", "pool", "M", "C", "E", "K", "fail"]
+        ["A", "pool", "M", "L", "N", "Q", "C", "E", "K", "fail"]
             .iter()
             .all(|i| has(&split.production, i))
-            && ["X", "H", "O", "D", "P", "Y"]
+            && ["X", "H", "O", "U", "D", "P", "Y"]
                 .iter()
                 .all(|i| has(&split.tests, i))
-            && ["X", "H", "O", "D", "P", "Y", "G", "DECLARED"]
+            && ["X", "H", "O", "U", "D", "P", "Y", "G", "DECLARED"]
                 .iter()
                 .all(|i| !has(&split.production, i))
-            && ["A", "M", "C", "E", "K"]
+            && ["A", "M", "L", "N", "Q", "C", "E", "K"]
                 .iter()
                 .all(|i| !has(&split.tests, i)),
-        "a wrapped `cfg(all(test, …))`, `cfg(any(test, all(test, …)))`, a `cfg(test)` method, \
-         field and `use` are test code; `cfg(any(test, feature))`, `cfg(not(test))` and the rest \
-         are production; a doc comment, a block comment and a `decide_seam!` declaration name \
-         nothing: {:?} / {:?}",
+        "a wrapped `cfg(all(test, …))`, `cfg(any(test, all(test, …)))`, \
+         `cfg(any(test, feature = \"test-util\"))`, a `cfg(test)` method, field and `use` are \
+         test code; `cfg(any(test, feature = \"failpoints\"))`, a lone `feature = \"test-util\"` \
+         (bare or in `any`), `any(test, feature = \"test-util\", <other>)`, `cfg(not(test))` and \
+         the rest are production; a doc comment, a block comment and a `decide_seam!` declaration \
+         name nothing: {:?} / {:?}",
         split.production.idents,
         split.tests.idents
     );

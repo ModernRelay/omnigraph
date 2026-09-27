@@ -9,7 +9,8 @@ use omnigraph_compiler::{
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::db::manifest::{Snapshot, TableIdentity, table_path_for_identity};
+use crate::db::Snapshot;
+use crate::db::manifest::{TableIdentity, table_path_for_identity};
 use crate::error::{OmniError, Result};
 use crate::storage::{StorageAdapter, join_uri};
 

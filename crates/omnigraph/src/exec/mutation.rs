@@ -978,7 +978,7 @@ impl Omnigraph {
                     // authority and map a moved caller head to terminal 412.
                     let _schema_guard = self
                         .write_queue()
-                        .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+                        .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
                         .await;
                     let _branch_guard = self
                         .write_queue()

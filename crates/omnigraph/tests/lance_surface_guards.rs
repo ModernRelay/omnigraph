@@ -509,7 +509,7 @@ async fn stage_conflict_matrix_txn(dataset: Arc<Dataset>, kind: ConflictMatrixTx
 
 // --- Guard 1: LanceError::TooMuchWriteContention variant exists ------------
 //
-// `db/manifest/publisher.rs::map_lance_publish_error` pattern-matches on this
+// `omnigraph-catalog/src/publisher.rs::map_lance_publish_error` pattern-matches on this
 // variant to surface typed `OmniError::ManifestRowLevelCasContention`. If
 // Lance renames the variant or removes the builder, this guard fails.
 
@@ -519,7 +519,7 @@ async fn lance_error_too_much_write_contention_variant_exists() {
     assert!(
         matches!(err, lance::Error::TooMuchWriteContention { .. }),
         "Lance::Error::TooMuchWriteContention variant missing or renamed; \
-         update db/manifest/publisher.rs::map_lance_publish_error and \
+         update omnigraph-catalog/src/publisher.rs::map_lance_publish_error and \
          this guard, then re-pin docs/dev/lance.md."
     );
 }
@@ -547,7 +547,7 @@ async fn lance_error_dataset_already_exists_variant_exists() {
 
 // --- Guard 2: ManifestLocation field shape ---------------------------------
 //
-// `db/manifest/metadata.rs:84-88` reads `.path`, `.size`, `.e_tag`,
+// `omnigraph-core/src/metadata.rs:134-138` reads `.path`, `.size`, `.e_tag`,
 // `.naming_scheme` off `dataset.manifest_location()`. If any field renames
 // or changes type, this guard fails to compile.
 
@@ -943,7 +943,7 @@ async fn _compile_checkout_version_then_restore_signature() -> lance::Result<()>
 
 // --- Guard 4: DatasetBuilder::from_namespace fluent chain ------------------
 //
-// `db/manifest/namespace.rs:162-174` chains
+// `omnigraph-catalog/src/tests.rs` chains
 // `DatasetBuilder::from_namespace(ns, vec![id]).await?.with_branch(...).with_version(...).load().await?`.
 // Compile-only.
 
@@ -967,7 +967,7 @@ async fn _compile_dataset_builder_from_namespace_signature(
 
 // --- Guard 5: MergeInsertBuilder fluent chain ------------------------------
 //
-// `db/manifest/publisher.rs:370-391` is the manifest CAS. If any method on
+// `omnigraph-catalog/src/publisher.rs` is the manifest CAS. If any method on
 // the builder renames or changes signature, the publisher silently breaks.
 // Compile-only.
 
@@ -3045,7 +3045,7 @@ async fn skip_auto_cleanup_suppresses_version_gc() {
 // "the unenforced primary key is a reserved key and cannot be changed once set".
 //
 // This is the upstream behavior that broke
-// `db/manifest/migrations.rs::migrate_v1_to_v2`'s crash-idempotency: a
+// `omnigraph-catalog/src/migrations.rs::migrate_v1_to_v2`'s crash-idempotency: a
 // pre-v0.4.0 graph that crashed after the field-set but before the stamp bump
 // re-enters the migration with the PK already present, and on Lance 6 the
 // re-apply was a no-op. The migration now guards the set on the manifest's

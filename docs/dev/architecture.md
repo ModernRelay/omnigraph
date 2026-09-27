@@ -20,6 +20,8 @@ flowchart TB
     COMPILER[omnigraph-compiler]
     PLANNER[omnigraph-planner]
     ENGINE[omnigraph engine]
+    CATALOG[omnigraph-catalog]
+    CORE[omnigraph-core]
     POLICY[omnigraph-policy]
     STORAGE[omnigraph-storage]
     LANCE[Lance datasets]
@@ -35,6 +37,11 @@ flowchart TB
     PLANNER --> COMPILER
     ENGINE --> POLICY
     ENGINE --> STORAGE
+    ENGINE --> CATALOG
+    ENGINE --> CORE
+    CATALOG --> CORE
+    CATALOG --> STORAGE
+    CORE --> STORAGE
     ENGINE --> LANCE
     CLUSTER --> STORAGE
     LANCE --> OBJECTS
@@ -72,7 +79,9 @@ alias is reused. See [invariants.md](invariants.md) and
 |---|---|
 | `omnigraph-compiler` | `.pg` and `.gq` parsing, catalog, type checking, lint, migration planning, and typed IR lowering. It has no Lance dependency. |
 | `omnigraph-planner` | Logical and physical plans, optimizer passes, cost estimates and explain documents; metadata enters through `PlanSource`, with no Lance dependency. |
-| `omnigraph` (`omnigraph-engine`) | Snapshots, query and mutation execution, graph topology, graph branches/lineage, validation, multi-dataset publication, and recovery. |
+| `omnigraph` (`omnigraph-engine`) | The public facade (`Omnigraph`, `Snapshot`), the graph coordinator, query and mutation execution, the table store, graph topology, validation, and recovery. |
+| `omnigraph-catalog` | `__manifest` publication (multi-dataset publication), graph branch registrations and lineage, retention, and `commit_graph`. |
+| `omnigraph-core` | `OmniError`, Lance dataset access and instrumentation, native Lance branch ref control (`branch_control`), and dataset addressing. |
 | `omnigraph-storage` | Shared local/S3/Azure control-object access used for manifests' companion objects, cluster state, locks, approvals, and recovery artifacts. |
 | Lance | Dataset files, transactions, versions, native refs, secondary indexes, compaction, and version cleanup. |
 | `omnigraph-policy` | Cedar compilation and the engine-facing action/scope/actor gate. |

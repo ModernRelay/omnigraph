@@ -163,8 +163,9 @@ setting_variables+=("OMNIGRAPH_TRAVERSAL_MODE")
 
 # Scan roots. `--self-test` repoints them at a fixture tree.
 engine_src="crates/omnigraph/src"
-engine_test_dirs=(crates/omnigraph/tests crates/omnigraph/examples)
-engine_instrumentation="crates/omnigraph/src/instrumentation.rs"
+engine_src_dirs="$engine_src crates/omnigraph-core/src crates/omnigraph-catalog/src"
+engine_test_dirs=(crates/omnigraph/tests crates/omnigraph/examples crates/omnigraph-core/tests crates/omnigraph-catalog/tests)
+engine_instrumentation="crates/omnigraph-core/src/instrumentation.rs"
 
 # Sets `engine_fail` and reports every violation under the current roots.
 scan_engine_settings() {
@@ -174,7 +175,7 @@ scan_engine_settings() {
       [[ -z "$hit" ]] && continue
       echo "error: $engine_src reads $variable; it is a session setting (or the retired traversal variable); take it from the session: $hit" >&2
       engine_fail=1
-    done < <(grep -rnE "(std::env::var|env::var|var_os)\(\s*\"$variable\"" "$engine_src" || true)
+    done < <(grep -rnE "(std::env::var|env::var|var_os)\(\s*\"$variable\"" $engine_src_dirs || true)
     # `EnvGuard::set(&[` lists its pairs on the following lines, hence the
     # trailing context window.
     while IFS= read -r hit; do
@@ -188,7 +189,7 @@ scan_engine_settings() {
     [[ -z "$hit" ]] && continue
     echo "error: $engine_src reaches the environment through the settings table; take every setting from the session: $hit" >&2
     engine_fail=1
-  done < <(grep -rnE "settings::from_env(_with)?[[:space:]]*\(|use[^;]*settings::[^;]*from_env|(DEFINITIONS\[[^]]*\]|spec\(\)|definition\(\))[[:space:]]*\.[[:space:]]*env\b" "$engine_src" || true)
+  done < <(grep -rnE "settings::from_env(_with)?[[:space:]]*\(|use[^;]*settings::[^;]*from_env|(DEFINITIONS\[[^]]*\]|spec\(\)|definition\(\))[[:space:]]*\.[[:space:]]*env\b" $engine_src_dirs || true)
   while IFS= read -r hit; do
     [[ -z "$hit" ]] && continue
     echo "error: $engine_instrumentation carries a per-setting override static; the session owns rrf_plan and stage_write_concurrency: $hit" >&2
@@ -222,6 +223,7 @@ reset_fixture() {
   : > "$fixture_root/probe/src/lib.rs"
   : > "$fixture_root/probe/tests/settings.rs"
   engine_src="$fixture_root/probe/src"
+  engine_src_dirs="$engine_src"
   engine_test_dirs=("$fixture_root/probe/tests" "$fixture_root/probe/examples")
   engine_instrumentation="$fixture_root/probe/src/instrumentation.rs"
 }

@@ -13,8 +13,9 @@ use super::is_internal_system_branch;
 use super::manifest::{
     CapturedManifestProbe, DatasetUpdate, ExpectedTableVersions, GenesisManifestAttempt,
     LineageIntent, LineageRefresh, ManifestChange, ManifestCoordinator, ManifestIncarnation,
-    ManifestInitError, PublishPrecondition, Snapshot,
+    ManifestInitError, PublishPrecondition,
 };
+use super::snapshot::Snapshot;
 use crate::seams::{decide_seam, fail};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -314,7 +315,7 @@ impl GraphCoordinator {
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        self.manifest.snapshot()
+        Snapshot::wrap(self.manifest.snapshot())
     }
 
     pub fn current_branch(&self) -> Option<&str> {
@@ -443,6 +444,7 @@ impl GraphCoordinator {
             graph_manifest_version,
         )
         .await
+        .map(Snapshot::wrap)
     }
 
     pub async fn resolve_snapshot_id(&self, branch: &str) -> Result<SnapshotId> {
@@ -520,12 +522,14 @@ impl GraphCoordinator {
             }
             ReadTarget::Snapshot(snapshot_id) => {
                 let commit = self.resolve_commit(snapshot_id).await?;
-                let snapshot = ManifestCoordinator::snapshot_at(
-                    self.root_uri(),
-                    commit.graph_branch.as_deref(),
-                    commit.graph_manifest_version,
-                )
-                .await?;
+                let snapshot = Snapshot::wrap(
+                    ManifestCoordinator::snapshot_at(
+                        self.root_uri(),
+                        commit.graph_branch.as_deref(),
+                        commit.graph_manifest_version,
+                    )
+                    .await?,
+                );
                 // The reopen above is keyed only by (manifest branch, numeric
                 // version). A named branch deleted and recreated at the same
                 // numeric version between this handle's commit resolution and

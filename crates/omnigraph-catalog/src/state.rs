@@ -17,16 +17,16 @@ use super::{
 
 #[derive(Debug, Clone)]
 pub struct DatasetEntry {
-    pub(crate) identity: TableIdentity,
+    pub identity: TableIdentity,
     pub type_key: String,
     pub dataset_path: String,
     pub published_dataset_version: u64,
     pub native_dataset_branch: Option<String>,
     pub entity_count: u64,
-    pub(crate) version_metadata: TableVersionMetadata,
+    pub version_metadata: TableVersionMetadata,
     /// The `__manifest` version whose publish wrote this registration: the
     /// clock the projection orders registrations by (RFC 0062).
-    pub(crate) manifest_version: u64,
+    pub manifest_version: u64,
 }
 
 impl DatasetEntry {
@@ -44,14 +44,14 @@ impl DatasetEntry {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct ManifestState {
-    pub(super) version: u64,
-    pub(super) entries: Vec<DatasetEntry>,
+pub struct ManifestState {
+    pub version: u64,
+    pub entries: Vec<DatasetEntry>,
     /// Exact materialized `graph_head:<branch>` values from this SAME manifest
     /// version. Keeping the head beside the table snapshot prevents a
     /// manifest-only refresh from leaving coarse write authority split between
     /// a fresh table view and the commit graph's older derived cache.
-    pub(super) graph_heads: HashMap<String, String>,
+    pub graph_heads: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,14 +68,14 @@ struct TableTombstoneEntry {
 /// touching any reader above that boundary. Kept as a separate struct here to
 /// keep `state.rs` free of the `commit_graph` module dependency.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GraphLineageRow {
-    pub(crate) graph_commit_id: String,
-    pub(crate) graph_branch: Option<String>,
-    pub(crate) graph_manifest_version: u64,
-    pub(crate) parent_commit_id: Option<String>,
-    pub(crate) merged_parent_commit_id: Option<String>,
-    pub(crate) actor_id: Option<String>,
-    pub(crate) created_at: i64,
+pub struct GraphLineageRow {
+    pub graph_commit_id: String,
+    pub graph_branch: Option<String>,
+    pub graph_manifest_version: u64,
+    pub parent_commit_id: Option<String>,
+    pub merged_parent_commit_id: Option<String>,
+    pub actor_id: Option<String>,
+    pub created_at: i64,
 }
 
 /// JSON payload of a `graph_commit` row's `metadata` column. The immutable
@@ -104,7 +104,7 @@ struct GraphHeadMetadata {
 
 /// The `object_id` for a branch's mutable head pointer row. Main encodes as
 /// `graph_head:main`; named branches as `graph_head:<branch>`.
-pub(crate) fn graph_head_object_id(branch: Option<&str>) -> String {
+pub fn graph_head_object_id(branch: Option<&str>) -> String {
     format!(
         "{}{}",
         super::GRAPH_HEAD_OBJECT_ID_PREFIX,
@@ -130,7 +130,7 @@ struct ManifestScan {
     graph_heads: HashMap<String, String>,
 }
 
-pub(super) fn manifest_schema() -> SchemaRef {
+pub fn manifest_schema() -> SchemaRef {
     // `object_id` is the merge-insert join key in the publisher; marking it as
     // Lance's unenforced primary key engages row-level CAS at commit time, so
     // two concurrent writers that try to land the same `object_id` row are
@@ -162,7 +162,7 @@ pub(super) fn manifest_schema() -> SchemaRef {
     ]))
 }
 
-pub(super) async fn read_manifest_state_with_registration_clocks(
+pub async fn read_manifest_state_with_registration_clocks(
     dataset: &Dataset,
 ) -> Result<ManifestState> {
     if super::migrations::read_stamp(dataset) != Some(6) {
@@ -174,7 +174,7 @@ pub(super) async fn read_manifest_state_with_registration_clocks(
     manifest_state_from_scan(dataset.version().version, scan)
 }
 
-pub(super) async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestState> {
+pub async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestState> {
     let version = dataset.version().version;
     // The table-state hot path never needs lineage, so don't pay its JSON decode.
     let scan = read_manifest_scan(dataset, false).await?;
@@ -187,7 +187,7 @@ pub(super) async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestSta
 /// `GraphCoordinator` needs both projections. Keeping them in one pass avoids a
 /// second dataset open/full scan and guarantees its table snapshot and lineage
 /// cache describe the exact same manifest version.
-pub(super) async fn read_manifest_state_and_lineage(
+pub async fn read_manifest_state_and_lineage(
     dataset: &Dataset,
 ) -> Result<(ManifestState, Vec<GraphLineageRow>)> {
     let version = dataset.version().version;
@@ -234,7 +234,7 @@ fn manifest_state_from_scan(version: u64, scan: ManifestScan) -> Result<Manifest
 /// projection, and duplicating it made an otherwise small exception-safety
 /// clone O(commit history).
 #[derive(Debug, Clone)]
-pub(super) struct ProjectionAccumulator {
+pub struct ProjectionAccumulator {
     registrations: HashMap<TableIdentity, TableRegistration>,
     latest_versions: HashMap<TableIdentity, DatasetEntry>,
     tombstone_map: HashMap<TableIdentity, u64>,
@@ -337,12 +337,12 @@ impl ProjectionAccumulator {
     /// Drop one branch's head pointer (its durable row was deleted — the
     /// mutable-row half of a head update, or a branch deletion; a replacement,
     /// when one exists, arrives via the delta fragments' live rows).
-    pub(super) fn remove_head(&mut self, branch_key: &str) {
+    pub(crate) fn remove_head(&mut self, branch_key: &str) {
         self.graph_heads.remove(branch_key);
     }
 
     /// Reduce to the visible state at `version`. Pure and repeatable.
-    pub(super) fn finish(&self, version: u64) -> Result<ManifestState> {
+    pub(crate) fn finish(&self, version: u64) -> Result<ManifestState> {
         finish_manifest_state(
             version,
             &self.registrations,
@@ -356,7 +356,7 @@ impl ProjectionAccumulator {
 /// One coherent scan producing the finished state, compact retained fold
 /// accumulators, and lineage rows handed off to `CommitGraph`. The plain read
 /// paths keep `read_manifest_state`.
-pub(super) async fn read_manifest_projection(
+pub(crate) async fn read_manifest_projection(
     dataset: &Dataset,
 ) -> Result<(ManifestState, ProjectionAccumulator, Vec<GraphLineageRow>)> {
     let version = dataset.version().version;
@@ -371,7 +371,7 @@ pub(super) async fn read_manifest_projection(
 /// Fold ONLY the live rows of `fragments` of `dataset` into `accumulator`
 /// (the appended-fragments delta of an incremental refresh) and reduce to the
 /// state at the dataset's version.
-pub(super) async fn fold_projection_delta(
+pub(crate) async fn fold_projection_delta(
     dataset: &Dataset,
     fragments: Vec<lance_table::format::Fragment>,
     accumulator: &mut ProjectionAccumulator,
@@ -387,7 +387,7 @@ pub(super) async fn fold_projection_delta(
 /// read from a pinned version where those rows are still live. Bounded by the
 /// deletion-vector difference the caller measured — a handful of rows, never
 /// history-sized.
-pub(super) async fn read_object_identities_at_offsets(
+pub(crate) async fn read_object_identities_at_offsets(
     dataset: &Dataset,
     fragment: lance_table::format::Fragment,
     offsets: &std::collections::HashSet<u32>,
@@ -459,7 +459,7 @@ pub(super) async fn read_object_identities_at_offsets(
 /// byte-identity the fold relies on. Tombstones are passed as
 /// `(identity, manifest_version)` tuples so callers outside this module need
 /// not name the private `TableTombstoneEntry`.
-pub(super) fn assemble_manifest_state(
+pub(crate) fn assemble_manifest_state(
     version: u64,
     registrations: HashMap<TableIdentity, TableRegistration>,
     version_entries: Vec<DatasetEntry>,
@@ -479,7 +479,7 @@ pub(super) fn assemble_manifest_state(
 /// Return the exact compact accumulators alongside the visible state. The
 /// publisher already folds these inputs; retaining the result avoids another
 /// scan after the graph coordinator has adopted the corresponding lineage.
-pub(super) fn assemble_manifest_projection(
+pub(crate) fn assemble_manifest_projection(
     version: u64,
     registrations: HashMap<TableIdentity, TableRegistration>,
     version_entries: Vec<DatasetEntry>,
@@ -542,7 +542,7 @@ fn finish_manifest_state(
 
 // Preserve historical registrations for cleanup's published-pin proof, including
 // versions superseded by later writes. Current snapshots alone are insufficient.
-pub(super) async fn read_manifest_entries(dataset: &Dataset) -> Result<Vec<DatasetEntry>> {
+pub(crate) async fn read_manifest_entries(dataset: &Dataset) -> Result<Vec<DatasetEntry>> {
     let scan = read_manifest_scan(dataset, false).await?;
     let registrations = scan.table_registrations;
     scan.version_entries
@@ -566,19 +566,19 @@ pub(super) async fn read_manifest_entries(dataset: &Dataset) -> Result<Vec<Datas
 /// scan (RFC-013 P2). Replaces the prior four scans on the publish path (three
 /// thin accessors + a separate `read_graph_lineage`): `load_publish_state`
 /// projects every piece it needs out of this single result.
-pub(super) struct PublishScan {
-    pub(super) table_registrations: HashMap<TableIdentity, TableRegistration>,
-    pub(super) version_entries: Vec<DatasetEntry>,
+pub(crate) struct PublishScan {
+    pub(crate) table_registrations: HashMap<TableIdentity, TableRegistration>,
+    pub(crate) version_entries: Vec<DatasetEntry>,
     /// `(identity, manifest_version)` of each tombstone, mapped to the sealed
     /// Lance data version the tombstone row records.
-    pub(super) tombstones: Vec<((TableIdentity, u64), u64)>,
-    pub(super) lineage_rows: Vec<GraphLineageRow>,
+    pub(crate) tombstones: Vec<((TableIdentity, u64), u64)>,
+    pub(crate) lineage_rows: Vec<GraphLineageRow>,
     /// Exact `graph_head:<branch>` rows keyed by the branch suffix (`main` for
     /// main). Absence is meaningful and is preserved by a missing map entry.
-    pub(super) graph_heads: HashMap<String, String>,
+    pub(crate) graph_heads: HashMap<String, String>,
 }
 
-pub(super) async fn read_manifest_table_registrations(
+pub(crate) async fn read_manifest_table_registrations(
     dataset: &Dataset,
 ) -> Result<Vec<TableRegistration>> {
     Ok(read_manifest_scan(dataset, false)
@@ -591,7 +591,7 @@ pub(super) async fn read_manifest_table_registrations(
 /// One-scan read of everything the publish path needs. `collect_lineage` is
 /// always on here (the publisher resolves a parent), so the lineage JSON decode
 /// rides the same pass as the table-state assembly instead of a second scan.
-pub(super) async fn read_publish_scan(dataset: &Dataset) -> Result<PublishScan> {
+pub(crate) async fn read_publish_scan(dataset: &Dataset) -> Result<PublishScan> {
     let scan = read_manifest_scan(dataset, true).await?;
     Ok(PublishScan {
         table_registrations: scan.table_registrations,
@@ -740,9 +740,9 @@ async fn read_manifest_scan_with_clocks(
         && dataset
             .schema()
             .metadata
-            .contains_key(super::upgrade::UPGRADE_PENDING_KEY)
+            .contains_key(crate::migrations::UPGRADE_PENDING_KEY)
     {
-        historical = Box::pin(super::upgrade::historical_source(dataset.clone(), 7)).await?;
+        historical = Box::pin(crate::migrations::historical_source(dataset.clone(), 7)).await?;
         &historical
     } else {
         dataset
@@ -1027,7 +1027,7 @@ async fn read_manifest_scan_with_clocks(
 /// lineage object types and builds no table snapshot, so the table-state hot
 /// path never pays for lineage JSON and this path never pays for table-entry
 /// assembly.
-pub(crate) async fn read_graph_lineage(
+pub async fn read_graph_lineage(
     dataset: &Dataset,
 ) -> Result<(Vec<GraphLineageRow>, HashMap<String, String>)> {
     crate::instrumentation::record_manifest_scan();
@@ -1090,7 +1090,7 @@ pub(crate) async fn read_graph_lineage(
 /// — kept in one place so the publisher's per-attempt parent resolution and the
 /// cache agree by construction. `None` only for a graph with no commits yet
 /// (a parentless genesis).
-pub(crate) fn head_lineage_row(rows: &[GraphLineageRow]) -> Option<&GraphLineageRow> {
+pub fn head_lineage_row(rows: &[GraphLineageRow]) -> Option<&GraphLineageRow> {
     rows.iter().max_by(|a, b| {
         a.graph_manifest_version
             .cmp(&b.graph_manifest_version)
@@ -1103,12 +1103,12 @@ pub(crate) fn head_lineage_row(rows: &[GraphLineageRow]) -> Option<&GraphLineage
 /// publisher maps these onto its `PendingVersionRow`s (folding lineage into the
 /// table-version publish batch), and the genesis init path pushes them straight
 /// into the init batch.
-pub(crate) struct GraphLineageRowPart {
-    pub(crate) object_id: String,
-    pub(crate) object_type: &'static str,
-    pub(crate) metadata: String,
-    pub(crate) table_version: Option<u64>,
-    pub(crate) table_branch: Option<String>,
+pub struct GraphLineageRowPart {
+    pub object_id: String,
+    pub object_type: &'static str,
+    pub metadata: String,
+    pub table_version: Option<u64>,
+    pub table_branch: Option<String>,
 }
 
 /// Encode one graph commit into its two `__manifest` rows: the immutable
@@ -1117,7 +1117,7 @@ pub(crate) struct GraphLineageRowPart {
 /// for main. The immutable commit fields with no dedicated column live in the
 /// `graph_commit` row's `metadata` JSON; the mutable head pointer payload lives
 /// in the `graph_head` row's `metadata`.
-pub(crate) fn graph_lineage_row_parts(
+pub fn graph_lineage_row_parts(
     commit: &GraphLineageRow,
     branch: Option<&str>,
 ) -> Result<[GraphLineageRowPart; 2]> {
@@ -1158,7 +1158,7 @@ pub(crate) fn graph_lineage_row_parts(
     ])
 }
 
-pub(super) fn entries_to_batch(
+pub(crate) fn entries_to_batch(
     entries: &[DatasetEntry],
     version_metadata: &HashMap<TableIdentity, String>,
     genesis_lineage: &[GraphLineageRowPart],
@@ -1236,7 +1236,7 @@ pub(super) fn entries_to_batch(
     )
 }
 
-pub(super) fn manifest_rows_batch(
+pub(crate) fn manifest_rows_batch(
     object_ids: Vec<String>,
     object_types: Vec<String>,
     locations: Vec<Option<String>>,
@@ -1328,7 +1328,7 @@ pub(super) fn manifest_rows_batch(
     .map_err(OmniError::arrow_internal)
 }
 
-pub(super) fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+pub(crate) fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
     batch
         .column_by_name(name)
         .ok_or_else(|| {

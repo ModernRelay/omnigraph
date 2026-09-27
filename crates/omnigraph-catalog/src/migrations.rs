@@ -35,8 +35,13 @@
 //! omnigraph first" error. An old binary cannot clobber a newer schema by
 //! silently treating "unknown stamp" as "missing stamp".
 
+use std::collections::{HashMap, HashSet};
+
 use lance::Dataset;
+use lance::dataset::refs::BranchIdentifier;
+use lance::dataset::transaction::{Operation, Transaction, UpdateMap};
 use omnigraph_compiler::{SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_V3, SystemColumns};
+use serde::{Deserialize, Serialize};
 
 use crate::error::{OmniError, Result};
 
@@ -88,12 +93,12 @@ use crate::error::{OmniError, Result};
 ///
 /// v1–v10 graphs are not served by this binary (see `MIN_SUPPORTED`); the
 /// history is kept for provenance and to document what each stamp value meant.
-pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 11;
+pub const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 11;
 
 /// The oldest main-manifest stamp accepted by normal open: v11, the target of
 /// every registered upgrade route. Explicit conversion and retained-snapshot
 /// decoding do not lower this gate.
-pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = 11;
+pub const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = 11;
 
 /// The stamp a fresh graph of the given system column vintage is born with:
 /// CURRENT for both `id`/`src`/`dst` and `__id`/`__src`/`__dst` since v10.
@@ -101,7 +106,7 @@ pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = 11;
 /// the stamp; the stamp is the storage-format fence old binaries refuse on.
 /// An unknown vintage is still refused here so a new spelling cannot be born
 /// without a decision about its stamp.
-pub(crate) fn stamp_for_system_columns(system_columns: SystemColumns) -> Result<u32> {
+pub fn stamp_for_system_columns(system_columns: SystemColumns) -> Result<u32> {
     if system_columns == SYSTEM_COLUMNS_LEGACY || system_columns == SYSTEM_COLUMNS_V3 {
         Ok(INTERNAL_MANIFEST_SCHEMA_VERSION)
     } else {
@@ -125,7 +130,7 @@ pub(crate) fn stamp_for_system_columns(system_columns: SystemColumns) -> Result<
 /// system column vintages, and v10 is the 0.11.x line after RFC 0067 (the
 /// stamp of every graph the 0.11.0 crate version wrote with detached table
 /// commits). The fallback keeps this map total.
-pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
+pub fn release_for_internal_schema_version(stamp: u32) -> &'static str {
     match stamp {
         1 => "0.3.1 or earlier",
         2 => "0.4.1 to 0.6.1",
@@ -150,7 +155,7 @@ static CONVERSION_ADMISSIONS: std::sync::Mutex<Vec<(String, u32)>> =
     std::sync::Mutex::new(Vec::new());
 
 /// One admission, withdrawn when dropped.
-pub(crate) struct ConversionAdmission {
+pub struct ConversionAdmission {
     manifest_uri: String,
     stamp: u32,
 }
@@ -163,7 +168,7 @@ fn conversion_admissions() -> std::sync::MutexGuard<'static, Vec<(String, u32)>>
 
 /// Admit `root_uri`'s `__manifest`, and every branch of it, at `stamp` for
 /// the lifetime of the returned guard.
-pub(crate) fn admit_conversion_source(root_uri: &str, stamp: u32) -> ConversionAdmission {
+pub fn admit_conversion_source(root_uri: &str, stamp: u32) -> ConversionAdmission {
     let manifest_uri = super::manifest_uri(root_uri);
     conversion_admissions().push((manifest_uri.clone(), stamp));
     ConversionAdmission {
@@ -195,13 +200,13 @@ fn admitted_conversion_source(dataset: &Dataset) -> Option<u32> {
         .map(|(_, stamp)| *stamp)
 }
 
-pub(super) const INTERNAL_SCHEMA_VERSION_KEY: &str = "omnigraph:internal_schema_version";
+pub const INTERNAL_SCHEMA_VERSION_KEY: &str = "omnigraph:internal_schema_version";
 
 /// The schema-metadata entry stamping a fresh manifest at `stamp`. Folded into
 /// the Arrow schema of init's `Dataset::write` so the stamp lands in the same
 /// Lance commit that creates `__manifest` — the atomic-birth half of the
 /// torn-init fix (the other half is `guard_stamp`'s absent arm).
-pub(super) fn stamp_entry(stamp: u32) -> (String, String) {
+pub(crate) fn stamp_entry(stamp: u32) -> (String, String) {
     (INTERNAL_SCHEMA_VERSION_KEY.to_string(), stamp.to_string())
 }
 
@@ -210,7 +215,7 @@ pub(super) fn stamp_entry(stamp: u32) -> (String, String) {
 /// and an unparseable value; the open paths never use this — they go through
 /// `guard_stamp`, which distinguishes those shapes and refuses each with its
 /// own diagnosis instead of flooring to a version.
-pub(crate) fn read_stamp(dataset: &Dataset) -> Option<u32> {
+pub fn read_stamp(dataset: &Dataset) -> Option<u32> {
     dataset
         .schema()
         .metadata
@@ -238,15 +243,9 @@ pub(crate) fn read_stamp(dataset: &Dataset) -> Option<u32> {
 /// - No stamp key on a pre-modern layout — the genuine pre-stamp world:
 ///   treated as v1 and refused through the ordinary sub-floor message naming
 ///   the 0.3.1 export path.
-pub(crate) fn guard_stamp(dataset: &Dataset) -> Result<u32> {
-    if dataset
-        .schema()
-        .metadata
-        .contains_key(super::upgrade::UPGRADE_PENDING_KEY)
-    {
-        return Err(OmniError::manifest(super::upgrade::recovery_guidance(
-            dataset,
-        )));
+pub fn guard_stamp(dataset: &Dataset) -> Result<u32> {
+    if dataset.schema().metadata.contains_key(UPGRADE_PENDING_KEY) {
+        return Err(OmniError::manifest(recovery_guidance(dataset)));
     }
     match dataset.schema().metadata.get(INTERNAL_SCHEMA_VERSION_KEY) {
         Some(value) => match value.parse::<u32>() {
@@ -298,7 +297,7 @@ fn manifest_layout_is_modern(dataset: &Dataset) -> bool {
 /// - `stamp < MIN_SUPPORTED`: the graph was made by an older omnigraph whose
 ///   storage format this binary does not read — rebuild it via export/import.
 /// - `MIN_SUPPORTED..=CURRENT` is served as-is and never migrated on open.
-pub(crate) fn refuse_if_stamp_unsupported(stamp: u32) -> Result<()> {
+pub fn refuse_if_stamp_unsupported(stamp: u32) -> Result<()> {
     if stamp > INTERNAL_MANIFEST_SCHEMA_VERSION {
         return Err(OmniError::manifest(format!(
             "__manifest is stamped at internal schema v{} but this binary reads only v{} to v{} \
@@ -329,8 +328,218 @@ pub(crate) fn refuse_if_stamp_unsupported(stamp: u32) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-async fn set_stamp(dataset: &mut Dataset, version: u32) -> Result<()> {
+pub const UPGRADE_PENDING_KEY: &str = "omnigraph:storage_upgrade_pending";
+pub const UPGRADE_RECEIPT_KEY: &str = "omnigraph:storage_upgrade_receipt";
+pub const MAX_BRANCHES: usize = 1024;
+pub const MAX_INTENT_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SourceBranch {
+    pub native: Option<String>,
+    pub identity: BranchIdentifier,
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UpgradeIntent {
+    pub protocol: u32,
+    pub attempt: String,
+    pub source_format: u32,
+    pub target_format: u32,
+    pub graph_identity: String,
+    pub branches: Vec<SourceBranch>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BranchReceipt {
+    protocol: u32,
+    attempt: String,
+    source: SourceBranch,
+}
+
+pub fn invalid(message: impl Into<String>) -> OmniError {
+    OmniError::manifest(message)
+}
+
+pub fn intent_from(dataset: &Dataset) -> Result<Option<UpgradeIntent>> {
+    let Some(json) = dataset.schema().metadata.get(UPGRADE_PENDING_KEY) else {
+        return Ok(None);
+    };
+    if json.len() > MAX_INTENT_BYTES {
+        return Err(invalid(
+            "storage upgrade intent exceeds the metadata budget",
+        ));
+    }
+    let intent: UpgradeIntent = serde_json::from_str(json)
+        .map_err(|e| invalid(format!("unrecognized upgrade ownership: {e}")))?;
+    let mut names = HashSet::new();
+    if !matches!(
+        (intent.protocol, intent.source_format, intent.target_format),
+        (1, 6, 7) | (2, 7, 8) | (3, 8, 10) | (3, 9, 10) | (4, 10, 11)
+    ) || intent.attempt.parse::<ulid::Ulid>().is_err()
+        || intent.graph_identity.is_empty()
+        || intent.branches.is_empty()
+        || intent.branches.len() > MAX_BRANCHES
+        || intent
+            .branches
+            .last()
+            .is_none_or(|branch| branch.native.is_some())
+        || intent
+            .branches
+            .iter()
+            .any(|branch| branch.version == 0 || !names.insert(branch.native.clone()))
+    {
+        return Err(invalid("unsupported or ambiguous storage upgrade intent"));
+    }
+    Ok(Some(intent))
+}
+
+pub fn recovery_guidance(dataset: &Dataset) -> String {
+    match intent_from(dataset) {
+        Ok(Some(intent)) => format!(
+            "storage upgrade recovery required: stop all writers and maintenance and rerun `omnigraph upgrade <graph> --to-format {}` with this upgrade-capable executable; preserve the existing attempt.{}",
+            intent.target_format,
+            if intent.target_format == 7 { " After completion, run `omnigraph upgrade <graph> --to-format 8` before serving with this executable." } else { "" },
+        ),
+        _ => "storage upgrade ownership is unknown: preserve the graph and original upgrade options; use this upgrade-capable executable for read-only `omnigraph upgrade <graph> --check` diagnostics before recovery".into(),
+    }
+}
+
+pub fn receipt(branch: &SourceBranch, intent: &UpgradeIntent) -> BranchReceipt {
+    BranchReceipt {
+        protocol: intent.protocol,
+        attempt: intent.attempt.clone(),
+        source: branch.clone(),
+    }
+}
+
+pub fn branch_completed(
+    dataset: &Dataset,
+    source: &SourceBranch,
+    intent: &UpgradeIntent,
+) -> Result<bool> {
+    let Some(raw) = dataset.schema().metadata.get(UPGRADE_RECEIPT_KEY) else {
+        return Ok(false);
+    };
+    if raw.len() > MAX_INTENT_BYTES {
+        return Err(invalid(
+            "storage upgrade receipt exceeds the metadata budget",
+        ));
+    }
+    let found: BranchReceipt =
+        serde_json::from_str(raw).map_err(|e| invalid(format!("invalid upgrade receipt: {e}")))?;
+    if found != receipt(source, intent) {
+        let source_head = source
+            .version
+            .checked_add(u64::from(
+                source.native.is_none()
+                    && dataset.schema().metadata.contains_key(UPGRADE_PENDING_KEY),
+            ))
+            .ok_or_else(|| invalid("upgrade version overflow"))?;
+        if intent.protocol > found.protocol
+            && found.attempt != intent.attempt
+            && dataset.version().version == source_head
+        {
+            return Ok(false);
+        }
+        return Err(invalid("foreign upgrade receipt"));
+    }
+    if read_stamp(dataset) != Some(intent.target_format) {
+        return Err(invalid("upgrade receipt has an incompatible format"));
+    }
+    let expected = source
+        .version
+        .checked_add(if source.native.is_none() { 2 } else { 1 })
+        .ok_or_else(|| invalid("upgrade version overflow"))?;
+    let activated =
+        source.native.is_none() && !dataset.schema().metadata.contains_key(UPGRADE_PENDING_KEY);
+    let expected = expected
+        .checked_add(u64::from(activated))
+        .ok_or_else(|| invalid("upgrade version overflow"))?;
+    if dataset.version().version != expected {
+        return Err(invalid(
+            "upgraded branch moved while conversion was incomplete",
+        ));
+    }
+    Ok(true)
+}
+
+pub async fn historical_source(snapshot: Dataset, source_format: u32) -> Result<Dataset> {
+    if source_format != 7 || !snapshot.schema().metadata.contains_key(UPGRADE_PENDING_KEY) {
+        return Ok(snapshot);
+    }
+    let intent =
+        intent_from(&snapshot)?.ok_or_else(|| invalid("historical upgrade intent disappeared"))?;
+    if intent.protocol != 1 || snapshot.manifest().branch.is_some() {
+        return Err(invalid("unsupported historical upgrade ownership"));
+    }
+    let main = intent
+        .branches
+        .last()
+        .ok_or_else(|| invalid("historical upgrade has no main source"))?;
+    if branch_completed(&snapshot, main, &intent)? {
+        return Ok(snapshot);
+    }
+    let expected = main
+        .version
+        .checked_add(1)
+        .ok_or_else(|| invalid("upgrade version overflow"))?;
+    let transaction = snapshot
+        .read_transaction()
+        .await
+        .map_err(OmniError::storage)?
+        .ok_or_else(|| invalid("historical upgrade fence has no transaction proof"))?;
+    let json = snapshot
+        .schema()
+        .metadata
+        .get(UPGRADE_PENDING_KEY)
+        .ok_or_else(|| invalid("historical upgrade intent disappeared"))?
+        .clone();
+    let operation = Transaction::new(main.version, fence_operation(json, 7), None);
+    if snapshot.version().version != expected
+        || read_stamp(&snapshot) != Some(7)
+        || transaction.read_version != main.version
+        || lance_table::format::pb::Transaction::from(&transaction).operation
+            != lance_table::format::pb::Transaction::from(&operation).operation
+        || crate::branch_control::dataset_branch_identifier(&snapshot)
+            .await
+            .map_err(OmniError::storage)?
+            != main.identity
+    {
+        return Err(invalid(
+            "historical upgrade fence does not match its exact source",
+        ));
+    }
+    let source = snapshot
+        .checkout_version(main.version)
+        .await
+        .map_err(OmniError::storage)?;
+    if read_stamp(&source) != Some(6) {
+        return Err(invalid("historical upgrade fence source is not v6"));
+    }
+    Ok(source)
+}
+
+pub fn fence_operation(intent: String, target: u32) -> Operation {
+    Operation::UpdateConfig {
+        config_updates: None,
+        table_metadata_updates: None,
+        field_metadata_updates: HashMap::new(),
+        schema_metadata_updates: Some(UpdateMap {
+            update_entries: vec![
+                (INTERNAL_SCHEMA_VERSION_KEY.to_string(), target.to_string()).into(),
+                (UPGRADE_PENDING_KEY.to_string(), intent).into(),
+            ],
+            replace: false,
+        }),
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub async fn set_stamp(dataset: &mut Dataset, version: u32) -> Result<()> {
     dataset
         .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY.to_string(), version.to_string())])
         .await
@@ -340,16 +549,17 @@ async fn set_stamp(dataset: &mut Dataset, version: u32) -> Result<()> {
 
 /// Test-only: force the on-disk internal-schema stamp to `version`. The minimal
 /// seam used to synthesize a sub-CURRENT graph and assert the open path refuses
-/// it. Its only caller is the in-source refusal test, so it is `cfg(test)`-only.
-#[cfg(test)]
-pub(crate) async fn set_stamp_for_test(dataset: &mut Dataset, version: u32) -> Result<()> {
+/// it. Its callers are the refusal tests here and in the engine, so it compiles
+/// only under `test` or the `test-util` feature.
+#[cfg(any(test, feature = "test-util"))]
+pub async fn set_stamp_for_test(dataset: &mut Dataset, version: u32) -> Result<()> {
     set_stamp(dataset, version).await
 }
 
 /// Test-only: overwrite the internal-schema stamp with a raw (possibly
 /// non-numeric) value. Used to pin `guard_stamp`'s unreadable-stamp arm.
 #[cfg(test)]
-pub(crate) async fn set_raw_stamp_for_test(dataset: &mut Dataset, value: &str) -> Result<()> {
+pub async fn set_raw_stamp_for_test(dataset: &mut Dataset, value: &str) -> Result<()> {
     dataset
         .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY.to_string(), value.to_string())])
         .await
@@ -361,7 +571,7 @@ pub(crate) async fn set_raw_stamp_for_test(dataset: &mut Dataset, value: &str) -
 /// state a pre-atomic-stamp binary left when init died between the `__manifest`
 /// Create commit and the stamp commit. Used to pin `guard_stamp`'s absent arm.
 #[cfg(test)]
-pub(crate) async fn remove_stamp_for_test(dataset: &mut Dataset) -> Result<()> {
+pub async fn remove_stamp_for_test(dataset: &mut Dataset) -> Result<()> {
     let remaining: Vec<(String, String)> = dataset
         .schema()
         .metadata
@@ -426,43 +636,6 @@ mod tests {
         assert!(future.contains("internal schema v12"), "got: {future}");
         assert!(future.contains("reads only v11 to v11"), "got: {future}");
         assert!(future.contains("upgrade omnigraph"), "got: {future}");
-    }
-
-    /// An admitted root opens at the stamp its conversion names and at no
-    /// other; the admission ends with its guard, and a foreign root is never
-    /// admitted.
-    #[tokio::test]
-    async fn conversion_admission_admits_one_root_at_one_stamp_while_held() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_str().unwrap();
-        drop(
-            crate::db::Omnigraph::init(root, "node Person { name: String }")
-                .await
-                .unwrap(),
-        );
-        let control_session = crate::lance_access::control_session();
-        let mut manifest =
-            super::super::layout::open_manifest_dataset_with_session(root, None, &control_session)
-                .await
-                .unwrap();
-        set_stamp(&mut manifest, 10).await.unwrap();
-        let refused = guard_stamp(&manifest).unwrap_err().to_string();
-        assert!(refused.contains("reads only v11 to v11"), "{refused}");
-        {
-            let _admission = admit_conversion_source(root, 10);
-            assert_eq!(guard_stamp(&manifest).unwrap(), 10);
-            let _other = admit_conversion_source("/nowhere/else", 9);
-            assert!(guard_stamp(&manifest).is_ok());
-        }
-        assert!(
-            guard_stamp(&manifest).is_err(),
-            "the admission ends with its guard"
-        );
-        let _wrong_stamp = admit_conversion_source(root, 9);
-        assert!(
-            guard_stamp(&manifest).is_err(),
-            "an admission names one stamp and admits no other"
-        );
     }
 
     /// The refusal names the release line that wrote each stamp so an operator

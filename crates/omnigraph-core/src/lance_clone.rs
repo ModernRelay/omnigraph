@@ -244,14 +244,14 @@ struct IndexOriginCommitHandler {
     reuse_main_source_location: bool,
 }
 
-pub(crate) fn wrap_commit_handler(inner: Arc<dyn CommitHandler>) -> Arc<dyn CommitHandler> {
+pub fn wrap_commit_handler(inner: Arc<dyn CommitHandler>) -> Arc<dyn CommitHandler> {
     Arc::new(IndexOriginCommitHandler {
         inner,
         reuse_main_source_location: false,
     })
 }
 
-pub(crate) async fn configured_commit_handler(
+pub async fn configured_commit_handler(
     uri: &str,
     params: &Option<lance::io::ObjectStoreParams>,
     existing: Option<Arc<dyn CommitHandler>>,
@@ -281,7 +281,7 @@ pub(crate) async fn configured_commit_handler(
     }))
 }
 
-pub(crate) async fn write_params(
+pub async fn write_params(
     uri: &str,
     mut params: lance::dataset::WriteParams,
 ) -> Result<lance::dataset::WriteParams> {
@@ -291,7 +291,7 @@ pub(crate) async fn write_params(
     Ok(params)
 }
 
-pub(crate) async fn create_branch(
+pub async fn create_branch(
     source: &mut Dataset,
     branch: &str,
     source_version: u64,

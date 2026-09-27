@@ -52,9 +52,10 @@ use super::model::{ChangeFeedScope, ChangeOpKind};
 use super::row_compare::{OrderedRows, ScanTargets, rows_equal_across_vintages};
 use crate::db::DatasetEntry;
 use crate::error::Result;
+use crate::staging::is_detached_version;
 use crate::table_store::{
-    StagedTransactionIdentity, TableStore, has_insert_absence_certificate,
-    has_no_by_source_delete_marker, load_deleted_ids,
+    StagedTransactionIdentity, has_insert_absence_certificate, has_no_by_source_delete_marker,
+    load_deleted_ids,
 };
 use omnigraph_compiler::SystemColumns;
 
@@ -263,7 +264,7 @@ fn interval_proof(
     to_opened: u64,
     to_dataset: &Dataset,
 ) -> Option<IntervalProof> {
-    if TableStore::is_detached_version(to_opened) {
+    if is_detached_version(to_opened) {
         if to_entry.version_metadata.staged_version() != Some(to_opened) {
             return None;
         }

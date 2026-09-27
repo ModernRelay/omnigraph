@@ -810,7 +810,11 @@ async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindex
         .commit_staged(Arc::new(ds), staged_index)
         .await
         .unwrap();
-    assert!(!TableStore::has_unindexed_fragments(&ds).await.unwrap());
+    assert!(
+        !crate::dataset_index::has_unindexed_fragments(&ds)
+            .await
+            .unwrap()
+    );
 
     let expected_field_ids = ds
         .schema()
@@ -914,7 +918,7 @@ async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindex
         other => panic!("persisted proven insert lost its Update/filter shape: {other:?}"),
     }
     assert!(
-        TableStore::has_unindexed_fragments(&committed)
+        crate::dataset_index::has_unindexed_fragments(&committed)
             .await
             .unwrap(),
         "the pre-existing BTREE must not claim the newly inserted fragment"
@@ -2420,7 +2424,7 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
             .await
             .unwrap();
         assert!(
-            TableStore::has_unindexed_fragments(&coverage_ds)
+            crate::dataset_index::has_unindexed_fragments(&coverage_ds)
                 .await
                 .unwrap(),
             "fixture must expose per-segment partial coverage for {column}"

@@ -7,9 +7,11 @@
 /crates/omnigraph-api-types/            @aaltshuler
 /crates/omnigraph-azure-admission/      @aaltshuler
 /crates/omnigraph-bench/                @aaltshuler
+/crates/omnigraph-catalog/              @azimafroozeh @aaltshuler
 /crates/omnigraph-cli/                  @aaltshuler
 /crates/omnigraph-cluster/              @aaltshuler
 /crates/omnigraph-compiler/             @azimafroozeh @aaltshuler
+/crates/omnigraph-core/                 @azimafroozeh @aaltshuler
 /crates/omnigraph-dst/                  @azimafroozeh
 /crates/omnigraph-gqt/                  @azimafroozeh
 /crates/omnigraph-planner/              @azimafroozeh @aaltshuler

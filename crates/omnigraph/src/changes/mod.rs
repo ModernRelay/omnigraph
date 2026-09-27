@@ -25,8 +25,10 @@ use self::row_compare::{
     OrderedRows, RawRow, ScanTargets, rows_equal_across_vintages, user_schema_fingerprint,
 };
 use crate::db::DatasetEntry;
-use crate::db::manifest::{Snapshot, TableIdentity, system_columns_at_image};
+use crate::db::Snapshot;
+use crate::db::manifest::{TableIdentity, system_columns_at_image};
 use crate::error::{OmniError, Result};
+use crate::staging::is_detached_version;
 use crate::storage_layer::{SnapshotHandle, TableStorage};
 use crate::table_store::TableStore;
 
@@ -355,7 +357,7 @@ async fn diff_table_same_lineage(
     let vt = to_entry.published_dataset_version;
     let storage: &dyn TableStorage = table_store;
     let to_ds = storage.open_snapshot_at_entry(to_entry).await?;
-    if TableStore::is_detached_version(to_ds.dataset().version().version) {
+    if is_detached_version(to_ds.dataset().version().version) {
         return diff_table_detached_commit(storage, from_entry, to_entry, &to_ds, is_edge, filter)
             .await;
     }

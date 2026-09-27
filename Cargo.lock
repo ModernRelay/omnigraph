@@ -5603,6 +5603,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnigraph-catalog"
+version = "0.11.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "async-trait",
+ "datafusion",
+ "futures",
+ "lance",
+ "lance-core",
+ "lance-file",
+ "lance-namespace",
+ "lance-namespace-impls",
+ "lance-table",
+ "object_store",
+ "omnigraph-compiler",
+ "omnigraph-core",
+ "omnigraph-seams",
+ "omnigraph-storage",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "ulid",
+ "url",
+]
+
+[[package]]
 name = "omnigraph-cli"
 version = "0.11.0"
 dependencies = [
@@ -5679,6 +5709,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnigraph-core"
+version = "0.11.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "datafusion",
+ "frostem",
+ "futures",
+ "lance",
+ "lance-core",
+ "lance-file",
+ "lance-index",
+ "lance-io",
+ "lance-linalg",
+ "lance-namespace",
+ "lance-table",
+ "lance-tokenizer",
+ "object_store",
+ "omnigraph-compiler",
+ "omnigraph-seams",
+ "omnigraph-storage",
+ "prost",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "sha2 0.10.9",
+ "stop-words",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "ulid",
+ "unicode-normalization",
+ "url",
+]
+
+[[package]]
 name = "omnigraph-dst"
 version = "0.11.0"
 dependencies = [
@@ -5717,7 +5788,6 @@ dependencies = [
  "bytes",
  "chrono",
  "datafusion",
- "frostem",
  "futures",
  "lance",
  "lance-core",
@@ -5730,10 +5800,11 @@ dependencies = [
  "lance-namespace-impls",
  "lance-select",
  "lance-table",
- "lance-tokenizer",
  "libc",
  "object_store",
+ "omnigraph-catalog",
  "omnigraph-compiler",
+ "omnigraph-core",
  "omnigraph-planner",
  "omnigraph-policy",
  "omnigraph-seams",
@@ -5746,7 +5817,6 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sha2 0.10.9",
- "stop-words",
  "syn",
  "tempfile",
  "thiserror",
@@ -5755,7 +5825,6 @@ dependencies = [
  "toml",
  "tracing",
  "ulid",
- "unicode-normalization",
  "url",
 ]
 

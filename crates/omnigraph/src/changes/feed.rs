@@ -23,8 +23,9 @@ use super::token::{
     self, BranchScopeV1, FEED_PURPOSE, FeedCursorV1, FeedPageTokenV1, KIND_FEED_CURSOR,
     KIND_FEED_PAGE, cursor_rejected,
 };
+use crate::db::Snapshot;
 use crate::db::commit_graph::GraphCommit;
-use crate::db::manifest::{ManifestCoordinator, Snapshot};
+use crate::db::manifest::ManifestCoordinator;
 use crate::error::{OmniError, Result};
 use crate::table_store::TableStore;
 
@@ -439,12 +440,14 @@ async fn commit_snapshot(root_uri: &str, cut: &ChangeFeedCut, commit_id: &str) -
             "lineage projection is missing commit '{commit_id}'"
         ))
     })?;
-    let snapshot = ManifestCoordinator::snapshot_at(
-        root_uri,
-        commit.graph_branch.as_deref(),
-        commit.graph_manifest_version,
-    )
-    .await?;
+    let snapshot = Snapshot::wrap(
+        ManifestCoordinator::snapshot_at(
+            root_uri,
+            commit.graph_branch.as_deref(),
+            commit.graph_manifest_version,
+        )
+        .await?,
+    );
     // The cut was captured earlier; this reopen happens later and lock-free by
     // `(manifest branch, version)`. A named branch deleted and recreated at the
     // same version in that window would reopen the REPLACEMENT bytes under the

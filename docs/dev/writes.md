@@ -157,7 +157,7 @@ keeps its number, `base + 1`, as the table's logical version inside its
 records `omnigraph.last_linear_version`, the highest linear version a pin
 ever reached (`1` for a table created under v11), and every writer that
 rebuilds the row copies it forward (`TableVersionMetadata`,
-`db/manifest/metadata.rs`). A writer whose captured snapshot predates another
+`crates/omnigraph-core/src/metadata.rs`). A writer whose captured snapshot predates another
 publication loses the CAS and reprepares (`ReadSetChanged`). No writer reads
 the linear HEAD: a foreign linear commit above
 `omnigraph.last_linear_version` is what `repair` reports as `foreign_drift`

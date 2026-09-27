@@ -136,6 +136,15 @@ async fn scheduled_lock(slot: Arc<QueueSlot>) -> QueueGuard {
 /// serialize at the queue.
 pub(crate) type TableQueueKey = (String, Option<String>);
 
+/// The write-queue key that serializes every graph-global schema writer
+/// (schema apply and the system-column upgrade) against each other and
+/// against the passes that install or discard a staged schema contract. The
+/// name cannot collide with real table keys (those are `node:`/`edge:`
+/// prefixed).
+pub(crate) fn schema_apply_serial_queue_key() -> TableQueueKey {
+    ("__schema_apply__".to_string(), None)
+}
+
 /// Non-cloneable ownership of the sole immutable export cut for one graph.
 ///
 /// The root registry stores weak references, so retaining the manager here is

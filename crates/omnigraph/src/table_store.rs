@@ -5,7 +5,7 @@ use arrow_array::{
 use arrow_schema::SchemaRef;
 use datafusion::common::{
     DataFusionError,
-    tree_node::{Transformed, TreeNode, TreeNodeRecursion},
+    tree_node::{Transformed, TreeNode},
 };
 use datafusion::execution::{
     context::{SessionConfig, SessionContext},
@@ -58,14 +58,17 @@ use lance_select::mask::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 use omnigraph_compiler::SystemColumns;
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::{num::NonZero, sync::Arc};
 
 use crate::blob::{
     BlobDescriptor, BlobDescriptorDecoder, ExternalBlobPolicy, NormalizedExternalBlobUri,
 };
-use crate::db::manifest::TableVersionMetadata;
+use crate::dataset_index::{
+    has_btree_index_on, has_fts_index_on, has_vector_index_on, is_full_text_index,
+    user_indices_for_column, validate_full_text_demand, validate_full_text_scan,
+};
+use crate::db::manifest::{TableVersionMetadata, open_dataset_entry};
 use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::seams::{decide_seam, skip};
@@ -74,7 +77,15 @@ use crate::storage_layer::{
     PendingScanBudget, ProvenInsertChunk,
 };
 
-pub(crate) mod fts_compat;
+pub(crate) use crate::error::is_scratch_exhaustion;
+pub(crate) use omnigraph_core::dataset_index::FtsFilterDemand;
+pub use omnigraph_core::dataset_index::IndexCoverage;
+pub(crate) use omnigraph_core::fts_compat;
+#[cfg(test)]
+pub(crate) use omnigraph_core::staging::{
+    STAGED_AGAINST_BRANCH_INCARNATION, STAGED_AGAINST_GRAPH_HEAD,
+};
+pub(crate) use omnigraph_core::staging::{StagedTransactionIdentity, StagingWitness};
 
 /// Durable proof carried by an OmniGraph insertion-only transaction.
 ///
@@ -132,47 +143,6 @@ pub(crate) struct ScanTuning<'a> {
     /// over every `filter_expr` call although Lance keeps only the last filter:
     /// a fail-closed over-approximation.
     filter_demand: FtsFilterDemand,
-}
-
-/// Which FTS-index columns a filter expression reads through
-/// `contains_tokens(column, ...)`. `all_columns` is the fail-closed verdict
-/// for a call whose first argument is not a plain column.
-#[derive(Debug, Default)]
-pub(crate) struct FtsFilterDemand {
-    all_columns: bool,
-    columns: HashSet<String>,
-}
-
-impl FtsFilterDemand {
-    fn from_filter(filter: &Expr) -> Self {
-        let mut demand = Self::default();
-        filter
-            .apply(|expr| {
-                if let Expr::ScalarFunction(function) = expr
-                    && function.name() == "contains_tokens"
-                {
-                    match function.args.first() {
-                        Some(Expr::Column(column)) => {
-                            demand.columns.insert(column.name.clone());
-                        }
-                        // An unfamiliar expression must not bypass the gate.
-                        _ => demand.all_columns = true,
-                    }
-                }
-                Ok(TreeNodeRecursion::Continue)
-            })
-            .expect("the visitor returns Ok on every node");
-        demand
-    }
-
-    fn merge(&mut self, other: Self) {
-        self.all_columns |= other.all_columns;
-        self.columns.extend(other.columns);
-    }
-
-    fn is_empty(&self) -> bool {
-        !self.all_columns && self.columns.is_empty()
-    }
 }
 
 /// A configured scanner and the full-text reads its validation checks.
@@ -234,15 +204,9 @@ impl PreparedScan {
     /// The scanner, once its full-text reads are checked against `dataset`.
     async fn validated(self, dataset: &Dataset) -> Result<Scanner> {
         if self.has_sql_filter {
-            TableStore::validate_full_text_scan(dataset, &self.scanner, self.full_text_columns)
-                .await?;
+            validate_full_text_scan(dataset, &self.scanner, self.full_text_columns).await?;
         } else if self.full_text_columns.is_some() || !self.filter_demand.is_empty() {
-            TableStore::validate_full_text_demand(
-                dataset,
-                self.full_text_columns,
-                self.filter_demand,
-            )
-            .await?;
+            validate_full_text_demand(dataset, self.full_text_columns, self.filter_demand).await?;
         }
         Ok(self.scanner)
     }
@@ -345,11 +309,6 @@ impl ScanTuning<'_> {
         self.scanner.with_row_address();
         self
     }
-}
-
-pub(crate) fn is_scratch_exhaustion(error: &DataFusionError) -> bool {
-    matches!(error.find_root(), DataFusionError::ResourcesExhausted(message)
-        if message.contains("disk space") || message.contains("max_temp_directory_size"))
 }
 
 fn mark_ordered_scan_resource_error(
@@ -674,67 +633,6 @@ pub struct TableState {
     pub(crate) version_metadata: TableVersionMetadata,
 }
 
-/// Whether a `key_col IN (...)` scan on a dataset will be served by the
-/// persisted scalar (BTREE) index, or silently fall back to a full filtered
-/// scan. Detection-only (metadata, no IO); the scan returns the correct rows
-/// either way. Surfaced by the indexed traversal path so the silent perf
-/// fallback is observable, and available to a future cost-based planner.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IndexCoverage {
-    /// The column has a usable BTREE and every fragment records `physical_rows`.
-    Indexed,
-    /// Lance will not use the scalar index for this scan (correct, full scan).
-    Degraded { reason: String },
-}
-
-/// Stable identity of one Lance transaction.
-///
-/// Lance persists both fields in the transaction file referenced by the
-/// committed manifest. The pair, rather than a numeric table version alone,
-/// proves that an observed version was produced by a given staged effect.
-/// The UUID distinguishes two writers that started from the same version.
-/// Lance may preserve both fields while rebasing, so callers of the exact
-/// linear commit must also require the achieved table version to be exactly
-/// `read_version + 1`.
-///
-/// RFC 0067 reads the same pair from the transaction file name the manifest
-/// records (`{read_version}-{uuid}.txn`, pinned in `lance_surface_guards`),
-/// so identifying a pin's linear twin or following a chain of detached
-/// commits costs no request beyond the manifest itself.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StagedTransactionIdentity {
-    pub read_version: u64,
-    pub uuid: String,
-}
-
-impl From<&Transaction> for StagedTransactionIdentity {
-    fn from(transaction: &Transaction) -> Self {
-        Self {
-            read_version: transaction.read_version,
-            uuid: transaction.uuid.clone(),
-        }
-    }
-}
-
-impl StagedTransactionIdentity {
-    /// The identity a manifest records, or `None` when it names no
-    /// transaction file or the name has an unrecognized shape.
-    pub(crate) fn recorded_by(dataset: &Dataset) -> Option<Self> {
-        let name = dataset.manifest().transaction_file.as_deref()?;
-        let (read_version, uuid) = name.strip_suffix(".txn")?.split_once('-')?;
-        Some(Self {
-            read_version: read_version.parse().ok()?,
-            uuid: uuid.to_string(),
-        })
-    }
-
-    /// Whether the transaction was staged on a detached version, which is
-    /// how a chain of detached commits links itself without manifest history.
-    pub(crate) fn base_is_detached(&self) -> bool {
-        TableStore::is_detached_version(self.read_version)
-    }
-}
-
 /// Outcome of replaying a detached transaction at its linear target.
 #[derive(Debug)]
 pub enum PromotionCommit {
@@ -792,99 +690,6 @@ pub struct StagedIndexFold {
 pub struct StagedCompaction {
     pub staged: StagedWrite,
     pub metrics: CompactionMetrics,
-}
-
-/// Transaction property naming the graph branch incarnation a detached
-/// commit was staged against (detached-only RFC §Garbage collection).
-pub(crate) const STAGED_AGAINST_BRANCH_INCARNATION: &str =
-    "omnigraph.staged_against_branch_incarnation";
-/// Transaction property naming the logical graph head a detached commit was
-/// staged against; empty when the branch had no materialized head.
-pub(crate) const STAGED_AGAINST_GRAPH_HEAD: &str = "omnigraph.staged_against_graph_head";
-
-/// The publication authority a detached commit was staged against: the
-/// branch incarnation and the logical graph head its publish compares and
-/// swaps on. Written into the staged transaction's properties so the
-/// collector reads a manifest's owner from the manifest alone.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StagingWitness {
-    branch_incarnation: String,
-    graph_head: Option<String>,
-}
-
-impl StagingWitness {
-    pub(crate) fn new(
-        identifier: &lance::dataset::refs::BranchIdentifier,
-        graph_head: Option<&str>,
-    ) -> Result<Self> {
-        let branch_incarnation = serde_json::to_string(identifier).map_err(|error| {
-            OmniError::manifest_internal(format!("branch identifier is not serializable: {error}"))
-        })?;
-        Ok(Self {
-            branch_incarnation,
-            graph_head: graph_head.map(str::to_string),
-        })
-    }
-
-    pub(crate) fn branch_incarnation(&self) -> &str {
-        &self.branch_incarnation
-    }
-
-    pub(crate) fn graph_head(&self) -> Option<&str> {
-        self.graph_head.as_deref()
-    }
-
-    /// The witness a manifest's transaction records; `None` when a writer
-    /// from before the witness staged it, or its authority is malformed.
-    pub(crate) fn from_transaction(transaction: &Transaction) -> Option<Self> {
-        let properties = transaction.transaction_properties.as_deref()?;
-        let branch_incarnation = properties.get(STAGED_AGAINST_BRANCH_INCARNATION)?.clone();
-        let identifier: lance::dataset::refs::BranchIdentifier =
-            serde_json::from_str(&branch_incarnation).ok()?;
-        if identifier == lance::dataset::refs::BranchIdentifier::missing_identifier_sentinel()
-            || serde_json::to_string(&identifier).ok()? != branch_incarnation
-            || identifier.version_mapping.iter().any(|(_, uuid)| {
-                uuid.len() != 32
-                    || uuid.bytes().all(|byte| byte == b'0')
-                    || !uuid
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            })
-        {
-            return None;
-        }
-        let recorded_head = properties.get(STAGED_AGAINST_GRAPH_HEAD)?;
-        let graph_head = if recorded_head.is_empty() {
-            None
-        } else {
-            let head = ulid::Ulid::from_string(recorded_head).ok()?;
-            if head.to_string() != *recorded_head {
-                return None;
-            }
-            Some(recorded_head.clone())
-        };
-        Some(Self {
-            branch_incarnation,
-            graph_head,
-        })
-    }
-
-    fn stamp(&self, transaction: &mut Transaction) {
-        let mut properties = transaction
-            .transaction_properties
-            .as_deref()
-            .cloned()
-            .unwrap_or_default();
-        properties.insert(
-            STAGED_AGAINST_BRANCH_INCARNATION.to_string(),
-            self.branch_incarnation.clone(),
-        );
-        properties.insert(
-            STAGED_AGAINST_GRAPH_HEAD.to_string(),
-            self.graph_head.clone().unwrap_or_default(),
-        );
-        transaction.transaction_properties = Some(Arc::new(properties));
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1535,7 +1340,7 @@ impl TableStore {
     }
 
     pub async fn open_at_entry(&self, entry: &DatasetEntry) -> Result<Dataset> {
-        entry.open(&self.root_uri, Some(&self.session)).await
+        open_dataset_entry(entry, &self.root_uri, Some(&self.session)).await
     }
 
     /// Open a table for change-feed enumeration, re-proving the branch
@@ -1552,7 +1357,7 @@ impl TableStore {
         if entry.native_dataset_branch.is_none() {
             return self.open_at_entry(entry).await;
         }
-        let dataset = match entry.open(&self.root_uri, None).await {
+        let dataset = match open_dataset_entry(entry, &self.root_uri, None).await {
             Ok(dataset) => dataset,
             Err(error @ OmniError::HistoricalVersionReclaimed { .. }) => {
                 // Cleanup can reclaim a pinned version of a live fork (a
@@ -2288,62 +2093,6 @@ impl TableStore {
         })
     }
 
-    /// Check only full-text reads, against this exact snapshot's artifacts.
-    /// SQL SDK filters are inspected as typed expressions, not string-matched.
-    pub(crate) async fn validate_full_text_scan(
-        ds: &Dataset,
-        scanner: &Scanner,
-        columns: Option<HashSet<String>>,
-    ) -> Result<()> {
-        let filter_demand = match scanner.get_expr_filter().map_err(OmniError::storage)? {
-            Some(filter) => FtsFilterDemand::from_filter(&filter),
-            None => FtsFilterDemand::default(),
-        };
-        Self::validate_full_text_demand(ds, columns, filter_demand).await
-    }
-
-    /// The validation proper, over an already-derived demand: `columns` is
-    /// the full-text query's column set (`Some(empty)` = every FTS column),
-    /// `filter_demand` what the filters read through `contains_tokens`.
-    async fn validate_full_text_demand(
-        ds: &Dataset,
-        columns: Option<HashSet<String>>,
-        filter_demand: FtsFilterDemand,
-    ) -> Result<()> {
-        crate::instrumentation::record_fts_validation();
-        let all_columns =
-            columns.as_ref().is_some_and(HashSet::is_empty) || filter_demand.all_columns;
-        let mut requested = columns.unwrap_or_default();
-        requested.extend(filter_demand.columns);
-        if !all_columns && requested.is_empty() {
-            return Ok(());
-        }
-        let fields: HashSet<_> = requested
-            .iter()
-            .filter_map(|column| ds.schema().field(column).map(|field| field.id))
-            .collect();
-        // Ordinary reads return above without allocating. Keep the optional
-        // storage-validation future out of every caller's scan/count state.
-        Box::pin(async move {
-            let indices = ds.load_indices().await.map_err(OmniError::storage)?;
-            for index in indices.iter().filter(|index| {
-                (Self::is_full_text_index(index) || index.index_details.is_none())
-                    && (all_columns || index.fields.iter().any(|field| fields.contains(field)))
-            }) {
-                fts_compat::verify_index(ds, index).await?;
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    pub(crate) fn is_full_text_index(index: &IndexMetadata) -> bool {
-        index
-            .index_details
-            .as_ref()
-            .is_some_and(|details| IndexDetails(details.clone()).supports_fts())
-    }
-
     async fn execute_bounded_ordered_scan(
         scanner: Scanner,
         options: LanceExecutionOptions,
@@ -2603,98 +2352,10 @@ impl TableStore {
         .map_err(OmniError::storage)
     }
 
-    /// Metadata-only check (no IO) of whether `scan_edges_by_endpoint` — a
-    /// `key_col IN (...)` filter — on `ds` will be served by the persisted BTREE
-    /// on `column`, or silently fall back to a full filtered scan. Mirrors
-    /// Lance's own decision: scalar indices are disabled for the whole scan if
-    /// ANY fragment lacks `physical_rows` (lance `dataset/scanner.rs`
-    /// `create_filter_plan`), and are obviously unused if no BTREE on the
-    /// column exists. The scan is correct (returns all rows) either way — this
-    /// only surfaces the perf cliff so the indexed traversal can warn on it.
-    pub async fn key_column_index_coverage(ds: &Dataset, column: &str) -> Result<IndexCoverage> {
-        let Some(field_id) = ds.schema().field(column).map(|field| field.id) else {
-            return Ok(IndexCoverage::Degraded {
-                reason: format!("column '{}' not in schema", column),
-            });
-        };
-        let indices = ds.load_indices().await.map_err(OmniError::storage)?;
-        let btree = indices
-            .iter()
-            .filter(|index| !is_system_index(index))
-            .filter(|index| index.fields.len() == 1 && index.fields[0] == field_id)
-            .find(|index| {
-                index
-                    .index_details
-                    .as_ref()
-                    .map(|details| details.type_url.ends_with("BTreeIndexDetails"))
-                    .unwrap_or(false)
-            });
-        let Some(btree) = btree else {
-            return Ok(IndexCoverage::Degraded {
-                reason: format!("no BTREE index on '{}'", column),
-            });
-        };
-        // Same check Lance runs: a fragment missing physical_rows disables
-        // scalar indices for the entire scan (all-or-nothing).
-        if ds.fragments().iter().any(|f| f.physical_rows.is_none()) {
-            return Ok(IndexCoverage::Degraded {
-                reason: "a fragment is missing physical_rows".to_string(),
-            });
-        }
-        // An index only covers the fragments it was built over; fragments
-        // appended afterward (edge-index creation is skipped once a BTREE exists)
-        // are scanned unindexed. If any CURRENT fragment is absent from the
-        // index's `fragment_bitmap`, the scan is partly a full scan — so the
-        // chooser must not price it as fully indexed. A `None` bitmap means Lance
-        // can't report coverage; don't over-degrade in that case.
-        if let Some(bitmap) = btree.fragment_bitmap.as_ref() {
-            let uncovered = ds
-                .fragments()
-                .iter()
-                .filter(|f| !bitmap.contains(f.id as u32))
-                .count();
-            if uncovered > 0 {
-                return Ok(IndexCoverage::Degraded {
-                    reason: format!(
-                        "{} fragment(s) not covered by the index on '{}'",
-                        uncovered, column
-                    ),
-                });
-            }
-        }
-        Ok(IndexCoverage::Indexed)
-    }
-
-    /// True if any non-system index on `ds` leaves at least one current
-    /// fragment uncovered, i.e. rows that the index does not yet account for
-    /// (appended after the index was built, or rewritten by compaction). Such
-    /// fragments are scanned unindexed until index maintenance covers them
-    /// (full-text requires explicit rebuilding). Returns false when every index covers every fragment, or
-    /// when the table has no (non-system) indices to optimize. A `None`
-    /// `fragment_bitmap` means Lance cannot report coverage for that index, so
-    /// we do not treat it as uncovered (mirrors `key_column_index_coverage`).
-    ///
-    /// This reports physical coverage, not whether ordinary optimize can fix it.
-    pub async fn has_unindexed_fragments(ds: &Dataset) -> Result<bool> {
-        let indices = ds.load_indices().await.map_err(OmniError::storage)?;
-        let frag_ids: Vec<u32> = ds.fragments().iter().map(|f| f.id as u32).collect();
-        for index in indices.iter() {
-            if is_system_index(index) {
-                continue;
-            }
-            if let Some(bitmap) = index.fragment_bitmap.as_ref() {
-                if frag_ids.iter().any(|id| !bitmap.contains(*id)) {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
-    }
-
     /// One eligibility rule for optimize planning and execution. Full-text
     /// folding cannot establish analyzer proof; unknown kinds cannot be planned.
     pub(crate) fn can_fold_index(index: &IndexMetadata) -> bool {
-        !is_system_index(index) && index.index_details.is_some() && !Self::is_full_text_index(index)
+        !is_system_index(index) && index.index_details.is_some() && !is_full_text_index(index)
     }
 
     /// Whether a foldable index is a vector index.
@@ -2883,7 +2544,7 @@ impl TableStore {
         if let Some(filter) = &filter {
             let mut scanner = ds.scan();
             scanner.filter(filter).map_err(OmniError::storage)?;
-            Self::validate_full_text_scan(ds, &scanner, None).await?;
+            validate_full_text_scan(ds, &scanner, None).await?;
         }
         ds.count_rows(filter).await.map_err(OmniError::storage)
     }
@@ -4177,11 +3838,6 @@ impl TableStore {
         Ok((dataset, identity))
     }
 
-    /// Whether a Lance version id names a detached version (RFC 0067).
-    pub(crate) fn is_detached_version(version: u64) -> bool {
-        version & lance_table::format::DETACHED_VERSION_MASK != 0
-    }
-
     /// The identity of the transaction a version records (RFC 0067), read
     /// from the manifest alone.
     pub fn transaction_identity(&self, ds: &Dataset) -> Result<StagedTransactionIdentity> {
@@ -4724,7 +4380,7 @@ impl TableStore {
             .iter()
             .filter(|idx| {
                 new_names.contains(&idx.name)
-                    || (Self::is_full_text_index(idx)
+                    || (is_full_text_index(idx)
                         && idx
                             .fields
                             .iter()
@@ -4799,7 +4455,7 @@ impl TableStore {
         }
         scanner.with_fragments(combine_committed_with_staged(ds, staged));
         if filter.is_some() {
-            Self::validate_full_text_scan(ds, &scanner, None).await?;
+            validate_full_text_scan(ds, &scanner, None).await?;
         }
         let stream = scanner
             .try_into_stream()
@@ -5125,60 +4781,27 @@ impl TableStore {
         }
         scanner.with_fragments(combine_committed_with_staged(ds, staged));
         if filter.is_some() {
-            Self::validate_full_text_scan(ds, &scanner, None).await?;
+            validate_full_text_scan(ds, &scanner, None).await?;
         }
         let count = scanner.count_rows().await.map_err(OmniError::storage)?;
         Ok(count as usize)
     }
 
-    async fn user_indices_for_column(ds: &Dataset, column: &str) -> Result<Vec<IndexMetadata>> {
-        let field_id = ds
-            .schema()
-            .field(column)
-            .map(|field| field.id)
-            .ok_or_else(|| {
-                OmniError::manifest_internal(format!(
-                    "dataset is missing expected index column '{}'",
-                    column
-                ))
-            })?;
-        let indices = ds.load_indices().await.map_err(OmniError::storage)?;
-        Ok(indices
-            .iter()
-            .filter(|index| !is_system_index(index))
-            .filter(|index| index.fields.len() == 1 && index.fields[0] == field_id)
-            .cloned()
-            .collect())
-    }
-
     pub async fn has_btree_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
-        Self::has_btree_index_on(ds, column).await
-    }
-
-    pub(crate) async fn has_btree_index_on(ds: &Dataset, column: &str) -> Result<bool> {
-        let indices = Self::user_indices_for_column(ds, column).await?;
-        Ok(indices.iter().any(|index| {
-            index
-                .index_details
-                .as_ref()
-                .map(|details| details.type_url.ends_with("BTreeIndexDetails"))
-                .unwrap_or(false)
-        }))
+        has_btree_index_on(ds, column).await
     }
 
     pub async fn has_fts_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
-        Self::has_fts_index_on(ds, column).await
+        has_fts_index_on(ds, column).await
     }
 
-    pub(crate) async fn has_fts_index_on(ds: &Dataset, column: &str) -> Result<bool> {
-        let indices = Self::user_indices_for_column(ds, column).await?;
-        Ok(indices.iter().any(|index| {
-            index
-                .index_details
-                .as_ref()
-                .map(|details| IndexDetails(details.clone()).supports_fts())
-                .unwrap_or(false)
-        }))
+    /// Kept on `TableStore` so the frozen v1 executor (`tests/v1_frozen.rs`)
+    /// keeps its bytes; the body lives in `omnigraph_core::dataset_index`.
+    pub(crate) async fn key_column_index_coverage(
+        ds: &Dataset,
+        column: &str,
+    ) -> Result<IndexCoverage> {
+        crate::dataset_index::key_column_index_coverage(ds, column).await
     }
 
     /// Metadata-only check (no data IO) of whether the FTS (inverted) index
@@ -5197,7 +4820,7 @@ impl TableStore {
     /// runs the postfilter plan — so every unprovable case (no FTS index,
     /// an entry without a fragment bitmap) contributes nothing.
     pub(crate) async fn fts_covers_all_fragments(ds: &Dataset, column: &str) -> Result<bool> {
-        let indices = Self::user_indices_for_column(ds, column).await?;
+        let indices = user_indices_for_column(ds, column).await?;
         let fts_bitmaps: Vec<_> = indices
             .iter()
             .filter(|index| {
@@ -5220,18 +4843,7 @@ impl TableStore {
     }
 
     pub async fn has_vector_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
-        Self::has_vector_index_on(ds, column).await
-    }
-
-    pub(crate) async fn has_vector_index_on(ds: &Dataset, column: &str) -> Result<bool> {
-        let indices = Self::user_indices_for_column(ds, column).await?;
-        Ok(indices.iter().any(|index| {
-            index
-                .index_details
-                .as_ref()
-                .map(|details| IndexDetails(details.clone()).is_vector())
-                .unwrap_or(false)
-        }))
+        has_vector_index_on(ds, column).await
     }
 
     pub async fn create_empty_dataset(dataset_uri: &str, schema: &SchemaRef) -> Result<Dataset> {

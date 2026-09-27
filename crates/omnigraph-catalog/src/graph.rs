@@ -37,7 +37,7 @@ const GENESIS_MANIFEST_VERSION: u64 = 1;
 /// another valid v1 manifest whose deterministic table identities happen to
 /// have the same numeric values.
 #[derive(Debug, Clone)]
-pub(crate) struct GenesisManifestAttempt {
+pub struct GenesisManifestAttempt {
     lineage: GraphLineageRow,
     stamp: u32,
 }
@@ -45,7 +45,7 @@ pub(crate) struct GenesisManifestAttempt {
 impl GenesisManifestAttempt {
     /// Mint the receipt before invoking the manifest Create operation so the
     /// caller retains enough information to classify a lost acknowledgement.
-    pub(crate) fn mint(system_columns: SystemColumns) -> Result<Self> {
+    pub fn mint(system_columns: SystemColumns) -> Result<Self> {
         Ok(Self {
             lineage: GraphLineageRow {
                 graph_commit_id: crate::dst_ids::new_ulid().to_string(),
@@ -54,7 +54,7 @@ impl GenesisManifestAttempt {
                 parent_commit_id: None,
                 merged_parent_commit_id: None,
                 actor_id: None,
-                created_at: crate::db::now_micros()?,
+                created_at: crate::metadata::now_micros()?,
             },
             stamp: stamp_for_system_columns(system_columns)?,
         })
@@ -70,13 +70,13 @@ impl GenesisManifestAttempt {
 /// the immutable v1 manifest may already be durable and must be probed before
 /// any schema cleanup is considered.
 #[derive(Debug)]
-pub(crate) enum ManifestInitError {
+pub enum ManifestInitError {
     BeforeManifestCreate(OmniError),
     ManifestCreateOutcomeUnknown(OmniError),
 }
 
 impl ManifestInitError {
-    pub(crate) fn into_source(self) -> OmniError {
+    pub fn into_source(self) -> OmniError {
         match self {
             Self::BeforeManifestCreate(source) | Self::ManifestCreateOutcomeUnknown(source) => {
                 source
@@ -116,7 +116,7 @@ impl From<ManifestInitError> for OmniError {
 /// and lands them all in the one `__manifest` Create commit. A returned error
 /// from the Create call is acknowledgement-unknown; reading the state back is
 /// `load_initial_manifest_state`, on the confirmed post-commit side.
-pub(super) async fn init_manifest_graph(
+pub(crate) async fn init_manifest_graph(
     root_uri: &str,
     catalog: &Catalog,
     control_session: &Arc<lance::session::Session>,
@@ -161,7 +161,7 @@ pub(super) async fn init_manifest_graph(
         session: Some(Arc::clone(control_session)),
         ..Default::default()
     };
-    let params = crate::storage_layer::lance_clone::write_params(&manifest_path, params)
+    let params = crate::lance_clone::write_params(&manifest_path, params)
         .await
         .map_err(OmniError::storage)?;
     let dataset = Dataset::write(reader, &manifest_path, Some(params))
@@ -179,7 +179,7 @@ pub(super) async fn init_manifest_graph(
 /// Reopen and authenticate the one immutable genesis manifest created by
 /// `attempt`.  This is the only positive classification of an ambiguous Create
 /// result; a merely valid v1 manifest from another initializer is not enough.
-pub(super) async fn open_exact_genesis_manifest(
+pub(crate) async fn open_exact_genesis_manifest(
     root_uri: &str,
     attempt: &GenesisManifestAttempt,
     control_session: &Arc<lance::session::Session>,
@@ -263,14 +263,14 @@ fn genesis_probe_mismatch(root_uri: &str, detail: impl std::fmt::Display) -> Omn
 /// Reads back the state the `__manifest` Create commit landed. The
 /// `init.post_manifest_create` failpoint fires as this function's first
 /// statement.
-pub(super) async fn load_initial_manifest_state(
+pub(crate) async fn load_initial_manifest_state(
     dataset: &Dataset,
 ) -> Result<(ManifestState, Vec<GraphLineageRow>)> {
     fail(&INIT_POST_MANIFEST_CREATE)?;
     read_manifest_state_and_lineage(dataset).await
 }
 
-pub(super) async fn open_manifest_graph(
+pub(crate) async fn open_manifest_graph(
     root_uri: &str,
     branch: Option<&str>,
     control_session: &Arc<lance::session::Session>,
@@ -290,7 +290,7 @@ pub(super) async fn open_manifest_graph(
     Ok((dataset, known_state, branch_identifier, native_branch))
 }
 
-pub(super) async fn open_manifest_graph_with_lineage(
+pub(crate) async fn open_manifest_graph_with_lineage(
     root_uri: &str,
     branch: Option<&str>,
     control_session: &Arc<lance::session::Session>,
@@ -310,7 +310,7 @@ pub(super) async fn open_manifest_graph_with_lineage(
     Ok((dataset, known_state, lineage_rows, branch_identifier))
 }
 
-pub(super) async fn snapshot_state_at(
+pub(crate) async fn snapshot_state_at(
     root_uri: &str,
     branch: Option<&str>,
     version: u64,
@@ -460,7 +460,7 @@ async fn create_empty_dataset(
         session: Some(Arc::clone(control_session)),
         ..Default::default()
     };
-    let params = crate::storage_layer::lance_clone::write_params(uri, params)
+    let params = crate::lance_clone::write_params(uri, params)
         .await
         .map_err(OmniError::storage)?;
     let dataset = Dataset::write(reader, uri, Some(params))

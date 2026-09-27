@@ -66,7 +66,7 @@ fn next_logical_ms() -> Option<u64> {
 /// the real clock, directly.
 #[cfg(not(feature = "dst"))]
 #[inline(always)]
-pub(crate) fn now_utc() -> DateTime<Utc> {
+pub fn now_utc() -> DateTime<Utc> {
     Utc::now()
 }
 
@@ -74,13 +74,13 @@ pub(crate) fn now_utc() -> DateTime<Utc> {
 /// `dst` feature: the real clock, directly.
 #[cfg(not(feature = "dst"))]
 #[inline(always)]
-pub(crate) fn system_time_now() -> SystemTime {
+pub fn system_time_now() -> SystemTime {
     SystemTime::now()
 }
 
 /// Seam for `chrono::Utc::now()` call sites.
 #[cfg(feature = "dst")]
-pub(crate) fn now_utc() -> DateTime<Utc> {
+pub fn now_utc() -> DateTime<Utc> {
     match next_logical_ms() {
         Some(ms) => Utc
             .timestamp_millis_opt(ms as i64)
@@ -92,7 +92,7 @@ pub(crate) fn now_utc() -> DateTime<Utc> {
 
 /// Seam for `std::time::SystemTime::now()` call sites.
 #[cfg(feature = "dst")]
-pub(crate) fn system_time_now() -> SystemTime {
+pub fn system_time_now() -> SystemTime {
     match next_logical_ms() {
         Some(ms) => UNIX_EPOCH + Duration::from_millis(ms),
         None => SystemTime::now(),

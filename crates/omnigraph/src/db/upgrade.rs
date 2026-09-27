@@ -10,15 +10,17 @@ use lance::dataset::refs::BranchIdentifier;
 use lance::dataset::transaction::{Operation, Transaction, UpdateMap};
 use lance::dataset::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use lance_file::version::LanceFileVersion;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::error::{OmniError, Result};
 use crate::storage::{normalize_root_uri, storage_for_uri};
 
-use super::layout::open_manifest_dataset_native_with_session;
-use super::migrations::{INTERNAL_SCHEMA_VERSION_KEY, read_stamp};
-use super::state::{read_manifest_state, read_manifest_state_with_registration_clocks};
-use super::{
+use crate::db::manifest::layout::open_manifest_dataset_native_with_session;
+use crate::db::manifest::migrations::{INTERNAL_SCHEMA_VERSION_KEY, read_stamp};
+use crate::db::manifest::state::{
+    read_manifest_state, read_manifest_state_with_registration_clocks,
+};
+use crate::db::manifest::{
     OBJECT_TYPE_GRAPH_COMMIT, OBJECT_TYPE_GRAPH_HEAD, OBJECT_TYPE_TABLE,
     OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION,
 };
@@ -26,21 +28,25 @@ use crate::seams::{decide_seam, fail};
 
 #[path = "upgrade/detached_only.rs"]
 mod detached_only;
+pub(crate) mod legacy_sidecars;
 
-pub(super) const UPGRADE_PENDING_KEY: &str = "omnigraph:storage_upgrade_pending";
-const UPGRADE_RECEIPT_KEY: &str = "omnigraph:storage_upgrade_receipt";
+#[cfg(all(test, feature = "failpoints"))]
+pub(super) use crate::db::manifest::migrations::BranchReceipt;
+pub(super) use crate::db::manifest::migrations::{
+    MAX_BRANCHES, MAX_INTENT_BYTES, SourceBranch, UPGRADE_PENDING_KEY, UPGRADE_RECEIPT_KEY,
+    UpgradeIntent, branch_completed, fence_operation, historical_source, intent_from, invalid,
+    receipt,
+};
 const HANDLER: &str = "registration-clocks-v6-to-v7";
 const RETIREMENT_HANDLER: &str = "native-retirement-v7-to-v8";
 const DETACHED_PINS_HANDLER: &str = "detached-pins-v8-v9-to-v10";
 const DETACHED_ONLY_HANDLER: &str = "detached-only-v10-to-v11";
 const DEFAULT_TARGET: u32 = 11;
 const RETIREMENT_KEY: &str = "omnigraph.retired_manifest_branch";
-const MAX_BRANCHES: usize = 1024;
 const MAX_VERSIONS: usize = 100_000;
 const MAX_APPENDED_UPGRADE_VERSIONS: u64 = 3;
 const MAX_ROWS: usize = 1_000_000;
 const MAX_METADATA_BYTES: usize = 64 * 1024 * 1024;
-const MAX_INTENT_BYTES: usize = 1024 * 1024;
 
 /// Explicit storage conversion options. Execution requires exclusive operator control.
 #[derive(Debug, Clone, Copy, Default)]
@@ -138,33 +144,6 @@ impl UpgradeReport {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct SourceBranch {
-    native: Option<String>,
-    identity: BranchIdentifier,
-    version: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct UpgradeIntent {
-    protocol: u32,
-    attempt: String,
-    source_format: u32,
-    target_format: u32,
-    graph_identity: String,
-    branches: Vec<SourceBranch>,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct BranchReceipt {
-    protocol: u32,
-    attempt: String,
-    source: SourceBranch,
-}
-
 /// Upgrade a standalone graph offline; neither this function nor `--check` starts recovery on open.
 pub async fn upgrade_storage(uri: &str, options: UpgradeOptions) -> Result<UpgradeReport> {
     upgrade_storage_as(uri, options, None, None).await
@@ -211,54 +190,6 @@ pub async fn upgrade_storage_as(
 async fn open(root: &str, native: Option<&str>) -> Result<Dataset> {
     open_manifest_dataset_native_with_session(root, native, &crate::lance_access::control_session())
         .await
-}
-
-fn invalid(message: impl Into<String>) -> OmniError {
-    OmniError::manifest(message)
-}
-
-fn intent_from(dataset: &Dataset) -> Result<Option<UpgradeIntent>> {
-    let Some(json) = dataset.schema().metadata.get(UPGRADE_PENDING_KEY) else {
-        return Ok(None);
-    };
-    if json.len() > MAX_INTENT_BYTES {
-        return Err(invalid(
-            "storage upgrade intent exceeds the metadata budget",
-        ));
-    }
-    let intent: UpgradeIntent = serde_json::from_str(json)
-        .map_err(|e| invalid(format!("unrecognized upgrade ownership: {e}")))?;
-    let mut names = HashSet::new();
-    if !matches!(
-        (intent.protocol, intent.source_format, intent.target_format),
-        (1, 6, 7) | (2, 7, 8) | (3, 8, 10) | (3, 9, 10) | (4, 10, 11)
-    ) || intent.attempt.parse::<ulid::Ulid>().is_err()
-        || intent.graph_identity.is_empty()
-        || intent.branches.is_empty()
-        || intent.branches.len() > MAX_BRANCHES
-        || intent
-            .branches
-            .last()
-            .is_none_or(|branch| branch.native.is_some())
-        || intent
-            .branches
-            .iter()
-            .any(|branch| branch.version == 0 || !names.insert(branch.native.clone()))
-    {
-        return Err(invalid("unsupported or ambiguous storage upgrade intent"));
-    }
-    Ok(Some(intent))
-}
-
-pub(super) fn recovery_guidance(dataset: &Dataset) -> String {
-    match intent_from(dataset) {
-        Ok(Some(intent)) => format!(
-            "storage upgrade recovery required: stop all writers and maintenance and rerun `omnigraph upgrade <graph> --to-format {}` with this upgrade-capable executable; preserve the existing attempt.{}",
-            intent.target_format,
-            if intent.target_format == 7 { " After completion, run `omnigraph upgrade <graph> --to-format 8` before serving with this executable." } else { "" },
-        ),
-        _ => "storage upgrade ownership is unknown: preserve the graph and original upgrade options; use this upgrade-capable executable for read-only `omnigraph upgrade <graph> --check` diagnostics before recovery".into(),
-    }
 }
 
 async fn run(
@@ -419,7 +350,9 @@ async fn run_step(
     let (_, schema_state) =
         crate::db::schema_state::load_validated_schema_contract(root, Arc::clone(&storage)).await?;
     report.graph_identity = Some(schema_state.schema_identity_domain.clone());
-    let sidecars = super::pending_legacy_sidecars(root, storage.as_ref()).await?;
+    let sidecars =
+        crate::db::upgrade::legacy_sidecars::pending_legacy_sidecars(root, storage.as_ref())
+            .await?;
     if !sidecars.is_empty() {
         report.outcome = UpgradeOutcome::RecoveryRequired;
         report.finding(
@@ -435,15 +368,15 @@ async fn run_step(
     let stamp = read_stamp(&main);
     let served_at_or_above_target = stamp.is_some_and(|stamp| {
         stamp >= step_target
-            && step_target >= super::migrations::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION
-            && stamp <= super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION
+            && step_target >= crate::db::manifest::migrations::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION
+            && stamp <= crate::db::manifest::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION
     });
     if pending.is_none()
         && let Some(expected) = stamp
         && (expected == step_target || served_at_or_above_target)
     {
-        if expected >= super::migrations::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION {
-            super::migrations::guard_stamp(&main)?;
+        if expected >= crate::db::manifest::migrations::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION {
+            crate::db::manifest::migrations::guard_stamp(&main)?;
         }
         read_manifest_state(&main).await?;
         let branches = if expected >= 8 {
@@ -488,13 +421,13 @@ async fn run_step(
     }
     if pending.is_none()
         && let Some(stamp) = stamp
-        && stamp > super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION
+        && stamp > crate::db::manifest::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION
     {
         report.finding(
             "newer_than_binary",
             format!(
                 "this graph is stamped v{stamp}, newer than the v{} this executable serves; upgrade omnigraph before touching it",
-                super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION
+                crate::db::manifest::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION
             ),
         );
         return Ok(());
@@ -502,13 +435,13 @@ async fn run_step(
     if pending.is_none()
         && let Some(stamp) = stamp
         && stamp > step_target
-        && step_target < super::migrations::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION
+        && step_target < crate::db::manifest::migrations::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION
     {
         report.finding(
             "target_below_stamp",
             format!(
                 "this graph is stamped v{stamp}; the requested target v{step_target} is below the oldest format this executable serves (v{}), and no downgrade route exists",
-                super::migrations::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION
+                crate::db::manifest::migrations::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION
             ),
         );
         return Ok(());
@@ -746,65 +679,6 @@ async fn inventory(main: &Dataset, graph_identity: String) -> Result<UpgradeInte
     })
 }
 
-fn receipt(branch: &SourceBranch, intent: &UpgradeIntent) -> BranchReceipt {
-    BranchReceipt {
-        protocol: intent.protocol,
-        attempt: intent.attempt.clone(),
-        source: branch.clone(),
-    }
-}
-
-fn branch_completed(
-    dataset: &Dataset,
-    source: &SourceBranch,
-    intent: &UpgradeIntent,
-) -> Result<bool> {
-    let Some(raw) = dataset.schema().metadata.get(UPGRADE_RECEIPT_KEY) else {
-        return Ok(false);
-    };
-    if raw.len() > MAX_INTENT_BYTES {
-        return Err(invalid(
-            "storage upgrade receipt exceeds the metadata budget",
-        ));
-    }
-    let found: BranchReceipt =
-        serde_json::from_str(raw).map_err(|e| invalid(format!("invalid upgrade receipt: {e}")))?;
-    if found != receipt(source, intent) {
-        let source_head = source
-            .version
-            .checked_add(u64::from(
-                source.native.is_none()
-                    && dataset.schema().metadata.contains_key(UPGRADE_PENDING_KEY),
-            ))
-            .ok_or_else(|| invalid("upgrade version overflow"))?;
-        if intent.protocol > found.protocol
-            && found.attempt != intent.attempt
-            && dataset.version().version == source_head
-        {
-            return Ok(false);
-        }
-        return Err(invalid("foreign upgrade receipt"));
-    }
-    if read_stamp(dataset) != Some(intent.target_format) {
-        return Err(invalid("upgrade receipt has an incompatible format"));
-    }
-    let expected = source
-        .version
-        .checked_add(if source.native.is_none() { 2 } else { 1 })
-        .ok_or_else(|| invalid("upgrade version overflow"))?;
-    let activated =
-        source.native.is_none() && !dataset.schema().metadata.contains_key(UPGRADE_PENDING_KEY);
-    let expected = expected
-        .checked_add(u64::from(activated))
-        .ok_or_else(|| invalid("upgrade version overflow"))?;
-    if dataset.version().version != expected {
-        return Err(invalid(
-            "upgraded branch moved while conversion was incomplete",
-        ));
-    }
-    Ok(true)
-}
-
 fn verify_source_head(
     dataset: &Dataset,
     source: &SourceBranch,
@@ -925,7 +799,8 @@ async fn preflight(root: &str, intent: &UpgradeIntent, work: &mut UpgradeWork) -
             return Err(invalid("source manifest primary-key evidence is invalid"));
         }
         validate_metadata_budget(&source).await?;
-        let (old, lineage) = super::state::read_manifest_state_and_lineage(&source).await?;
+        let (old, lineage) =
+            crate::db::manifest::state::read_manifest_state_and_lineage(&source).await?;
         if intent.source_format == 6 {
             validate_source_branch_identity(branch, &old, &lineage)?;
         } else if branch.native.is_some()
@@ -939,7 +814,7 @@ async fn preflight(root: &str, intent: &UpgradeIntent, work: &mut UpgradeWork) -
             compare_states(old, &mut translated)?;
         }
         let schema: Schema = source.schema().into();
-        let expected = super::state::manifest_schema();
+        let expected = crate::db::manifest::state::manifest_schema();
         if schema.fields().len() != expected.fields().len()
             || schema
                 .fields()
@@ -1012,7 +887,8 @@ async fn preflight(root: &str, intent: &UpgradeIntent, work: &mut UpgradeWork) -
             }
             confined(root, &snapshot)?;
             validate_metadata_budget(&snapshot).await?;
-            let (state, lineage) = super::state::read_manifest_state_and_lineage(&snapshot).await?;
+            let (state, lineage) =
+                crate::db::manifest::state::read_manifest_state_and_lineage(&snapshot).await?;
             if unstamped_bootstrap {
                 let genesis = lineage.first();
                 let valid_genesis = lineage.len() == 1
@@ -1116,8 +992,8 @@ async fn preflight(root: &str, intent: &UpgradeIntent, work: &mut UpgradeWork) -
 
 fn validate_source_branch_identity(
     branch: &SourceBranch,
-    state: &super::state::ManifestState,
-    lineage: &[super::state::GraphLineageRow],
+    state: &crate::db::manifest::state::ManifestState,
+    lineage: &[crate::db::manifest::state::GraphLineageRow],
 ) -> Result<()> {
     let Some(native) = branch.native.as_deref() else {
         return Ok(());
@@ -1147,62 +1023,6 @@ fn validate_source_branch_identity(
     Ok(())
 }
 
-pub(super) async fn historical_source(snapshot: Dataset, source_format: u32) -> Result<Dataset> {
-    if source_format != 7 || !snapshot.schema().metadata.contains_key(UPGRADE_PENDING_KEY) {
-        return Ok(snapshot);
-    }
-    let intent =
-        intent_from(&snapshot)?.ok_or_else(|| invalid("historical upgrade intent disappeared"))?;
-    if intent.protocol != 1 || snapshot.manifest().branch.is_some() {
-        return Err(invalid("unsupported historical upgrade ownership"));
-    }
-    let main = intent
-        .branches
-        .last()
-        .ok_or_else(|| invalid("historical upgrade has no main source"))?;
-    if branch_completed(&snapshot, main, &intent)? {
-        return Ok(snapshot);
-    }
-    let expected = main
-        .version
-        .checked_add(1)
-        .ok_or_else(|| invalid("upgrade version overflow"))?;
-    let transaction = snapshot
-        .read_transaction()
-        .await
-        .map_err(OmniError::storage)?
-        .ok_or_else(|| invalid("historical upgrade fence has no transaction proof"))?;
-    let json = snapshot
-        .schema()
-        .metadata
-        .get(UPGRADE_PENDING_KEY)
-        .ok_or_else(|| invalid("historical upgrade intent disappeared"))?
-        .clone();
-    let operation = Transaction::new(main.version, fence_operation(json, 7), None);
-    if snapshot.version().version != expected
-        || read_stamp(&snapshot) != Some(7)
-        || transaction.read_version != main.version
-        || lance_table::format::pb::Transaction::from(&transaction).operation
-            != lance_table::format::pb::Transaction::from(&operation).operation
-        || crate::branch_control::dataset_branch_identifier(&snapshot)
-            .await
-            .map_err(OmniError::storage)?
-            != main.identity
-    {
-        return Err(invalid(
-            "historical upgrade fence does not match its exact source",
-        ));
-    }
-    let source = snapshot
-        .checkout_version(main.version)
-        .await
-        .map_err(OmniError::storage)?;
-    if read_stamp(&source) != Some(6) {
-        return Err(invalid("historical upgrade fence source is not v6"));
-    }
-    Ok(source)
-}
-
 async fn retained_version_refs(
     dataset: &Dataset,
     limit: usize,
@@ -1225,8 +1045,8 @@ async fn retained_version_refs(
 }
 
 fn compare_states(
-    mut old: super::state::ManifestState,
-    translated: &mut super::state::ManifestState,
+    mut old: crate::db::manifest::state::ManifestState,
+    translated: &mut crate::db::manifest::state::ManifestState,
 ) -> Result<()> {
     old.entries.sort_by_key(|entry| entry.identity);
     translated.entries.sort_by_key(|entry| entry.identity);
@@ -1250,21 +1070,6 @@ async fn equivalent(source: &Dataset, target: &Dataset) -> Result<()> {
     let old = read_manifest_state(source).await?;
     let mut converted = read_manifest_state(target).await?;
     compare_states(old, &mut converted)
-}
-
-fn fence_operation(intent: String, target: u32) -> Operation {
-    Operation::UpdateConfig {
-        config_updates: None,
-        table_metadata_updates: None,
-        field_metadata_updates: HashMap::new(),
-        schema_metadata_updates: Some(UpdateMap {
-            update_entries: vec![
-                (INTERNAL_SCHEMA_VERSION_KEY.to_string(), target.to_string()).into(),
-                (UPGRADE_PENDING_KEY.to_string(), intent).into(),
-            ],
-            replace: false,
-        }),
-    }
 }
 
 async fn publish_fence(dataset: Dataset, intent: String, target: u32) -> Result<Dataset> {

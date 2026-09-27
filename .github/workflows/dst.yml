@@ -178,4 +178,4 @@ jobs:
       # job is the one per-PR gate that lints the engine's SHIPPED shape
       # (default features, dst compiled out; releases build with -p).
       - name: Clippy shipped engine shape (no dst)
-        run: cargo clippy -p omnigraph-engine -p omnigraph-storage --all-targets --locked -- -D warnings
+        run: cargo clippy -p omnigraph-engine -p omnigraph-storage -p omnigraph-core -p omnigraph-catalog --all-targets --locked -- -D warnings
