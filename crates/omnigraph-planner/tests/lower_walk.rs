@@ -3,8 +3,9 @@
 
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
 use omnigraph_planner::{
-    ExpandFields, HashJoinFields, Lower, NodeId, PhysicalNode, PhysicalPlan, PlanError, Prefilter,
-    RankArm, RankKind, RankedAccess, ScanInput, ScanSpec, SideId, SortMergeJoinFields,
+    ContainsJoinFields, ExpandFields, HashJoinFields, Lower, NodeId, PhysicalNode, PhysicalPlan,
+    PlanError, Prefilter, RankArm, RankKind, RankedAccess, ScanInput, ScanSpec, SideId,
+    SortMergeJoinFields,
 };
 
 fn no_prefilter() -> Prefilter {
@@ -107,8 +108,24 @@ impl Lower for Trace {
         self.call("page", id, &[&input])
     }
 
-    fn cross_join(&mut self, id: NodeId, left: String, right: String) -> Result<String, PlanError> {
+    fn cross_join(
+        &mut self,
+        id: NodeId,
+        _: &[IRExpr],
+        left: String,
+        right: String,
+    ) -> Result<String, PlanError> {
         self.call("cross_join", id, &[&left, &right])
+    }
+
+    fn contains_join(
+        &mut self,
+        id: NodeId,
+        _: ContainsJoinFields<'_>,
+        left: String,
+        right: String,
+    ) -> Result<String, PlanError> {
+        self.call("contains_join", id, &[&left, &right])
     }
 
     fn filter(&mut self, id: NodeId, _: &[IRExpr], input: String) -> Result<String, PlanError> {
@@ -199,7 +216,11 @@ fn every_input_is_lowered_before_its_consumer_and_finish_runs_last() {
     let mut plan = PhysicalPlan::new();
     let left = leaf(&mut plan, "a");
     let right = leaf(&mut plan, "b");
-    let join = plan.add(PhysicalNode::CrossJoin { left, right });
+    let join = plan.add(PhysicalNode::CrossJoin {
+        left,
+        right,
+        filters: Vec::new(),
+    });
     let filter = plan.add(PhysicalNode::Filter {
         input: join,
         filters: Vec::new(),
@@ -249,6 +270,7 @@ fn a_hash_join_lowers_its_probe_then_its_build_scan_then_itself() {
             projection: None,
             filter: None,
             binding: Some("d".to_string()),
+            runtime_filter: None,
         }),
         ordered: false,
         keys_only: false,
@@ -398,6 +420,7 @@ fn a_node_with_two_consumers_refuses_the_lowering() {
     let join = plan.add(PhysicalNode::CrossJoin {
         left: shared,
         right: shared,
+        filters: Vec::new(),
     });
     plan.set_root(join);
 

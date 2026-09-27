@@ -302,7 +302,7 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
 
 /// A bare search order plans the score `Sort` the engine runs, with the
 /// query's limit as its fetch; a fusion plans none, since it orders its own
-/// rows, and each arm is its own subtree.
+/// rows, and each arm keeps every cross-binding conjunct in its own subtree.
 #[test]
 fn a_search_order_plans_its_score_sort_and_a_fusion_two_arms() {
     let bm25 = IRExpr::Bm25 {
@@ -334,8 +334,20 @@ fn a_search_order_plans_its_score_sort_and_a_fusion_two_arms() {
         secondary: Box::new(bm25),
         k: None,
     };
+    let contains = IRExpr::comparison(prop("c", "text"), CompOp::StringContains, prop("n", "slug"));
+    let residual = IRExpr::comparison(prop("n", "slug"), CompOp::Ne, prop("c", "slug"));
     let (plan, _) = physical(
-        &ir(vec![scan("c")], vec![prop("c", "slug")], vec![rrf]),
+        &ir(
+            vec![
+                scan("n"),
+                scan("c"),
+                IROp::Filter(
+                    IRExpr::and_all([contains.clone(), residual.clone()]).expect("two conjuncts"),
+                ),
+            ],
+            vec![prop("c", "slug")],
+            vec![rrf],
+        ),
         &source(),
     );
     let json = plan.to_json();
@@ -352,11 +364,34 @@ fn a_search_order_plans_its_score_sort_and_a_fusion_two_arms() {
     let arms = fuse["inputs"].as_array().expect("two arm inputs");
     assert_eq!(arms.len(), 2);
     assert_ne!(arms[0]["id"], arms[1]["id"]);
-    assert_eq!(arms[0]["ranked"]["kind"], "nearest");
-    assert_eq!(arms[0]["ranked"]["scope"], "primary");
-    assert_eq!(arms[0]["ranked"]["fetch"], 10);
-    assert_eq!(arms[1]["ranked"]["kind"], "bm25");
-    assert_eq!(arms[1]["ranked"]["scope"], "secondary");
+    for (arm, (kind, scope)) in arms
+        .iter()
+        .zip([("nearest", "primary"), ("bm25", "secondary")])
+    {
+        assert_eq!(arm["node"], "CrossJoin", "{scope} arm");
+        assert_eq!(
+            arm["filters"],
+            serde_json::json!([contains.to_string(), residual.to_string()]),
+            "{scope} arm keeps every conjunct"
+        );
+        let inputs = arm["inputs"].as_array().expect("two join inputs");
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0]["node"], "Scan");
+        assert_eq!(inputs[0]["binding"], "n");
+        assert_eq!(inputs[1]["node"], "Scan");
+        assert_eq!(inputs[1]["binding"], "c");
+        assert!(
+            inputs
+                .iter()
+                .all(|scan| scan.get("runtime_filter").is_none())
+        );
+        assert_eq!(inputs[1]["ranked"]["kind"], kind);
+        assert_eq!(inputs[1]["ranked"]["scope"], scope);
+    }
+    assert_ne!(arms[0]["inputs"][0]["id"], arms[1]["inputs"][0]["id"]);
+    assert_ne!(arms[0]["inputs"][1]["id"], arms[1]["inputs"][1]["id"]);
+    assert_eq!(arms[0]["inputs"][1]["ranked"]["fetch"], 10);
+    assert!(arms[1]["inputs"][1]["ranked"]["fetch"].is_null());
     assert!(
         !plan
             .live()

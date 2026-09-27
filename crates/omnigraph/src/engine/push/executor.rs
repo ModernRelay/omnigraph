@@ -264,6 +264,7 @@ fn build_chain<'a>(
             }
             | PhysicalNode::HashJoin { .. }
             | PhysicalNode::CrossJoin { .. }
+            | PhysicalNode::ContainsJoin { .. }
             | PhysicalNode::Filter { .. }
             | PhysicalNode::Expand { .. }
             | PhysicalNode::AntiJoin { .. }

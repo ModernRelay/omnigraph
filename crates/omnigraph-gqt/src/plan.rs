@@ -16,6 +16,10 @@
 //! scan Doc as $d: ranked nearest fetch 10 nprobes 20
 //! expand $d Knows $e: mode indexed_scan
 //! expand $d Knows $e: mode indexed_scan ran csr
+//! contains join $p.text contains $m.number
+//! cross join $p.text contains $m.number
+//! scan Passage as $p: runtime filter text
+//! scan Passage as $p: no runtime filter
 //! filter reads [a.state, b.state]
 //! pass projection_pushdown
 //! not pass aggregate_pushdown
@@ -36,7 +40,7 @@ use serde_json::Value;
 
 use crate::report::Row;
 
-const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `hash join $var[ ran <hash_join|id_lookup>]`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>]`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a, $b]`, `sort no tiebreak`, `pass <name>`, `not pass <name>`";
+const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `hash join $var[ ran <hash_join|id_lookup>]`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a, $b]`, `sort no tiebreak`, `pass <name>`, `not pass <name>`";
 
 const ID_LOOKUP: &str = "id_lookup";
 const JOIN_SIDES: [&str; 2] = ["hash_join", "id_lookup"];
@@ -87,6 +91,19 @@ pub(crate) enum PlanLine {
         fetch: Option<u64>,
         nprobes: Option<u64>,
     },
+    /// Every selected physical scan is marked with a runtime filter on
+    /// `column`, or with none when `column` is `None`.
+    ScanRuntimeFilter {
+        type_name: String,
+        binding: Option<String>,
+        column: Option<String>,
+    },
+    /// A physical `ContainsJoin` pairs `$haystack contains $needle`, each a
+    /// `binding.property`.
+    ContainsJoin { haystack: String, needle: String },
+    /// A physical `CrossJoin` holds the conjunct `$haystack contains $needle`
+    /// among its `filters`: the plain filtered product, no `ContainsJoin`.
+    CrossJoin { haystack: String, needle: String },
     /// The physical `Expand` from `$src` over `edge_type` to `$dst` runs in
     /// `mode` (`csr` or `indexed_scan`), and when `ran` is claimed, the run
     /// ended on that mode.
@@ -192,13 +209,37 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             });
             continue;
         }
+        let join = if let Some(rest) = line.strip_prefix("contains join ") {
+            Some((rest, "contains join"))
+        } else {
+            line.strip_prefix("cross join ")
+                .map(|rest| (rest, "cross join"))
+        };
+        if let Some((rest, head)) = join {
+            let words: Vec<&str> = rest.split_whitespace().collect();
+            let (haystack, needle) = match words[..] {
+                [haystack, "contains", needle] => {
+                    match (property_ref(haystack), property_ref(needle)) {
+                        (Some(haystack), Some(needle)) => (haystack, needle),
+                        _ => return Err(refused("names both columns as `$binding.property`")),
+                    }
+                }
+                _ => return Err(refused(&format!("claims `{head} $h.x contains $n.y`"))),
+            };
+            lines.push(if head == "contains join" {
+                PlanLine::ContainsJoin { haystack, needle }
+            } else {
+                PlanLine::CrossJoin { haystack, needle }
+            });
+            continue;
+        }
         let (rest, expand) = if let Some(rest) = line.strip_prefix("scan ") {
             (rest, false)
         } else if let Some(rest) = line.strip_prefix("expand ") {
             (rest, true)
         } else {
             return Err(refused(
-                "knows six line heads: `scan`, `hash join`, `expand`, `filter`, `sort`, `pass`",
+                "knows eight line heads: `scan`, `hash join`, `contains join`, `cross join`, `expand`, `filter`, `sort`, `pass`",
             ));
         };
         let Some((selector, claim)) = rest.split_once(':') else {
@@ -249,6 +290,24 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
         let claim = claim.trim();
         let claim = if claim == "no filter" {
             ScanClaim::NoFilter
+        } else if claim == "no runtime filter" {
+            lines.push(PlanLine::ScanRuntimeFilter {
+                type_name,
+                binding,
+                column: None,
+            });
+            continue;
+        } else if let Some(column) = claim.strip_prefix("runtime filter ") {
+            let column = column.trim();
+            if !identifier(column) {
+                return Err(refused("claims `runtime filter <column>`, one column name"));
+            }
+            lines.push(PlanLine::ScanRuntimeFilter {
+                type_name,
+                binding,
+                column: Some(column.to_string()),
+            });
+            continue;
         } else if let Some(ranked) = claim.strip_prefix("ranked ") {
             let mut words = ranked.split_whitespace();
             let kind = words
@@ -300,7 +359,7 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
                     Some(list) => (false, list),
                     None => {
                         return Err(refused(
-                            "claims `columns`, `not columns`, `filter reads`, `no filter`, `access` or `ranked`",
+                            "claims `columns`, `not columns`, `filter reads`, `no filter`, `access`, `ranked`, `runtime filter` or `no runtime filter`",
                         ));
                     }
                 },
@@ -320,6 +379,13 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
         return Err("`--- expect plan` carries at least one line".to_string());
     }
     Ok(lines)
+}
+
+/// `binding.property` of a `$binding.property` reference, `None` for any
+/// other spelling.
+fn property_ref(text: &str) -> Option<String> {
+    let (binding, property) = text.strip_prefix('$')?.split_once('.')?;
+    (identifier(binding) && identifier(property)).then(|| format!("{binding}.{property}"))
 }
 
 /// A non-empty `[a, b]` list, or `None` when the text is not one.
@@ -412,13 +478,15 @@ struct PlannedExpandMode {
 }
 
 /// One `Scan` of the explain document's physical plan with the access path
-/// it recorded (`None` on a table scan) and its ranking (`None` unranked).
+/// it recorded (`None` on a table scan), its ranking (`None` unranked) and
+/// the column of the runtime filter it is marked with (`None` unmarked).
 #[derive(Debug)]
 struct PlannedAccess {
     type_key: String,
     binding: Option<String>,
     access: Option<String>,
     ranked: Option<PlannedRanking>,
+    runtime_filter: Option<String>,
 }
 
 /// One `HashJoin` of the explain document's physical plan with its node id.
@@ -426,6 +494,14 @@ struct PlannedAccess {
 struct PlannedJoin {
     id: Option<u64>,
     binding: String,
+}
+
+/// One `ContainsJoin` of the explain document's physical plan: the two
+/// columns it pairs by, each `binding.property`.
+#[derive(Debug)]
+struct PlannedContainsJoin {
+    haystack: String,
+    needle: String,
 }
 
 /// The `ranked` object of a physical `Scan` row: the index, its fetch and
@@ -475,8 +551,8 @@ fn ran_side(report: Option<&[Row]>, id: Option<u64>, what: &str) -> Result<Strin
 }
 
 /// The logical plan's scans and in-memory filters, and the physical plan's
-/// traversal modes, access paths, hash joins and sort tie-breaks (`Err` names
-/// a `Sort` row with no `tiebreak` key).
+/// traversal modes, access paths, hash joins, contains joins, each cross
+/// join's `filters` and sort tie-breaks (`Err`: a `Sort` row with no `tiebreak`).
 #[derive(Debug, Default)]
 struct PlannedNodes {
     scans: Vec<PlannedScan>,
@@ -484,6 +560,8 @@ struct PlannedNodes {
     modes: Vec<PlannedExpandMode>,
     accesses: Vec<PlannedAccess>,
     joins: Vec<PlannedJoin>,
+    contains_joins: Vec<PlannedContainsJoin>,
+    cross_joins: Vec<Vec<String>>,
     sorts: Vec<Result<Vec<String>, String>>,
 }
 
@@ -527,11 +605,29 @@ fn planned_physical(node: &Value, out: &mut PlannedNodes) {
                         .get("nprobes")
                         .map(|nprobes| nprobes.as_u64().unwrap_or(0)),
                 }),
+            runtime_filter: node
+                .get("runtime_filter")
+                .and_then(|filter| filter.get("column"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
         }),
         Some("HashJoin") => out.joins.push(PlannedJoin {
             id,
             binding: text("binding"),
         }),
+        Some("ContainsJoin") => out.contains_joins.push(PlannedContainsJoin {
+            haystack: text("haystack").trim_start_matches('$').to_string(),
+            needle: text("needle").trim_start_matches('$').to_string(),
+        }),
+        Some("CrossJoin") => out.cross_joins.push(
+            node.get("filters")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+        ),
         Some("Sort") => out.sorts.push(
             node.get("tiebreak")
                 .and_then(Value::as_array)
@@ -817,6 +913,65 @@ pub(crate) fn plan_mismatch(
                             ),
                         });
                     }
+                }
+            }
+            PlanLine::ScanRuntimeFilter {
+                type_name,
+                binding,
+                column,
+            } => {
+                let selected = match physical_scans(&nodes, type_name, binding.as_deref()) {
+                    Ok(selected) => selected,
+                    Err(mismatch) => return Some(mismatch),
+                };
+                for scan in selected {
+                    match (&scan.runtime_filter, column) {
+                        (None, Some(column)) => {
+                            return Some(format!(
+                                "expect plan: the scan of `{type_name}` carries no runtime filter, expected one on `{column}`"
+                            ));
+                        }
+                        (Some(have), None) => {
+                            return Some(format!(
+                                "expect plan: the scan of `{type_name}` carries a runtime filter on `{have}`, expected none"
+                            ));
+                        }
+                        (Some(have), Some(column)) if have != column => {
+                            return Some(format!(
+                                "expect plan: the scan of `{type_name}` carries a runtime filter on `{have}`, expected `{column}`"
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            PlanLine::ContainsJoin { haystack, needle } => {
+                let found = nodes
+                    .contains_joins
+                    .iter()
+                    .any(|join| join.haystack == *haystack && join.needle == *needle);
+                if !found {
+                    let known: Vec<String> = nodes
+                        .contains_joins
+                        .iter()
+                        .map(|join| format!("${} contains ${}", join.haystack, join.needle))
+                        .collect();
+                    return Some(format!(
+                        "expect plan: no contains join `${haystack} contains ${needle}` in the physical plan; it joins {known:?}"
+                    ));
+                }
+            }
+            PlanLine::CrossJoin { haystack, needle } => {
+                let conjunct = format!("${haystack} contains ${needle}");
+                let found = nodes
+                    .cross_joins
+                    .iter()
+                    .any(|filters| filters.contains(&conjunct));
+                if !found {
+                    return Some(format!(
+                        "expect plan: no cross join holding `{conjunct}` in the physical plan; its cross joins hold {:?}",
+                        nodes.cross_joins
+                    ));
                 }
             }
             PlanLine::ScanAccess { type_name, binding } => {
@@ -1374,6 +1529,127 @@ mod tests {
             "hash join $d ran",
             "hash join $d ran csr",
             "hash join $d took hash_join",
+        ] {
+            assert!(parse_plan_body(&[(0, refused)]).is_err(), "{refused}");
+        }
+    }
+
+    /// A `contains join` line reads the physical `ContainsJoin`'s columns
+    /// and a `runtime filter` claim the marked scan's column; the collected
+    /// side is unmarked, and a `cross join` line the plain product's filters.
+    #[test]
+    fn contains_join_and_runtime_filter_claims_read_the_physical_plan() {
+        let explain = json!({
+            "physical_plan": {"node": "Projection", "inputs": [
+                {"node": "ContainsJoin", "id": 3, "haystack": "$p.text", "needle": "$m.number",
+                 "residual": [], "inputs": [
+                    {"node": "Scan", "id": 1, "table": "node:Matter", "binding": "m"},
+                    {"node": "Scan", "id": 2, "table": "node:Passage", "binding": "p",
+                     "runtime_filter": {"column": "text", "needle": ["m", "number"],
+                                        "kind": "text_contains_any"}}
+                ]}
+            ]},
+            "passes": ["resolve", "join_algorithm"],
+        });
+        let lines = parse_plan_body(&[
+            (0, "contains join $p.text contains $m.number"),
+            (1, "scan Passage as $p: runtime filter text"),
+            (2, "scan Matter as $m: no runtime filter"),
+            (3, "pass join_algorithm"),
+        ])
+        .unwrap();
+        assert_eq!(
+            lines[0],
+            PlanLine::ContainsJoin {
+                haystack: "p.text".to_string(),
+                needle: "m.number".to_string(),
+            }
+        );
+        assert_eq!(
+            lines[1],
+            PlanLine::ScanRuntimeFilter {
+                type_name: "Passage".to_string(),
+                binding: Some("p".to_string()),
+                column: Some("text".to_string()),
+            }
+        );
+        assert_eq!(
+            lines[2],
+            PlanLine::ScanRuntimeFilter {
+                type_name: "Matter".to_string(),
+                binding: Some("m".to_string()),
+                column: None,
+            }
+        );
+        assert_eq!(check(&lines, &explain), None);
+        for (claim, message) in [
+            (
+                "contains join $m.number contains $p.text",
+                "no contains join `$m.number contains $p.text`",
+            ),
+            (
+                "scan Matter as $m: runtime filter number",
+                "carries no runtime filter, expected one on `number`",
+            ),
+            (
+                "scan Passage as $p: no runtime filter",
+                "carries a runtime filter on `text`, expected none",
+            ),
+            (
+                "scan Passage as $p: runtime filter pid",
+                "carries a runtime filter on `text`, expected `pid`",
+            ),
+            ("scan Other: runtime filter text", "no scan of `Other`"),
+            (
+                "cross join $p.text contains $m.number",
+                "no cross join holding `$p.text contains $m.number` in the physical plan; its cross joins hold []",
+            ),
+        ] {
+            let lines = parse_plan_body(&[(0, claim)]).unwrap();
+            let mismatch = check(&lines, &explain).unwrap();
+            assert!(mismatch.contains(message), "{claim}: {mismatch}");
+        }
+        let plain = json!({
+            "physical_plan": {"node": "CrossJoin", "filters": ["$p.text contains $m.number"], "inputs": [
+                {"node": "Scan", "table": "node:Matter", "binding": "m"},
+                {"node": "Scan", "table": "node:Passage", "binding": "p"}
+            ]},
+        });
+        let lines = parse_plan_body(&[(0, "contains join $p.text contains $m.number")]).unwrap();
+        assert!(
+            check(&lines, &plain)
+                .unwrap()
+                .contains("in the physical plan; it joins []")
+        );
+        let lines = parse_plan_body(&[
+            (0, "cross join $p.text contains $m.number"),
+            (1, "scan Passage as $p: no runtime filter"),
+        ])
+        .unwrap();
+        assert_eq!(
+            lines[0],
+            PlanLine::CrossJoin {
+                haystack: "p.text".to_string(),
+                needle: "m.number".to_string(),
+            }
+        );
+        assert_eq!(check(&lines, &plain), None);
+        let lines = parse_plan_body(&[(0, "cross join $m.number contains $p.text")]).unwrap();
+        assert!(
+            check(&lines, &plain)
+                .unwrap()
+                .contains(r#"its cross joins hold [["$p.text contains $m.number"]]"#)
+        );
+        for refused in [
+            "contains join p.text contains $m.number",
+            "contains join $p.text $m.number",
+            "contains join $p.text contains $m",
+            "contains join $p.text contains $m.number extra",
+            "cross join $p.text $m.number",
+            "cross join p.text contains $m.number",
+            "scan Passage as $p: runtime filter",
+            "scan Passage as $p: runtime filter p.text",
+            "scan Passage as $p: runtime filter text more",
         ] {
             assert!(parse_plan_body(&[(0, refused)]).is_err(), "{refused}");
         }

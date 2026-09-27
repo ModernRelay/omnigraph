@@ -1,0 +1,107 @@
+# issue: 775
+# red_on: upstream 24da4f54 saved CLI, 2026-09-27: fresh explain has one Filter reading [m.number, p.text, r.matter_number], so both separate filter-read assertions and pass predicate_pushdown fail; rows agree.
+# notes: `$p.text contains $m.number` reads only bindings bound under the cross join, so it runs on that join, below the traversal;
+# notes: `$r.matter_number != $m.number` also reads the traversal's destination and stays above it. Rows are the same in both placements.
+# notes: Written with `$p` reached from `$r`, the passages are a traversal's destination: no contains join, the same rows.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Matter {
+    number: String?
+}
+node Passage {
+    pid: String @key
+    text: String?
+}
+node SourceRevision {
+    rid: String @key
+    matter_number: String
+}
+edge PassageOfRevision: Passage -> SourceRevision
+
+--- seed
+{"type":"Matter","data":{"number":"1001"}}
+{"type":"Matter","data":{"number":"2002"}}
+{"type":"Matter","data":{}}
+{"type":"Passage","data":{"pid":"p1","text":"cites 1001 here"}}
+{"type":"Passage","data":{"pid":"p2","text":"see 1001"}}
+{"type":"Passage","data":{"pid":"p3"}}
+{"type":"Passage","data":{"pid":"p4","text":"about 2002"}}
+{"type":"Passage","data":{"pid":"p5","text":"2002 and more"}}
+{"type":"Passage","data":{"pid":"p6","text":"re 2002"}}
+{"type":"SourceRevision","data":{"rid":"r-other","matter_number":"3003"}}
+{"type":"SourceRevision","data":{"rid":"r-self","matter_number":"1001"}}
+{"type":"SourceRevision","data":{"rid":"r-two","matter_number":"4004"}}
+{"edge":"PassageOfRevision","from":"p1","to":"r-other"}
+{"edge":"PassageOfRevision","from":"p2","to":"r-self"}
+{"edge":"PassageOfRevision","from":"p3","to":"r-other"}
+{"edge":"PassageOfRevision","from":"p5","to":"r-two"}
+{"edge":"PassageOfRevision","from":"p6","to":"r-two"}
+
+--- query
+set engine = v2;
+query cross_binding_filter_stays_below_traversal() {
+    match {
+        $m: Matter
+        $p: Passage
+        $p.text contains $m.number
+        $p passageOfRevision $r
+        $r: SourceRevision
+        $r.matter_number != $m.number
+    }
+    return { $r.matter_number, $m.number as cited, count($p) as n }
+    order { $r.matter_number asc }
+    limit 30
+}
+
+--- expect unordered
+{"r.matter_number":"3003","cited":"1001","n":1}
+{"r.matter_number":"4004","cited":"2002","n":2}
+
+--- expect shape
+r.matter_number: String
+cited: String?
+n: I64
+
+--- expect plan
+filter reads [m.number, p.text]
+filter reads [m.number, r.matter_number]
+scan Matter as $m: no filter
+scan Passage as $p: no filter
+pass predicate_pushdown
+contains join $p.text contains $m.number
+scan Passage as $p: runtime filter text
+pass join_algorithm
+
+--- query
+set engine = v2;
+query passage_reached_by_the_traversal() {
+    match {
+        $m: Matter
+        $r: SourceRevision
+        $p passageOfRevision $r
+        $p.text contains $m.number
+        $r.matter_number != $m.number
+    }
+    return { $r.matter_number, $m.number as cited, count($p) as n }
+    order { $r.matter_number asc }
+    limit 30
+}
+
+--- expect unordered
+{"r.matter_number":"3003","cited":"1001","n":1}
+{"r.matter_number":"4004","cited":"2002","n":2}
+
+--- expect shape
+r.matter_number: String
+cited: String?
+n: I64
+
+--- expect plan
+scan Passage as $p: no runtime filter
+not pass join_algorithm

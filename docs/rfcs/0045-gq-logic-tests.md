@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - azimafroozeh
 created: 2026-08-29
-updated: 2026-09-18
+updated: 2026-09-26
 discussion: https://github.com/ModernRelay/omnigraph/pull/584
 supersedes: []
 superseded_by: []
@@ -26,8 +26,9 @@ is their default home: regressions for merged bug fixes, and feature
 cases (cases with no issue anchor) for new or existing behavior alike. A
 ***logic test case*** is a single self-contained file (extension `.gqt`)
 holding a `.pg` schema, seed rows as JSONL, and one or more ***steps***:
-a read query or a mutation, each with its params and its expected outcome
-(rows, affected counts, or an error message); a case may also restart the
+a read query, a mutation or a CLI invocation, each with its params and its
+expected outcome (rows, affected counts, an error message, or an exit code);
+a case may also restart the
 store between steps and repeat a step group over a value list. A
 dedicated workspace crate, `omnigraph-gqt` (`publish = false`, outside
 `default-members`, and outside the explicit `-p` list `release.yml`
@@ -52,13 +53,13 @@ the repo, and the harness calls only public engine surfaces.
 
 This amendment makes ***agent experience (AX)***, an agent's ability to
 construct, execute, diagnose, and reproduce a case without guessing,
-the format's design priority. Cases state the execution target, storage,
-and fault conditions that matter to a failure. Concision removes repetition, not
+the format's design priority. Cases state the storage, where every step
+goes (Execution routes, below), and the fault conditions that matter to a failure. Concision removes repetition, not
 required evidence. Convenience for a human author does not justify hidden
 configuration, automatic repair, or a weaker assertion.
 
 The proposed environment and fault contract is specified in Design.
-It extends the existing format; its target combinations are not a claim
+It extends the existing format; its route and storage combinations are not a claim
 of implemented support. GQ declarations, schemas, and result comparison
 retain their existing owners.
 
@@ -98,8 +99,8 @@ and explicit execution evidence address these ambiguities.
 ## User and operational behavior
 
 For the proposed environment extension, author one set of steps and
-expectations, list exact target/storage combinations before the schema,
-and place a fault immediately before its target operation. The harness
+expectations, list the exact storage backends before the schema, name each
+step's path in its header (Execution routes, below), and place a fault immediately before its target operation. The harness
 validates all selected combinations first. An unsupported combination is
 a named failure, never a skipped assertion or a fallback environment.
 
@@ -111,10 +112,11 @@ a named failure, never a skipped assertion or a fallback environment.
 | Match injected text without firing the hook | Require correlated typed delivery evidence. |
 | Run one environment and claim full coverage | Report the exact selection and omitted executions. |
 | Hide a failed write with retry or reopen | Execute only authored operations; no harness recovery. |
+| Omit `via` on a step header | Refuse with the grammar; no default API (Execution routes, below). |
 
 | Supported author route | Accepted behavior |
 |---|---|
-| Existing engine/filesystem case | Add its explicit engine/filesystem environment before execution. |
+| Existing engine/filesystem case | Add its explicit `local-filesystem` environment and `via engine` to every query and mutate header except settings and show steps before execution. |
 | Explicit environment list | Fresh graph and shared assertions for each supported entry. |
 | Fault before one operation | Injection, delivery verification, and cleanup at that operation. |
 | Exact environment/seed rerun | Declared subset only, with complete reproduction context. |
@@ -145,7 +147,7 @@ target prints one line per case with its elapsed time
 (`ok issue_563_aggregate_uncapped 0.12s` /
 `FAIL issue_563_underfill_retry 0.09s`) and fails at the end with the list of
 failing cases and, per failure, the failing step named by ordinal and kind
-(`step 3 (mutate)`), the iteration binding when the step sits in a loop
+(`step 3 (query via http)`), the iteration binding when the step sits in a loop
 (`$who=carol`), and the expected-versus-actual row diff, count mismatch,
 or error mismatch. Each execution stops at its first failing step (later
 steps would use state the failed step no longer vouches for); explicit
@@ -352,8 +354,7 @@ issue. The regression shape, one read step:
 --- runner
 timeout_ms: 10000
 environments:
-  - target: omnigraph-engine
-    storage: local-filesystem
+  - storage: local-filesystem
 
 --- schema
 node Chunk {
@@ -365,7 +366,7 @@ node Chunk {
 {"type":"Chunk","data":{"slug":"chunk-00","text":"needle needle filler"}}
 {"type":"Chunk","data":{"slug":"chunk-01","text":"needle filler"}}
 
---- query
+--- query via engine
 query recall_count($q: String) {
     match {
         $c: Chunk
@@ -393,8 +394,7 @@ A multi-step feature case, showing mutation steps, a restart, and a loop:
 --- runner
 timeout_ms: 10000
 environments:
-  - target: omnigraph-engine
-    storage: local-filesystem
+  - storage: local-filesystem
 
 --- schema
 node Person {
@@ -407,7 +407,7 @@ node Person {
 
 --- foreach $who bob carol
 
---- mutate
+--- mutate via engine
 query insert_person($name: String) {
     insert Person { name: $name, age: 40 }
 }
@@ -421,7 +421,7 @@ query insert_person($name: String) {
 
 --- restart
 
---- query
+--- query via engine
 query all_names() {
     match { $p: Person }
     return { $p.name }
@@ -459,18 +459,19 @@ spelling (no sign, no leading zeros) or `none`; any other spelling is
 refused. `# traversal:` takes `indexed` or `csr` and pins every
 declaration step to that mode, for cases whose subject is one traversal
 path (Execution semantics owns the default); a statement step traverses
-nothing and runs outside the pin.
+nothing and runs outside the pin. `# traversal:` in a file that names a
+server API (Execution routes, below) is refused: the pin is a task-local seam of the runner process.
 
 A file is: required `--- runner` (Explicit execution environments),
 then `--- schema`, then
 `--- seed`, then one or more steps, of
-which at least one is a query or mutate step; a file missing any of these
-three leading sections, ordering them differently, or carrying no query or
-mutate step (nothing would be asserted, a restart-only step list
+which at least one is a query, mutate or cli step; a file missing any of these
+three leading sections, ordering them differently, or carrying no query,
+mutate or cli step (nothing would be asserted, a restart-only step list
 included) is refused. A `--- seam` may precede an operation as specified
 in Seams at an explicit step. A step is one of:
 
-- `--- query` holding exactly one GQ declaration with a read body, followed
+- `--- query via <api>[, <api>]` (the APIs of Execution routes, below) holding exactly one GQ declaration with a read body, followed
   by an optional `--- params` section (JSON object) and a mandatory
   `--- expect` section with mode word `unordered`, `ordered`, or
   `error: <substring>`, where the substring is the trimmed remainder of the
@@ -533,8 +534,9 @@ in Seams at an explicit step. A step is one of:
   scan, or its access path differs.
   Every list is a set. A plan section anywhere but directly
   after a shape section, an empty one, or a line outside the nine forms is
-  refused with the forms spelled out.
-- `--- mutate` holding exactly one GQ declaration with a mutation body,
+  refused with the forms spelled out. A plan section on a step that names
+  any API (Execution routes, below) but `engine` is refused.
+- `--- mutate via <api>` (one API of Execution routes, below) holding exactly one GQ declaration with a mutation body,
   followed by an optional `--- params` and a mandatory `--- expect` with
   mode word `ok` (success, counts unasserted),
   `affected: nodes=<N> edges=<M>` (success with both counts asserted; both
@@ -543,8 +545,35 @@ in Seams at an explicit step. A step is one of:
   there is no row expect on a mutate step.
 - `--- restart`, body empty: drop the store handle and reopen it from the
   same URI before the next step.
+- A settings step (a `--- mutate` whose body is a `set ...;` statement) and a
+  show step (a `--- query` whose body is `show ...;`) take no `via`: their
+  headers stay bare, a `via` on them is refused with the grammar, they
+  contribute nothing to route derivation, and a setting applies to every
+  later step whatever its API (Execution routes, below).
+- `--- cli`, body: the arguments of one `omnigraph` invocation against the
+  case's server, whitespace-separated, single quotes around an argument that
+  carries spaces. The body is one line; no escape exists for a literal single
+  quote, so an argument needing one stays a Rust test. The runner supplies the
+  executable, appends `--server <URL>` and `--graph <ID>` and sets the bearer
+  token in the child's environment; a body carrying `--server`, `--graph`,
+  `--store`, `--cluster`, `--profile`, `--uri`, `--as-actor` or any credential
+  is refused. It takes no header argument and is followed, in this order and
+  each at most once, by a mandatory `--- expect exit: <N>` (`<N>` a decimal 0
+  to 255; a process ended by a signal fails the step naming the signal) and
+  optionally by `--- expect stderr: <substring>` (trimmed remainder, empty
+  body) and, when the body carries `--json` and its subcommand is `mutate` or
+  `branch create`, `branch delete` or `branch merge`, by one mutate expect
+  applied to the receipt on stdout; that expect without `--json` in the body
+  is refused. `outcome:` reads the receipt's `outcome` field. `--- cli` is
+  admitted only under the `omnigraph-server` route.
 
-`--- query` and `--- mutate` take one optional argument, `branch: <name>`
+`--- query` and `--- mutate` take a mandatory first argument, `via <api>[, <api>]` (Execution routes, below),
+except a settings or show step, whose header stays bare (the bullet above):
+the word `via`, then one or more API names (Execution routes, below)
+separated by commas with optional spaces, each name once, the list ending at
+`branch:` or the end of the line; several only on `--- query`. `via` has no default; a
+header without it is refused with the grammar. They take one optional second
+argument, `branch: <name>`
 (a word, a colon, the trimmed remainder, the shape of `error:
 <substring>`), the branch a declaration step runs against; absent, `main`.
 The name is taken verbatim and unquoted, so a `/` needs no quoting there
@@ -565,7 +594,8 @@ the statement's two words. `branch create` and `branch delete` take `ok` or
 `fast_forward`, `merged`, asserting the engine's merge outcome. `ok` on a
 `branch merge` is satisfied by a no-op merge too (`already_up_to_date` is a
 success), so `outcome:` is what pins a landing; `outcome:`
-on any other step is refused, and so is `affected:` on a control write (no
+on any other step is refused, the receipt expect of a `--- cli` merge
+excepted, and so is `affected:` on a control write (no
 counts exist). `branch list` is a rows step: it takes `unordered`,
 `ordered`, or `error: <substring>` over rows `{"name": "…"}`, its rows are
 sorted by `name` in byte order (a total order, so `ordered` is accepted and
@@ -610,7 +640,7 @@ query through its params. Header-line expectations (`error:` substrings,
 mention the iteration value. Loop variables are `$[a-z][a-z0-9_]*`; loops
 may not nest and may not enclose `--- schema` or `--- seed`. The
 substitution marker is fenced fail-closed: `${` appearing anywhere
-outside a params or expect body (a query or mutate body, a seed row, a
+outside a params or expect body (a query, mutate or cli body, a seed row, a
 header line), loop or no loop, is refused, and inside a params or expect
 body every `${...}` must name the enclosing loop's variable (no enclosing
 loop, or any other name, is refused); no escape syntax exists for a
@@ -643,31 +673,33 @@ files decay back into directories.
 
 ### Explicit execution environments
 
-A ***test environment*** is one execution target, storage backend, and
-configuration for a complete case. Exactly one required `--- runner` YAML
-section before `--- schema` declares the environments. Every case, including
-an existing fault-free engine case, carries it. The following syntax specifies
-the amendment contract; the examples do not establish implementation
-qualification.
+A ***test environment*** is one storage backend and configuration for a
+complete case. Exactly one required `--- runner` YAML section before
+`--- schema` declares the environments. Every case, including an existing
+fault-free engine case, carries it. Where a step goes is not part of the
+environment: every step header names its own path, and each environment's
+execution route is derived from those names and its `seeds` (Execution routes, below).
+The following syntax specifies the amendment contract; the examples do not
+establish implementation qualification.
 
 ```yaml
 --- runner
 timeout_ms: 10000
 environments:
-  - target: omnigraph-engine
-    storage: local-filesystem
-  - target: omnigraph-engine-dst
-    storage: in-memory-object-store
+  - storage: local-filesystem
+  - storage: in-memory-object-store
     seeds: [0, 42]
 ```
 
-`timeout_ms` and `environments` are required in every case.
-An environment requires `target` and `storage`, plus the parameters required
-by that target. Its full parameter set defines the environment; there is no
+`timeout_ms` and `environments` are required in every case; `expect_refusal:
+<capability>` (Validation and agent diagnostics) is the one optional key.
+An environment requires `storage`, plus the parameters required by that
+storage and `seeds` when the case runs under the simulated environment. Its
+full parameter set defines the environment; there is no
 separate environment ID. Exact duplicate entries are refused. There is no
 runner format version: the parser and corpus migrate together, and replay
 requires the recorded source and executable identities. Omitted configuration
-has no default execution route. There are 1 to 16 environments, executed in
+has no default; nothing is derived from the host. There are 1 to 16 environments, executed in
 listed order. The file budget is 1 to 600000 milliseconds of wall time,
 starting before case reading and preflight. It measures profile resolution,
 setup, every environment, both executions of every DST seed, and ordinary
@@ -687,22 +719,61 @@ Each environment starts from a fresh isolated graph, applies the schema
 and seed, performs the existing index setup, then executes the complete
 step list. Branch targets, parameters, rows, result shapes, affected
 counts, and expected errors have one definition shared by all environments.
-Each environment is checked against the file's expectations. Cross-target
+Each environment is checked against the file's expectations. Cross-route
 identity of generated IDs, timestamps, or internal operation order is not
-asserted. A target-specific expected result belongs in a separate case.
-Target and storage selection cannot change inside a case execution.
+asserted. A route-specific expected result belongs in a separate case.
+Storage and seeds cannot change inside a case execution; the API (defined below) is a
+property of each step.
 
-| Target | Execution |
+#### Execution routes
+
+Every `--- query` and `--- mutate` step other than a settings or show step names the ***API*** it goes through,
+the path from the case file to the engine and back:
+
+| API | Where the step goes |
 |---|---|
-| `omnigraph-engine` | Direct calls to `Omnigraph`. |
-| `omnigraph-engine-dst` | Direct engine execution under the seeded DST environment. |
-| `omnigraph-server` | Requests through the server's HTTP API. |
-| `omnigraph-server-dst` | Requests through the server's HTTP API with server tasks and its embedded engine under a qualified seeded DST environment. |
+| `engine` | Direct `Omnigraph` calls in the runner process. |
+| `http` | The server's HTTP API through the runner's HTTP client. |
+| `mcp` | The server's MCP surface at `/mcp` (`crates/omnigraph-server/src/mcp.rs`, streamable HTTP, mounted only when an OIDC resource is configured). Its shipped tools invoke stored reads only, so `via mcp` is refused before fixture effects as `unsupported_capability: mcp` until a tool that executes an authored GQ read exists ([RFC 0003](0003-mcp-server-surface.md) or its amendment); `via mcp` is admitted on `--- query` only. |
 
-`target` is the only execution selector. There is no separate `runtime` or
-DST-mode field. The server embeds `Omnigraph`; these names do not assert an
-independent server-to-engine network connection. Server-DST requires its own
-execution qualification; engine-DST qualification alone cannot establish it.
+The CLI is a fourth path, spelled as its own step kind, `--- cli`, because
+its result is an exit code and two streams rather than rows. For route
+derivation a `--- cli` step counts as naming the API `cli`; `via cli` is
+refused with the three API names. The ***execution route*** of each
+environment entry is derived from the set of APIs the file's steps name and
+from that entry's `seeds`; the file declares no route, and a file may carry
+environments with different routes.
+
+| APIs named in the file | `seeds` | Route |
+|---|---|---|
+| `engine` only | absent | `omnigraph-engine`: the engine embedded in the runner process, no server. |
+| any of `http`, `mcp`, `cli` | absent | `omnigraph-server`: a runner-owned local server process for `local-filesystem`; for external backends the connection profile (defined below) defines the server lifecycle. |
+| `engine` only | present | `omnigraph-engine-dst`: direct engine execution under the seeded DST environment. |
+| `http` or `mcp`, without `cli` | present | `omnigraph-server-dst`: the server's HTTP API with server tasks and its embedded engine under a qualified seeded DST environment. |
+| `cli` | present | `invalid_case`: a process cannot run inside the simulated environment. |
+
+Settings and show steps name no API and do not enter this derivation; a
+setting applies to every later step whatever its API.
+
+`--- query via engine` in a file that also names a server API is a ***physical read***:
+a read-only open of the owned root, admitted only after a sequential
+lifecycle step has contained the serving process and refused before it at
+preflight, by step order: a `via engine` step must follow a kill or shutdown
+step with no restart step between them; the refusal is `invalid_case` naming
+both steps (Sequential server lifecycle steps). `--- mutate via engine` in
+such a file is refused as `invalid_case`. A `--- query` may name several
+server APIs (`engine` never joins a list; the form becomes usable once a
+second server API is admitted);
+the step then executes once per API in listed order and every execution is
+compared against the same expect and shape sections, so one step asserts that
+the APIs agree. A `--- mutate` names exactly one API, `engine` or `http`.
+
+`via` and `seeds` are the only route selectors. There is no `target`,
+`runtime` or DST-mode field. The server embeds `Omnigraph`; the route names
+do not assert an independent server-to-engine network connection. The report,
+the evidence record and the rerun command name the derived route. Server-DST
+requires its own execution qualification; engine-DST qualification alone
+cannot establish it.
 
 | Storage | Meaning |
 |---|---|
@@ -718,7 +789,7 @@ the environment must connect Lance dataset I/O to the corresponding
 isolated storage too. The storage name does not certify a provider's
 compatibility or change its existing qualification status.
 
-| Target roadmap | Local filesystem | In-memory object store | S3-compatible | Azure Blob |
+| Route roadmap | Local filesystem | In-memory object store | S3-compatible | Azure Blob |
 |---|---|---|---|---|
 | `omnigraph-engine` | Intended | Intended | Intended | Intended |
 | `omnigraph-engine-dst` | Refused | Intended | Refused | Refused |
@@ -729,42 +800,45 @@ compatibility or change its existing qualification status.
 implemented or qualified. Initial implementation admission is limited to
 `omnigraph-engine` with `local-filesystem` and no seam directives, and
 `omnigraph-engine-dst` with `in-memory-object-store`. Every other combination
-must report `unsupported_environment` before case setup. Further targets,
+must report `unsupported_environment` before case setup. Further routes,
 storage combinations and controls require their own acceptance evidence.
 A requested combination unavailable in the running build
 fails before case setup. There is no automatic substitution or skip.
 
-S3, Azure, and every server environment additionally require `profile`.
-A ***connection profile*** supplies connection details and test lifecycle
-control outside the case. It cannot override target, storage, seeds,
-faults, assertions, or the file budget. The file carries the profile name;
-the report carries its resolved non-secret configuration and digest.
-Credentials stay outside the case and report. Profiles distinguish actual
-services, including different S3-compatible providers and Azure emulators.
-They record effective storage options, including request retry settings.
-Changing a provider or these options changes the recorded environment.
+The `omnigraph-server` route on `local-filesystem` requires no
+connection profile (defined below).
+It cannot select an ambient server, because the environment entry refuses
+unknown fields (`deny_unknown_fields`) and the worker starts from a cleared
+environment (`env_clear()`). GQT owns fresh graph state, cluster
+configuration, required local credentials, launch and cleanup. For the local
+server route the worker generates the bearer token from its own entropy, writes it
+to a worker-owned file passed as `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE`, and
+the report records no credential; the token appears in neither input
+nor report. The server is cluster-only: provisioning follows the cluster-boot
+lifecycle of the CLI/server process support (`converged_loaded_cluster` and
+`spawn_server_with_cluster` in `crates/omnigraph-cli/tests/support/mod.rs`),
+not a graph-creation HTTP endpoint. The proposed architecture and
+qualification are in [Self-contained server testing with GQT and DST](2026-09-26-self-contained-server-testing.md).
+Naming this combination does not change its current admission status.
 
-For example, a future HTTP environment can declare:
+S3 and Azure environments will require a ***connection profile*** once one is
+specified; today no `profile` key is parsed and one is refused as an unknown
+field. A connection profile supplies connection details and lifecycle control
+outside the case. A profile cannot override the route, storage, seeds, a step's API, faults, assertions or
+the file budget. The report records resolved non-secret configuration and its
+digest; credentials remain excluded. Provider identity and effective retry
+options distinguish environments. Such profiles and external-service testing
+are not introduced by the local-server extension.
 
-```yaml
-  - target: omnigraph-server
-    storage: s3-compatible
-    profile: gqt-server-s3
-```
-
-The profile must verify the server's actual backend and provide an
-exclusively owned graph with fresh schema and seed state. The server is
-cluster-only; graph provisioning follows cluster configuration and
-lifecycle controls, not an invented graph-creation HTTP endpoint. Reuse
-the server test support's lifecycle owner. A URL and credentials alone
-cannot satisfy this contract. A profile that cannot prove isolation,
-required result types, or a requested test control is refused.
+A selected environment must prove exclusive state, actual backend, required
+result types and requested controls. A URL and credentials alone cannot
+satisfy that contract. Unsupported combinations fail without substitution.
 
 #### Seeds and reproducibility
 
-`seeds` is required for `omnigraph-engine-dst` and `omnigraph-server-dst`:
-1 to 64 distinct unsigned 64-bit integers. Other targets reject it.
-Declaring seeds does not make an unsupported target admissible. Each seed
+`seeds` selects the two simulated routes, `omnigraph-engine-dst` and
+`omnigraph-server-dst`: 1 to 64 distinct unsigned 64-bit integers.
+Declaring seeds does not make an unsupported route admissible. Each seed
 executes twice in
 fresh child processes, with seeded scheduling, engine IDs, engine time,
 and in-memory storage setup. Process-global initialization happens after
@@ -798,7 +872,7 @@ recorded. An authored retry is another explicit operation step.
 seed. The environment supplies configuration and resource setup through
 `UniverseEnvironment`; the scenario supplies operations and checks through
 `UniverseScenario`. This entry point is for seeded execution. The ordinary
-engine target retains its ordinary runtime and the same GQT step comparisons.
+engine route retains its ordinary runtime and the same GQT step comparisons.
 
 The caller must establish process isolation, process-start pool and entropy
 settings, failpoint registration, and the invocation wall deadline before
@@ -848,12 +922,12 @@ occurrence: 1
 action: fail
 scope: next_step
 
---- mutate
+--- mutate via engine
 branch merge source into target
 
 --- expect error: injected failpoint triggered: branch_merge.post_fork_pre_commit
 
---- mutate branch: target
+--- mutate via engine branch: target
 query unrelated_write() {
     insert Marker { name: "after_failure" }
 }
@@ -876,7 +950,7 @@ until a case can express two concurrent steps. `occurrence` is 1 to 1000000 and 
 that seam attributable to the selected operation, including its production
 retries. It starts at zero when the operation is armed. The installed
 decision passes the first N-1 crossings, fires on the Nth, and passes every
-later one. Target and storage do not change this meaning.
+later one. Route and storage do not change this meaning.
 
 With `subject`, `occurrence` counts only the crossings whose subject matches
 the glob; without it, every crossing.
@@ -997,10 +1071,34 @@ after publish; on `storage.put` with `subject: __recovery/*`,
 
 `--- restart` continues to mean closing the graph handle and reopening
 the same stored graph. It does not mean process crash or HTTP reconnect.
-In-memory contents must survive that handle reopen. A server environment
-must perform the equivalent graph reopen or refuse the case. Process
-crashes, multi-connection interleavings, and randomized fault discovery
-remain outside this format extension.
+In-memory contents must survive that handle reopen. The `omnigraph-server`
+route refuses `--- restart` as `unsupported_capability: restart` until a
+handle-reopen control is qualified. Process restart
+is a distinct step under the sequential server lifecycle steps below; modeled
+server restart belongs to the Deterministic server execution proposal.
+Multi-connection interleavings and randomized fault discovery remain outside
+this format extension.
+
+### Sequential server lifecycle steps
+
+A server epoch is identified by the server alias and a boot ordinal; restart
+steps create a new epoch and the report records both.
+
+Each Failure cell is a requirement.
+
+| Semantic control | Operands and success evidence | Failure behavior |
+|---|---|---|
+| Request shutdown | Server epoch; admission-close and lifecycle observations | Watchdog/worker timeout cannot count as orderly shutdown |
+| Kill or restart process | Owned server/root identity; server pid reaped and no surviving descendant of it, the worker excluded; fresh boot/readiness evidence | Handle reopen or modeled death cannot satisfy actual process death |
+| Physical read (`--- query via engine` after containment) | Owned root after containment; a read-only open comparing rows/pins against expectation | Refused while a serving process owns the root |
+
+These are sequential steps under the same one-at-a-time rule as every other
+step in a case. Named clients, holds and joins are a separate proposal.
+This amendment spells no lifecycle step; until a later amendment adds their
+`--- <step>` forms no file contains one, and `via engine` in a file naming a
+server API is refused as `unsupported_capability: physical_read`; once they
+exist, the step-order rule of Execution routes applies. A server API step after a kill or shutdown step and
+before a restart step is refused at preflight.
 
 ### Known recovery failures
 
@@ -1078,16 +1176,18 @@ the ordinary requirement that every healthy assertion pass.
 
 ### Validation and agent diagnostics
 
-Parse the complete file, resolve profiles, and check every selected
-environment's capabilities before creating case state. Reject unknown or
+Parse the complete file, resolve required profiles and runner-owned local
+configuration, and check every selected environment's static capabilities
+before fixture effects. Reject unknown or
 duplicate YAML keys, YAML aliases/merge keys/tags, misplaced sections,
 unknown enum values, empty selections, duplicate environment parameters or seeds, and fields
-that do not apply to the chosen target. Do not infer a target from a
+that do not apply to the derived route. Do not infer a route from a
 storage URI or repair a misspelled field during execution.
 
 Preflight must produce one immutable input for the invocation: the exact
 validated case bytes, declared and selected executions, resolved non-secret
-profile settings, and expected engine/runner build identities. Every
+profile settings where required, runner-owned configuration, and expected
+engine/runner/server build identities. Every
 execution consumes that input; workers cannot reopen the original case or
 resolve a profile name again as configuration authority. The runner records
 the input digest. Before setup, each worker verifies that digest and its
@@ -1095,7 +1195,9 @@ actual executable identity against the input. Known identity differences
 fail with `environment_changed`; unknown identities remain explicitly
 unverified and cannot support a verified reproduction or DST replay.
 Server execution additionally revalidates its effective configuration and
-build identity at readiness, before creating case state. Credentials remain
+build identity at readiness, after guarded minimum cluster/graph provisioning
+and before scenario dispatch. Readiness failure is setup failure, not executed
+product coverage. Credentials remain
 external and excluded from the recorded input. This binds tested inputs;
 it does not freeze the external service's internal execution schedule.
 
@@ -1104,6 +1206,12 @@ For example, `--- seam` requires its exact catalog seam, and `--- expect shape`
 requires result type evidence. There is no second hand-maintained
 `requires` list that can disagree with the case. A server cannot substitute
 inferred types for missing executed types or omit an existing comparison.
+A refused control fails preflight with `unsupported_capability` naming the
+control; a case declaring `expect_refusal: <capability>` in `--- runner` passes
+when exactly that refusal occurs and is reported as harness coverage only.
+`unsupported_environment` cannot be declared expected; unadmitted route and
+storage combinations are exercised by the parser self-tests, not by corpus
+cases.
 
 Every result identifies its scope using the following applicability rules.
 The result carries the invocation's case path and content hash when the
@@ -1115,14 +1223,14 @@ profile, step, or seed may stand in for missing evidence.
 | Result scope | Applicable context |
 |---|---|
 | Case/preflight | Source span when locatable; environment parameters only when parsed unambiguously; profile digest only after resolution. No operation ordinal is required for malformed YAML. |
-| Execution/step | Target, storage, full declared parameters, effective settings, profile digest when required, and seed/replay index for DST. Step ordinal, loop iteration, source span, and expected/actual values apply to operation assertions; setup/teardown failures identify their phase instead. |
+| Execution/step | Route, storage, the step's API, full declared parameters, effective settings, profile digest when required, and seed/replay index for DST. Step ordinal, loop iteration, source span, and expected/actual values apply to operation assertions; setup/teardown failures identify their phase instead. |
 | Replay comparison | Environment parameters, seed, both attempt identities, their verdicts, and differing observations when available. A comparison does not invent a single failing step when attempts reached different steps. |
 | Supervisor | The affected execution or invocation, containment outcome, and original failure reference. Operation context is included only when known. |
 | Invocation summary | Final outcome and coverage of every declared execution: selected or unselected, then passed, accepted known failure, failed, or not run with a reason. If parsing cannot establish that inventory, coverage is explicitly unavailable and the invocation fails. |
 
 Within one invocation, full environment parameters and seed/replay index identify an
-execution. Step ordinal and loop iteration identify an observation inside
-it. Reports from different invocations must retain their invocation boundary;
+execution. Step ordinal, loop iteration and, on a step naming several APIs,
+the API identify an observation inside it. Reports from different invocations must retain their invocation boundary;
 case path or digest alone cannot identify a run. A replay compares operation
 identities and values, not run-specific report references.
 
@@ -1138,6 +1246,11 @@ error code alongside the readable explanation. Contract codes include
 `replay_mismatch`, `worker_failed`, `report_failed`, `timeout`, and
 `unexpected_pass`. `known_failure` is a separate accepted status defined
 in Known recovery failures; its raw worker result remains an assertion failure.
+Server execution adds the following codes. `unsupported_capability` reports a
+refused control and names it. The names are `mcp`, `cli`, `restart`,
+`result_types` and `physical_read`. `cleanup_failed` reports an owned namespace whose quiescence could not be
+proved. `containment_failed` reports an owned process that could not be proved
+contained. `unqualified` reports a selected assertion with a qualification gap.
 Every invocation must emit a terminal summary. A missing, malformed,
 incomplete, or unwritable report fails the invocation and cannot yield
 a successful exit. If the structured output cannot be written, the runner
@@ -1146,10 +1259,10 @@ Cleanup failure preserves the original operation failure as well as its
 own outcome; it never replaces the evidence that triggered cleanup.
 
 The runner supplies an exact rerun command plus the required build and
-profile references. The `--target`, `--storage` and `--seed` filters select all
+profile references. The `--route`, `--storage` and `--seed` filters select all
 matching declared executions. Supplied filters combine with AND and only
 narrow the file's declared executions; they cannot change them. A seed filter
-requires a target or storage filter. The report lists
+requires a route or storage filter. The report lists
 selected and unselected executions, and a partial run never claims the
 whole case passed. Zero matching environments or seeds is a refusal.
 Each individual execution stops its step loop at the first failed step.
@@ -1163,7 +1276,18 @@ Every suppressed execution, including a mandatory replay, is reported as
 not run with its terminal cause. Overall success requires every selected
 execution and mandatory replay to pass or satisfy Known recovery failures,
 and a complete terminal report. Accepted known failures remain distinct from
-genuine passes.
+genuine passes. A qualification gap reports the assertion as `not_run` with
+cause `unqualified:<missing capability>`; an invocation with a gap on a
+selected assertion exits unsuccessfully unless `expect_refusal` names that
+capability. The GQT invocation exits 0 exactly when at least one execution was
+selected and every selected execution and mandatory replay passed or is an
+accepted known failure, and the terminal report was written; a refusal, gap,
+cleanup or containment failure exits non-zero, unless the case's
+`expect_refusal` names that capability.
+
+Server-route containment and storage cleanup follow [Self-contained server testing with GQT and DST](2026-09-26-self-contained-server-testing.md)
+§Provisioning, limits and containment; the continuation and
+suppressed-execution rules above apply unchanged.
 
 The report is derived execution evidence, never configuration authority.
 A reproduction compares case, build, effective settings, and non-secret
@@ -1564,13 +1688,16 @@ The explicit runner section is mandatory for all cases. It has no version
 field; parser and corpus changes land together.
 Omitting the section or any required field is `invalid_case`, including for
 previously accepted engine/local-filesystem cases. Migration adds that
-environment explicitly to every existing case; no provider, execution target,
-seed or timeout is discovered from the host or supplied as a format default.
+environment explicitly to every existing case, and every existing
+`--- query` and `--- mutate` header except settings and show steps gains
+`via engine`; no provider, execution route,
+API, seed or timeout is discovered from the host or supplied as a format
+default.
 
 The prototype's `mode: normal` / `mode: dst` runner shape is not an alias
-for this contract. The earlier draft's `runtime` field and `omnigraph-dst`
-value are not aliases either; use `target: omnigraph-engine-dst` for direct
-engine simulation. Migration rewrites every configuration explicitly. In
+for this contract. The earlier drafts' `runtime` and `target` fields and the
+`omnigraph-dst` value are not aliases either; direct engine simulation is
+`seeds` with every query and mutate step except settings and show steps `via engine`. Migration rewrites every configuration explicitly. In
 particular, the prototype's
 fault occurrence count starts during initialization; the proposed count
 starts at the selected operation. Migration must identify that operation
@@ -1616,7 +1743,7 @@ interleaving remains outside GQT and retains its existing DST owner.
 | Inline every endpoint and credential | Self-contained connection data, but secrets and machine-specific addresses prevent portable cases. Profiles own connection data; resolved evidence exposes drift. |
 | Reopen case/profile paths in every worker | Avoids handing workers resolved input, but an edit after preflight can make two workers agree on a different experiment. Preserve validated input and check worker identities. |
 | Arm faults once at file startup | Simpler lifecycle, but setup can consume the occurrence intended for a later merge. Step scope gives the occurrence an explicit owner. |
-| Add a separate capability list or expected file per target | Duplicates facts already present in operations and assertions, creating disagreement paths. Derive requirements and share expectations. |
+| Add a separate capability list or expected file per route, or a declared route or client list beside the steps' `via` | Duplicates facts already present in operations and assertions, creating disagreement paths. Derive requirements and share expectations. |
 
 The nearest in-repo owners are the GQT parser/comparator, DST environment,
 `StorageAdapter`, and server test support. Extend those boundaries rather
@@ -1677,7 +1804,7 @@ support the separation; neither establishes this proposed GQT syntax.
 
 ## Evidence and tests
 
-The amendment requires the following evidence before a target/storage
+The amendment requires the following evidence before a route/storage
 combination is advertised as supported:
 
 | Owner | Required evidence |
@@ -1699,7 +1826,7 @@ The existing merge-refusal cases retain successful-write expectations
 after the injected failure. An explicitly marked exact recovery defect can
 qualify only under Known recovery failures; its accepted status remains
 distinct from a genuine pass. Unmarked or mismatching failures remain
-regression failures. Neither blessing nor target selection can hide them.
+regression failures. Neither blessing nor route selection can hide them.
 
 Lance's [object-store configuration](https://lance.org/guide/object_store/)
 documents backend options outside the query text. GQT must record the
@@ -1816,14 +1943,15 @@ the docs indexes honest, so no new orphan doc file).
 3. Qualify configured S3 and Azure engine execution with provider-specific
    evidence and existing admission rules. CI must supply declared profiles;
    missing configured services fail their selected cases.
-4. Add HTTP execution through the existing server lifecycle owner. Enable
-   `omnigraph-server` cases first; enable reopen and faults only when their
-   separate capability tests pass. Qualify `omnigraph-server-dst` independently,
-   including controlled server tasks and the embedded engine. Neither server
-   target is a prerequisite for the first engine/DST integration.
+4. Add automatically provisioned local HTTP execution through the existing
+   server lifecycle owner, without a connection profile. Enable ordinary
+   sequential comparisons first; qualify reopen and lifecycle controls
+   separately. Prove partial-startup containment, actual transport/process
+   evidence and oracle
+   sensitivity. Neither server route delays the first engine/DST integration.
 
 The RFC's `implementation` remains `partial` while this extension has
-unqualified targets. No stage changes engine recovery behavior or claims
+unqualified route and storage combinations. No stage changes engine recovery behavior or claims
 determinism for real external services.
 
 ## Unresolved questions
@@ -1834,7 +1962,7 @@ decisions. Two implementation proposals remain, with explicit owners:
 | Proposal | Decision owner | Required event |
 |---|---|---|
 | CLI and diagnostic wire schema | GQT maintainer | Accept the proposal and pass phase 1's selection, applicability, coverage, and report-failure tests before enabling the interface. |
-| HTTP profile and test-control protocol | Server lifecycle maintainer, with GQT maintainer acceptance of the execution contract | Accept the proposal and qualify backend identity, exclusive graphs, result typing, and each requested control before enabling phase 4 capabilities. |
+| Runner-owned server execution and sequential lifecycle steps | Server lifecycle maintainer and GQT maintainer | Accept the format and qualify backend/build identity, exclusive graphs, result typing, the sequential lifecycle steps and their negative tests before enabling phase 4 capabilities. The local route requires no profile. |
 
 These roles own the decisions, not an assertion that a particular maintainer
 has already approved them. Neither proposal may weaken the specified
@@ -2319,3 +2447,13 @@ historical command and configuration descriptions are not migration aliases.
   reporting context, CI above)". The claim that a test-attributed `issue_N`
   function inside the three named crates runs in a required context stands;
   it now also holds for every other workspace crate through `Test Workspace`.
+
+- 2026-09-26: The `omnigraph-server` route on `local-filesystem` needs no
+  connection profile; the runner owns the server, with sequential lifecycle
+  steps. A step names where it goes with `via`, the CLI is the `--- cli`
+  step, the route is derived from the file's APIs and `seeds`, and the
+  `target` field is gone. Superseded: every sentence about the `target`
+  field and the connection-profile requirement for the local server; the
+  sentences on step kinds, step identity, migration and server `--- restart`
+  are reworded for `via` and `--- cli`. Per
+  [Self-contained server testing with GQT and DST](2026-09-26-self-contained-server-testing.md).

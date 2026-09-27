@@ -759,13 +759,18 @@ async fn rrf_order_runs_a_cross_join_over_multiple_probe_batches() {
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
-    for required in ["CrossJoinExec", "FilterExec"] {
-        assert!(
-            (0..batch.num_rows())
-                .any(|row| trees.value(row) == "datafusion" && nodes.value(row) == required),
-            "RRF batch-order fixture no longer exercises {required}"
-        );
-    }
+    let details = batch
+        .column_by_name("detail")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(
+        (0..batch.num_rows()).any(|row| trees.value(row) == "datafusion"
+            && nodes.value(row) == "CrossJoinExec"
+            && details.value(row).contains("$d.n = $p.n")),
+        "RRF batch-order fixture no longer exercises a CrossJoinExec filtering its pairs"
+    );
     let probes = omnigraph::instrumentation::QueryMemoryProbes::default();
     omnigraph::instrumentation::with_query_memory_probes(
         probes.clone(),
@@ -789,6 +794,11 @@ async fn rrf_order_runs_a_cross_join_over_multiple_probe_batches() {
                 .get("input_batches")
                 .is_some_and(|batches| *batches >= 2),
             "the actual right input must cross a batch boundary: {join:?}"
+        );
+        assert_eq!(
+            join.values.get("output_batches"),
+            Some(&1),
+            "the surviving pairs of both right batches stay below the batch size and leave in one batch at `finish`, not one per left row: {join:?}"
         );
     }
 }

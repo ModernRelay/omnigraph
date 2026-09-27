@@ -238,6 +238,11 @@ impl ScanTuning<'_> {
         self
     }
 
+    pub(crate) fn batch_readahead(&mut self, batches: usize) -> &mut Self {
+        self.scanner.batch_readahead(batches);
+        self
+    }
+
     pub(crate) fn prefilter(&mut self, should_prefilter: bool) -> &mut Self {
         self.scanner.prefilter(should_prefilter);
         self

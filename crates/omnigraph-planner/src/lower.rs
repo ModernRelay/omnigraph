@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
+use omnigraph_compiler::query::ast::CompOp;
 use omnigraph_compiler::types::Direction;
 
 use crate::cost::{AccessPath, ExpandMode, ExpandPolicy};
@@ -50,6 +51,30 @@ pub struct HashJoinFields<'p> {
     pub binding: &'p str,
     pub fallback: Option<AccessPath>,
     pub spec: &'p ScanSpec,
+}
+
+/// The fields of [`PhysicalNode::ContainsJoin`] beside its inputs.
+#[derive(Debug, Clone, Copy)]
+pub struct ContainsJoinFields<'p> {
+    pub haystack: (&'p str, &'p str),
+    pub needle: (&'p str, &'p str),
+    pub residual: &'p [IRExpr],
+}
+
+impl ContainsJoinFields<'_> {
+    /// The `$h.x contains $n.y` conjunct `haystack` and `needle` stand for,
+    /// as the `Filter` over the `CrossJoin` wrote it.
+    pub fn conjunct(&self) -> IRExpr {
+        let access = |(variable, property): (&str, &str)| IRExpr::PropAccess {
+            variable: variable.to_string(),
+            property: property.to_string(),
+        };
+        IRExpr::comparison(
+            access(self.haystack),
+            CompOp::StringContains,
+            access(self.needle),
+        )
+    }
 }
 
 /// One method per [`PhysicalNode`] variant, called by [`PhysicalPlan::lower`]
@@ -120,6 +145,17 @@ pub trait Lower {
     fn cross_join(
         &mut self,
         id: NodeId,
+        filters: &[IRExpr],
+        left: Self::Op,
+        right: Self::Op,
+    ) -> Result<Self::Op, Self::Error>;
+
+    /// Called with the collected side (`left`) and the scan it filters
+    /// (`right`) lowered.
+    fn contains_join(
+        &mut self,
+        id: NodeId,
+        fields: ContainsJoinFields<'_>,
         left: Self::Op,
         right: Self::Op,
     ) -> Result<Self::Op, Self::Error>;
@@ -348,10 +384,30 @@ impl PhysicalPlan {
                 let input = self.lower_node(*input, l)?;
                 l.page(id, *rows, *bytes, resume.as_deref(), input)
             }
-            PhysicalNode::CrossJoin { left, right } => {
+            PhysicalNode::CrossJoin {
+                left,
+                right,
+                filters,
+            } => {
                 let left = self.lower_node(*left, l)?;
                 let right = self.lower_node(*right, l)?;
-                l.cross_join(id, left, right)
+                l.cross_join(id, filters, left, right)
+            }
+            PhysicalNode::ContainsJoin {
+                left,
+                right,
+                haystack,
+                needle,
+                residual,
+            } => {
+                let left = self.lower_node(*left, l)?;
+                let right = self.lower_node(*right, l)?;
+                let fields = ContainsJoinFields {
+                    haystack: (&haystack.0, &haystack.1),
+                    needle: (&needle.0, &needle.1),
+                    residual,
+                };
+                l.contains_join(id, fields, left, right)
             }
             PhysicalNode::Filter { input, filters } => {
                 let input = self.lower_node(*input, l)?;

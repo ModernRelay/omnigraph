@@ -1,0 +1,230 @@
+# issue: none
+# notes: Contains pairs preserve overlapping, duplicate, repeated, Unicode, empty and null needle semantics.
+# notes: Residual filters apply to found pairs; a collected haystack or an `or` uses a plain filtered cross join with the same rows.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Matter {
+    mid: String @key
+    number: String?
+}
+node Passage {
+    pid: String @key
+    text: String?
+}
+
+--- seed
+{"type":"Matter","data":{"mid":"m-10","number":"10"}}
+{"type":"Matter","data":{"mid":"m-16","number":"16"}}
+{"type":"Matter","data":{"mid":"m-1016","number":"1016"}}
+{"type":"Matter","data":{"mid":"m-1016-again","number":"1016"}}
+{"type":"Matter","data":{"mid":"m-016","number":"016-0"}}
+{"type":"Matter","data":{"mid":"m-alpha","number":"alpha"}}
+{"type":"Matter","data":{"mid":"m-beta","number":"beta"}}
+{"type":"Matter","data":{"mid":"m-echo","number":"echo"}}
+{"type":"Matter","data":{"mid":"m-e-acute","number":"é"}}
+{"type":"Matter","data":{"mid":"m-nihon","number":"日本"}}
+{"type":"Matter","data":{"mid":"m-empty","number":""}}
+{"type":"Matter","data":{"mid":"m-null"}}
+{"type":"Passage","data":{"pid":"p-overlap","text":"x1016-00009y"}}
+{"type":"Passage","data":{"pid":"p-two","text":"alpha and beta"}}
+{"type":"Passage","data":{"pid":"p-twice","text":"echo, echo"}}
+{"type":"Passage","data":{"pid":"p-again","text":"echo 16 è"}}
+{"type":"Passage","data":{"pid":"p-multibyte","text":"café 日本語の文"}}
+{"type":"Passage","data":{"pid":"p-none","text":"nothing here"}}
+{"type":"Passage","data":{"pid":"p-empty","text":""}}
+{"type":"Passage","data":{"pid":"p-null"}}
+
+--- query
+set engine = v2;
+query found_numbers() {
+    match {
+        $m: Matter
+        $p: Passage
+        $p.text contains $m.number
+        $m.mid != "m-empty"
+    }
+    return { $m.mid, $p.pid }
+}
+
+--- expect unordered
+{"m.mid":"m-10","p.pid":"p-overlap"}
+{"m.mid":"m-16","p.pid":"p-overlap"}
+{"m.mid":"m-1016","p.pid":"p-overlap"}
+{"m.mid":"m-1016-again","p.pid":"p-overlap"}
+{"m.mid":"m-016","p.pid":"p-overlap"}
+{"m.mid":"m-alpha","p.pid":"p-two"}
+{"m.mid":"m-beta","p.pid":"p-two"}
+{"m.mid":"m-echo","p.pid":"p-twice"}
+{"m.mid":"m-echo","p.pid":"p-again"}
+{"m.mid":"m-16","p.pid":"p-again"}
+{"m.mid":"m-e-acute","p.pid":"p-multibyte"}
+{"m.mid":"m-nihon","p.pid":"p-multibyte"}
+
+--- expect shape
+m.mid: String
+p.pid: String
+
+--- expect plan
+contains join $p.text contains $m.number
+scan Passage as $p: runtime filter text
+scan Matter as $m: no runtime filter
+pass join_algorithm
+
+--- query
+set engine = v2;
+query found_numbers_and_the_empty_one() {
+    match {
+        $m: Matter
+        $p: Passage
+        $p.text contains $m.number
+    }
+    return { $m.mid, $p.pid }
+}
+
+--- expect unordered
+{"m.mid":"m-10","p.pid":"p-overlap"}
+{"m.mid":"m-16","p.pid":"p-overlap"}
+{"m.mid":"m-1016","p.pid":"p-overlap"}
+{"m.mid":"m-1016-again","p.pid":"p-overlap"}
+{"m.mid":"m-016","p.pid":"p-overlap"}
+{"m.mid":"m-alpha","p.pid":"p-two"}
+{"m.mid":"m-beta","p.pid":"p-two"}
+{"m.mid":"m-echo","p.pid":"p-twice"}
+{"m.mid":"m-echo","p.pid":"p-again"}
+{"m.mid":"m-16","p.pid":"p-again"}
+{"m.mid":"m-e-acute","p.pid":"p-multibyte"}
+{"m.mid":"m-nihon","p.pid":"p-multibyte"}
+{"m.mid":"m-empty","p.pid":"p-overlap"}
+{"m.mid":"m-empty","p.pid":"p-two"}
+{"m.mid":"m-empty","p.pid":"p-twice"}
+{"m.mid":"m-empty","p.pid":"p-again"}
+{"m.mid":"m-empty","p.pid":"p-multibyte"}
+{"m.mid":"m-empty","p.pid":"p-none"}
+{"m.mid":"m-empty","p.pid":"p-empty"}
+
+--- expect shape
+m.mid: String
+p.pid: String
+
+--- query
+set engine = v2;
+query found_numbers_by_every_pair() {
+    match {
+        $m: Matter
+        $p: Passage
+        ($p.text contains $m.number) or false
+    }
+    return { $m.mid, $p.pid }
+}
+
+--- expect unordered
+{"m.mid":"m-10","p.pid":"p-overlap"}
+{"m.mid":"m-16","p.pid":"p-overlap"}
+{"m.mid":"m-1016","p.pid":"p-overlap"}
+{"m.mid":"m-1016-again","p.pid":"p-overlap"}
+{"m.mid":"m-016","p.pid":"p-overlap"}
+{"m.mid":"m-alpha","p.pid":"p-two"}
+{"m.mid":"m-beta","p.pid":"p-two"}
+{"m.mid":"m-echo","p.pid":"p-twice"}
+{"m.mid":"m-echo","p.pid":"p-again"}
+{"m.mid":"m-16","p.pid":"p-again"}
+{"m.mid":"m-e-acute","p.pid":"p-multibyte"}
+{"m.mid":"m-nihon","p.pid":"p-multibyte"}
+{"m.mid":"m-empty","p.pid":"p-overlap"}
+{"m.mid":"m-empty","p.pid":"p-two"}
+{"m.mid":"m-empty","p.pid":"p-twice"}
+{"m.mid":"m-empty","p.pid":"p-again"}
+{"m.mid":"m-empty","p.pid":"p-multibyte"}
+{"m.mid":"m-empty","p.pid":"p-none"}
+{"m.mid":"m-empty","p.pid":"p-empty"}
+
+--- expect shape
+m.mid: String
+p.pid: String
+
+--- expect plan
+scan Passage as $p: no runtime filter
+scan Matter as $m: no runtime filter
+not pass join_algorithm
+
+--- query
+set engine = v2;
+query found_numbers_under_a_second_filter() {
+    match {
+        $m: Matter
+        $p: Passage
+        $p.text contains $m.number
+        $m.number != $p.text and ($m.mid != "m-16" or $p.pid != "p-overlap")
+    }
+    return { $m.mid, $p.pid }
+}
+
+--- expect unordered
+{"m.mid":"m-10","p.pid":"p-overlap"}
+{"m.mid":"m-1016","p.pid":"p-overlap"}
+{"m.mid":"m-1016-again","p.pid":"p-overlap"}
+{"m.mid":"m-016","p.pid":"p-overlap"}
+{"m.mid":"m-alpha","p.pid":"p-two"}
+{"m.mid":"m-beta","p.pid":"p-two"}
+{"m.mid":"m-echo","p.pid":"p-twice"}
+{"m.mid":"m-echo","p.pid":"p-again"}
+{"m.mid":"m-16","p.pid":"p-again"}
+{"m.mid":"m-e-acute","p.pid":"p-multibyte"}
+{"m.mid":"m-nihon","p.pid":"p-multibyte"}
+{"m.mid":"m-empty","p.pid":"p-overlap"}
+{"m.mid":"m-empty","p.pid":"p-two"}
+{"m.mid":"m-empty","p.pid":"p-twice"}
+{"m.mid":"m-empty","p.pid":"p-again"}
+{"m.mid":"m-empty","p.pid":"p-multibyte"}
+{"m.mid":"m-empty","p.pid":"p-none"}
+
+--- expect shape
+m.mid: String
+p.pid: String
+
+--- expect plan
+contains join $p.text contains $m.number
+scan Passage as $p: runtime filter text
+scan Matter as $m: no runtime filter
+pass join_algorithm
+
+--- query
+set engine = v2;
+query passage_written_first() {
+    match {
+        $p: Passage
+        $m: Matter
+        $p.text contains $m.number
+        $m.mid != "m-empty"
+    }
+    return { $m.mid, $p.pid }
+}
+
+--- expect unordered
+{"m.mid":"m-10","p.pid":"p-overlap"}
+{"m.mid":"m-16","p.pid":"p-overlap"}
+{"m.mid":"m-1016","p.pid":"p-overlap"}
+{"m.mid":"m-1016-again","p.pid":"p-overlap"}
+{"m.mid":"m-016","p.pid":"p-overlap"}
+{"m.mid":"m-alpha","p.pid":"p-two"}
+{"m.mid":"m-beta","p.pid":"p-two"}
+{"m.mid":"m-echo","p.pid":"p-twice"}
+{"m.mid":"m-echo","p.pid":"p-again"}
+{"m.mid":"m-16","p.pid":"p-again"}
+{"m.mid":"m-e-acute","p.pid":"p-multibyte"}
+{"m.mid":"m-nihon","p.pid":"p-multibyte"}
+
+--- expect shape
+m.mid: String
+p.pid: String
+
+--- expect plan
+scan Passage as $p: no runtime filter
+scan Matter as $m: no runtime filter
+not pass join_algorithm
