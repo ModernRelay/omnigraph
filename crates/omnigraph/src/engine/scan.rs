@@ -5,6 +5,8 @@
 use super::*;
 
 use super::operators::memory::WorkMemory;
+use crate::instrumentation::record_node_scan_projection;
+use crate::table_store::{ScanTuning, TableStore};
 use arrow_schema::SchemaRef;
 use datafusion::prelude::{Expr, col, lit as df_lit};
 use lance_index::scalar::FullTextSearchQuery;
@@ -29,6 +31,153 @@ pub(crate) fn id_in_list_expr(ids: &[String], id_col: &str) -> datafusion::prelu
     col(id_col).in_list(id_list, false)
 }
 
+/// Lance batches a pipelined read decodes ahead, which the pool does not see.
+const PIPELINED_READAHEAD: usize = 2;
+
+/// One node scan resolved before any Lance read: the dataset, the pushed
+/// filter (the literal filters, a gate's eligible set, a BM25 filter's member
+/// ids), the hoisted full-text query and the columns it reads.
+pub(super) struct NodeRead<'n> {
+    ds: Dataset,
+    pub(super) node_type: &'n omnigraph_compiler::catalog::NodeType,
+    filter_expr: Option<Expr>,
+    fts_query: Option<FullTextSearchQuery>,
+    pub(super) columns: ScanColumns<'n>,
+    /// The gate proved the answer empty, or a BM25 filter matched no row: no
+    /// Lance read runs.
+    pub(super) proven_empty: bool,
+}
+
+impl<'n> NodeRead<'n> {
+    pub(super) async fn resolve(
+        type_name: &str,
+        filters: &[IRExpr],
+        params: &ParamMap,
+        snapshot: &Snapshot,
+        catalog: &'n Catalog,
+        search_mode: &SearchMode,
+        binding_columns: Option<&NeededColumns>,
+        memory: &WorkMemory,
+    ) -> Result<Self> {
+        let table_key = format!("node:{}", type_name);
+        let ds = snapshot.open_lance_dataset(&table_key).await?;
+
+        let node_type = &catalog.node_types[type_name];
+
+        let mut filter_expr =
+            build_lance_filter_expr(filters, params, Some(&node_type.arrow_schema));
+
+        if let Some(eligible_ids) = search_mode.eligible_ids() {
+            let in_list = id_in_list_expr(eligible_ids, catalog.system_columns.id);
+            filter_expr = Some(match filter_expr {
+                Some(expr) => expr.and(in_list),
+                None => in_list,
+            });
+        }
+
+        let ranking = search_mode.bm25.as_ref();
+        let mut hoisted_fts_queries: Vec<FullTextSearchQuery> = Vec::new();
+        for filter in filters {
+            let Some(query) = search_filter_query(filter, params)? else {
+                continue;
+            };
+            let ranked_matches_only = ranking.is_some_and(|target| {
+                search_filter_is_ranking(filter, &target.property, &target.text, params)
+            });
+            if !ranked_matches_only {
+                hoisted_fts_queries.push(query);
+            }
+        }
+        let (fts_query, member_ids) = match (ranking, conjoin_fts_queries(hoisted_fts_queries)) {
+            (
+                Some(Bm25Target {
+                    property: prop,
+                    text,
+                }),
+                filter_query,
+            ) => {
+                let ids = match filter_query {
+                    Some(query) => Some(
+                        search_filter_member_ids(
+                            &ds,
+                            filter_expr.as_ref(),
+                            query,
+                            catalog.system_columns.id,
+                            memory,
+                        )
+                        .await?,
+                    ),
+                    None => None,
+                };
+                let ranking_query = FullTextSearchQuery::new(text.clone())
+                    .with_column(prop.clone())
+                    .map_err(|error| OmniError::storage_context("fts with_column", error))?;
+                (Some(ranking_query), ids)
+            }
+            (None, filter_query) => (filter_query, None),
+        };
+        if let Some(ids) = &member_ids {
+            let in_list = id_in_list_expr(ids, catalog.system_columns.id);
+            filter_expr = Some(match filter_expr {
+                Some(expr) => expr.and(in_list),
+                None => in_list,
+            });
+        }
+        let columns = ScanColumns::new(
+            node_type,
+            SearchColumns {
+                distance: search_mode.nearest.is_some(),
+                score: fts_query.is_some(),
+            },
+            binding_columns,
+        );
+        let proven_empty =
+            search_mode.answer_proven_empty || member_ids.as_ref().is_some_and(Vec::is_empty);
+        if !proven_empty {
+            record_node_scan_projection(columns.read_projection().as_deref());
+        }
+        Ok(Self {
+            ds,
+            node_type,
+            filter_expr,
+            fts_query,
+            columns,
+            proven_empty,
+        })
+    }
+
+    /// The Lance plan of this read: the projection, the pushed filter as a
+    /// prefilter, the `(rows, bytes)` batch override and bounded readahead of
+    /// a pipelined read, the full-text query, then `configure` (nearest).
+    pub(super) fn plan(
+        &self,
+        pipelined_batch: Option<(usize, usize)>,
+        configure: impl FnOnce(&mut ScanTuning<'_>) -> Result<()>,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
+    > {
+        let projection = self.columns.read_projection();
+        TableStore::scan_plan_with(&self.ds, projection.as_deref(), None, false, |scanner| {
+            if let Some(expr) = &self.filter_expr {
+                scanner.filter_expr(expr.clone());
+                scanner.prefilter(true);
+            }
+            if let Some((rows, bytes)) = pipelined_batch {
+                scanner.batch_size(rows);
+                scanner.batch_size_bytes(bytes as u64);
+                scanner.batch_readahead(PIPELINED_READAHEAD);
+            }
+            if let Some(fts_query) = &self.fts_query {
+                scanner
+                    .full_text_search(fts_query.clone())
+                    .map_err(|error| OmniError::storage_context("full_text_search", error))?;
+            }
+            configure(scanner)
+        })
+    }
+}
+
 /// Scan a node type under the supplied projection, filters and search mode.
 /// Apply filters before search ranking, retain score columns, and widen an
 /// underfilled ANN scan according to its reported probe outcomes.
@@ -44,21 +193,18 @@ pub(super) async fn execute_node_scan(
     binding_columns: Option<&NeededColumns>,
     memory: &WorkMemory,
 ) -> Result<RecordBatch> {
-    let table_key = format!("node:{}", type_name);
-    let ds = snapshot.open_lance_dataset(&table_key).await?;
-
-    let node_type = &catalog.node_types[type_name];
-
-    let mut filter_expr = build_lance_filter_expr(filters, params, Some(&node_type.arrow_schema));
-
-    if let Some(eligible_ids) = search_mode.eligible_ids() {
-        let in_list = id_in_list_expr(eligible_ids, catalog.system_columns.id);
-        filter_expr = Some(match filter_expr {
-            Some(expr) => expr.and(in_list),
-            None => in_list,
-        });
-    }
-
+    let read = NodeRead::resolve(
+        type_name,
+        filters,
+        params,
+        snapshot,
+        catalog,
+        search_mode,
+        binding_columns,
+        memory,
+    )
+    .await?;
+    let node_type = read.node_type;
     let nearest_target = search_mode.nearest.as_ref().map(|target| {
         (
             target.property.clone(),
@@ -66,70 +212,8 @@ pub(super) async fn execute_node_scan(
             target.k,
         )
     });
-    let ranking = search_mode.bm25.as_ref();
-    let mut hoisted_fts_queries: Vec<FullTextSearchQuery> = Vec::new();
-    for filter in filters {
-        let Some(query) = search_filter_query(filter, params)? else {
-            continue;
-        };
-        let ranked_matches_only = ranking.is_some_and(|target| {
-            search_filter_is_ranking(filter, &target.property, &target.text, params)
-        });
-        if !ranked_matches_only {
-            hoisted_fts_queries.push(query);
-        }
-    }
-    let (fts_query, member_ids) = match (ranking, conjoin_fts_queries(hoisted_fts_queries)) {
-        (
-            Some(Bm25Target {
-                property: prop,
-                text,
-            }),
-            filter_query,
-        ) => {
-            let ids = match filter_query {
-                Some(query) => Some(
-                    search_filter_member_ids(
-                        &ds,
-                        filter_expr.as_ref(),
-                        query,
-                        catalog.system_columns.id,
-                        memory,
-                    )
-                    .await?,
-                ),
-                None => None,
-            };
-            let ranking_query = FullTextSearchQuery::new(text.clone())
-                .with_column(prop.clone())
-                .map_err(|error| OmniError::storage_context("fts with_column", error))?;
-            (Some(ranking_query), ids)
-        }
-        (None, filter_query) => (filter_query, None),
-    };
-    if let Some(ids) = &member_ids {
-        let in_list = id_in_list_expr(ids, catalog.system_columns.id);
-        filter_expr = Some(match filter_expr {
-            Some(expr) => expr.and(in_list),
-            None => in_list,
-        });
-    }
-    let columns = ScanColumns::new(
-        node_type,
-        SearchColumns {
-            distance: nearest_target.is_some(),
-            score: fts_query.is_some(),
-        },
-        binding_columns,
-    );
-    let has_blobs = columns.has_blobs;
-    let read_projection = columns.read_projection();
-    let projection = read_projection.as_deref();
-    let scan_proven_empty =
-        search_mode.answer_proven_empty || member_ids.as_ref().is_some_and(Vec::is_empty);
-    if !scan_proven_empty {
-        crate::instrumentation::record_node_scan_projection(projection);
-    }
+    let has_blobs = read.columns.has_blobs;
+    let scan_proven_empty = read.proven_empty;
     let mut probe_budget: Option<usize> = nearest_target.as_ref().and(search_mode.ann_probe_budget);
     let known_matches: Option<usize> = nearest_target
         .as_ref()
@@ -137,7 +221,8 @@ pub(super) async fn execute_node_scan(
         .map(<[String]>::len);
     let dataset_rows: Option<u64> = match nearest_target.as_ref() {
         Some(_) if !scan_proven_empty => Some(
-            ds.count_rows(None)
+            read.ds
+                .count_rows(None)
                 .await
                 .map_err(|error| OmniError::storage_context("count_rows", error))?
                 as u64,
@@ -163,48 +248,28 @@ pub(super) async fn execute_node_scan(
         > = Arc::new(std::sync::Mutex::new(None));
         let stats_sink = scan_stats.clone();
         let batches: Vec<RecordBatch> = Box::pin(async {
-            let plan = crate::table_store::TableStore::scan_plan_with(
-                &ds,
-                projection,
-                None,
-                false,
-                |scanner| {
-                    if let Some(ref expr) = filter_expr {
-                        scanner.filter_expr(expr.clone());
-                        scanner.prefilter(true);
-                    }
-
-                    if let Some(fts_query) = &fts_query {
-                        scanner
-                            .full_text_search(fts_query.clone())
-                            .map_err(|error| {
-                                OmniError::storage_context("full_text_search", error)
-                            })?;
-                    }
-
+            let plan = read
+                .plan(None, |scanner| {
                     if let Some((prop, query_arr, k)) = nearest_target.as_ref() {
-                        {
-                            scanner
-                                .nearest(prop, query_arr, *k)
-                                .map_err(|error| OmniError::storage_context("nearest", error))?;
-                            scanner.use_index(use_index);
-                            if let Some(maximum) = probe_budget {
-                                scanner.maximum_nprobes(maximum);
-                            }
-                            crate::instrumentation::record_ann_probe_budget(probe_budget);
-                            scanner.scan_stats_callback(Arc::new(move |summary| {
-                                *stats_sink
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                    Some(summary.clone());
-                            }));
-                            scanner.target_parallelism(1);
+                        scanner
+                            .nearest(prop, query_arr, *k)
+                            .map_err(|error| OmniError::storage_context("nearest", error))?;
+                        scanner.use_index(use_index);
+                        if let Some(maximum) = probe_budget {
+                            scanner.maximum_nprobes(maximum);
                         }
+                        crate::instrumentation::record_ann_probe_budget(probe_budget);
+                        scanner.scan_stats_callback(Arc::new(move |summary| {
+                            *stats_sink
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(summary.clone());
+                        }));
+                        scanner.target_parallelism(1);
                     }
                     Ok(())
-                },
-            )
-            .await?;
+                })
+                .await?;
             let (plan, stream) = attempt_memory
                 .stream(plan)
                 .map_err(|error| memory.error(error))?;
@@ -343,7 +408,7 @@ pub(super) async fn execute_node_scan(
     }
 
     let scan_result = if batches.is_empty() {
-        columns.empty_batch(node_type)
+        read.columns.empty_batch(node_type)
     } else if batches.len() == 1 {
         batches.into_iter().next().unwrap()
     } else {

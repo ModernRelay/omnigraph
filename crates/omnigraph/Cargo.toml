@@ -49,6 +49,7 @@ lance-linalg = { workspace = true }
 lance-namespace = { workspace = true }
 lance-table = { workspace = true }
 prost = "0.14"
+aho-corasick = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-ord = { workspace = true }

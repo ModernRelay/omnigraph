@@ -4,7 +4,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use arrow_array::BooleanArray;
+use arrow_array::{BooleanArray, RecordBatch};
 use datafusion::common::Result as DfResult;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
@@ -21,6 +21,24 @@ use crate::engine::expr::evaluate_filter;
 
 /// The refusal name the pool reports when a filtered batch does not fit.
 const OUTPUT: &str = "filter output";
+
+/// Every one of `filters` evaluated over `batch`, conjoined into one mask
+/// (a null drops the row); `None` when there is no filter.
+pub(super) fn conjoined_mask(
+    batch: &RecordBatch,
+    filters: &[IRExpr],
+    params: &ParamMap,
+) -> DfResult<Option<BooleanArray>> {
+    let mut mask: Option<BooleanArray> = None;
+    for filter in filters {
+        let next = evaluate_filter(batch, filter, params).map_err(external)?;
+        mask = Some(match mask {
+            None => next,
+            Some(mask) => datafusion::arrow::compute::and(&mask, &next)?,
+        });
+    }
+    Ok(mask)
+}
 
 pub(crate) struct FilterExec {
     input: Arc<dyn ExecutionPlan>,
@@ -112,16 +130,7 @@ impl ExecutionPlan for FilterExec {
                     drop(held);
                     match input.next().await {
                         Some(Ok(batch)) => {
-                            let mut mask: Option<BooleanArray> = None;
-                            for filter in &filters {
-                                let next =
-                                    evaluate_filter(&batch, filter, &params).map_err(external)?;
-                                mask = Some(match mask {
-                                    None => next,
-                                    Some(mask) => datafusion::arrow::compute::and(&mask, &next)?,
-                                });
-                            }
-                            let kept = match mask {
+                            let kept = match conjoined_mask(&batch, &filters, &params)? {
                                 Some(mask) => {
                                     arrow_select::filter::filter_record_batch(&batch, &mask)?
                                 }

@@ -97,6 +97,53 @@ query fused($t: String, $q: Vector(4)) {
 }
 "#;
 
+const CITATION_SCHEMA: &str = r#"
+node Matter {
+    mid: String @key
+    number: String?
+}
+node Passage {
+    pid: String @key
+    text: String?
+}
+"#;
+
+const CITATION_SEED: &[&str] = &[
+    r#"{"type":"Matter","data":{"mid":"m1","number":"1001"}}"#,
+    r#"{"type":"Matter","data":{"mid":"m2","number":"2002"}}"#,
+    r#"{"type":"Matter","data":{"mid":"m3"}}"#,
+    r#"{"type":"Passage","data":{"pid":"p0","text":"cites 1001 here"}}"#,
+    r#"{"type":"Passage","data":{"pid":"p1","text":"about 2002"}}"#,
+    r#"{"type":"Passage","data":{"pid":"m1","text":"1001 again"}}"#,
+    r#"{"type":"Passage","data":{"pid":"p3","text":"nothing"}}"#,
+    r#"{"type":"Passage","data":{"pid":"p4"}}"#,
+];
+
+const CITATION_QUERIES: &str = r#"
+query cited() {
+    match {
+        $m: Matter
+        $p: Passage
+        $p.text contains $m.number
+        $m.mid != $p.pid
+    }
+    return { $m.mid, $p.pid }
+    order { $m.mid, $p.pid }
+}
+"#;
+
+async fn citations(dir: &tempfile::TempDir) -> Session {
+    let db = session(
+        Omnigraph::init(dir.path().to_str().unwrap(), CITATION_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(&CITATION_SEED.join("\n"), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    with_setting(&db, "engine", "v2")
+}
+
 async fn people(dir: &tempfile::TempDir) -> Session {
     let db = session(
         Omnigraph::init(dir.path().to_str().unwrap(), PEOPLE_SCHEMA)
@@ -234,6 +281,137 @@ async fn a_hash_join_traversal_replays_with_its_switches() {
     assert!(
         rows.iter().all(|row| row["attempts"][0]["drained"] == true),
         "a fully consumed run drains every operator: {rows:#?}"
+    );
+}
+
+/// The plan carries the `ContainsJoin`, its residual and the right scan's
+/// marker; the replay builds the same join over the same filled slot and
+/// answers the same rows (`m1`'s pair with the passage named `m1` drops).
+#[tokio::test]
+async fn a_contains_join_with_a_residual_replays_through_its_marked_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = citations(&dir).await;
+    let Replayed { result, plan, rows } =
+        replayed(&db, CITATION_QUERIES, "cited", &ParamMap::new()).await;
+    assert_eq!(
+        result,
+        [
+            serde_json::json!({"m.mid": "m1", "p.pid": "p0"}),
+            serde_json::json!({"m.mid": "m2", "p.pid": "p1"}),
+        ]
+    );
+    let (right, residual) = plan
+        .plan
+        .live()
+        .find_map(|(_, node)| match node {
+            PhysicalNode::ContainsJoin {
+                right, residual, ..
+            } => Some((*right, residual.len())),
+            _ => None,
+        })
+        .expect("a ContainsJoin");
+    assert_eq!(residual, 1, "`$m.mid != $p.pid` is the residual");
+    let Some(PhysicalNode::Scan { spec, .. }) = plan.plan.node(right) else {
+        panic!("the right side is a scan");
+    };
+    assert_eq!(
+        spec.runtime_filter
+            .as_ref()
+            .map(|filter| filter.column.as_str()),
+        Some("text")
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row["operator"] == "ContainsJoinExec" && row["status"] == "executed"),
+        "{rows:#?}"
+    );
+}
+
+/// Every JSON object under `value`, each handed to `edit`.
+fn edit_objects(value: &mut Value, edit: &mut impl FnMut(&mut serde_json::Map<String, Value>)) {
+    match value {
+        Value::Object(object) => {
+            edit(object);
+            for child in object.values_mut() {
+                edit_objects(child, edit);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                edit_objects(item, edit);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The refusal of the `cited` plan's replay once `edit` has rewritten its
+/// serialized form.
+async fn edited_replay_refusal(
+    edit: &mut impl FnMut(&mut serde_json::Map<String, Value>),
+) -> OmniError {
+    let dir = tempfile::tempdir().unwrap();
+    let db = citations(&dir).await;
+    let run = db
+        .query_inspected(
+            ReadTarget::branch("main"),
+            CITATION_QUERIES,
+            "cited",
+            &ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    let mut serialized = serde_json::to_value(&run.plan).unwrap();
+    edit_objects(&mut serialized, edit);
+    let bound: omnigraph_planner::BoundPlan = serde_json::from_value(serialized).unwrap();
+    match db
+        .replay_bound_plan(ReadTarget::branch("main"), bound)
+        .await
+    {
+        Ok(replay) => panic!("the edited plan replays: {:?}", rows_of(&replay.result)),
+        Err(error) => error,
+    }
+}
+
+/// A replayed plan whose scan marker sieves `pid`, or by `m.mid`, while its join
+/// pairs `text` by `m.number` refuses at lowering, instead of dropping pairs.
+#[tokio::test]
+async fn a_marker_that_disagrees_with_its_contains_join_refuses_the_replay() {
+    for (key, value) in [
+        ("column", Value::from("pid")),
+        ("needle", serde_json::json!(["m", "mid"])),
+    ] {
+        let error = edited_replay_refusal(&mut |object| {
+            if let Some(Value::Object(filter)) = object.get_mut("runtime_filter") {
+                filter.insert(key.to_string(), value.clone());
+            }
+        })
+        .await;
+        assert!(
+            error
+                .to_string()
+                .contains("pairs `text` by `m.number`, but its right scan"),
+            "{key}: {error}"
+        );
+    }
+}
+
+/// A replayed plan whose `ContainsJoin` became a plain `CrossJoin` leaves a
+/// marked scan no join fills: the lowering refuses it instead of running it.
+#[tokio::test]
+async fn a_marker_with_no_contains_join_refuses_the_replay() {
+    let error = edited_replay_refusal(&mut |object| {
+        if object.get("node") == Some(&Value::from("ContainsJoin")) {
+            object.retain(|key, _| matches!(key.as_str(), "node" | "left" | "right"));
+            object.insert("node".to_string(), Value::from("CrossJoin"));
+        }
+    })
+    .await;
+    assert!(
+        error
+            .to_string()
+            .contains("carries a runtime filter no contains join fills"),
+        "{error}"
     );
 }
 

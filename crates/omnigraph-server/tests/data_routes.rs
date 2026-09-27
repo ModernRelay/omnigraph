@@ -2690,8 +2690,8 @@ const EXPLAIN_INSERT_PERSON: &str = "explain query insert_person($name: String, 
 const EXPLAIN_OLDER_PAIRS: &str = "explain query older_pairs() {\n    match {\n        $a: Person\n        $b: Person\n        $a.age > $b.age\n    }\n    return { $a.name, $b.name }\n}\n";
 
 /// The `explain` answer lists the lowered DataFusion tree after the physical
-/// tree: a filter over two bindings, which no scan can take, is a
-/// `FilterExec` over the `CrossJoinExec` of the two `ScanExec` rows.
+/// tree: a filter over two bindings, which no scan can take, runs in the
+/// `CrossJoinExec` of the two `ScanExec` rows.
 #[tokio::test(flavor = "multi_thread")]
 async fn query_endpoint_explain_lists_the_lowered_datafusion_tree() {
     let (_temp, app) = app_for_loaded_graph().await;
@@ -2723,11 +2723,11 @@ async fn query_endpoint_explain_lists_the_lowered_datafusion_tree() {
         .filter(|row| row["tree"] == "datafusion")
         .collect();
     assert_eq!(datafusion[0]["depth"], 0, "{body}");
-    let filter = datafusion
+    let join = datafusion
         .iter()
-        .find(|row| row["node"] == "FilterExec")
-        .unwrap_or_else(|| panic!("a filter over two bindings is a FilterExec row: {body}"));
-    let predicate = filter["detail"].as_str().unwrap();
+        .find(|row| row["node"] == "CrossJoinExec")
+        .unwrap_or_else(|| panic!("a filter over two bindings runs in the CrossJoinExec: {body}"));
+    let predicate = join["detail"].as_str().unwrap();
     assert!(
         predicate.contains("a.age") && predicate.contains("b.age"),
         "the predicate reads both bindings: {predicate}"
@@ -2741,8 +2741,8 @@ async fn query_endpoint_explain_lists_the_lowered_datafusion_tree() {
         "one ScanExec per binding: {body}"
     );
     assert!(
-        datafusion.iter().any(|row| row["node"] == "CrossJoinExec"),
-        "{body}"
+        !datafusion.iter().any(|row| row["node"] == "FilterExec"),
+        "the join holds the filter, so no FilterExec row: {body}"
     );
     assert!(
         explain_plan_rows(&body, "datafusion").is_empty(),

@@ -1,0 +1,55 @@
+# issue: none
+# notes: The sieving scan of a haystack type with Blob and Vector properties rebuilds each kept batch with the Blob as null.
+# notes: A .gq read cannot project a Blob, so the node object and the Vector column carry the rows.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Matter {
+    mid: String @key
+    number: String
+}
+node Passage {
+    pid: String @key
+    text: String?
+    payload: Blob?
+    embedding: Vector(2)?
+}
+
+--- seed
+{"type":"Matter","data":{"mid":"m-10","number":"10"}}
+{"type":"Matter","data":{"mid":"m-alpha","number":"alpha"}}
+{"type":"Passage","data":{"pid":"p-cites","text":"cites 10","embedding":[1.0,2.0]}}
+{"type":"Passage","data":{"pid":"p-alpha","text":"alpha"}}
+{"type":"Passage","data":{"pid":"p-none","text":"nothing","embedding":[3.0,4.0]}}
+{"type":"Passage","data":{"pid":"p-null"}}
+
+--- query
+set engine = v2;
+query found_numbers() {
+    match {
+        $m: Matter
+        $p: Passage
+        $p.text contains $m.number
+    }
+    return { $m.mid, $p, $p.embedding }
+}
+
+--- expect unordered
+{"m.mid":"m-10","p":{"@id":"p-cites","pid":"p-cites","text":"cites 10"},"p.embedding":[1.0,2.0]}
+{"m.mid":"m-alpha","p":{"@id":"p-alpha","pid":"p-alpha","text":"alpha"}}
+
+--- expect shape
+m.mid: String
+p: Passage
+p.embedding: Vector(2)?
+
+--- expect plan
+contains join $p.text contains $m.number
+scan Passage as $p: runtime filter text
+scan Matter as $m: no runtime filter
+pass join_algorithm

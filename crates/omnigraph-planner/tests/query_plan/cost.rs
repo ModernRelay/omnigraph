@@ -1,3 +1,5 @@
+use omnigraph_planner::{RuntimeFilterKind, RuntimeFilterSpec};
+
 use super::*;
 
 #[test]
@@ -485,4 +487,196 @@ fn two_hops_choose_a_cold_csr_below_both_caps() {
     assert!(!cost.csr_cached);
     assert!(cost.frontier_rows <= cost.max_frontier_cap);
     assert!(cost.effective_max_hops <= cost.max_hops_cap);
+}
+
+/// The bindings of the plan's join scans as `(left, right)`, with the join
+/// node's name.
+fn join_sides(plan: &PhysicalPlan) -> (String, String, &'static str) {
+    let binding = |id| match plan.node(id) {
+        Some(PhysicalNode::Scan { spec, .. }) => spec.binding.clone().expect("a bound scan"),
+        other => panic!("a join side is a scan, not {other:?}"),
+    };
+    plan.live()
+        .find_map(|(_, node)| match node {
+            PhysicalNode::CrossJoin { left, right, .. }
+            | PhysicalNode::ContainsJoin { left, right, .. } => {
+                Some((binding(*left), binding(*right), node.name()))
+            }
+            _ => None,
+        })
+        .expect("a join")
+}
+
+/// `$m.title contains $w.title`, Matter written first: the searched Matter
+/// scan streams on the right only when its known rows are at least Word's, and
+/// the sides never swap when `$w.title contains $m.title` searches back too.
+#[test]
+fn a_contains_join_streams_the_searched_side_only_when_it_has_no_fewer_rows() {
+    let contains = |haystack: &str, needle: &str| {
+        IRExpr::comparison(
+            prop(haystack, "title"),
+            CompOp::StringContains,
+            prop(needle, "title"),
+        )
+    };
+    let query = |filter: IRExpr| {
+        ir(
+            vec![
+                scan_of("m", "Matter"),
+                scan_of("w", "Word"),
+                IROp::Filter(filter),
+            ],
+            vec![prop("m", "slug"), prop("w", "slug")],
+            vec![],
+        )
+    };
+    let plan_sides = |op: &Operation, matters: Option<u64>, words: Option<u64>| {
+        let source = MemorySource::default()
+            .with_node_type("Matter", node_type("Matter", matters))
+            .with_node_type("Word", node_type("Word", words));
+        join_sides(&physical(op, &source).0)
+    };
+    let both_ways =
+        query(IRExpr::and_all([contains("m", "w"), contains("w", "m")]).expect("two conjuncts"));
+    assert_eq!(
+        plan_sides(&both_ways, Some(1_000), Some(3)),
+        ("m".to_string(), "w".to_string(), "ContainsJoin"),
+        "a pair searching both ways keeps the written order"
+    );
+    let op = query(contains("m", "w"));
+    let sides = |matters: Option<u64>, words: Option<u64>| plan_sides(&op, matters, words);
+    let written = ("m".to_string(), "w".to_string(), "CrossJoin");
+    let swapped = ("w".to_string(), "m".to_string(), "ContainsJoin");
+    assert_eq!(
+        sides(Some(3), Some(1_000)),
+        written,
+        "1,000 words collected as needles against 3 titles gain no filter"
+    );
+    assert_eq!(sides(Some(1_000), Some(3)), swapped);
+    assert_eq!(
+        sides(Some(3), Some(3)),
+        swapped,
+        "ties stream the searched side"
+    );
+    assert_eq!(sides(None, Some(3)), written);
+    assert_eq!(sides(Some(1_000), None), written);
+}
+
+/// `$p.text contains $m.title` with the searched Passage scan on the right
+/// plans a `ContainsJoin` with the other conjunct as residual and the scan
+/// marked, under `join_algorithm`; a non-text `title` keeps the `CrossJoin`.
+#[test]
+fn a_contains_join_marks_its_right_scan_and_keeps_the_other_conjunct() {
+    let contains = IRExpr::comparison(
+        prop("p", "text"),
+        CompOp::StringContains,
+        prop("m", "title"),
+    );
+    let other = IRExpr::comparison(prop("m", "slug"), CompOp::Ne, prop("p", "slug"));
+    let op = ir(
+        vec![
+            scan_of("m", "Matter"),
+            scan_of("p", "Passage"),
+            IROp::Filter(IRExpr::and_all([contains.clone(), other.clone()]).expect("two")),
+        ],
+        vec![prop("m", "slug"), prop("p", "slug")],
+        vec![],
+    );
+    let typed = |title: DataType| {
+        let mut matter = node_type("Matter", None);
+        let fields: Vec<Field> = schema()
+            .fields()
+            .iter()
+            .map(|field| match field.name().as_str() {
+                "title" => Field::new("title", title.clone(), true),
+                _ => field.as_ref().clone(),
+            })
+            .collect();
+        matter.schema = Arc::new(Schema::new(fields));
+        MemorySource::default()
+            .with_node_type("Matter", matter)
+            .with_node_type("Passage", node_type("Passage", None))
+    };
+    let (plan, fired) = physical(&op, &typed(DataType::Utf8));
+    assert!(fired.contains(&"join_algorithm"), "{fired:?}");
+    let (join, node) = plan
+        .live()
+        .find(|(_, node)| matches!(node, PhysicalNode::ContainsJoin { .. }))
+        .expect("a ContainsJoin");
+    let PhysicalNode::ContainsJoin {
+        right,
+        haystack,
+        needle,
+        residual,
+        ..
+    } = node
+    else {
+        unreachable!("selected above");
+    };
+    assert_eq!(haystack, &("p".to_string(), "text".to_string()));
+    assert_eq!(needle, &("m".to_string(), "title".to_string()));
+    assert_eq!(residual, std::slice::from_ref(&other));
+    let Some(PhysicalNode::Scan { spec, .. }) = plan.node(*right) else {
+        panic!("the right side is a scan");
+    };
+    assert_eq!(spec.binding.as_deref(), Some("p"));
+    assert_eq!(
+        spec.runtime_filter,
+        Some(RuntimeFilterSpec {
+            column: "text".to_string(),
+            needle: ("m".to_string(), "title".to_string()),
+            kind: RuntimeFilterKind::TextContainsAny,
+        })
+    );
+    let json = plan.to_json();
+    let printed = find_node(&json, "ContainsJoin").expect("the join prints");
+    assert_eq!(printed["id"], join);
+    assert_eq!(printed["haystack"], "$p.text");
+    assert_eq!(printed["needle"], "$m.title");
+    assert_eq!(printed["residual"], serde_json::json!([other.to_string()]));
+    let scan = &printed["inputs"][1];
+    assert_eq!(scan["binding"], "p");
+    assert_eq!(scan["runtime_filter"]["column"], "text");
+    assert_eq!(
+        scan["runtime_filter"]["needle"],
+        serde_json::json!(["m", "title"])
+    );
+    assert_eq!(scan["runtime_filter"]["kind"], "text_contains_any");
+    assert!(
+        printed["inputs"][0].get("runtime_filter").is_none(),
+        "the collected side carries no filter"
+    );
+
+    let (plan, fired) = physical(&op, &typed(DataType::Int64));
+    assert!(!fired.contains(&"join_algorithm"), "{fired:?}");
+    let filters = plan
+        .live()
+        .find_map(|(_, node)| match node {
+            PhysicalNode::CrossJoin { filters, .. } => Some(filters.clone()),
+            _ => None,
+        })
+        .expect("a CrossJoin over a numeric needle");
+    assert_eq!(filters, [contains, other]);
+    let marked: Vec<Option<String>> = plan
+        .live()
+        .filter_map(|(_, node)| match node {
+            PhysicalNode::Scan { spec, .. } if spec.runtime_filter.is_some() => {
+                Some(spec.binding.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(marked.is_empty(), "no scan is marked, but {marked:?} are");
+}
+
+/// The first node named `name` in pre-order.
+fn find_node<'j>(node: &'j serde_json::Value, name: &str) -> Option<&'j serde_json::Value> {
+    if node["node"] == name {
+        return Some(node);
+    }
+    node["inputs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|input| find_node(input, name))
 }

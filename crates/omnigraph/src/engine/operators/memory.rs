@@ -390,6 +390,20 @@ impl WorkMemory {
             .inspect_err(|_| self.resources.refused(&self.name))
     }
 
+    /// `grow` for a charge the caller does without when the pool refuses it:
+    /// `false` then, with no refusal recorded, since the query goes on.
+    pub(in crate::engine) fn grow_if_free(&self, bytes: usize) -> DfResult<bool> {
+        self.check()?;
+        Ok(self.scratch.try_grow(bytes).is_ok())
+    }
+
+    /// Lower this work's charge to `bytes` once its peak has passed; a charge
+    /// already at or under `bytes`, or freed meanwhile, stays as it is.
+    pub(in crate::engine) fn shrink_to(&self, bytes: usize) {
+        let excess = self.scratch.size().saturating_sub(bytes);
+        let _ = self.scratch.try_shrink(excess);
+    }
+
     /// Reserve conservative capacity for collection entries, including element
     /// storage, growth and hash-table overhead.
     pub(in crate::engine) fn entries<T>(&self, count: usize) -> DfResult<()> {

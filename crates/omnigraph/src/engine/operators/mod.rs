@@ -28,14 +28,18 @@ use serde::{Deserialize, Serialize};
 use crate::error::{OmniError, Result};
 
 mod anti_join;
+mod contains_join;
 mod cross_join;
 mod expand;
 mod expand_stream;
 mod filter;
+#[cfg(test)]
+mod fixtures;
 mod hash_join;
 mod limit;
 pub(in crate::engine) mod memory;
 mod metadata_count;
+mod pair_buffer;
 mod producer;
 mod projection;
 mod rank_fuse;
@@ -43,10 +47,12 @@ mod scan;
 mod single_hop;
 mod sort;
 mod subquery_aggregate;
+mod text_match;
 
 pub(super) use anti_join::{
     AntiJoinMaskExec, OuterReferenceExec, OuterSlot, fresh_tag_column, tagged_schema,
 };
+pub(super) use contains_join::ContainsJoinExec;
 pub(super) use cross_join::CrossJoinExec;
 pub(super) use expand::{ExpandExec, ExpandStep, GraphEnv};
 pub(super) use filter::FilterExec;
@@ -55,7 +61,8 @@ pub(super) use limit::LimitExec;
 pub(super) use metadata_count::MetadataCountExec;
 pub(super) use projection::ProjectionExec;
 pub(super) use rank_fuse::{ArmOrder, RankFuseExec};
-pub(super) use scan::{ScanExec, ScanSource};
+use scan::{Filled, Needles};
+pub(super) use scan::{RuntimeFilterSlot, ScanExec, ScanSource};
 pub(super) use sort::{SortExec, SortKey};
 pub(crate) use subquery_aggregate::{RowCountPredicate, SubqueryAggregate, absorb_inner_batches};
 

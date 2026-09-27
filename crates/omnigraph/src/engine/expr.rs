@@ -37,6 +37,7 @@ impl ProjectionContext {
                 | PhysicalNode::Limit { .. }
                 | PhysicalNode::Page { .. }
                 | PhysicalNode::CrossJoin { .. }
+                | PhysicalNode::ContainsJoin { .. }
                 | PhysicalNode::Filter { .. }
                 | PhysicalNode::AntiJoin { .. }
                 | PhysicalNode::OuterReference { .. }
