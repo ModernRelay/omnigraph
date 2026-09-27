@@ -154,10 +154,17 @@ chunks publish sequentially inside the one recovery envelope, and all routes
 defer index construction to reconciliation.
 
 Cost tests cap common fast-forward manifest opens/scans at three and diverged
-merges at four, five for a non-bound target. Each scan still folds the surviving append-only `__manifest`
-history. `optimize` can reduce fragment overhead but does not make journal
-decoding independent of retained history. The decoder reduces one Arrow batch
-at a time rather than retaining the complete batch collection.
+merges at four, five for a non-bound target. Every publish rewrites the live
+`__manifest` rows into new files, normally one fragment (Lance splits a write
+at 1,048,576 rows per file), so a scan no longer pays per-fragment and
+per-deletion-file requests. Pages within a file are still read separately; the
+local history curve measured 40-41 requests per write from 1 to 1,024 prior
+publications, which is a measurement, not a guarantee. The rows still include history (`graph_commit` and every
+`table_version` registration), so the bytes decoded grow with retained
+history. Read-only scans reduce one Arrow batch at a time; the publish scan
+retains every batch, because the copy-on-write publish rewrites them, so
+publication memory grows with retained history. Each `__manifest` version
+keeps its own copy of the rows and no path prunes `__manifest` versions yet.
 
 Successful local publication preserves the existing coherent projection after
 lineage adoption, avoiding a full reconstruction on the next unchanged refresh.

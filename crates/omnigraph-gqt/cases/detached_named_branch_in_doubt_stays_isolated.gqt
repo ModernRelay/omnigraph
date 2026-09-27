@@ -1,0 +1,116 @@
+# issue: none
+# red_on: none; guard case
+# notes: An in-doubt named-branch publication stays visible through later publications and restart, without leaking to main or duplicating an unkeyed edge.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person { name: String @key }
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- mutate
+branch create work
+--- expect ok
+
+--- seam
+at: publish.post_merge_pre_ack
+occurrence: 1
+action: fail
+scope: next_step
+
+--- seam
+at: publish.read_back
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate branch: work
+query ambiguous_write() {
+    insert Person { name: "bob" }
+    insert Knows { from: "alice", to: "alice" }
+}
+--- expect error: outcome is in doubt
+
+--- query branch: work
+query uncertain_publication_is_visible() {
+    match { $p: Person }
+    return { $p.name }
+}
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+--- expect shape
+p.name: String
+
+--- query branch: work
+query uncertain_edge_exists_once() {
+    match { $p: Person $p $e:knows $q }
+    return { $p.name, $q.name }
+}
+--- expect unordered
+{"p.name":"alice","q.name":"alice"}
+--- expect shape
+p.name: String
+q.name: String
+
+--- mutate branch: main
+query advance_main() { insert Person { name: "carol" } }
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: work
+query advance_work() { insert Person { name: "diana" } }
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- query branch: work
+query work_keeps_both_publications() {
+    match { $p: Person }
+    return { $p.name }
+}
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+{"p.name":"diana"}
+--- expect shape
+p.name: String
+
+--- query branch: work
+query work_edge_survives_once() {
+    match { $p: Person $p $e:knows $q }
+    return { $p.name, $q.name }
+}
+--- expect unordered
+{"p.name":"alice","q.name":"alice"}
+--- expect shape
+p.name: String
+q.name: String
+
+--- query branch: main
+query main_keeps_its_own_publication() {
+    match { $p: Person }
+    return { $p.name }
+}
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"carol"}
+--- expect shape
+p.name: String
+
+--- query branch: main
+query main_has_no_work_edges() {
+    match { $p: Person $p $e:knows $q }
+    return { $p.name, $q.name }
+}
+--- expect unordered
+--- expect shape
+p.name: String
+q.name: String

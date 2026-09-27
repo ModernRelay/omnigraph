@@ -122,16 +122,15 @@ def admit(records, point, runs, identity, binary_hash):
                     "Manifest logical rows changed")
             require(manifest["version_after"] >= manifest["version_before"] > 0,
                     "Manifest version moved backwards")
-            require(0 < manifest["fragments_after"] <= manifest["fragments_before"],
-                    "Unexpected manifest fragment layout")
+            require(manifest["fragments_before"] == manifest["fragments_after"] == 1,
+                    "copy-on-write publication leaves one __manifest fragment per branch")
             if layout == "uncompacted":
                 require(manifest["version_after"] == manifest["version_before"]
                         and manifest["fragments_after"] == manifest["fragments_before"],
                         "Uncompacted fixture was modified")
         require(metrics.get("setup_layout_full_rows_verified") == (layout == "compacted"),
                 "Compacted fixture needs exact full-row verification")
-        require(metrics.get("setup_layout_fragments_removed", -1) > 0 if layout == "compacted"
-                else metrics.get("setup_layout_fragments_removed") == 0, "Vacuous or unexpected compaction")
+        require(metrics.get("setup_layout_fragments_removed") == 0, "Unexpected manifest compaction")
         for prefix in ("open", "prewarm"):
             require(isinstance(metrics.get(f"{prefix}_io_manifest_reads"), int), f"Missing {prefix} accounting")
         if point["scenario"] in ("branch-create", "branch-create-from"):

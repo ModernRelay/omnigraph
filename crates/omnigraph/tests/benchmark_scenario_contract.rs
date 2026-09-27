@@ -630,7 +630,9 @@ fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
     assert!(controls.contains("versions.is_subset(&retained)"));
     assert!(controls.contains("compaction changed branch history/head/table pins"));
     assert!(controls.contains("compaction changed native branch identity or registry"));
-    assert!(controls.contains("compacted arm must perform physical work"));
+    assert!(
+        controls.contains("copy-on-write publication leaves one __manifest fragment per branch")
+    );
     assert!(controls.contains("one payload row from every table"));
     assert!(!controls.contains("cleanup_old_versions("));
     assert!(!controls.contains(".optimize().await"));

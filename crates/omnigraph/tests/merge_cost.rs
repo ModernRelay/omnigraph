@@ -23,7 +23,7 @@ mod helpers;
 use std::future::Future;
 
 use helpers::cost::{
-    IoCounts, assert_flat, assert_grows, cost_harness, local_graph, measure, measure_with_staged,
+    IoCounts, assert_flat, cost_harness, local_graph, measure, measure_with_staged,
 };
 use helpers::{
     MUTATION_QUERIES, collect_column_strings, commit_many, mixed_params, read_table_branch,
@@ -391,15 +391,11 @@ fn merge_lineage_setting_selects_the_completed_classifier() {
     });
 }
 
-/// CLAIM 2: a merge's `__manifest` cost grows with commit-history depth on an
-/// un-compacted graph. The bound route performs four coherent manifest scans (five for a non-bound target), and
-/// each surviving append-only journal fold scans O(fragments) of `__manifest`.
-/// Contrast with `write_cost.rs`, where a single write's manifest scan is held
-/// FLAT *after compaction* — here we deliberately do NOT compact, modelling the
-/// production graph that has grown its `_versions/` and `__manifest` fragments
-/// without GC.
+/// CLAIM 2: a merge's `__manifest` reads are flat in history on a graph that is
+/// never compacted: its four coherent scans (five for a non-bound target) each
+/// read the one live fragment.
 #[test]
-fn merge_manifest_cost_grows_with_history() {
+fn merge_manifest_cost_is_flat_in_history() {
     on_big_stack(|| {
         cost_harness(async {
             for inactive_target in [false, true] {
@@ -484,10 +480,7 @@ fn merge_manifest_cost_grows_with_history() {
                     curve.push((d, io));
                 }
 
-                // Regime A: merge __manifest cost still grows with history because
-                // each of the fixed-count coherent scans folds the uncompacted
-                // append-only journal.
-                assert_grows(&curve, |c| c.manifest_reads, 1, "merge __manifest scan");
+                assert_flat(&curve, |c| c.manifest_reads, 4, "merge __manifest scan");
                 // A named, non-bound target adds one coherent authority capture.
                 // Lineage minting and the cached starting publication view must
                 // not add two more full-history reads.

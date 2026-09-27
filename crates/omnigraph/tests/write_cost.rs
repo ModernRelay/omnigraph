@@ -25,8 +25,8 @@
 mod helpers;
 
 use helpers::cost::{
-    IoCounts, assert_flat, assert_grows, cost_harness, last_manifest_reads, local_graph, measure,
-    measure_insert, measure_insert_as, measure_with_staged,
+    IoCounts, assert_flat, cost_harness, last_manifest_reads, local_graph, measure, measure_insert,
+    measure_insert_as, measure_with_staged,
 };
 use helpers::{
     MUTATION_QUERIES, commit_many, commit_many_as, init_and_load, mixed_params, mutate_main,
@@ -333,31 +333,11 @@ async fn optimize_manifest_reads_are_flat_in_history() {
     .await;
 }
 
-/// **Served-regime twin of `internal_table_scans_are_flat_in_history` — the gate
-/// that was missing.** The flat gate above calls `db.optimize()` before EVERY
-/// measured write, so it only ever proves the *compacted* invariant and stays green
-/// even if a served graph's per-write `__manifest` scan amplifies without bound. A
-/// real served graph does NOT optimize between writes: every publish appends a
-/// fragment to `__manifest`, and the publish-path scan (`read_manifest_scan`, a bare
-/// `dataset.scan()` with no filter/projection) reads ALL of them, so the per-write
-/// `__manifest` read count is O(fragments-since-compaction) and climbs with history.
-/// That is the live amplification behind the reported single-row write latency
-/// (~16s on 0.7.2; still growing post-#299) — physical fragment read cost, not
-/// logical row count (output rows stay ~flat while requests grow).
-///
-/// **This is a TRIPWIRE, not the final gate.** It asserts the scan *grows*, i.e. it
-/// pins the CURRENT served-regime cost (green today) — exactly the `assert_grows`
-/// idiom its sibling `data_table_reads_split_into_flat_opener_and_scan_flat_with_session` uses,
-/// and the "turns red when the fix lands" shape of the Lance surface guards. It flips
-/// RED the moment the amplification is fixed (write-path probe-gated warm reuse, and
-/// bringing `__manifest` into `cleanup` version-GC so F stays bounded in history).
-/// **When it goes red, that is the signal to invert it to**
-/// `assert_flat(&curve, |c| c.manifest_reads, <slack>, "__manifest scan (served)")` —
-/// promoting it to the permanent served-regime gate. Only `manifest_reads` is
-/// asserted: lineage lives in `__manifest` (RFC-013 Phase 7) and the per-write
-/// commit-graph update is in-memory, so there is no separate commit-graph scan.
+/// Served-regime twin of `internal_table_scans_are_flat_in_history`: without
+/// `optimize` between writes, the per-write `__manifest` reads stay flat because
+/// every publish leaves one live fragment (formerly the `assert_grows` tripwire).
 #[tokio::test]
-async fn internal_table_scans_grow_without_compaction() {
+async fn internal_table_scans_are_flat_without_compaction() {
     cost_harness(async {
         const ACTOR: &str = "act-cost-gate-served";
         let dir = tempfile::tempdir().unwrap();
@@ -381,15 +361,10 @@ async fn internal_table_scans_grow_without_compaction() {
             curve.push((d, io));
         }
 
-        // Green TODAY (the bug): the per-write `__manifest` scan is O(fragments) and grows
-        // by far more than the flat gate's slack of 4 across a 10→100 depth sweep. The `20`
-        // floor mirrors the proven-safe `assert_grows` sibling (data-table scan) and sits
-        // comfortably below the real growth (~+3 `__manifest` reads/depth × ~90 depth × the
-        // 3–4 publish-path scans) while unambiguously distinguishing "grows" from "flat".
-        assert_grows(
+        assert_flat(
             &curve,
             |c| c.manifest_reads,
-            20,
+            4,
             "__manifest scan (uncompacted/served)",
         );
     })
