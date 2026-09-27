@@ -2172,21 +2172,9 @@ query chain($repo: String) {
     );
 }
 
-/// A zero-row cascade delete must not advance an edge table's Lance HEAD past
-/// its manifest version. A `delete <Node>` cascades a delete into every incident
-/// edge type (`exec/mutation.rs`). The original bug this guards against: the old
-/// inline `delete_where` (`Dataset::delete`) advanced Lance HEAD **even when zero
-/// edges matched**, while the cascade recorded the new version in the manifest
-/// only `if deleted_rows > 0`. So deleting a node with no incident edges advanced
-/// `edge:Knows` Lance HEAD while the manifest stayed behind — a `HEAD > manifest`
-/// drift that then tripped the next strict write's `PublishedDatasetVersionMismatch`, and
-/// `repair` refused (delete-class drift), wedging the graph.
-///
-/// This pins the invariant directly: after any node delete, every edge table's
-/// manifest version must equal its on-disk Lance HEAD — no write may advance HEAD
-/// past the manifest (invariant 2 / the deny-list). Now GREEN: `delete` is staged
-/// (MR-A / iss-950, via Lance 7.0's `DeleteBuilder::execute_uncommitted`), so a
-/// 0-row delete commits no Lance version at all — correct by construction.
+/// A node delete matching no edges cascades a 0-row delete into `edge:Knows`
+/// that commits no Lance version at all (MR-A): the registration keeps its pin,
+/// no detached version is staged, and the linear HEAD does not move.
 #[tokio::test]
 async fn node_delete_with_no_incident_edges_leaves_no_edge_table_drift() {
     let dir = tempfile::tempdir().unwrap();
@@ -2203,6 +2191,17 @@ async fn node_delete_with_no_incident_edges_leaves_no_edge_table_drift() {
     )
     .await
     .unwrap();
+    let before = snapshot_main(&db)
+        .await
+        .unwrap()
+        .dataset("edge:Knows")
+        .expect("edge:Knows must be in the manifest")
+        .clone();
+    let full = format!("{}/{}", root.trim_end_matches('/'), before.dataset_path);
+    let head_before = Dataset::open(&full).await.unwrap().version().version;
+    let detached_before = helpers::collector::detached_versions(&full).await;
+    let pin_before = pinned_version(&db, "main", "edge:Knows").await;
+
     mutate_main(
         &db,
         MUTATION_QUERIES,
@@ -2210,22 +2209,32 @@ async fn node_delete_with_no_incident_edges_leaves_no_edge_table_drift() {
         &params(&[("$name", "Loner")]),
     )
     .await
-    .expect("the first delete itself succeeds — it leaves the drift for the NEXT write");
+    .expect("the delete succeeds");
 
-    // The invariant: edge:Knows manifest version == its on-disk Lance HEAD.
-    let snap = snapshot_main(&db).await.unwrap();
-    let entry = snap
+    let after = snapshot_main(&db)
+        .await
+        .unwrap()
         .dataset("edge:Knows")
-        .expect("edge:Knows must be in the manifest");
-    let full = format!("{}/{}", root.trim_end_matches('/'), entry.dataset_path);
-    let head = Dataset::open(&full).await.unwrap().version().version;
+        .expect("edge:Knows must be in the manifest")
+        .clone();
     assert_eq!(
-        entry.published_dataset_version, head,
-        "a node delete matching no edges advanced edge:Knows Lance HEAD to v{head} but the \
-         manifest still records v{} — HEAD>manifest drift from a 0-row cascade delete. A staged \
-         0-row delete must commit no Lance version at all (MR-A); this drift means that \
-         regressed.",
-        entry.published_dataset_version,
+        pinned_version(&db, "main", "edge:Knows").await,
+        pin_before,
+        "a 0-row cascade delete publishes no new pin for edge:Knows"
+    );
+    assert_eq!(
+        after.published_dataset_version,
+        before.published_dataset_version
+    );
+    assert_eq!(
+        helpers::collector::detached_versions(&full).await,
+        detached_before,
+        "a 0-row cascade delete stages no detached version on edge:Knows"
+    );
+    assert_eq!(
+        Dataset::open(&full).await.unwrap().version().version,
+        head_before,
+        "a 0-row cascade delete commits no linear version on edge:Knows"
     );
 }
 

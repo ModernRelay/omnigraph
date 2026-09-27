@@ -2,7 +2,7 @@
 //!
 //! `MutationStaging` accumulates per-table input batches in memory during a
 //! `mutate_as` or `load` query. At end-of-query it prepares one staged Lance
-//! transaction per touched existing ref (or a deferred first-touch plan), then
+//! transaction per touched table, on the dataset its registration names, then
 //! joins the RFC-022 protocol: acquire ordered gates, revalidate the complete
 //! read set, commit each effect as a detached version (RFC 0067), and return
 //! the exact publisher inputs while retaining the guards through manifest CAS.
@@ -50,20 +50,6 @@ pub(crate) enum PendingMode {
     StrictInsert,
     Upsert,
     Overwrite,
-}
-
-/// Work that must be staged only after a first-touch target ref exists. Lance
-/// writes uncommitted fragment/deletion files under the opened branch's tree;
-/// staging against the inherited source and later committing on the target
-/// would publish paths that do not exist in the target tree.
-enum DeferredStagePlan {
-    Pending {
-        mode: PendingMode,
-        batch: RecordBatch,
-    },
-    Delete {
-        predicate: Expr,
-    },
 }
 
 /// Per-table accumulator. Each insert/update op pushes a `RecordBatch` into
@@ -114,10 +100,6 @@ pub(crate) struct StagedTablePath {
     pub(crate) pinned_native_ref: crate::db::manifest::NativeRefPin,
     /// The manifest registration the pin was read from (RFC 0067).
     pub(crate) entry: crate::db::DatasetEntry,
-    /// First-touch named-branch fork deferred until `commit_all` holds the
-    /// gates. Preparation reads the inherited `source_entry`; commit then
-    /// creates `target_branch` and stages branch-local files there.
-    pub(crate) deferred_fork: Option<crate::db::DeferredTableFork>,
 }
 
 /// Per-query staging state.
@@ -141,12 +123,9 @@ pub(crate) struct MutationStaging {
     /// `pending`. Staged as one combined `stage_delete` per table at
     /// end-of-query (no inline HEAD advance) — see `stage_delete_table`.
     pub(crate) delete_predicates: HashMap<String, Vec<Expr>>,
-    /// Ids removed per table, captured by the delete ops as they scan their
-    /// matched rows (so validation recounts the srcs a delete empties without
-    /// re-resolving the predicates). Disjoint from `pending` by D₂; flows into
-    /// the validation [`ChangeSet`](crate::validate::ChangeSet) via
-    /// [`to_changeset`](Self::to_changeset). The combined `stage_delete` at
-    /// commit still removes by predicate — these ids are validation-only.
+    /// Ids removed per table, captured by the delete ops from their matched
+    /// rows: validation recounts the srcs a delete empties, and the staged
+    /// delete records them on its transaction as the commit's change set.
     pub(crate) deleted_ids: HashMap<String, Vec<String>>,
     /// Strictest [`MutationOpKind`] seen per table within this query. Drives
     /// the op-kind-aware drift check in [`StagedMutation::commit_all`]: for
@@ -182,7 +161,6 @@ impl MutationStaging {
         table_branch: Option<String>,
         pinned_native_ref: Option<String>,
         entry: crate::db::DatasetEntry,
-        deferred_fork: Option<crate::db::DeferredTableFork>,
         expected_version: u64,
         op_kind: MutationOpKind,
     ) -> Result<()> {
@@ -203,7 +181,6 @@ impl MutationStaging {
                 table_branch,
                 pinned_native_ref: crate::db::manifest::NativeRefPin::Exact(pinned_native_ref),
                 entry,
-                deferred_fork,
             });
         self.expected_versions
             .entry(table_key.to_string())
@@ -457,8 +434,8 @@ impl MutationStaging {
     /// `stage_write_concurrency` setting, shared by the loader and the
     /// mutation path. Each staged write is an independent Lance dataset;
     /// ops within a single table stay serial under Lance's manifest OCC, so
-    /// cross-table staging has no shared state to race. Deferred first-touch
-    /// branch effects and delete transactions remain serial. Publication is
+    /// cross-table staging has no shared state to race. Delete transactions
+    /// remain serial. Publication is
     /// untouched: everything after staging still funnels through the single
     /// manifest CAS. The constructive staging stream drains before the first
     /// error surfaces (any staged-but-unpublished residue is reclaimable, not
@@ -474,8 +451,7 @@ impl MutationStaging {
             paths,
             pending,
             delete_predicates,
-            // Validation-only; consumed before staging, nothing to commit here.
-            deleted_ids: _,
+            deleted_ids,
             op_kinds: _,
         } = self;
 
@@ -613,7 +589,9 @@ impl MutationStaging {
             let Some(combined) = predicates.into_iter().reduce(Expr::or) else {
                 continue;
             };
-            if let Some(entry) = stage_delete_table(db, table_key, combined, path, expected).await?
+            let removed_ids = deleted_ids.get(&table_key).cloned().unwrap_or_default();
+            if let Some(entry) =
+                stage_delete_table(db, table_key, combined, path, expected, removed_ids).await?
             {
                 staged_entries.push(entry);
             }
@@ -725,42 +703,11 @@ async fn stage_pending_table(
     path: StagedTablePath,
     expected: u64,
 ) -> Result<Option<StagedTableEntry>> {
-    // Reopen the pinned dataset. Existing-table effects stage on this handle
-    // now. A deferred first-touch effect uses it only as the inherited source
-    // pin; its files stage on the target handle after the fork.
-    let ds = match path.deferred_fork.as_ref() {
-        Some(fork) => {
-            db.storage()
-                .open_snapshot_at_entry(&fork.source_entry)
-                .await?
-        }
-        None => {
-            db.open_pinned_for_write(&table_key, &path.full_path, &path.entry)
-                .await?
-        }
-    };
+    let ds = db
+        .open_pinned_for_write(&path.full_path, &path.entry)
+        .await?;
 
     let combined = table.batch;
-
-    if path.deferred_fork.is_some() {
-        // The transaction identity is minted before the fork; the actual Lance
-        // transaction is staged on the new target ref once `commit_all` has
-        // created it, then bound to this UUID. Its read version remains Lance's
-        // independently-derived value and is checked by the binder.
-        let planned_transaction = pre_minted_transaction_identity(expected);
-        return Ok(Some(StagedTableEntry {
-            table_key,
-            path,
-            expected_version: expected,
-            dataset: ds,
-            staged_write: None,
-            deferred_stage: Some(DeferredStagePlan::Pending {
-                mode: table.mode,
-                batch: combined,
-            }),
-            planned_transaction,
-        }));
-    }
 
     // Bracket the actual storage future, not preparation or publication. The
     // task-local probe is unset in production; tests use its rendezvous to
@@ -794,15 +741,12 @@ async fn stage_pending_table(
         }
         PendingMode::Overwrite => db.storage().stage_overwrite(&ds, combined).await?,
     };
-    let planned_transaction = staged.transaction_identity();
     Ok(Some(StagedTableEntry {
         table_key,
         path,
         expected_version: expected,
         dataset: ds,
         staged_write: Some(staged),
-        deferred_stage: None,
-        planned_transaction,
     }))
 }
 
@@ -820,57 +764,31 @@ async fn stage_delete_table(
     predicate: Expr,
     path: StagedTablePath,
     expected: u64,
+    deleted_ids: Vec<String>,
 ) -> Result<Option<StagedTableEntry>> {
-    let ds = match path.deferred_fork.as_ref() {
-        Some(fork) => {
-            db.storage()
-                .open_snapshot_at_entry(&fork.source_entry)
-                .await?
-        }
-        None => {
-            db.open_pinned_for_write(&table_key, &path.full_path, &path.entry)
-                .await?
-        }
-    };
-    if path.deferred_fork.is_some() {
-        // Probe only. The actual deletion vector must be written under the
-        // target branch tree after `commit_all` creates that ref.
-        if db
-            .storage()
-            .first_row_id_for_filter(&ds, predicate.clone(), db.catalog().system_columns)
-            .await?
-            .is_none()
-        {
-            return Ok(None);
-        }
-        return Ok(Some(StagedTableEntry {
-            table_key,
-            path,
-            expected_version: expected,
-            dataset: ds,
-            staged_write: None,
-            deferred_stage: Some(DeferredStagePlan::Delete { predicate }),
-            planned_transaction: pre_minted_transaction_identity(expected),
-        }));
-    }
+    let ds = db
+        .open_pinned_for_write(&path.full_path, &path.entry)
+        .await?;
     match db.storage().stage_delete(&ds, predicate).await? {
-        Some(staged) => Ok(Some(StagedTableEntry {
-            table_key,
-            path,
-            expected_version: expected,
-            dataset: ds,
-            planned_transaction: staged.transaction_identity(),
-            staged_write: Some(staged),
-            deferred_stage: None,
-        })),
+        Some(mut staged) => {
+            staged
+                .record_deleted_ids(ds.dataset(), &deleted_ids)
+                .await?;
+            Ok(Some(StagedTableEntry {
+                table_key,
+                path,
+                expected_version: expected,
+                dataset: ds,
+                staged_write: Some(staged),
+            }))
+        }
         None => Ok(None),
     }
 }
 
-/// Output of [`MutationStaging::stage_all`]. Carries ready Lance transactions
-/// for existing refs and complete deferred stage plans for first-touch named
-/// refs, plus the metadata needed to commit the detached effects and produce
-/// the publisher's input.
+/// Output of [`MutationStaging::stage_all`]. Carries one ready Lance
+/// transaction per touched table, plus the metadata needed to commit the
+/// detached effects and produce the publisher's input.
 ///
 /// Splitting `stage_all` and `commit_all` keeps reclaimable preparation outside
 /// writer gates while the latter owns ordered acquisition, revalidation, and
@@ -887,80 +805,14 @@ pub(crate) struct StagedMutation {
     expected_versions: crate::db::manifest::ExpectedTableVersions,
 }
 
-/// Per-table state captured during `stage_all` and consumed by
-/// `commit_all`. Holds the opened snapshot plus either a staged Lance
-/// transaction or a deferred first-touch plan. Storage handles remain opaque
-/// per MR-793 §III.9 — the inner `lance::Dataset` / `StagedWrite` are not
-/// visible to engine code outside the storage layer.
+/// Per-table state from `stage_all` for `commit_all`: the opened snapshot and
+/// its staged Lance transaction, both opaque storage handles (MR-793 §III.9).
 struct StagedTableEntry {
     table_key: String,
     path: StagedTablePath,
     expected_version: u64,
     dataset: SnapshotHandle,
     staged_write: Option<StagedHandle>,
-    deferred_stage: Option<DeferredStagePlan>,
-    planned_transaction: crate::table_store::StagedTransactionIdentity,
-}
-
-fn pre_minted_transaction_identity(
-    read_version: u64,
-) -> crate::table_store::StagedTransactionIdentity {
-    crate::table_store::StagedTransactionIdentity {
-        read_version,
-        // Lance treats the UUID as an opaque transaction identity/path
-        // component. A ULID is equally unique and filesystem-safe while
-        // avoiding a second UUID generator in the engine surface.
-        uuid: format!("omnigraph-{}", crate::dst_ids::new_ulid()),
-    }
-}
-
-async fn stage_deferred_plan(
-    db: &crate::db::Omnigraph,
-    table_key: &str,
-    target: SnapshotHandle,
-    plan: DeferredStagePlan,
-    planned: &crate::table_store::StagedTransactionIdentity,
-) -> Result<StagedHandle> {
-    let mut staged = match plan {
-        DeferredStagePlan::Pending { mode, batch } => match mode {
-            PendingMode::StrictInsert => {
-                db.storage()
-                    .stage_keyed_write(
-                        target.clone(),
-                        table_key,
-                        batch,
-                        KeyedWriteSemantics::StrictInsert,
-                        db.catalog().system_columns,
-                    )
-                    .await?
-            }
-            PendingMode::Upsert => {
-                db.storage()
-                    .stage_keyed_write(
-                        target.clone(),
-                        table_key,
-                        batch,
-                        KeyedWriteSemantics::Upsert,
-                        db.catalog().system_columns,
-                    )
-                    .await?
-            }
-            PendingMode::Overwrite => db.storage().stage_overwrite(&target, batch).await?,
-        },
-        DeferredStagePlan::Delete { predicate } => db
-            .storage()
-            .stage_delete(&target, predicate)
-            .await?
-            .ok_or_else(|| {
-                OmniError::manifest_read_set_changed(
-                    "deferred_delete_match",
-                    Some("matching row at inherited pin".to_string()),
-                    Some("no matching row on exact target fork".to_string()),
-                )
-            })?,
-    };
-    staged.bind_transaction_identity(planned)?;
-    Ok(staged)
 }
 
 /// Output of [`StagedMutation::commit_all`] after its detached effects: the
@@ -973,9 +825,6 @@ pub(crate) struct CommittedMutation {
     /// publisher checks them together with native branch identity, exact graph
     /// head, and schema identity as one authority precondition.
     pub(crate) expected_versions: crate::db::manifest::ExpectedTableVersions,
-    /// RFC 0067: what promotes each published pin from the handles the writer
-    /// holds, in the order the tables were staged; empty when nothing staged.
-    pub(crate) promotions: Vec<crate::db::HeldPromotion>,
     /// Root schema, coarse branch, and sorted `(table, branch)` guards. The
     /// caller MUST hold the complete set across manifest publish (see
     /// `commit_all`) so no same-process writer interleaves after revalidation.
@@ -989,18 +838,11 @@ decide_seam! {
     pub static MUTATION_POST_TABLE_COMMIT = ("mutation.post_table_commit", Mutation, [Fail]);
 }
 
-decide_seam! {
-    /// After every deferred first-touch table ref is created, before any
-    /// staged transaction is committed on it. An unreferenced fork is
-    /// reclaimable garbage that cleanup classifies, never a visible effect.
-    pub static MUTATION_POST_FORK_PRE_COMMIT = ("mutation.post_fork_pre_commit", Mutation, [Fail]);
-}
-
 impl StagedMutation {
     /// Acquire ordered schema/branch/table gates, revalidate the complete read
     /// set, commit every staged effect as a detached version of its pinned
     /// base (RFC 0067), and return the publisher input plus guards. No Lance
-    /// HEAD moves here; the caller promotes the returned pins after publishing.
+    /// HEAD moves here, and the published pins stay detached.
     ///
     /// **Caller must hold the returned `_guards` Vec across the
     /// subsequent manifest publish.** Releasing guards before publish
@@ -1018,18 +860,14 @@ impl StagedMutation {
     /// and fully reprepares; strict Update/Delete/Overwrite returns
     /// `ReadSetChanged`. Both outcomes occur before any detached commit, so
     /// staged transaction files remain unreferenced and reclaimable.
-    /// First-touch named-branch forks are also deferred to this phase. The
-    /// method acquires schema → branch → table gates, revalidates the complete
-    /// read token, and only then creates any Lance refs.
     pub(crate) async fn commit_all(
         self,
         db: &crate::db::Omnigraph,
         branch: Option<&str>,
         txn: &crate::db::WriteTxn,
-        lineage_intent: &crate::db::manifest::LineageIntent,
     ) -> Result<CommittedMutation> {
         let StagedMutation {
-            mut staged,
+            staged,
             expected_versions,
         } = self;
 
@@ -1092,26 +930,6 @@ impl StagedMutation {
                     Some(current.to_string()),
                 ));
             }
-
-            if entry.path.deferred_fork.is_some() {
-                // The inherited handle is the pin: its linear version, or its
-                // staged version while the pin is pending (RFC 0067); the fork
-                // loop below promotes a pending pin before it forks.
-                let opened = entry.dataset.version();
-                let staged = snapshot
-                    .dataset(&entry.table_key)
-                    .and_then(|e| e.version_metadata.staged_version());
-                if opened != current && staged != Some(opened) {
-                    return Err(OmniError::manifest_read_set_changed(
-                        format!("published_dataset_version:{}", entry.table_key),
-                        Some(current.to_string()),
-                        Some(opened.to_string()),
-                    ));
-                }
-            }
-            // RFC 0067: the effect is a detached commit of the pinned base, so
-            // the table's linear HEAD is no concern of this writer. Publication
-            // is the one CAS; promotion follows it.
         }
         // An empty load/mutation has no independently durable table effect.
         // It may still publish its fixed lineage intent.
@@ -1119,7 +937,6 @@ impl StagedMutation {
             return Ok(CommittedMutation {
                 updates: Vec::new(),
                 expected_versions,
-                promotions: Vec::new(),
                 guards,
             });
         }
@@ -1132,71 +949,14 @@ impl StagedMutation {
                 ))
             })?),
         };
-        for entry in &mut staged {
-            if let Some(fork) = entry.path.deferred_fork.as_mut() {
-                fork.target_branch = crate::branch_names::table_fork_name(
-                    &fork.target_branch,
-                    txn.base.graph_manifest_version(),
-                    &lineage_intent.graph_commit_id,
-                );
-                entry.path.table_branch = Some(fork.target_branch.clone());
-            }
-        }
 
         // Deterministic pre-effect race point: the authority is validated and
         // nothing durable exists yet. A concurrent winner may publish; this
         // attempt then loses the manifest CAS and reprepares.
         fail(&catalog::FORK_BEFORE_CLASSIFY)?;
 
-        // RFC 0067: first-touch forks are created now, with no intent record.
-        // An unreferenced fork is reclaimable garbage that cleanup classifies,
-        // never a graph-visible effect. A pending pin on the inherited source
-        // is promoted first so the fork has a linear version to start from.
-        let mut created_any_fork = false;
-        for entry in &mut staged {
-            let Some(fork) = entry.path.deferred_fork.clone() else {
-                continue;
-            };
-            db.promote_inherited_pin(&entry.table_key, &entry.path.full_path, &fork.source_entry)
-                .await?;
-            let target = db
-                .fork_dataset_from_entry_state(
-                    &entry.table_key,
-                    fork.source_entry.identity,
-                    &entry.path.full_path,
-                    fork.source_entry.native_dataset_branch.as_deref(),
-                    fork.source_entry.published_dataset_version,
-                    &fork.target_branch,
-                )
-                .await?;
-            entry.dataset = target;
-            created_any_fork = true;
-            let plan = entry.deferred_stage.take().ok_or_else(|| {
-                OmniError::manifest_internal(format!(
-                    "deferred fork for '{}' has no deferred stage plan",
-                    entry.table_key
-                ))
-            })?;
-            let staged_write = stage_deferred_plan(
-                db,
-                &entry.table_key,
-                entry.dataset.clone(),
-                plan,
-                &entry.planned_transaction,
-            )
-            .await?;
-            entry.staged_write = Some(staged_write);
-        }
-        if created_any_fork {
-            fail(&MUTATION_POST_FORK_PRE_COMMIT)?;
-        }
-
-        // RFC 0067: every staged effect is committed as a detached version of
-        // its pinned base. Nothing moves the table's linear HEAD, nothing can
-        // rebase, and nothing is visible until the manifest publishes the pin
-        // `(expected + 1, staged, uuid)`; promotion replays the pin after that.
+        let witness = txn.authority.staging_witness()?;
         let mut updates: Vec<DatasetUpdate> = Vec::with_capacity(staged.len());
-        let mut promotions = Vec::with_capacity(staged.len());
         for entry in staged {
             let StagedTableEntry {
                 table_key,
@@ -1204,8 +964,6 @@ impl StagedMutation {
                 expected_version,
                 dataset,
                 staged_write,
-                deferred_stage: _,
-                planned_transaction: _,
             } = entry;
             let staged_write = staged_write.ok_or_else(|| {
                 OmniError::manifest_internal(format!(
@@ -1213,29 +971,17 @@ impl StagedMutation {
                     table_key
                 ))
             })?;
-            let base = dataset.clone();
             let (detached, identity) = db
                 .storage()
-                .commit_staged_detached(dataset, staged_write)
+                .commit_staged_detached(dataset, staged_write, &witness)
                 .await?;
             let state = db.storage().table_state(&path.full_path, &detached).await?;
             let target = expected_version + 1;
             let version_metadata = state
                 .version_metadata
                 .with_table_fork_owner(table_fork_owner)
-                .with_staged(state.version, identity.uuid.clone());
-            promotions.push(crate::db::HeldPromotion {
-                table_key: table_key.clone(),
-                dataset_path: path.entry.dataset_path.clone(),
-                full_path: path.full_path.clone(),
-                table_branch: path.table_branch.clone(),
-                base,
-                chain: Vec::new(),
-                detached,
-                target,
-                uuid: identity.uuid,
-                e_tag: version_metadata.e_tag().map(str::to_string),
-            });
+                .with_staged(state.version, identity.uuid.clone())
+                .with_last_linear_version(path.entry.version_metadata.last_linear_version());
             updates.push(DatasetUpdate {
                 identity: path.identity,
                 type_key: table_key,
@@ -1250,7 +996,6 @@ impl StagedMutation {
         Ok(CommittedMutation {
             updates,
             expected_versions,
-            promotions,
             guards,
         })
     }

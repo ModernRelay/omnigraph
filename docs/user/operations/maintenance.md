@@ -5,7 +5,8 @@ OmniGraph provides four direct-storage maintenance commands:
 - `optimize` compacts data and reconciles declared indexes.
 - `rebuild-full-text-indexes` replaces full-text indexes on one branch.
 - `repair` classifies storage drift and can publish an approved repair.
-- `cleanup` permanently removes eligible old versions and unused table forks.
+- `cleanup` permanently removes unretained table versions and unused table
+  forks left by branches created before storage format v11.
 
 They do not run through the HTTP server. Address a standalone graph directly,
 or select a graph from a cluster root:
@@ -15,9 +16,9 @@ omnigraph optimize ./graph.omni
 omnigraph optimize --cluster s3://company/omnigraph --graph knowledge
 ```
 
-Stop overlapping writers while running maintenance. Azure writers must also
-run through `omnigraph-azure-admission`; Azure support remains a qualification
-preview pending the adversarial live-Azure matrix.
+Follow the command-specific concurrency requirements below. Azure writers
+must also run through `omnigraph-azure-admission`; Azure support remains a
+qualification preview pending the adversarial live-Azure matrix.
 
 ## Optimize
 
@@ -34,8 +35,8 @@ versions or collect unused table forks. Use `cleanup` for storage reclamation.
 Each table's work is staged as detached Lance versions of the table's current
 pin and published in one graph commit, like any other write. A run
 that fails before that commit leaves the graph unchanged and no recovery
-state; a run interrupted after it leaves pins the next write on each table,
-or `cleanup`, promotes onto the table's linear history. Optimize runs beside
+state; after it the published pins are the tables' versions, with nothing
+left to finish. Optimize runs beside
 live writers: a write that lands on a table while its compaction is staged
 fails the run with a read-set conflict, and the next run re-plans from the
 new state. An update or delete prepared before an optimize published reports
@@ -62,11 +63,6 @@ commit or maintenance work.
 
 A vector index whose property has no usable vectors remains pending rather than
 failing the run. Run optimize again after loading or generating vectors.
-
-Optimize refuses a table whose published write is blocked by a foreign commit
-on its linear history (`repair` reports it as `blocked_promotion`) and
-unexplained drift on a table's linear history; use `repair` for drift that
-remains unexplained.
 
 ## Rebuild full-text indexes
 
@@ -104,48 +100,65 @@ guessed replacement; see [unsupported inventory](upgrade.md#unsupported-index-in
 
 ## Repair
 
-Repair is a deliberate operator action for a node or edge type whose backing
-dataset is ahead of the graph's visible version without a matching
-interrupted operation. Preview first:
+Repair reports, per node or edge type, how the backing dataset's Lance linear
+history stands against the graph's registration. Preview:
 
 ```bash
 omnigraph repair ./graph.omni --json
 ```
 
-After reviewing every classification, publish only verified maintenance drift:
+Every OmniGraph table write is a detached Lance commit that a graph commit
+pins, so a table's linear history ends where it was created, and the
+registration records that point as its last linear version
+(`omnigraph.last_linear_version`; `1` for a table created under storage
+format v11). A graph table is classified `no_drift` when its linear HEAD
+equals that version and `foreign_drift` when linear commits sit above it. A
+foreign commit came from something other than OmniGraph writing the table
+directory; no read or write of the graph resolves the linear HEAD, so
+foreign drift changes no query result and blocks no writer. For a
+`foreign_drift` table `repair` prints the last linear version, the HEAD and
+the number of foreign versions in `operations`, takes no action (`no_op`)
+and exits 0. It never adopts the foreign commit, with or without
+`--force --confirm`. `cleanup` leaves foreign versions and their files in
+place and lists them per table under `foreign_versions`. A HEAD below the
+recorded last linear version is reported as an internal manifest error.
+Each `repair --json` row carries `type_key`, `published_dataset_version`,
+`lance_head_version`, `classification`, `action`, `operations` and `error`.
 
-```bash
-omnigraph repair ./graph.omni --confirm
-```
-
-Suspicious or unverifiable drift is refused. `--force --confirm` can publish it,
-but should be used only when an operator has independently established that the
-the new state of the backing dataset is correct. Repair publishes an existing state; it
-does not rewrite lost or corrupt data.
-
-A `blocked_promotion` classification names a table whose published write
-cannot land on the linear history because a foreign commit took its version.
-Reads, mutations and loads keep working through the pin. Branch merge, index
-builds, schema apply, the system-column upgrade, optimize and a branch's first
-write to that table refuse it. `cleanup` skips version GC for it because only
-the pin's detached version holds the acknowledged rows. Repair reports the
-block on every live branch, so one table can appear once per branch with the
-same `type_key` (the `error` field names the branch), and never adopts the
-foreign commit, with or without `--force`. No command resolves a blocked pin yet; see
-[Troubleshooting](troubleshooting.md#blocked-pin).
-
-If you cannot verify suspicious drift, restore or rebuild from a trusted export
-or backup.
+`--confirm` and `--force --confirm` remain accepted and publish nothing on a
+v11 graph: the classes they used to publish (`verified_maintenance`,
+`suspicious`, `unverifiable`) described a table whose registration named its
+linear HEAD, which no v11 registration does. To discard foreign commits,
+export the graph and load it into a new one; see
+[Troubleshooting](troubleshooting.md#foreign-drift).
 
 ## Cleanup
 
-Cleanup collects unused table forks and permanently removes eligible old
-versions from node and edge datasets, plus data reachable only through those
-versions. Branch deletion and later writes leave reclamation to this command.
-Forks still needed by a live branch or its underlying history remain protected,
-even if their original branch no longer uses them. Without
-`--confirm`, the CLI only echoes the requested retention policy and exits before
-opening the graph; it does not enumerate candidate versions:
+Cleanup is a tracing collector over the graph's table storage. Every table
+write is a detached Lance commit that a graph commit pins, so what a table
+keeps is decided by which graph commits the run retains. Per live branch
+the run computes the graph commits its policy keeps, takes the table
+versions those commits pin as roots, marks every file the root manifests
+reference (base and overlay data files, deletion files, index directories,
+transaction files), and deletes unretained table versions and the files only
+they reference. Selected merge bases and native tagged snapshots are retained
+in addition to the versions selected by the policy.
+Historical table lifetimes participate even after a type is dropped or its
+name is re-added under a new identity. Blob sidecars follow their parent data
+file's reachability.
+A table version no graph commit ever named is unpublished staging: a write
+in flight, or one that failed before its publication. Unless a native tag
+protects it, it is deleted when the branch incarnation and graph head its
+commit recorded can no longer be published against: its valid incarnation is absent from a complete inventory taken
+after the staged manifests were listed, or the captured head moved past its
+publication without naming it. Missing or malformed ownership is kept.
+Cleanup validates its complete branch and tag capture after all table
+inventories; an overlapping change refuses the plan before deletion. Cleanup also removes table forks
+left by branches created before storage format v11 once nothing references
+them and the graph branch incarnation in their name is gone. Branch deletion
+and later writes leave reclamation to this command. Without `--confirm`, the
+CLI only echoes the requested retention policy and exits before opening the
+graph; it does not enumerate candidates:
 
 ```bash
 omnigraph cleanup --keep 10 --older-than 7d ./graph.omni
@@ -161,19 +174,25 @@ At least one retention option is required:
 
 | Option | Meaning |
 |---|---|
-| `--keep N` | Request retention of the newest `N` versions per retained node or edge dataset |
-| `--older-than DURATION` | Remove only older versions; defer unused-fork collection while any data or branch-reference object is newer than the cutoff; among detached manifests whose linear twin is verified, reap only the older ones. A verified detached manifest newer than the cutoff stays in place and does not defer its table's version GC |
+| `--keep N` | Retain the newest `N` graph commits of every live branch, and every table version they pin |
+| `--older-than DURATION` | Also retain every graph commit newer than the cutoff, on every live branch; and collect a pre-v11 table fork only once every data and branch-reference object of the fork is older than the cutoff |
 
-When both are present, a version must be outside both retention windows before
-it can be removed. Live branches and other storage references may keep
-additional versions. The count applies to dataset versions, not graph commits,
-and does not by itself retain forks. A fork that no pin references is collected
-once the graph branch incarnation in its name is gone: immediately with `--keep`
-alone, and with `--older-than` only after every data and branch-reference object
-of the fork is older than the cutoff. Forks of a live branch are kept. Forks
-whose name carries no incarnation, which includes every fork of a branch
-created before incarnation-suffixed names, are kept permanently. Deleting a branch starts a fresh grace period for its retained history,
-even when that history is old. Choose a policy that matches your rollback and audit needs.
+A graph commit survives when either option retains it. The current HEAD of
+every live branch is always retained, and a named branch also keeps its
+oldest commit, the copy of the parent's commit it was created from, while
+the branch lives. Cleanup also retains the selected merge bases between
+current branch heads and accepted merge inputs. Native tags protect the exact
+snapshots they name. A tagged graph snapshot retains all its table versions; a
+tagged table snapshot retains that version, including a detached version or a
+version on main.
+`--keep` counts graph commits on that branch, never Lance versions of a
+dataset: `--keep 10` keeps the last ten graph commits of each live branch
+readable, with every table version one of them pins, whatever their age. A pre-v11 fork that no
+registration references is collected once the graph branch incarnation in
+its name is gone: immediately with `--keep` alone, and with `--older-than`
+only after every object of the fork is older than the cutoff. Native tags,
+readable graph snapshots and required native ancestors also protect forks. Choose a policy that matches
+your rollback and audit needs.
 
 For `s3://` and `az://` targets, destructive execution also requires an
 interactive confirmation or `--yes`. Non-interactive and JSON runs refuse
@@ -182,49 +201,72 @@ without `--yes`.
 Before cleanup:
 
 1. stop long-lived Blob readers and readers of snapshots the policy removes;
-   writers may keep running (see below);
 2. verify important branches and snapshots;
 3. make or verify a backup/export;
-4. resolve interrupted operations and any drift reported by `repair`;
+4. review the retention policy against the snapshots and branches you still
+   need;
 5. review the exact retention command and confirmation target.
 
-Cleanup fails closed if it cannot prove that live branches or storage drift
-are safe. A failure to clean one backing dataset is reported in
-the result; fix the cause and rerun cleanup to converge.
+Cleanup fails closed per table: a trace that does not finish (a pinned
+version missing from the table's version listing, or a read that failed)
+deletes nothing for that table and reports why in its result row; fix the
+cause and rerun cleanup to converge. The run derives each branch's history
+and pins from one captured version, then validates that the live inventory,
+versions, incarnations and tags still match after all table inventories.
+A changed observation refuses the whole plan before deletion; rerun with the
+same policy. Retirement archives exact branch identity and ancestry inside
+its native tree, then removes the active ref. Creation does not scan retired
+histories. Cleanup removes unneeded retired trees and their archives, while
+preserving trees needed by live descendants, merge bases or tags.
 
-Cleanup may run beside live writers. A write that has not published yet keeps
-its detached manifests, and a branch's first-write table fork is kept while
-that branch is live. Such a table's version GC is deferred for the run, and a
-later cleanup converges once the write has published. A write that lands on
-main while cleanup is classifying can make the run stop with a HEAD-drift
-refusal; rerun cleanup.
+Ordinary graph writes and branch merges may overlap cleanup. A merge protects
+its accepted source, target and base snapshots with durable native tags;
+source advancement does not revoke those inputs. A cancelled merge or one
+whose publication returns an in-doubt error keeps its tags until the target
+witness proves it can no longer publish. An unchanged or unresolvable target
+keeps them. Graph-branch creation/deletion and cleanup retain the existing
+single-writer-process control boundary.
 
-Two things defer a table's version GC: a detached manifest without a verified
-linear twin, and a blocked pin. Cleanup promotes a pending pin itself. Both are retained
-even when old, because a writer may still publish them and an age cutoff is
-not proof that a writer has stopped. The table's result row sets `deferred` to `true` and its `error` field (under `--json`) names the retained
-detached versions and which cause applies. Cleanup preserves their data files
-and continues with unaffected tables. Staging that a failed write abandoned is
-retained indefinitely and keeps deferring that table. A detached manifest whose
-linear twin is verified never defers version GC, whatever its age;
-`--older-than` only decides whether it is reaped in this run. A detached
-manifest whose target version is gone while the table is already at or past
-that version is also reclaimable. A chain's links are deleted oldest first, so
-an interrupted run leaves a chain the next run can still verify.
+Legacy native snapshots can borrow another location's files. Cleanup retains
+those physical origins, including overlay and index files. An incomplete origin
+trace prevents physical-file deletion across the run. Unregistered native trees
+can retain extra origin files until a later cleanup after those trees vanish.
 
-Exit 0 means every table was visited and nothing that a live branch, a
-pending pin or an unverified detached manifest needs was removed. It does not
-mean every table was collected: read the result rows for failed and deferred
-tables. `repair` reports a foreign commit blocking promotion but does not adopt
-it, including with `--force`.
+Ordinary writes retain unpublished staging, because the branch head its commit recorded is still the
+branch's head. A write that publishes during the run either landed before
+the snapshot, in which case its version is a root, or after it, in which
+case its staging is kept for the same reason. Staging left by a write that
+failed before publication is kept until that branch publishes again or is
+deleted; on a branch that never publishes again it stays, and its table's
+result row counts it under `unpublished_manifests`. Age alone never decides
+anything: an old staging is not proof that its writer stopped, and an old
+pinned version is never removed while a retained graph commit names it.
+Files no listed manifest references follow Lance's seven-day unverified-file
+rule, including temporary manifests. Each orphan Blob sidecar must satisfy
+that age rule itself, even when its parent data file is older.
+
+Each table's result row (under `--json`) carries `bytes_removed`,
+`manifests_removed` (table versions deleted: published ones no retained
+graph commit names, and dead staging), `unpublished_manifests` and
+`unpublished_bytes` (the staging the run found, dead ones included),
+`foreign_versions` (Lance versions above the table's last linear version,
+which the run never deletes) and `error`, set only when the table's trace
+did not finish, in which case its counts are zero. `old_versions_removed`
+stays for one release beside `manifests_removed` and carries the same
+number; nothing defers a table, so the row has no `deferred` field.
+
+Exit 0 means every table was visited and that nothing a retained graph
+commit pins, and no file such a commit references, was removed. It does not mean every table was collected: read the result rows
+for tables with an `error`.
 
 ## Suggested cadence
 
 - Run `optimize` after large loads or on a regular cadence for write-heavy
   graphs.
-- Run `repair` only when a command reports uncovered drift.
+- Run `repair` when you want to know whether something outside OmniGraph
+  committed to a table's Lance history.
 - Run `cleanup` from an explicit retention policy after backups and rollback
   requirements have been reviewed.
 
-Storage-format upgrades use export and rebuild, not maintenance. See
+Storage-format upgrades are `omnigraph upgrade`, not maintenance. See
 [Upgrading](upgrade.md).

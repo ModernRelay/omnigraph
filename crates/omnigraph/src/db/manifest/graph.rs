@@ -367,7 +367,8 @@ async fn build_initial_entries(
             control_session,
         )
         .await?;
-        let metadata = TableVersionMetadata::from_dataset(root_uri, &table_path, &ds)?;
+        let metadata = TableVersionMetadata::from_dataset(root_uri, &table_path, &ds)?
+            .with_last_linear_version(Some(ds.version().version));
 
         entries.push(DatasetEntry {
             identity,
@@ -407,7 +408,8 @@ async fn build_initial_entries(
             control_session,
         )
         .await?;
-        let metadata = TableVersionMetadata::from_dataset(root_uri, &table_path, &ds)?;
+        let metadata = TableVersionMetadata::from_dataset(root_uri, &table_path, &ds)?
+            .with_last_linear_version(Some(ds.version().version));
 
         entries.push(DatasetEntry {
             identity,

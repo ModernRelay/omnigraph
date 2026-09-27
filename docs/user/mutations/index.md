@@ -150,8 +150,8 @@ controls that width for both Load and insert/update mutations (default 8,
 range `1..=64`); it is `process` scope, so the server takes it from
 `OMNIGRAPH_LOAD_CONCURRENCY` and a direct CLI run from that variable or from
 `--set` on `load`, `ingest` or `mutate` (a JSONL input carries no `set` line),
-and an invalid or `0` value refuses startup instead of running the default. First-touch branch effects are
-deferred and delete staging remains serial. This affects preparation only—one
+and an invalid or `0` value refuses startup instead of running the default.
+Delete staging remains serial. This affects preparation only—one
 request still publishes exactly one graph commit.
 
 A stale strict update, delete, or overwrite can return `read_set_conflict`.

@@ -1,14 +1,18 @@
 //! Crash classification for Lance's public native branch controls.
 //!
-//! Graph retirement marks logical authority in branch metadata while preserving
-//! native refs and trees for explicit cleanup. Controls remain serialized by
+//! Graph retirement archives exact native authority before unlinking its active
+//! ref. Native trees remain available until dependency-aware cleanup. Controls remain serialized by
 //! OmniGraph's single-writer-process schema, branch, and table gates.
 
 use std::collections::HashMap;
 use std::future::Future;
 
+use futures::StreamExt;
 use lance::Dataset;
-use lance::dataset::refs::{BranchContents, BranchIdentifier, check_valid_branch};
+use lance::dataset::refs::{
+    BranchContents, BranchIdentifier, branch_contents_path, check_valid_branch,
+};
+use object_store::{ObjectStoreExt, PutMode, PutOptions};
 
 use crate::error::{OmniError, Result};
 use crate::seams::{decide_seam, fail};
@@ -109,6 +113,20 @@ pub(crate) async fn resolve_live_native_branch(
     dataset: &Dataset,
     logical: &str,
 ) -> Result<Option<String>> {
+    let live = live_manifest_branches_matching(dataset, |candidate| candidate == logical).await?;
+    crate::branch_names::resolve_native_branch(live.iter().map(String::as_str), logical)
+}
+
+pub(crate) async fn schema_apply_locked(dataset: &Dataset) -> Result<bool> {
+    live_manifest_branches_matching(dataset, crate::db::is_schema_apply_lock_branch)
+        .await
+        .map(|branches| !branches.is_empty())
+}
+
+async fn live_manifest_branches_matching(
+    dataset: &Dataset,
+    matches: impl Fn(&str) -> bool,
+) -> Result<Vec<String>> {
     let root = dataset
         .branch_location()
         .find_main()
@@ -119,7 +137,7 @@ pub(crate) async fn resolve_live_native_branch(
         .map_err(OmniError::storage)?;
     let mut live = Vec::new();
     for native in list_branch_ref_names(&store, &root.path).await? {
-        if crate::branch_names::logical_branch_name(&native) != logical {
+        if !matches(crate::branch_names::logical_branch_name(&native)) {
             continue;
         }
         let path = lance::dataset::refs::branch_contents_path(&root.path, &native);
@@ -135,7 +153,83 @@ pub(crate) async fn resolve_live_native_branch(
             Err(error) => return Err(OmniError::storage(error)),
         }
     }
-    crate::branch_names::resolve_native_branch(live.iter().map(String::as_str), logical)
+    Ok(live)
+}
+
+/// Validate the source and the target's equal, ancestor and descendant names.
+pub(crate) async fn ensure_manifest_branch_create_namespace(
+    dataset: &Dataset,
+    target: &str,
+) -> Result<()> {
+    let target_prefix = format!("{target}/");
+    let source = dataset
+        .manifest()
+        .branch
+        .as_deref()
+        .map(crate::branch_names::logical_branch_name);
+    let overlaps_target = |candidate: &str| {
+        candidate == target
+            || (candidate != "main"
+                && (candidate.starts_with(&target_prefix)
+                    || target.starts_with(&format!("{candidate}/"))))
+    };
+    let mut live = live_manifest_branches_matching(dataset, |candidate| {
+        Some(candidate) == source || overlaps_target(candidate)
+    })
+    .await?;
+    live.sort();
+    let mut names = std::collections::BTreeSet::new();
+    for native in &live {
+        let logical = crate::branch_names::logical_branch_name(native);
+        if !names.insert(logical) {
+            return Err(OmniError::manifest_conflict(format!(
+                "branch '{logical}' has more than one live native incarnation; run cleanup \
+                 before using it"
+            )));
+        }
+    }
+    if names.contains(target) {
+        return Err(OmniError::manifest_conflict(format!(
+            "branch '{target}' already exists"
+        )));
+    }
+    if let Some(conflicting) = names.into_iter().find(|name| overlaps_target(name)) {
+        return Err(OmniError::manifest_conflict(format!(
+            "cannot create branch '{target}' while live branch '{conflicting}' shares its \
+             physical Lance path; live graph branch names may not be ancestors or descendants"
+        )));
+    }
+    Ok(())
+}
+
+async fn branch_ref_names(dataset: &Dataset) -> Result<Vec<String>> {
+    let root = dataset
+        .branch_location()
+        .find_main()
+        .map_err(OmniError::storage)?;
+    let store = dataset
+        .object_store(None)
+        .await
+        .map_err(OmniError::storage)?;
+    list_branch_ref_names(&store, &root.path).await
+}
+
+async fn branch_tree_exists(dataset: &Dataset, branch: &str) -> Result<bool> {
+    let target = dataset
+        .branch_location()
+        .find_branch(Some(branch))
+        .map_err(OmniError::storage)?;
+    let store = dataset
+        .object_store(None)
+        .await
+        .map_err(OmniError::storage)?;
+    Ok(store
+        .read_dir_all(&target.path, None)
+        .next()
+        .await
+        .transpose()
+        .map_err(OmniError::storage)?
+        .is_some())
 }
 
 /// Every native ref name under `_refs/branches/`, decoded the way Lance's own
@@ -172,6 +266,7 @@ pub(crate) async fn list_all_branch_contents(
 }
 
 const RETIRED_MANIFEST_BRANCH_KEY: &str = "omnigraph.retired_manifest_branch";
+pub(crate) const RETIRED_BRANCH_ARCHIVE: &str = "_omnigraph_retired_branch.json";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -217,6 +312,196 @@ pub(crate) async fn list_live_manifest_branch_contents(
     Ok(live)
 }
 
+/// Retired refs left by older writers or an interrupted archive publication.
+pub(crate) async fn list_retired_manifest_branch_contents(
+    dataset: &Dataset,
+) -> Result<HashMap<String, BranchContents>> {
+    let mut retired = HashMap::new();
+    for (branch, contents) in list_branch_contents(dataset).await? {
+        if !manifest_branch_is_live(&branch, &contents)? {
+            retired.insert(branch, contents);
+        }
+    }
+    Ok(retired)
+}
+
+fn retirement_archive_path(dataset: &Dataset, branch: &str) -> Result<object_store::path::Path> {
+    Ok(dataset
+        .branch_location()
+        .find_branch(Some(branch))
+        .map_err(OmniError::storage)?
+        .path
+        .join(RETIRED_BRANCH_ARCHIVE))
+}
+
+/// Read immutable retirement history without restoring live branch authority.
+pub(crate) async fn archived_manifest_branch(
+    dataset: &Dataset,
+    branch: &str,
+) -> Result<Option<BranchContents>> {
+    check_valid_branch(branch).map_err(OmniError::storage)?;
+    let path = retirement_archive_path(dataset, branch)?;
+    let store = dataset
+        .object_store(None)
+        .await
+        .map_err(OmniError::storage)?;
+    let bytes = match store.inner.get(&path).await {
+        Ok(object) => object
+            .bytes()
+            .await
+            .map_err(|error| OmniError::storage(error.into()))?,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(OmniError::storage(error.into())),
+    };
+    let contents: BranchContents = serde_json::from_slice(&bytes).map_err(|error| {
+        OmniError::manifest_conflict(format!(
+            "invalid retirement archive for '{branch}': {error}"
+        ))
+    })?;
+    if manifest_branch_is_live(branch, &contents)? {
+        return Err(OmniError::manifest_conflict(format!(
+            "retirement archive for '{branch}' lacks exact retirement metadata"
+        )));
+    }
+    Ok(Some(contents))
+}
+
+/// Enumerate immutable histories only during maintenance and historical lookup.
+pub(crate) async fn list_archived_manifest_branches(
+    dataset: &Dataset,
+) -> Result<HashMap<String, BranchContents>> {
+    let root = dataset
+        .branch_location()
+        .find_main()
+        .map_err(OmniError::storage)?
+        .path
+        .join("tree");
+    let prefix = format!("{root}/");
+    let suffix = format!("/{RETIRED_BRANCH_ARCHIVE}");
+    let store = dataset
+        .object_store(None)
+        .await
+        .map_err(OmniError::storage)?;
+    let mut files = store.read_dir_all(&root, None);
+    let mut archives = HashMap::new();
+    while let Some(file) = files.next().await {
+        let file = file.map_err(OmniError::storage)?;
+        if file.location.filename() != Some(RETIRED_BRANCH_ARCHIVE) {
+            continue;
+        }
+        let branch = file
+            .location
+            .as_ref()
+            .strip_prefix(&prefix)
+            .and_then(|relative| relative.strip_suffix(&suffix))
+            .ok_or_else(|| {
+                OmniError::manifest_conflict("retirement archive outside native tree")
+            })?;
+        let contents = archived_manifest_branch(dataset, branch)
+            .await?
+            .ok_or_else(|| {
+                OmniError::manifest_conflict(format!(
+                    "retirement archive for '{branch}' disappeared during inventory"
+                ))
+            })?;
+        archives.insert(branch.to_string(), contents);
+    }
+    Ok(archives)
+}
+
+fn same_branch_contents(left: &BranchContents, right: &BranchContents) -> bool {
+    left.identifier == right.identifier
+        && left.parent_branch == right.parent_branch
+        && left.parent_version == right.parent_version
+        && left.create_at == right.create_at
+        && left.manifest_size == right.manifest_size
+        && left.metadata == right.metadata
+}
+
+/// Archive before unlinking: a crash leaves either retired authority or its
+/// immutable history, and never makes a retired native path reusable.
+async fn archive_retired_ref(
+    dataset: &Dataset,
+    branch: &str,
+    contents: &BranchContents,
+) -> Result<()> {
+    if manifest_branch_is_live(branch, contents)? {
+        return Err(OmniError::manifest_conflict(format!(
+            "cannot archive live branch '{branch}'"
+        )));
+    }
+    let path = retirement_archive_path(dataset, branch)?;
+    let store = dataset
+        .object_store(None)
+        .await
+        .map_err(OmniError::storage)?;
+    let bytes = serde_json::to_vec(contents).map_err(|error| {
+        OmniError::manifest_internal(format!("failed to encode retirement archive: {error}"))
+    })?;
+    if let Err(error) = store
+        .inner
+        .put_opts(
+            &path,
+            bytes.into(),
+            PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        let Some(existing) = archived_manifest_branch(dataset, branch).await? else {
+            return Err(OmniError::storage(error.into()));
+        };
+        if !same_branch_contents(contents, &existing) {
+            return Err(OmniError::manifest_conflict(format!(
+                "retirement archive for '{branch}' changed"
+            )));
+        }
+    }
+    fail(&BRANCH_DELETE_POST_ARCHIVE)?;
+    match get_branch_contents(dataset, branch).await {
+        Ok(observed) if same_branch_contents(&observed, contents) => {}
+        Ok(_) => {
+            return Err(OmniError::manifest_conflict(format!(
+                "branch '{branch}' changed before ref unlink"
+            )));
+        }
+        Err(lance::Error::RefNotFound { .. }) => return Ok(()),
+        Err(error) => return Err(OmniError::storage(error)),
+    }
+    let root = dataset
+        .branch_location()
+        .find_main()
+        .map_err(OmniError::storage)?
+        .path;
+    match store
+        .inner
+        .delete(&branch_contents_path(&root, branch))
+        .await
+    {
+        Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+        Err(error) => match get_branch_contents(dataset, branch).await {
+            Err(lance::Error::RefNotFound { .. }) => Ok(()),
+            Ok(_) => Err(OmniError::storage(error.into())),
+            Err(read_error) => Err(OmniError::storage(read_error)),
+        },
+    }
+}
+
+/// Finish retirement records written by an older writer or before a crash.
+pub(crate) async fn archive_retired_manifest_branches(dataset: &Dataset) -> Result<()> {
+    let mut retired = list_retired_manifest_branch_contents(dataset)
+        .await?
+        .into_iter()
+        .collect::<Vec<_>>();
+    retired.sort_by(|left, right| left.0.cmp(&right.0));
+    for (branch, contents) in retired {
+        archive_retired_ref(dataset, &branch, &contents).await?;
+    }
+    Ok(())
+}
+
 /// Read exact native authority and refuse retired or malformed graph refs.
 pub(crate) async fn get_live_manifest_branch_contents(
     dataset: &Dataset,
@@ -239,13 +524,17 @@ pub(crate) async fn get_live_manifest_branch_contents(
 }
 
 decide_seam! {
-    /// After Lance returns success from native delete, before OmniGraph
-    /// acknowledges it. Recovery must classify the absent BranchContents as a
-    /// completed logical deletion.
+    /// After native retirement succeeds, before OmniGraph acknowledges it.
+    /// A lost acknowledgement is classified through the exact retirement marker.
     pub static BRANCH_DELETE_POST_NATIVE = ("branch_delete.post_native", BranchDelete, [Fail]);
 }
 
-/// Retire logical authority through public metadata; cleanup owns physical refs.
+decide_seam! {
+    /// After immutable retirement history is durable, before unlinking its ref.
+    pub static BRANCH_DELETE_POST_ARCHIVE = ("branch_delete.post_archive", BranchDelete, [Fail]);
+}
+
+/// Revoke logical authority, archive its exact history, then unlink only the ref.
 /// Callers hold schema, branch, and table gates in one writer process.
 /// The metadata replacement is one-object publication, without a native CAS.
 pub(crate) async fn retire_branch_recoverably(
@@ -256,18 +545,26 @@ pub(crate) async fn retire_branch_recoverably(
     if branch == "main" {
         return Err(OmniError::manifest_conflict("cannot retire branch 'main'"));
     }
-    let contents = dataset
-        .branches()
-        .get(branch)
-        .await
-        .map_err(OmniError::storage)?;
+    let mut contents = match get_branch_contents(dataset, branch).await {
+        Ok(contents) => contents,
+        Err(lance::Error::RefNotFound { .. }) => {
+            let archive = archived_manifest_branch(dataset, branch).await?;
+            return match archive {
+                Some(archive) if archive.identifier == *expected_identifier => Ok(()),
+                _ => Err(OmniError::manifest_conflict(format!(
+                    "branch '{branch}' has no matching retirement archive"
+                ))),
+            };
+        }
+        Err(error) => return Err(OmniError::storage(error)),
+    };
     if contents.identifier != *expected_identifier {
         return Err(OmniError::manifest_conflict(format!(
             "branch '{branch}' changed before retirement"
         )));
     }
     if !manifest_branch_is_live(branch, &contents)? {
-        return Ok(());
+        return archive_retired_ref(dataset, branch, &contents).await;
     }
     if expected_identifier == &BranchIdentifier::main()
         || expected_identifier == &BranchIdentifier::missing_identifier_sentinel()
@@ -277,10 +574,9 @@ pub(crate) async fn retire_branch_recoverably(
         )));
     }
     let tags = dataset.tags().list().await.map_err(OmniError::storage)?;
-    if let Some((tag, _)) = tags
-        .iter()
-        .find(|(_, tag)| tag.branch.as_deref() == Some(branch))
-    {
+    if let Some((tag, _)) = tags.iter().find(|(name, tag)| {
+        tag.branch.as_deref() == Some(branch) && !crate::db::manifest::is_merge_input_tag(name)
+    }) {
         return Err(OmniError::storage(lance::Error::RefConflict {
             message: format!(
                 "cannot retire graph branch '{branch}' while native manifest tag '{tag}' pins it; remove the tag first"
@@ -295,28 +591,32 @@ pub(crate) async fn retire_branch_recoverably(
     let value = serde_json::to_string(&record).map_err(|error| {
         OmniError::manifest_internal(format!("failed to encode branch retirement: {error}"))
     })?;
-    let mut metadata = contents.metadata;
-    metadata.insert(RETIRED_MANIFEST_BRANCH_KEY.to_string(), value);
-    let result = match dataset.branches().replace_metadata(branch, metadata).await {
+    contents
+        .metadata
+        .insert(RETIRED_MANIFEST_BRANCH_KEY.to_string(), value);
+    let result = match dataset
+        .branches()
+        .replace_metadata(branch, contents.metadata.clone())
+        .await
+    {
         Ok(()) => fail(&BRANCH_DELETE_POST_NATIVE),
         Err(error) => Err(OmniError::storage(error)),
     };
-    let Err(error) = result else { return Ok(()) };
-    let observed = dataset
-        .branches()
-        .get(branch)
-        .await
-        .map_err(OmniError::storage)?;
-    if observed.identifier != *expected_identifier {
-        return Err(OmniError::manifest_conflict(format!(
-            "branch '{branch}' changed during retirement"
-        )));
+    if let Err(error) = result {
+        let observed = get_branch_contents(dataset, branch)
+            .await
+            .map_err(OmniError::storage)?;
+        if observed.identifier != *expected_identifier {
+            return Err(OmniError::manifest_conflict(format!(
+                "branch '{branch}' changed during retirement"
+            )));
+        }
+        if manifest_branch_is_live(branch, &observed)? {
+            return Err(error);
+        }
+        contents = observed;
     }
-    if manifest_branch_is_live(branch, &observed)? {
-        Err(error)
-    } else {
-        Ok(())
-    }
+    archive_retired_ref(dataset, branch, &contents).await
 }
 
 /// Pinned Lance treats an already-absent target tree as success. OmniGraph
@@ -349,7 +649,11 @@ async fn force_delete_branch_tree_unchecked(dataset: &mut Dataset, branch: &str)
 }
 
 async fn branch_contents(dataset: &Dataset, branch: &str) -> Result<Option<BranchContents>> {
-    Ok(list_branch_contents(dataset).await?.get(branch).cloned())
+    match get_branch_contents(dataset, branch).await {
+        Ok(contents) => Ok(Some(contents)),
+        Err(lance::Error::RefNotFound { .. }) => Ok(None),
+        Err(error) => Err(OmniError::storage(error)),
+    }
 }
 
 pub(crate) fn path_descendant<'a>(
@@ -364,13 +668,10 @@ pub(crate) fn path_descendant<'a>(
         .min()
 }
 
-fn path_collision<'a>(
-    branches: &'a HashMap<String, BranchContents>,
-    branch: &str,
-) -> Option<&'a str> {
+fn path_collision<'a>(branches: &'a [String], branch: &str) -> Option<&'a str> {
     let branch_prefix = format!("{branch}/");
     branches
-        .keys()
+        .iter()
         .map(String::as_str)
         .filter(|candidate| {
             *candidate != branch
@@ -421,6 +722,22 @@ pub(crate) async fn reclaim_ref_absent_tree(dataset: &mut Dataset, branch: &str)
              physical Lance path; delete the child branch first"
         )));
     }
+    let target = dataset
+        .branch_location()
+        .find_branch(Some(branch))
+        .map_err(OmniError::storage)?;
+    let store = dataset
+        .object_store(None)
+        .await
+        .map_err(OmniError::storage)?;
+    let mut files = store.read_dir_all(&target.path, None);
+    while let Some(file) = files.next().await {
+        if file.map_err(OmniError::storage)?.location.filename() == Some(RETIRED_BRANCH_ARCHIVE) {
+            return Err(OmniError::manifest_conflict(format!(
+                "cannot reuse branch '{branch}' while retired native history remains"
+            )));
+        }
+    }
     // This is the final authority read before the destructive call. The
     // supported single-writer-process gate boundary prevents a local create
     // from interleaving after it; an exact ref observed here is never passed to
@@ -459,33 +776,34 @@ decide_seam! {
     pub static BRANCH_CREATE_POST_NATIVE = ("branch_create.post_native", BranchCreate, [Fail]);
 }
 
-/// Create a fresh table fork once. A fork no manifest publication references is
-/// garbage that cleanup reclaims.
-pub(crate) async fn create_unique_table_fork(
-    source: &mut Dataset,
-    branch: &str,
-    source_version: u64,
-) -> Result<Dataset> {
-    check_valid_branch(branch).map_err(OmniError::storage)?;
-    if source.version().version != source_version {
-        return Err(OmniError::manifest_conflict(format!(
-            "table fork source moved: expected version {}, current {}",
-            source_version,
-            source.version().version,
-        )));
+/// Archived legacy ancestors still own their native path, even without refs.
+/// Flat generated names need no archive probe; slash names cost one per ancestor.
+async fn refuse_archived_path_ancestor(dataset: &Dataset, branch: &str) -> Result<()> {
+    for (end, _) in branch.match_indices('/') {
+        let ancestor = &branch[..end];
+        let path = retirement_archive_path(dataset, ancestor)?;
+        let store = dataset
+            .object_store(None)
+            .await
+            .map_err(OmniError::storage)?;
+        match store.inner.head(&path).await {
+            Ok(_) => {
+                return Err(OmniError::manifest_conflict(format!(
+                    "cannot create branch '{branch}' while retired branch '{ancestor}' shares its physical Lance path"
+                )));
+            }
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(error) => return Err(OmniError::storage(error.into())),
+        }
     }
-    let created = crate::storage_layer::lance_clone::create_branch(source, branch, source_version)
-        .await
-        .map_err(OmniError::storage)?;
-    fail(&BRANCH_CREATE_POST_NATIVE)?;
-    Ok(created)
+    Ok(())
 }
 
 /// Create a branch with a bounded recovery classifier.
 ///
 /// The caller must already hold OmniGraph's schema → source/target branch →
-/// table gate envelope. An absent `BranchContents` ref makes any same-name tree
-/// derived garbage, so it is reclaimed before the first attempt. An ambiguous
+/// table gate envelope. A ref-absent tree without retirement history is derived
+/// garbage and is reclaimed before the first attempt. An ambiguous
 /// native error is then classified from fresh authority: matching contents are
 /// accepted as a lost acknowledgement, mismatching contents are never deleted,
 /// and a ref-less clone is reclaimed before one bounded retry.
@@ -510,8 +828,10 @@ pub(crate) async fn create_branch_recoverably(
         .await
         .map_err(OmniError::storage)?;
 
-    let initial_branches = list_branch_contents(source).await?;
-    if initial_branches.contains_key(branch) {
+    let initial_branches = branch_ref_names(source).await?;
+    if initial_branches.iter().any(|name| name == branch)
+        && branch_contents(source, branch).await?.is_some()
+    {
         return Ok(BranchCreateOutcome::RefAlreadyExists);
     }
     if let Some(conflicting) = path_collision(&initial_branches, branch) {
@@ -520,7 +840,12 @@ pub(crate) async fn create_branch_recoverably(
              physical Lance path; live graph branch names may not be ancestors or descendants"
         )));
     }
-    if !reclaim_ref_absent_tree(source, branch).await? {
+    refuse_archived_path_ancestor(source, branch).await?;
+    if branch_contents(source, branch).await?.is_some() {
+        return Err(authority_appeared_after_absence(source, branch).await?);
+    }
+    if branch_tree_exists(source, branch).await? && !reclaim_ref_absent_tree(source, branch).await?
+    {
         return Err(authority_appeared_after_absence(source, branch).await?);
     }
 
@@ -1099,6 +1424,126 @@ mod tests {
         assert_eq!(vanish.injected_failures(), 1);
     }
 
+    /// The scoped sentinel check is a writer fence: unrelated damaged refs
+    /// must not block it, but a damaged sentinel cannot mean "unlocked". Keep
+    /// legacy and generated lifetimes, retirement, and read races in one fixture.
+    #[tokio::test]
+    async fn schema_lock_lookup_preserves_authority_while_ignoring_unrelated_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dataset = test_dataset(&dir).await;
+        let version = dataset.version().version;
+        let sentinel = crate::db::SCHEMA_APPLY_LOCK_BRANCH;
+        let generated = crate::branch_names::native_branch_name(
+            sentinel,
+            &crate::branch_names::mint_incarnation(),
+        );
+
+        for logical in [sentinel.to_string(), format!("/{sentinel}")] {
+            let native = crate::branch_names::native_branch_name(
+                &logical,
+                &crate::branch_names::mint_incarnation(),
+            );
+            assert!(crate::db::is_schema_apply_lock_branch(
+                crate::branch_names::logical_branch_name(&native)
+            ));
+        }
+
+        dataset
+            .create_branch("unrelated", version, None)
+            .await
+            .unwrap();
+        let root = dataset.branch_location().find_main().unwrap().path;
+        let store = dataset.object_store(None).await.unwrap();
+        let unrelated = lance::dataset::refs::branch_contents_path(&root, "unrelated");
+        store.put(&unrelated, b"{").await.unwrap();
+        assert!(
+            !schema_apply_locked(&dataset).await.unwrap(),
+            "an unrelated malformed ref must not turn an idle schema into a lock error"
+        );
+
+        for native in [sentinel.to_string(), generated] {
+            dataset.create_branch(&native, version, None).await.unwrap();
+            assert!(
+                schema_apply_locked(&dataset).await.unwrap(),
+                "a live sentinel must block writers: {native}"
+            );
+
+            let transient = Arc::new(VanishingBranchRefFault::stale_head_size_once(&format!(
+                "{native}.json"
+            )));
+            let wrapped = dataset.with_object_store_wrappers(vec![
+                Arc::clone(&transient) as Arc<dyn WrappingObjectStore>
+            ]);
+            assert!(
+                schema_apply_locked(&wrapped).await.unwrap(),
+                "a torn sentinel read must retry without admitting a writer"
+            );
+            assert_eq!(transient.injected_failures(), 1);
+
+            let identity = dataset.branches().get(&native).await.unwrap().identifier;
+            retire_branch_recoverably(&dataset, &native, &identity)
+                .await
+                .unwrap();
+            assert!(
+                !schema_apply_locked(&dataset).await.unwrap(),
+                "a validated retired sentinel must no longer block writers: {native}"
+            );
+
+            let retired = archived_manifest_branch(&dataset, &native)
+                .await
+                .unwrap()
+                .unwrap();
+            store
+                .put(
+                    &lance::dataset::refs::branch_contents_path(&root, &native),
+                    &serde_json::to_vec(&retired).unwrap(),
+                )
+                .await
+                .unwrap();
+            let mismatched = RetiredManifestBranch {
+                version: 1,
+                native_branch: "different-native-ref".to_string(),
+                identifier: retired.identifier.clone(),
+            };
+            for malformed in ["{".to_string(), serde_json::to_string(&mismatched).unwrap()] {
+                let mut metadata = retired.metadata.clone();
+                metadata.insert(RETIRED_MANIFEST_BRANCH_KEY.to_string(), malformed);
+                dataset
+                    .branches()
+                    .replace_metadata(&native, metadata)
+                    .await
+                    .unwrap();
+                let error = schema_apply_locked(&dataset)
+                    .await
+                    .expect_err("malformed or mismatched sentinel retirement must fail closed");
+                assert!(error.to_string().contains("retirement metadata"), "{error}");
+                dataset
+                    .branches()
+                    .replace_metadata(&native, retired.metadata.clone())
+                    .await
+                    .unwrap();
+            }
+
+            let persistent = Arc::new(VanishingBranchRefFault::new(
+                &format!("{native}.json"),
+                usize::MAX,
+                InjectedRefRead::StaleHeadSize,
+            ));
+            let wrapped = dataset.with_object_store_wrappers(vec![
+                Arc::clone(&persistent) as Arc<dyn WrappingObjectStore>
+            ]);
+            schema_apply_locked(&wrapped)
+                .await
+                .expect_err("an unreadable relevant sentinel must never be treated as absent");
+            assert!(persistent.injected_failures() >= BRANCH_REF_READ_MAX_ATTEMPTS);
+            assert_eq!(persistent.branch_lists(), 1);
+            assert!(
+                !schema_apply_locked(&dataset).await.unwrap(),
+                "the read-only failures must leave the validated retirement intact"
+            );
+        }
+    }
+
     #[test]
     fn create_match_requires_exact_parent_incarnation_prefix() {
         let parent = BranchIdentifier {
@@ -1158,7 +1603,10 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let retired = dataset.branches().get("feature").await.unwrap();
+        let retired = archived_manifest_branch(&dataset, "feature")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(retired.identifier, original.identifier);
         assert_eq!(
             retired.metadata.get("external").map(String::as_str),
@@ -1166,7 +1614,7 @@ mod tests {
         );
         assert!(!manifest_branch_is_live("feature", &retired).unwrap());
         assert!(
-            list_branch_contents(&dataset)
+            !list_branch_contents(&dataset)
                 .await
                 .unwrap()
                 .contains_key("feature")
@@ -1181,15 +1629,136 @@ mod tests {
             get_live_manifest_branch_contents(&dataset, "feature").await,
             Err(OmniError::BranchNotFound { .. })
         ));
-        let historical = dataset.checkout_branch("feature").await.unwrap();
+        let historical = dataset
+            .checkout_version(lance::dataset::refs::Ref::Version(
+                Some("feature".to_string()),
+                Some(version),
+            ))
+            .await
+            .unwrap();
         assert_eq!(historical.version().version, version);
         retire_branch_recoverably(&dataset, "feature", &original.identifier)
             .await
             .unwrap();
         assert_eq!(
-            serde_json::to_value(dataset.branches().get("feature").await.unwrap()).unwrap(),
+            serde_json::to_value(
+                archived_manifest_branch(&dataset, "feature")
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
             serde_json::to_value(retired).unwrap(),
         );
+    }
+
+    #[cfg(feature = "failpoints")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn retirement_archive_retry_preserves_legacy_identity_and_ref_until_valid() {
+        let _scenario = crate::seams::FailScenario::setup();
+        for legacy in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut dataset = test_dataset(&dir).await;
+            let version = dataset.version().version;
+            dataset
+                .create_branch("feature", version, None)
+                .await
+                .unwrap();
+            let root = dataset.branch_location().find_main().unwrap().path;
+            let store = dataset.object_store(None).await.unwrap();
+            if legacy {
+                let mut value =
+                    serde_json::to_value(dataset.branches().get("feature").await.unwrap()).unwrap();
+                value.as_object_mut().unwrap().remove("identifier");
+                store
+                    .put(
+                        &branch_contents_path(&root, "feature"),
+                        &serde_json::to_vec(&value).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let expected = dataset.branches().get("feature").await.unwrap().identifier;
+            {
+                let _interrupted = BRANCH_DELETE_POST_ARCHIVE.fire_always();
+                retire_branch_recoverably(&dataset, "feature", &expected)
+                    .await
+                    .unwrap_err();
+            }
+            let pending = dataset.branches().get("feature").await.unwrap();
+            assert!(!manifest_branch_is_live("feature", &pending).unwrap());
+            assert_eq!(pending.identifier, expected);
+            let archived = archived_manifest_branch(&dataset, "feature")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(archived.identifier, expected);
+            let archive_path = retirement_archive_path(&dataset, "feature").unwrap();
+            store.put(&archive_path, b"{").await.unwrap();
+            retire_branch_recoverably(&dataset, "feature", &expected)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                dataset.branches().get("feature").await.unwrap().identifier,
+                expected
+            );
+            assert!(list_archived_manifest_branches(&dataset).await.is_err());
+            store
+                .put(&archive_path, &serde_json::to_vec(&archived).unwrap())
+                .await
+                .unwrap();
+            archive_retired_manifest_branches(&dataset).await.unwrap();
+            assert!(matches!(
+                dataset.branches().get("feature").await,
+                Err(lance::Error::RefNotFound { .. })
+            ));
+            retire_branch_recoverably(&dataset, "feature", &expected)
+                .await
+                .unwrap();
+            assert!(
+                reclaim_ref_absent_tree(&mut dataset, "feature")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                list_archived_manifest_branches(&dataset).await.unwrap()["feature"].identifier,
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retirement_archive_preserves_nested_native_path_ownership() {
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let mut dataset = test_dataset(&dir).await;
+        let native = "team/data/feature";
+        let version = dataset.version().version;
+        dataset.create_branch(native, version, None).await.unwrap();
+        let identifier = dataset.branches().get(native).await.unwrap().identifier;
+        retire_branch_recoverably(&dataset, native, &identifier)
+            .await
+            .unwrap();
+        assert!(
+            dir.path()
+                .join("tree/team/data/feature")
+                .join(RETIRED_BRANCH_ARCHIVE)
+                .exists()
+        );
+        let archives = list_archived_manifest_branches(&dataset).await.unwrap();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(archives[native].identifier, identifier);
+        assert!(matches!(
+            dataset.branches().get(native).await,
+            Err(lance::Error::RefNotFound { .. })
+        ));
+        let error = create_branch_recoverably(&mut dataset, "team/data/feature/child", version)
+            .await
+            .err()
+            .expect("retired path must refuse a descendant");
+        assert!(error.to_string().contains("retired branch"), "{error}");
     }
 
     #[tokio::test]

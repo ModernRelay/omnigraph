@@ -51,7 +51,7 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Maintenance and substrate fences | `maintenance.rs`, `lance_surface_guards.rs`, `lance_version_columns.rs`, `forbidden_apis.rs` |
 | Export and lineage | `export.rs`, `lineage_projection.rs` |
 | Legacy-vintage graphs (`id`/`src`/`dst` spellings, born at the current stamp) | `legacy_columns.rs` — load, query, export round trip, evolution; needs `--features failpoints` |
-| System-column upgrade (RFC 0040 step 3: respelling in place on a served graph, no stamp change since v10) | `system_column_upgrade.rs` — check and execute, preflight refusals, every window before the manifest commit leaving no residue, a post-commit failure finished by the next read-write open or the same handle's next write, pending pins after a skipped promotion, the control-object cost; needs `--features failpoints`. Route composition and the default target: `upgrade/tests.rs` |
+| System-column upgrade (RFC 0040 step 3: respelling in place on a served graph, no stamp change since v10) | `system_column_upgrade.rs` — check and execute, preflight refusals, every window before the manifest commit leaving no residue, a post-commit failure finished by the next read-write open or the same handle's next write, the control-object cost; needs `--features failpoints`. Route composition and the default target: `upgrade/tests.rs` |
 | Cost and benchmark contracts | `write_cost.rs`, `write_cost_s3.rs`, `warm_read_cost.rs`, `branch_control_cost.rs`, `merge_cost.rs`, `changes_cost.rs`, the checkpoint/head lookup instruments, and `benchmark_scenario_contract.rs` |
 
 Use `tests/helpers/mod.rs` for the standard graph, snapshots, row reads, Blob selectors, and bounded Blob collection. Recovery helpers belong in `tests/helpers/recovery.rs`; object-store counters belong in `tests/helpers/cost.rs`.
@@ -61,12 +61,12 @@ candidate scans, bounded page work, and caught-up versus backlog polling curves.
 
 ### Recovery and failpoints
 
-Crash tests must cover the writer, the promotion that follows it, and the user-visible reopening behavior:
+Crash tests must cover the writer and the user-visible reopening behavior:
 
-- `tests/failpoints.rs` owns crash windows around durable effects: after a detached effect, before and after publication, between promotions, where the graph is unchanged or a pin stays pending;
+- `tests/failpoints.rs` owns crash windows around durable effects: after a detached effect and before publication, where the graph is unchanged, and after publication, where the pin is complete;
 - `tests/detached_commit_matrix.rs` owns the writer × window × fault × recovery-actor matrix under one oracle;
 - `tests/recovery.rs` owns what is left of open-time recovery: a clean open creates nothing, a sidecar from an older build refuses a read-write open and not a read-only one, and a read-only open never touches schema staging;
-- `tests/lance_surface_guards.rs` owns the twin-replay rules promotion depends on;
+- `tests/lance_surface_guards.rs` owns the Lance detached-commit facts the pin and the collector depend on;
 - the writer's normal integration owner proves pre-effect failures leave no residue.
 
 To add a seam: declare it beside the site it guards, above the item that

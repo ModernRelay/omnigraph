@@ -288,8 +288,10 @@ fn replay_uses_frozen_case_and_rejects_changed_evidence() {
 #[test]
 fn several_seams_before_one_step_each_deliver_and_a_repeated_seam_is_refused() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let text = std::fs::read_to_string(root.join("cases/mutation_pending_pin_survives_reopen.gqt"))
-        .unwrap();
+    let text = std::fs::read_to_string(
+        root.join("cases/mutation_contention_and_lost_ack_survive_reopen.gqt"),
+    )
+    .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("two_seams.gqt");
     std::fs::write(&path, &text).unwrap();
@@ -312,7 +314,7 @@ fn several_seams_before_one_step_each_deliver_and_a_repeated_seam_is_refused() {
         .collect::<Vec<_>>();
     assert_eq!(
         delivered,
-        vec!["publish.load_state", "mutation.post_publish_pre_promotion"],
+        vec!["publish.load_state", "publish.post_merge_pre_ack"],
         "one delivery record per seam, in declaration order"
     );
 

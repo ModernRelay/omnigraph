@@ -61,8 +61,8 @@ assertion remains a failure unless it meets the explicit known-failure contract 
 Place a seam directly before its mutate operation, a GQ mutation or a branch
 statement; no seam is crossed by a query step yet. Several seam blocks may
 precede one operation when they name distinct seams (contention at
-publication and a failure before promotion on one mutation,
-`cases/mutation_pending_pin_survives_reopen.gqt`); each carries
+publication and a lost acknowledgement on one mutation,
+`cases/mutation_contention_and_lost_ack_survive_reopen.gqt`); each carries
 its own delivery record, and the same seam twice before one operation is
 refused. The one exception is the store: at most one directive per step may
 act on the store, as a store place or as a store action on a decision seam; a
@@ -103,9 +103,10 @@ contention-only seam, or an explicit `contention` action, injects a retryable
 error that the publisher retries, so the step succeeds and the `seam_delivered` record is its only
 proof; on a seam declaring fail the step states the injected error in its
 `--- expect error:` row, unless the site swallows the failure by design (the
-promotion after a mutation's publication, `mutation.post_publish_pre_promotion`,
-where the step succeeds and the delivery record is the proof,
-`cases/mutation_pending_pin_survives_reopen.gqt`). A `skip` action carries
+lost acknowledgement after a publication, `publish.post_merge_pre_ack`, which
+the publisher's read-back recognizes as success, so the step succeeds and the
+delivery record is the proof,
+`cases/mutation_contention_and_lost_ack_survive_reopen.gqt`). A `skip` action carries
 the healthy expectation the skipped path produces; a lost durable write is
 then proven healed by a `--- restart` and the query after it. The occurrence counts
 crossings inside that operation, including production retries; setup and

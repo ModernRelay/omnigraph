@@ -1,5 +1,5 @@
 //! The full crash-window catalog for the hunt
-//! (`dst_hunt_crash_window_sweep`): 61 of the engine's decision seams
+//! (`dst_hunt_crash_window_sweep`): 56 of the engine's decision seams
 //! (`omnigraph::seams::catalog`) at the pinned engine version. A seam added
 //! to the engine enters here as never-reached until its workload exists.
 //!
@@ -7,7 +7,7 @@
 //! be a name the engine catalog declares, so a typo'd or renamed-away window
 //! fails the suite instead of compiling and silently never firing.
 
-pub const CRASH_WINDOWS: [&str; 61] = [
+pub const CRASH_WINDOWS: [&str; 56] = [
     "blob_read.post_capture",
     "branch_control.pre_gates",
     "branch_create.post_native",
@@ -21,7 +21,6 @@ pub const CRASH_WINDOWS: [&str; 61] = [
     "branch_merge.post_candidate_validation",
     "branch_merge.post_table_effect",
     "branch_merge.post_phase_b_pre_manifest_commit",
-    "branch_merge.post_fork_pre_commit",
     "branch_merge.rewrite_after_delete_pre_confirm",
     "branch_merge.rewrite_after_merge_pre_delete",
     "classify.fresh_read",
@@ -29,13 +28,10 @@ pub const CRASH_WINDOWS: [&str; 61] = [
     "cleanup.reconcile_fork",
     "cleanup.resolve_branch_snapshot",
     "cleanup.table_gc",
-    "ensure_indices.post_publish_pre_promotion",
     "ensure_indices.post_phase_b_pre_manifest_commit",
-    "ensure_indices.post_fork_pre_commit",
     "ensure_indices.post_stage_pre_commit_btree",
     "ensure_indices.post_table_effect",
     "fork.before_classify",
-    "fork.post_create_pre_open",
     "graph_publish.after_manifest_commit",
     "graph_publish.before_commit_append",
     "init.after_coordinator_init",
@@ -46,9 +42,7 @@ pub const CRASH_WINDOWS: [&str; 61] = [
     "load.post_branch_create_pre_stage",
     "mutation.delete_node_pre_primary_delete",
     "mutation.post_finalize_pre_publisher",
-    "mutation.post_fork_pre_commit",
     "mutation.post_no_effect_pre_gate",
-    "mutation.post_publish_pre_promotion",
     "mutation.post_stage_pre_effect_gate",
     "mutation.post_table_commit",
     "open.before_schema_contract_read",
@@ -62,15 +56,16 @@ pub const CRASH_WINDOWS: [&str; 61] = [
     "schema_apply.after_staging_write",
     "schema_apply.before_staging_write",
     "schema_apply.post_lock_pre_effect",
-    "schema_apply.post_publish_pre_promotion",
     "schema_apply.post_table_commit",
     "schema_reload.before_contract_read",
     "storage.local_create_if_absent_probe",
     // Append new windows so index-derived census seeds for existing windows
     // remain stable.
     "branch_merge.rewrite_after_insert_pre_update",
-    "branch_merge.post_publish_pre_promotion",
-    "optimize.post_publish_pre_promotion",
+    "cleanup.sweep_pre_manifest_delete",
+    "cleanup.sweep_between_manifests",
+    "cleanup.sweep_pre_file_delete",
+    "branch_delete.post_archive",
 ];
 
 #[cfg(test)]

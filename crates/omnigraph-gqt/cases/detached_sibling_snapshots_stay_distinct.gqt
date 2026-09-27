@@ -1,0 +1,144 @@
+# issue: none
+# notes: Equal-write siblings keep distinct node values and edge topology during alternating warm reads, restart and a later write to one sibling.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person { name: String @key age: I32 }
+edge Knows: Person -> Person { @key(@src, @dst) }
+
+--- seed
+{"type":"Person","data":{"name":"a","age":0}}
+{"type":"Person","data":{"name":"b","age":10}}
+{"type":"Person","data":{"name":"c","age":20}}
+{"edge":"Knows","from":"a","to":"b"}
+
+--- mutate
+branch create left
+--- expect ok
+
+--- mutate
+branch create right
+--- expect ok
+
+--- mutate branch: left
+query left_changes() { update Person set { age: 1 } where name = "a" insert Knows { from: "b", to: "c" } }
+--- expect affected: nodes=1 edges=1
+
+--- mutate branch: right
+query right_changes() { update Person set { age: 2 } where name = "a" insert Knows { from: "c", to: "a" } }
+--- expect affected: nodes=1 edges=1
+
+--- query branch: left
+query edges() { match { $x: Person $x $e:knows $y } return { $x.name, $x.age, $y.name } }
+--- expect unordered
+{"x.name":"a","x.age":1,"y.name":"b"}
+{"x.name":"b","x.age":10,"y.name":"c"}
+--- expect shape
+x.name: String
+x.age: I32
+y.name: String
+
+--- query branch: right
+query edges() { match { $x: Person $x $e:knows $y } return { $x.name, $x.age, $y.name } }
+--- expect unordered
+{"x.name":"a","x.age":2,"y.name":"b"}
+{"x.name":"c","x.age":20,"y.name":"a"}
+--- expect shape
+x.name: String
+x.age: I32
+y.name: String
+
+--- query branch: left
+query edges() { match { $x: Person $x $e:knows $y } return { $x.name, $x.age, $y.name } }
+--- expect unordered
+{"x.name":"a","x.age":1,"y.name":"b"}
+{"x.name":"b","x.age":10,"y.name":"c"}
+--- expect shape
+x.name: String
+x.age: I32
+y.name: String
+
+--- query branch: right
+query edges() { match { $x: Person $x $e:knows $y } return { $x.name, $x.age, $y.name } }
+--- expect unordered
+{"x.name":"a","x.age":2,"y.name":"b"}
+{"x.name":"c","x.age":20,"y.name":"a"}
+--- expect shape
+x.name: String
+x.age: I32
+y.name: String
+
+--- query branch: main
+query edges() { match { $x: Person $x $e:knows $y } return { $x.name, $x.age, $y.name } }
+--- expect unordered
+{"x.name":"a","x.age":0,"y.name":"b"}
+--- expect shape
+x.name: String
+x.age: I32
+y.name: String
+
+--- restart
+
+--- query branch: right
+query edges() { match { $x: Person $x $e:knows $y } return { $x.name, $x.age, $y.name } }
+--- expect unordered
+{"x.name":"a","x.age":2,"y.name":"b"}
+{"x.name":"c","x.age":20,"y.name":"a"}
+--- expect shape
+x.name: String
+x.age: I32
+y.name: String
+
+--- query branch: left
+query edges() { match { $x: Person $x $e:knows $y } return { $x.name, $x.age, $y.name } }
+--- expect unordered
+{"x.name":"a","x.age":1,"y.name":"b"}
+{"x.name":"b","x.age":10,"y.name":"c"}
+--- expect shape
+x.name: String
+x.age: I32
+y.name: String
+
+--- mutate branch: left
+query left_again() { update Person set { age: 3 } where name = "a" insert Knows { from: "c", to: "b" } }
+--- expect affected: nodes=1 edges=1
+
+--- restart
+
+--- query branch: right
+query edges() { match { $x: Person $x $e:knows $y } return { $x.name, $x.age, $y.name } }
+--- expect unordered
+{"x.name":"a","x.age":2,"y.name":"b"}
+{"x.name":"c","x.age":20,"y.name":"a"}
+--- expect shape
+x.name: String
+x.age: I32
+y.name: String
+
+--- query branch: left
+query edges() { match { $x: Person $x $e:knows $y } return { $x.name, $x.age, $y.name } }
+--- expect unordered
+{"x.name":"a","x.age":3,"y.name":"b"}
+{"x.name":"b","x.age":10,"y.name":"c"}
+{"x.name":"c","x.age":20,"y.name":"b"}
+--- expect shape
+x.name: String
+x.age: I32
+y.name: String
+
+--- query branch: main
+query edges() { match { $x: Person $x $e:knows $y } return { $x.name, $x.age, $y.name } }
+--- expect unordered
+{"x.name":"a","x.age":0,"y.name":"b"}
+--- expect shape
+x.name: String
+x.age: I32
+y.name: String

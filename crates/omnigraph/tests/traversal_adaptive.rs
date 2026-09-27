@@ -297,14 +297,15 @@ async fn optimize_persists_the_graph_index_artifact() {
     assert_eq!(&body[..8], b"OGCSRIDX", "binary artifact magic");
     assert_eq!(
         u32::from_le_bytes(body[8..12].try_into().unwrap()),
-        2,
-        "format version 2 (self-describing section preludes)"
+        3,
+        "format version 3 (detached pins in table identity stamps)"
     );
     // The header is JSON and carries the digest + identity stamps.
     let header_len = u64::from_le_bytes(body[12..20].try_into().unwrap()) as usize;
     let header = std::str::from_utf8(&body[20..20 + header_len]).unwrap();
     assert!(header.contains("\"payload_sha256_b64\""));
     assert!(header.contains("\"tables\""));
+    assert!(header.contains("\"staged_version\""));
 }
 
 // Fail-open: a corrupt artifact must be rejected and rebuilt around, never

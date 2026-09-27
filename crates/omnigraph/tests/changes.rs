@@ -12,6 +12,28 @@ use omnigraph::loader::LoadMode;
 
 use helpers::*;
 
+/// Reclaim the Person history every commit but the newest pins: `cleanup
+/// --keep 1` (the collector sweeps the pins only pruned `__manifest` versions
+/// name).
+async fn reclaim_person_history(db: &Session) {
+    let stats = db
+        .cleanup(omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .unwrap();
+    let person = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert!(person.error.is_none(), "{person:?}");
+    assert!(
+        person.manifests_removed > 0,
+        "precondition: history reclaimed: {person:?}"
+    );
+}
+
 async fn head_commit_id(uri: &str, branch: Option<&str>) -> String {
     let commit_graph = match branch {
         Some(branch) => CommitGraph::open_at_branch(uri, branch).await.unwrap(),
@@ -1644,29 +1666,7 @@ async fn commit_changes_are_exact_ordered_and_bounded() {
     assert!(empty_page.next_page_token.is_none());
 
     // Reclaiming a pinned participant turns the commit into a typed gap.
-    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let person_path = &snapshot.dataset("node:Person").unwrap().dataset_path;
-    let person_uri = format!(
-        "{}/{}",
-        db.uri().trim_end_matches('/'),
-        person_path.trim_start_matches('/')
-    );
-    let person = lance::Dataset::open(&person_uri).await.unwrap();
-    let removed = lance::dataset::cleanup::cleanup_old_versions(
-        &person,
-        lance::dataset::cleanup::CleanupPolicy {
-            before_version: Some(person.version().version),
-            delete_unverified: true,
-            error_if_tagged_old_versions: false,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    assert!(
-        removed.old_versions > 0,
-        "precondition: history was reclaimed"
-    );
+    reclaim_person_history(&db).await;
     let gap = db
         .commit_changes_page(&inserted.commit.graph_commit_id, &scope, None, None, None)
         .await
@@ -3054,26 +3054,7 @@ async fn change_feed_gap_then_baseline_reset() {
 
     // Reclaim the Person history commit A pins: the feed cannot continue
     // contiguously and surfaces the typed gap with the caller's cursor.
-    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let person_path = &snapshot.dataset("node:Person").unwrap().dataset_path;
-    let person_uri = format!(
-        "{}/{}",
-        db.uri().trim_end_matches('/'),
-        person_path.trim_start_matches('/')
-    );
-    let person = lance::Dataset::open(&person_uri).await.unwrap();
-    let removed = lance::dataset::cleanup::cleanup_old_versions(
-        &person,
-        lance::dataset::cleanup::CleanupPolicy {
-            before_version: Some(person.version().version),
-            delete_unverified: true,
-            error_if_tagged_old_versions: false,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    assert!(removed.old_versions > 0, "precondition: history reclaimed");
+    reclaim_person_history(&db).await;
 
     let gap = db
         .poll_change_feed(feed_request(None, ChangeFeedPosition::Cursor(c0.clone())))

@@ -1192,7 +1192,9 @@ impl Omnigraph {
                     || live_cell.stable_property_id != resolved_cell.stable_property_id
                     || live_entry.published_dataset_version != entry.published_dataset_version
                     || live_entry.native_dataset_branch != entry.native_dataset_branch
-                    || live_entry.version_metadata != entry.version_metadata
+                    || !live_entry
+                        .version_metadata
+                        .same_read_witness(&entry.version_metadata)
                 {
                     return Err(OmniError::manifest(format!(
                         "Blob property '{}.{}' has no persisted property-lifetime witness at the selected target",

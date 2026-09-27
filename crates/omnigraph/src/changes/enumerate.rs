@@ -233,7 +233,6 @@ pub(crate) struct IntervalPlan {
     type_name: String,
     /// The paired manifest entries (begin/end version, branch, identity).
     pub(crate) from_entry: DatasetEntry,
-    pub(crate) to_entry: DatasetEntry,
     pub(crate) from_dataset: Dataset,
     pub(crate) to_dataset: Dataset,
     /// The system column spellings each side's image carries, resolved from
@@ -425,7 +424,6 @@ async fn plan_intervals(
                     kind,
                     type_name: type_name.to_string(),
                     from_entry: from.clone(),
-                    to_entry: to.clone(),
                     from_dataset,
                     to_dataset,
                     from_columns,
@@ -552,7 +550,6 @@ pub(crate) async fn enumerate_commit_changes(
         // live history read happens here.
         let mut source = EmitSource::plan(
             &plan.from_entry,
-            &plan.to_entry,
             plan.from_dataset,
             plan.to_dataset,
             plan.candidate_plan,

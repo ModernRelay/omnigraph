@@ -2,12 +2,12 @@
 //! legacy-vintage graph. Renames `id`/`src`/`dst` to `__id`/`__src`/`__dst`
 //! in every node and edge table and installs the current-vintage schema
 //! contract. Since RFC 0067 it has schema apply's shape: each rename-only
-//! `Project` commits detached from the table's promoted pin, the staged
-//! contract names the graph commit that publishes it, one manifest CAS
-//! publishes every pin, and the held renames promote afterwards. It writes no
+//! `Project` commits detached from the table's pin, the staged contract
+//! names the graph commit that publishes it, and one manifest CAS publishes
+//! every pin. It writes no
 //! recovery record: a failure before the CAS leaves only reclaimable detached
 //! versions and a staging the next read-write open discards; one after it
-//! leaves pins the next writer promotes and a contract the next read-write
+//! leaves published detached pins and a contract the next read-write
 //! open (or this handle's next write) installs. Since v10 both vintages share
 //! one `__manifest` stamp, so the upgrade moves no stamp; the vintage is the
 //! contract's `system-columns` feature.
@@ -356,25 +356,10 @@ async fn execute_with_lock(
         ));
     }
 
-    // Graph-global writer: promote every pending pin before planning, refuse
-    // a blocked one, and prove each rename applies before any effect.
     let mut existing_heads = HashMap::<String, SnapshotHandle>::new();
     for entry in snapshot.datasets() {
         let dataset_uri = db.storage().dataset_uri(&entry.dataset_path);
-        let head = db
-            .storage()
-            .open_dataset_head(&dataset_uri, entry.native_dataset_branch.as_deref())
-            .await?;
-        let head = db
-            .promote_pending_pin(&entry.type_key, &dataset_uri, entry, head)
-            .await?;
-        db.ensure_existing_effect_baseline(
-            &entry.type_key,
-            entry.native_dataset_branch.as_deref(),
-            entry.published_dataset_version,
-            &head,
-        )
-        .await?;
+        let head = db.open_pinned_for_write(&dataset_uri, entry).await?;
         TableStore::renamed_schema(head.dataset(), &system_column_renames(&entry.type_key))
             .map_err(|error| {
                 OmniError::manifest(format!(
@@ -396,7 +381,6 @@ async fn execute_with_lock(
     let mut published_commit: Option<String> = None;
     let effects = async {
         fail(&catalog::SCHEMA_APPLY_POST_LOCK_PRE_EFFECT)?;
-        let mut promotions = Vec::<crate::db::HeldPromotion>::new();
         let mut manifest_changes = Vec::new();
         let mut expected_versions = crate::db::manifest::ExpectedTableVersions::new();
         for entry in snapshot.datasets() {
@@ -408,31 +392,21 @@ async fn execute_with_lock(
             })?;
             let renames = system_column_renames(&entry.type_key);
             let staged = db.storage().stage_rename_columns(&head, &renames).await?;
-            // The rename lands as a detached version behind a pin one past
-            // the published version; promotion replays it onto the linear
-            // HEAD after the manifest publishes. Lance refuses a `Project`
-            // replayed over its own twin, so racing promoters leave nothing.
             let dataset_uri = db.storage().dataset_uri(&entry.dataset_path);
-            let base = head.clone();
-            let (detached, transaction) =
-                db.storage().commit_staged_detached(head, staged).await?;
+            let witness = crate::table_store::StagingWitness::new(
+                &base_branch_identifier,
+                base_graph_head.as_deref(),
+            )?;
+            let (detached, transaction) = db
+                .storage()
+                .commit_staged_detached(head, staged, &witness)
+                .await?;
             let state = db.storage().table_state(&dataset_uri, &detached).await?;
             let published_dataset_version = entry.published_dataset_version + 1;
             let version_metadata = state
                 .version_metadata
-                .with_staged(state.version, transaction.uuid.clone());
-            promotions.push(crate::db::HeldPromotion {
-                table_key: entry.type_key.clone(),
-                dataset_path: entry.dataset_path.clone(),
-                full_path: dataset_uri,
-                table_branch: entry.native_dataset_branch.clone(),
-                base,
-                chain: Vec::new(),
-                detached,
-                target: published_dataset_version,
-                uuid: transaction.uuid,
-                e_tag: version_metadata.e_tag().map(str::to_string),
-            });
+                .with_staged(state.version, transaction.uuid.clone())
+                .with_last_linear_version(entry.version_metadata.last_linear_version());
             expected_versions.insert(
                 entry.identity,
                 crate::db::manifest::TableVersionExpectation {
@@ -520,19 +494,12 @@ async fn execute_with_lock(
             },
         )
         .await?;
-        crate::db::schema_state::cleanup_staging_files(&db.root_uri, db.storage.as_ref())
-            .await?;
+        crate::db::schema_state::cleanup_staging_files(&db.root_uri, db.storage.as_ref()).await?;
 
         db.store_schema_view(desired_catalog, desired_source, &desired_ir)?;
         db.coordinator.write().await.refresh().await?;
         db.runtime_cache.invalidate_all().await;
         db.invalidate_graph_index().await;
-        match fail(&catalog::SCHEMA_APPLY_POST_PUBLISH_PRE_PROMOTION) {
-            Ok(()) => db.promote_held_all(promotions).await,
-            Err(error) => {
-                tracing::warn!(error = %error, "system-column upgrade promotion interrupted; the next writer promotes")
-            }
-        }
         Ok::<u64, OmniError>(graph_manifest_version)
     }
     .await;

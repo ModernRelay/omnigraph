@@ -83,32 +83,35 @@ See [Operating a cluster](../clusters/index.md).
 - Recovery required: reopen the graph read-write or restart its server. A
   graph carrying a sidecar from a release before 0.12 must first be opened
   read-write with that release.
-- Uncovered drift: preview with `repair`; publish only classifications you have
-  verified.
-- Cleanup refusal: resolve drift and verify all live branches before
-  retrying.
+- Foreign drift: `repair` reports Lance commits above a table's last linear
+  version as `foreign_drift`; no read or write uses them and no command
+  adopts them (below).
+- Cleanup row with `error`: the collector's trace of that table did not
+  finish, so nothing of that table was deleted; fix the named cause and
+  rerun. Other tables are collected and the command exits 0.
 - Azure admission failure: inspect the lease owner before using the admission
   tool's break-glass flow.
 
-### Blocked pin
+### Foreign drift
 
-A pin is blocked when a foreign commit occupies the linear version its
-published write was meant to take. The condition is per table.
+`omnigraph repair` classifies a graph table as `foreign_drift` when its
+Lance linear history carries commits above the table's recorded last linear
+version (`omnigraph.last_linear_version` on the registration). Every
+OmniGraph write is a detached commit that a graph commit pins, so such a
+commit came from something else writing the table directory directly. The
+condition is per table.
 
-- From a write: a branch merge, index build, schema apply, system-column
-  upgrade, optimize, or a branch's first write to that table returns a
-  conflict that names the table and says the published pin at that version
-  cannot be promoted. Retrying returns the same error.
-- From `cleanup`: the table's result row says version GC was skipped for it.
-  Other tables are collected and the command exits 0.
-- From `repair`: the table is classified `blocked_promotion` with action
-  `refused`, on every live branch that carries the pin, and the command exits
-  non-zero. `--force --confirm` refuses the same way.
+- Queries, mutations, loads, merges, index builds, schema apply, optimize
+  and cleanup are unaffected: none of them resolves the linear HEAD.
+- `repair` prints the last linear version, the HEAD and the count of foreign
+  versions, takes no action and exits 0. `--confirm` and `--force --confirm`
+  never adopt the foreign commit.
+- `cleanup` never deletes a foreign version or its files; the table's result
+  row lists them under `foreign_versions`.
 
-Reads, mutations and loads on that table keep working, and every acknowledged
-row stays readable. The table's old versions are not reclaimed while the block
-stands. No command resolves a blocked pin yet. To move the data off the blocked
-table, export the graph and load it into a new one.
+There is no command to run before writing: the write path has no
+precondition on a table's linear history. To discard the foreign commits,
+export the graph and load it into a new one.
 
 See [Maintenance](maintenance.md) and [Deployment](../deployment.md).
 

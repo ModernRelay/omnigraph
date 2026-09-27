@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod collector;
 pub mod cost;
 pub mod expand_projection;
 #[cfg(feature = "failpoints")]
@@ -150,16 +151,72 @@ pub async fn open_dataset_head_exact(uri: &str, branch: Option<&str>) -> lance::
     }
 }
 
-/// Open the physical HEAD selected by a published graph table entry.
-pub async fn open_published_dataset_head(
+/// Open the raw Lance dataset of a branch's table at the version its
+/// registration pins: the detached version under the detached-only switch.
+pub async fn open_pinned_dataset_for_test(
     db: &Omnigraph,
-    logical: &str,
+    branch: &str,
     table_key: &str,
 ) -> lance::Dataset {
-    let snapshot = snapshot_branch(db, logical).await.unwrap();
+    let snapshot = snapshot_branch(db, branch).await.unwrap();
     let entry = snapshot.dataset(table_key).unwrap();
+    let pinned = snapshot
+        .open_dataset(table_key)
+        .await
+        .unwrap()
+        .published_dataset_version();
     let uri = format!("{}/{}", db.uri().trim_end_matches('/'), entry.dataset_path);
-    open_dataset_head_exact(&uri, entry.native_dataset_branch.as_deref()).await
+    open_dataset_head_exact(&uri, entry.native_dataset_branch.as_deref())
+        .await
+        .checkout_version(pinned)
+        .await
+        .unwrap()
+}
+
+/// Whether a Lance version number is a detached version (RFC 0067).
+pub fn is_detached_version(version: u64) -> bool {
+    version & lance_table::format::DETACHED_VERSION_MASK != 0
+}
+
+/// The Lance version a branch's registration pins for `table_key`.
+pub async fn pinned_version(db: &Omnigraph, branch: &str, table_key: &str) -> u64 {
+    open_pinned_dataset_for_test(db, branch, table_key)
+        .await
+        .version()
+        .version
+}
+
+/// Commit the branch's pinned `table_key` image as a linear HEAD above
+/// `above` (a Lance restore, then no-op deletes): a row-preserving foreign
+/// commit above the table's last linear version.
+pub async fn forge_linear_head_from_pin(
+    db: &Omnigraph,
+    branch: &str,
+    table_key: &str,
+    above: u64,
+) -> u64 {
+    let pinned = pinned_version(db, branch, table_key).await;
+    let entry = snapshot_branch(db, branch)
+        .await
+        .unwrap()
+        .dataset(table_key)
+        .unwrap()
+        .clone();
+    let uri = format!("{}/{}", db.uri().trim_end_matches('/'), entry.dataset_path);
+    let head = open_dataset_head_exact(&uri, entry.native_dataset_branch.as_deref()).await;
+    let restore = lance::dataset::transaction::Transaction::new(
+        head.version().version,
+        lance::dataset::transaction::Operation::Restore { version: pinned },
+        None,
+    );
+    let mut raw = lance::dataset::CommitBuilder::new(Arc::new(head))
+        .execute(restore)
+        .await
+        .unwrap();
+    while raw.version().version <= above {
+        lance_delete_inline(&mut raw, "1 = 2").await;
+    }
+    raw.version().version
 }
 
 /// Whether `name` is `{logical}` itself or `{logical}.{ULID}` — one

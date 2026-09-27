@@ -1,23 +1,24 @@
 # Upgrading OmniGraph
 
-Normal open accepts storage format v10 only; nothing is migrated on open. A
-v8 or v9 graph from the 0.11.x line takes one explicit `omnigraph upgrade`
-(below), a metadata-only step that keeps its branches and spellings; use
-export/import with a source-compatible binary when no route exists.
-Storage formats, release versions and full-text index formats are separate;
-check the [release notes](../../releases/) before upgrading.
+Normal open accepts storage format v11 only; nothing is migrated on open. A
+v8, v9 or v10 graph from the 0.11.x line takes one explicit `omnigraph upgrade`
+(below), which keeps its branches and spellings; use export/import with a
+source-compatible binary when no route exists. Storage formats, release
+versions and full-text index formats are separate; check the
+[release notes](../../releases/) before upgrading.
 
 ## Explicit storage migration
 
-`omnigraph upgrade` defaults to v10: the conversions to v8 where the source
-needs them, then the v10 stamp step, which restamps main and every live branch.
-Qualified standalone v6 graphs from the 0.9.x/0.10.x release lines run v6 → v7
-registration conversion followed by metadata-only v7 → v8 conversion. Qualified
-v7 development graphs run only the final step. Both reuse table data and preserve
-branch ancestry, IDs, property values, schema identity, retained commit IDs and
-numeric snapshots. Historical v6 snapshots keep their original metadata and use
-an explicit legacy decoder after root admission; historical v7 snapshots keep
-their registration-clock interpretation.
+`omnigraph upgrade` defaults to v11: the conversions to v8 where the source
+needs them, the v10 stamp step, then the v11 step, which promotes every pending
+table pin once, reaps proven copies oldest link first, records the last linear version on
+every registration of every live branch and restamps. Qualified standalone v6
+graphs run v6 → v7 registration conversion, then metadata-only v7 → v8;
+qualified v7 development graphs run only the latter. Both reuse table data and
+preserve branch ancestry, IDs, property values, schema identity, retained
+commit IDs and numeric snapshots. Historical v6 snapshots keep their original
+metadata and use an explicit legacy decoder after root admission; historical
+v7 snapshots keep their registration-clock interpretation.
 
 1. Stop every server, embedded writer, maintenance process and cluster apply
    that could touch the graph or its shared dependencies. A process-local lock
@@ -55,15 +56,18 @@ their registration-clock interpretation.
    with the old executable; old bytes remaining in the upgraded root do not
    make downgrading safe. Post-upgrade writes are absent from that backup.
 
-`--to-format` defaults to 10. Explicit `--to-format 7` or `8` stops there for
-a compatible older executable; the current binary refuses either result. v9
+`--to-format` defaults to 11. Explicit `--to-format 7`, `8` or `10` stops there
+for a compatible older executable; the current binary refuses each result. v9
 is not a target: the respelling it marked is a separate operation on a served
-graph (below). A v10 graph reports `already_current` for the default and for
-`--to-format 10`; a lower target on it is refused as a downgrade. Unsupported
-sources and targets refuse; there is no automatic data-moving fallback. Check
-and execution return zero only for success (`check_passed`, `completed` or
-`already_current`); a repeated success is a no-write no-op. A source with a
-pending recovery sidecar refuses until the executable that wrote it resolves it.
+graph (below). A v11 graph reports `already_current` for the default and for
+`--to-format 11`; a lower target on it is refused as a downgrade. The v11 step
+refuses, before any write, a pin whose linear target a foreign commit occupies
+(`blocked_promotion`, reported by `--check` too); after the switch no pin can
+reach that state. Unsupported sources and targets refuse; there is no
+automatic data-moving fallback. Check and execution return zero only for
+success (`check_passed`, `completed` or `already_current`); a repeated success
+is a no-write no-op. A source with a pending recovery sidecar refuses until the
+executable that wrote it resolves it.
 
 After each handler's early fence, ordinary opens refuse until every branch is
 converted and validated and main activates that handler's target. If interrupted,
@@ -79,12 +83,11 @@ point the source executable at it.
 Source v6/v7 graphs containing reserved native-ref retirement metadata refuse
 conversion. On a v8 graph, admission validates that metadata and excludes
 valid retired refs from logical branch enumeration while retaining their physical
-ancestry. Upgrade neither retires branches nor reclaims their storage.
-
-Branch naming must also be unambiguous. A native name ending in a ULID-shaped
-suffix could be either a v0.9 logical name or a newer branch incarnation. The
+ancestry. Upgrade neither retires branches nor reclaims their storage. Branch
+naming must also be unambiguous: a native name ending in a ULID-shaped suffix
+could be either a v0.9 logical name or a newer branch incarnation, so the
 handler requires a logical-head commit written after that native branch's fork
-to prove the interpretation. Otherwise it refuses before writing, including
+to prove the interpretation and otherwise refuses before writing, including
 unused suffixed branches without that evidence. Duplicate logical names and
 incarnation-shaped inner path segments also refuse. Resolve the branch naming
 with the source executable or use the export/rebuild fallback; do not rename
@@ -95,14 +98,12 @@ of decoded batch metadata, 1,024 native branches and 100,000 retained versions
 per branch. Version references are counted before historical manifests are
 loaded. Exceeding a bound refuses before conversion. Payload bytes copied
 and rewritten are zero; managed Blob validation can still read substantial data.
-
 Server and cluster selectors, cluster profiles and recognized cluster-layout
 roots refuse until a cluster upgrade protocol is qualified. Local paths, file
 URIs and symlink aliases are resolved before the cluster ownership check. Direct path access
 is an operator interface; it cannot prove that an arbitrary root is unmanaged.
 Embedded callers must supply exclusive control and, where installed, the policy
 checker to `upgrade_storage_as`, which checks `SchemaApply` for every branch.
-
 The genuine predecessor CI journeys cover local standalone roots. Other backend
 qualification is separate; see the [support matrix](../../dev/versioning.md#storage-upgrade-support-matrix).
 Storage migration does not rebuild full-text indexes. Use the procedure below
@@ -238,9 +239,8 @@ mapping is:
 | v5 | the exact unreleased development build that wrote it |
 | v6 | latest 0.10.x (the refusal names 0.9.x or 0.10.x) |
 | v7 | the exact unreleased development build that wrote it |
-| v8 | 0.11 development builds before the system-column namespace change, and conversions completed with `omnigraph upgrade --to-format 8`; `omnigraph upgrade` takes it to v10 without export/import |
-| v9 | the 0.11.x line; `omnigraph upgrade` takes it to v10 without export/import |
-| v10 | current line; entity export/import normally not required within this generation |
+| v8, v9, v10 | the 0.11.x line (v8: development builds before the system-column namespace change and conversions completed with `omnigraph upgrade --to-format 8`; v10: detached table commits); `omnigraph upgrade` takes each to v11 without export/import |
+| v11 | current line; entity export/import normally not required within this generation |
 
 If the graph's generation is newer than the binary, upgrade the binary instead.
 
@@ -248,7 +248,7 @@ If the graph's generation is newer than the binary, upgrade the binary instead.
 
 `omnigraph schema upgrade-system-columns <graph>` respells a served graph's
 legacy system columns in place (`id`/`src`/`dst` to `__id`/`__src`/`__dst`);
-the stamp stays v10. Columns are renamed by field id: no rows are rewritten,
+the stamp stays v11. Columns are renamed by field id: no rows are rewritten,
 indexes survive, and data, history, and commit ids are unchanged;
 `--check` runs the preflight and writes nothing; `--json` prints the report.
 The preflight refuses a graph with any non-main branch (merge what you need,

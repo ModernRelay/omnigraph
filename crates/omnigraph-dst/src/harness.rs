@@ -90,6 +90,7 @@ pub const DET_WORLD: Detector = on(Channel::Query, Oracle::WorldDifferential);
 pub const DET_MEMBERSHIP: Detector = on(Channel::Query, Oracle::MembershipQuery);
 pub const DET_RO_AUDIT: Detector = on(Channel::Query, Oracle::ReadOnlyAudit);
 pub const DET_PHYSICAL: Detector = on(Channel::Physical, Oracle::PhysicalExport);
+pub const DET_COLLECTOR: Detector = on(Channel::Physical, Oracle::CollectorInvariant);
 pub const DET_HISTORY: Detector = on(Channel::History, Oracle::HistoryDifferential);
 pub const DET_TRAVERSAL: Detector = on(Channel::Query, Oracle::TraversalModeDifferential);
 pub const DET_SESSION: Detector = on(Channel::Session, Oracle::SessionDifferential);
@@ -774,8 +775,7 @@ enum Milestone {
     DeleteFixtureOnBranch,
     /// `ensure_indices` on main (the non-fork ensure_indices windows).
     EnsureIndicesMain,
-    /// `ensure_indices` on the FRESH milestone branch — every table pin is
-    /// first-touch, the deferred-fork ensure_indices route.
+    /// `ensure_indices` on the milestone branch after a data op there.
     EnsureIndicesBranch,
     /// `cleanup` on main (branch-snapshot resolution / fork reconciliation /
     /// table GC run against whatever state earlier milestones built).
@@ -792,10 +792,6 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
         // Delete-shaped mutation window: guarantee a DeletePerson exists.
         "mutation.delete_node_pre_primary_delete" => {
             return vec![MutateMain, DeleteFixtureOnMain];
-        }
-        // First-touch fork route: fresh branch, then its first data op.
-        "mutation.post_fork_pre_commit" | "fork.post_create_pre_open" => {
-            return vec![EnsureBranch, DataOnBranch];
         }
         "classify.fresh_read" | "cleanup.reconcile_fork" => {
             return vec![EnsureBranch, DataOnBranch, DeleteBranch, CleanupMain];
@@ -819,10 +815,7 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
         "branch_merge.rewrite_after_insert_pre_update" => {
             return vec![EnsureBranch, DataOnBranch, MutateMain, MergeBranch];
         }
-        // ensure_indices deferred-fork route: put data on the branch first
-        // (forks ONE table and places it) so the branch ensure_indices has
-        // work to do and the remaining tables are first-touch.
-        "ensure_indices.post_fork_pre_commit" | "ensure_indices.post_table_effect" => {
+        "ensure_indices.post_table_effect" => {
             return vec![EnsureBranch, DataOnBranch, EnsureIndicesBranch];
         }
         // cleanup with state to work on: a live branch fork.
@@ -1099,9 +1092,8 @@ pub struct UniverseReport {
     /// Client retries performed after ack-lost ops
     /// (0 without `client_retry`).
     pub client_retries: usize,
-    /// maintenance deaths whose obligation pass ran (rerun
-    /// converged + per-op obligation held). Bite evidence — 0 in universes
-    /// whose deaths never landed in a maintenance op.
+    /// Failed maintenance attempts whose obligation pass ran (rerun
+    /// converged + per-op obligation held), including returned Cleanup errors.
     pub maintenance_reruns: usize,
     /// content reads returned with read-time bit rot (0 without
     /// `corrupt_read_pct`). Bite evidence for the corruption axis; the
@@ -1184,6 +1176,8 @@ type EdgeRowId = u64;
 
 #[derive(Clone, Debug, Default)]
 struct Model {
+    /// Optional Person properties in the accepted schema, not attempted applies.
+    schema_extras: usize,
     /// name → (age, ver); ver = -1 for rows written without one.
     persons: BTreeMap<String, (i64, i64)>,
     /// Physical rows by id — the multiset default: re-inserting a pair is
@@ -1383,6 +1377,7 @@ fn predict_merge(base: &Model, source: &Model, target: &Model) -> Option<Model> 
     // Ghosts are carried by the CALLER (`apply_world`'s merge arm, via
     // `three_way_ghosts`) — predict_merge stays a purely logical judgment.
     Some(Model {
+        schema_extras: target.schema_extras,
         persons,
         edges,
         ghosts: BTreeSet::new(),
@@ -1550,12 +1545,26 @@ async fn exec_op(db: &Session, branch: &str, op: &Op) -> OmniResult<()> {
         .await
         .map(|_| ()),
         Op::Optimize => Box::pin(db.optimize()).await.map(|_| ()),
-        Op::Cleanup => Box::pin(db.cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        }))
-        .await
-        .map(|_| ()),
+        Op::Cleanup => {
+            let stats = Box::pin(db.cleanup(omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            }))
+            .await?;
+            let deferred: BTreeMap<String, String> = stats
+                .iter()
+                .filter_map(|row| {
+                    row.error
+                        .as_ref()
+                        .map(|error| (row.type_key.clone(), error.clone()))
+                })
+                .collect();
+            LAST_CLEANUP_DEFERRED
+                .lock()
+                .expect("cleanup deferral map")
+                .insert(db.uri().to_string(), deferred);
+            Ok(())
+        }
         Op::EnsureIndices => Box::pin(db.ensure_indices()).await.map(|_| ()),
         Op::SchemaAddProperty { count } => Box::pin(db.apply_schema(&schema_with_extras(*count)))
             .await
@@ -1643,12 +1652,8 @@ fn apply_to_model(model: &mut Model, op: &Op, rows: &mut EdgeRowId) {
         }
         // Maintenance is logically invisible by contract; schema evolution is
         // additive-only; refresh/sync only move the handle's view.
-        Op::Optimize
-        | Op::Cleanup
-        | Op::EnsureIndices
-        | Op::SchemaAddProperty { .. }
-        | Op::Refresh
-        | Op::SyncBranch => {}
+        Op::SchemaAddProperty { count } => model.schema_extras = *count,
+        Op::Optimize | Op::Cleanup | Op::EnsureIndices | Op::Refresh | Op::SyncBranch => {}
     }
 }
 
@@ -1892,26 +1897,6 @@ fn window_matches(window: &str, wop: &WorldOp) -> bool {
     if window == "load.post_branch_create_pre_stage" {
         // Only the implicit fork-if-missing path crosses this one.
         return matches!(wop, WorldOp::LoadFork { .. });
-    }
-    if window == "mutation.post_fork_pre_commit" {
-        // Deferred-fork route: only a data op OFF main can be a first touch
-        // (main's tables are native, never forked). Scheduling these on main
-        // ops is a guaranteed miss.
-        return matches!(
-            wop,
-            WorldOp::Data { branch, op, .. } if branch != "main" && is_mutation_op(op)
-        );
-    }
-    if window == "ensure_indices.post_fork_pre_commit" {
-        // Same deferred-fork gate, ensure_indices flavor.
-        return matches!(
-            wop,
-            WorldOp::Data {
-                branch,
-                op: Op::EnsureIndices,
-                ..
-            } if branch != "main"
-        );
     }
     let family = window.split('.').next().unwrap_or(window);
     match family {
@@ -3446,6 +3431,11 @@ async fn assert_world_matches(db: &Session, world: &WorldModel, where_: &str) {
 /// partial multi-table commit does not publish), and every head-advancing
 /// entry heal resolves the watch within its own iteration.
 async fn capture_history(db: &Omnigraph, main: &Model, history: &mut Vec<(String, Model)>) {
+    assert_eq!(
+        db.schema_source().as_str(),
+        schema_with_extras(main.schema_extras),
+        "history capture must use the schema accepted by the workload model"
+    );
     // Boxed: composes with the big engine op futures in run_universe's poll
     // frame (2 MiB test-stack trait).
     let head = Box::pin(db.resolve_snapshot("main"))
@@ -3505,9 +3495,22 @@ async fn assert_history_matches(db: &Session, history: &[(String, Model)], where
             type_names: Some(vec!["Person".to_string()]),
             ops: None,
         };
-        let cs = Box::pin(db.diff_commits(a_id, b_id, &filter))
-            .await
-            .expect("diff_commits over recorded history");
+        let cs = match Box::pin(db.diff_commits(a_id, b_id, &filter)).await {
+            Ok(changes) => changes,
+            Err(OmniError::ChangeSchemaBoundary {
+                graph_commit_id,
+                type_name,
+            }) if a_m.schema_extras != b_m.schema_extras
+                && graph_commit_id == *b_id
+                && type_name == "Person" =>
+            {
+                continue;
+            }
+            Err(error) => panic!(
+                "{where_}: diff_commits over recorded history failed without a matching \
+                 accepted schema transition: {error:?}"
+            ),
+        };
         let mut model_changed: BTreeSet<String> = BTreeSet::new();
         let mut model_deleted: BTreeSet<String> = BTreeSet::new();
         for (name, val) in &a_m.persons {
@@ -3644,6 +3647,21 @@ fn is_legal_rejection(
         return true;
     }
     false
+}
+
+/// Classify schema settlement against the two schemas the workload permits.
+fn schema_apply_outcome(
+    before_count: usize,
+    requested_count: usize,
+    observed: &str,
+) -> Option<ReconcileOutcome> {
+    if observed == schema_with_extras(requested_count) {
+        Some(ReconcileOutcome::Applied)
+    } else if observed == schema_with_extras(before_count) {
+        Some(ReconcileOutcome::NotApplied)
+    } else {
+        None
+    }
 }
 
 /// How a failed op's world state settled after reconcile + recovery reopen.
@@ -3786,7 +3804,11 @@ impl RetryEffect {
     }
 }
 
-#[cfg_attr(not(feature = "failpoints"), allow(unused_variables))]
+struct CleanupEvidence<'a> {
+    images: &'a [(String, Model)],
+    paths: Option<&'a omnigraph::db::CollectorPathSnapshot>,
+}
+
 /// MAINTENANCE-OBLIGATION ORACLES. For empty-model-delta
 /// maintenance ops (Optimize/Cleanup/EnsureIndices) the two-sided crash
 /// contract's hypotheses COINCIDE — their reconcile verdicts are ties
@@ -3813,6 +3835,7 @@ impl RetryEffect {
 /// Sensitivity: `Scenario.fail_maintenance_rerun` arms a REAL
 /// engine failpoint around the rerun so the convergence assert provably
 /// fires — `dst_sensitivity_maintenance_rerun_failure_is_red`.
+#[cfg_attr(not(feature = "failpoints"), allow(unused_variables))]
 async fn maintenance_obligations(
     db: &Session,
     world: &WorldModel,
@@ -3820,19 +3843,29 @@ async fn maintenance_obligations(
     label: &str,
     at_op: usize,
     fail_rerun: bool,
+    cleanup: CleanupEvidence<'_>,
 ) -> bool {
     let WorldOp::Data { op, .. } = wop else {
         return false;
     };
     let (rerun_window, kind) = match op {
         Op::Optimize => ("optimize.before_compact", "Optimize"),
-        Op::Cleanup => ("cleanup.pre_gates", "Cleanup"),
+        Op::Cleanup => ("cleanup.table_gc", "Cleanup"),
         Op::EnsureIndices => (
             "ensure_indices.post_phase_b_pre_manifest_commit",
             "EnsureIndices",
         ),
         _ => return false,
     };
+    crate::cost::set_label("_verify");
+    if matches!(op, Op::Cleanup) {
+        assert_collector_images(db, cleanup.images, at_op).await;
+        assert_collector_paths(
+            cleanup.paths.expect("Cleanup captured its retained paths"),
+            at_op,
+        )
+        .await;
+    }
     // (1) Idempotent convergence.
     let rerun = {
         #[cfg(feature = "failpoints")]
@@ -3858,6 +3891,29 @@ async fn maintenance_obligations(
     }
     match op {
         Op::Cleanup => {
+            let deferred = LAST_CLEANUP_DEFERRED
+                .lock()
+                .expect("cleanup deferral map")
+                .get(db.uri())
+                .cloned()
+                .unwrap_or_default();
+            if !deferred.is_empty() {
+                detectors::violation(
+                    DET_MAINTENANCE,
+                    at_op,
+                    format!(
+                        "{label}: MAINTENANCE OBLIGATION violated — clean Cleanup retry deferred table work: {deferred:?}"
+                    ),
+                    "a fault-free Cleanup retry finishes every table",
+                );
+            }
+            assert_collector_images(db, cleanup.images, at_op).await;
+            assert_collector_paths(
+                cleanup.paths.expect("Cleanup captured its retained paths"),
+                at_op,
+            )
+            .await;
+            assert_collector_invariants(db, at_op, true, false).await;
             // (2) Whole observable world back via real traversal.
             let visible = observe_world(db).await;
             if visible != world.render() {
@@ -3943,6 +3999,168 @@ async fn reopen_under_storm(
                      ({REOPEN_ATTEMPT_CAP} attempts; last error: {e:?})"
                 );
             }
+        }
+    }
+}
+
+/// Per-table errors from the last Cleanup, retained for fault attribution.
+static LAST_CLEANUP_DEFERRED: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<String, BTreeMap<String, String>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Compare workload-captured heads and fork bases without consulting collector roots.
+async fn assert_collector_images(db: &Session, images: &[(String, Model)], at_op: usize) {
+    detectors::tagged(DET_COLLECTOR, at_op, async {
+        for (commit, model) in images {
+            let target = ReadTarget::snapshot(SnapshotId::new(commit));
+            assert_eq!(
+                Box::pin(person_rows_target(db, target)).await,
+                model.person_rows(),
+                "collector lost saved Person image {commit}"
+            );
+            let target = ReadTarget::snapshot(SnapshotId::new(commit));
+            assert_eq!(
+                Box::pin(knows_pairs_target(db, target)).await,
+                model.edge_pairs(),
+                "collector lost saved Knows image {commit}"
+            );
+        }
+    })
+    .await;
+}
+
+async fn assert_collector_paths(paths: &omnigraph::db::CollectorPathSnapshot, at_op: usize) {
+    let missing = paths.missing_paths().await.unwrap_or_else(|error| {
+        detectors::violation(
+            DET_COLLECTOR,
+            at_op,
+            format!("saved paths could not be probed: {error}"),
+            "every object captured before cleanup remains present",
+        )
+    });
+    if !missing.is_empty() {
+        detectors::violation(
+            DET_COLLECTOR,
+            at_op,
+            format!("cleanup lost saved objects: {missing:?}"),
+            "every object captured before cleanup remains present",
+        );
+    }
+}
+
+/// Snapshot the model's current heads and the bases saved when its branches forked.
+async fn collector_images(
+    db: &Session,
+    world: &WorldModel,
+    fork_bases: &BTreeMap<String, (String, Model)>,
+) -> Vec<(String, Model)> {
+    let mut images = Vec::new();
+    for branch in world.branch_names() {
+        let head = Box::pin(db.resolve_snapshot(&branch))
+            .await
+            .expect("resolve collector oracle head");
+        images.push((head.to_string(), world.state_of(&branch).clone()));
+        if branch != "main" {
+            images.push(
+                fork_bases
+                    .get(&branch)
+                    .expect("workload saved this branch's fork base")
+                    .clone(),
+            );
+        }
+    }
+    images
+}
+
+/// Retained paths stay readable, and successful table sweeps leave neither
+/// published garbage nor provably dead staging manifests.
+async fn assert_collector_invariants(
+    db: &Session,
+    at_op: usize,
+    after_cleanup: bool,
+    damaged_during_cleanup: bool,
+) {
+    let expected = "retained pins and their paths exist, and cleanup removes published garbage and dead stagings";
+    let report = match db
+        .cleanup_plan(omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+    {
+        Ok(report) => report,
+        Err(error) => detectors::violation(
+            DET_COLLECTOR,
+            at_op,
+            format!("the collector could not plan: {error}"),
+            expected,
+        ),
+    };
+    let deferred = LAST_CLEANUP_DEFERRED
+        .lock()
+        .expect("cleanup deferral map")
+        .get(db.uri())
+        .cloned()
+        .unwrap_or_default();
+    if after_cleanup {
+        for (table, error) in &deferred {
+            let injected = [
+                FAULT_MARKER,
+                ACK_LOSS_MARKER,
+                LATENT_MARKER,
+                "injected failpoint triggered:",
+            ]
+            .iter()
+            .any(|marker| error.contains(marker));
+            if !injected && !damaged_during_cleanup {
+                detectors::violation(
+                    DET_COLLECTOR,
+                    at_op,
+                    format!("{table}: Cleanup returned an unattributed table error: {error}"),
+                    expected,
+                );
+            }
+        }
+    }
+    match db.cleanup_plan_missing_paths(&report).await {
+        Ok(missing) if !missing.is_empty() => detectors::violation(
+            DET_COLLECTOR,
+            at_op,
+            format!("retained pins' paths are absent (location, path): {missing:?}"),
+            expected,
+        ),
+        Ok(_) => {}
+        Err(error) => detectors::violation(
+            DET_COLLECTOR,
+            at_op,
+            format!("the collector's paths could not be probed: {error}"),
+            expected,
+        ),
+    }
+    for plan in &report.tables {
+        if !plan.errors.is_empty() {
+            detectors::violation(
+                DET_COLLECTOR,
+                at_op,
+                format!(
+                    "{}: the trace did not finish: {:?}",
+                    plan.location, plan.errors
+                ),
+                expected,
+            );
+        }
+        let mut survivors = plan.would_remove();
+        survivors.extend(plan.dead_stagings());
+        if after_cleanup && !survivors.is_empty() && !deferred.contains_key(&plan.table_key) {
+            detectors::violation(
+                DET_COLLECTOR,
+                at_op,
+                format!(
+                    "{}: published garbage or dead stagings survived cleanup: {survivors:?}",
+                    plan.location
+                ),
+                expected,
+            );
         }
     }
 }
@@ -4175,6 +4393,23 @@ async fn reconcile_after_failure(
         // no-op instead of panicking or overwriting a slot).
         ReconcileOutcome::NotApplied
     };
+    if let WorldOp::Data {
+        op: Op::SchemaAddProperty { count },
+        ..
+    } = wop
+    {
+        outcome = schema_apply_outcome(world.main.schema_extras, *count, &db.schema_source())
+            .unwrap_or_else(|| {
+                detectors::violation(
+                    DET_CRASH_CONTRACT,
+                    at_op,
+                    format!(
+                        "{label}: recovered schema is neither the accepted nor attempted schema"
+                    ),
+                    "schema recovery settles to the accepted or attempted workload schema",
+                )
+            });
+    }
     // Which channel the ruling rests on — recorded so the run tables carry
     // observed provenance, never an assumption (canary lesson).
     let mut channel: &'static str = "query";
@@ -5123,6 +5358,7 @@ impl UniverseScenario<RustResources> for Scenario {
         // history baseline (the fixture-load commit) — captured
         // before fault injection enables so the baseline read is clean.
         let mut history: Vec<(String, Model)> = Vec::new();
+        let mut fork_bases: BTreeMap<String, (String, Model)> = BTreeMap::new();
         let mut history_verified_from: usize = 0;
         Box::pin(capture_history(&db, &world.main, &mut history)).await;
 
@@ -5254,6 +5490,61 @@ impl UniverseScenario<RustResources> for Scenario {
                 history_verified_from = history.len().saturating_sub(1);
             }
 
+            crate::cost::set_label("_verify");
+            if let Some(f) = &failing {
+                f.suspend();
+            }
+            let fork_name = match &wop {
+                WorldOp::BranchCreate { name } => Some(name),
+                WorldOp::LoadFork { branch, .. } => Some(branch),
+                _ => None,
+            };
+            if let Some(name) = fork_name.filter(|name| !world.branches.contains_key(*name)) {
+                let head = Box::pin(db.resolve_snapshot("main"))
+                    .await
+                    .expect("resolve model fork base");
+                fork_bases.insert(name.clone(), (head.to_string(), world.main.clone()));
+            }
+            let cleanup_images = if matches!(
+                &wop,
+                WorldOp::Data {
+                    op: Op::Cleanup,
+                    ..
+                }
+            ) {
+                let images = collector_images(&db, &world, &fork_bases).await;
+                assert_collector_images(&db, &images, i).await;
+                images
+            } else {
+                Vec::new()
+            };
+            let cleanup_paths = if matches!(
+                &wop,
+                WorldOp::Data {
+                    op: Op::Cleanup,
+                    ..
+                }
+            ) {
+                let report = db
+                    .cleanup_plan(omnigraph::db::CleanupPolicyOptions {
+                        keep_versions: Some(1),
+                        older_than: None,
+                    })
+                    .await
+                    .expect("capture retained roots before cleanup");
+                let paths = db
+                    .cleanup_plan_path_snapshot(&report)
+                    .await
+                    .expect("capture retained object paths");
+                assert_collector_paths(&paths, i).await;
+                Some(paths)
+            } else {
+                None
+            };
+            if let Some(f) = &failing {
+                f.resume();
+            }
+
             let expected_conflict = expects_merge_conflict(&world, &wop);
             // Debug aid: DST_OP_LOG=1 prints each sampled op — turns any
             // failing universe's seed line into a full repro transcript
@@ -5334,6 +5625,10 @@ impl UniverseScenario<RustResources> for Scenario {
                                 &format!("crash:{failpoint}@op{i}"),
                                 i,
                                 sc.fail_maintenance_rerun,
+                                CleanupEvidence {
+                                    images: &cleanup_images,
+                                    paths: cleanup_paths.as_ref(),
+                                },
                             ))
                             .await
                         } else {
@@ -5356,6 +5651,28 @@ impl UniverseScenario<RustResources> for Scenario {
                                 history_verified_from = history.len().saturating_sub(1);
                             }
                         }
+                    }
+                }
+                if matches!(
+                    &wop,
+                    WorldOp::Data {
+                        op: Op::Cleanup,
+                        ..
+                    }
+                ) {
+                    crate::cost::set_label("_verify");
+                    if let Some(f) = &failing {
+                        f.suspend();
+                    }
+                    assert_collector_images(&db, &cleanup_images, i).await;
+                    assert_collector_paths(
+                        cleanup_paths.as_ref().expect("Cleanup captured paths"),
+                        i,
+                    )
+                    .await;
+                    assert_collector_invariants(&db, i, true, false).await;
+                    if let Some(f) = &failing {
+                        f.resume();
                     }
                 }
                 continue;
@@ -5471,6 +5788,10 @@ impl UniverseScenario<RustResources> for Scenario {
                         &format!("crash-state:write#{}@op{i}", ks.writes_observed()),
                         i,
                         sc.fail_maintenance_rerun,
+                        CleanupEvidence {
+                            images: &cleanup_images,
+                            paths: cleanup_paths.as_ref(),
+                        },
                     ))
                     .await
                 } else {
@@ -5517,6 +5838,30 @@ impl UniverseScenario<RustResources> for Scenario {
                         ) {
                             force_session_check = true;
                         }
+                        if matches!(
+                            &wop,
+                            WorldOp::Data {
+                                op: Op::Cleanup,
+                                ..
+                            }
+                        ) {
+                            let damaged = failing.as_ref().map(|f| f.damage_events()).unwrap_or(0)
+                                > damage_before;
+                            if let Some(f) = &failing {
+                                f.suspend();
+                            }
+                            crate::cost::set_label("_verify");
+                            assert_collector_images(&db, &cleanup_images, i).await;
+                            assert_collector_paths(
+                                cleanup_paths.as_ref().expect("Cleanup captured paths"),
+                                i,
+                            )
+                            .await;
+                            assert_collector_invariants(&db, i, true, damaged).await;
+                            if let Some(f) = &failing {
+                                f.resume();
+                            }
+                        }
                         apply_world(&mut world, &wop);
                     }
                     Err(err) => {
@@ -5559,6 +5904,29 @@ impl UniverseScenario<RustResources> for Scenario {
                             );
                         }
                         legal_rejections += 1;
+                        let failed_cleanup = matches!(
+                            &wop,
+                            WorldOp::Data {
+                                op: Op::Cleanup,
+                                ..
+                            }
+                        );
+                        if failed_cleanup {
+                            if let Some(f) = &failing {
+                                f.suspend();
+                            }
+                            crate::cost::set_label("_verify");
+                            assert_collector_images(&db, &cleanup_images, i).await;
+                            assert_collector_paths(
+                                cleanup_paths.as_ref().expect("Cleanup captured paths"),
+                                i,
+                            )
+                            .await;
+                            crate::cost::set_label(&crate::cost::debug_head(&wop));
+                            if let Some(f) = &failing {
+                                f.resume();
+                            }
+                        }
                         let mut retry_effect = RetryEffect::None;
                         if format!("{err:?}").contains(ACK_LOSS_MARKER)
                             && sc.faults.as_ref().is_some_and(|p| p.client_retry)
@@ -5630,6 +5998,31 @@ impl UniverseScenario<RustResources> for Scenario {
                             } else {
                                 None
                             };
+                        if failed_cleanup && op_targets_live(&world, &wop) {
+                            if let Some(f) = &failing {
+                                f.suspend();
+                            }
+                            let ran = Box::pin(maintenance_obligations(
+                                &db,
+                                &world,
+                                &wop,
+                                &format!("fault@op{i}"),
+                                i,
+                                sc.fail_maintenance_rerun,
+                                CleanupEvidence {
+                                    images: &cleanup_images,
+                                    paths: cleanup_paths.as_ref(),
+                                },
+                            ))
+                            .await;
+                            if ran {
+                                maintenance_reruns += 1;
+                                history_verified_from = history.len().saturating_sub(1);
+                            }
+                            if let Some(f) = &failing {
+                                f.resume();
+                            }
+                        }
                         if let Some((outcome, channel, context)) = fault_verdict {
                             reconcile_verdicts.push((
                                 format!("{context}@op{i}"),
@@ -5860,6 +6253,7 @@ impl UniverseScenario<RustResources> for Scenario {
             Box::pin(assert_physical_matches(&db, &world, "final reopen")),
         )
         .await;
+        assert_collector_invariants(&db, sc.ops, false, false).await;
         // both Expand modes + the bound arm, every branch.
         detectors::tagged(
             DET_TRAVERSAL,
@@ -6362,5 +6756,349 @@ mod retry_tests {
             .expect("lost insertion must report a detector violation");
         assert_eq!(violation.detector, super::DET_CRASH_CONTRACT);
         assert_eq!(retry.edge_outcome(&twice, &absent, &once, &twice), None);
+    }
+}
+
+#[cfg(test)]
+mod history_schema_tests {
+    use super::*;
+    use futures::FutureExt;
+
+    struct HistorySchemaFixture;
+
+    impl UniverseScenario<MemoryStorage> for HistorySchemaFixture {
+        type Output = ();
+
+        async fn run(&self, resources: &mut MemoryStorage, _seed: u64) {
+            let db = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::init_with_storage(
+                        &resources.root,
+                        TEST_SCHEMA,
+                        resources.adapter.clone(),
+                        InitOptions::default(),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+                SessionSettings::default(),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            let mut world = WorldModel::default();
+            for (name, age, ver) in person_rows(&db).await {
+                world.main.persons.insert(name, (age, ver));
+            }
+            for pair in knows_pairs(&db).await {
+                world.add_edge_row("main", pair);
+            }
+            let mut history = Vec::new();
+            capture_history(&db, &world.main, &mut history).await;
+            db.apply_schema(&schema_with_extras(1)).await.unwrap();
+            world.main.schema_extras = 1;
+            capture_history(&db, &world.main, &mut history).await;
+            assert_eq!(
+                history.len(),
+                2,
+                "schema publication must advance recorded history"
+            );
+            assert_history_matches(&db, &history, "accepted schema transition").await;
+
+            let mut wrong_epoch = history.clone();
+            wrong_epoch[1].1.schema_extras = 0;
+            let rejected = std::panic::AssertUnwindSafe(assert_history_matches(
+                &db,
+                &wrong_epoch,
+                "missing schema transition",
+            ))
+            .catch_unwind()
+            .await;
+            assert!(
+                rejected.is_err(),
+                "a typed boundary without model evidence must fail"
+            );
+
+            db.branch_create("blocks-schema").await.unwrap();
+            assert!(db.apply_schema(&schema_with_extras(2)).await.is_err());
+            assert_eq!(
+                schema_apply_outcome(1, 2, &db.schema_source()),
+                Some(ReconcileOutcome::NotApplied),
+                "equal rows cannot turn a rejected schema attempt into accepted history"
+            );
+            db.branch_delete("blocks-schema").await.unwrap();
+            db.load_jsonl(
+                r#"{"type":"Person","data":{"name":"after-schema","age":61,"ver":7}}"#,
+                LoadMode::Merge,
+            )
+            .await
+            .unwrap();
+            world.main.persons.insert("after-schema".into(), (61, 7));
+            capture_history(&db, &world.main, &mut history).await;
+            assert_history_matches(&db, &history, "same-schema write after rejection").await;
+            assert_eq!(schema_apply_outcome(1, 2, &schema_with_extras(3)), None);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn history_accepts_only_proven_schema_boundaries() {
+        let environment = MemoryEnvironment::new(
+            "shared-memory://dst-history-schema-boundary",
+            22_940,
+            UniverseProcess::Shared,
+        );
+        let run = crate::environment::run_universe(&environment, &HistorySchemaFixture);
+        run.cleanup.unwrap().unwrap();
+        run.result.unwrap().unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "failpoints"))]
+mod collector_oracle_tests {
+    use super::*;
+    use futures::{FutureExt, TryStreamExt};
+    use lance_io::object_store::ObjectStoreParams;
+    use lance_io::object_store::ObjectStoreProvider;
+    use lance_io::object_store::providers::shared_memory::SharedMemoryStoreProvider;
+    use object_store::ObjectStoreExt;
+    use object_store::path::Path;
+    use url::Url;
+
+    async fn objects(store: &dyn object_store::ObjectStore) -> BTreeMap<Path, bytes::Bytes> {
+        let mut objects = BTreeMap::new();
+        for meta in store.list(None).try_collect::<Vec<_>>().await.unwrap() {
+            objects.insert(
+                meta.location.clone(),
+                store
+                    .get(&meta.location)
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap(),
+            );
+        }
+        objects
+    }
+
+    async fn fixture(resources: &MemoryStorage) -> (Session, WorldModel) {
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            ),
+            SessionSettings::default(),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+        let mut world = WorldModel::default();
+        for (name, age, ver) in person_rows(&db).await {
+            world.main.persons.insert(name, (age, ver));
+        }
+        for pair in knows_pairs(&db).await {
+            world.add_edge_row("main", pair);
+        }
+        (db, world)
+    }
+
+    struct CollectorFixture {
+        saved_base: bool,
+    }
+
+    impl UniverseScenario<MemoryStorage> for CollectorFixture {
+        type Output = ();
+
+        async fn run(&self, resources: &mut MemoryStorage, _seed: u64) {
+            let (db, mut world) = fixture(resources).await;
+            let store = SharedMemoryStoreProvider::default()
+                .new_store(
+                    Url::parse(&resources.root).unwrap(),
+                    &ObjectStoreParams::default(),
+                )
+                .await
+                .unwrap()
+                .inner;
+            if self.saved_base {
+                let head = db.resolve_snapshot("main").await.unwrap().to_string();
+                let images = vec![(head, world.main.clone())];
+                let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+                let table = snapshot
+                    .dataset("node:Person")
+                    .unwrap()
+                    .dataset_path
+                    .clone();
+                let initial = objects(store.as_ref()).await;
+                let base_manifests: Vec<_> = initial
+                    .keys()
+                    .filter(|path| {
+                        path.as_ref().contains(&format!("{table}/_versions/d"))
+                            && path.as_ref().ends_with(".manifest")
+                    })
+                    .cloned()
+                    .collect();
+                assert_eq!(
+                    base_manifests.len(),
+                    1,
+                    "fixture captures its actual Person base manifest"
+                );
+                let create = WorldOp::BranchCreate {
+                    name: "saved-base".into(),
+                };
+                exec_world_op(&db, &create).await.unwrap();
+                apply_world(&mut world, &create);
+                for branch in ["main", "saved-base"] {
+                    let op = WorldOp::Data {
+                        branch: branch.into(),
+                        op: Op::InsertV {
+                            name: format!("new-{branch}"),
+                            age: 41,
+                            ver: 9,
+                        },
+                    };
+                    exec_world_op(&db, &op).await.unwrap();
+                    apply_world(&mut world, &op);
+                }
+                exec_op(&db, "main", &Op::Cleanup).await.unwrap();
+                assert_collector_images(&db, &images, 0).await;
+                store.delete(&base_manifests[0]).await.unwrap();
+                drop(db);
+                let fresh = Session::from_defaults(
+                    Arc::new(
+                        Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                            .await
+                            .unwrap(),
+                    ),
+                    SessionSettings::default(),
+                );
+                assert_world_matches(&fresh, &world, "current tips survive seeded base loss").await;
+                let red = std::panic::AssertUnwindSafe(assert_collector_images(&fresh, &images, 0))
+                    .catch_unwind()
+                    .await;
+                assert!(
+                    red.is_err(),
+                    "saved-base oracle must catch loss outside readable current tips"
+                );
+                return;
+            }
+
+            let before = objects(store.as_ref()).await;
+            {
+                let _fp = omnigraph::seams::catalog::MUTATION_POST_TABLE_COMMIT.fail_once_at(1);
+                assert!(
+                    exec_op(
+                        &db,
+                        "main",
+                        &Op::InsertV {
+                            name: "stranded".into(),
+                            age: 30,
+                            ver: 1,
+                        }
+                    )
+                    .await
+                    .is_err()
+                );
+            }
+            let staged: BTreeMap<_, _> = objects(store.as_ref())
+                .await
+                .into_iter()
+                .filter(|(path, _)| !before.contains_key(path))
+                .collect();
+            let staged_manifests: Vec<_> = staged
+                .keys()
+                .filter(|path| {
+                    path.as_ref().contains("/_versions/d") && path.as_ref().ends_with(".manifest")
+                })
+                .cloned()
+                .collect();
+            assert!(
+                !staged_manifests.is_empty(),
+                "real interrupted write must strand a manifest"
+            );
+            exec_op(&db, "main", &Op::Cleanup).await.unwrap();
+            assert_collector_invariants(&db, 0, true, false).await;
+            for path in &staged_manifests {
+                assert!(store.head(path).await.is_ok(), "live staging retained");
+            }
+            exec_op(
+                &db,
+                "main",
+                &Op::InsertV {
+                    name: "advanced".into(),
+                    age: 31,
+                    ver: 2,
+                },
+            )
+            .await
+            .unwrap();
+            exec_op(&db, "main", &Op::Cleanup).await.unwrap();
+            let mut removed = Vec::new();
+            for (path, bytes) in &staged {
+                if store.head(path).await.is_err() {
+                    removed.push(path.clone());
+                    store.put(path, bytes.clone().into()).await.unwrap();
+                }
+            }
+            assert!(
+                removed.iter().any(|path| path.as_ref().contains("/data/")),
+                "cleanup reclaimed unique staged payload"
+            );
+            let report = db
+                .cleanup_plan(omnigraph::db::CleanupPolicyOptions {
+                    keep_versions: Some(1),
+                    older_than: None,
+                })
+                .await
+                .unwrap();
+            assert!(
+                report
+                    .tables
+                    .iter()
+                    .all(|plan| plan.would_remove().is_empty()),
+                "seeded leak is only dead staging"
+            );
+            assert!(
+                report
+                    .tables
+                    .iter()
+                    .any(|plan| !plan.dead_stagings().is_empty())
+            );
+            let red =
+                std::panic::AssertUnwindSafe(assert_collector_invariants(&db, 0, true, false))
+                    .catch_unwind()
+                    .await;
+            assert!(
+                red.is_err(),
+                "dead staging alone must redden the progress oracle"
+            );
+            exec_op(&db, "main", &Op::Cleanup).await.unwrap();
+            assert_collector_invariants(&db, 0, true, false).await;
+            for path in &removed {
+                assert!(
+                    store.head(path).await.is_err(),
+                    "retry removes seeded leak: {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn collector_oracle_rejects_dead_staging_leak_and_saved_base_loss() {
+        let _scenario = omnigraph::seams::FailScenario::setup();
+        for saved_base in [false, true] {
+            let environment = MemoryEnvironment::new(
+                format!("shared-memory://dst-collector-oracle-{saved_base}"),
+                22_913,
+                UniverseProcess::Shared,
+            );
+            let run =
+                crate::environment::run_universe(&environment, &CollectorFixture { saved_base });
+            run.cleanup.unwrap().unwrap();
+            run.result.unwrap().unwrap();
+        }
     }
 }

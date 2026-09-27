@@ -546,7 +546,7 @@ fn dst_sessions_agree_and_replay() {
 #[test]
 #[serial]
 fn dst_maintenance_commit_uses_execution_branch() {
-    for (seed, write, op) in [(228_301, 118, 13), (228_317, 133, 9)] {
+    for (seed, write, op) in [(228_301, 102, 13), (228_317, 102, 9)] {
         let report = run_universe(
             &format!("shared-memory://dst-maintenance-commit-{seed}"),
             &Scenario {
@@ -1357,7 +1357,7 @@ fn dst_ack_loss_bite_and_replay() {
             latency_pct: 0,
             max_latency_ms: 1,
             lance_realm: false,
-            ack_loss_pct: 20,
+            ack_loss_pct: 100,
             client_retry: false,
             ..Default::default()
         }),
@@ -1376,7 +1376,9 @@ fn dst_ack_loss_bite_and_replay() {
     );
     assert!(
         a.acks_lost > 0,
-        "acknowledgements should actually be lost (acks_lost={})",
+        "acknowledgements should actually be lost (acks_lost={}); the adapter realm's routine \
+         writes are Optimize's CSR persist since RFC 0067 removed the sidecars and the reaper \
+         moved to the Lance realm, so every one of them loses its ack here",
         a.acks_lost
     );
     assert!(a.verified > 0);
@@ -1641,25 +1643,17 @@ fn dst_schema_ops_randomized_oracles_hold_and_replay() {
     assert!(a.verified > 0);
 }
 
-/// SCHEMA-APPLY CRASH WINDOWS under the randomized workload: inject a
-/// failure into the staged apply at each publication-shaped window
-/// (detached table commit, staged contract written,
-/// published-but-unpromoted), then let reconcile, recovery reopen, and the
-/// full oracle stack judge the aftermath — the windows the quarantine kept
-/// dark, now with the same bite-and-replay contract as the maintenance
-/// cells above. The post-publish window is ABSORBING by design (RFC 0067:
-/// promotion is advisory after publication — the injected error skips
-/// promotion and leaves a pending pin the next writer promotes), so its
-/// bite evidence is the persistent probe's crossing, not a death.
+/// SCHEMA-APPLY CRASH WINDOWS under the randomized workload: a failure at the
+/// detached table commit or the staged contract write, judged by reconcile,
+/// recovery reopen and the full oracle stack (bite-and-replay).
 #[cfg(feature = "failpoints")]
 #[test]
 #[serial]
 fn dst_schema_apply_crash_windows_bite_and_replay() {
     let _s = omnigraph::seams::FailScenario::setup();
-    let cells: [(&str, u64, usize, bool); 3] = [
+    let cells: [(&str, u64, usize, bool); 2] = [
         ("schema_apply.post_table_commit", 7, 30, true),
         ("schema_apply.after_staging_write", 7, 30, true),
-        ("schema_apply.post_publish_pre_promotion", 7, 30, false),
     ];
     for (window, seed, ops, dies) in cells {
         // Crossing proof first: same seed, record-only callback on the seam
@@ -2004,6 +1998,45 @@ fn dst_maintenance_obligations_bite_and_replay() {
             "s20 cell {window}: strict replay",
         );
     }
+    for keep_handle in [false, true] {
+        let report = run_universe(
+            &format!("shared-memory://dst-s20-returned-cleanup-{keep_handle}"),
+            &returned_cleanup_error_scenario(keep_handle),
+        );
+        assert_eq!(report.crashes, 0, "this route returns an ordinary error");
+        assert!(!report.crash_state_hit);
+        assert!(
+            report.lance_realm_injected > 0,
+            "storage faults must be delivered"
+        );
+        assert_eq!(
+            report.maintenance_reruns, 1,
+            "the one failed Cleanup must receive its clean convergence pass"
+        );
+        assert!(
+            report
+                .reconcile_verdicts
+                .iter()
+                .any(|(context, _, _)| context.starts_with("fault@op"))
+        );
+        assert_eq!(report.reopens == 0, keep_handle);
+    }
+}
+
+#[cfg(feature = "failpoints")]
+fn returned_cleanup_error_scenario(keep_handle: bool) -> Scenario {
+    Scenario {
+        seed: 7,
+        ops: 3,
+        reach_target: Some("cleanup.pre_gates"),
+        keep_handle,
+        faults: Some(omnigraph_dst::harness::FaultPlan {
+            read_error_pct: 100,
+            lance_realm: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 /// SENSITIVITY PROOF (a green oracle is worthless until
@@ -2015,35 +2048,53 @@ fn dst_maintenance_obligations_bite_and_replay() {
 #[serial]
 fn dst_sensitivity_maintenance_rerun_failure_is_red() {
     let _s = omnigraph::seams::FailScenario::setup();
-    let sc = Scenario {
-        seed: 7,
-        ops: 24,
-        crash_on_match: Some(("optimize.before_compact", 0)),
-        fail_maintenance_rerun: true,
-        ..Default::default()
-    };
-    let result = omnigraph_dst::harness::run_universe_caught("shared-memory://dst-s20-red", &sc);
-    let Err(panic) = result else {
-        panic!("s20 sensitivity: a failing rerun MUST redden the universe");
-    };
-    let msg = omnigraph_dst::harness::panic_message(panic.as_ref());
-    assert!(
-        msg.contains("MAINTENANCE OBLIGATION"),
-        "s20 sensitivity: the red must name the obligation, got: {msg}"
-    );
-    // The recorded violation must carry the EXPECTED detector tag.
-    let violation = panic
-        .downcast_ref::<omnigraph_dst::detectors::Violation>()
-        .expect("s20 sensitivity: the red must be a detector-tagged Violation");
-    assert_eq!(
-        violation.detector,
-        omnigraph_dst::harness::DET_MAINTENANCE,
-        "s20 sensitivity: wrong detector tag"
-    );
-    assert!(
-        msg.contains("detector=Store(Query)/MaintenanceObligations"),
-        "s20 sensitivity: the rendered row must carry the detector field, got: {msg}"
-    );
+    let mut cases = ["optimize.before_compact", "cleanup.pre_gates"]
+        .into_iter()
+        .map(|window| {
+            (
+                window.to_string(),
+                Scenario {
+                    seed: 7,
+                    ops: 24,
+                    crash_on_match: Some((window, 0)),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    cases.extend([false, true].into_iter().map(|keep_handle| {
+        (
+            format!("returned-cleanup-{keep_handle}"),
+            returned_cleanup_error_scenario(keep_handle),
+        )
+    }));
+    for (case, mut sc) in cases {
+        sc.fail_maintenance_rerun = true;
+        let result = omnigraph_dst::harness::run_universe_caught(
+            &format!("shared-memory://dst-s20-red-{case}"),
+            &sc,
+        );
+        let Err(panic) = result else {
+            panic!("s20 sensitivity: a failing rerun MUST redden the universe");
+        };
+        let msg = omnigraph_dst::harness::panic_message(panic.as_ref());
+        assert!(
+            msg.contains("MAINTENANCE OBLIGATION"),
+            "s20 sensitivity: the red must name the obligation, got: {msg}"
+        );
+        let violation = panic
+            .downcast_ref::<omnigraph_dst::detectors::Violation>()
+            .expect("s20 sensitivity: the red must be a detector-tagged Violation");
+        assert_eq!(
+            violation.detector,
+            omnigraph_dst::harness::DET_MAINTENANCE,
+            "s20 sensitivity: wrong detector tag"
+        );
+        assert!(
+            msg.contains("detector=Store(Query)/MaintenanceObligations"),
+            "s20 sensitivity: the rendered row must carry the detector field, got: {msg}"
+        );
+    }
 }
 
 /// SETUP CRASHES: windows whose precondition is a
@@ -2172,71 +2223,266 @@ fn dst_milestone_never_remerges_merged_branch() {
     omnigraph_dst::harness::assert_strict_replay(&a, &b, "milestone-remerge pin: strict replay");
 }
 
-/// BENCH HARNESS — the COUNTING PASS golden: one standard universe's
-/// storage actions, tallied per op kind and per realm-verb at both
-/// interposition points, compared byte-for-byte against the checked-in
-/// golden (`cost_table.txt`, crate root; regen with DST_REGEN_COSTS=1).
-/// Exact deterministic counts, no wall-clock claims; the counting must
-/// replay identically before the golden is trusted. A diff is a NAMED
-/// cost regression ("Optimize's l.put count moved").
-///
-/// Lance 11's tag checks add one LIST per native branch reclaim, including
-/// absent-tree cleanup before create/first-touch. The fixture's String @keys
-/// implicitly create FTS indexes: RFC 0043 defers their incremental folding.
-/// An optimizer-only ablation removed 21 Optimize PUTs (85 -> 64); the full
-/// path adds two artifact-certificate PUTs (64 -> 66). The lower Optimize,
-/// audit, and verification read counts also replay under that ablation: they
-/// follow the reduced folding/version work, not a general performance win.
-///
-/// Fold-eligible planning also skips one FTS-only no-op in this universe:
-/// Optimize adapter PUT/DELETE each fall 3 -> 2 (no empty recovery cycle).
-/// Skipping its apply-phase fresh snapshot removes two schema EXISTS and
-/// three schema GETs, plus the unnecessary manifest/index reads (Lance GET
-/// 642 -> 622, LIST 72 -> 71). Lance PUT stays 66 and every other op's counts
-/// stay identical: useful maintenance work and verification are unchanged.
-///
-/// The graph-index artifact (`__graph_index/csr-current.bin`) adds one
-/// Optimize adapter PUT (write_bytes, 2 -> 3); its probes surface as adapter
-/// GETs (`read_bytes_if_exists_bounded` tallies as a.get: Optimize 60 -> 63
-/// plus EXISTS 38 -> 42, _audit 114 -> 116, _verify 564 -> 575) and stamp-fresh
-/// loads shave a few cold-build Lance GETs (_audit 1222 -> 1221,
-/// _verify 2079 -> 2074; Optimize l.get 622 -> 628 from the save-side stamping).
-///
-/// Graph-wide borrower proofs add first-touch reads; lineage identity creation
-/// and exact captured-view reuse avoid unrelated branch opens. Net changes are
-/// AddFriend 382/74 -> 396/75 and InsertLegacy 291/60 -> 278/58.
-/// Empty cleanup sweeps skip the proof and two old branch-registry LISTs.
-/// Count retention uses version_refs() to avoid 18 manifest GETs, reducing
-/// Cleanup GET/LIST 227/136 -> 209/134. Other counts are unchanged.
-/// A branch first-touch write lists the table's refs once before arming, so
-/// an orphan ref is dropped pre-arm: AddFriend/InsertLegacy LIST 75/58 -> 76/59.
-/// A SnapshotId read opens one pinned dataset to detect the image's
-/// system-column vintage (RFC 0040 historical reads); the audit's first such
-/// read is a cold open: _audit l.get 1220 -> 1228.
-/// RFC 0067 (detached mutation and load): every mutation-class op loses its
-/// sidecar adapter PUT and DELETE calls and the ref LISTs its sidecar arm paid
-/// (AddFriend a.put 8 -> 0, a.delete 4 -> 0, l.list 65 -> 59) and pays one
-/// more Lance manifest PUT per touched table for the detached commit's twin
-/// (AddFriend l.put 30 -> 38); Cleanup now reaps the promoted detached
-/// manifests (a.delete 0 -> 8, l.get 345 -> 353).
-/// The detached index writer opens each productive table at its pin and
-/// promotes the twin it lands (EnsureIndices l.get 11 -> 15; the closing
-/// pass reads the promoted twins, _close l.get 31 -> 35, _verify 2071 -> 2069).
-/// Detached schema apply: a read-write open lists the branch refs once to
-/// reclaim a stale schema-apply sentinel (_setup/_audit l.list 37/65 ->
-/// 38/66, _audit l.get 1228 -> 1230) and a read-only open probes the staged
-/// schema state once for its coherence proof (_audit a.exists 79 -> 81,
-/// _verify 376 -> 389).
-/// Conservative detached reclamation reads historical published pins and
-/// verifies UUID-matching linear twins before deleting any detached copy.
-/// Cleanup l.get rises 353 -> 515; the complete pass's l.list falls 168 -> 158.
-/// This keep-only fixture now also reaps proven historical copies, moving
-/// Cleanup a.delete 8 -> 14. Every other count is unchanged; this is the
-/// measured cost of the reclamation proof, not a general performance claim.
-/// Reclamation then reads each pinned table's linear head once, so a copy
-/// whose twin was pruned behind the head is reclaimable and a fork is judged
-/// by its owner's liveness: Cleanup l.list 158 -> 206, l.get 515 -> 529, and
-/// the pruned-twin copies this fixture leaves move a.delete 14 -> 20.
+/// Branch creation reads stay independent of unrelated retired history.
+/// The provider meter observes native ref IO that dataset wrappers can miss.
+#[test]
+#[serial]
+fn dst_branch_creation_reads_ignore_unrelated_retired_history() {
+    let _s = omnigraph::seams::FailScenario::setup();
+    struct BranchCreationCost {
+        retired_count: usize,
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for BranchCreationCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            db.branch_create("source").await.unwrap();
+            for index in 0..self.retired_count {
+                let name = format!("unrelated-retired/branch-{index}");
+                db.branch_create(&name).await.unwrap();
+                db.branch_delete(&name).await.unwrap();
+            }
+
+            omnigraph_dst::cost::set_label("CreateMain");
+            db.branch_create("fresh").await.unwrap();
+            omnigraph_dst::cost::set_label("CreateFromCold");
+            db.branch_create_from("source", "from-source")
+                .await
+                .unwrap();
+            omnigraph_dst::cost::set_label("CreateFromWarm");
+            db.branch_create_from("source", "from-source-warm")
+                .await
+                .unwrap();
+            omnigraph_dst::cost::set_label("_verify");
+            assert_eq!(
+                db.branch_list().await.unwrap(),
+                vec!["main", "fresh", "from-source", "from-source-warm", "source"]
+            );
+        }
+    }
+
+    omnigraph_dst::lance_faults::install();
+    let mut baseline_reads = None;
+    for retired_count in [0, 16] {
+        let environment = omnigraph_dst::memory::MemoryEnvironment::new(
+            format!("shared-memory://dst-branch-create-retired-{retired_count}"),
+            22_901,
+            omnigraph_dst::UniverseProcess::Shared,
+        );
+        let ledger = omnigraph_dst::cost::arm();
+        let run = omnigraph_dst::run_universe(&environment, &BranchCreationCost { retired_count });
+        let table = ledger.render_calls();
+        omnigraph_dst::cost::disarm();
+        run.cleanup.unwrap().unwrap();
+        run.result.unwrap().unwrap();
+        let reads = table
+            .lines()
+            .filter_map(|line| {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                (fields[1] == "l.get"
+                    && ["CreateMain", "CreateFromCold", "CreateFromWarm"].contains(&fields[0]))
+                .then(|| {
+                    (
+                        fields[0].to_string(),
+                        fields[2]
+                            .strip_prefix("calls=")
+                            .unwrap()
+                            .parse::<u64>()
+                            .unwrap(),
+                    )
+                })
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            reads.len(),
+            3,
+            "every creation route must reach the physical meter: {table}"
+        );
+        assert!(reads.values().all(|count| *count > 0), "{table}");
+        if let Some(baseline) = &baseline_reads {
+            assert_eq!(
+                &reads, baseline,
+                "unrelated retired lifetimes must not add physical branch creation reads: {table}"
+            );
+        } else {
+            baseline_reads = Some(reads);
+        }
+    }
+}
+
+/// Successful deletion must remove retired lifetimes from creation's physical reads.
+/// Reopen and provider-level metering keep a warm cache from hiding history growth.
+#[test]
+#[serial]
+fn dst_branch_recreation_reads_ignore_same_name_retired_history() {
+    let _s = omnigraph::seams::FailScenario::setup();
+    struct BranchRecreationCost {
+        retired_count: usize,
+        reopen: bool,
+        from_source: bool,
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage>
+        for BranchRecreationCost
+    {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            db.branch_create("source").await.unwrap();
+            db.branch_create_from("source", "source-primer")
+                .await
+                .unwrap();
+            db.branch_delete("source-primer").await.unwrap();
+            for _ in 0..self.retired_count {
+                if self.from_source {
+                    db.branch_create_from("source", "recycled").await.unwrap();
+                } else {
+                    db.branch_create("recycled").await.unwrap();
+                }
+                db.branch_delete("recycled").await.unwrap();
+            }
+
+            let db = if self.reopen {
+                omnigraph_dst::cost::set_label("_reopen");
+                drop(db);
+                session(
+                    Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                db
+            };
+            omnigraph_dst::cost::set_label("Create");
+            if self.from_source {
+                db.branch_create_from("source", "recycled").await.unwrap();
+            } else {
+                db.branch_create("recycled").await.unwrap();
+            }
+            omnigraph_dst::cost::set_label("_verify");
+            assert_eq!(
+                db.branch_list().await.unwrap(),
+                vec!["main", "recycled", "source"]
+            );
+            assert_eq!(
+                person_rows_on(&db, "recycled").await,
+                person_rows_on(&db, "source").await
+            );
+        }
+    }
+
+    omnigraph_dst::lance_faults::install();
+    let mut baselines = std::collections::BTreeMap::new();
+    let mut regressions = Vec::new();
+    for retired_count in [0, 1, 16] {
+        for reopen in [false, true] {
+            for from_source in [false, true] {
+                let handle = if reopen { "reopened" } else { "warm" };
+                let route = if from_source {
+                    "branch_create_from"
+                } else {
+                    "branch_create"
+                };
+                let environment = omnigraph_dst::memory::MemoryEnvironment::new(
+                    format!(
+                        "shared-memory://dst-branch-recreate-{retired_count}-{reopen}-{from_source}"
+                    ),
+                    22_902,
+                    omnigraph_dst::UniverseProcess::Shared,
+                );
+                let ledger = omnigraph_dst::cost::arm();
+                let run = omnigraph_dst::run_universe(
+                    &environment,
+                    &BranchRecreationCost {
+                        retired_count,
+                        reopen,
+                        from_source,
+                    },
+                );
+                let table = ledger.render_calls();
+                omnigraph_dst::cost::disarm();
+                run.cleanup.unwrap().unwrap();
+                run.result.unwrap().unwrap();
+                let reads = table
+                    .lines()
+                    .filter_map(|line| {
+                        let fields = line.split_whitespace().collect::<Vec<_>>();
+                        (fields[0] == "Create" && matches!(fields[1], "l.get" | "l.list")).then(
+                            || {
+                                (
+                                    fields[1].to_string(),
+                                    fields[2]
+                                        .strip_prefix("calls=")
+                                        .unwrap()
+                                        .parse::<u64>()
+                                        .unwrap(),
+                                )
+                            },
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                assert_eq!(
+                    reads.len(),
+                    2,
+                    "creation must reach both physical read meters: {table}"
+                );
+                assert!(reads.values().all(|count| *count > 0), "{table}");
+                if retired_count == 0 {
+                    baselines.insert((reopen, from_source), reads);
+                } else {
+                    let baseline = &baselines[&(reopen, from_source)];
+                    if &reads != baseline {
+                        regressions.push(format!(
+                            "retired={retired_count} handle={handle} route={route}: \
+                             baseline={baseline:?}, observed={reads:?}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(baselines.len(), 4);
+    assert!(
+        regressions.is_empty(),
+        "same-name retirement history must not add physical branch creation reads:\n{}",
+        regressions.join("\n")
+    );
+}
+
+/// The counting-pass golden: one universe's storage actions per op kind and
+/// realm-verb, replayed identically, then compared with `cost_table.txt`
+/// (regen with DST_REGEN_COSTS=1); every changed line is a named cost change.
 #[test]
 #[serial]
 fn dst_bench_cost_count_golden() {

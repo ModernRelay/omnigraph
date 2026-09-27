@@ -1728,25 +1728,24 @@ pub(crate) enum VersionResolution {
     At(u64),
 }
 
-/// Open a table pin (RFC 0067). A pin without a staged version is an exact
-/// open of its target. A pin with one opens the linear target when it exists
-/// and carries the pin's transaction uuid, and otherwise the staged detached
-/// version: either the pin is pending promotion, or its promotion is blocked
-/// by a foreign commit at the target. An absent target counts as pending only
-/// while the table's linear head has not reached it; once the head is at or
-/// past the target, the twin was promoted and later pruned, and the staged
-/// manifest must not resurrect pruned history.
+/// Open a table pin (RFC 0067): a pin without a staged version opens its
+/// target, a staged pin above `last_linear_version` opens its detached
+/// version, and any older pin keeps the v10 twin rule for historical rows.
 pub(crate) async fn open_pinned_dataset(
     uri: &str,
     target_version: u64,
     staged_version: Option<u64>,
     transaction_uuid: Option<&str>,
+    last_linear_version: Option<u64>,
     session: Option<&Arc<lance::session::Session>>,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Dataset> {
     let Some(staged) = staged_version else {
         return open_dataset(uri, VersionResolution::At(target_version), session, wrapper).await;
     };
+    if last_linear_version.is_some_and(|last| target_version > last) {
+        return open_dataset(uri, VersionResolution::At(staged), session, wrapper).await;
+    }
     match open_dataset(
         uri,
         VersionResolution::At(target_version),
@@ -1775,12 +1774,6 @@ pub(crate) async fn open_pinned_dataset(
                 .version()
                 .version;
             if latest < target_version {
-                // The twin is not promoted yet, so serve the staged version —
-                // but a concurrent cleanup can promote this pin and reap its
-                // staged tip between the Latest probe above and this open. If
-                // the staged version is gone, fall through to the target
-                // re-check below rather than reporting reclaimed history, the
-                // same recovery the `latest >= target` arm performs.
                 match open_dataset(uri, VersionResolution::At(staged), session, wrapper.clone())
                     .await
                 {
@@ -1789,11 +1782,6 @@ pub(crate) async fn open_pinned_dataset(
                     Err(other) => return Err(other),
                 }
             }
-            // HEAD reached the target between the two reads (or a racing
-            // promotion landed the twin and reaped the staged tip), so a
-            // promotion may have landed the twin after the first probe missed
-            // it. Read the exact target once more before reporting reclaimed
-            // history.
             match open_dataset(
                 uri,
                 VersionResolution::At(target_version),

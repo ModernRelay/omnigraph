@@ -99,7 +99,8 @@ The frontier ceiling additionally binds execution: the cost decision reruns at
 every indexed hop with the observed frontier, and a traversal that outgrows
 the ceiling or the projected cost switches to CSR mid-flight, carrying its
 visited state. `optimize` persists the built CSR/CSC to
-`__graph_index/csr-current.bin` (format v2: self-describing sections inside a
+`__graph_index/csr-current.bin` (format v3: detached-pin identity stamps and
+self-describing sections inside a
 digested payload); loads verify per-edge identity stamps and fall open to the
 in-memory scan build, and the runtime cache shares one decoded artifact across
 scoped requests with per-request freshness checks. Both execution paths have

@@ -88,10 +88,10 @@ both branches descend from, counting a merged branch as an ancestor. Two
 branches that each merged the same third branch therefore share that
 branch's commit as their base, and an entity only one of them changed after
 that import merges cleanly. The record of such a commit lives in the branch
-it was merged from, and the merge reads it from any live branch whose
-lineage still holds it. Once no live branch holds it, the base falls back to
-the older common commit, so an entity both sides received from the deleted
-branch and one side then changed can report `divergent_update`.
+it was merged from, and the merge can read it from a live branch or retained
+retired history. Cleanup preserves the exact selected base and the retired
+histories needed to resolve it. Recreating the logical branch name cannot
+substitute the replacement branch's same-numbered snapshot.
 
 Each conflict identifies the affected type and, when applicable, entity id. The
 HTTP server returns conflicts with status `409`, the same answer for

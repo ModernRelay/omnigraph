@@ -228,27 +228,35 @@ query insert_project($name: String) {
         )
         .await
         .expect("source write must use the token-bound post-apply catalog");
-    let project_before_indices = stale_handle
-        .snapshot_of(ReadTarget::branch("source"))
-        .await
-        .unwrap()
-        .dataset("node:Project")
-        .unwrap()
-        .published_dataset_version;
+    let project_uri = helpers::collector::table_uri(&stale_handle, "Project").await;
+    let project_published = |snapshot: omnigraph::db::Snapshot| {
+        snapshot
+            .dataset("node:Project")
+            .unwrap()
+            .published_dataset_version
+    };
+    let project_before_indices = project_published(
+        stale_handle
+            .snapshot_of(ReadTarget::branch("source"))
+            .await
+            .unwrap(),
+    );
+    let detached_before_indices = helpers::collector::detached_versions(&project_uri).await;
     stale_handle
         .ensure_indices_on("source")
         .await
         .expect("index planning must use the same token-bound post-apply catalog");
-    let project_after_indices = stale_handle
-        .snapshot_of(ReadTarget::branch("source"))
-        .await
-        .unwrap()
-        .dataset("node:Project")
-        .unwrap()
-        .published_dataset_version;
+    let project_after_indices = project_published(
+        stale_handle
+            .snapshot_of(ReadTarget::branch("source"))
+            .await
+            .unwrap(),
+    );
+    let detached_after_indices = helpers::collector::detached_versions(&project_uri).await;
     assert!(
-        project_after_indices > project_before_indices,
-        "the stale handle must discover and build Project's declared key index"
+        project_after_indices > project_before_indices
+            || detached_after_indices != detached_before_indices,
+        "the stale handle must discover and build Project's declared key index, publishing a higher pin and a new detached commit on the inherited location: {project_before_indices} -> {project_after_indices}, {detached_before_indices:?} -> {detached_after_indices:?}"
     );
     assert_eq!(
         stale_handle
@@ -1394,6 +1402,7 @@ edge WorksAt: Human -> Company
     assert_eq!(after.dataset_path, before.dataset_path);
     assert!(after.published_dataset_version > before.published_dataset_version);
     assert!(after_snapshot.dataset("node:Person").is_none());
+    reclaim_hard_dropped_history(&db).await;
     assert!(
         db.snapshot_at_graph_manifest_version(before_manifest_version)
             .await
@@ -1403,6 +1412,21 @@ edge WorksAt: Human -> Company
             .is_err(),
         "hard cleanup must reclaim the renamed source incarnation's prior version"
     );
+}
+
+/// A hard drop's prior version is a pin that `cleanup` reclaims once `--keep`
+/// prunes the `__manifest` version naming it.
+async fn reclaim_hard_dropped_history(db: &Session) {
+    let stats = db
+        .cleanup(omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .unwrap();
+    for row in &stats {
+        assert!(row.error.is_none(), "{row:?}");
+    }
 }
 
 #[tokio::test]
@@ -1814,6 +1838,7 @@ async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
     // the dataset at that snapshot should fail (Lance can't load the
     // dropped version). This is the Hard-mode contract — the prior
     // data is unreachable.
+    reclaim_hard_dropped_history(&db).await;
     let pre_drop = db
         .snapshot_at_graph_manifest_version(before_version)
         .await

@@ -10,10 +10,10 @@ environments:
 node Person { name: String @key }
 --- seed
 --- seam
-at: branch_merge.post_fork_pre_commit
+at: branch_merge.post_table_effect
 occurrence: 1
 action: fail
 scope: next_step
 --- mutate
-branch merge "injected failpoint triggered: branch_merge.post_fork_pre_commit" into main
---- expect error: injected failpoint triggered: branch_merge.post_fork_pre_commit
+branch merge "injected failpoint triggered: branch_merge.post_table_effect" into main
+--- expect error: injected failpoint triggered: branch_merge.post_table_effect

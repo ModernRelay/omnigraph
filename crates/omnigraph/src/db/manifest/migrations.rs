@@ -16,14 +16,17 @@
 //! ## Served stamps and explicit conversion
 //!
 //! Normal open accepts `MIN_SUPPORTED..=CURRENT`, which since v10 is one
-//! stamp: every served graph may carry RFC 0067 table pins whose linear
-//! target is still pending, which an older binary would misread. Both RFC
-//! 0040 system column vintages (`id`/`src`/`dst` and `__id`/`__src`/`__dst`)
-//! live under that stamp; the vintage is read from the schema IR, never from
-//! the stamp. Normal open refuses an active storage-upgrade intent. The
-//! explicit offline upgrade entry point converts supported v6/v7/v8/v9 graphs
-//! to v10 before serving. Retained v6 snapshots use the legacy decoder after
-//! root admission; normal open never runs conversion or lowers MIN_SUPPORTED.
+//! stamp: every served graph may carry table pins that name a detached Lance
+//! version and no linear one (RFC "Detached-only tables"), which an older
+//! binary would misread as reclaimed history. Both RFC 0040 system column
+//! vintages (`id`/`src`/`dst` and `__id`/`__src`/`__dst`) live under that
+//! stamp; the vintage is read from the schema IR, never from the stamp.
+//! Normal open refuses an active storage-upgrade intent. The explicit
+//! offline upgrade entry point converts supported v6 to v10 graphs to v11
+//! before serving; its v10 step opens the graph through an engine handle,
+//! admitted at the stamp it converts from by [`admit_conversion_source`],
+//! before it fences. Retained v6 snapshots use the legacy decoder after root
+//! admission; normal open never runs conversion or lowers MIN_SUPPORTED.
 //! Fresh graphs receive their stamp atomically in the manifest Create commit.
 //!
 //! ## Forward-version protection
@@ -75,15 +78,22 @@ use crate::error::{OmniError, Result};
 ///   absent target and misdiagnose a pending pin as reclaimed history, so
 ///   the stamp refuses it before any open. Both system column vintages are
 ///   stamped v10; the stamp no longer encodes the vintage.
+/// - v11 — RFC "Detached-only tables": a pin is never promoted, so
+///   `published_dataset_version` names no Lance version and a table's history
+///   is its chain of detached commits. A registration carries
+///   `omnigraph.last_linear_version`, the highest linear version a v10 pin
+///   reached; rows at or below it keep the v10 twin rule, rows above it open
+///   their detached version directly. A v10 binary would read a v11 pin's
+///   target as reclaimed history, so the stamp refuses it before any open.
 ///
-/// v1–v9 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
-/// is kept for provenance and to document what each stamp value meant.
-pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 10;
+/// v1–v10 graphs are not served by this binary (see `MIN_SUPPORTED`); the
+/// history is kept for provenance and to document what each stamp value meant.
+pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 11;
 
-/// The oldest main-manifest stamp accepted by normal open: v10, the target of
+/// The oldest main-manifest stamp accepted by normal open: v11, the target of
 /// every registered upgrade route. Explicit conversion and retained-snapshot
 /// decoding do not lower this gate.
-pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = 10;
+pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = 11;
 
 /// The stamp a fresh graph of the given system column vintage is born with:
 /// CURRENT for both `id`/`src`/`dst` and `__id`/`__src`/`__dst` since v10.
@@ -111,8 +121,10 @@ pub(crate) fn stamp_for_system_columns(system_columns: SystemColumns) -> Result<
 /// `git show vX.Y.Z:crates/omnigraph/src/db/manifest/migrations.rs`):
 /// v1 ≤ 0.3.1, v2 0.4.1–0.6.1, v3 0.6.2–0.7.2, v4 0.8.x, v5 was
 /// unreleased (final source commit pinned below), v6 is 0.9.x–0.10.x,
-/// v7 an unreleased development build, and v8 and v9 are the two 0.11.x
-/// system column vintages. The fallback keeps this map total.
+/// v7 an unreleased development build, v8 and v9 are the two 0.11.x
+/// system column vintages, and v10 is the 0.11.x line after RFC 0067 (the
+/// stamp of every graph the 0.11.0 crate version wrote with detached table
+/// commits). The fallback keeps this map total.
 pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
     match stamp {
         1 => "0.3.1 or earlier",
@@ -126,8 +138,61 @@ pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
         7 => "an unreleased v7 development build",
         8 => "0.11.x (legacy system column spellings)",
         9 => "0.11.x",
+        10 => "0.11.x (detached table commits)",
         _ => "an unrecognized older release",
     }
+}
+
+/// Roots a storage conversion may open through an engine handle at the stamp
+/// it converts from, keyed by `__manifest` URI; `guard_stamp` admits exactly
+/// that stamp for an admitted root and refuses everything else as before.
+static CONVERSION_ADMISSIONS: std::sync::Mutex<Vec<(String, u32)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// One admission, withdrawn when dropped.
+pub(crate) struct ConversionAdmission {
+    manifest_uri: String,
+    stamp: u32,
+}
+
+fn conversion_admissions() -> std::sync::MutexGuard<'static, Vec<(String, u32)>> {
+    CONVERSION_ADMISSIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Admit `root_uri`'s `__manifest`, and every branch of it, at `stamp` for
+/// the lifetime of the returned guard.
+pub(crate) fn admit_conversion_source(root_uri: &str, stamp: u32) -> ConversionAdmission {
+    let manifest_uri = super::manifest_uri(root_uri);
+    conversion_admissions().push((manifest_uri.clone(), stamp));
+    ConversionAdmission {
+        manifest_uri,
+        stamp,
+    }
+}
+
+impl Drop for ConversionAdmission {
+    fn drop(&mut self) {
+        let mut admissions = conversion_admissions();
+        if let Some(index) = admissions
+            .iter()
+            .position(|(uri, stamp)| *uri == self.manifest_uri && *stamp == self.stamp)
+        {
+            admissions.remove(index);
+        }
+    }
+}
+
+/// The stamp `dataset`'s root is admitted at, when a conversion holds one.
+fn admitted_conversion_source(dataset: &Dataset) -> Option<u32> {
+    let uri = dataset.uri();
+    conversion_admissions()
+        .iter()
+        .find(|(manifest_uri, _)| {
+            uri == manifest_uri || uri.starts_with(&format!("{manifest_uri}/"))
+        })
+        .map(|(_, stamp)| *stamp)
 }
 
 pub(super) const INTERNAL_SCHEMA_VERSION_KEY: &str = "omnigraph:internal_schema_version";
@@ -186,7 +251,9 @@ pub(crate) fn guard_stamp(dataset: &Dataset) -> Result<u32> {
     match dataset.schema().metadata.get(INTERNAL_SCHEMA_VERSION_KEY) {
         Some(value) => match value.parse::<u32>() {
             Ok(stamp) => {
-                refuse_if_stamp_unsupported(stamp)?;
+                if admitted_conversion_source(dataset) != Some(stamp) {
+                    refuse_if_stamp_unsupported(stamp)?;
+                }
                 Ok(stamp)
             }
             Err(_) => Err(OmniError::manifest(format!(
@@ -240,7 +307,7 @@ pub(crate) fn refuse_if_stamp_unsupported(stamp: u32) -> Result<()> {
         )));
     }
     if stamp < MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION {
-        let explicit_upgrade = if matches!(stamp, 6..=9) {
+        let explicit_upgrade = if matches!(stamp, 6..=10) {
             " A registered in-place route is also available: stop all writers and maintenance, retain a verified backup, and run `omnigraph upgrade <graph> --check` before execution; the route keeps the graph's branches and system column spellings."
         } else {
             ""
@@ -319,15 +386,15 @@ mod tests {
     /// the floor or above the ceiling.
     #[test]
     fn unsupported_guard_accepts_exactly_the_supported_range() {
-        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_LEGACY).unwrap(), 10);
-        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_V3).unwrap(), 10);
+        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_LEGACY).unwrap(), 11);
+        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_V3).unwrap(), 11);
         assert!(stamp_for_system_columns(omnigraph_compiler::SYSTEM_COLUMNS_META).is_err());
         assert_eq!(
             (
                 MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
                 INTERNAL_MANIFEST_SCHEMA_VERSION
             ),
-            (10, 10)
+            (11, 11)
         );
         for stamp in MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION..=INTERNAL_MANIFEST_SCHEMA_VERSION {
             assert!(
@@ -338,8 +405,11 @@ mod tests {
         let below = refuse_if_stamp_unsupported(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION - 1)
             .expect_err("a sub-floor stamp must be refused")
             .to_string();
-        assert!(below.contains("reads only v10 to v10"), "got: {below}");
-        assert!(below.contains("0.11.x"), "got: {below}");
+        assert!(below.contains("reads only v11 to v11"), "got: {below}");
+        assert!(
+            below.contains("0.11.x (detached table commits)"),
+            "got: {below}"
+        );
         assert!(below.contains("omnigraph upgrade"), "got: {below}");
         let legacy = refuse_if_stamp_unsupported(7)
             .expect_err("a v7 stamp must be refused")
@@ -353,9 +423,46 @@ mod tests {
         let future = refuse_if_stamp_unsupported(future_stamp)
             .expect_err("the first unsupported future stamp must be refused")
             .to_string();
-        assert!(future.contains("internal schema v11"), "got: {future}");
-        assert!(future.contains("reads only v10 to v10"), "got: {future}");
+        assert!(future.contains("internal schema v12"), "got: {future}");
+        assert!(future.contains("reads only v11 to v11"), "got: {future}");
         assert!(future.contains("upgrade omnigraph"), "got: {future}");
+    }
+
+    /// An admitted root opens at the stamp its conversion names and at no
+    /// other; the admission ends with its guard, and a foreign root is never
+    /// admitted.
+    #[tokio::test]
+    async fn conversion_admission_admits_one_root_at_one_stamp_while_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        drop(
+            crate::db::Omnigraph::init(root, "node Person { name: String }")
+                .await
+                .unwrap(),
+        );
+        let control_session = crate::lance_access::control_session();
+        let mut manifest =
+            super::super::layout::open_manifest_dataset_with_session(root, None, &control_session)
+                .await
+                .unwrap();
+        set_stamp(&mut manifest, 10).await.unwrap();
+        let refused = guard_stamp(&manifest).unwrap_err().to_string();
+        assert!(refused.contains("reads only v11 to v11"), "{refused}");
+        {
+            let _admission = admit_conversion_source(root, 10);
+            assert_eq!(guard_stamp(&manifest).unwrap(), 10);
+            let _other = admit_conversion_source("/nowhere/else", 9);
+            assert!(guard_stamp(&manifest).is_ok());
+        }
+        assert!(
+            guard_stamp(&manifest).is_err(),
+            "the admission ends with its guard"
+        );
+        let _wrong_stamp = admit_conversion_source(root, 9);
+        assert!(
+            guard_stamp(&manifest).is_err(),
+            "an admission names one stamp and admits no other"
+        );
     }
 
     /// The refusal names the release line that wrote each stamp so an operator

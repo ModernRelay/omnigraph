@@ -29,6 +29,172 @@ use omnigraph_compiler::{
     SchemaIdentityDomain, build_catalog_from_ir, compile_schema_shape, initialize_schema_ir,
 };
 
+#[tokio::test]
+async fn detached_branch_pins_without_etags_isolate_handles_writes_and_topology() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let graph = Arc::new(
+        crate::db::Omnigraph::init(
+            root,
+            r#"
+node Person { name: String @key }
+edge Knows: Person -> Person {}
+"#,
+        )
+        .await
+        .unwrap(),
+    );
+    let session = crate::Session::from_defaults(
+        Arc::clone(&graph),
+        omnigraph_compiler::settings::SessionSettings::default(),
+    );
+    session
+        .load_with_receipt(
+            "main",
+            r#"{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"c"}}"#,
+            crate::loader::LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    for branch in ["left", "right"] {
+        graph.branch_create(branch).await.unwrap();
+    }
+    session
+        .load_with_receipt(
+            "left",
+            r#"{"type":"Person","data":{"name":"d"}}
+{"edge":"Knows","from":"a","to":"b"}"#,
+            crate::loader::LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    session
+        .load_with_receipt(
+            "right",
+            r#"{"type":"Person","data":{"name":"e"}}
+{"type":"Person","data":{"name":"f"}}
+{"edge":"Knows","from":"b","to":"c"}"#,
+            crate::loader::LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    drop(session);
+    drop(graph);
+    let reader = crate::db::Omnigraph::open(root).await.unwrap();
+    let (mut left, catalog) = reader
+        .capture_read_view(crate::db::ReadTarget::branch("left"))
+        .await
+        .unwrap();
+    let (mut right, _) = reader
+        .capture_read_view(crate::db::ReadTarget::branch("right"))
+        .await
+        .unwrap();
+    for resolved in [&mut left, &mut right] {
+        for entry in resolved.snapshot.entries.values_mut() {
+            let mut metadata = serde_json::to_value(&entry.version_metadata).unwrap();
+            metadata["e_tag"] = serde_json::Value::Null;
+            entry.version_metadata = serde_json::from_value(metadata).unwrap();
+        }
+    }
+    for table in ["node:Person", "edge:Knows"] {
+        let a = left.snapshot.dataset(table).unwrap();
+        let b = right.snapshot.dataset(table).unwrap();
+        assert_eq!(a.published_dataset_version, b.published_dataset_version);
+        assert_eq!(a.dataset_path, b.dataset_path);
+        assert_eq!(a.native_dataset_branch, b.native_dataset_branch);
+        assert_ne!(
+            a.version_metadata.staged_version(),
+            b.version_metadata.staged_version()
+        );
+    }
+    let left_people = left
+        .snapshot
+        .open_lance_dataset("node:Person")
+        .await
+        .unwrap();
+    let right_people = right
+        .snapshot
+        .open_lance_dataset("node:Person")
+        .await
+        .unwrap();
+    assert_eq!(left_people.count_rows(None).await.unwrap(), 4);
+    assert_eq!(right_people.count_rows(None).await.unwrap(), 5);
+    assert_ne!(
+        left_people.version().version,
+        right_people.version().version
+    );
+
+    let scope = HashMap::from([(
+        "Knows".to_string(),
+        ("Person".to_string(), "Person".to_string()),
+    )]);
+    let left_index = reader
+        .graph_index_for_resolved(&left, &scope, catalog.system_columns)
+        .await
+        .unwrap();
+    let right_index = reader
+        .graph_index_for_resolved(&right, &scope, catalog.system_columns)
+        .await
+        .unwrap();
+    assert!(!Arc::ptr_eq(&left_index, &right_index));
+    assert_ne!(
+        left_index.type_index("Person").unwrap().ids(),
+        right_index.type_index("Person").unwrap().ids()
+    );
+    crate::graph_index::persist::save(
+        &left.snapshot,
+        reader.storage_adapter(),
+        &scope,
+        &left_index,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        crate::graph_index::persist::load(&left.snapshot, &scope, Some(reader.storage_adapter()))
+            .await
+            .is_some()
+    );
+    assert!(
+        crate::graph_index::persist::load(&right.snapshot, &scope, Some(reader.storage_adapter()))
+            .await
+            .is_none(),
+        "a cold artifact must reject another detached pin at the same counter"
+    );
+
+    let entry = right.snapshot.dataset("node:Person").unwrap();
+    let full_path = format!("{root}/{}", entry.dataset_path);
+    let base = crate::db::omnigraph::promotion::open_pinned_for_write(&reader, &full_path, entry)
+        .await
+        .unwrap();
+    assert_eq!(base.version(), right_people.version().version);
+    let transaction = right_people.read_transaction().await.unwrap().unwrap();
+    let witness = crate::table_store::StagingWitness::from_transaction(&transaction).unwrap();
+    let staged = reader
+        .storage()
+        .stage_delete(
+            &base,
+            datafusion::prelude::ident("name").eq(datafusion::prelude::lit("e")),
+        )
+        .await
+        .unwrap()
+        .expect("the right branch owns e");
+    let (written, identity) = reader
+        .storage()
+        .commit_staged_detached(base, staged, &witness)
+        .await
+        .unwrap();
+    assert_eq!(identity.read_version, right_people.version().version);
+    assert_eq!(
+        reader.storage().count_rows(&written, None).await.unwrap(),
+        4
+    );
+    assert_eq!(left_people.count_rows(None).await.unwrap(), 4);
+    assert_eq!(right_people.count_rows(None).await.unwrap(), 5);
+}
+
 #[test]
 fn publisher_retry_vocabulary_remains_row_level_cas_only() {
     let row_cas = map_lance_publish_error(lance::Error::too_much_write_contention("contended"));
@@ -302,8 +468,6 @@ async fn open_refuses_a_stamp_below_the_served_floor_before_any_effect() {
             Omnigraph::init(uri, schema).await.unwrap()
         };
         drop(db);
-        // Both vintages are born at v10; a v9 stamp is the 0.11.x graph an
-        // operator has not upgraded yet.
         let mut manifest = open_manifest_dataset(uri, None).await.unwrap();
         super::migrations::set_stamp_for_test(&mut manifest, 9)
             .await
@@ -333,7 +497,7 @@ async fn open_refuses_a_stamp_below_the_served_floor_before_any_effect() {
             };
             let error = result.err().expect("a v9 stamp is below the served floor");
             assert!(
-                error.to_string().contains("reads only v10 to v10"),
+                error.to_string().contains("reads only v11 to v11"),
                 "{error}"
             );
             assert!(error.to_string().contains("omnigraph upgrade"), "{error}");
@@ -3171,10 +3335,18 @@ async fn exact_publish_rejects_named_branch_delete_recreate_aba() {
         ),
         "a cached native handle must reject retired live authority"
     );
-    assert_eq!(
-        old_branch.branch_identifier().await.unwrap(),
-        old_identifier
-    );
+    let archived = crate::branch_control::archived_manifest_branch(
+        &old_branch,
+        old_branch.manifest().branch.as_deref().unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(archived.identifier, old_identifier);
+    assert!(matches!(
+        old_branch.branch_identifier().await,
+        Err(lance::Error::RefNotFound { .. })
+    ));
     mc.create_branch("feature").await.unwrap();
     assert_ne!(
         probe_dataset_latest_incarnation(&old_branch, Some("feature"))

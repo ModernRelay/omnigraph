@@ -48,6 +48,10 @@ pub struct ManifestError {
     pub kind: ManifestErrorKind,
     pub message: String,
     pub details: Option<ManifestConflictDetails>,
+    /// Publication may be durable despite an unavailable acknowledgement or
+    /// readback. Retention guards must remain until authority proves it cannot
+    /// still publish; the external error category remains `Internal`.
+    pub publication_in_doubt: bool,
 }
 
 impl ManifestError {
@@ -56,6 +60,7 @@ impl ManifestError {
             kind,
             message: message.into(),
             details: None,
+            publication_in_doubt: false,
         }
     }
 
@@ -633,6 +638,25 @@ impl OmniError {
         Self::Manifest(ManifestError::new(ManifestErrorKind::Internal, message))
     }
 
+    pub(crate) fn manifest_publish_in_doubt(message: impl Into<String>) -> Self {
+        Self::Manifest(ManifestError {
+            publication_in_doubt: true,
+            ..ManifestError::new(ManifestErrorKind::Internal, message)
+        })
+    }
+
+    /// Whether a manifest publication lacks a definitive durable outcome.
+    /// This signal is independent of the diagnostic text and conflict details.
+    pub fn is_manifest_publish_in_doubt(&self) -> bool {
+        matches!(
+            self,
+            Self::Manifest(ManifestError {
+                publication_in_doubt: true,
+                ..
+            })
+        )
+    }
+
     pub fn published_dataset_version_mismatch(
         type_key: impl Into<String>,
         expected_published_dataset_version: u64,
@@ -974,6 +998,7 @@ mod tests {
                 Some("commit-before".to_string()),
                 Some("commit-after".to_string()),
             ),
+            OmniError::manifest_publish_in_doubt("exact in-doubt outcome").with_context("merge"),
             OmniError::ResourceLimitExceeded {
                 resource: "blob materialization bytes".to_string(),
                 limit: 10,
@@ -1002,6 +1027,7 @@ mod tests {
                 assert_eq!(actual.kind, expected.kind);
                 assert_eq!(actual.message, expected.message);
                 assert_eq!(actual.details, expected.details);
+                assert_eq!(actual.publication_in_doubt, expected.publication_in_doubt);
             }
             (
                 OmniError::ResourceLimitExceeded {

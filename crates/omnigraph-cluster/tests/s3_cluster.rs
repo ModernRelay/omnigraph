@@ -15,6 +15,8 @@
 //! suite pins (a spawned delete dying with a short-lived runtime) only
 //! reproduces realistically under it.
 
+#![recursion_limit = "256"]
+
 use std::env;
 use std::fs;
 

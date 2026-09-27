@@ -1,6 +1,6 @@
 # issue: none
-# notes: Two seams on one mutation: contention while loading publish state is retried, and the failure after publication skips the writer's own promotion, so the mutation succeeds and publishes a pending pin (RFC 0067).
-# notes: The reopen reads the row through the pin's staged version; the next write on the table promotes the pending pin before its own and both rows read back.
+# notes: Two seams on one mutation: contention while loading publish state is retried, and the lost acknowledgement after publication is recognized by the publisher's read-back, so the mutation succeeds with its detached pin (RFC 0067).
+# notes: The reopen reads the row through the pin's staged version; the next write on the table stages on that pin and both rows read back.
 
 --- runner
 timeout_ms: 10000
@@ -23,7 +23,7 @@ occurrence: 1
 action: contention
 scope: next_step
 --- seam
-at: mutation.post_publish_pre_promotion
+at: publish.post_merge_pre_ack
 occurrence: 1
 action: fail
 scope: next_step
@@ -57,7 +57,7 @@ query add_another() {
 --- expect affected: nodes=1 edges=0
 
 --- query
-query rows_after_promotion() {
+query rows_after_second_write() {
     match { $p: Person }
     return { $p.name }
 }
