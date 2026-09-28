@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - azimafroozeh
 created: 2026-08-29
-updated: 2026-09-26
+updated: 2026-09-27
 discussion: https://github.com/ModernRelay/omnigraph/pull/584
 supersedes: []
 superseded_by: []
@@ -506,10 +506,7 @@ in Seams at an explicit step. A step is one of:
   `OMNIGRAPH_GQ_BLESS=1` and review the diff. A rows step may carry one
   optional `--- expect plan` section, the ***plan section***, directly after
   its shape section: one assertion per line over the plan the step's query
-  runs under, in nine forms. The query's effective engine must
-  be v2, after applying the runner baseline, case settings and query prefix.
-  Under v1 the runner fails the step before execution or explain because
-  v1 produces no plan. A `scan <Type>[ as $var]:` head
+  runs under, in nine forms. A `scan <Type>[ as $var]:` head
   selects the scans of that node type (every scan of it, or the one bound
   to `$var`) and claims one fact of each: `columns [<a>, <b>]` the exact
   columns it projects; `not columns [<a>, <b>]` columns it must not read;
@@ -536,6 +533,21 @@ in Seams at an explicit step. A step is one of:
   after a shape section, an empty one, or a line outside the nine forms is
   refused with the forms spelled out. A plan section on a step that names
   any API (Execution routes, below) but `engine` is refused.
+  A query step may end with one `--- expect same as v1` section, the
+  ***reference comparison***, directly after its shape section or, when it
+  has one, its plan section; the section has no body. The runner runs the
+  step's query a second time on a copy of the case session whose reads run
+  on the frozen engine v1 (`omnigraph_reference_engine::ReferenceEngine`,
+  installed through `Session::with_read_executor`), and compares those rows
+  with the step's v2 rows under the step's own mode word, `ordered` or
+  `unordered`. The step's rows expect still applies; the comparison is added
+  to it, never a replacement. Any v1 error, a v1 gate refusal included, or a
+  row difference fails the step. The section is refused on a mutate step, an
+  error expect, a `show` step and a `branch list` step, and anywhere but
+  directly after a query step's shape or plan section. The DST runner skips
+  the comparison. The reference answers `not { ... }` among the correlated
+  blocks only and refuses count predicates and a string `nearest` argument,
+  so a step using those carries no reference comparison.
 - `--- mutate via <api>` (one API of Execution routes, below) holding exactly one GQ declaration with a mutation body,
   followed by an optional `--- params` and a mandatory `--- expect` with
   mode word `ok` (success, counts unasserted),
@@ -1532,7 +1544,7 @@ is registered at run time as its own libtest-compatible test (a libtest-mimic
 trial under `datatest-stable`) named `case::<relative/path>.gqt`. Shared cases
 live directly under `cases/`; v2-specific cases live in `cases/v2/`, with
 plan assertions in `cases/v2/planner/`. Directory placement is organizational:
-a case that requires v2 still explicitly selects `engine = v2`, and discovery
+every case runs on engine v2, the `engine` setting's one value, and discovery
 never supplies a setting. The runner it
 calls (parser, execution, comparison, bless) is the crate's library,
 `crates/omnigraph-gqt/src/lib.rs`, and the format self-tests are unit
@@ -1855,11 +1867,13 @@ the format defines:
 - `issue_563_underfill_retry.gqt`: edges only on the middle band the capped
   scan window excludes; red (retry disabled) returned zero rows, green
   returns exactly `chunk-08` and `chunk-09`.
-- `order_clause_aggregate_refused.gqt`, an `expect error` case pinning a
-  refusal on the order clause: an aggregate
-  written out in full in `order { }` rather than by its projection alias is
-  refused with the bare message `unsupported ordering expression` (the #566
-  shape), so the error path is exercised from day one.
+- `order_key_aggregate_or_node_binds_to_return_item.gqt` (named
+  `order_clause_aggregate_refused.gqt` until the 2026-09-27 entry of the
+  Decision log): an aggregate written out in full in `order { }` binds to the
+  `return` item that writes it. The case first pinned the engine v1 refusal
+  `unsupported ordering expression` (the
+  [#566](https://github.com/ModernRelay/omnigraph/issues/566) shape), so the
+  error path was exercised from day one.
 - `restart_survives_reopen.gqt` (feature case, `# issue: none`): the
   multi-step example in the Design section, inserts via mutate steps inside
   a `foreach`, asserts affected counts, restarts, reads back; pins that
@@ -2457,3 +2471,19 @@ historical command and configuration descriptions are not migration aliases.
   sentences on step kinds, step identity, migration and server `--- restart`
   are reworded for `via` and `--- cli`. Per
   [Self-contained server testing with GQT and DST](2026-09-26-self-contained-server-testing.md).
+- 2026-09-27, amendment from the PR that made engine v2 the only engine:
+  the `engine` setting keeps the one value `v2`, engine v1 moved into the
+  frozen crate `omnigraph-reference-engine`, and a query step reaches it only
+  through the new `--- expect same as v1` section (§Design, the reference
+  comparison). Superseded sentences: in the plan section, "The query's
+  effective engine must be v2, after applying the runner baseline, case
+  settings and query prefix. Under v1 the runner fails the step before
+  execution or explain because v1 produces no plan."; in §Runner mechanics,
+  "a case that requires v2 still explicitly selects `engine = v2`". The CI
+  mode that ran the corpus a second time with `OMNIGRAPH_GQ_ENGINE=v2` is
+  deleted; `OMNIGRAPH_GQ_ENGINE` accepts only `v2` or empty. The corpus
+  lost its `set engine = v1;` lines; two cases were renamed,
+  `order_clause_aggregate_refused.gqt` to
+  `order_key_aggregate_or_node_binds_to_return_item.gqt` (§Evidence and
+  tests) and `engine_v1_refuses_compound_predicates.gqt` to
+  `compound_and_bare_boolean_filters.gqt`.

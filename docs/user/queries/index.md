@@ -119,12 +119,6 @@ matches take constants evaluated once per invocation, such as
 `adult: true or $flag`; a property or system field there is `T45`. See
 [Mutations](../mutations/index.md).
 
-A read with a compound filter (`and`, `or`, `not`, a null test, a bare `Bool`
-operand), or a comparison in `return` or `order`, runs on engine v2: add
-`set engine = v2;` before it, or start the server with `OMNIGRAPH_ENGINE=v2`,
-the one fix for a stored query. Under the default `v1` it is refused with a
-`plan error` that shows both fixes. Mutations run under either engine.
-
 ### Correlated blocks
 
 `not { ... }`, `exists { ... }`, `count { ... } op value` and
@@ -144,7 +138,7 @@ The block narrows the rows before `order` and `limit`, so a paged listing
 filtered by a relationship count is exact. A binding the block's traversal
 connects to the outer row is reached through that traversal, never scanned as
 a whole table, however many rows the outer pattern has; a binding correlated
-only through a filter, or read by a text search, is scanned. On engine v2 a
+only through a filter, or read by a text search, is scanned. A
 single-hop, filter-free `count { ... }` over a directed, unbound edge is
 answered from the graph index's degree. A bare aggregate in `match`,
 `count($d) > 2` without a block, is refused: it names no row to group by.
@@ -221,10 +215,9 @@ nullable (`is null` and `is not null` are always `Bool`), and refused in an aggr
 Search expressions are documented in [Search](../search/index.md).
 
 An explicit order is total and deterministic: OmniGraph adds entity ids as a
-final tie-breaker when user keys are equal, and on the `v2` engine only where
-the ids can change the visible order (when every returned expression is an
-order key, equal rows are indistinguishable and no id is read); `v1` appends
-every `<var>.id`, and the rows are the same either way. Ascending order places nulls first;
+final tie-breaker when user keys are equal, only where the ids can change the
+visible order (when every returned expression is an order key, equal rows are
+indistinguishable and no id is read). Ascending order places nulls first;
 descending order places them last. `nearest(...)` ordering requires a `limit`.
 
 An order key that is a property access or a system field sorts as before,
@@ -233,8 +226,6 @@ a comparison, a call) must be a return alias or an expression written in
 `return`, as in `return { count($d) as deals } order { count($d) desc }`;
 otherwise it is ``T42: order key `max($d.amount)` does not appear in return;
 add it to return or order by its alias``, with the key as written.
-Engine v1 accepts only a property, a system field, an alias or the leading
-search key.
 
 Search orderings share that contract: `nearest(...)` ranks by ascending vector
 distance and `bm25(...)` by descending relevance score, so the score (never

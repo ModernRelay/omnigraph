@@ -6,8 +6,9 @@ Every `.gqt` file under `cases/`, including subdirectories, is one test
 in the complete corpus. Test names retain the path relative to `cases/`.
 Shared cases live directly under `cases/`; v2-specific cases live under
 `cases/v2/`, with plan assertions under `cases/v2/planner/`.
-These directories organize the corpus. Cases that require v2 still select it
-explicitly with `set engine = v2;`; discovery never changes the engine.
+These directories organize the corpus. Every case runs on engine v2, the one
+engine; a case's `set engine = v2;` line changes nothing, and discovery never
+selects an engine.
 The format contract and future extensions live in
 [RFC 0045](../../docs/rfcs/0045-gq-logic-tests.md).
 
@@ -139,10 +140,7 @@ extensions.
 ## Plan expectations
 
 A query step may carry an `--- expect plan` section directly after its
-`--- expect shape`. The query's effective engine must be `v2`, selected by
-the runner baseline, a case settings step, or the query's `set engine = v2;`
-prefix. Under `v1` the harness fails before executing or explaining the
-query: v1 produces no plan. Each line asserts one fact of the selected v2
+`--- expect shape`. Each line asserts one fact of the query's v2
 plan, obtained from the engine's explain document before row
 comparison, without executing the query a second time:
 
@@ -198,6 +196,31 @@ of the scan, the candidates it asks the index for and, on a `nearest` scan,
 the probe cap the plan carries (`0` spells no cap, as the `ann_nprobes`
 setting does). Nothing is compared as rendered text, so a planner that
 reaches the same facts by another route keeps the case green.
+
+## Reference comparison
+
+A query step may end with `--- expect same as v1`, directly after its
+`--- expect shape` or `--- expect plan`; the section has no body. The runner
+runs the step's query again on a copy of the case session carrying the frozen
+engine v1 (`omnigraph_reference_engine::ReferenceEngine`, the crate
+`omnigraph-reference-engine`, installed through `Session::with_read_executor`)
+and compares its rows with v2's, ordered or unordered as the step's
+`--- expect` says. The step's own rows expect still applies; the comparison is
+added to it.
+
+```text
+--- expect unordered
+--- expect shape
+p.name: String
+--- expect same as v1
+```
+
+A v1 error, a v1 gate refusal included, or a row difference fails the step.
+The section is refused on a mutate step, an error expect, `show` and
+`branch list`. The DST runner skips the comparison. The reference answers
+`not { ... }` blocks only among the correlated blocks, and refuses count
+predicates and a string `nearest` argument, so a step using those carries no
+`expect same as v1`.
 
 ## Run and reproduce
 
@@ -364,22 +387,18 @@ unset, empty, or `0` leaves it disabled. Other values, including non-UTF-8
 values, produce an `invalid_case` report before execution or rewriting.
 Replay ignores this variable and refuses saved blessing invocations.
 
-`OMNIGRAPH_GQ_ENGINE` selects the initial `engine` setting for direct and
-DST case sessions, and the baseline `reset engine` restores. Unset, empty,
-or `v1` selects the executor; `v2` selects the plan route. CI runs the corpus
-under both routes. A case's `set engine = …;` overrides this baseline like
-any other setting. `--- expect plan` requires the query's effective engine
-to be `v2`; a query prefix or case setting can override the runner baseline.
-Plan-specific corpus cases explicitly select v2, while shared row cases
-inherit the baseline and run on both routes.
+`OMNIGRAPH_GQ_ENGINE` names the initial `engine` setting for direct and
+DST case sessions, the baseline `reset engine` restores. It accepts only `v2`,
+empty or unset, all three meaning engine v2, the setting's one value; engine
+v1 is reached only through `--- expect same as v1`, never through this
+variable.
 
-Invocation reports freeze the selected engine in the worker input before
-clearing the worker environment. Replay uses that recorded engine even if
-`OMNIGRAPH_GQ_ENGINE` now selects the other route. Reports whose input has no
-engine field mean `v1`; v1 reports continue to omit the field. Engine input
-is covered by the report's input digest, and the executable and source
-identity checks still apply. Any other value, including non-UTF-8 values,
-produces an `invalid_case` report before workers start, including on replay.
+Invocation reports freeze the engine in the worker input before clearing the
+worker environment, and replay uses the recorded value. An input without the
+field means `v2`. Engine input is covered by the report's input digest, and
+the executable and source identity checks still apply. Any other value, `v1`
+and non-UTF-8 values included, produces an `invalid_case` report before
+workers start, including on replay.
 
 `OMNIGRAPH_GQ_BLESS=1` is supported only for a case declaring one direct-engine
 environment. A subset selection cannot bless a multi-environment case. It rewrites a failing row or shape expectation and still returns

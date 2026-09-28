@@ -16,6 +16,7 @@
 /crates/omnigraph-gqt/                  @azimafroozeh
 /crates/omnigraph-planner/              @azimafroozeh @aaltshuler
 /crates/omnigraph-policy/               @aaltshuler
+/crates/omnigraph-reference-engine/     @azimafroozeh @aaltshuler
 /crates/omnigraph-seams/                @azimafroozeh @aaltshuler
 /crates/omnigraph-server/               @aaltshuler
 /crates/omnigraph-storage/              @azimafroozeh @aaltshuler

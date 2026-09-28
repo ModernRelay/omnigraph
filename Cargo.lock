@@ -5843,6 +5843,7 @@ dependencies = [
  "omnigraph-dst",
  "omnigraph-engine",
  "omnigraph-planner",
+ "omnigraph-reference-engine",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -5873,6 +5874,30 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tempfile",
+]
+
+[[package]]
+name = "omnigraph-reference-engine"
+version = "0.11.0"
+dependencies = [
+ "arrow-array",
+ "arrow-cast",
+ "arrow-ord",
+ "arrow-schema",
+ "arrow-select",
+ "arrow-string",
+ "chrono",
+ "datafusion",
+ "futures",
+ "lance",
+ "lance-datafusion",
+ "lance-index",
+ "omnigraph-catalog",
+ "omnigraph-compiler",
+ "omnigraph-core",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

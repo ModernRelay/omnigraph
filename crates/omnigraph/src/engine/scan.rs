@@ -1,6 +1,5 @@
-//! v2's copy of v1's node scan: the scanner configuration, the per-scan
-//! ANN probe ladder, the scan-side filter lowering, the wide-batch helpers
-//! (phase 4). Copied, never referenced.
+//! The node scan: the scanner configuration, the per-scan ANN probe ladder,
+//! the scan-side filter lowering, the wide-batch helpers.
 
 use super::*;
 

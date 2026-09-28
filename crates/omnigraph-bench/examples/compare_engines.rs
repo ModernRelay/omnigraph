@@ -134,16 +134,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .await?;
     }
     setup.ensure_indices().await?;
-    let sessions = [
-        Session::from_defaults(
-            Arc::clone(setup.db()),
-            setup.settings().clone().with("engine", "v1")?,
-        ),
-        Session::from_defaults(
-            Arc::clone(setup.db()),
-            setup.settings().clone().with("engine", "v2")?,
-        ),
-    ];
+    let session = Session::from_defaults(
+        Arc::clone(setup.db()),
+        setup.settings().clone().with("engine", "v2")?,
+    );
     let cases = [
         ("scan", args.rows),
         ("wide_scan", args.rows),
@@ -158,28 +152,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ];
     let mut expected = Vec::new();
     for (name, rows) in &cases {
-        let result = query(&sessions[0], name).await?;
+        let result = query(&session, name).await?;
         assert_eq!(result.num_rows(), *rows, "non-vacuous {name}");
         if *name == "count_all" {
             assert_eq!(result.to_rust_json()?, json!([{"n": args.rows}]));
         }
-        let other = query(&sessions[1], name).await?;
-        let fields = |result: &QueryResult| {
-            result
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| (field.name().clone(), field.data_type().clone()))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(fields(&result), fields(&other), "result types: {name}");
-        let reference = canonical(&result, *name == "top_people")?;
-        assert_eq!(
-            reference,
-            canonical(&other, *name == "top_people")?,
-            "result parity: {name}"
-        );
-        expected.push(reference);
+        expected.push(canonical(&result, *name == "top_people")?);
     }
     println!(
         "{}",
@@ -196,24 +174,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         for offset in 0..cases.len() {
             let index = (round + offset) % cases.len();
             let (name, _) = cases[index];
-            for engine in [(round + index) % 2, 1 - (round + index) % 2] {
-                let start = Instant::now();
-                let result = query(&sessions[engine], name).await?;
-                let elapsed = start.elapsed();
-                black_box(&result);
-                assert_eq!(
-                    canonical(&result, name == "top_people")?,
-                    expected[index],
-                    "sample parity: {name}"
+            let start = Instant::now();
+            let result = query(&session, name).await?;
+            let elapsed = start.elapsed();
+            black_box(&result);
+            assert_eq!(
+                canonical(&result, name == "top_people")?,
+                expected[index],
+                "sample parity: {name}"
+            );
+            if round >= args.warmups {
+                println!(
+                    "{}",
+                    json!({"kind": "sample", "rows": args.rows, "query": name,
+                    "engine": "v2", "pair": round - args.warmups,
+                    "elapsed_ns": elapsed.as_nanos(), "result_rows": result.num_rows()})
                 );
-                if round >= args.warmups {
-                    println!(
-                        "{}",
-                        json!({"kind": "sample", "rows": args.rows, "query": name,
-                        "engine": if engine == 0 { "v1" } else { "v2" }, "pair": round - args.warmups,
-                        "elapsed_ns": elapsed.as_nanos(), "result_rows": result.num_rows()})
-                    );
-                }
             }
         }
     }

@@ -364,8 +364,12 @@ fn resolve_params(ir: &QueryIR, params: &ParamMap) -> Result<ResolvedParams> {
 
 /// Build the physical plan for execution without explain diagnostics.
 pub(crate) fn plan_query(source: &QuerySource<'_>) -> Result<PhysicalPlan> {
-    omnigraph_planner::plan_query(&source.ir, source, &source.bounds())
-        .map_err(|reason| no_plan(reason.to_json()))
+    omnigraph_planner::plan_query(&source.ir, source, &source.bounds()).map_err(|reason| {
+        match reason {
+            Unrouted::UnsupportedQuery { message } => OmniError::manifest(message),
+            reason => no_plan(reason.to_json()),
+        }
+    })
 }
 
 /// What the gate built for one compiled query: its explain document and the

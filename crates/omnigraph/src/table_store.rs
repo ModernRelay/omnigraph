@@ -2290,73 +2290,6 @@ impl TableStore {
             })
     }
 
-    /// Indexed neighbor lookup for graph traversal. Given an edge dataset and a
-    /// set of endpoint keys on `key_col` (the graph's `src` spelling for
-    /// out-traversal, its `dst` spelling for in-traversal), return the matching
-    /// edge rows projected to `[key_col, opposite_col]`.
-    ///
-    /// The `key_col IN (keys)` predicate is built as a structured DataFusion
-    /// `Expr` and applied via `Scanner::filter_expr`, so Lance routes it through
-    /// the persisted BTREE on `key_col` (index-search → take). Cost scales with
-    /// the frontier size, not |E| — the basis for serving selective traversals
-    /// without building the whole in-memory CSR. Empty `keys` returns empty
-    /// without scanning.
-    ///
-    /// Note: like any indexed scan, this observes only fragments the BTREE
-    /// covers plus an unindexed-fragment scan fallback; it reads the committed
-    /// snapshot `ds` was opened at.
-    pub async fn scan_edges_by_endpoint(
-        ds: &Dataset,
-        key_col: &str,
-        opposite_col: &str,
-        keys: &[String],
-    ) -> Result<Vec<RecordBatch>> {
-        Self::scan_edges_by_endpoint_projected(ds, key_col, opposite_col, &[], keys).await
-    }
-
-    /// Scan matching edges with endpoints and extra projected columns.
-    /// Bound-edge expansion requests identity and declared properties as extras.
-    pub async fn scan_edges_by_endpoint_projected(
-        ds: &Dataset,
-        key_col: &str,
-        opposite_col: &str,
-        extra_cols: &[&str],
-        keys: &[String],
-    ) -> Result<Vec<RecordBatch>> {
-        use datafusion::prelude::{col, lit};
-
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut projection: Vec<&str> = Vec::with_capacity(2 + extra_cols.len());
-        projection.push(key_col);
-        projection.push(opposite_col);
-        projection.extend(
-            extra_cols
-                .iter()
-                .copied()
-                .filter(|extra| *extra != key_col && *extra != opposite_col),
-        );
-        let key_list: Vec<datafusion::prelude::Expr> =
-            keys.iter().map(|k| lit(k.clone())).collect();
-        let filter_expr = col(key_col).in_list(key_list, false);
-        Self::scan_stream_with(
-            ds,
-            Some(projection.as_slice()),
-            None,
-            None,
-            false,
-            |scanner| {
-                scanner.filter_expr(filter_expr);
-                Ok(())
-            },
-        )
-        .await?
-        .try_collect()
-        .await
-        .map_err(OmniError::storage)
-    }
-
     /// One eligibility rule for optimize planning and execution. Full-text
     /// folding cannot establish analyzer proof; unknown kinds cannot be planned.
     pub(crate) fn can_fold_index(index: &IndexMetadata) -> bool {
@@ -4800,18 +4733,9 @@ impl TableStore {
         has_fts_index_on(ds, column).await
     }
 
-    /// Kept on `TableStore` so the frozen v1 executor (`tests/v1_frozen.rs`)
-    /// keeps its bytes; the body lives in `omnigraph_core::dataset_index`.
-    pub(crate) async fn key_column_index_coverage(
-        ds: &Dataset,
-        column: &str,
-    ) -> Result<IndexCoverage> {
-        crate::dataset_index::key_column_index_coverage(ds, column).await
-    }
-
     /// Metadata-only check (no data IO) of whether the FTS (inverted) index
     /// entries on `column` together cover EVERY current fragment of `ds`.
-    /// The FTS twin of [`Self::key_column_index_coverage`], consumed as a
+    /// The FTS twin of `dataset_index::key_column_index_coverage`, consumed as a
     /// correctness fence by the rrf prefilter gate: rows in fragments no
     /// entry covers are scored by a filter-dependent batch-derived scorer
     /// instead of the index-global BM25 statistics (lance

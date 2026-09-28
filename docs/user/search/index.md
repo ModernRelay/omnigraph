@@ -18,11 +18,9 @@ for nearest-neighbor ordering.
 Filters in the `match` block are applied before ranking, so `limit 10` means the
 top ten matches that satisfy the graph and property filters.
 
-With `engine = v2`, a `bm25()` ordering reads every matching entity before
-applying the final limit. Equal scores are then ordered by entity identity,
-including when the smallest identity lies beyond the first search candidates.
-Engine v1 uses a bounded candidate scan and retries without the bound when
-traversals or filters leave the limit unfilled.
+A `bm25()` ordering reads every matching entity before applying the final
+limit. Equal scores are then ordered by entity identity, including when the
+smallest identity lies beyond the first search candidates.
 
 Full-text rankings inside `rrf()` are
 never bounded this way: each full-text arm scans every matching entity, and
@@ -80,7 +78,7 @@ cap remains a recall/latency tradeoff.
 
 | Setting or variable | Meaning |
 |---|---|
-| `ann_nprobes` ([session setting](../queries/index.md#session-settings), `request` scope; process default `OMNIGRAPH_ANN_NPROBES`) | Partition cap per index delta of a `nearest` scan; default 20, `0` removes the cap, an invalid value refuses startup; on `engine = v1` the setting is read at execution and no plan records it |
+| `ann_nprobes` ([session setting](../queries/index.md#session-settings), `request` scope; process default `OMNIGRAPH_ANN_NPROBES`) | Partition cap per index delta of a `nearest` scan; default 20, `0` removes the cap, an invalid value refuses startup |
 | `OMNIGRAPH_RRF_GATE_RATIO` | Fraction of the ranked type below which a traversal-constrained `nearest` or `rrf()` prefilters its scan; default 0.10, `0` turns the gate off, an invalid value is the default |
 | `OMNIGRAPH_RRF_GATE_MAX_IDS` | Largest eligible set the gate pushes into the scan; default 100000, `0` turns the gate off, an invalid value is the default |
 | `rrf_plan` ([session setting](../queries/index.md#session-settings), `process` scope; process default `OMNIGRAPH_RRF_PLAN`) | `auto` (default), `force_prefilter`, or `force_postfilter`, for diagnosis. On a traversal-constrained `nearest`, `force_postfilter` can leave `limit` unfilled and `force_prefilter` ranks the eligible entities regardless of the size threshold |

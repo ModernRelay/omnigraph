@@ -1,6 +1,8 @@
 use super::*;
 
-use crate::engine::{evaluate_constant, id_in_list_expr, ir_expr_to_df_expr};
+use crate::engine::{
+    check_param_date_literals, evaluate_constant, id_in_list_expr, ir_expr_to_df_expr,
+};
 use crate::seams::{decide_seam, fail};
 use crate::session::Session;
 use crate::storage_layer::PendingScanBudget;
@@ -946,7 +948,7 @@ impl Omnigraph {
         // execution. A lowering/validation error returns exactly as it did
         // when this happened inside execute_named_mutation.
         let ir = self.lower_named_mutation(&txn.catalog, query_source, query_name)?;
-        super::query::check_param_date_literals(params, &ir.params)?;
+        check_param_date_literals(params, &ir.params)?;
         // Only an insert-only mutation is safe to replay automatically after a
         // pre-effect authority mismatch. Update/Delete keep strict caller-visible
         // `ReadSetChanged`; replaying their stale read-modify-write plan would be

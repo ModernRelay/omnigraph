@@ -1,8 +1,7 @@
 //! The run-time side of a ranked scan: the `SearchMode` one `ScanExec` runs
 //! under, built per scan node from the plan's `RankedAccess` and the bound
 //! values; the per-pass `Pass` the overfetch ladder and the prefilter gates
-//! write; the gates and probe ladders themselves (v2's copy of v1's, phase 4;
-//! the frozen `exec/query.rs` stays upstream's bytes).
+//! write; the gates and probe ladders themselves.
 
 use omnigraph_planner::{
     GatePolicy, Hop, NodeId, OverfetchRung, Prefilter, PrefilterMode, RankKind,
@@ -342,7 +341,7 @@ pub(super) fn nearest_property_dim_and_model(
 
 /// A value bound through the Rust `ParamMap` API skips the JSON param arm: refuse
 /// a time-bearing `Date` string, and a non-`Date` literal on a `Date` parameter.
-pub(super) fn check_param_date_literals(
+pub(crate) fn check_param_date_literals(
     params: &ParamMap,
     declared: &[omnigraph_compiler::query::ast::Param],
 ) -> Result<()> {

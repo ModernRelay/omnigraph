@@ -25,8 +25,9 @@ Stable code owners:
 | Concern | Owner |
 |---|---|
 | Parser, type checker, lowering | `crates/omnigraph-compiler/src/query/`, `src/ir/` |
-| Query orchestration and IR execution (engine v1) | `crates/omnigraph/src/exec/query.rs` |
+| Read doors | `crates/omnigraph/src/exec/query_doors.rs` |
 | Plan lowering, operators and context (engine v2) | `crates/omnigraph/src/engine/` |
+| Frozen engine v1, the GQT test reference | `crates/omnigraph-reference-engine/` |
 | Lance scan boundary | `crates/omnigraph/src/table_store.rs` |
 | Topology build/cache | `crates/omnigraph/src/graph_index/`, `runtime_cache.rs` |
 | Mutation orchestration | `crates/omnigraph/src/exec/mutation.rs` |
@@ -56,7 +57,7 @@ factorized and flatten only where the result contract needs it.
 ### Expand path selection
 
 For an unbound `Expand`, the mode (per-hop BTREE scans, `indexed_scan`, or
-the in-memory CSR, `csr`) is a plan decision. On engine v2 the planner's
+the in-memory CSR, `csr`) is a plan decision. The planner's
 cost model (`omnigraph_planner::cost`: `choose_expand_mode`,
 `CSR_BUILD_FACTOR`) decides at plan time from the row-count estimate of the
 Expand's input (`estimate_rows`: the node type's `entity_count`, reduced
@@ -81,15 +82,13 @@ every indexed hop after the first re-decides with the observed frontier
 (`should_switch_to_csr`). Every input of those re-decisions is on the node
 (`inputs`, the two ceilings included) or is data of the run (the probed
 coverage, the observed frontier, the CSR this run built); the report row's
-`ran` names the mode the traversal ended on. Engine v1 keeps its own copy of
-the model in `crates/omnigraph/src/exec/query.rs`, decided at execution time
-from the measured frontier.
+`ran` names the mode the traversal ended on.
 
 | Setting | Default | Effect |
 |---|---:|---|
-| `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER` | `1024` | A larger estimated (v2) or measured (v1) input frontier always selects CSR before the cost comparison. On v2 it is read once by `QuerySource::gather`, carried on every `Expand`'s cost inputs and recorded in the plan's `assumptions.env`; the run reads the plan's value. |
+| `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER` | `1024` | A larger estimated input frontier always selects CSR before the cost comparison. It is read once by `QuerySource::gather`, carried on every `Expand`'s cost inputs and recorded in the plan's `assumptions.env`; the run reads the plan's value. |
 | `OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS` | `6` | A larger effective maximum hop count always selects CSR before the cost comparison. Read and carried like the frontier ceiling. |
-| the expand path | cost model | No session setting names it: the cost model chooses, and only the harness forces one through `SessionSettings::with_traversal` (`Traversal::Indexed` for per-hop BTREE scans, `Traversal::Csr` for the in-memory path), as the GQT `# traversal:` header pin does; on v2 the pin is read at plan time (`PlanSource::traversal`) and the engine runs a forced mode without the runtime corrections. |
+| the expand path | cost model | No session setting names it: the cost model chooses, and only the harness forces one through `SessionSettings::with_traversal` (`Traversal::Indexed` for per-hop BTREE scans, `Traversal::Csr` for the in-memory path), as the GQT `# traversal:` header pin does; the pin is read at plan time (`PlanSource::traversal`) and the engine runs a forced mode without the runtime corrections. |
 
 The hop cap is a plan-time cap (the hop count is fully known when the plan is
 built). A missing or nonnumeric value uses its default; a zero hop cap also
@@ -109,26 +108,28 @@ mode override is an operational escape hatch and test seam only.
 
 ## Filters and pushdown
 
-A read query has two routes, chosen by the session setting `engine`
-(`omnigraph_compiler::settings::Engine`, the Session settings RFC). `v1` is
-the executor this section describes first and the definition's default. `v2`
-runs the query from a plan: `set engine = v2;` before
-the query, `--set engine=v2` on the CLI, `{"settings": {"engine": "v2"}}` at
-`POST /query`, or `OMNIGRAPH_ENGINE=v2` as the process default; the GQ logic
-corpus runs on it under `OMNIGRAPH_GQ_ENGINE=v2`. The routes share no
-operator code: `v1` is `exec/query.rs` and `exec/projection.rs`, frozen at
-upstream's bytes and pinned by `tests/v1_frozen.rs`; `v2` is the `engine/`
-module, whose operator bodies started as copies of v1's and are replaced one
-by one. They share the catalog, the snapshot, `TableStore` and the graph
-index. A defect seen on `v1` is fixed on `v2`. The doors (`Session::query`,
-`query_with_head`, `run_query_at` in `exec/query_doors.rs`) pick the route.
+A read query runs on engine v2, from a plan. The session setting `engine`
+(`omnigraph_compiler::settings::Engine`, the Session settings RFC) keeps one
+value, `v2`, and refuses `v1` as an unknown value. The doors
+(`Session::query`, `query_with_head`, `run_query_at` in
+`exec/query_doors.rs`) plan every read through `engine::execute_query`. A
+query shape the planner refuses (`UnsupportedQuery`) is a `BadRequest` user
+error on execute, the error `explain_query` gives for it.
 
-On `V1` the executor hoists a filter only when its bindings and operation
-make the move semantically safe. Pushable scalar expressions use structured
-DataFusion/Lance expressions with case-preserved column identities. Search
-prefilters remain on the same scanner as the search operation. Multi-binding
-or unsupported expressions stay in the engine at their lowered position. On
-`V2` the same placement is a planner decision, the `predicate_pushdown` pass
+Engine v1, the executor v2 replaced, is the crate
+`omnigraph-reference-engine` (`publish = false`). Its source is frozen and
+pinned by the crate's `tests/frozen.rs`; it depends on `omnigraph-compiler`,
+`omnigraph-core`, `omnigraph-catalog` and third-party crates only, so it is
+independent of the production engine and planner in either direction; the
+compiler, core and catalog crates are shared. `omnigraph-gqt` is its one dependent: it
+installs `ReferenceEngine` on a session copy through
+`Session::with_read_executor` (the `ReadExecutor` trait in
+`omnigraph_catalog::read_executor`, both under the `test-util` feature) to run
+a step's `--- expect same as v1` comparison. It answers `not { ... }` blocks
+only among the correlated blocks, and refuses count predicates and a string
+`nearest` argument. A defect is fixed on v2, never in the reference.
+
+Filter placement is a planner decision, the `predicate_pushdown` pass
 on a query plan (`place_query_filters`, per scope: the top-level tree and
 each correlated block's inner tree on its own): a search filter moves to the scan of
 its field's binding; a scalar filter on exactly one binding that
@@ -149,19 +150,10 @@ String-built SQL is retained only at explicitly documented compatibility
 seams. The camel-case regression and its two-parser boundary are recorded in
 [the case study](case-studies/camel-case-filtering.md).
 
-Column projection is the second pushdown dimension. On `V1`,
-`collect_needed_columns` derives each binding's needed columns from the whole
-query (RETURN, `order {}`, every filter, recursing into anti-join inner
-pipelines), and `execute_node_scan` prunes its Lance projection to that
-demand plus an always-keep set: `id` (join, fusion, and tie-break key) and
-the type's key columns. The verdicts fail open, never closed: a bare `$var`
-and a binding absent from the demand map keep the full non-blob projection
-(#704 is this fail-open on a bare-variable count). A search-target scan
-prunes like any other and names Lance's ranking column (`_distance` or
-`_score`) in its projection, so the score survives the scan and the vector
-or text column is read only when demanded.
+Column projection is the second pushdown dimension, the
+`projection_pushdown` pass described below.
 
-On `V2` a read query runs from a plan. Before a query runs, `plan_query`
+Before a query runs, `plan_query`
 (`engine/plan_source.rs`) hands the compiled `QueryIR` to the planner as
 `Operation::Query`: `resolve_query` folds the `IROp` pipeline into a logical
 tree (one `TableScan` per `match` binding, `Join { kind: Cross }` for a
@@ -231,7 +223,7 @@ by `engine/scan.rs`, `engine/graph.rs`, `engine/expr.rs` and
 | `Projection` | `ProjectionExec` over `GqProjectionExpr` per return expression, output charged as `projection output`; when a `Sort` consumes it, every column the sort reads and every declared tie-break id follow the return columns under the hidden prefix `~`, which the sort drops | omnigraph |
 | `Sort` | `SortExec`: with a `fetch`, a streaming top-k (every input batch merged into the retained best `fetch` rows and released, so the pool holds one batch and `fetch` rows at a time); without one, the whole input held under the query pool (no spill) and sorted once. Keys are `lexsort_to_indices` over the node's `order_by`, `nulls_first = !descending`, then the `<binding>.<id>` columns of the node's declared `tiebreak`, ascending; the `~` columns are dropped on the way out. The planner (`optimizer::sort_tiebreak`) declares every binding in scope, name-sorted, and none where ids cannot change the visible order: group rows, a `return` whose every expression is an order key, a binding whose `@id` is a key; `projection_pushdown` reads an id only for a declared tie-break, a traversal, a dependent scan, an anti-join, a ranked scan or an expression naming `@id`. The planner writes a search order's score key (`$d._score desc`, `$d._distance asc`) first and the query's plain keys after it, with the limit as `fetch`; a fusion plans no `Sort`, and an aggregate under a search order plans none | omnigraph |
 | `Limit` (`Page` in explain JSON) | `LimitExec`: passes batches and cuts the last one at the bound; a limit of zero executes nothing below it | omnigraph |
-| `Aggregate` | `AggregateExec` (`Single`) with the group keys and aggregate arguments as `GqProjectionExpr`s over the wide batch (an integer `sum`/`avg` argument cast to `Float64`, v1's result type); `count($v)` counts the identity column; DataFusion emits the group keys before the aggregates, and `run_plan` puts the collected result back in return order (`lower::in_order`) | DataFusion |
+| `Aggregate` | `AggregateExec` (`Single`) with the group keys and aggregate arguments as `GqProjectionExpr`s over the wide batch (an integer `sum`/`avg` argument cast to `Float64`, the result type); `count($v)` counts the identity column; DataFusion emits the group keys before the aggregates, and `run_plan` puts the collected result back in return order (`lower::in_order`) | DataFusion |
 
 A traversal's destination is reached one of two ways, chosen when the
 planner lowers a `TableScan` with an input (pass `access_path`). `id_lookup`
@@ -369,11 +361,11 @@ publish output-row and elapsed-compute metrics, with `output_batches` for
 every `ExpandExec` and scan metrics for ANN
 probe/search outcomes. `engine::execute_query` keeps the nearest prefilter
 gate and ANN overfetch ladder; each attempt lowers and
-runs a new plan under the same query context. V1 retains its own executor.
+runs a new plan under the same query context.
 
 The plan is observable without running: the GQ statement `explain query …`
 (`FileBody::Explain`) reaches `query_with_head` like every read, and the
-engine answers the gate's document for the `V2` route, the rewritten logical
+engine answers the gate's document, the rewritten logical
 plan, the physical plan, the lowered DataFusion plan and the passes that
 fired, as rows (`tree`, `depth`, `node`, `detail`: one row per node of each
 tree in pre-order, the `datafusion` tree rendered by DataFusion's
@@ -381,12 +373,9 @@ tree in pre-order, the `datafusion` tree rendered by DataFusion's
 other fields). An explain lowers the plan but runs nothing, so a `nearest()`
 over a string query, whose embedding needs the embedding client, gets a
 `plan` row `datafusion` naming the reason in place of that tree.
-`Session::explain_query` returns the v2 document itself. A `.gqt` case's
-`--- expect plan` requires the query's effective engine to be `V2`; the
-harness refuses the assertion under `V1` before executing or explaining
-the query. Runner selection, case settings and query prefixes all apply.
-The standalone explain surfaces describe v2 independently of this guard.
-V2 destination hydration uses the planned projection; edge-property attach
+`Session::explain_query` returns the same document itself. A `.gqt` case's
+`--- expect plan` compares it; case settings and query prefixes apply.
+Destination hydration uses the planned projection; edge-property attach
 retains its complete property projection.
 
 ## V2 plan lowering: one node, one operator
@@ -544,8 +533,7 @@ its end timestamp, since its stream skips empty batches and records its end.
 the `Explain` rendered from that same plan and the report.
 `Session::query_inspected` (`exec/query_doors.rs`) returns it; the door is
 `pub` and `#[doc(hidden)]` because the GQT runner, its only caller, is
-another crate, and it refuses an effective engine other than `v2` and an
-`explain` statement. `Session::query` returns the same rows and discards the
+another crate, and it refuses an `explain` statement. `Session::query` returns the same rows and discards the
 report. Every node of the physical explain JSON carries its `id`, the key the
 report rows use, and the key the `ran` lines of a case's `--- expect plan`
 read ([testing.md](testing.md#plan-replay)).
@@ -564,7 +552,7 @@ operations; traversal or projection must not silently discard them. RRF
 executes its sources independently against the same graph snapshot and fuses
 their ordered results.
 
-V2 BM25 scans have no candidate cap. The final ordering applies the score,
+BM25 scans have no candidate cap. The final ordering applies the score,
 secondary keys and every binding's identity before the query limit; a full
 candidate window cannot prove that it contains the leading tied identities.
 

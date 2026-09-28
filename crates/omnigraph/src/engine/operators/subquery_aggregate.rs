@@ -1,8 +1,8 @@
 //! The decorrelated evaluation of a `SubqueryPredicate`: every inner row
 //! carries the tag of the outer row it came from, `SubqueryAggregate::absorb`
 //! folds the inner batches into one running aggregate per outer row, and
-//! `keep_mask` applies the predicate to each row's aggregate. Shared by
-//! `AntiJoinMaskExec` and the v1 executor.
+//! `keep_mask` applies the predicate to each row's aggregate for
+//! `AntiJoinMaskExec`.
 
 use std::cmp::Ordering;
 use std::sync::Arc;

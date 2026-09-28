@@ -513,6 +513,112 @@ fn refuses_ok_expect_on_a_query_step() {
     assert!(refusal("x", &text).contains("a query step takes"));
 }
 
+const SAME: &str = "--- expect same as v1\n";
+
+#[test]
+fn same_as_v1_follows_a_query_steps_shape_or_plan() {
+    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}{QUERY}{EXPECT}");
+    let case = parse_case("x", &text).unwrap();
+    let flags: Vec<bool> = case
+        .items
+        .iter()
+        .map(|item| match item {
+            Item::Step(Step::Query(step)) => step.same_as_v1,
+            other => panic!("expected query steps, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(flags, [true, false]);
+    let after_plan = format!(
+        "{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- expect plan\npass projection_pushdown\n{SAME}"
+    );
+    let case = parse_case("x", &after_plan).unwrap();
+    let Some(Item::Step(Step::Query(step))) = case.items.first() else {
+        panic!("first item is the query step");
+    };
+    assert!(step.same_as_v1 && step.plan.is_some());
+}
+
+#[test]
+fn same_as_v1_is_refused_off_a_query_rows_expect() {
+    for text in [
+        format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{SAME}"),
+        format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{EXPECT_OK}{SAME}"),
+    ] {
+        let refused = refusal("x", &text);
+        assert!(
+            refused.starts_with("invalid_case: ") && refused.contains("refused on a mutate step"),
+            "{refused}"
+        );
+    }
+    let rows = "--- expect unordered\n{\"p.name\": \"alice\"}\n";
+    for (text, needle) in [
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{SAME}{SHAPE}"),
+            "must directly follow",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{rows}{SAME}{SHAPE}"),
+            "needs an `--- expect shape`",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect error: boom\n{SAME}"),
+            "must directly follow",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}{SAME}"),
+            "must directly follow",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}{{\"p.name\": \"alice\"}}\n"),
+            "carries no body",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{CREATE}{LIST}{SAME}"),
+            "only on a query declaration step",
+        ),
+    ] {
+        let refused = refusal("x", &text);
+        assert!(refused.contains(needle), "{needle}: {refused}");
+    }
+}
+
+#[tokio::test]
+async fn same_as_v1_fails_on_a_v1_error_or_a_row_difference() {
+    let equal = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}");
+    let case = parse_case("x", &equal).unwrap();
+    execute_case(&case, Path::new("unused.gqt"), false)
+        .await
+        .unwrap();
+
+    let compound = "--- query\nquery either() {\n    match { $p: Person  $p.name = \"alice\" or $p.name = \"bob\" }\n    return { $p.name }\n}\n";
+    let refused = format!("{HDR}{SCHEMA}{SEED}{compound}{EXPECT}{SAME}");
+    let case = parse_case("x", &refused).unwrap();
+    let err = execute_case(&case, Path::new("unused.gqt"), false)
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("expect same as v1: v2 returned rows, v1 failed")
+            && err.contains("compound predicates")
+            && err.contains("drop `--- expect same as v1` from this step"),
+        "{err}"
+    );
+
+    let differing = "# issue: none\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n\
+         --- schema\nnode P {\n    k: String @key\n    age: I64\n    score: F64\n}\n\
+         --- seed\n{\"type\":\"P\",\"data\":{\"k\":\"k\",\"age\":7,\"score\":7.5}}\n\
+         --- query\nquery kept() {\n    match { $p: P  not { $p.age < $p.score } }\n    return { $p.k }\n}\n\
+         --- expect unordered\n--- expect shape\np.k: String\n--- expect same as v1\n";
+    let case = parse_case("x", differing).unwrap();
+    let err = execute_case(&case, Path::new("unused.gqt"), false)
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("the engines disagree (expected = v1, actual = v2)")
+            && err.contains("{\"p.k\":\"k\"}"),
+        "{err}"
+    );
+}
+
 #[test]
 fn refuses_query_step_without_expect() {
     let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}");
@@ -1480,7 +1586,7 @@ async fn pinned_step_runs_only_its_pinned_path() {
             .await
             .unwrap_or_else(|e| panic!("{mode}: {e}"));
 
-        let (session, _uri, _dir) = open_case_store(&case, Engine::V1).await.unwrap();
+        let (session, _uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
         assert_eq!(session.settings().traversal().as_str(), mode);
         let Some(Item::Step(Step::Query(step))) = case.items.first() else {
             panic!("first item is the query step");
@@ -1528,7 +1634,7 @@ async fn traversal_pin_survives_settings_steps_and_rebind() {
          --- restart\n"
     );
     let case = parse_case("pinned", &text).unwrap();
-    let (mut session, uri, _dir) = open_case_store(&case, Engine::V1).await.unwrap();
+    let (mut session, uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
     let Some(Item::Step(Step::Query(query))) = case.items.first() else {
         panic!("first item is the query step");
     };

@@ -1,0 +1,138 @@
+# issue: none
+# notes: `not { }` over a traversal: a predicated inner pipeline, a nested double negation,
+# notes: the bare-expand and filtered-inner forms of the same negation, and a destination
+# notes: binding inside the negation. Replaces the Rust tests anti_join_predicated_negation,
+# notes: nested_anti_join_double_negation, anti_join_fast_and_slow_paths_agree and
+# notes: negation_with_inner_destination_binding (traversal.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32?
+}
+
+node Company {
+    name: String @key
+}
+
+edge Knows: Person -> Person {
+    since: Date?
+}
+
+edge WorksAt: Person -> Company
+
+--- seed
+{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob","age":25}}
+{"type":"Person","data":{"name":"Charlie","age":35}}
+{"type":"Person","data":{"name":"Diana","age":28}}
+{"type":"Company","data":{"name":"Acme"}}
+{"type":"Company","data":{"name":"Globex"}}
+{"edge":"Knows","from":"Alice","to":"Bob"}
+{"edge":"Knows","from":"Alice","to":"Charlie"}
+{"edge":"Knows","from":"Bob","to":"Diana"}
+{"edge":"WorksAt","from":"Alice","to":"Acme"}
+{"edge":"WorksAt","from":"Bob","to":"Globex"}
+
+--- query
+query not_at_acme() {
+    match {
+        $p: Person
+        not {
+            $p worksAt $c
+            $c.name = "Acme"
+        }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "Bob"}
+{"p.name": "Charlie"}
+{"p.name": "Diana"}
+
+--- expect shape
+p.name: String
+
+--- query
+query not_at_acme_binding() {
+    match {
+        $p: Person
+        not {
+            $p worksAt $c
+            $c: Company { name: "Acme" }
+        }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "Bob"}
+{"p.name": "Charlie"}
+{"p.name": "Diana"}
+
+--- expect shape
+p.name: String
+
+--- query
+query no_nonacme_employer() {
+    match {
+        $p: Person
+        not {
+            $p worksAt $c
+            not {
+                $c.name = "Acme"
+            }
+        }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "Alice"}
+{"p.name": "Charlie"}
+{"p.name": "Diana"}
+
+--- expect shape
+p.name: String
+
+--- query
+query unemployed_bare_expand() {
+    match {
+        $p: Person
+        not { $p worksAt $_ }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "Charlie"}
+{"p.name": "Diana"}
+
+--- expect shape
+p.name: String
+
+--- query
+query unemployed_filtered_inner() {
+    match {
+        $p: Person
+        not {
+            $p worksAt $c
+            $c.name != ""
+        }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "Charlie"}
+{"p.name": "Diana"}
+
+--- expect shape
+p.name: String

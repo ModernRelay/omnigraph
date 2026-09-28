@@ -45,6 +45,8 @@ pub mod migrations;
 #[cfg(any(test, feature = "test-util"))]
 pub mod namespace;
 pub mod publisher;
+#[cfg(feature = "test-util")]
+pub mod read_executor;
 pub mod retention;
 pub mod state;
 pub use branch_names::is_merge_input_tag;

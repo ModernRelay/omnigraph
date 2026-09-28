@@ -5651,9 +5651,8 @@
           },
           "engine": {
             "type": "string",
-            "description": "whether a read query runs through engine version 2, the plan runner; this setting does not change change-feed or merge execution",
+            "description": "the engine a read query runs on; `v2`, the plan runner, is the one value; this setting does not change change-feed or merge execution",
             "enum": [
-              "v1",
               "v2"
             ]
           },

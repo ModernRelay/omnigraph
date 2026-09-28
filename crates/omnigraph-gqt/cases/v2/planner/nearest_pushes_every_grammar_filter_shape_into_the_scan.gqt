@@ -1,0 +1,289 @@
+# issue: none
+# notes: Every filter shape the GQ grammar can put on the ranked binding (=, !=, >, <, >=, <=,
+# notes: starts_with, contains, a parameter, a flipped operand) is pushed into the ranked
+# notes: `nearest` scan, so the top-k of the MATCHING rows comes back from one scan. The query
+# notes: vector is the origin and doc n sits at distance n, so rank order is n order. Replaces
+# notes: the Rust test nearest_pushes_every_grammar_filter_shape_into_the_scan (search.rs), whose
+# notes: `pushed_filter_exprs == 1` probe is the `filter reads` plan line here.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    n: I64 @index
+    name: String @index
+    embedding: Vector(4) @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"n00","n":0,"name":"doc-00","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n01","n":1,"name":"doc-01","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n02","n":2,"name":"doc-02","embedding":[2.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n03","n":3,"name":"doc-03","embedding":[3.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n04","n":4,"name":"doc-04","embedding":[4.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n05","n":5,"name":"doc-05","embedding":[5.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n06","n":6,"name":"doc-06","embedding":[6.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n07","n":7,"name":"doc-07","embedding":[7.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n08","n":8,"name":"doc-08","embedding":[8.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n09","n":9,"name":"doc-09","embedding":[9.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n10","n":10,"name":"doc-10","embedding":[10.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n11","n":11,"name":"doc-11","embedding":[11.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n12","n":12,"name":"doc-12","embedding":[12.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n13","n":13,"name":"doc-13","embedding":[13.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n14","n":14,"name":"doc-14","embedding":[14.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n15","n":15,"name":"doc-15","embedding":[15.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n16","n":16,"name":"doc-16","embedding":[16.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n17","n":17,"name":"doc-17","embedding":[17.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n18","n":18,"name":"doc-18","embedding":[18.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n19","n":19,"name":"doc-19","embedding":[19.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n20","n":20,"name":"doc-20","embedding":[20.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n21","n":21,"name":"doc-21","embedding":[21.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n22","n":22,"name":"doc-22","embedding":[22.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n23","n":23,"name":"doc-23","embedding":[23.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n24","n":24,"name":"doc-24","embedding":[24.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n25","n":25,"name":"doc-25","embedding":[25.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n26","n":26,"name":"doc-26","embedding":[26.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n27","n":27,"name":"doc-27","embedding":[27.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n28","n":28,"name":"doc-28","embedding":[28.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n29","n":29,"name":"doc-29","embedding":[29.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n30","n":30,"name":"doc-30","embedding":[30.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n31","n":31,"name":"doc-31","embedding":[31.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n32","n":32,"name":"doc-32","embedding":[32.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n33","n":33,"name":"doc-33","embedding":[33.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n34","n":34,"name":"doc-34","embedding":[34.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n35","n":35,"name":"doc-35","embedding":[35.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n36","n":36,"name":"doc-36","embedding":[36.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n37","n":37,"name":"doc-37","embedding":[37.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n38","n":38,"name":"doc-38","embedding":[38.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n39","n":39,"name":"doc-39","embedding":[39.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n40","n":40,"name":"doc-40","embedding":[40.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n41","n":41,"name":"doc-41","embedding":[41.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n42","n":42,"name":"doc-42","embedding":[42.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n43","n":43,"name":"doc-43","embedding":[43.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n44","n":44,"name":"doc-44","embedding":[44.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n45","n":45,"name":"doc-45","embedding":[45.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n46","n":46,"name":"doc-46","embedding":[46.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n47","n":47,"name":"doc-47","embedding":[47.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n48","n":48,"name":"doc-48","embedding":[48.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n49","n":49,"name":"doc-49","embedding":[49.0,0.0,0.0,0.0]}}
+
+--- query
+query f_eq($q: Vector(4)) {
+    match { $d: Doc
+        $d.n = 7 }
+    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug": "n07"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan Doc as $d: ranked nearest fetch 3
+scan Doc as $d: filter reads [d.n]
+
+--- query
+query f_ne($q: Vector(4)) {
+    match { $d: Doc
+        $d.n != 0 }
+    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug": "n01"}
+{"d.slug": "n02"}
+{"d.slug": "n03"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan Doc as $d: ranked nearest fetch 3
+scan Doc as $d: filter reads [d.n]
+
+--- query
+query f_gt($q: Vector(4)) {
+    match { $d: Doc
+        $d.n > 10 }
+    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug": "n11"}
+{"d.slug": "n12"}
+{"d.slug": "n13"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan Doc as $d: ranked nearest fetch 3
+scan Doc as $d: filter reads [d.n]
+
+--- query
+query f_lt($q: Vector(4)) {
+    match { $d: Doc
+        $d.n < 3 }
+    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug": "n00"}
+{"d.slug": "n01"}
+{"d.slug": "n02"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan Doc as $d: ranked nearest fetch 3
+scan Doc as $d: filter reads [d.n]
+
+--- query
+query f_ge($q: Vector(4)) {
+    match { $d: Doc
+        $d.n >= 10 }
+    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug": "n10"}
+{"d.slug": "n11"}
+{"d.slug": "n12"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan Doc as $d: ranked nearest fetch 3
+scan Doc as $d: filter reads [d.n]
+
+--- query
+query f_le($q: Vector(4)) {
+    match { $d: Doc
+        $d.n <= 2 }
+    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug": "n00"}
+{"d.slug": "n01"}
+{"d.slug": "n02"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan Doc as $d: ranked nearest fetch 3
+scan Doc as $d: filter reads [d.n]
+
+--- query
+query f_starts_with($q: Vector(4)) {
+    match { $d: Doc
+        $d.name starts_with "doc-2" }
+    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug": "n20"}
+{"d.slug": "n21"}
+{"d.slug": "n22"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan Doc as $d: ranked nearest fetch 3
+scan Doc as $d: filter reads [d.name]
+
+--- query
+query f_contains($q: Vector(4)) {
+    match { $d: Doc
+        $d.name contains "-3" }
+    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug": "n30"}
+{"d.slug": "n31"}
+{"d.slug": "n32"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan Doc as $d: ranked nearest fetch 3
+scan Doc as $d: filter reads [d.name]
+
+--- query
+query f_param($q: Vector(4), $n: I64) {
+    match { $d: Doc
+        $d.n = $n }
+    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0], "n": 7}
+
+--- expect ordered
+{"d.slug": "n07"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan Doc as $d: ranked nearest fetch 3
+scan Doc as $d: filter reads [d.n]
+
+--- query
+query f_flipped($q: Vector(4)) {
+    match { $d: Doc
+        10 < $d.n }
+    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug": "n11"}
+{"d.slug": "n12"}
+{"d.slug": "n13"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan Doc as $d: ranked nearest fetch 3
+scan Doc as $d: filter reads [d.n]
