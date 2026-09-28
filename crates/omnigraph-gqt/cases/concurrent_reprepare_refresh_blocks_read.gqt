@@ -1,0 +1,36 @@
+# issue: none
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+}
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+--- mutate
+branch create feature
+--- expect ok
+--- concurrent
+w1: query add_bob() { insert Person { name: "bob" } }
+w2: query add_carol() { insert Person { name: "carol" } }
+w3 on feature: query add_dave() { insert Person { name: "dave" } }
+r1: query all() { match { $p: Person } return { $p.name } }
+order: w2 park put nodes/, w3 park put feature/_versions/, w1, w2 put nodes/, r1 start, r1, w3 put feature/_versions/, w3, w2
+--- expect
+w1: ok
+w2: ok
+w3: ok
+r1: ok
+--- query
+query all() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+{"p.name":"carol"}
+--- expect shape
+p.name: String
