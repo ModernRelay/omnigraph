@@ -372,6 +372,11 @@ impl WorkMemory {
         (self.resources.limit / 32).clamp(1, 1024 * 1024) as usize
     }
 
+    /// Rows per produced batch: the session's `batch_size`, never zero.
+    pub(in crate::engine) fn batch_rows(&self) -> usize {
+        self.ctx.session_config().batch_size().max(1)
+    }
+
     pub(in crate::engine) fn check(&self) -> DfResult<()> {
         if self.cancelled.stopped.load(Ordering::Relaxed) {
             return Err(DataFusionError::Execution("query cancelled".into()));
