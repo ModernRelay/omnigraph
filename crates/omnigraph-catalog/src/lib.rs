@@ -17,6 +17,7 @@ pub(crate) use omnigraph_core::{
 pub mod commit_graph;
 
 mod commit;
+mod record;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -83,9 +84,14 @@ use state::{
     read_manifest_state, read_object_identities_at_offsets,
 };
 
-/// The maximum supported storage-format stamp; this binary reads and writes 8 or 9.
+/// The maximum supported storage-format stamp, the one this binary writes; the
+/// served range starts at [`MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION`].
 /// Read a graph's per-branch stamp with [`internal_schema_stamp_at`].
 pub const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = migrations::INTERNAL_MANIFEST_SCHEMA_VERSION;
+/// The lowest storage-format stamp normal open serves.
+pub const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 =
+    migrations::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION;
+pub use migrations::is_served_stamp;
 
 pub const OBJECT_TYPE_TABLE: &str = "table";
 pub const OBJECT_TYPE_TABLE_VERSION: &str = "table_version";

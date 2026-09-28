@@ -7,17 +7,15 @@
 //! CAS. Earlier versions stay readable, which keeps point-in-time reads and
 //! lost-acknowledgement read-back unchanged.
 //!
+//! The stored row shape lives in `record`.
+//!
 //! Costs. The live set is normally one fragment (Lance splits a write at
-//! 1,048,576 rows per file), so a scan no longer pays the merge writer's
-//! per-fragment and per-deletion-file requests. A file's pages are still read
-//! separately, so this is not a guarantee of a constant request count; the
-//! local history curve measured 40-41 requests per write from 1 to 1,024 prior
-//! publications. The live set still holds every history row (`graph_commit`
-//! and every `table_version` registration): the bytes written and decoded per
-//! publish, and the publish's memory (the scan keeps every batch for the
-//! rewrite), grow with history. Each version keeps its own full copy and
-//! nothing prunes `__manifest` versions today, so retained bytes grow with the
-//! square of the publication count until version retention exists.
+//! 1,048,576 rows per file). The live set still holds every history row
+//! (`graph_commit` and every `table_version` registration): the bytes written
+//! and decoded per publish, and the publish's memory (the scan keeps every
+//! batch for the rewrite), grow with history. Each version keeps its own full
+//! copy and nothing prunes `__manifest` versions today, so retained bytes grow
+//! with the square of the publication count until version retention exists.
 //!
 //! Lance's auto-cleanup hook is skipped: `__manifest` versions are the snapshot
 //! and time-travel authority, and a `__manifest` created before the v7 bump
@@ -27,18 +25,26 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::{BooleanArray, RecordBatch};
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::Schema;
 use datafusion::arrow::compute::filter_record_batch;
 use lance::Dataset;
 use lance::dataset::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
+use lance_file::version::LanceFileVersion;
 
 use crate::error::{OmniError, Result};
+use crate::migrations::{INTERNAL_MANIFEST_SCHEMA_VERSION, read_stamp, stamp_entry};
 use crate::publisher::map_lance_publish_error;
-use crate::state::{manifest_schema, string_column};
+use crate::record::{
+    StoredShape, compact_to_storage, flat_manifest_schema, flat_to_storage,
+    manifest_storage_schema, written_shape,
+};
+use crate::state::string_column;
 
 /// Rewrite the live row set (`live_rows` minus the keys `pending` replaces,
-/// plus `pending`) as new files and commit it at `dataset`'s version + 1,
-/// keeping the dataset's schema metadata, where the internal-schema stamp lives.
+/// plus `pending`) as new files and commit it at `dataset`'s version + 1. Both
+/// inputs carry the logical `manifest_schema` columns; the stored shape follows
+/// `written_shape`, and a packed write stamps [`INTERNAL_MANIFEST_SCHEMA_VERSION`]
+/// in the same commit.
 pub(crate) async fn overwrite(
     dataset: Dataset,
     pending: RecordBatch,
@@ -48,10 +54,29 @@ pub(crate) async fn overwrite(
         .iter()
         .flatten()
         .collect();
-    let schema = Arc::new(Schema::new_with_metadata(
-        manifest_schema().fields().clone(),
-        dataset.schema().metadata.clone(),
-    ));
+    let mut metadata = dataset.schema().metadata.clone();
+    let stamp = read_stamp(&dataset);
+    if let Some(above) = stamp.filter(|stamp| *stamp > INTERNAL_MANIFEST_SCHEMA_VERSION) {
+        return Err(OmniError::manifest_internal(format!(
+            "__manifest is stamped at internal schema v{above}, above the v{INTERNAL_MANIFEST_SCHEMA_VERSION} this binary writes; refusing to publish over it"
+        )));
+    }
+    let shape = written_shape(stamp);
+    let schema = match shape {
+        StoredShape::Packed => {
+            let (key, value) = stamp_entry(INTERNAL_MANIFEST_SCHEMA_VERSION);
+            metadata.insert(key, value);
+            manifest_storage_schema(metadata)?
+        }
+        StoredShape::Flat => Arc::new(Schema::new_with_metadata(
+            flat_manifest_schema().fields().clone(),
+            metadata,
+        )),
+    };
+    let to_storage = |batch: &RecordBatch| match shape {
+        StoredShape::Packed => compact_to_storage(batch, &schema),
+        StoredShape::Flat => flat_to_storage(batch, &schema),
+    };
     let mut batches = Vec::with_capacity(live_rows.len() + 1);
     for batch in &live_rows {
         let keep = BooleanArray::from_iter(
@@ -61,14 +86,24 @@ pub(crate) async fn overwrite(
         );
         let kept = filter_record_batch(batch, &keep).map_err(OmniError::arrow_internal)?;
         if kept.num_rows() > 0 {
-            batches.push(with_schema(&kept, &schema)?);
+            batches.push(to_storage(&kept)?);
         }
     }
-    batches.push(with_schema(&pending, &schema)?);
+    batches.push(to_storage(&pending)?);
+    commit_overwrite(dataset, batches).await
+}
+
+/// Commit `batches` as the whole stored row set at `dataset`'s version + 1 (the module doc: zero
+/// retries, the version number is the CAS).
+pub(crate) async fn commit_overwrite(
+    dataset: Dataset,
+    batches: Vec<RecordBatch>,
+) -> Result<Dataset> {
     let params = WriteParams {
         mode: WriteMode::Overwrite,
         auto_cleanup: None,
         skip_auto_cleanup: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
         ..Default::default()
     };
     let dataset = Arc::new(dataset);
@@ -83,20 +118,4 @@ pub(crate) async fn overwrite(
         .execute(transaction)
         .await
         .map_err(map_lance_publish_error)
-}
-
-fn with_schema(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
-    let columns = schema
-        .fields()
-        .iter()
-        .map(|field| {
-            batch.column_by_name(field.name()).cloned().ok_or_else(|| {
-                OmniError::manifest_internal(format!(
-                    "manifest batch is missing column {}",
-                    field.name()
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    RecordBatch::try_new(schema.clone(), columns).map_err(OmniError::arrow_internal)
 }

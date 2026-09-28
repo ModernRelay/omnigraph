@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-08-16
-updated: 2026-08-23
+updated: 2026-09-29
 discussion: "https://github.com/ModernRelay/omnigraph/pull/491"
 supersedes: []
 superseded_by: []
@@ -279,10 +279,10 @@ Existing operation-local boundaries retain their narrower meanings:
 - optimize keeps its local raw-Lance retry classifier; and
 - no other Lance conflict becomes a replay signal.
 
-RFC 0034 recovery disposition and RFC 0036 supervision remain separate
-contracts. A future supervisor may consider `Transient` after its recovery and
-effect-state rules authorize another attempt, but this RFC supplies neither
-that authorization nor scheduling policy.
+The proposed [server authority and completion contract](2026-09-29-server-runtime-and-online-deployment.md#authority-and-completion)
+remains separate from failure classification. A future supervisor may consider
+`Transient` only after its completion and effect-state rules authorize another
+attempt; this RFC supplies neither that authorization nor scheduling policy.
 
 ### Compatibility
 
@@ -392,3 +392,10 @@ available as historical context but is not merged or rebased.
 No unresolved OmniGraph design questions. New public upstream evidence may
 justify finer classification in a later RFC, but provider message parsing is
 not an acceptable substitute.
+
+## Decision log
+
+- 2026-09-29: The server authority and completion proposal replaces the paragraph
+  assigning recovery disposition and supervision to RFCs 0034 and 0036. Typed
+  storage classification still supplies no replay authorization or scheduling
+  policy; the accepted error contract is unchanged.

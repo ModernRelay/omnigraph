@@ -1502,8 +1502,7 @@ async fn blob_read_on_upgraded_unmarked_v6_table_fails_closed_for_old_snapshots(
     let mut manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
         .await
         .unwrap();
-    manifest
-        .update_schema_metadata([("omnigraph:internal_schema_version", "10")])
+    omnigraph_catalog::migrations::restamp_flat_for_test(&mut manifest, 10)
         .await
         .unwrap();
     drop(manifest);

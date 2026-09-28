@@ -2,20 +2,25 @@
 rfc: "0035"
 title: "Served operation ownership"
 track: maintainer
-status: draft
+status: superseded
 implementation: not-started
 authors:
   - OmniGraph maintainers
 created: 2026-08-13
-updated: 2026-09-26
+updated: 2026-09-29
 discussion: null
 supersedes: []
-superseded_by: []
-blocked_on:
-  - "Server lifecycle and online deployment RFC (2026-09-10): minimum T10 ownership gate (increment B)"
+superseded_by:
+  - "2026-09-29-server-runtime-and-online-deployment"
+blocked_on: []
 ---
 
 # RFC 0035: Served operation ownership
+
+> **Superseded on 2026-09-29** by [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md).
+> The replacement remains a draft and is not implemented. This document is
+> retained as historical rationale; its obsolete mechanisms and dependencies
+> are not current implementation requirements.
 
 **Depends on:** existing engine write and recovery contracts; no runtime-activation or recovery-supervision design; historical admission (§7.3) and the shipping gate in §10 are owned by [Server lifecycle and online deployment](2026-09-10-server-lifecycle-and-online-deployment.md), the server lifecycle RFC.
 **Replaces:** [PR #490](https://github.com/ModernRelay/omnigraph/pull/490), retaining its cancellation evidence rather than its stacked implementation.
