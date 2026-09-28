@@ -48,7 +48,8 @@ RFCs 0001 to 0068 use `NNNN-kebab-title.md`, the heading
 closed at 0068: no new number is allocated, and `scripts/check-docs.py`
 rejects any numbered filename outside the allocated and reserved numbers it
 lists. Numbers reserved by PRs that were open
-when the namespace closed (0047 and 0048 by PR #606; 0050 by the
+when the namespace closed (0047 and 0048 by PR #606, carried on by PR #791
+and PR #793; 0050 by the
 `rfc/0050-engine-crate-topology` branch; 0056 by PR #670; 0059 by PR #675;
 0060 by PR #677; 0067 and 0068 by PR #725) may still land under their
 reserved numbers. Every other gap

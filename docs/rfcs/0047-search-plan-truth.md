@@ -8,7 +8,7 @@ authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-01
 updated: 2026-09-28
-discussion: null
+discussion: "https://github.com/ModernRelay/omnigraph/pull/791"
 supersedes: []
 superseded_by: []
 blocked_on: []
@@ -53,9 +53,9 @@ v1's executor keeps its bytes, and GQ gains no syntax.
 
 Related decisions: [Shared expression model](2026-09-24-shared-expression-model.md)
 owns the query surface this RFC works within; RFC 0048
-([Search contracts and retrieval algebra, PR #PR0048](https://github.com/ModernRelay/omnigraph/pull/PR0048))
+([Search contracts and retrieval algebra, PR #793](https://github.com/ModernRelay/omnigraph/pull/793))
 owns the retrieval contract beyond this slice; the analyzed lexical search RFC
-([PR #PRLEX](https://github.com/ModernRelay/omnigraph/pull/PRLEX)) owns analyzers
+([PR #792](https://github.com/ModernRelay/omnigraph/pull/792)) owns analyzers
 and exact lexical matching; [Self-contained server testing with GQT and DST](2026-09-26-self-contained-server-testing.md)
 owns the read envelope's result column types, which item 5 extends beside.
 
