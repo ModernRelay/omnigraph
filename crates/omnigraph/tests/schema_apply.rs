@@ -370,8 +370,10 @@ async fn mutation_waits_for_mid_apply_schema_gate_then_reprepares() {
 
     mutation_rv.release();
     // Give the already-runnable mutation repeated scheduler turns. It must stay
-    // pending on the schema gate; completing here means it either advanced under
-    // an in-flight migration or returned a spurious post-prepare failure.
+    // pending on the schema gate — its SHARED permit parks behind the apply's
+    // held EXCLUSIVE permit (RFC 2026-09-18-shared-schema-gate); completing
+    // here means it either advanced under an in-flight migration or returned
+    // a spurious post-prepare failure.
     for _ in 0..128 {
         tokio::task::yield_now().await;
         if mutation_task.is_finished() {
@@ -390,6 +392,66 @@ async fn mutation_waits_for_mid_apply_schema_gate_then_reprepares() {
         .unwrap()
         .expect("insert-only mutation must reprepare under the promoted schema");
     assert_eq!(result.affected_nodes, 1);
+    assert_eq!(count_rows(&db, "node:Person").await, 5);
+}
+
+/// The mis-classified-writer tripwire: a writer parked inside its envelope
+/// holds its SHARED permit, so the apply must not reach the seam after its
+/// sentinel. Falsified by dropping the permit in `HeldWriteGates::new`: red.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn parked_writer_blocks_schema_apply() {
+    use omnigraph::seams::catalog;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(init_and_load(&dir).await);
+    let desired = TEST_SCHEMA.replace("    age: I32?\n}", "    age: I32?\n    motto: String?\n}");
+
+    let in_envelope =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER);
+    let writer_db = Arc::clone(&db);
+    let writer = tokio::spawn(async move {
+        writer_db
+            .mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "gate-holder")], &[("$age", 27)]),
+            )
+            .await
+    });
+    in_envelope.wait_until_reached().await;
+
+    let post_sentinel =
+        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_POST_SENTINEL);
+    let schema_db = Arc::clone(&db);
+    let schema_task = tokio::spawn(async move { schema_db.apply_schema(&desired).await });
+    // Wall time: an apply past the gate makes store requests before the seam.
+    let crossed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !post_sentinel.reached() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        crossed.is_err(),
+        "schema apply must wait behind a writer's held shared schema permit; it \
+         created its sentinel while the writer was parked",
+    );
+    assert!(!schema_task.is_finished());
+
+    in_envelope.release();
+    writer
+        .await
+        .unwrap()
+        .expect("the parked writer must publish after release");
+    post_sentinel.wait_until_reached().await;
+    post_sentinel.release();
+    schema_task
+        .await
+        .unwrap()
+        .expect("schema apply must complete once the writer's envelope releases");
     assert_eq!(count_rows(&db, "node:Person").await, 5);
 }
 

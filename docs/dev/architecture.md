@@ -127,7 +127,17 @@ gates for single-writer ownership.
 
 ## Concurrency and support boundary
 
-- Reads are snapshot-isolated and do not take write gates.
+- Reads are snapshot-isolated. A read-view capture takes a shared schema
+  permit (so it cannot observe a contract mid-swap) and no branch or table
+  gate, so it does not wait for writers on other handles. It does wait for
+  an exclusive pass on any handle of the process (schema apply, the
+  system-column upgrade, open, refresh, settle, reload, `sync_branch`,
+  branch create), and, because the gate is write-preferring, from the
+  moment one is queued. It also takes its
+  handle's coordinator lock, which a publish on that handle's bound branch
+  holds for the manifest compare-and-swap: a read and a write sharing one
+  handle and branch (for example, the server's requests on `main`) still
+  wait for each other there.
 - Write preparation may overlap. Durable effects are ordered by the shared
   schema, branch, and sorted-table gates, then fenced again by persisted
   authority and Lance transaction identity.

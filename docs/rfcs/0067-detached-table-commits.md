@@ -1203,6 +1203,13 @@ per write, which compaction bounds.
    process-wide. Evidence needed: the `writes.rs` concurrency matrix rerun
    with staging outside the gates, and the whole-run cost instrument showing
    the critical section shrank to revalidate-and-publish.
+   *Amended 2026-09-28:* the shared schema gate shipped
+   ([Shared schema gate](2026-09-18-shared-schema-gate.md)); committing the
+   detached effects before the gates was measured and not adopted. The
+   detached commit is 13–15% of the gate hold, and because revalidation
+   fails on any move of the branch head, under same-branch contention each
+   losing attempt would write a commit that is dead on arrival. That RFC's
+   decision log has the numbers and the levers they point to.
 3. **Group commit at the branch publisher.** One publisher task per branch
    per process owns the CAS. Writers stage, then submit an entry (captured
    authority, staged pins, lineage row) and wait. While one CAS is in
@@ -1218,7 +1225,8 @@ per write, which compaction bounds.
    table, and the head row moving from H to the last commit under the same
    row-level check as today; every entry gets the same durable outcome and
    is acknowledged only after the CAS returns; promotion runs afterwards in
-   one pass. Consequences a separate RFC must decide: time travel by
+   one pass (since removed: [detached-only tables](2026-09-21-detached-only-tables.md)
+   leaves no promotion to run). Consequences a separate RFC must decide: time travel by
    manifest version becomes time travel by batch, each commit row must carry
    the table pins it changed so the change feed stays per commit, and a
    snapshot at an interior commit of a batch is derivable but not
@@ -1251,8 +1259,12 @@ claims).
   serializing process-wide (#643); nothing in this RFC depends on the gates
   for correctness. Proposed in
   [Shared schema gate and the write critical section](2026-09-18-shared-schema-gate.md).
-  Decided by the engine maintainers in the change that
-  closes #643.
+  Decided 2026-09-19 for the schema-gate half: the gate is shared for
+  writers, merges, maintenance, branch delete and read captures, and
+  exclusive for contract-lifecycle passes and branch create (that RFC,
+  implemented). The merge case of
+  [#643](https://github.com/ModernRelay/omnigraph/issues/643), two merges
+  overlapping, is not evidenced by that change and stays open here.
 - Whether merge promotion ever uses `Restore` of the chain tip instead of
   per-chunk replay, and above which chain length. Per-chunk replay is the only
   shipped path. A `Restore` makes the row stamps of restored rows

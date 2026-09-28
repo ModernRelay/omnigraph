@@ -5333,10 +5333,7 @@ impl Omnigraph {
         // Holding both branch gates through publication prevents a target
         // delete/recreate from reusing the branch name underneath a plan (ABA).
         self.settle_pending_schema_install().await?;
-        let _schema_guard = self
-            .write_queue()
-            .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
-            .await;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await;
         let _branch_guards = self
             .write_queue()
             .acquire_branches(&[source_branch.clone(), target_branch.clone()])
