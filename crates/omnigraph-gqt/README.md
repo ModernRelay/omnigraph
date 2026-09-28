@@ -134,8 +134,75 @@ table; a place-and-action pair outside it, or listed but not implemented, is
 refused at admission naming the table row. An old `--- fault` block
 converts by renaming the section and its `return_error` action to
 `action: fail`; `at`, `occurrence` and `scope` keep their names. Process crashes,
-concurrent steps, server/CLI sessions and network simulation are future
-extensions.
+server/CLI sessions and network simulation are future extensions.
+
+## Concurrent block
+
+A `--- concurrent` section runs two to four labeled GQ statements at the
+same time on the case's one handle, in the order its `order:` line names;
+it is one step of the case and runs under the DST runner only.
+
+```text
+--- concurrent
+w1: query add_bob() { insert Person { name: "bob" } }
+r1: query all() { match { $p: Person } return { $p.name } }
+order: w1 park put __manifest/_versions/, r1 start, r1, w1 put __manifest/_versions/
+--- expect
+w1: ok
+r1: ok
+```
+
+A session is `<label>[ on <branch>]: <statement>` at column 0, continued on
+the lines that follow: one query or mutation declaration with no parameters,
+on `main` unless `on <branch>` says otherwise. Every session is a `Session`
+over the case handle, so the sessions share its in-process locks the way a
+server's requests do. `order:` closes the block: comma-separated entries,
+each `<label> start` (the session's statement begins; the runner holds it
+before that), `<label>` (the session's completion, reported as `done`),
+`<label> <verb> <key-suffix>` (the session's next store request of that
+verb whose key contains the suffix, run in turn; the cursor moves past the
+entry when the request completes: a multipart write when its upload
+completes or aborts, a listing when its first item or end arrives, a `copy`
+is named by its destination key) or `<label> park <verb> <key-suffix>` (the
+session arrives at that request and is held there, inside whatever the
+engine holds at that point, until its next entry is due; arrival moves the
+cursor; the entry after a park for its label is that request without
+`park`, or the label's completion). Verbs are `get`, `head`, `put`, `list`,
+`delete` and `copy`. Labels are `[a-z][a-z0-9]*`; `setup`, `runner`, `step`
+and `order` are reserved. A request no entry names runs at once, and a
+request made outside any session's future (a Lance pool thread, a task the
+engine spawned) can never be named. The `--- expect` after the block is
+bare, one `<label>: ok` or `<label>: error: <needle>` line per session;
+rows are not compared inside a block.
+
+While a session waits on the script the block drives the paused clock
+itself (RFC 0045 §Concurrent block says why) up to ten virtual seconds past
+the last cursor move or request; past that the clock stands still and the
+block fails as starved when neither an entry nor a request arrives for half
+the case's `timeout_ms` of wall time, at most ten seconds, or when a
+session finishes without a request entry of its own. A session blocked in
+the engine while no session waits on the script ends as the case's
+timeout. The example above is the read-during-publish case: on an engine
+whose publish holds the schema gate and the handle's coordinator lock
+across the manifest commit, `r1` waits behind `w1` (at the schema gate,
+before it reaches the coordinator lock) and the block starves at entry 3;
+on an engine that installs the published state after the commit, it
+passes. An entry naming a request the engine makes while holding a lock
+another session needs starves the block too: the writer's manifest `put` is
+safe to park at, a read's `__manifest` listing is under the coordinator read
+lock and is not, which is what `start` is for. The evidence row
+`concurrent_block` carries each session's outcome, the entry the cursor
+stopped at and the block's failure, replay-compared; the grant sequence
+with its wall times and the count of requests made outside any session are
+in the report's measurements, not the cost table. Under `--measure` each
+session is its own row, labeled by its session label, and the block's own
+row holds the requests made outside any session, so a read's virtual time
+beside a write is a number. Once a block is starved its sessions drain, and
+the requests they make from then on are in phase `after_abort`: a starved
+block's rows are the drain, not the interleaving the script named. Store
+requests are the only points an entry can name in this version; seams and
+in-process gates as entries, control statements as sessions and sessions on
+separate handles are later extensions.
 
 ## Plan expectations
 

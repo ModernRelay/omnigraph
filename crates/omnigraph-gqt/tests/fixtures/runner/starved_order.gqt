@@ -1,0 +1,21 @@
+# issue: none
+--- runner
+timeout_ms: 20000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    name: String @key
+}
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+--- concurrent
+w1: query add_bob() { insert Person { name: "bob" } }
+r1: query all() { match { $p: Person } return { $p.name } }
+order: r1, w1 put no_such_object_is_ever_written
+--- expect
+w1: ok
+r1: ok
