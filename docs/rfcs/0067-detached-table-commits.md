@@ -1259,7 +1259,8 @@ claims).
   per-chunk promotion cost near the 1,024-chunk bound.
 - Group commit at the branch gate is a separate proposal; here it is N
   detached commits, one publication, N promotions. Decided in that proposal,
-  when it opens.
+  when it opens. Proposed in [RFC: Group commit](2026-09-28-group-commit.md),
+  which publishes a batch as one graph commit rather than as N commit rows.
 - How a blocked table is unblocked. A foreign linear commit occupying a
   pin's target never resolves on its own, and every later pin on that table
   waits behind it. The candidates are a `repair` arm that restores the
