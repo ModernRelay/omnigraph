@@ -881,7 +881,7 @@ impl Omnigraph {
                         "prepared mutation authority changed before effects; repreparing"
                     );
                     crate::instrumentation::record_mutation_reprepare();
-                    self.refresh().await?;
+                    self.refresh_for_reprepare().await?;
                 }
                 result => return result,
             }

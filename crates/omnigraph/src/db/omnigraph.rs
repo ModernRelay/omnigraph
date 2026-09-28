@@ -62,11 +62,12 @@ use super::commit_graph::GraphCommit;
 use super::manifest::{GenesisManifestAttempt, ManifestChange, TableRegistration, TableTombstone};
 use super::schema_state::{
     SCHEMA_SOURCE_FILENAME, SchemaContractText, SchemaStagingPolicy, SchemaStateRecovery,
-    load_validated_schema_contract, load_validated_schema_contract_for_source,
-    read_accepted_schema_ir, read_schema_contract_text, read_schema_contract_text_for_source,
-    read_schema_state_identity, recover_schema_state_files, render_schema_contract, schema_ir_uri,
-    schema_source_staging_uri, schema_source_uri, schema_state_uri, validate_schema_contract,
-    validate_schema_contract_text, validate_schema_ir_against_snapshot, write_schema_contract,
+    StagedContract, inspect_staged_contract, load_validated_schema_contract,
+    load_validated_schema_contract_for_source, read_accepted_schema_ir, read_schema_contract_text,
+    read_schema_contract_text_for_source, read_schema_state_identity, recover_schema_state_files,
+    render_schema_contract, schema_ir_uri, schema_source_staging_uri, schema_source_uri,
+    schema_state_uri, validate_schema_contract, validate_schema_contract_text,
+    validate_schema_ir_against_snapshot, write_schema_contract,
 };
 use super::snapshot::Snapshot;
 use super::{
@@ -831,7 +832,7 @@ impl Omnigraph {
             .await?;
             // A staged schema contract names the graph commit that publishes
             // it: install it when that commit is in lineage, discard it
-            // otherwise. The caller holds the shared schema gate.
+            // otherwise. The caller holds the exclusive schema permit.
             recover_schema_state_files(
                 &root,
                 Arc::clone(&storage),
@@ -1359,23 +1360,28 @@ impl Omnigraph {
         const MAX_CAPTURE_RETRIES: usize = 8;
         let branch = normalize_branch_name(branch.unwrap_or("main"))?;
 
-        let mut parked_behind_apply = false;
-        for _ in 0..MAX_CAPTURE_RETRIES {
-            // A standing sentinel means a contract-lifecycle pass is in
-            // flight. An apply on this root holds the exclusive schema
-            // permit for its whole pass, so parking on the shared side
-            // waits it out; the writer then recaptures under the promoted
-            // contract instead of being refused and retrying hot (RFC
-            // 2026-09-18-shared-schema-gate). A cross-process apply grants
-            // the permit at once, so the bounded loop still ends in the
-            // sentinel refusal below. The common path takes no permit here:
-            // `commit_all` takes the writer's, and the gate is never held
-            // twice on one call path.
+        let mut captures = 0;
+        loop {
+            // A standing sentinel under a busy gate is an apply in this
+            // process: park on the shared side, then recapture under the
+            // promoted contract. Under a free gate it is another process's
+            // apply, or a dead one: the typed refusal, once a second listing
+            // confirms it (RFC 2026-09-18-shared-schema-gate).
             if self.schema_apply_sentinel_present().await? {
-                drop(self.write_queue().acquire_schema_shared().await);
-                parked_behind_apply = true;
+                match self.write_queue().try_acquire_schema_shared() {
+                    Some(free) => {
+                        drop(free);
+                        self.ensure_schema_apply_not_locked("write preparation")
+                            .await?;
+                    }
+                    None => drop(self.write_queue().acquire_schema_shared().await),
+                }
                 tokio::task::yield_now().await;
                 continue;
+            }
+            captures += 1;
+            if captures > MAX_CAPTURE_RETRIES {
+                break;
             }
             // A schema apply publishes graph_head before promoting its staged
             // contract. Read one fully validated IR/catalog, capture coherent
@@ -1420,12 +1426,6 @@ impl Omnigraph {
             });
         }
 
-        if parked_behind_apply {
-            // The sentinel outlived every park: a cross-process apply (or one
-            // that died holding it) — the same typed refusal as before.
-            self.ensure_schema_apply_not_locked("write preparation")
-                .await?;
-        }
         Err(OmniError::manifest_read_set_changed(
             format!("write_authority:{}", branch.as_deref().unwrap_or("main")),
             None,
@@ -2196,6 +2196,28 @@ impl Omnigraph {
     pub(crate) async fn refresh_coordinator_only(&self) -> Result<()> {
         self.coordinator.write().await.refresh().await?;
         self.invalidate_read_caches().await;
+        Ok(())
+    }
+
+    /// The reprepare refresh: a write whose authority moved recaptures from
+    /// the coordinator alone, and takes the contract-lifecycle pass of
+    /// [`refresh`](Self::refresh) only when a published staging is waiting
+    /// to be installed. `open_write_txn` reads the accepted contract from
+    /// the store on every capture, so the schema view and the `PromoteOnly`
+    /// pass add nothing to an ordinary reprepare; taking their exclusive
+    /// permit there made every same-branch reprepare a process-wide barrier
+    /// (RFC 2026-09-18-shared-schema-gate, 2026-09-29 entry).
+    pub(crate) async fn refresh_for_reprepare(&self) -> Result<()> {
+        self.refresh_coordinator_only().await?;
+        if matches!(
+            inspect_staged_contract(&self.root_uri, self.storage.as_ref(), false).await?,
+            StagedContract::Marked {
+                published: true,
+                ..
+            }
+        ) {
+            self.refresh().await?;
+        }
         Ok(())
     }
 
@@ -3026,7 +3048,7 @@ impl Omnigraph {
         let source = self.active_branch().await;
         self.settle_pending_schema_install().await?;
         fail(&BRANCH_CONTROL_PRE_GATES)?;
-        let _schema_permit = self.write_queue().acquire_schema_shared().await;
+        let _schema_permit = self.write_queue().acquire_schema_exclusive().await;
         let _branch_guards = self
             .write_queue()
             .acquire_branches(&[source.clone(), Some(target.clone())])
@@ -3109,7 +3131,7 @@ impl Omnigraph {
         self.ensure_schema_state_valid().await?;
         self.settle_pending_schema_install().await?;
         fail(&BRANCH_CONTROL_PRE_GATES)?;
-        let _schema_permit = self.write_queue().acquire_schema_shared().await;
+        let _schema_permit = self.write_queue().acquire_schema_exclusive().await;
         let _branch_guards = self
             .write_queue()
             .acquire_branches(&[branch.clone(), Some(target_branch.clone())])

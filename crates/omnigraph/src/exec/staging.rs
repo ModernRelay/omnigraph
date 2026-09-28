@@ -889,9 +889,8 @@ impl StagedMutation {
         // per-table gates. Hold the full set through manifest publish.
         let schema = db.write_queue().acquire_schema_shared().await;
         let branch_guard = db.write_queue().acquire_branch(branch).await;
-        let mut queue = vec![branch_guard];
-        queue.extend(db.write_queue().acquire_many(&queue_keys).await);
-        let gates = crate::db::write_queue::HeldWriteGates::new(schema, queue);
+        let table_guards = db.write_queue().acquire_many(&queue_keys).await;
+        let gates = crate::db::write_queue::HeldWriteGates::new(schema, branch_guard, table_guards);
 
         // Re-capture manifest pins under the queue (PR 2 / MR-686).
         //

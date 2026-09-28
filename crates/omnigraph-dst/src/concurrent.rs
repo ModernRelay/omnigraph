@@ -1534,12 +1534,6 @@ fn writer_life(
     }))
 }
 
-/// ARM 1 — the maintenance actor's life: races Optimize / Cleanup(keep=1) /
-/// ensure_indices against the data writers from its own thread + handle.
-/// Returns (committed, legal retries, cleanups run). STRICT first-contact
-/// error surface: only `kind: Conflict` is legal; anything else panics
-/// naming the op — this arm's whole point is learning what a live peer's
-/// maintenance actually surfaces.
 /// The schema actor (RFC 2026-09-18-shared-schema-gate): monotone
 /// additive applies racing the data writers. Each apply takes the schema
 /// gate's EXCLUSIVE side inside the engine, so it drains every writer's
@@ -1630,6 +1624,12 @@ fn schema_life(
     }))
 }
 
+/// ARM 1 — the maintenance actor's life: races Optimize / Cleanup(keep=1) /
+/// ensure_indices against the data writers from its own thread + handle.
+/// Returns (committed, legal retries, cleanups run). STRICT first-contact
+/// error surface: only `kind: Conflict` is legal; anything else panics
+/// naming the op — this arm's whole point is learning what a live peer's
+/// maintenance actually surfaces.
 fn maintenance_life(
     root: &str,
     storage: Arc<dyn StorageAdapter>,
@@ -1952,12 +1952,13 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
     // Birth certificate. NOTE the envelope: this line does NOT promise replay.
     println!(
         "dst concurrent universe [root={root} seed={} writers={} ops_per_writer={} \
-         maintenance_ops={} kill_writer={:?} branch_cycles={}] \
+         maintenance_ops={} schema_ops={} kill_writer={:?} branch_cycles={}] \
          envelope=bite+oracles-hold (no replay claim)",
         sc.seed,
         sc.writers,
         sc.ops_per_writer,
         sc.maintenance_ops,
+        sc.schema_ops,
         sc.kill_writer,
         sc.branch_cycles
     );

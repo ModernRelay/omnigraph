@@ -395,12 +395,9 @@ async fn mutation_waits_for_mid_apply_schema_gate_then_reprepares() {
     assert_eq!(count_rows(&db, "node:Person").await, 5);
 }
 
-/// The reverse-direction pin for the shared/exclusive schema gate — the test
-/// that catches a mis-classified writer: a writer holding its SHARED permit
-/// (parked inside its envelope after detached commits, before publish) must
-/// block a schema apply's EXCLUSIVE acquisition entirely, before the apply
-/// creates its sentinel or touches any file. If a writer site were wrongly
-/// left off the gate, the apply would proceed mid-write and this test reds.
+/// The mis-classified-writer tripwire: a writer parked inside its envelope
+/// holds its SHARED permit, so the apply must not reach the seam after its
+/// sentinel. Falsified by dropping the permit in `HeldWriteGates::new`: red.
 #[cfg(feature = "failpoints")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
@@ -426,26 +423,31 @@ async fn parked_writer_blocks_schema_apply() {
     });
     in_envelope.wait_until_reached().await;
 
+    let post_sentinel =
+        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_POST_SENTINEL);
     let schema_db = Arc::clone(&db);
     let schema_task = tokio::spawn(async move { schema_db.apply_schema(&desired).await });
-    // The apply must park on the exclusive side behind the writer's shared
-    // permit: repeated scheduler turns, never finished.
-    for _ in 0..128 {
-        tokio::task::yield_now().await;
-        if schema_task.is_finished() {
-            break;
+    // Wall time: an apply past the gate makes store requests before the seam.
+    let crossed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !post_sentinel.reached() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-    }
+    })
+    .await;
     assert!(
-        !schema_task.is_finished(),
-        "schema apply must wait behind a writer's held shared schema permit",
+        crossed.is_err(),
+        "schema apply must wait behind a writer's held shared schema permit; it \
+         created its sentinel while the writer was parked",
     );
+    assert!(!schema_task.is_finished());
 
     in_envelope.release();
     writer
         .await
         .unwrap()
         .expect("the parked writer must publish after release");
+    post_sentinel.wait_until_reached().await;
+    post_sentinel.release();
     schema_task
         .await
         .unwrap()

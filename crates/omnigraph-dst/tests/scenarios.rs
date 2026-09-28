@@ -4709,10 +4709,10 @@ fn dst_maintenance_actor_first_contact() {
 /// under shared permits. Oracles: every writer claim commits (no wedge under
 /// schema contention), every apply commits (writers cannot starve the
 /// exclusive side), each apply lands exactly one empty-person-diff era
-/// commit, and — across the seed budget — the writers genuinely interleaved
-/// (`alternations` ≥ 1 somewhere) and at least one apply landed between two
-/// writer commits (`era_commits_between_data` ≥ 1 somewhere); otherwise the
-/// green is vacuous. Plain mode only:
+/// commit, and — in every seed — the writers genuinely interleaved
+/// (`alternations` ≥ 1) and at least one apply landed between two writer
+/// commits (`era_commits_between_data` ≥ 1); otherwise the green is
+/// vacuous. Plain mode only:
 /// an apply's table rewrite runs on the single `lance-cpu` pool thread,
 /// which the seam arbiter deliberately cannot see, so under the seam
 /// scheduler its stall budget trips on a loaded machine (measured: 0, 4,
@@ -4724,8 +4724,6 @@ fn dst_maintenance_actor_first_contact() {
 #[serial]
 fn dst_schema_apply_racing_writers_first_contact() {
     use omnigraph_dst::concurrent::{ConcurrentScenario, run_concurrent_universe};
-    let mut interleaved_somewhere = false;
-    let mut apply_between_writes = false;
     for seed in dst_seeds(&[24_301, 24_302, 24_303]) {
         let root = format!("shared-memory://dst-s24-schema-{seed}");
         let sc = ConcurrentScenario {
@@ -4754,8 +4752,16 @@ fn dst_schema_apply_racing_writers_first_contact() {
             report.maintenance_commits, 3,
             "each apply lands exactly one empty-person-diff era commit"
         );
-        interleaved_somewhere |= report.alternations >= 1;
-        apply_between_writes |= report.era_commits_between_data >= 1;
+        assert!(
+            report.alternations >= 1,
+            "seed {seed}: the writers never interleaved — a vacuous green for the \
+             concurrency claim"
+        );
+        assert!(
+            report.era_commits_between_data >= 1,
+            "seed {seed}: no schema apply landed between two writer commits — the \
+             applies never contended with the writers"
+        );
         println!(
             "dst s24 schema [seed={seed}]: committed={} occ_retries={} \
              schema(committed={} retries={}) alternations={} applies_between_writes={}",
@@ -4767,16 +4773,6 @@ fn dst_schema_apply_racing_writers_first_contact() {
             report.era_commits_between_data
         );
     }
-    assert!(
-        interleaved_somewhere,
-        "no seed produced interleaved writer commits — a vacuous green for the \
-         concurrency claim; widen the seed budget"
-    );
-    assert!(
-        apply_between_writes,
-        "no seed landed a schema apply between two writer commits — the applies \
-         never contended with the writers; widen the seed budget"
-    );
 }
 
 /// The schema-arm hunt instrument: wider seeds, scheduler on, faults on —
@@ -4962,8 +4958,26 @@ fn dst_concurrent_fleet() {
             seam_schedule: seam,
             park_deleter_hold: false,
         };
-        let arms: [(&str, ConcurrentScenario); 6] = [
+        let arms: [(&str, ConcurrentScenario); 8] = [
             ("race", base.clone()),
+            // Schema arms: plain mode only (the first-contact pin says why).
+            (
+                "schema",
+                ConcurrentScenario {
+                    schema_ops: 3,
+                    seam_schedule: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "schema+maint",
+                ConcurrentScenario {
+                    schema_ops: 3,
+                    maintenance_ops: 4,
+                    seam_schedule: false,
+                    ..base.clone()
+                },
+            ),
             (
                 "maint",
                 ConcurrentScenario {

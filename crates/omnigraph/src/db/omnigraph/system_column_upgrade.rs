@@ -175,7 +175,17 @@ pub(super) async fn upgrade_system_columns(
     if !options.check {
         db.settle_pending_schema_install().await?;
     }
-    let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
+    let (_shared_gate, _exclusive_gate): (
+        Option<crate::db::write_queue::SchemaSharedPermit>,
+        Option<crate::db::write_queue::SchemaExclusivePermit>,
+    ) = if options.check {
+        (Some(db.write_queue().acquire_schema_shared().await), None)
+    } else {
+        (
+            None,
+            Some(db.write_queue().acquire_schema_exclusive().await),
+        )
+    };
     db.refresh_coordinator_only().await?;
     let stamp = crate::db::manifest::internal_schema_stamp_at(db.uri(), None)
         .await?

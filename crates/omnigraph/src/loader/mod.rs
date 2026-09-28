@@ -548,7 +548,7 @@ async fn load_jsonl_data(
                     branch = branch.unwrap_or("main"),
                     "prepared load authority changed before effects; repreparing"
                 );
-                db.refresh().await?;
+                db.refresh_for_reprepare().await?;
             }
             result => return result,
         }

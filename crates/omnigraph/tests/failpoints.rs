@@ -1895,6 +1895,62 @@ async fn cross_branch_writers_overlap_inside_schema_gate() {
     );
 }
 
+/// Branch create takes the schema gate's EXCLUSIVE side: no CAS covers its
+/// namespace inventory, so a sibling create with disjoint branch gates must
+/// wait at the gate, then refuse on the collision the first leaves behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn sibling_branch_creates_exclude_at_the_schema_gate() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    db.branch_create("b").await.unwrap();
+    let db = std::sync::Arc::new(db);
+
+    let after_inventory = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE,
+    );
+    let first_db = std::sync::Arc::clone(&db);
+    let first = tokio::spawn(async move { first_db.branch_create("feature").await });
+    after_inventory.wait_until_reached().await;
+
+    let second_db = std::sync::Arc::clone(&db);
+    let mut second = tokio::spawn(async move {
+        second_db
+            .branch_create_from(ReadTarget::branch("b"), "feature/x")
+            .await
+    });
+    let overtaking = tokio::time::timeout(std::time::Duration::from_secs(1), &mut second).await;
+    assert!(
+        overtaking.is_err(),
+        "a sibling create must wait at the schema gate while the first create sits \
+         between its inventory and its native create"
+    );
+
+    after_inventory.release();
+    first
+        .await
+        .unwrap()
+        .expect("the first create must land after release");
+    let err = second
+        .await
+        .unwrap()
+        .expect_err("the sibling create must refuse on the collision the first create left");
+    assert!(
+        err.to_string().contains("shares its physical Lance path"),
+        "unexpected refusal: {err}"
+    );
+    let branches = db.branch_list().await.unwrap();
+    assert!(
+        branches.iter().any(|name| name == "feature"),
+        "{branches:?}"
+    );
+    assert!(
+        !branches.iter().any(|name| name == "feature/x"),
+        "{branches:?}"
+    );
+}
+
 /// Reads capture their catalog under a SHARED schema permit, so a read on
 /// another handle no longer waits for a writer's publish hold (RFC
 /// 2026-09-18-shared-schema-gate). Park a writer inside its envelope; a

@@ -159,6 +159,13 @@ decide_seam! {
     pub static SCHEMA_APPLY_POST_LOCK_PRE_EFFECT = ("schema_apply.post_lock_pre_effect", Unreachable, [Fail]);
 }
 
+decide_seam! {
+    /// Right after the durable sentinel lands, under the exclusive schema
+    /// permit and before any planning: the first crossing proves the apply
+    /// got past every shared holder.
+    pub static SCHEMA_APPLY_POST_SENTINEL = ("schema_apply.post_sentinel", Unreachable, [Fail]);
+}
+
 async fn plan_schema_for_apply_from_accepted(
     db: &Omnigraph,
     desired_schema_source: &str,
@@ -265,8 +272,11 @@ where
     // 2026-09-18-shared-schema-gate).
     let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
     acquire_schema_apply_lock(db).await?;
-    let result =
-        apply_schema_with_lock(db, desired_schema_source, options, actor, validate_catalog).await;
+    let result = async {
+        fail(&SCHEMA_APPLY_POST_SENTINEL)?;
+        apply_schema_with_lock(db, desired_schema_source, options, actor, validate_catalog).await
+    }
+    .await;
     let release_result = release_schema_apply_lock(db).await;
     if release_result.is_err() {
         // Liveness: the next write entry on this handle retries the release

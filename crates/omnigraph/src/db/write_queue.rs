@@ -148,10 +148,13 @@ pub(crate) type TableQueueKey = (String, Option<String>);
 /// The graph-global schema gate: the one shared/exclusive slot.
 ///
 /// It serializes every graph-global schema writer (schema apply and the
-/// system-column upgrade) and every pass that installs, discards, or
-/// republishes the accepted schema-contract view against each other —
-/// exclusively — while readers of the accepted view (ordinary writers,
-/// merges, maintenance, branch control, read-view captures) share.
+/// system-column upgrade), every pass that installs, discards, or
+/// republishes the accepted schema-contract view, and every pass that
+/// changes the live branch-ref set without a CAS over it (branch create
+/// and create-from, whose namespace inventory precedes the native create)
+/// against each other — exclusively — while readers of the accepted view
+/// (ordinary writers, merges, maintenance, branch delete, read-view
+/// captures) share.
 ///
 /// The gate is non-reentrant in BOTH modes on one task: an exclusive
 /// holder re-acquiring either side self-deadlocks exactly like the
@@ -179,6 +182,18 @@ pub(crate) struct SchemaGateSlot {
     releases: std::sync::atomic::AtomicU64,
 }
 
+impl SchemaGateSlot {
+    /// The release protocol shared by both permits, the same as
+    /// `QueueGuard`'s: turn first, release inside it, bump the epoch last so
+    /// an observed bump implies a genuinely released slot.
+    fn release<G>(&self, guard: Option<G>) {
+        let _turn = crate::dst_gate::turn();
+        drop(guard);
+        self.releases
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// A shared schema permit: proof that no contract-lifecycle pass is
 /// concurrently swapping the accepted schema/catalog view. Held by
 /// readers of that view for the duration of their gate-ordered work
@@ -190,8 +205,8 @@ pub(crate) struct SchemaSharedPermit {
 }
 
 /// An exclusive schema permit: sole ownership of the accepted-view
-/// transition. Held by schema apply, the system-column upgrade, and the
-/// contract install/discard/reload passes.
+/// transition. Held by schema apply, the system-column upgrade, the
+/// contract install/discard/reload passes, and branch create.
 #[must_use = "dropping the permit releases the exclusive schema gate"]
 pub(crate) struct SchemaExclusivePermit {
     inner: Option<OwnedRwLockWriteGuard<()>>,
@@ -200,93 +215,66 @@ pub(crate) struct SchemaExclusivePermit {
 
 impl Drop for SchemaSharedPermit {
     fn drop(&mut self) {
-        // Same protocol as `QueueGuard`: turn first, release inside it,
-        // bump the epoch last so an observed bump implies a genuinely
-        // released reader slot.
-        let _turn = crate::dst_gate::turn();
-        drop(self.inner.take());
-        self.slot
-            .releases
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.slot.release(self.inner.take());
     }
 }
 
 impl Drop for SchemaExclusivePermit {
     fn drop(&mut self) {
-        let _turn = crate::dst_gate::turn();
-        drop(self.inner.take());
-        self.slot
-            .releases
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.slot.release(self.inner.take());
     }
 }
 
-/// Scheduled shared acquisition of the schema gate; the exact
-/// [`scheduled_lock`] protocol on the read side. Uninstalled: plain
-/// blocking `read_owned` (fair, write-preferring). Installed: stay in the
-/// turn loop, `try_read_owned` only when the release epoch moved, yield
-/// every iteration.
+/// One side of the schema gate on the [`scheduled_lock`] protocol: plain
+/// blocking acquire uninstalled; installed, try only when the release
+/// epoch moved, yielding every turn.
+async fn scheduled_schema_permit<G>(
+    slot: &SchemaGateSlot,
+    acquire: impl AsyncFnOnce(Arc<AsyncRwLock<()>>) -> G,
+    try_acquire: impl Fn(Arc<AsyncRwLock<()>>) -> Option<G>,
+) -> G {
+    let mut wait_epoch: Option<u64> = None;
+    loop {
+        match crate::dst_gate::turn() {
+            None => return acquire(Arc::clone(&slot.lock)).await,
+            Some(_turn) => {
+                let epoch_now = slot.releases.load(std::sync::atomic::Ordering::SeqCst);
+                if wait_epoch.is_none_or(|e| epoch_now != e) {
+                    match try_acquire(Arc::clone(&slot.lock)) {
+                        Some(guard) => return guard,
+                        None => wait_epoch = Some(epoch_now),
+                    }
+                }
+                // else: no release since the failed attempt — a no-op turn.
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
 async fn scheduled_schema_shared(slot: Arc<SchemaGateSlot>) -> SchemaSharedPermit {
-    let mut wait_epoch: Option<u64> = None;
-    loop {
-        match crate::dst_gate::turn() {
-            None => {
-                let guard = Arc::clone(&slot.lock).read_owned().await;
-                return SchemaSharedPermit {
-                    inner: Some(guard),
-                    slot,
-                };
-            }
-            Some(_turn) => {
-                let epoch_now = slot.releases.load(std::sync::atomic::Ordering::SeqCst);
-                if wait_epoch.is_none_or(|e| epoch_now != e) {
-                    match Arc::clone(&slot.lock).try_read_owned() {
-                        Ok(guard) => {
-                            return SchemaSharedPermit {
-                                inner: Some(guard),
-                                slot: Arc::clone(&slot),
-                            };
-                        }
-                        Err(_) => wait_epoch = Some(epoch_now),
-                    }
-                }
-                // else: no release since the failed attempt — a no-op turn.
-            }
-        }
-        tokio::task::yield_now().await;
+    let guard = scheduled_schema_permit(
+        &slot,
+        async |lock| lock.read_owned().await,
+        |lock| lock.try_read_owned().ok(),
+    )
+    .await;
+    SchemaSharedPermit {
+        inner: Some(guard),
+        slot,
     }
 }
 
-/// Scheduled exclusive acquisition of the schema gate; the write-side
-/// twin of [`scheduled_schema_shared`].
 async fn scheduled_schema_exclusive(slot: Arc<SchemaGateSlot>) -> SchemaExclusivePermit {
-    let mut wait_epoch: Option<u64> = None;
-    loop {
-        match crate::dst_gate::turn() {
-            None => {
-                let guard = Arc::clone(&slot.lock).write_owned().await;
-                return SchemaExclusivePermit {
-                    inner: Some(guard),
-                    slot,
-                };
-            }
-            Some(_turn) => {
-                let epoch_now = slot.releases.load(std::sync::atomic::Ordering::SeqCst);
-                if wait_epoch.is_none_or(|e| epoch_now != e) {
-                    match Arc::clone(&slot.lock).try_write_owned() {
-                        Ok(guard) => {
-                            return SchemaExclusivePermit {
-                                inner: Some(guard),
-                                slot: Arc::clone(&slot),
-                            };
-                        }
-                        Err(_) => wait_epoch = Some(epoch_now),
-                    }
-                }
-                // else: no release since the failed attempt — a no-op turn.
-            }
-        }
-        tokio::task::yield_now().await;
+    let guard = scheduled_schema_permit(
+        &slot,
+        async |lock| lock.write_owned().await,
+        |lock| lock.try_write_owned().ok(),
+    )
+    .await;
+    SchemaExclusivePermit {
+        inner: Some(guard),
+        slot,
     }
 }
 
@@ -301,17 +289,23 @@ async fn scheduled_schema_exclusive(slot: Arc<SchemaGateSlot>) -> SchemaExclusiv
 #[must_use = "dropping the gates releases the write envelope"]
 pub(crate) struct HeldWriteGates {
     _schema: SchemaSharedPermit,
-    /// `[0]` is the branch gate, followed by the lex-sorted table gates.
-    _queue: Vec<QueueGuard>,
+    _branch: QueueGuard,
+    _tables: Vec<QueueGuard>,
 }
 
 impl HeldWriteGates {
     /// Assemble the envelope from the gates in acquisition order: the
-    /// shared schema permit, then the branch gate and sorted table gates.
-    pub(crate) fn new(schema: SchemaSharedPermit, queue: Vec<QueueGuard>) -> Self {
+    /// shared schema permit, then the branch gate, then the sorted table
+    /// gates.
+    pub(crate) fn new(
+        schema: SchemaSharedPermit,
+        branch: QueueGuard,
+        tables: Vec<QueueGuard>,
+    ) -> Self {
         Self {
             _schema: schema,
-            _queue: queue,
+            _branch: branch,
+            _tables: tables,
         }
     }
 }
@@ -430,6 +424,18 @@ impl WriteQueueManager {
     /// gate is non-reentrant — see [`SchemaGateSlot`]).
     pub(crate) async fn acquire_schema_shared(&self) -> SchemaSharedPermit {
         scheduled_schema_shared(Arc::clone(&self.schema_gate)).await
+    }
+
+    /// The shared side without waiting: `None` while an exclusive permit is
+    /// held or queued in this process. A standing schema-apply sentinel with
+    /// a free gate is therefore another process's apply (or a dead one).
+    pub(crate) fn try_acquire_schema_shared(&self) -> Option<SchemaSharedPermit> {
+        let _turn = crate::dst_gate::turn();
+        let guard = Arc::clone(&self.schema_gate.lock).try_read_owned().ok()?;
+        Some(SchemaSharedPermit {
+            inner: Some(guard),
+            slot: Arc::clone(&self.schema_gate),
+        })
     }
 
     /// Take the schema gate's exclusive side: sole ownership of the
@@ -590,30 +596,31 @@ mod tests {
         assert!(second.try_acquire_export_cut().is_some());
     }
 
-    #[tokio::test]
-    async fn schema_shared_permits_are_concurrent() {
-        let qm = Arc::new(WriteQueueManager::new());
-        let first = qm.acquire_schema_shared().await;
-        let qm2 = Arc::clone(&qm);
-        let second = timeout(Duration::from_secs(2), async move {
-            qm2.acquire_schema_shared().await
-        })
-        .await
-        .expect("a second shared permit must not wait behind the first");
-        drop(first);
-        drop(second);
-    }
-
+    /// Shared permits are concurrent; each side excludes the other. The
+    /// contending acquisitions run on their own tasks, as engine callers do.
     #[tokio::test]
     async fn schema_exclusive_excludes_shared_both_directions() {
         let qm = Arc::new(WriteQueueManager::new());
 
+        let first = qm.acquire_schema_shared().await;
+        let qm2 = Arc::clone(&qm);
+        let second = timeout(
+            Duration::from_secs(2),
+            tokio::spawn(async move { qm2.acquire_schema_shared().await }),
+        )
+        .await
+        .expect("a second shared permit must not wait behind the first")
+        .unwrap();
+        drop(first);
+        drop(second);
+
         // Held exclusive blocks a shared acquire.
         let exclusive = qm.acquire_schema_exclusive().await;
         let qm2 = Arc::clone(&qm);
-        let blocked = timeout(Duration::from_millis(200), async move {
-            qm2.acquire_schema_shared().await
-        })
+        let blocked = timeout(
+            Duration::from_millis(200),
+            tokio::spawn(async move { qm2.acquire_schema_shared().await }),
+        )
         .await;
         assert!(
             blocked.is_err(),
@@ -621,17 +628,20 @@ mod tests {
         );
         drop(exclusive);
         let qm2 = Arc::clone(&qm);
-        let shared = timeout(Duration::from_secs(2), async move {
-            qm2.acquire_schema_shared().await
-        })
+        let shared = timeout(
+            Duration::from_secs(2),
+            tokio::spawn(async move { qm2.acquire_schema_shared().await }),
+        )
         .await
-        .expect("shared must acquire once the exclusive permit releases");
+        .expect("shared must acquire once the exclusive permit releases")
+        .unwrap();
 
         // Held shared blocks an exclusive acquire.
         let qm2 = Arc::clone(&qm);
-        let blocked = timeout(Duration::from_millis(200), async move {
-            qm2.acquire_schema_exclusive().await
-        })
+        let blocked = timeout(
+            Duration::from_millis(200),
+            tokio::spawn(async move { qm2.acquire_schema_exclusive().await }),
+        )
         .await;
         assert!(
             blocked.is_err(),
@@ -639,19 +649,18 @@ mod tests {
         );
         drop(shared);
         let qm2 = Arc::clone(&qm);
-        let _exclusive = timeout(Duration::from_secs(2), async move {
-            qm2.acquire_schema_exclusive().await
-        })
+        let _exclusive = timeout(
+            Duration::from_secs(2),
+            tokio::spawn(async move { qm2.acquire_schema_exclusive().await }),
+        )
         .await
-        .expect("exclusive must acquire once the shared permit releases");
+        .expect("exclusive must acquire once the shared permit releases")
+        .unwrap();
     }
 
-    /// The plain-mode no-starvation pin: tokio's `RwLock` is
-    /// write-preferring, so once an exclusive acquisition is queued, a
-    /// LATER shared acquisition parks behind it instead of overtaking. If
-    /// a tokio upgrade ever changes that policy, this test reds and the
-    /// schema gate's fairness claim (RFC 2026-09-18-shared-schema-gate)
-    /// must be re-derived.
+    /// The plain-mode no-starvation pin: a shared acquisition after a queued
+    /// exclusive parks behind it (tokio's `RwLock` is write-preferring). A
+    /// tokio change of policy reds this and the RFC's fairness claim.
     #[tokio::test]
     async fn queued_schema_exclusive_blocks_later_shared() {
         let qm = Arc::new(WriteQueueManager::new());
@@ -659,13 +668,21 @@ mod tests {
 
         let qm_writer = Arc::clone(&qm);
         let writer = tokio::spawn(async move { qm_writer.acquire_schema_exclusive().await });
-        // Give the exclusive acquisition time to enter the waiter queue.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let qm_probe = Arc::clone(&qm);
+        timeout(Duration::from_secs(2), async move {
+            while let Some(permit) = qm_probe.try_acquire_schema_shared() {
+                drop(permit);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the exclusive acquisition must enter the waiter queue");
 
         let qm2 = Arc::clone(&qm);
-        let overtaking = timeout(Duration::from_millis(200), async move {
-            qm2.acquire_schema_shared().await
-        })
+        let overtaking = timeout(
+            Duration::from_millis(200),
+            tokio::spawn(async move { qm2.acquire_schema_shared().await }),
+        )
         .await;
         assert!(
             overtaking.is_err(),
@@ -679,11 +696,13 @@ mod tests {
             .expect("writer task must not panic");
         drop(exclusive);
         let qm2 = Arc::clone(&qm);
-        let _shared = timeout(Duration::from_secs(2), async move {
-            qm2.acquire_schema_shared().await
-        })
+        let _shared = timeout(
+            Duration::from_secs(2),
+            tokio::spawn(async move { qm2.acquire_schema_shared().await }),
+        )
         .await
-        .expect("the parked shared permit must acquire after the exclusive releases");
+        .expect("the parked shared permit must acquire after the exclusive releases")
+        .unwrap();
     }
 
     #[tokio::test]
@@ -694,20 +713,23 @@ mod tests {
 
         let exclusive = first.acquire_schema_exclusive().await;
         let second2 = Arc::clone(&second);
-        let blocked = timeout(Duration::from_millis(200), async move {
-            second2.acquire_schema_shared().await
-        })
+        let blocked = timeout(
+            Duration::from_millis(200),
+            tokio::spawn(async move { second2.acquire_schema_shared().await }),
+        )
         .await;
         assert!(
             blocked.is_err(),
             "handles for one root must exclude on one schema gate"
         );
         drop(exclusive);
-        let _shared = timeout(Duration::from_secs(2), async move {
-            second.acquire_schema_shared().await
-        })
+        let _shared = timeout(
+            Duration::from_secs(2),
+            tokio::spawn(async move { second.acquire_schema_shared().await }),
+        )
         .await
-        .expect("the second handle's shared permit must acquire after release");
+        .expect("the second handle's shared permit must acquire after release")
+        .unwrap();
     }
 
     #[tokio::test]

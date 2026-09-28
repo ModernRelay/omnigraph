@@ -98,15 +98,20 @@ handoff use the existing complete fold. This is disposable process memory;
 history for collision, expected-version, and lineage validation.
 
 The capture itself (`open_write_txn`) takes no permit on the common path:
-when a schema-apply sentinel stands it parks on the shared side until the
-apply releases, then recaptures under the promoted contract.
+when a schema-apply sentinel stands and an apply in this process holds the
+exclusive permit, it parks on the shared side until the apply releases, then
+recaptures under the promoted contract. A sentinel under a free gate is
+another process's apply and gets the typed refusal at once. Only `mutate`
+and `load` reach the park: merge, index maintenance, optimize, cleanup and
+repair call `ensure_schema_apply_idle` before their capture, so a standing
+sentinel refuses them one call earlier.
 
 Finalization acquires the root-shared gate order:
 
 1. the schema gate — a shared permit for ordinary writers (only a
    contract-lifecycle pass such as schema apply or the system-column
-   upgrade takes it exclusively, so cross-branch writers do not serialize
-   on it; see
+   upgrade, and branch create, whose namespace inventory no CAS covers,
+   take it exclusively, so cross-branch writers do not serialize on it; see
    [RFC 2026-09-18-shared-schema-gate](../rfcs/2026-09-18-shared-schema-gate.md));
 2. target branch;
 3. touched `(table identity, physical branch)` entries in deterministic order;

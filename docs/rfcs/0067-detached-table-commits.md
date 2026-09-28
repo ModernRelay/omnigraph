@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - ragnorc
 created: 2026-09-14
-updated: 2026-09-25
+updated: 2026-09-29
 discussion: null
 supersedes: []
 superseded_by: []
@@ -1258,8 +1258,12 @@ claims).
   serializing process-wide (#643); nothing in this RFC depends on the gates
   for correctness. Proposed in
   [Shared schema gate and the write critical section](2026-09-18-shared-schema-gate.md).
-  Decided by the engine maintainers in the change that
-  closes #643.
+  Decided 2026-09-19 for the schema-gate half: the gate is shared for
+  writers, merges, maintenance, branch delete and read captures, and
+  exclusive for contract-lifecycle passes and branch create (that RFC,
+  implemented). The merge case of
+  [#643](https://github.com/ModernRelay/omnigraph/issues/643), two merges
+  overlapping, is not evidenced by that change and stays open here.
 - Whether merge promotion ever uses `Restore` of the chain tip instead of
   per-chunk replay, and above which chain length. Per-chunk replay is the only
   shipped path. A `Restore` makes the row stamps of restored rows
