@@ -74,12 +74,16 @@ async fn stale_overwrite_loses_the_version_cas_without_replacing_the_winner() {
         skip_auto_cleanup: true,
         ..Default::default()
     };
+    let stored_schema =
+        super::record::manifest_storage_schema(base.schema().metadata.clone()).unwrap();
+    let winner_row = super::record::compact_to_storage(
+        &relabelled_manifest_row(&live_rows, "cas_probe:winner"),
+        &stored_schema,
+    )
+    .unwrap();
     let winner = InsertBuilder::new(Arc::new(base.clone()))
         .with_params(&append)
-        .execute(vec![relabelled_manifest_row(
-            &live_rows,
-            "cas_probe:winner",
-        )])
+        .execute(vec![winner_row])
         .await
         .unwrap();
     assert_eq!(winner.version().version, base.version().version + 1);
@@ -840,7 +844,13 @@ async fn test_directory_namespace_direct_publish_cannot_replace_native_omnigraph
         })
         .await
         .unwrap_err();
-    assert!(format!("{list_error:?}").contains("TableNotFound"));
+    let cannot_address = |error: &str| error.contains("FieldNotFound");
+    assert!(
+        cannot_address(&format!("{list_error:?}")),
+        "the directory namespace reads `__manifest` by its own catalog columns; since stamp 12 \
+         `location` lives inside the packed `record` struct, so it fails at FieldNotFound one \
+         step before the TableNotFound a flat manifest gave: {list_error:?}"
+    );
 
     let describe_error = namespace
         .describe_table_version(DescribeTableVersionRequest {
@@ -850,7 +860,10 @@ async fn test_directory_namespace_direct_publish_cannot_replace_native_omnigraph
         })
         .await
         .unwrap_err();
-    assert!(format!("{describe_error:?}").contains("TableNotFound"));
+    assert!(
+        cannot_address(&format!("{describe_error:?}")),
+        "{describe_error:?}"
+    );
 
     // omnigraph's manifest stays authoritative: refresh ignores the direct
     // `person_ds.append` above (it was never manifest-published), so the row
@@ -3305,4 +3318,219 @@ async fn legacy_manifest_decoder_preserves_equal_version_tombstone() {
             .to_string()
             .contains("above the scanned dataset version")
     );
+}
+
+/// The `present` byte marking exactly `null_fields` null, by their bit in `RECORD_FIELDS`.
+fn null_bits(null_fields: &[&str]) -> u8 {
+    null_fields
+        .iter()
+        .map(|field| {
+            let bit = super::record::RECORD_FIELDS
+                .iter()
+                .position(|name| name == field)
+                .unwrap();
+            1u8 << bit
+        })
+        .fold(0, |mask, bit| mask | bit)
+}
+
+/// A logical batch with every record field in each of its states: a value,
+/// null, and (for strings) empty, so the packed shape must keep empty and
+/// null apart through the `present` bits.
+fn record_states_batch() -> RecordBatch {
+    let identity = TableIdentity {
+        stable_table_id: 7,
+        table_incarnation_id: 3,
+    };
+    super::state::manifest_rows_batch(
+        vec![
+            super::layout::table_object_id(identity),
+            "graph_head:main".into(),
+            "x".into(),
+        ],
+        vec!["table".into(), "graph_head".into(), "probe".into()],
+        vec![Some("tables/7.3/".into()), None, Some(String::new())],
+        vec![None, Some("{}".into()), Some(String::new())],
+        vec!["node:Person".into(), String::new(), "k".into()],
+        vec![Some(identity), None, Some(identity)],
+        vec![None, Some(9), Some(0)],
+        vec![None, Some("main".into()), Some(String::new())],
+        vec![None, None, Some(0)],
+    )
+    .unwrap()
+}
+
+#[test]
+fn packed_record_round_trips_nulls_through_present_bits() {
+    let logical = record_states_batch();
+    let schema = super::record::manifest_storage_schema(HashMap::new()).unwrap();
+    let names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(names, ["object_id", "object_type", "record"]);
+    let stored = super::record::compact_to_storage(&logical, &schema).unwrap();
+    let record = stored
+        .column_by_name("record")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::StructArray>()
+        .unwrap();
+    assert_eq!(record.num_columns(), 9);
+    assert!(record.columns().iter().all(|child| child.null_count() == 0));
+    let present = record
+        .column_by_name("present")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::UInt8Array>()
+        .unwrap();
+    assert_eq!(
+        present.values().as_ref(),
+        &[
+            null_bits(&["metadata", "table_version", "table_branch", "row_count"]),
+            null_bits(&[
+                "location",
+                "stable_table_id",
+                "table_incarnation_id",
+                "row_count"
+            ]),
+            null_bits(&[]),
+        ]
+    );
+
+    let expanded = super::record::expand_from_storage(&stored).unwrap();
+    assert_eq!(expanded, logical);
+
+    let flat = super::state::flat_manifest_schema();
+    assert_eq!(flat.fields().len(), 11);
+    assert_eq!(flat.field(4).name(), "base_objects");
+}
+
+/// `stored` with its `present` column replaced by `present`, the rows a
+/// writer that set a null bit over a value would leave behind.
+fn with_present_bits(stored: &RecordBatch, present: Vec<u8>) -> RecordBatch {
+    let record = stored
+        .column_by_name("record")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::StructArray>()
+        .unwrap();
+    let mut children = record.columns().to_vec();
+    let present_index = record
+        .column_names()
+        .iter()
+        .position(|name| *name == super::record::PRESENT_COLUMN)
+        .unwrap();
+    children[present_index] = Arc::new(arrow_array::UInt8Array::from(present));
+    let tampered = arrow_array::StructArray::new(record.fields().clone(), children, None);
+    RecordBatch::try_new(
+        stored.schema(),
+        vec![
+            stored.column(0).clone(),
+            stored.column(1).clone(),
+            Arc::new(tampered),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn packed_record_refuses_a_null_bit_beside_a_value() {
+    let logical = record_states_batch();
+    let schema = super::record::manifest_storage_schema(HashMap::new()).unwrap();
+    let stored = super::record::compact_to_storage(&logical, &schema).unwrap();
+
+    let string_tampered = with_present_bits(&stored, vec![null_bits(&["location"]), 0, 0]);
+    let error = super::record::expand_from_storage(&string_tampered).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("'location' is marked null but carries a value at row 0"),
+        "{error}"
+    );
+
+    let u64_tampered = with_present_bits(&stored, vec![null_bits(&["stable_table_id"]), 0, 0]);
+    let error = super::record::expand_from_storage(&u64_tampered).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("'stable_table_id' is marked null but carries a value at row 0"),
+        "{error}"
+    );
+}
+
+/// A manifest still stored flat at stamp 11 opens and reads as it is, and its
+/// next publish rewrites it packed at stamp 12 with the same state; the
+/// pre-conversion version keeps its flat shape for time travel.
+#[tokio::test]
+async fn stamp_11_manifest_converts_on_its_next_publish() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let mut born = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(super::migrations::read_stamp(&born), Some(12));
+    let at_birth = logical_view(&born).await;
+
+    super::migrations::restamp_flat_for_test(&mut born, 11)
+        .await
+        .unwrap();
+    assert_eq!(super::migrations::read_stamp(&born), Some(11));
+    let flat = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(super::migrations::read_stamp(&flat), Some(11));
+    assert!(flat.schema().field("location").is_some());
+    assert!(flat.schema().field("base_objects").is_some());
+    let flat_version = flat.version().version;
+    assert_eq!(logical_view(&flat).await, at_birth);
+
+    let live_rows = read_publish_scan(&flat).await.unwrap().live_rows;
+    let empty_pending = live_rows[0].slice(0, 0);
+    let converted = super::commit::overwrite(flat, empty_pending, live_rows)
+        .await
+        .unwrap();
+    assert_eq!(super::migrations::read_stamp(&converted), Some(12));
+    assert!(
+        converted.manifest().uses_stable_row_ids(),
+        "the conversion overwrite must keep the stable row ids genesis enables"
+    );
+    let names: Vec<_> = converted
+        .schema()
+        .fields
+        .iter()
+        .map(|f| f.name.clone())
+        .collect();
+    assert_eq!(names, ["object_id", "object_type", "record"]);
+    let fragments = converted.get_fragments();
+    let file = &fragments[0].metadata().files[0];
+    assert_eq!(
+        file.column_indices.len(),
+        3,
+        "the packed record is one physical column beside `object_id` and `object_type`: {:?}",
+        file.column_indices
+    );
+    assert_eq!(logical_view(&converted).await, at_birth);
+
+    let historical = converted.checkout_version(flat_version).await.unwrap();
+    assert_eq!(super::migrations::read_stamp(&historical), Some(11));
+    assert!(historical.schema().field("base_objects").is_some());
+    assert_eq!(logical_view(&historical).await, at_birth);
+}
+
+/// What a reader projects out of a `__manifest` version through either stored shape: the
+/// `ManifestState` entries (as `Debug` text: `DatasetEntry` has no `PartialEq`) and heads, and
+/// the lineage scan's commits and heads; not the dataset version, which every rewrite changes.
+async fn logical_view(
+    dataset: &lance::Dataset,
+) -> (
+    String,
+    HashMap<String, String>,
+    Vec<GraphLineageRow>,
+    HashMap<String, String>,
+) {
+    let state = super::state::read_manifest_state(dataset).await.unwrap();
+    let (commits, heads) = read_graph_lineage(dataset).await.unwrap();
+    (
+        format!("{:?}", state.entries),
+        state.graph_heads,
+        commits,
+        heads,
+    )
 }

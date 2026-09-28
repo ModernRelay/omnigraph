@@ -836,7 +836,7 @@ fn current_binary_reports_already_current_on_a_fresh_graph() {
     ] {
         let report = support::parse_stdout_json(&output_success(cli().args(&args)));
         assert_eq!(report["outcome"], "already_current", "{args:?}");
-        assert_eq!(report["observed_format"], 11, "{args:?}");
+        assert_eq!(report["observed_format"], 12, "{args:?}");
     }
 
     for lower in ["7", "8", "10"] {
@@ -1841,9 +1841,25 @@ query vectors($q: Vector(4)) {
     output_success(cli().args([
         "mutate", "revise", "--query", query_path, "--store", uri, "--branch", "review",
     ]));
+    let stamp_of = |branch: &str| {
+        support::parse_stdout_json(&output_success(
+            cli().args(["snapshot", uri, "--branch", branch, "--json"]),
+        ))["internal_schema_version"]
+            .clone()
+    };
+    assert_eq!(
+        (stamp_of("review"), stamp_of("main")),
+        (serde_json::json!(12), serde_json::json!(11)),
+        "the genuine v11 graph converts branch by branch: the published branch is v12, the idle one v11"
+    );
     output_success(cli().args([
         "branch", "merge", "review", "--into", "main", "--store", uri, "--json",
     ]));
+    assert_eq!(
+        stamp_of("main"),
+        serde_json::json!(12),
+        "the merge is main's publish, so main converts too"
+    );
     let merged = current_query("--branch", "main", "docs");
     assert!(merged.as_array().unwrap().iter().any(
         |row| row["d.slug"] == "dl-basics" && row["d.body"] == "written after storage upgrade"

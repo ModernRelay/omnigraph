@@ -2838,6 +2838,7 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "db/manifest.rs: omnigraph_catalog::DatasetEntry",
     "db/manifest.rs: omnigraph_catalog::DatasetUpdate",
     "db/manifest.rs: omnigraph_catalog::INTERNAL_MANIFEST_SCHEMA_VERSION",
+    "db/manifest.rs: omnigraph_catalog::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION",
     "db/manifest.rs: omnigraph_catalog::READ_REFRESH_POST_STATE_PRE_LINEAGE",
     "error.rs: omnigraph_core::error::ManifestConflictDetails",
     "error.rs: omnigraph_core::error::ManifestError",
