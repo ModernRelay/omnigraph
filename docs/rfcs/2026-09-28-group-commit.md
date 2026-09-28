@@ -82,7 +82,7 @@ RustFS behind toxiproxy adding about 30 ms per round trip.
 | | Local | +30 ms |
 |---|---|---|
 | One writer on one branch | 31.7 commits/s | 0.87 commits/s |
-| Eight writers on one branch, PR #783 | 25.5 | 0.40 |
+| Eight writers on one branch, PR #783 | 20–25 | 0.40 |
 | Branch-gate hold for one commit | 7.3 ms | 670 ms |
 | of which revalidation / detached commit / publication | 0.6 / 1.1 / 5.6 ms | 298 / 85 / 284 ms |
 | Failed revalidations per publication, eight writers | 6.6 | 2.9 |
@@ -93,8 +93,10 @@ branch therefore cannot exceed one writer. At +30 ms each failed attempt
 holds the gate for about 300 ms before giving up, about 19 s of a 30 s
 window, which is more than the successful writes used. Failing faster from
 the handle's in-memory view was prototyped and measured. It raised the
-+30 ms rate from 0.40 to 0.53 commits/s, lowered the local rate, and left
-the ceiling where it was. Issue #784 is the same mechanism seen from the
++30 ms rate from 0.40 to 0.53 commits/s, gave nothing locally, and left the
+ceiling where it was. The local one-branch cell drifts by about 20% between
+sessions. Interleaved reruns put `main`, PR #783 and a diagnostic build all
+at 20–25 commits/s, so only same-session comparisons count. Issue #784 is the same mechanism seen from the
 writers' side: at +30 ms one writer makes all twelve commits of each run.
 
 ### What a batch buys
