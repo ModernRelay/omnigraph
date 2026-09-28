@@ -38,6 +38,19 @@ struct Observations {
     lifecycle: Option<[std::sync::Arc<std::sync::atomic::AtomicU64>; 2]>,
 }
 
+/// Whether this task runs under the DST runner, whose replay evidence and
+/// seam crossings a second, unrecorded query would perturb.
+pub(crate) fn active() -> bool {
+    #[cfg(tokio_unstable)]
+    {
+        DECORATION.try_with(|_| ()).is_ok()
+    }
+    #[cfg(not(tokio_unstable))]
+    {
+        false
+    }
+}
+
 pub(crate) fn observe(value: impl FnOnce() -> String) {
     OBSERVATIONS
         .try_with(|events| {
@@ -283,7 +296,7 @@ struct Input {
     environment: Environment,
     seed: Option<u64>,
     effective_settings: settings::EffectiveSettings,
-    #[serde(default, skip_serializing_if = "is_v1")]
+    #[serde(default)]
     engine: Engine,
     bless: bool,
     /// `--measure`: the DST worker records every store request per step.
@@ -292,10 +305,6 @@ struct Input {
     /// The latency model of a `--measure` run, by name; empty when not measuring.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     model: String,
-}
-
-fn is_v1(engine: &Engine) -> bool {
-    *engine == Engine::V1
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]

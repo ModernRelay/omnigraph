@@ -71,10 +71,10 @@ refuses startup; no default is substituted.
 
 | Name | Type and values | Default | Scope | Process default variable | What it chooses |
 |---|---|---|---|---|---|
-| `engine` | enum `v1`, `v2` | `v1` | request | `OMNIGRAPH_ENGINE` | whether a read query runs through engine version 2, the plan runner; this setting does not change change-feed or merge execution |
+| `engine` | enum `v2` | `v2` | request | `OMNIGRAPH_ENGINE` | the engine a read query runs on; `v2`, the plan runner, is the only value, and `v1` is refused as an unknown value; this setting does not change change-feed or merge execution |
 | `rrf_plan` | enum `auto`, `force_prefilter`, `force_postfilter` | `auto` | process | `OMNIGRAPH_RRF_PLAN` | the reciprocal rank fusion plan on a traversal-constrained `nearest`, for diagnosis |
 | `merge_lineage` | enum `off`, `on`, `verify` | `on` (a debug build defaults to `verify`) | request | `OMNIGRAPH_MERGE_LINEAGE` | how a merge finds the entities it classifies: the full-scan walk, the lineage path, or both compared |
-| `ann_nprobes` | integer, at least `0` | `20` | request | `OMNIGRAPH_ANN_NPROBES` | the partition cap per index delta of a `nearest` scan; `0` is no cap; on `engine = v1` the setting is read at execution and no plan records it |
+| `ann_nprobes` | integer, at least `0` | `20` | request | `OMNIGRAPH_ANN_NPROBES` | the partition cap per index delta of a `nearest` scan; `0` is no cap |
 | `stage_write_concurrency` | integer `1..=64` | `8` | process | `OMNIGRAPH_LOAD_CONCURRENCY` | the width of the staged-write fan-out for `load` and `mutate` |
 
 A name outside the table, a value of the wrong type, and a value outside the

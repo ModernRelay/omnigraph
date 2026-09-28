@@ -1,7 +1,6 @@
-//! v2's copy of v1's graph operators: the expand family with its mode
-//! choice and ID emission, the anti-join arms, the RRF fusion, and the
-//! handles (`GraphIndexHandle`, `EmbeddingResolver`) the doors build for
-//! the v2 route (phase 4). Copied, never referenced.
+//! The graph operators: the expand family with its mode choice and ID
+//! emission, the anti-join arms, the RRF fusion, and the handles
+//! (`GraphIndexHandle`, `EmbeddingResolver`) the doors build.
 
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;

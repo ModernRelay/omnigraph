@@ -1,0 +1,83 @@
+# issue: none
+# notes: Hop ranges on the chain A->B->C->D: {1,3} reaches B, C and D, {2,3} skips the first
+# notes: hop, {2,2} keeps only C. Replaces the Rust tests variable_hops_1_to_3,
+# notes: variable_hops_2_to_3 and variable_hops_exact_2 (traversal.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"A"}}
+{"type":"Person","data":{"name":"B"}}
+{"type":"Person","data":{"name":"C"}}
+{"type":"Person","data":{"name":"D"}}
+{"edge":"Knows","from":"A","to":"B"}
+{"edge":"Knows","from":"B","to":"C"}
+{"edge":"Knows","from":"C","to":"D"}
+
+--- query
+query reachable($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows{1,3} $f
+    }
+    return { $f.name }
+}
+
+--- params
+{"name": "A"}
+
+--- expect unordered
+{"f.name": "B"}
+{"f.name": "C"}
+{"f.name": "D"}
+
+--- expect shape
+f.name: String
+
+--- query
+query far_reachable($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows{2,3} $f
+    }
+    return { $f.name }
+}
+
+--- params
+{"name": "A"}
+
+--- expect unordered
+{"f.name": "C"}
+{"f.name": "D"}
+
+--- expect shape
+f.name: String
+
+--- query
+query exactly_2($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows{2,2} $f
+    }
+    return { $f.name }
+}
+
+--- params
+{"name": "A"}
+
+--- expect unordered
+{"f.name": "C"}
+
+--- expect shape
+f.name: String

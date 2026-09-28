@@ -1,0 +1,111 @@
+# issue: none
+# notes: `order { $p.age asc }` and the comparison filters `<`, `>=`, `<=` and `!=` on a
+# notes: property. Replaces the Rust tests ordering_ascending, filter_less_than,
+# notes: filter_greater_equal, filter_less_equal and filter_not_equal (traversal.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32?
+}
+
+--- seed
+{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob","age":25}}
+{"type":"Person","data":{"name":"Charlie","age":35}}
+{"type":"Person","data":{"name":"Diana","age":28}}
+
+--- query
+query by_age_asc() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+    order { $p.age asc }
+}
+
+--- expect ordered
+{"p.name": "Bob", "p.age": 25}
+{"p.name": "Diana", "p.age": 28}
+{"p.name": "Alice", "p.age": 30}
+{"p.name": "Charlie", "p.age": 35}
+
+--- expect shape
+p.name: String
+p.age: I32?
+
+--- query
+query young($age: I32) {
+    match {
+        $p: Person
+        $p.age < $age
+    }
+    return { $p.name, $p.age }
+    order { $p.age asc }
+}
+
+--- params
+{"age": 28}
+
+--- expect ordered
+{"p.name": "Bob", "p.age": 25}
+
+--- expect shape
+p.name: String
+p.age: I32?
+
+--- query
+query at_least_30() {
+    match {
+        $p: Person
+        $p.age >= 30
+    }
+    return { $p.name }
+    order { $p.age asc }
+}
+
+--- expect ordered
+{"p.name": "Alice"}
+{"p.name": "Charlie"}
+
+--- expect shape
+p.name: String
+
+--- query
+query at_most_28() {
+    match {
+        $p: Person
+        $p.age <= 28
+    }
+    return { $p.name }
+    order { $p.age asc }
+}
+
+--- expect ordered
+{"p.name": "Bob"}
+{"p.name": "Diana"}
+
+--- expect shape
+p.name: String
+
+--- query
+query not_alice() {
+    match {
+        $p: Person
+        $p.name != "Alice"
+    }
+    return { $p.name }
+    order { $p.name asc }
+}
+
+--- expect ordered
+{"p.name": "Bob"}
+{"p.name": "Charlie"}
+{"p.name": "Diana"}
+
+--- expect shape
+p.name: String

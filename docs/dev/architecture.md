@@ -90,6 +90,7 @@ alias is reused. See [invariants.md](invariants.md) and
 | `omnigraph-cli` | Operator commands, target resolution, output, embedded/remote dispatch, and local credential selection. |
 | `omnigraph-server` | HTTP authentication, read authorization, admission control, routing, OpenAPI, and multi-graph serving. |
 | `omnigraph-azure-admission` | Azure deployment wrapper that admits one mutation-capable server process through the root-derived Blob lease. It is not a storage backend. |
+| `omnigraph-reference-engine` | Engine v1, frozen (`publish = false`, hash-pinned by its `tests/frozen.rs`): the reference executor a GQT step's `--- expect same as v1` compares engine v2 against. It depends only on `omnigraph-compiler`, `omnigraph-core`, `omnigraph-catalog` and third-party crates; `omnigraph-gqt` is the only crate that may depend on it (`forbidden_apis.rs` guards both), and no production door reaches it. |
 
 ## Principal flows
 

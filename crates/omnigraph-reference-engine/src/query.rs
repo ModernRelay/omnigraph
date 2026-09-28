@@ -1,44 +1,15 @@
 use super::*;
 
 use super::projection::{
-    apply_filter, apply_ordering, evaluate_expr, project_return, projections_have_aggregates,
+    apply_filter, apply_ordering, project_return, projections_have_aggregates,
 };
-use crate::engine::{SubqueryAggregate, absorb_inner_batches};
 use omnigraph_compiler::ir::SubqueryPredicate;
 
 use crate::instrumentation::{
     RrfGateFallback, RrfGatePlan, RrfGateVerdict, record_ann_prefilter_verdict,
     record_rrf_gate_verdict,
 };
-use crate::session::Session;
 use omnigraph_compiler::settings::{RrfPlan, SessionSettings, Traversal};
-
-/// Bundles the per-handle embedding client cell with the optional injected
-/// config (RFC-012 Phase 5) so the lazy init uses the injected config when
-/// present, else `EmbeddingClient::from_env()`. Threaded through the query path
-/// in place of the bare cell, preserving laziness (a graph that never embeds
-/// builds no client and needs no key).
-pub(crate) struct EmbeddingResolver<'a> {
-    cell: &'a tokio::sync::OnceCell<EmbeddingClient>,
-    config: Option<&'a crate::embedding::EmbeddingConfig>,
-}
-
-impl EmbeddingResolver<'_> {
-    async fn resolve(&self) -> Result<&EmbeddingClient> {
-        let config = self.config.cloned();
-        self.cell
-            .get_or_try_init(|| async move {
-                match config {
-                    Some(cfg) => EmbeddingClient::new(cfg),
-                    None => EmbeddingClient::from_env(),
-                }
-            })
-            .await
-    }
-}
-
-#[path = "query_doors.rs"]
-mod doors;
 
 // ─── Search mode ─────────────────────────────────────────────────────────────
 
@@ -232,8 +203,6 @@ fn bm25_scan_limit(ir: &QueryIR) -> Option<usize> {
 async fn extract_search_mode(
     ir: &QueryIR,
     params: &ParamMap,
-    catalog: &Catalog,
-    embedding: &EmbeddingResolver<'_>,
     settings: &SessionSettings,
 ) -> Result<SearchMode> {
     if ir.order_by.is_empty() {
@@ -246,10 +215,7 @@ async fn extract_search_mode(
             property,
             query,
         } => {
-            let vec = resolve_nearest_query_vec(
-                ir, catalog, variable, property, query, params, embedding,
-            )
-            .await?;
+            let vec = resolve_nearest_query_vec(query, params)?;
             let k = usize::try_from(ir.limit.ok_or_else(|| {
                 OmniError::manifest("nearest() ordering requires a limit clause".to_string())
             })?)
@@ -296,11 +262,8 @@ async fn extract_search_mode(
                 .map(|k| u32::try_from(k).unwrap_or(u32::MAX))
                 .unwrap_or(60);
 
-            let primary_mode =
-                extract_sub_search_mode(ir, primary, params, catalog, embedding, settings).await?;
-            let secondary_mode =
-                extract_sub_search_mode(ir, secondary, params, catalog, embedding, settings)
-                    .await?;
+            let primary_mode = extract_sub_search_mode(ir, primary, params, settings)?;
+            let secondary_mode = extract_sub_search_mode(ir, secondary, params, settings)?;
 
             Ok(SearchMode {
                 rrf: Some(RrfMode {
@@ -317,12 +280,10 @@ async fn extract_search_mode(
 }
 
 /// Extract a sub-search mode from a nested RRF expression (nearest or bm25).
-async fn extract_sub_search_mode(
+fn extract_sub_search_mode(
     ir: &QueryIR,
     expr: &IRExpr,
     params: &ParamMap,
-    catalog: &Catalog,
-    embedding: &EmbeddingResolver<'_>,
     settings: &SessionSettings,
 ) -> Result<SearchMode> {
     match expr {
@@ -331,10 +292,7 @@ async fn extract_sub_search_mode(
             property,
             query,
         } => {
-            let vec = resolve_nearest_query_vec(
-                ir, catalog, variable, property, query, params, embedding,
-            )
-            .await?;
+            let vec = resolve_nearest_query_vec(query, params)?;
             let k = ir
                 .limit
                 .map(|rows| usize::try_from(rows).unwrap_or(usize::MAX))
@@ -376,42 +334,11 @@ async fn extract_sub_search_mode(
 }
 
 /// Resolve an expression to a nearest() query vector.
-async fn resolve_nearest_query_vec(
-    ir: &QueryIR,
-    catalog: &Catalog,
-    variable: &str,
-    property: &str,
-    expr: &IRExpr,
-    params: &ParamMap,
-    embedding: &EmbeddingResolver<'_>,
-) -> Result<Vec<f32>> {
+fn resolve_nearest_query_vec(expr: &IRExpr, params: &ParamMap) -> Result<Vec<f32>> {
     let lit = resolve_literal_or_param(expr, params)?;
     match lit {
         Literal::List(_) => literal_to_f32_vec(&lit),
-        Literal::String(text) => {
-            let (expected_dim, recorded_model) =
-                nearest_property_dim_and_model(ir, catalog, variable, property)?;
-            // Lazily resolve the per-handle client once, then reuse it across
-            // queries (keeps the provider connection pool warm); a graph that
-            // never embeds never builds a client and needs no provider key.
-            let client = embedding.resolve().await?;
-            // Same-space guarantee: if the property recorded the model that
-            // produced its stored vectors (`@embed("…", model="…")`), the query
-            // embedder must resolve to that same model — otherwise the comparison
-            // is across vector spaces. Reject loudly instead of ranking garbage.
-            if let Some(recorded) = &recorded_model {
-                let resolved = &client.config().model;
-                if resolved != recorded {
-                    return Err(OmniError::manifest(format!(
-                        "nearest() on '{property}': its stored vectors were embedded with model \
-                         '{recorded}', but the query embedder resolves to '{resolved}'. Set \
-                         OMNIGRAPH_EMBED_MODEL='{recorded}' (and the matching provider) or re-embed \
-                         the stored vectors."
-                    )));
-                }
-            }
-            client.embed_query_text(&text, expected_dim).await
-        }
+        Literal::String(_) => Err(crate::gate::V1Refusal::StringNearest.error()),
         _ => Err(OmniError::manifest(
             "nearest query must be a string or list of floats".to_string(),
         )),
@@ -452,48 +379,6 @@ fn literal_to_f32_vec(lit: &Literal) -> Result<Vec<f32>> {
     }
 }
 
-/// Resolve the nearest() target property's vector dimension and the embedding
-/// model recorded for it via `@embed("…", model="…")` (`None` if unrecorded).
-fn nearest_property_dim_and_model(
-    ir: &QueryIR,
-    catalog: &Catalog,
-    variable: &str,
-    property: &str,
-) -> Result<(usize, Option<String>)> {
-    let type_name = resolve_binding_type_name(&ir.pipeline, variable).ok_or_else(|| {
-        OmniError::manifest_internal(format!(
-            "nearest() variable '${}' is not bound to a node type in the lowered pipeline",
-            variable
-        ))
-    })?;
-    let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
-        OmniError::manifest_internal(format!(
-            "nearest() binding '${}' resolved unknown node type '{}'",
-            variable, type_name
-        ))
-    })?;
-    let prop = node_type.properties.get(property).ok_or_else(|| {
-        OmniError::manifest_internal(format!(
-            "nearest() property '{}.{}' is missing from the catalog",
-            type_name, property
-        ))
-    })?;
-    let dim = match prop.scalar {
-        ScalarType::Vector(dim) if !prop.list => dim as usize,
-        _ => {
-            return Err(OmniError::manifest_internal(format!(
-                "nearest() property '{}.{}' is not a scalar vector",
-                type_name, property
-            )));
-        }
-    };
-    let recorded_model = node_type
-        .embed_sources
-        .get(property)
-        .and_then(|embed| embed.model.clone());
-    Ok((dim, recorded_model))
-}
-
 fn resolve_binding_type_name<'a>(pipeline: &'a [IROp], variable: &str) -> Option<&'a str> {
     for op in pipeline {
         match op {
@@ -518,7 +403,7 @@ fn resolve_binding_type_name<'a>(pipeline: &'a [IROp], variable: &str) -> Option
 
 /// A value bound through the Rust `ParamMap` API skips the JSON param arm: refuse
 /// a time-bearing `Date` string, and a non-`Date` literal on a `Date` parameter.
-pub(super) fn check_param_date_literals(
+fn check_param_date_literals(
     params: &ParamMap,
     declared: &[omnigraph_compiler::query::ast::Param],
 ) -> Result<()> {
@@ -566,7 +451,6 @@ pub async fn execute_query(
     snapshot: &Snapshot,
     graph_index: &GraphIndexHandle<'_>,
     catalog: &Catalog,
-    embedding: &EmbeddingResolver<'_>,
     settings: &SessionSettings,
 ) -> Result<QueryResult> {
     check_param_date_literals(params, &ir.params)?;
@@ -587,7 +471,7 @@ pub async fn execute_query(
     }
     let params = resolved_params.as_ref().unwrap_or(params);
 
-    let search_mode = extract_search_mode(ir, params, catalog, embedding, settings).await?;
+    let search_mode = extract_search_mode(ir, params, settings).await?;
 
     // Every large future awaited here is boxed: this function's state is
     // inline in its callers' (a `block_on` body in tests puts it on the 2 MiB
@@ -2203,7 +2087,7 @@ fn execute_pipeline<'a>(
 /// relationship, … table), the cause of the cross-edge-join hang. Empty when the
 /// only traversal is an `AntiJoin` with no inner `Expand` — that shape never asks
 /// the handle for an index, so an empty build is never realized.
-fn referenced_edge_types(
+pub(crate) fn referenced_edge_types(
     pipeline: &[IROp],
     catalog: &Catalog,
 ) -> HashMap<String, (String, String)> {
@@ -2239,10 +2123,8 @@ fn collect_referenced_edge_names(pipeline: &[IROp], out: &mut std::collections::
 /// Lazily provides the in-memory CSR graph index, building it on first use and
 /// memoizing for the rest of the query. Indexed-mode Expand never asks for it,
 /// so a query that is entirely index-served and has no AntiJoin never pays the
-/// O(|E|) CSR build (the whole point of the indexed path). The `Cached` builder
-/// also reuses the cross-query `RuntimeCache` entry; `Direct` builds against an
-/// arbitrary snapshot (time-travel reads); `None` is for queries with no
-/// traversal at all.
+/// O(|E|) CSR build (the whole point of the indexed path). `Direct` builds
+/// against the snapshot; `None` is for queries with no traversal at all.
 pub struct GraphIndexHandle<'a> {
     cell: tokio::sync::OnceCell<Option<Arc<GraphIndex>>>,
     builder: GraphIndexBuilder<'a>,
@@ -2250,12 +2132,6 @@ pub struct GraphIndexHandle<'a> {
 
 enum GraphIndexBuilder<'a> {
     None,
-    Cached(
-        &'a Omnigraph,
-        &'a crate::db::ResolvedTarget,
-        HashMap<String, (String, String)>,
-        SystemColumns,
-    ),
     Direct(
         &'a Snapshot,
         HashMap<String, (String, String)>,
@@ -2264,26 +2140,14 @@ enum GraphIndexBuilder<'a> {
 }
 
 impl<'a> GraphIndexHandle<'a> {
-    fn none() -> Self {
+    pub(crate) fn none() -> Self {
         Self {
             cell: tokio::sync::OnceCell::new(),
             builder: GraphIndexBuilder::None,
         }
     }
 
-    fn cached(
-        db: &'a Omnigraph,
-        resolved: &'a crate::db::ResolvedTarget,
-        edge_types: HashMap<String, (String, String)>,
-        system_columns: SystemColumns,
-    ) -> Self {
-        Self {
-            cell: tokio::sync::OnceCell::new(),
-            builder: GraphIndexBuilder::Cached(db, resolved, edge_types, system_columns),
-        }
-    }
-
-    fn direct(
+    pub(crate) fn direct(
         snapshot: &'a Snapshot,
         edge_types: HashMap<String, (String, String)>,
         system_columns: SystemColumns,
@@ -2302,18 +2166,9 @@ impl<'a> GraphIndexHandle<'a> {
             .get_or_try_init(|| async {
                 match &self.builder {
                     GraphIndexBuilder::None => Ok::<Option<Arc<GraphIndex>>, OmniError>(None),
-                    GraphIndexBuilder::Cached(db, resolved, edge_types, system_columns) => {
-                        Ok(Some(
-                            db.graph_index_for_resolved(resolved, edge_types, *system_columns)
-                                .await?,
-                        ))
-                    }
-                    GraphIndexBuilder::Direct(snapshot, edge_types, system_columns) => {
-                        Ok(Some(Arc::new(
-                            GraphIndex::load_or_build(snapshot, edge_types, None, *system_columns)
-                                .await?,
-                        )))
-                    }
+                    GraphIndexBuilder::Direct(snapshot, edge_types, system_columns) => Ok(Some(
+                        Arc::new(GraphIndex::build(snapshot, edge_types, *system_columns).await?),
+                    )),
                 }
             })
             .await?;
@@ -4008,8 +3863,7 @@ fn try_bulk_anti_join_mask(
     Some(BooleanArray::from(keep_mask))
 }
 
-/// Execute a correlated block: keep the wide batch's rows whose aggregate
-/// over the inner pipeline's matches satisfies `predicate`.
+/// Execute an AntiJoin: remove rows from wide batch where the inner pipeline finds matches.
 async fn execute_anti_join(
     wide: &mut RecordBatch,
     inner_pipeline: &[IROp],
@@ -4100,16 +3954,34 @@ async fn execute_anti_join(
     )
     .await?;
 
-    let mut aggregate = SubqueryAggregate::new(predicate, params, num_rows)?;
-    let inner_batches: Vec<RecordBatch> = inner_wide.into_iter().collect();
-    absorb_inner_batches(
-        &mut aggregate,
-        &inner_batches,
-        tag_col.as_str(),
-        predicate.arg.as_ref(),
-        &|batch, arg| evaluate_expr(batch, arg, params),
-    )?;
-    let mask = aggregate.keep_mask()?;
+    // Outer rows whose tag survived have >= 1 match. A produced-but-untagged
+    // batch means the inner pipeline dropped the correlation column — fail loudly
+    // rather than silently keeping every row (which would corrupt the anti-join).
+    let mut matched: HashSet<u32> = HashSet::new();
+    if let Some(batch) = inner_wide {
+        if batch.num_rows() > 0 {
+            let tags = batch
+                .column_by_name(tag_col.as_str())
+                .ok_or_else(|| {
+                    OmniError::manifest(
+                        "anti-join inner pipeline dropped the correlation column".to_string(),
+                    )
+                })?
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| {
+                    OmniError::manifest(format!("'{}' column is not UInt32", tag_col))
+                })?;
+            for i in 0..tags.len() {
+                matched.insert(tags.value(i));
+            }
+        }
+    }
+
+    let keep_mask: Vec<bool> = (0..num_rows as u32)
+        .map(|i| !matched.contains(&i))
+        .collect();
+    let mask = BooleanArray::from(keep_mask);
     *wide = arrow_select::filter::filter_record_batch(wide, &mask)
         .map_err(OmniError::arrow_internal)?;
     Ok(())
@@ -4936,1262 +4808,4 @@ fn take_batch(batch: &RecordBatch, indices: &UInt32Array) -> Result<RecordBatch>
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(OmniError::arrow_internal)?;
     RecordBatch::try_new(batch.schema(), columns).map_err(OmniError::arrow_internal)
-}
-
-#[cfg(test)]
-mod ann_probe_budget_tests {
-    use super::{LadderStep, SearchMode, ladder_step};
-
-    #[test]
-    fn uncapping_rows_leaves_the_probe_budget_alone() {
-        let mode = SearchMode {
-            nearest: Some(("d".into(), "embedding".into(), vec![0.0], 10)),
-            ann_probe_budget: Some(7),
-            bm25_scan_limit: Some(40),
-            ..Default::default()
-        };
-
-        let retry = mode.to_uncapped();
-        assert_eq!(retry.bm25_scan_limit, None);
-        assert_eq!(retry.ann_probe_budget, Some(7));
-    }
-
-    #[test]
-    fn with_nearest_k_replaces_k_and_seeds_the_probe_cap() {
-        let mode = SearchMode {
-            nearest: Some(("d".into(), "embedding".into(), vec![0.5], 10)),
-            ann_probe_budget: Some(7),
-            ..Default::default()
-        };
-        let wider = mode.with_nearest_k(40, Some(28));
-        assert_eq!(
-            wider.nearest,
-            Some(("d".into(), "embedding".into(), vec![0.5], 40))
-        );
-        assert_eq!(wider.ann_probe_budget, Some(28));
-        let uncapped = mode.with_nearest_k(40, None);
-        assert_eq!(uncapped.ann_probe_budget, None);
-    }
-
-    #[test]
-    fn overfetch_multiplies_then_runs_one_exact_pass() {
-        use super::{NearestScanReport, OverfetchRung};
-        let scan = |k: usize, maximum: Option<usize>, dataset_rows: u64| NearestScanReport {
-            rows: k,
-            k,
-            maximum_nprobes: maximum,
-            exhausted: false,
-            dataset_rows,
-        };
-        assert_eq!(
-            super::next_overfetch_rung(1, 10, scan(10, Some(20), 2_000)),
-            Some(OverfetchRung::Wider {
-                factor: 4,
-                k: 40,
-                maximum: Some(20)
-            })
-        );
-        assert_eq!(
-            super::next_overfetch_rung(4, 10, scan(40, None, 2_000)),
-            Some(OverfetchRung::Wider {
-                factor: 16,
-                k: 160,
-                maximum: None
-            })
-        );
-        assert_eq!(
-            super::next_overfetch_rung(16, 10, scan(160, Some(80), 2_000)),
-            Some(OverfetchRung::Exact { k: 2_000 }),
-            "past the ceiling the exact pass asks for the whole type"
-        );
-        assert_eq!(
-            super::next_overfetch_rung(4, 10, scan(40, Some(80), 100)),
-            Some(OverfetchRung::Exact { k: 100 }),
-            "a rung that would ask for the whole type anyway is the exact pass"
-        );
-        assert_eq!(
-            super::next_overfetch_rung(1, 160, scan(160, Some(20), 160)),
-            None,
-            "a full scan that asked for exactly the whole type returned every row"
-        );
-    }
-
-    #[test]
-    fn probe_ladder_multiplies_then_uncaps() {
-        assert_eq!(super::next_probe_budget(20, 1_000), Some(80));
-        assert_eq!(super::next_probe_budget(80, 1_000), Some(320));
-        assert_eq!(super::next_probe_budget(320, 1_000), None);
-        assert_eq!(super::next_probe_budget(20, 60), None);
-        assert_eq!(super::next_probe_budget(1, 100), Some(4));
-    }
-
-    const IVF_SHORT: Option<(Option<u64>, Option<u64>)> = Some((Some(1), Some(1_000)));
-
-    #[test]
-    fn ladder_rescans_flat_on_an_infinite_distance_before_every_other_stop() {
-        assert_eq!(
-            ladder_step(10, 10, Some(10), Some(10), true, IVF_SHORT, None, None),
-            LadderStep::FlatRescan
-        );
-        assert_eq!(
-            ladder_step(3, 10, None, None, true, Some((None, None)), Some(20), None),
-            LadderStep::FlatRescan
-        );
-    }
-
-    #[test]
-    fn ladder_stops_without_a_cap() {
-        assert_eq!(
-            ladder_step(3, 10, None, None, false, IVF_SHORT, None, None),
-            LadderStep::Stop
-        );
-    }
-
-    #[test]
-    fn ladder_stops_when_the_scan_is_full() {
-        assert_eq!(
-            ladder_step(10, 10, None, None, false, IVF_SHORT, Some(20), None),
-            LadderStep::Stop
-        );
-    }
-
-    #[test]
-    fn ladder_stops_when_every_known_match_is_here() {
-        assert_eq!(
-            ladder_step(5, 10, Some(5), None, false, IVF_SHORT, Some(20), None),
-            LadderStep::Stop
-        );
-        assert_eq!(
-            ladder_step(4, 10, Some(5), None, false, IVF_SHORT, Some(20), None),
-            LadderStep::Rescan(80)
-        );
-    }
-
-    #[test]
-    fn ladder_stops_when_the_scan_holds_the_whole_dataset() {
-        assert_eq!(
-            ladder_step(7, 10, None, Some(7), false, IVF_SHORT, Some(20), None),
-            LadderStep::Stop
-        );
-        assert_eq!(
-            ladder_step(7, 10, None, Some(8), false, IVF_SHORT, Some(20), None),
-            LadderStep::Rescan(80)
-        );
-    }
-
-    #[test]
-    fn ladder_treats_a_summary_with_neither_counter_as_a_flat_scan() {
-        assert_eq!(
-            ladder_step(3, 10, None, None, false, Some((None, None)), Some(20), None),
-            LadderStep::Stop
-        );
-    }
-
-    #[test]
-    fn ladder_fails_closed_without_both_counters() {
-        for summary in [None, Some((Some(1), None)), Some((None, Some(8)))] {
-            assert_eq!(
-                ladder_step(3, 10, None, None, false, summary, Some(20), None),
-                LadderStep::RescanUncapped {
-                    summary_missing: true
-                },
-                "summary {summary:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn ladder_stops_when_every_ranked_partition_was_searched() {
-        for summary in [Some((Some(8), Some(8))), Some((Some(9), Some(8)))] {
-            assert_eq!(
-                ladder_step(3, 10, None, None, false, summary, Some(20), None),
-                LadderStep::Stop,
-                "summary {summary:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn ladder_stops_when_widening_changed_nothing() {
-        assert_eq!(
-            ladder_step(3, 10, None, None, false, IVF_SHORT, Some(80), Some((3, 1))),
-            LadderStep::Stop
-        );
-        assert_eq!(
-            ladder_step(3, 10, None, None, false, IVF_SHORT, Some(80), Some((3, 0))),
-            LadderStep::Rescan(320)
-        );
-        assert_eq!(
-            ladder_step(3, 10, None, None, false, IVF_SHORT, Some(80), Some((2, 1))),
-            LadderStep::Rescan(320)
-        );
-    }
-
-    #[test]
-    fn ladder_climbs_then_uncaps() {
-        assert_eq!(
-            ladder_step(3, 10, None, None, false, IVF_SHORT, Some(20), None),
-            LadderStep::Rescan(80)
-        );
-        assert_eq!(
-            ladder_step(3, 10, None, None, false, IVF_SHORT, Some(320), None),
-            LadderStep::RescanUncapped {
-                summary_missing: false
-            }
-        );
-        assert_eq!(
-            ladder_step(
-                3,
-                10,
-                None,
-                None,
-                false,
-                Some((Some(1), Some(60))),
-                Some(20),
-                None
-            ),
-            LadderStep::RescanUncapped {
-                summary_missing: false
-            }
-        );
-    }
-}
-
-#[cfg(test)]
-mod expand_chooser_tests {
-    use super::*;
-    use crate::table_store::IndexCoverage;
-
-    /// Build cost inputs with generous hard caps, so the cost comparison (not a
-    /// ceiling) is what the assertions exercise unless a test sets one on purpose.
-    fn inputs(
-        frontier_rows: usize,
-        edge_count: u64,
-        src_node_count: u64,
-        effective_max_hops: u32,
-        coverage: IndexCoverage,
-    ) -> ExpandCostInputs {
-        ExpandCostInputs {
-            frontier_rows,
-            edge_count,
-            src_node_count,
-            effective_max_hops,
-            max_hops_cap: 6,
-            max_frontier_cap: 1024,
-            coverage,
-            csr_cached: false,
-            probe_factor: 1.0,
-        }
-    }
-
-    #[test]
-    fn undirected_probe_factor_doubles_indexed_cost() {
-        // A directed traversal just under the crossover stays indexed (1 hop ×
-        // frontier 100 × fanout 10 = 1,000 < 1.5·|E| = 1,500); the SAME
-        // cardinalities traversed undirected pay both endpoint probes per hop
-        // (2,000 > 1,500) and flip to CSR. Guards against pricing an
-        // undirected traversal at half its probe count.
-        let mut i = inputs(100, 1_000, 100, 1, IndexCoverage::Indexed);
-        assert_eq!(choose_expand_mode(&i), ExpandMode::IndexedScan);
-        i.probe_factor = 2.0;
-        assert_eq!(choose_expand_mode(&i), ExpandMode::Csr);
-    }
-
-    #[test]
-    fn hop_policy_switches_on_observed_frontier_over_cap() {
-        // The hard ceiling becomes an execution bound: observed 2000 > 1024
-        // switches regardless of the cost estimate.
-        let i = inputs(1, 10_000_000, 1_000_000, 4, IndexCoverage::Indexed);
-        assert!(should_switch_to_csr(2000, 100, 2, false, &i));
-    }
-
-    #[test]
-    fn hop_policy_switches_on_projected_growth() {
-        // The #533 shape at IMDb scale: an UNDIRECTED traversal (probe factor
-        // 2, like `<coStarredWith>`), fanout ≈ 6.5, observed hop-2 frontier 238
-        // growing from 1. Observed growth 238× saturates the projection at |V|
-        // within a hop; the remaining 3 hops (~2×2.9M units) dwarf the CSR
-        // build (~3.75M) — the switch fires at hop 2, one hop before the hard
-        // ceiling would catch it. (The directed variant stays under the build
-        // cost at hop 2 and is caught by the ceiling at hop 3 instead —
-        // layered, both covered below.)
-        let mut i = inputs(1, 2_500_000, 388_000, 4, IndexCoverage::Indexed);
-        i.probe_factor = 2.0;
-        assert!(should_switch_to_csr(238, 1, 3, false, &i));
-
-        // Directed at hop 2: projection (~2.9M) is under the build cost — no
-        // switch yet…
-        i.probe_factor = 1.0;
-        assert!(!should_switch_to_csr(238, 1, 3, false, &i));
-        // …but hop 3's observed frontier (5,418) crosses the 1024 ceiling,
-        // which the policy enforces as an execution bound.
-        assert!(should_switch_to_csr(5_418, 238, 2, false, &i));
-    }
-
-    #[test]
-    fn hop_policy_keeps_genuinely_selective_traversals_indexed() {
-        // A frontier that stays tiny relative to |V| never switches: observed
-        // growth ~2× on a 1M-node graph, 2 remaining hops, ~thousands of
-        // scans vs a 15M-unit build.
-        let i = inputs(1, 10_000_000, 1_000_000, 4, IndexCoverage::Indexed);
-        assert!(!should_switch_to_csr(40, 20, 2, false, &i));
-    }
-
-    #[test]
-    fn hop_policy_switches_cheaply_onto_a_warm_csr() {
-        // With the CSR already built this query, any nonzero remaining indexed
-        // work loses to ~free reuse.
-        let i = inputs(1, 10_000_000, 1_000_000, 4, IndexCoverage::Indexed);
-        assert!(should_switch_to_csr(40, 20, 2, true, &i));
-    }
-
-    #[test]
-    fn hop_policy_growth_projection_saturates_at_source_count() {
-        // Explosive observed growth must not project past |V_src|: with
-        // saturation the 3-hop estimate is ~3·|V|·fanout; the switch verdict
-        // holds but the estimate stays finite and comparable.
-        let i = inputs(1, 1_000_000, 1_000, 4, IndexCoverage::Indexed);
-        // observed 900 from 1 → growth 900×; |V| = 1000 caps each later hop.
-        assert!(should_switch_to_csr(900, 1, 3, false, &i));
-    }
-
-    #[test]
-    fn selective_frontier_on_large_graph_picks_indexed() {
-        // 50 source rows against 1M source vertices, one hop: tiny selectivity —
-        // the PR #149 win the chooser must preserve.
-        let m = choose_expand_mode(&inputs(
-            50,
-            10_000_000,
-            1_000_000,
-            1,
-            IndexCoverage::Indexed,
-        ));
-        assert_eq!(m, ExpandMode::IndexedScan);
-    }
-
-    #[test]
-    fn flat_in_edge_count_same_selectivity_same_choice() {
-        // Same selectivity (frontier/|V_src|), 1000× difference in |E|. Indexed
-        // cost is independent of |E|, so the choice must not flip.
-        let small = choose_expand_mode(&inputs(50, 100_000, 1_000_000, 1, IndexCoverage::Indexed));
-        let huge = choose_expand_mode(&inputs(
-            50,
-            100_000_000,
-            1_000_000,
-            1,
-            IndexCoverage::Indexed,
-        ));
-        assert_eq!(small, ExpandMode::IndexedScan);
-        assert_eq!(huge, ExpandMode::IndexedScan);
-    }
-
-    #[test]
-    fn frontier_large_fraction_of_source_picks_csr() {
-        // hops*frontier (200) exceeds BUILD_FACTOR*|V_src| (1.5*100=150) → CSR,
-        // and 200 is below the frontier cap, so it is the cost model deciding.
-        let m = choose_expand_mode(&inputs(200, 1_000, 100, 1, IndexCoverage::Indexed));
-        assert_eq!(m, ExpandMode::Csr);
-    }
-
-    #[test]
-    fn frontier_over_hard_cap_picks_csr() {
-        // 2000 > 1024 ceiling, even though the selectivity is tiny.
-        let m = choose_expand_mode(&inputs(
-            2000,
-            10_000_000,
-            1_000_000,
-            1,
-            IndexCoverage::Indexed,
-        ));
-        assert_eq!(m, ExpandMode::Csr);
-    }
-
-    #[test]
-    fn hops_over_hard_cap_picks_csr() {
-        let m = choose_expand_mode(&inputs(
-            10,
-            10_000_000,
-            1_000_000,
-            8,
-            IndexCoverage::Indexed,
-        ));
-        assert_eq!(m, ExpandMode::Csr);
-    }
-
-    #[test]
-    fn degraded_single_hop_tiny_frontier_stays_indexed() {
-        // One full degraded scan (1*|E|) still edges out a full CSR build
-        // (1.5*|E|) for a one-off single hop.
-        let m = choose_expand_mode(&inputs(
-            5,
-            10_000,
-            10_000,
-            1,
-            IndexCoverage::Degraded {
-                reason: "no btree".into(),
-            },
-        ));
-        assert_eq!(m, ExpandMode::IndexedScan);
-    }
-
-    #[test]
-    fn degraded_multi_hop_picks_csr() {
-        // Two degraded scans (2*|E|) lose to one CSR build (1.5*|E|).
-        let m = choose_expand_mode(&inputs(
-            5,
-            10_000,
-            10_000,
-            2,
-            IndexCoverage::Degraded {
-                reason: "no btree".into(),
-            },
-        ));
-        assert_eq!(m, ExpandMode::Csr);
-    }
-
-    #[test]
-    fn warm_csr_is_always_reused() {
-        // A maximally selective traversal still prefers an already-built CSR
-        // (cost ~0) over re-scanning per hop.
-        let mut i = inputs(1, 10_000_000, 1_000_000, 1, IndexCoverage::Indexed);
-        i.csr_cached = true;
-        assert_eq!(choose_expand_mode(&i), ExpandMode::Csr);
-    }
-
-    #[test]
-    fn cost_model_caps_cross_type_hops() {
-        // Same-type passes the requested range through; cross-type caps at 1,
-        // matching execute_expand_indexed.
-        assert_eq!(cost_effective_hops(5, true), 5);
-        assert_eq!(cost_effective_hops(5, false), 1);
-        assert_eq!(cost_effective_hops(1, false), 1);
-
-        // Consequence: a selective frontier where the requested 5 hops would
-        // (wrongly) flip cross-type to CSR, but the capped 1 hop — what actually
-        // runs — keeps it indexed.
-        let mut i = inputs(
-            50,
-            10_000,
-            100,
-            cost_effective_hops(5, false),
-            IndexCoverage::Indexed,
-        );
-        assert_eq!(choose_expand_mode(&i), ExpandMode::IndexedScan);
-        i.effective_max_hops = 5; // as if the cross-type cap were not applied
-        assert_eq!(choose_expand_mode(&i), ExpandMode::Csr);
-    }
-}
-
-#[cfg(test)]
-mod referenced_edge_types_tests {
-    use super::*;
-
-    fn node_scan(var: &str, ty: &str) -> IROp {
-        IROp::NodeScan {
-            variable: var.to_string(),
-            type_name: ty.to_string(),
-            filters: Vec::new(),
-        }
-    }
-
-    fn expand(edge: &str) -> IROp {
-        IROp::Expand {
-            src_var: "a".into(),
-            dst_var: "b".into(),
-            edge_type: edge.to_string(),
-            direction: Direction::Out,
-            dst_type: "X".into(),
-            min_hops: 1,
-            max_hops: Some(1),
-            dst_filters: Vec::new(),
-            edge_binding: None,
-        }
-    }
-
-    fn names(pipeline: &[IROp]) -> Vec<String> {
-        let mut set = std::collections::BTreeSet::new();
-        collect_referenced_edge_names(pipeline, &mut set);
-        set.into_iter().collect()
-    }
-
-    #[test]
-    fn collects_a_single_expand_edge() {
-        assert_eq!(
-            names(&[node_scan("x", "ExternalID"), expand("identifiesPerson")]),
-            vec!["identifiesPerson".to_string()]
-        );
-    }
-
-    #[test]
-    fn ignores_non_traversal_ops_and_dedups() {
-        // A pipeline that touches one edge twice references exactly that one edge —
-        // never the whole catalog (the cross-edge-join hang this scoping fixes).
-        let pipeline = vec![
-            node_scan("x", "ExternalID"),
-            expand("identifiesPerson"),
-            IROp::Filter(IRExpr::comparison(
-                IRExpr::PropAccess {
-                    variable: "p".into(),
-                    property: "name".into(),
-                },
-                omnigraph_compiler::query::ast::CompOp::Eq,
-                IRExpr::Literal(Literal::String("a".into())),
-            )),
-            expand("identifiesPerson"),
-        ];
-        assert_eq!(names(&pipeline), vec!["identifiesPerson".to_string()]);
-    }
-
-    #[test]
-    fn recurses_through_anti_join_inner_pipeline() {
-        // The bulk anti-join fast path consumes the CSR for the inner Expand's
-        // edge, so its edge type must be in scope even though it is nested.
-        let pipeline = vec![
-            node_scan("p", "Person"),
-            expand("knows"),
-            IROp::AntiJoin {
-                outer_var: "p".into(),
-                inner: vec![expand("worksAt")],
-                predicate: SubqueryPredicate::not_exists(),
-            },
-        ];
-        assert_eq!(
-            names(&pipeline),
-            vec!["knows".to_string(), "worksAt".to_string()]
-        );
-    }
-
-    #[test]
-    fn recurses_through_nested_anti_joins() {
-        let pipeline = vec![IROp::AntiJoin {
-            outer_var: "p".into(),
-            inner: vec![IROp::AntiJoin {
-                outer_var: "c".into(),
-                inner: vec![expand("deepEdge")],
-                predicate: SubqueryPredicate::not_exists(),
-            }],
-            predicate: SubqueryPredicate::not_exists(),
-        }];
-        assert_eq!(names(&pipeline), vec!["deepEdge".to_string()]);
-    }
-
-    #[test]
-    fn anti_join_with_no_inner_expand_references_no_edges() {
-        // A predicate-only anti-join never asks the handle for an index, so the
-        // empty set is correct — no whole-graph build is realized.
-        let pipeline = vec![IROp::AntiJoin {
-            outer_var: "p".into(),
-            inner: vec![node_scan("c", "Company")],
-            predicate: SubqueryPredicate::not_exists(),
-        }];
-        assert!(names(&pipeline).is_empty());
-    }
-}
-
-#[cfg(test)]
-mod literal_lowering_tests {
-    use super::*;
-    use datafusion::prelude::Expr;
-    use datafusion::scalar::ScalarValue;
-
-    // With the column type known, the generic coercion types a date literal to
-    // the column's Date32/Date64 (the live pushdown path). Without a target it
-    // is the natural Utf8 fallback, which is still index-safe for dates because
-    // DataFusion casts the LITERAL, not the column (proven by
-    // `lance_surface_guards::scalar_index_use_requires_matched_literal_type`).
-    #[test]
-    fn date_literals_coerce_to_typed_arrow_scalars() {
-        use arrow_schema::DataType;
-        let dt = literal_to_expr_coerced(
-            &Literal::DateTime("2024-06-01T12:00:00Z".into()),
-            Some(&DataType::Date64),
-        )
-        .unwrap();
-        assert!(
-            matches!(dt, Expr::Literal(ScalarValue::Date64(Some(_)), ..)),
-            "DateTime vs Date64 column must coerce to a typed Date64, got {dt:?}"
-        );
-        let d =
-            literal_to_expr_coerced(&Literal::Date("2024-06-01".into()), Some(&DataType::Date32))
-                .unwrap();
-        assert!(
-            matches!(d, Expr::Literal(ScalarValue::Date32(Some(_)), ..)),
-            "Date vs Date32 column must coerce to a typed Date32, got {d:?}"
-        );
-        let nat = literal_to_expr_coerced(&Literal::Date("2024-06-01".into()), None).unwrap();
-        assert!(
-            matches!(nat, Expr::Literal(ScalarValue::Utf8(Some(_)), ..)),
-            "no target should keep the natural Utf8 date literal, got {nat:?}"
-        );
-    }
-
-    // A malformed date string makes coercion fail, so it falls back to the
-    // natural Utf8 literal rather than dropping the predicate to None.
-    #[test]
-    fn malformed_date_literal_falls_back_to_string() {
-        use arrow_schema::DataType;
-        let bad = literal_to_expr_coerced(
-            &Literal::DateTime("not-a-date".into()),
-            Some(&DataType::Date64),
-        )
-        .unwrap();
-        assert!(
-            matches!(bad, Expr::Literal(ScalarValue::Utf8(Some(_)), ..)),
-            "malformed DateTime literal should fall back to a Utf8 literal, got {bad:?}"
-        );
-    }
-
-    // With a column target, a literal lowers to the column's EXACT Arrow type
-    // (not its natural width), so DataFusion does not widen and cast the column
-    // — keeping the scalar BTREE usable. See
-    // `lance_surface_guards::scalar_index_use_requires_matched_literal_type`.
-    #[test]
-    fn integer_literal_coerces_to_narrow_column_type() {
-        use arrow_schema::DataType;
-        let i32_lit =
-            literal_to_expr_coerced(&Literal::Integer(5), Some(&DataType::Int32)).unwrap();
-        assert!(
-            matches!(i32_lit, Expr::Literal(ScalarValue::Int32(Some(5)), ..)),
-            "integer literal vs Int32 column must lower to Int32, got {i32_lit:?}"
-        );
-        let u32_lit =
-            literal_to_expr_coerced(&Literal::Integer(7), Some(&DataType::UInt32)).unwrap();
-        assert!(
-            matches!(u32_lit, Expr::Literal(ScalarValue::UInt32(Some(7)), ..)),
-            "integer literal vs UInt32 column must lower to UInt32, got {u32_lit:?}"
-        );
-    }
-
-    #[test]
-    fn float_literal_coerces_to_f32_column_type() {
-        use arrow_schema::DataType;
-        let f32_lit =
-            literal_to_expr_coerced(&Literal::Float(1.5), Some(&DataType::Float32)).unwrap();
-        assert!(
-            matches!(f32_lit, Expr::Literal(ScalarValue::Float32(Some(_)), ..)),
-            "float literal vs Float32 column must lower to Float32, got {f32_lit:?}"
-        );
-    }
-
-    // Lossless guard: a fractional float against an integer column must NOT
-    // truncate (2.7 -> 2). Fall back to the natural Float64 so the comparison
-    // stays exact (no integer equals 2.7).
-    #[test]
-    fn fractional_float_vs_int_column_falls_back_not_truncate() {
-        use arrow_schema::DataType;
-        let e = literal_to_expr_coerced(&Literal::Float(2.7), Some(&DataType::Int32)).unwrap();
-        assert!(
-            matches!(e, Expr::Literal(ScalarValue::Float64(Some(_)), ..)),
-            "fractional float vs Int32 must fall back to natural Float64, got {e:?}"
-        );
-    }
-
-    // A whole-number float IS lossless against an integer column, so it coerces.
-    #[test]
-    fn whole_float_vs_int_column_coerces() {
-        use arrow_schema::DataType;
-        let e = literal_to_expr_coerced(&Literal::Float(2.0), Some(&DataType::Int32)).unwrap();
-        assert!(
-            matches!(e, Expr::Literal(ScalarValue::Int32(Some(2)), ..)),
-            "whole-number float vs Int32 is lossless and must coerce to Int32(2), got {e:?}"
-        );
-    }
-
-    // Lossless guard: an integer literal outside the column's range must NOT
-    // overflow to null; fall back to the natural Int64 (correct via DataFusion).
-    #[test]
-    fn out_of_range_int_vs_narrow_column_falls_back() {
-        use arrow_schema::DataType;
-        let e = literal_to_expr_coerced(&Literal::Integer(3_000_000_000), Some(&DataType::Int32))
-            .unwrap();
-        assert!(
-            matches!(
-                e,
-                Expr::Literal(ScalarValue::Int64(Some(3_000_000_000)), ..)
-            ),
-            "out-of-range integer vs Int32 must fall back to natural Int64, got {e:?}"
-        );
-    }
-
-    // Float targets are exempt from the lossless guard: narrowing to the column's
-    // own precision is the correct comparison domain, even when the value is not
-    // exactly representable in F32 (0.1).
-    #[test]
-    fn float_vs_f32_column_coerces_even_when_not_exactly_representable() {
-        use arrow_schema::DataType;
-        let e = literal_to_expr_coerced(&Literal::Float(0.1), Some(&DataType::Float32)).unwrap();
-        assert!(
-            matches!(e, Expr::Literal(ScalarValue::Float32(Some(_)), ..)),
-            "float target must coerce 0.1 to Float32 (exempt from lossless guard), got {e:?}"
-        );
-    }
-
-    // No target (caller without a schema) keeps the natural width — the existing
-    // fallback, so behavior never regresses where the column type is unknown.
-    #[test]
-    fn literal_without_target_keeps_natural_width() {
-        let nat = literal_to_expr_coerced(&Literal::Integer(5), None).unwrap();
-        assert!(
-            matches!(nat, Expr::Literal(ScalarValue::Int64(Some(5)), ..)),
-            "no target should keep the natural Int64 width, got {nat:?}"
-        );
-    }
-
-    // True if either operand of a binary comparison is an Int32 literal.
-    fn binary_has_int32_literal(e: &Expr) -> bool {
-        if let Expr::BinaryExpr(b) = e {
-            [b.left.as_ref(), b.right.as_ref()]
-                .iter()
-                .any(|side| matches!(side, Expr::Literal(ScalarValue::Int32(Some(_)), ..)))
-        } else {
-            false
-        }
-    }
-
-    fn int32_schema() -> arrow_schema::Schema {
-        use arrow_schema::{DataType, Field};
-        arrow_schema::Schema::new(vec![Field::new("count", DataType::Int32, true)])
-    }
-
-    fn count_prop() -> IRExpr {
-        IRExpr::PropAccess {
-            variable: "m".into(),
-            property: "count".into(),
-        }
-    }
-
-    // Coercion is operator-independent: a range comparison's literal coerces to
-    // the column type just like equality does, so range filters on a narrow
-    // numeric column keep the BTREE.
-    #[test]
-    fn ir_filter_coerces_literal_for_range_op() {
-        let schema = int32_schema();
-        let filter = IRExpr::comparison(
-            count_prop(),
-            CompOp::Ge,
-            IRExpr::Literal(Literal::Integer(2)),
-        );
-        let expr = ir_filter_to_expr(&filter, &ParamMap::new(), Some(&schema)).unwrap();
-        assert!(
-            binary_has_int32_literal(&expr),
-            "range-op literal must coerce to the Int32 column type, got {expr:?}"
-        );
-    }
-
-    // The column may be on either side; the literal coerces to the opposite
-    // operand's column type regardless of order (`5 < count`).
-    #[test]
-    fn ir_filter_coerces_literal_when_column_is_on_the_right() {
-        let schema = int32_schema();
-        let filter = IRExpr::comparison(
-            IRExpr::Literal(Literal::Integer(2)),
-            CompOp::Lt,
-            count_prop(),
-        );
-        let expr = ir_filter_to_expr(&filter, &ParamMap::new(), Some(&schema)).unwrap();
-        assert!(
-            binary_has_int32_literal(&expr),
-            "reversed-operand literal must coerce to the Int32 column type, got {expr:?}"
-        );
-    }
-
-    // Name of the left operand's column in a binary comparison `col OP lit`.
-    fn binary_left_column_name(e: &Expr) -> Option<String> {
-        match e {
-            Expr::BinaryExpr(b) => match b.left.as_ref() {
-                Expr::Column(c) => Some(c.name.clone()),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
-    // #283: a camelCase property must reach the scan as its exact column name,
-    // not a SQL-normalized (lowercased) one. `col()` lowercases unquoted
-    // identifiers; the pushed-down column ref must stay `repoName`.
-    #[test]
-    fn ir_filter_preserves_camelcase_column_name() {
-        use arrow_schema::{DataType, Field};
-        let schema = arrow_schema::Schema::new(vec![Field::new("repoName", DataType::Utf8, true)]);
-        let filter = IRExpr::comparison(
-            IRExpr::PropAccess {
-                variable: "d".into(),
-                property: "repoName".into(),
-            },
-            CompOp::Eq,
-            IRExpr::Literal(Literal::String("acme".into())),
-        );
-        let expr = ir_filter_to_expr(&filter, &ParamMap::new(), Some(&schema)).unwrap();
-        assert_eq!(
-            binary_left_column_name(&expr).as_deref(),
-            Some("repoName"),
-            "camelCase column must be preserved (not lowercased to `reponame`), got {expr:?}"
-        );
-    }
-
-    // Index preservation: a camelCase numeric column still coerces its literal
-    // (so the scalar BTREE stays eligible) — the col→ident fix must not disturb
-    // the coercion path (which resolves the column type via field_with_name).
-    #[test]
-    fn ir_filter_coerces_literal_for_camelcase_int_column() {
-        use arrow_schema::{DataType, Field};
-        let schema =
-            arrow_schema::Schema::new(vec![Field::new("itemCount", DataType::Int32, true)]);
-        let filter = IRExpr::comparison(
-            IRExpr::PropAccess {
-                variable: "m".into(),
-                property: "itemCount".into(),
-            },
-            CompOp::Eq,
-            IRExpr::Literal(Literal::Integer(2)),
-        );
-        let expr = ir_filter_to_expr(&filter, &ParamMap::new(), Some(&schema)).unwrap();
-        assert!(
-            binary_has_int32_literal(&expr),
-            "camelCase int column must keep its coerced Int32 literal (BTREE-eligible), got {expr:?}"
-        );
-    }
-}
-
-/// Always-on unit coverage for the needed-columns walk. IO-free and
-/// parallel-safe, unlike the `#[ignore]`d byte gate in
-/// `column_projection_tests`.
-#[cfg(test)]
-mod needed_columns_tests {
-    use super::*;
-
-    fn prop(variable: &str, property: &str) -> IRExpr {
-        IRExpr::PropAccess {
-            variable: variable.to_string(),
-            property: property.to_string(),
-        }
-    }
-
-    fn ir(pipeline: Vec<IROp>, return_exprs: Vec<IRExpr>, order_by: Vec<IRExpr>) -> QueryIR {
-        QueryIR {
-            name: "t".to_string(),
-            params: vec![],
-            pipeline,
-            return_exprs: return_exprs
-                .into_iter()
-                .map(|expr| IRProjection { expr, alias: None })
-                .collect(),
-            order_by: order_by
-                .into_iter()
-                .map(|expr| IROrdering {
-                    expr,
-                    descending: false,
-                })
-                .collect(),
-            limit: None,
-        }
-    }
-
-    fn scan(variable: &str) -> IROp {
-        IROp::NodeScan {
-            variable: variable.to_string(),
-            type_name: "T".to_string(),
-            filters: vec![],
-        }
-    }
-
-    fn columns_of<'a>(needed: &'a HashMap<String, NeededColumns>, var: &str) -> &'a NeededColumns {
-        needed.get(var).expect("binding must be in the demand map")
-    }
-
-    fn assert_columns(needed: &HashMap<String, NeededColumns>, var: &str, expected: &[&str]) {
-        match columns_of(needed, var) {
-            NeededColumns::All => panic!("expected specific columns for '{var}', got All"),
-            NeededColumns::Columns(cols) => {
-                let mut got: Vec<&str> = cols.iter().map(|c| c.as_str()).collect();
-                got.sort_unstable();
-                let mut want = expected.to_vec();
-                want.sort_unstable();
-                assert_eq!(got, want, "needed columns for '{var}'");
-            }
-        }
-    }
-
-    #[test]
-    fn return_props_are_the_only_demand_for_a_plain_projection() {
-        let q = ir(vec![scan("c")], vec![prop("c", "slug")], vec![]);
-        let needed = collect_needed_columns(&q);
-        assert_columns(&needed, "c", &["slug"]);
-    }
-
-    #[test]
-    fn order_filters_and_aggregates_all_contribute() {
-        let q = ir(
-            vec![
-                scan("c"),
-                IROp::Filter(IRExpr::comparison(
-                    prop("c", "state"),
-                    CompOp::Eq,
-                    IRExpr::Literal(Literal::String("open".into())),
-                )),
-            ],
-            vec![IRExpr::Aggregate {
-                func: AggFunc::Count,
-                arg: Box::new(prop("c", "slug")),
-            }],
-            vec![prop("c", "rank")],
-        );
-        let needed = collect_needed_columns(&q);
-        assert_columns(&needed, "c", &["slug", "state", "rank"]);
-    }
-
-    #[test]
-    fn bare_variable_reference_fails_open_to_all() {
-        let q = ir(
-            vec![scan("c")],
-            vec![IRExpr::Variable("c".to_string()), prop("c", "slug")],
-            vec![],
-        );
-        let needed = collect_needed_columns(&q);
-        assert!(
-            matches!(columns_of(&needed, "c"), NeededColumns::All),
-            "a bare $var must demand the whole row regardless of other refs"
-        );
-    }
-
-    #[test]
-    fn anti_join_inner_filters_attribute_to_their_bindings() {
-        // not-exists inner pipeline referencing both an inner and the outer
-        // binding: the outer scan must still read the outer column the inner
-        // filter compares against.
-        let inner = vec![
-            scan("x"),
-            IROp::Filter(IRExpr::comparison(
-                prop("x", "kind"),
-                CompOp::Eq,
-                prop("c", "kind_ref"),
-            )),
-        ];
-        let q = ir(
-            vec![
-                scan("c"),
-                IROp::AntiJoin {
-                    outer_var: "c".to_string(),
-                    inner,
-                    predicate: SubqueryPredicate::not_exists(),
-                },
-            ],
-            vec![prop("c", "slug")],
-            vec![],
-        );
-        let needed = collect_needed_columns(&q);
-        assert_columns(&needed, "c", &["slug", "kind_ref"]);
-        assert_columns(&needed, "x", &["kind"]);
-    }
-
-    #[test]
-    fn nearest_records_the_ranked_vector_property() {
-        let q = ir(
-            vec![scan("c")],
-            vec![prop("c", "slug")],
-            vec![IRExpr::Nearest {
-                variable: "c".to_string(),
-                property: "embedding".to_string(),
-                query: Box::new(IRExpr::Param("q".to_string())),
-            }],
-        );
-        let needed = collect_needed_columns(&q);
-        assert_columns(&needed, "c", &["slug"]);
-    }
-
-    #[test]
-    fn nearest_in_a_later_ordering_position_keeps_the_plain_walk() {
-        let q = ir(
-            vec![scan("c")],
-            vec![prop("c", "slug")],
-            vec![
-                prop("c", "rank"),
-                IRExpr::Nearest {
-                    variable: "c".to_string(),
-                    property: "embedding".to_string(),
-                    query: Box::new(IRExpr::Param("q".to_string())),
-                },
-            ],
-        );
-        let needed = collect_needed_columns(&q);
-        assert_columns(&needed, "c", &["slug", "rank", "embedding"]);
-    }
-
-    #[test]
-    fn unreferenced_binding_has_no_demand_entry() {
-        // Cross-join shape: `$d` is bound but never referenced — no demand
-        // entry. `execute_node_scan` fails open to the full non-blob
-        // projection for a missing entry.
-        let q = ir(vec![scan("c"), scan("d")], vec![prop("c", "slug")], vec![]);
-        let needed = collect_needed_columns(&q);
-        assert!(needed.contains_key("c"));
-        assert!(!needed.contains_key("d"));
-    }
-
-    #[test]
-    fn expand_dst_filters_attribute_to_the_dst_binding() {
-        let q = ir(
-            vec![
-                scan("a"),
-                IROp::Expand {
-                    src_var: "a".to_string(),
-                    dst_var: "b".to_string(),
-                    edge_type: "knows".to_string(),
-                    direction: Direction::Out,
-                    dst_type: "T".to_string(),
-                    min_hops: 1,
-                    max_hops: Some(1),
-                    dst_filters: vec![IRExpr::comparison(
-                        prop("b", "state"),
-                        CompOp::Eq,
-                        IRExpr::Literal(Literal::String("open".into())),
-                    )],
-                    edge_binding: None,
-                },
-            ],
-            vec![prop("a", "slug")],
-            vec![],
-        );
-        let needed = collect_needed_columns(&q);
-        assert_columns(&needed, "a", &["slug"]);
-        assert_columns(&needed, "b", &["state"]);
-    }
-
-    #[test]
-    fn search_expression_arms_attribute_field_and_nested_columns() {
-        let q = ir(
-            vec![scan("c")],
-            vec![prop("c", "slug")],
-            vec![IRExpr::Rrf {
-                primary: Box::new(IRExpr::Fuzzy {
-                    field: Box::new(prop("c", "title")),
-                    query: Box::new(prop("c", "probe")),
-                    max_edits: Some(Box::new(prop("c", "edits"))),
-                }),
-                secondary: Box::new(IRExpr::Bm25 {
-                    field: Box::new(prop("c", "body")),
-                    query: Box::new(IRExpr::Literal(Literal::String("q".into()))),
-                }),
-                k: Some(Box::new(prop("c", "k_ref"))),
-            }],
-        );
-        let needed = collect_needed_columns(&q);
-        assert_columns(&needed, "c", &["slug", "title", "probe", "edits", "k_ref"]);
-    }
-
-    #[test]
-    fn rrf_leg_targets_fail_open_in_both_legs() {
-        // Cross-variable RRF: both legs' wide batches feed one fused concat,
-        // so each leg's search target must fail open in the OTHER leg too.
-        let mut needed = HashMap::new();
-        needed.insert(
-            "a".to_string(),
-            NeededColumns::Columns(HashSet::from(["x".to_string()])),
-        );
-        let rrf = RrfMode {
-            primary: Box::new(SearchMode {
-                nearest: Some(("a".to_string(), "emb".to_string(), vec![], 10)),
-                ..Default::default()
-            }),
-            secondary: Box::new(SearchMode {
-                bm25: Some(("b".to_string(), "text".to_string(), "q".to_string())),
-                ..Default::default()
-            }),
-            k: 60,
-            limit: 10,
-        };
-        fail_open_rrf_leg_targets(&mut needed, &rrf);
-        assert!(matches!(needed.get("a"), Some(NeededColumns::All)));
-        assert!(matches!(needed.get("b"), Some(NeededColumns::All)));
-    }
-}
-
-#[cfg(test)]
-mod column_projection_tests {
-    use super::*;
-    use omnigraph_compiler::SYSTEM_COLUMNS_V3;
-    use omnigraph_compiler::settings::SessionSettings;
-    use std::sync::Arc;
-
-    use crate::Session;
-    use crate::db::ReadTarget;
-    use crate::loader::LoadMode;
-
-    /// Embedding width. Wide enough (4 bytes/dim = 3 KiB/row) that the vector
-    /// column dominates the table, without an unwieldy JSONL fixture.
-    const DIM: usize = 768;
-    const ROWS: usize = 400;
-
-    const SCHEMA: &str = r#"
-node Chunk {
-    slug: String @key
-    embedding: Vector(768)
-}
-"#;
-
-    const QUERIES: &str = r#"
-query list_slugs() {
-    match { $c: Chunk }
-    return { $c.slug }
-}
-
-query first_slug() {
-    match { $c: Chunk }
-    return { $c.slug }
-    limit 1
-}
-"#;
-
-    /// Deterministic pseudo-random embeddings: a constant vector compresses to
-    /// nothing and would understate the column's real read cost.
-    fn seed_data() -> String {
-        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
-        let mut out = String::with_capacity(ROWS * DIM * 12);
-        for row in 0..ROWS {
-            out.push_str(&format!(
-                r#"{{"type":"Chunk","data":{{"slug":"chunk-{row:05}","embedding":["#
-            ));
-            for dim in 0..DIM {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                let value = (state >> 40) as f32 / 16_777_216.0;
-                if dim > 0 {
-                    out.push(',');
-                }
-                out.push_str(&format!("{value:.6}"));
-            }
-            out.push_str("]}}\n");
-        }
-        out
-    }
-
-    /// What a measured read does after the `node:Chunk` handle is warm.
-    enum Read {
-        /// A GQ query, by name, and the rows it must return.
-        Query(&'static str, usize),
-        /// A Lance scan of the same pinned version, projected to `columns`.
-        LanceProjected(&'static [&'static str]),
-        /// A Lance scan of the same pinned version, no projection.
-        LanceFull,
-    }
-
-    /// Object-store bytes one read costs, measured on Lance's own per-store
-    /// `IOTracker` — the seam that sees local-file reads: `ObjectStore::open`
-    /// routes the `file` scheme through `LocalObjectReader::open_with_tracker`,
-    /// bypassing any wrapped `object_store` instrumentation.
-    ///
-    /// Each call opens its own `Omnigraph` handle, so every arm reads cold from
-    /// its own `ReadCaches`/`Session`. The `node:Chunk` handle is opened first
-    /// and its cost discarded, so the measurement covers the scan alone — and so
-    /// the query below reuses that same cached `Dataset`, hence the same store
-    /// and the same tracker.
-    async fn read_bytes(uri: &str, read: Read) -> u64 {
-        let db = Session::from_defaults(
-            Arc::new(Omnigraph::open(uri).await.unwrap()),
-            SessionSettings::default(),
-        );
-        let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-        let dataset = snapshot.open_lance_dataset("node:Chunk").await.unwrap();
-        let store = dataset.object_store(None).await.unwrap();
-        let _ = store.io_stats_incremental();
-
-        let (rows, expected) = match read {
-            Read::Query(name, expected) => {
-                let result = db
-                    .query(ReadTarget::branch("main"), QUERIES, name, &ParamMap::new())
-                    .await
-                    .unwrap();
-                (
-                    result.batches().iter().map(|b| b.num_rows()).sum::<usize>(),
-                    expected,
-                )
-            }
-            Read::LanceProjected(columns) => {
-                let mut scanner = dataset.scan();
-                scanner.project(columns).unwrap();
-                let batches: Vec<RecordBatch> = scanner
-                    .try_into_stream()
-                    .await
-                    .unwrap()
-                    .try_collect()
-                    .await
-                    .unwrap();
-                (batches.iter().map(|b| b.num_rows()).sum::<usize>(), ROWS)
-            }
-            Read::LanceFull => {
-                let batches: Vec<RecordBatch> = dataset
-                    .scan()
-                    .try_into_stream()
-                    .await
-                    .unwrap()
-                    .try_collect()
-                    .await
-                    .unwrap();
-                (batches.iter().map(|b| b.num_rows()).sum::<usize>(), ROWS)
-            }
-        };
-        assert_eq!(rows, expected, "each arm must return the rows it asked for");
-        store.io_stats_incremental().read_bytes
-    }
-
-    /// `return { $c.slug }` must not read the `embedding` column.
-    ///
-    /// Three reads of one identical `Chunk` table: the GQ query, a Lance scan
-    /// projected to the lightweight columns (what a column-pruned scan costs),
-    /// and an unprojected Lance scan (what a full-row read costs). With column
-    /// pruning on the scan the query stays within 2× of the projected scan
-    /// (headroom for catalog/`__manifest` reads through the same store).
-    ///
-    /// Ignored in the parallel suite: the engine's process-wide
-    /// `STORE_REGISTRY` (`lance_access.rs`) shares one `ObjectStore` per
-    /// `file://` provider, so this test's `IOTracker` also counts every
-    /// concurrent test's reads. The measurement is exact when the process is
-    /// quiet. Lives in-source rather than beside `tests/helpers/cost.rs`
-    /// (the designated home for object-store counters) because the
-    /// per-store `IOTracker` seam this measurement needs is reachable only
-    /// in-crate — `Snapshot::open_lance_dataset` is `pub(crate)`.
-    #[tokio::test]
-    #[ignore = "byte-cost gate; the local-FS IOTracker is process-shared — run solo via `cargo test -p omnigraph-engine --lib column_projection_tests -- --ignored --nocapture`"]
-    async fn slug_projection_does_not_read_vector_column_issue_564() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let db = Session::from_defaults(
-            Arc::new(Omnigraph::init(uri, SCHEMA).await.unwrap()),
-            SessionSettings::default(),
-        );
-        db.load_jsonl(&seed_data(), LoadMode::Overwrite)
-            .await
-            .unwrap();
-        drop(db);
-
-        let query = read_bytes(uri, Read::Query("list_slugs", ROWS)).await;
-        let limited = read_bytes(uri, Read::Query("first_slug", 1)).await;
-        let pruned = read_bytes(uri, Read::LanceProjected(&[SYSTEM_COLUMNS_V3.id, "slug"])).await;
-        let full = read_bytes(uri, Read::LanceFull).await;
-
-        println!("gq return slug          = {query} bytes");
-        println!("gq return slug limit 1  = {limited} bytes");
-        println!("lance projected scan    = {pruned} bytes");
-        println!("lance full scan         = {full} bytes");
-
-        assert!(pruned > 0, "tracker must observe the projected scan");
-        assert!(
-            pruned * 4 <= full,
-            "fixture must make the vector column dominate: pruned={pruned} full={full}"
-        );
-        assert!(
-            query * 2 >= pruned,
-            "the query's reads must reach the same tracker: query={query} pruned={pruned}"
-        );
-        assert!(
-            limited <= pruned * 2,
-            "limit 1 must stay within 2x of the projected scan: limited={limited} pruned={pruned}"
-        );
-        assert!(
-            query <= pruned * 2,
-            "a slug-only projection must not pay for the embedding column: \
-             query={query} pruned={pruned} full={full}"
-        );
-    }
 }

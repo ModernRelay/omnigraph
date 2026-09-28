@@ -41,7 +41,7 @@ fn assert_memory_refusal(error: OmniError, limit: u64) {
     );
 }
 
-/// Compare ordered aggregate rows to the frozen executor while proving that
+/// Compare ordered aggregate rows to the unbounded run while proving that
 /// AggregateExec spilled. A successful non-spilling run is not acceptance.
 #[tokio::test]
 #[serial]
@@ -119,11 +119,11 @@ node Item {
         }
         out
     }
-    let v1_session = with_setting(&db, "engine", "v1");
-    let v1 = query_main(&v1_session, &query, "totals", &params(&[]))
+    let v2 = with_setting(&db, "engine", "v2");
+    let unbounded = query_main(&v2, &query, "totals", &params(&[]))
         .await
         .unwrap();
-    let expected = rows(v1.batches());
+    let expected = rows(unbounded.batches());
     assert_eq!(expected.len(), 32);
     assert_eq!(
         expected
@@ -137,7 +137,6 @@ node Item {
     assert!(expected.iter().all(|(_, count, values)| *count == 1
         && values.len() == 9
         && values.iter().all(|value| *value == 1.0_f64.to_bits())));
-    let v2 = with_setting(&db, "engine", "v2");
     let mut spilled = false;
     let mut diagnostics = Vec::new();
     for limit in [

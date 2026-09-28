@@ -77,10 +77,8 @@ use shape::{
 pub const CASE_TIMEOUT_ENV: &str = "OMNIGRAPH_GQ_CASE_TIMEOUT_SECS";
 pub const DEFAULT_CASE_TIMEOUT_SECS: u64 = 10;
 pub const BLESS_ENV: &str = "OMNIGRAPH_GQ_BLESS";
-/// `OMNIGRAPH_GQ_ENGINE=v2` runs every query step of an embedded-engine case
-/// on the plan route; unset, empty, or `v1` runs the route production runs.
-/// A server target keeps the server's route; this runner setting selects
-/// embedded sessions only.
+/// The runner's `engine` baseline for embedded-engine sessions: `v2`, empty
+/// or unset, all meaning engine v2, the setting's one value.
 pub const ENGINE_ENV: &str = "OMNIGRAPH_GQ_ENGINE";
 
 #[derive(Debug)]
@@ -193,6 +191,9 @@ struct QueryStep {
     /// The `--- expect plan` section, checked against the engine's explain
     /// document before the rows.
     plan: Option<PlanExpect>,
+    /// `--- expect same as v1`: the rows must also equal the reference
+    /// engine's rows for the same query, compared as `expect` compares.
+    same_as_v1: bool,
 }
 
 #[derive(Debug)]
@@ -1234,6 +1235,37 @@ fn complete_control_step(
     })
 }
 
+/// The expect word that adds the reference-engine comparison to a query
+/// step's rows expect.
+const SAME_AS_V1: &str = "same as v1";
+
+/// Why a `--- expect same as v1` section has no step to attach to; a mutate
+/// step, pending or just completed, gets its own refusal.
+fn same_as_v1_misplaced(
+    line: usize,
+    pending: Option<&Pending>,
+    items: &[Item],
+    open_loop: Option<&(String, Vec<String>, Vec<Step>)>,
+) -> String {
+    let last = match open_loop {
+        Some((_, _, steps)) => steps.last(),
+        None => match items.last() {
+            Some(Item::Step(step)) => Some(step),
+            Some(Item::Loop { .. }) | None => None,
+        },
+    };
+    let on_mutate = matches!(pending, Some(Pending::Decl(step)) if step.is_mutation)
+        || (pending.is_none() && matches!(last, Some(Step::Mutate(_))));
+    if on_mutate {
+        return format!(
+            "invalid_case: line {line}: `--- expect same as v1` is refused on a mutate step; the reference engine only reads, and a mutation returns no rows to compare"
+        );
+    }
+    format!(
+        "line {line}: `--- expect same as v1` must directly follow a query step's `--- expect shape` or `--- expect plan`; it adds the reference-engine comparison to the step's own rows expect"
+    )
+}
+
 /// The step a declaration section becomes under `mode`, or why the mode is
 /// refused for it.
 fn complete_decl_step(
@@ -1268,6 +1300,7 @@ fn complete_decl_step(
                 expects_expand: step.expects_expand,
                 expect: rows_expect(ordered, section, loop_var)?,
                 plan: None,
+                same_as_v1: false,
             }))
         }
         (ExpectHeader::Error(needle), is_mutation) => {
@@ -1294,6 +1327,7 @@ fn complete_decl_step(
                     expects_expand: step.expects_expand,
                     expect: QueryExpect::Error { needle },
                     plan: None,
+                    same_as_v1: false,
                 })
             })
         }
@@ -1380,6 +1414,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
     let mut pending: Option<Pending> = None;
     let mut awaiting_shape: Option<Step> = None;
     let mut awaiting_plan: Option<Step> = None;
+    let mut awaiting_same_as_v1: Option<Step> = None;
     let mut ordinal = 0usize;
     let mut seams = BTreeMap::new();
     let mut source_lines = BTreeMap::new();
@@ -1433,11 +1468,14 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
             Some((k, rest)) => (k, rest),
             None => (section.name.as_str(), ""),
         };
-        if !(kind == "expect" && rest.trim().starts_with("shape")) {
+        let expect_word = if kind == "expect" { rest.trim() } else { "" };
+        if !expect_word.starts_with("shape") {
             settle_shape(&mut items, &mut open_loop, awaiting_shape.take())?;
         }
-        if let Some(step) = awaiting_plan.take_if(|_| !(kind == "expect" && rest.trim() == "plan"))
-        {
+        if let Some(step) = awaiting_plan.take_if(|_| !matches!(expect_word, "plan" | SAME_AS_V1)) {
+            push_step(&mut items, &mut open_loop, step);
+        }
+        if let Some(step) = awaiting_same_as_v1.take_if(|_| expect_word != SAME_AS_V1) {
             push_step(&mut items, &mut open_loop, step);
         }
         if awaiting_seam_step && !matches!(kind, "mutate" | "seam") {
@@ -1708,6 +1746,28 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         ));
                     };
                     query.plan = Some(PlanExpect { lines });
+                    awaiting_same_as_v1 = Some(step);
+                    continue;
+                }
+                if rest.trim() == SAME_AS_V1 {
+                    let line = section.header_line + 1;
+                    refuse_nonempty_body(&section.body, "an `expect same as v1` section")?;
+                    let Some(mut step) =
+                        awaiting_plan.take().or_else(|| awaiting_same_as_v1.take())
+                    else {
+                        return Err(same_as_v1_misplaced(
+                            line,
+                            pending.as_ref(),
+                            &items,
+                            open_loop.as_ref(),
+                        ));
+                    };
+                    let Step::Query(query) = &mut step else {
+                        return Err(format!(
+                            "line {line}: `--- expect same as v1` is supported only on a query declaration step"
+                        ));
+                    };
+                    query.same_as_v1 = true;
                     push_step(&mut items, &mut open_loop, step);
                     continue;
                 }
@@ -1815,7 +1875,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         return Err("the final step is missing its `--- expect`".into());
     }
     settle_shape(&mut items, &mut open_loop, awaiting_shape.take())?;
-    if let Some(step) = awaiting_plan.take() {
+    if let Some(step) = awaiting_plan.take().or_else(|| awaiting_same_as_v1.take()) {
         push_step(&mut items, &mut open_loop, step);
     }
     if open_loop.is_some() {
@@ -2165,22 +2225,13 @@ async fn run_query_step(
         message,
         bless_lines: None,
     };
-    let settings = match session.effective(&step.source) {
-        Ok(settings) => Some(settings),
+    let inspected = match session.effective(&step.source) {
+        Ok(_) => true,
         Err(error) if step.plan.is_some() => {
             return Err(fail(format!("query settings failed: {error}")));
         }
-        Err(_) => None,
+        Err(_) => false,
     };
-    let inspected = settings
-        .as_ref()
-        .is_some_and(|settings| settings.engine() == Engine::V2);
-    if step.plan.is_some() && !inspected {
-        return Err(fail(
-            "expect plan requires engine = v2; effective engine is v1, which produces no plan"
-                .into(),
-        ));
-    }
     // A params refusal is one of the ways "the query must fail": route it
     // into an `error:` expectation instead of always failing the step.
     let params = match build_params(step.params_raw.as_ref(), &step.decl.params, binding) {
@@ -2272,12 +2323,54 @@ async fn run_query_step(
             if let Some(drift) = drift {
                 return Err(fail(drift));
             }
-            check_rows(&label, &result, *ordered, body_raw, *span, binding)
+            check_rows(&label, &result, *ordered, body_raw, *span, binding)?;
+            if step.same_as_v1 && !dst_runner::active() {
+                check_same_as_v1(session, step, &params, &result, *ordered)
+                    .await
+                    .map_err(&fail)?;
+            }
+            Ok(())
         }
         QueryExpect::Error { needle } => {
             check_error_expect(needle, outcome, "the query succeeded").map_err(fail)
         }
     }
+}
+
+/// `--- expect same as v1`: the step's query again on a copy of the case
+/// session whose reads run on the reference engine; any v1 error, a gate
+/// refusal included, or a row difference fails the step.
+async fn check_same_as_v1(
+    session: &Session,
+    step: &QueryStep,
+    params: &omnigraph_compiler::ParamMap,
+    v2: &QueryResult,
+    ordered: bool,
+) -> Result<(), String> {
+    let reference = session
+        .clone()
+        .with_read_executor(Arc::new(omnigraph_reference_engine::ReferenceEngine));
+    let v1 = reference
+        .query(
+            ReadTarget::branch(&step.branch),
+            &step.source,
+            &step.name,
+            params,
+        )
+        .await
+        .map_err(|e| format!("expect same as v1: v2 returned rows, v1 failed: {e}"))?;
+    let rows = |result: &QueryResult, engine: &str| match result.to_rust_json() {
+        Ok(Value::Array(rows)) => Ok(rows),
+        Ok(_) => Err(format!(
+            "expect same as v1: {engine} returned a non-array row set"
+        )),
+        Err(e) => Err(format!(
+            "expect same as v1: {engine} rows failed to render as JSON: {e}"
+        )),
+    };
+    compare_rows(&rows(&v1, "v1")?, &rows(v2, "v2")?, ordered).map_err(|(message, _)| {
+        format!("expect same as v1: the engines disagree (expected = v1, actual = v2): {message}")
+    })
 }
 
 /// Compares the executed rows with the expect body; a mismatch carries the
@@ -3052,20 +3145,20 @@ pub fn bless_from_env() -> Result<bool, String> {
 }
 
 /// The `engine` baseline of every case session, as `OMNIGRAPH_GQ_ENGINE`
-/// names it; `V1`, the definition's default, when unset.
+/// names it; `V2`, the definition's default, when unset.
 ///
 /// # Errors
 ///
-/// Refuses any value other than `v1`, `v2`, or empty.
+/// Refuses any value other than `v2` or empty.
 pub fn engine_from_env() -> Result<Engine, String> {
     match std::env::var(ENGINE_ENV) {
-        Err(std::env::VarError::NotPresent) => Ok(Engine::V1),
+        Err(std::env::VarError::NotPresent) => Ok(Engine::V2),
         Err(std::env::VarError::NotUnicode(v)) => Err(format!(
             "invalid_case: {ENGINE_ENV} requires UTF-8, got {v:?}"
         )),
-        Ok(v) if v.is_empty() => Ok(Engine::V1),
+        Ok(v) if v.is_empty() => Ok(Engine::V2),
         Ok(v) => Engine::from_spelling(&v).ok_or_else(|| {
-            format!("invalid_case: {ENGINE_ENV} takes v1 or v2 (or empty/unset), got `{v}`")
+            format!("invalid_case: {ENGINE_ENV} takes v2 (or empty/unset), got `{v}`")
         }),
     }
 }

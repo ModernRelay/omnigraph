@@ -197,7 +197,7 @@ impl Snapshot {
         Self { inner }
     }
 
-    #[cfg(all(test, feature = "failpoints"))]
+    #[cfg(any(all(test, feature = "failpoints"), feature = "test-util"))]
     pub(crate) fn raw(&self) -> &omnigraph_catalog::Snapshot {
         &self.inner
     }

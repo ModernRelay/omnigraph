@@ -1,8 +1,8 @@
-//! Diagnostic v1/v2 comparison of the four issue shapes; every measurement is a
-//! fresh child process whose peak RSS is evidence, never an assertion.
+//! Diagnostic timing of the four issue shapes on engine v2; every measurement is
+//! a fresh child process whose peak RSS is evidence, never an assertion.
 #![recursion_limit = "512"]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::hint::black_box;
@@ -53,7 +53,6 @@ const SHAPES: [(&str, &str); 4] = [
     ("723", "grouped_fanout"),
     ("750", "destination_search"),
 ];
-const ENGINES: [&str; 2] = ["v1", "v2"];
 const HUBS: usize = 200;
 const FANOUT: usize = 500;
 const TEAMS: usize = 10;
@@ -81,8 +80,6 @@ struct Args {
     out: PathBuf,
     #[arg(long)]
     child: bool,
-    #[arg(long)]
-    engine: Option<String>,
     #[arg(long)]
     shape: Option<String>,
     #[arg(long, default_value_t = 0)]
@@ -124,7 +121,6 @@ impl Expected {
 #[derive(Serialize, Deserialize)]
 struct ChildRecord {
     kind: String,
-    engine: String,
     shape: String,
     repeat: usize,
     rows_returned: usize,
@@ -270,59 +266,24 @@ fn check(
     }))
 }
 
-async fn verify_parity(
-    store: &Path,
-    expected: &Expected,
-) -> Result<(HashSet<String>, Vec<Value>), Box<dyn Error>> {
+async fn preflight(store: &Path, expected: &Expected) -> Result<Vec<Value>, Box<dyn Error>> {
     let db = Arc::new(Omnigraph::open(store.to_str().ok_or("non-UTF8 path")?).await?);
-    let mut excluded = HashSet::new();
+    let session = Session::from_defaults(db, SessionSettings::default());
     let mut evidence = Vec::new();
-    let fields = |result: &QueryResult| {
-        result
-            .schema()
-            .fields()
-            .iter()
-            .map(|field| (field.name().clone(), field.data_type().clone()))
-            .collect::<Vec<_>>()
-    };
     for (_, shape) in SHAPES {
-        let mut results = Vec::new();
-        for engine in ENGINES {
-            let session = Session::from_defaults(
-                Arc::clone(&db),
-                SessionSettings::default().with("engine", engine)?,
-            );
-            let result = query(&session, shape).await?;
-            let mismatch = check(shape, &result, expected)?;
-            if let Some(problem) = &mismatch {
-                if engine != "v1" || shape != "destination_search" {
-                    return Err(format!("{engine} preflight failed: {problem}").into());
-                }
-                excluded.insert(format!("{engine}:{shape}"));
-            }
-            let explain = if engine == "v2" {
-                Some(
-                    session
-                        .explain_query("main", QUERIES, shape, &HashMap::new())
-                        .await?,
-                )
-            } else {
-                None
-            };
-            evidence.push(
-                json!({"engine": engine, "shape": shape, "mismatch": mismatch,
-                "schema": format!("{:?}", result.schema()), "explain": explain}),
-            );
-            results.push(result);
+        let result = query(&session, shape).await?;
+        if let Some(problem) = check(shape, &result, expected)? {
+            return Err(format!("preflight failed: {problem}").into());
         }
-        if !excluded.contains(&format!("v1:{shape}"))
-            && (fields(&results[0]) != fields(&results[1])
-                || canonical(&results[0])? != canonical(&results[1])?)
-        {
-            return Err(format!("result parity failed before timing: {shape}").into());
-        }
+        let explain = session
+            .explain_query("main", QUERIES, shape, &HashMap::new())
+            .await?;
+        evidence.push(
+            json!({"shape": shape, "schema": format!("{:?}", result.schema()),
+            "explain": explain}),
+        );
     }
-    Ok((excluded, evidence))
+    Ok(evidence)
 }
 
 fn percentile(sorted: &[f64], fraction: f64) -> f64 {
@@ -332,12 +293,11 @@ fn percentile(sorted: &[f64], fraction: f64) -> f64 {
 
 async fn child(args: &Args) -> Result<(), Box<dyn Error>> {
     let store = args.store.as_deref().ok_or("--child needs --store")?;
-    let engine = args.engine.as_deref().ok_or("--child needs --engine")?;
     let shape = args.shape.as_deref().ok_or("--child needs --shape")?;
     let expected: Expected =
         serde_json::from_str(&fs::read_to_string(store.join("expected.json"))?)?;
     let db = Arc::new(Omnigraph::open(store.to_str().ok_or("non-UTF8 path")?).await?);
-    let session = Session::from_defaults(db, SessionSettings::default().with("engine", engine)?);
+    let session = Session::from_defaults(db, SessionSettings::default());
     let rss_after_open_bytes = peak_rss_bytes()?;
     let mut samples = Vec::with_capacity(args.iterations);
     let mut rows_returned = 0;
@@ -347,7 +307,7 @@ async fn child(args: &Args) -> Result<(), Box<dyn Error>> {
         let elapsed = start.elapsed();
         black_box(&result);
         if let Some(problem) = check(shape, &result, &expected)? {
-            return Err(format!("{engine} failed its row check: {problem}").into());
+            return Err(format!("failed its row check: {problem}").into());
         }
         rows_returned = result.num_rows();
         if round >= args.warmups {
@@ -359,7 +319,6 @@ async fn child(args: &Args) -> Result<(), Box<dyn Error>> {
     sorted.sort_by(f64::total_cmp);
     let record = ChildRecord {
         kind: "child".into(),
-        engine: engine.into(),
         shape: shape.into(),
         repeat: args.repeat,
         rows_returned,
@@ -428,7 +387,6 @@ async fn build_fixture(store: &Path, rows: usize) -> Result<Expected, Box<dyn Er
 fn run_child(
     store: &Path,
     args: &Args,
-    engine: &str,
     shape: &str,
     repeat: usize,
 ) -> Result<ChildRecord, Box<dyn Error>> {
@@ -438,14 +396,14 @@ fn run_child(
         .arg(&args.out)
         .arg("--store")
         .arg(store)
-        .args(["--engine", engine, "--shape", shape])
+        .args(["--shape", shape])
         .args(["--repeat", &repeat.to_string()])
         .args(["--warmups", &args.warmups.to_string()])
         .args(["--iterations", &args.iterations.to_string()])
         .output()?;
     if !output.status.success() {
         return Err(format!(
-            "child {engine} {shape} repeat {repeat} exited {}:\n{}",
+            "child {shape} repeat {repeat} exited {}:\n{}",
             output.status,
             String::from_utf8_lossy(&output.stderr)
         )
@@ -466,73 +424,62 @@ fn summarize(
     expected: &Expected,
     args: &Args,
     metadata: Value,
-    parity: Vec<Value>,
-    excluded: &HashSet<String>,
+    preflight: Vec<Value>,
 ) -> Result<Value, Box<dyn Error>> {
     let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
     let mut results = Vec::new();
     for (issue, shape) in SHAPES {
-        for engine in ENGINES {
-            let runs: Vec<&ChildRecord> = records
-                .iter()
-                .filter(|r| r.shape == shape && r.engine == engine)
-                .collect();
-            if excluded.contains(&format!("{engine}:{shape}")) {
-                results.push(json!({"issue": issue, "shape": shape, "engine": engine,
-                    "answer": "wrong", "timing": "excluded: preflight differs from fixture oracle"}));
-                continue;
-            }
-            if runs.is_empty() {
-                return Err(format!("no records for {shape} {engine}").into());
-            }
-            let mut medians: Vec<f64> = runs.iter().map(|r| r.median_ms).collect();
-            let mut pooled: Vec<f64> = runs
-                .iter()
-                .flat_map(|r| r.samples.iter().copied())
-                .collect();
-            pooled.sort_by(f64::total_cmp);
-            let peak = runs.iter().map(|r| r.peak_rss_bytes).max().unwrap_or(0);
-            let after_open = runs
-                .iter()
-                .map(|r| r.rss_after_open_bytes)
-                .max()
-                .unwrap_or(0);
-            let delta = runs
-                .iter()
-                .map(|r| r.peak_rss_bytes.saturating_sub(r.rss_after_open_bytes))
-                .max()
-                .unwrap_or(0);
-            let answers: Vec<&str> = runs.iter().map(|r| r.answer.as_str()).collect();
-            results.push(json!({
-                "issue": issue, "shape": shape, "engine": engine,
-                "rows_returned": runs[0].rows_returned,
-                "expected_rows": expected.rows_for(shape)?,
-                "answer": if answers.iter().all(|a| *a == "ok") { "ok" } else { "wrong" },
-                "mismatch": runs.iter().find_map(|r| r.mismatch.clone()),
-                "median_ms": median(&mut medians),
-                "repeat_medians_ms": runs.iter().map(|r| r.median_ms).collect::<Vec<_>>(),
-                "p95_ms_pooled": percentile(&pooled, 0.95),
-                "min_ms": pooled[0],
-                "peak_rss_mib": mib(peak),
-                "rss_after_open_mib": mib(after_open),
-                "delta_rss_over_open_mib": mib(delta),
-                "repeat_peak_rss_mib": runs.iter().map(|r| mib(r.peak_rss_bytes)).collect::<Vec<_>>(),
-                "repeat_delta_rss_mib": runs
-                    .iter()
-                    .map(|r| mib(r.peak_rss_bytes.saturating_sub(r.rss_after_open_bytes)))
-                    .collect::<Vec<_>>(),
-            }));
+        let runs: Vec<&ChildRecord> = records.iter().filter(|r| r.shape == shape).collect();
+        if runs.is_empty() {
+            return Err(format!("no records for {shape}").into());
         }
+        let mut medians: Vec<f64> = runs.iter().map(|r| r.median_ms).collect();
+        let mut pooled: Vec<f64> = runs
+            .iter()
+            .flat_map(|r| r.samples.iter().copied())
+            .collect();
+        pooled.sort_by(f64::total_cmp);
+        let peak = runs.iter().map(|r| r.peak_rss_bytes).max().unwrap_or(0);
+        let after_open = runs
+            .iter()
+            .map(|r| r.rss_after_open_bytes)
+            .max()
+            .unwrap_or(0);
+        let delta = runs
+            .iter()
+            .map(|r| r.peak_rss_bytes.saturating_sub(r.rss_after_open_bytes))
+            .max()
+            .unwrap_or(0);
+        let answers: Vec<&str> = runs.iter().map(|r| r.answer.as_str()).collect();
+        results.push(json!({
+            "issue": issue, "shape": shape,
+            "rows_returned": runs[0].rows_returned,
+            "expected_rows": expected.rows_for(shape)?,
+            "answer": if answers.iter().all(|a| *a == "ok") { "ok" } else { "wrong" },
+            "mismatch": runs.iter().find_map(|r| r.mismatch.clone()),
+            "median_ms": median(&mut medians),
+            "repeat_medians_ms": runs.iter().map(|r| r.median_ms).collect::<Vec<_>>(),
+            "p95_ms_pooled": percentile(&pooled, 0.95),
+            "min_ms": pooled[0],
+            "peak_rss_mib": mib(peak),
+            "rss_after_open_mib": mib(after_open),
+            "delta_rss_over_open_mib": mib(delta),
+            "repeat_peak_rss_mib": runs.iter().map(|r| mib(r.peak_rss_bytes)).collect::<Vec<_>>(),
+            "repeat_delta_rss_mib": runs
+                .iter()
+                .map(|r| mib(r.peak_rss_bytes.saturating_sub(r.rss_after_open_bytes)))
+                .collect::<Vec<_>>(),
+        }));
     }
     Ok(json!({
         "metadata": metadata,
-        "preflight": parity,
+        "preflight": preflight,
         "fixture": {
             "rows": expected.rows, "edges": expected.edges, "hubs": HUBS, "fanout": FANOUT,
             "teams": TEAMS, "needle_every": NEEDLE_EVERY, "vector_dimensions": VECTOR_DIMENSIONS,
             "expected": expected, "repeats": args.repeats, "warmups": args.warmups,
             "iterations": args.iterations,
-            "process": "one fresh child per (engine, shape, repeat); engine order alternates per repeat",
+            "process": "one fresh child per (shape, repeat)",
             "memory": "ru_maxrss of the child: a process peak, an upper bound including open, warm-up and JSON checks",
             "timing": "Session::query through materialized QueryResult; row checks outside the timer",
             "claim_eligible": false, "durable_record": false,
@@ -559,8 +506,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if args.child {
         return child(&args).await;
     }
-    if args.repeats < 2 || args.repeats % 2 != 0 {
-        return Err("repeats must be even and at least two to balance engine order".into());
+    if args.repeats < 2 {
+        return Err("use at least two repeats".into());
     }
     let metadata = provenance()?;
     fs::create_dir_all(&args.out)?;
@@ -591,30 +538,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         started.elapsed().as_secs_f64(),
         store.display()
     );
-    let (excluded, parity) = verify_parity(&store, &expected).await?;
+    let preflight = preflight(&store, &expected).await?;
     let mut records = Vec::new();
     for repeat in 0..args.repeats {
         for (_, shape) in SHAPES {
-            let order = if repeat % 2 == 0 { [0, 1] } else { [1, 0] };
-            for engine in order.map(|index| ENGINES[index]) {
-                if excluded.contains(&format!("{engine}:{shape}")) {
-                    continue;
-                }
-                let started = Instant::now();
-                let record = run_child(&store, &args, engine, shape, repeat)?;
-                eprintln!(
-                    "repeat {repeat} {shape:<24} {engine} median {:.3} ms peak {:.1} MiB answer {} ({:.1}s)",
-                    record.median_ms,
-                    record.peak_rss_bytes as f64 / (1024.0 * 1024.0),
-                    record.answer,
-                    started.elapsed().as_secs_f64()
-                );
-                writeln!(raw, "{}", serde_json::to_string(&record)?)?;
-                records.push(record);
-            }
+            let started = Instant::now();
+            let record = run_child(&store, &args, shape, repeat)?;
+            eprintln!(
+                "repeat {repeat} {shape:<24} median {:.3} ms peak {:.1} MiB answer {} ({:.1}s)",
+                record.median_ms,
+                record.peak_rss_bytes as f64 / (1024.0 * 1024.0),
+                record.answer,
+                started.elapsed().as_secs_f64()
+            );
+            writeln!(raw, "{}", serde_json::to_string(&record)?)?;
+            records.push(record);
         }
     }
-    let summary = summarize(&records, &expected, &args, metadata, parity, &excluded)?;
+    let summary = summarize(&records, &expected, &args, metadata, preflight)?;
     writeln!(summary_file, "{}", serde_json::to_string_pretty(&summary)?)?;
     println!("{}", serde_json::to_string(&summary["results"])?);
     Ok(())

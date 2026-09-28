@@ -1,0 +1,55 @@
+# issue: none
+# notes: Nested negations correlate each inner row to its own outer row. p1 works at two
+# notes: companies, so inner row positions diverge from the outer rows; p1 and p2 have a
+# notes: non-Acme employer and drop out. Replaces the Rust test
+# notes: nested_anti_join_with_fanout_correlates_correctly (traversal.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+
+node Company {
+    name: String @key
+}
+
+edge WorksAt: Person -> Company
+
+--- seed
+{"type":"Person","data":{"name":"p1"}}
+{"type":"Person","data":{"name":"p2"}}
+{"type":"Person","data":{"name":"p3"}}
+{"type":"Person","data":{"name":"p4"}}
+{"type":"Company","data":{"name":"Acme"}}
+{"type":"Company","data":{"name":"Globex"}}
+{"edge":"WorksAt","from":"p1","to":"Acme"}
+{"edge":"WorksAt","from":"p1","to":"Globex"}
+{"edge":"WorksAt","from":"p2","to":"Globex"}
+{"edge":"WorksAt","from":"p3","to":"Acme"}
+
+--- query
+query no_nonacme_employer() {
+    match {
+        $p: Person
+        not {
+            $p worksAt $c
+            not {
+                $c.name = "Acme"
+            }
+        }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "p3"}
+{"p.name": "p4"}
+
+--- expect shape
+p.name: String

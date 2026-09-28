@@ -1,5 +1,6 @@
 # issue: none
 # notes: Omitting a required key fails typechecking with T12; deleting an absent key affects zero rows.
+# notes: The first step also replaces the Rust test insert_missing_required_property_fails (traversal.rs).
 
 --- runner
 timeout_ms: 10000

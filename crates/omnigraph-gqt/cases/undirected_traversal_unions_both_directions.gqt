@@ -1,0 +1,142 @@
+# issue: none
+# notes: `$a <edge> $b` walks both directions: one hop, a {1,2} hop range and an anti-join
+# notes: see out ∪ in neighbours, and a pair joined both ways appears once. Replaces the Rust
+# notes: tests undirected_one_hop_unions_out_and_in_neighbors, undirected_variable_hops and
+# notes: undirected_anti_join_excludes_both_directions (traversal.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32?
+}
+
+edge Knows: Person -> Person {
+    since: Date?
+}
+
+--- seed
+{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob","age":25}}
+{"type":"Person","data":{"name":"Charlie","age":35}}
+{"type":"Person","data":{"name":"Diana","age":28}}
+{"edge":"Knows","from":"Alice","to":"Bob"}
+{"edge":"Knows","from":"Alice","to":"Charlie"}
+{"edge":"Knows","from":"Bob","to":"Diana"}
+
+--- query
+query connected_directional($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows $f
+    }
+    return { $f.name }
+}
+
+--- params
+{"name": "Bob"}
+
+--- expect unordered
+{"f.name": "Diana"}
+
+--- expect shape
+f.name: String
+
+--- query
+query connected($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p <knows> $f
+    }
+    return { $f.name }
+}
+
+--- params
+{"name": "Bob"}
+
+--- expect unordered
+{"f.name": "Alice"}
+{"f.name": "Diana"}
+
+--- expect shape
+f.name: String
+
+--- query
+query reach_both($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p <knows>{1,2} $f
+    }
+    return { $f.name }
+}
+
+--- params
+{"name": "Charlie"}
+
+--- expect unordered
+{"f.name": "Alice"}
+{"f.name": "Bob"}
+
+--- expect shape
+f.name: String
+
+--- query
+query no_outgoing() {
+    match {
+        $p: Person
+        not { $p knows $x }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "Charlie"}
+{"p.name": "Diana"}
+
+--- expect shape
+p.name: String
+
+--- query
+query isolated() {
+    match {
+        $p: Person
+        not { $p <knows> $x }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+
+--- expect shape
+p.name: String
+
+--- mutate
+query add_reverse() {
+    insert Knows { from: "Diana", to: "Bob" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- query
+query connected_after_reverse($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p <knows> $f
+    }
+    return { $f.name }
+}
+
+--- params
+{"name": "Bob"}
+
+--- expect unordered
+{"f.name": "Alice"}
+{"f.name": "Diana"}
+
+--- expect shape
+f.name: String

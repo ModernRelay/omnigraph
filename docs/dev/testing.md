@@ -44,8 +44,9 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Concern | Existing owners |
 |---|---|
 | Initialization and representative journeys | `lifecycle.rs`, `end_to_end.rs`, `composite_flow.rs`, `consistency.rs` |
-| Query results and operators | `aggregation.rs`, `literal_filters.rs`, `ordering.rs`, `traversal.rs`, `traversal_indexed.rs`, `proptest_equivalence.rs`; the `.gqt` corpus lives in `omnigraph-gqt` (`crates/omnigraph-gqt/cases/`) |
-| V2 execution, memory and frozen v1 | `engine_v2.rs`, `engine_v2_memory.rs`, `v1_frozen.rs`; `repro_issue_703.rs` and `repro_issue_723.rs` own ignored scale symptoms |
+| Query results and operators | `aggregation.rs`, `literal_filters.rs`, `ordering.rs`, `traversal_indexed.rs`, `traversal_adaptive.rs`, `proptest_equivalence.rs`; the `.gqt` corpus lives in `omnigraph-gqt` (`crates/omnigraph-gqt/cases/`) |
+| V2 execution and memory | `engine_v2.rs`, `engine_v2_memory.rs`; `repro_issue_703.rs` and `repro_issue_723.rs` own ignored scale symptoms |
+| Frozen engine v1, the reference | `crates/omnigraph-reference-engine/tests/frozen.rs` pins every source file's bytes; `forbidden_apis.rs` owns that `omnigraph-gqt` is the crate's only dependent and that its source names neither the engine nor the planner; the crate has no other tests, and a `.gqt` step's `--- expect same as v1` compares v2's rows with its answer |
 | V2 plan nodes' operators and the execution report | In-source `engine/report/tests.rs` owns which operator each node builds and what its row says (`ran`, `actual_rows`, `drained`); `crates/omnigraph-planner/tests/lower_walk.rs` owns the walk's order and refusals; the `ran` lines of `--- expect plan` read the report of the case's own run |
 | V2 plan sufficiency: the bound plan alone reproduces a run | `crates/omnigraph/tests/engine_v2_plan_replay.rs` (see [Plan replay](#plan-replay)): one query per node kind with a switch or a ladder, replayed twice through `Session::replay_bound_plan` from the serialized `BoundPlan`, equal rows and the same trace required; `crates/omnigraph-planner/tests/bound_plan.rs` owns the serialized form; in-source `engine/search.rs` tests own the declared ladder's stepping; `engine/plan_source.rs` tests own that the assumed memory limit sizes the plan, the lowering and the pool |
 | V2 scrubbed replay: no input beside the bound plan and the snapshot reaches execution | `engine_v2_scrubbed_replay.rs` owns the mechanism (the `std::env` grep over `crates/omnigraph/src/engine/`, the replay under an ambient memory limit and an ambient `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER` the plan did not capture, `ann_nprobes` as a plan field, the `profile` rows); `engine_v2_plan_replay.rs` owns the snapshot pins (an edge write or an insert after planning refuses the replay); the inventory cases `cases/v2/planner/input_*.gqt` own one input class each (`engine`, `ann_nprobes`, index build state), and the clock class is owned by `engine_v2_plan_replay.rs`; `engine_v2_memory.rs` owns `ran id_lookup` under a refused build |
@@ -155,7 +156,7 @@ The system tests start workspace binaries on ephemeral localhost ports. Set `OMN
 Focused iteration:
 
 ```bash
-cargo test -p omnigraph-engine --test traversal
+cargo test -p omnigraph-engine --test traversal_indexed
 cargo test -p omnigraph-engine --test writes concurrent
 cargo test -p omnigraph-server --test data_routes
 cargo test -p omnigraph-cli --test cli_data
@@ -176,8 +177,22 @@ cargo run -p omnigraph-gqt --bin omnigraph-gqt -- cases --measure --baseline /tm
 
 Discovery includes every `.gqt` file below `cases/`, recursively. Shared
 cases live at its root; v2-specific cases live in `v2/`, and plan assertions
-in `v2/planner/`. A v2 case still explicitly selects `engine = v2`; directory
-placement does not select an engine.
+in `v2/planner/`. Every case runs on engine v2, the one engine; a
+`set engine = v2;` line some cases carry changes nothing, and directory
+placement selects nothing.
+
+A query step may end with `--- expect same as v1`, directly after its
+`--- expect shape` or `--- expect plan`. The runner then runs the step's query
+again on a copy of the case session that carries the frozen reference engine
+(`omnigraph_reference_engine::ReferenceEngine`, installed through
+`Session::with_read_executor` under the engine's `test-util` feature) and
+compares its rows with v2's, ordered or unordered as the step's rows expect
+says. A v1 error, a v1 gate refusal included, or a row difference fails the
+step. The section is refused on a mutate step, an error expect, `show` and
+`branch list`, and the DST runner skips it. The reference answers `not { ... }`
+blocks only among the correlated blocks, and refuses count predicates and a
+string `nearest` argument, so a case using those carries no
+`expect same as v1`.
 
 Every case is its own libtest test named `case::<relative/path>.gqt`, registered
 at run time (`datatest-stable`), so the ordinary name filter selects cases, a
