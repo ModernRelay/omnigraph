@@ -8,7 +8,7 @@ authors:
   - OmniGraph maintainers
 created: 2026-09-29
 updated: 2026-09-29
-discussion: null
+discussion: https://github.com/ModernRelay/omnigraph/pull/799
 supersedes:
   - "0034"
   - "0035"
