@@ -2,25 +2,26 @@
 rfc: "0065"
 title: "Isolated branch merge publication"
 track: maintainer
-status: draft
+status: superseded
 implementation: not-started
 authors:
   - azimafroozeh
 created: 2026-09-09
-updated: 2026-09-10
+updated: 2026-09-29
 discussion: null
 supersedes: []
-superseded_by: []
-blocked_on:
-  - "Storage: qualify bounded owner ancestry and metadata, shared files, indexes and Blob retention on pinned Lance 11."
-  - "Engine: prove adopted-owner writes, maintenance and change-feed lifetime witnesses on main and named branches."
-  - "Recovery: prove publication-versus-abandonment ordering and crash-safe admission independent of terminal GC backlog."
-  - "Compatibility: specify the format fence and lossless supported upgrade path before enabling publication."
+superseded_by:
+  - "0067"
+blocked_on: []
 ---
 
 # RFC 0065: Isolated branch merge publication
 
-> Number provisional: recheck the registry and open reservations before publication.
+> **Superseded on 2026-09-29** by [RFC 0067: Detached table commits](0067-detached-table-commits.md),
+> whose accepted decision subsumes this private-branch merge design. See also
+> [Detached-only tables](2026-09-21-detached-only-tables.md) for final pins and
+> current retention. The body below preserves historical rationale; its private
+> refs, sidecars and detached-publication deferral are not current requirements.
 
 ## Summary
 
