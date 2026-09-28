@@ -15,9 +15,12 @@ version axes. Never derive one axis from another.
 
 ## Current storage contract
 
-The current binary serves **internal manifest schema v11**:
-`MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION` and `INTERNAL_MANIFEST_SCHEMA_VERSION`
-are both 11. v10 is the [RFC 0067](../rfcs/0067-detached-table-commits.md)
+The current binary serves **internal manifest schema v11 and v12**:
+`MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION` is 11 and
+`INTERNAL_MANIFEST_SCHEMA_VERSION` is 12. v12 changes only how a `__manifest`
+row is stored (one packed `record` column, see the v12 bullet below); a v11
+graph opens as it is and each Lance branch of its `__manifest` converts on its
+next publish, with no command. v10 is the [RFC 0067](../rfcs/0067-detached-table-commits.md)
 stamp: a table registration may name a detached Lance version whose linear
 target is published before it exists, which an older binary would open as
 reclaimed history, so the stamp refuses it before any open. Both system
@@ -70,6 +73,26 @@ before this binary serves it.
   `detached-only-v10-to-v11`, which promotes every pending pin once, reaps the
   proven copies, records the key on every current registration of every live
   branch, and restamps.
+- v12 keeps v11's logical rows (`manifest_schema()`, ten fields: the unused
+  `base_objects` list is gone) and stores them as three columns: `object_id`,
+  `object_type` and `record`, a Lance packed struct (`lance-encoding:packed`)
+  holding the eight remaining fields row-major plus a `present` bitmask, one
+  bit per field that is null in the logical row (Lance 11 refuses a null
+  value inside a packed struct child, so every child is declared non-null and
+  a null is stored as `""` or `0` with its bit set). A scan reads one column's
+  pages for the record instead of one per field, and always projects `record`
+  whole (Lance 11 cannot project a fixed-width child of a packed struct on
+  its own). Conversion is the branch's next publish: the copy-on-write
+  overwrite writes the packed shape and the v12 stamp in one commit; an idle
+  branch stays v11 and reads as v11; earlier versions keep their shape for
+  time travel. A graph holds v11 and v12 across its branches until every
+  branch has published, and every reader, `omnigraph upgrade` and
+  `omnigraph schema upgrade-system-columns` accept that state. `omnigraph
+  upgrade` has no v12 step and `--to-format 12` is an unsupported target; an
+  offline route that converts every branch at once is a separate change (see
+  §Changing an axis). A Lance directory-namespace client, which reads
+  `__manifest` by its own catalog column names, fails at `location` on a
+  stamp-12 manifest; it found no OmniGraph table at stamp 11 either.
 - the unreleased v7–v19 stamps of the rejected MemWAL experiment never shipped
   and are not supported migration inputs. Reuse of a numeric stamp by another
   design (RFC 0062, RFC 0042 or RFC 0040) does not make an experimental graph
@@ -150,7 +173,8 @@ see the [admission limits](../user/operations/upgrade.md).
 | Legacy vintage / v8 | Refused | v8 → v10 → v11 (`detached-pins-v8-v9-to-v10`, then `detached-only-v10-to-v11`; `--to-format 8` is an already-current no-op) | `upgrade/tests.rs::storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v11`, `storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_name`; `tests/system_column_upgrade.rs` (the respelling on a served graph, refusals, crash points) |
 | 0.11.x / v9 | Refused | v9 → v10 → v11 | `upgrade/tests.rs::storage_upgrade_default_route_takes_a_v9_graph_to_v11` |
 | 0.11.x (detached table commits) / v10 | Refused | v10 → v11 (`detached-only-v10-to-v11`) | `upgrade/tests.rs::storage_upgrade_default_route_takes_a_v10_graph_to_v11` |
-| Current / v11 | Accepted | Already current; a lower target is refused | `upgrade/tests.rs::storage_upgrade_current_vintage_is_already_current_without_a_route`; stamp tests in `migrations.rs` |
+| Current / v11 | Accepted; converts to v12 on each branch's next publish | Already current (also while the graph's branches mix v11 and v12); a lower target is refused; `--to-format 12` is an unsupported target, no route writes v12 | `omnigraph-catalog` `stamp_11_manifest_converts_on_its_next_publish` (no released binary wrote v11, so the synthetic conversion test is the predecessor evidence); `upgrade/tests.rs::storage_upgrade_accepts_a_graph_converting_branch_by_branch`; CLI `crossversion_upgrade.rs::genuine_v010_explicit_storage_upgrade_preserves_history` (a genuine 0.10.x graph upgraded to v11 converts branch by branch under the new binary's mutate and merge) |
+| Current / v12 | Accepted | Already current; a lower target is refused | `upgrade/tests.rs::storage_upgrade_current_vintage_is_already_current_without_a_route`; stamp tests in `migrations.rs` |
 | Older, future or unqualified experimental format | Refused | No route; source-compatible export/rebuild | Existing format fences and engine refusal tests |
 
 Source v6/v7 admission rejects any reserved native-ref retirement metadata.
@@ -210,6 +234,17 @@ GitHub Releases, and the TypeScript SDK ships through npm. Do not document
 4. Add genuine predecessor evidence for every declared direct or migration route,
    plus refusal and rebuild fallback evidence.
 5. Update the upgrade guide and release notes.
+
+A stamp that changes only the stored shape of `__manifest` rows, keeps the
+previous stamp's logical rows and is read beside it (`MIN_SUPPORTED` unchanged)
+takes a shorter path, as v12 did: no RFC, since no format decision is
+irreversible while both shapes are read; conversion is each branch's next
+publish, so a graph holds both stamps across its branches until every branch
+has published, and every reader and `omnigraph upgrade` accept that state; the
+offline route that converts every branch at once is registered as its own
+change before the release that ships the stamp; for a stamp no released binary
+wrote, the synthetic conversion test is the predecessor evidence and the matrix
+row says so. Steps 3 and 5 apply unchanged.
 
 ### Pins and staged contracts
 
