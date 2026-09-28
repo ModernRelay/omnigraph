@@ -213,7 +213,118 @@ cargo test -p omnigraph-gqt --test gq_logic_tests -- --test-threads=2
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --target omnigraph-engine-dst --storage in-memory-object-store --seed 42
 cargo run --bin omnigraph-gqt -- --replay ../../target/gqt-artifacts/invocation-EXAMPLE.json
+cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --measure
 ```
+
+`--measure` records, for every step of each DST environment, the object-store
+requests the engine made while the step ran. The measuring store is a
+decorator on the engine's `object_store_seam`, the seam the DST fault
+decorator uses, so every store the registry builds is wrapped: `__manifest`
+and table traffic alike, and the engine is not edited. The ledger keeps every
+request of the run, tagged with the label current when it was made: `setup`
+before the first step, `step` N while step N runs, `runner` N from its end to
+the next step (the runner's own checks); the runner only moves the label, and
+the report is the ledger grouped by it, so the rows add up to every request
+the store saw (`slot` column). Per group it reports:
+
+- `requests`, the work, and `repeat_reads`, the `get`s and `head`s of an
+  object and byte range the group had already read (the same bytes paid for
+  twice; objects are told apart by their real names, uuids included);
+- `after_publish`, the requests after the group's last `__manifest` version
+  put, the publish CAS: the crash window, where a crash leaves a published
+  operation unfinished; absent when the group published nothing;
+- a count per `<realm>_<kind>.<verb>` class (`manifest_meta.put`,
+  `table_data.get`, …) where the realm is the dataset (`__manifest`, the
+  table, the recovery root) and the kind its Lance directory; a request the
+  store refused counts under `<verb>_failed`, for every verb (`get`, `head`,
+  `put`, `put_part`, `put_multipart`, `put_complete`, `put_abort`, `copy`,
+  `delete`, `list`); a `list` counts one request per 1,000 keys, a multipart
+  upload the create, one request per part and the complete or abort, the
+  shapes S3 bills;
+- the schedule in the work-span model: the measuring store sleeps the
+  request's cost on the paused DST clock, so requests the engine issues
+  together overlap and a group's `makespan` (ticks of one millisecond, from
+  its first request's start to its last request's end) is the time its
+  schedule took under the model; the in-memory store alone answers
+  synchronously and would make every request its own tick;
+- its phases, from the engine's own decision seams: measure mode installs a
+  pass-through observer on every empty seam of the engine catalog, and a
+  request's phase is the last seam the engine crossed in the step (`start`
+  before the first crossing), so the report names `mutation.post_stage_pre_effect_gate`,
+  `fork.before_classify`, `mutation.post_finalize_pre_publisher`,
+  `publish.load_state`, `publish.pre_merge`, … in the order they were crossed;
+  nothing is inferred from the log's shape. A `--- seam` directive takes its
+  seam back for its step and the observer returns after it. Each phase has
+  its makespan, its `span` (the critical path with the phase's tables side by
+  side: the phase's non-table requests in series plus the longest single
+  table's time; a table request is one in a table's realm, so a branch's own
+  `__manifest` lineage under `__manifest/tree/` is never a table), its
+  requests and tables; the step's `span` is the sum of the phases' spans,
+  the critical path under "phases in sequence, tables independent within a
+  phase", so `waiting` (makespan minus span) is the time tables spent in
+  series that the model says they need not; every schedule column is the
+  model's time in ticks, a request spanning its start to its end, so they
+  share one unit under every model, and the printout shows the parallelism
+  achieved (requests per makespan tick) beside the parallelism available
+  (requests per span tick);
+- `sim ms`, the group's virtual time under the latency model, and `u$`, its
+  requests at S3 list prices in microdollars (PUT, COPY and LIST 5.0, GET and
+  HEAD 0.4, DELETE free).
+
+Every label the runner set is a row, so a step that made no request (a
+settings step, a no-op mutation before its first table) reports zero, and
+zero stays distinct from missing.
+
+`--model <name>` picks the latency model, what one request costs on the
+virtual clock: `unit` (the default: one tick per request, the model every
+count is stated under), `s3-like` (17 ms per request, the slope measured on
+the branch-age chart, plus the bytes at 50 MiB/s, Durner et al., until a
+calibration run on the real store replaces both) or `local` (0.1 ms plus the
+bytes at 1 GiB/s). The bytes are charged when they are known: a write's and
+a bounded read's before the call, a whole-object or offset read's after it,
+once the result says how much came back. Requests still overlap under every
+model; there is no per-device queue, since a serialized queue would make the
+makespan equal the request count and hide the overlap the schedule columns
+exist to show.
+
+The request counts (`requests`, `repeat_reads`, `after_publish`, the class
+counts) are an `io` evidence row per group, so the two runs of one seed must
+agree on them; the schedule-derived numbers (`makespan`, `span`, the phases,
+`sim ms`, `u$`) are measurement-only, since a detached commit's overlap moved
+by one tick between two runs of one seed (in the seed load and in a step), a
+determinism gap of the write path under DST, not of the counting; bytes and
+the uuid-redacted request log (each request with its start tick, so requests
+sharing a tick ran together) go to a `measurements` field the replay
+comparison skips. The invocation prints one ASCII table per environment, a
+row per step and per gap and a row per phase, and writes the long-form TSV
+under `target/gqt-artifacts/cost/` (phase rows as `phase.<name>.<field>`).
+Direct-engine environments record nothing: on a `file` root Lance bypasses
+the wrapped store for data files, so only the DST in-memory object store
+sees every request. Every case measures the same way; nothing in a case
+declares it, and the invocation takes several case paths or directories,
+anywhere on disk. `--artifacts <dir>` puts the report and the TSV in that
+directory instead of the build tree's `target/gqt-artifacts/`, so a suite
+kept outside this repository keeps its outputs beside its cases.
+
+**Baseline.** `--baseline <path>` names a TSV, anywhere on disk, with one
+row per case, environment, seed, slot and step and the three counts
+`requests`, `repeat_reads` and `after_publish`; the repository commits no
+such file, and without the flag a measured run prints its table and
+writes its TSV without a delta. A case is named by its path under the
+corpus whichever spelling the invocation used (a case outside the corpus
+by its absolute path). `--write-baseline` (with `--baseline`) replaces,
+for each measured case, the rows of the environments and seeds the run
+measured and keeps every other row, so a `--target` or `--seed` selection
+rewrites only what it ran; a run that failed writes nothing and says so;
+rows of a case the run did not measure stay, so after a case is renamed or
+removed, delete the file first and let a run over the directory rebuild
+it. With `--baseline` alone the run prints each case's delta against the
+file: a mutate, control, settings or restart row at any change, a query,
+show or list row past two requests or five percent, whichever is more, or
+at a changed crash window, plus the rows the baseline lacks and, within
+the measured environments and seeds, the rows the run lacks. The delta is
+a report, never a failure. A baseline that cannot be read or parsed fails
+the invocation, and its saved report says so.
 
 `--target`, `--storage` and `--seed` only narrow declared executions; all supplied
 filters must match. There are no environment IDs or runner format versions.
