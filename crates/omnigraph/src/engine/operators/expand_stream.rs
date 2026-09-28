@@ -1,7 +1,7 @@
 //! Expand aligns source rows with destination IDs in bounded output batches.
 //! A single unbound hop streams through `single_hop`; a bound edge runs the
 //! pair producer and its sort per input batch; multi-hop drains its frontier
-//! into the BFS breaker.
+//! into the BFS breaker, which emits its pairs a chunk at a time.
 
 use std::fmt;
 use std::sync::Arc;
@@ -21,7 +21,9 @@ use super::expand::{ExpandStep, GraphEnv};
 use super::memory::WorkMemory;
 use super::producer::{BatchSender, producer_stream};
 use super::{Switch, drain_one, external};
-use crate::engine::graph::{bound_edge_pair_schema, execute_expand, produce_bound_edge_pairs};
+use crate::engine::graph::{
+    ExpandedPairs, bound_edge_pair_schema, execute_expand, produce_bound_edge_pairs,
+};
 
 /// The most rows of one aligned output chunk, on all three strategies: the
 /// source columns of a chunk are one `WorkMemory::take`, reserved at twice
@@ -170,17 +172,22 @@ async fn emit_unbound(
     sender: &BatchSender,
     schema: &SchemaRef,
 ) -> Result<()> {
-    let pairs = execute_expand(
-        wide,
-        &env.graph_index,
-        &env.snapshot,
-        &env.catalog,
-        step,
-        switch,
-        memory,
-    )
+    execute_expand(wide, env, step, switch, memory, move |pairs| async move {
+        emit_pairs(wide, &pairs, memory, sender, schema)
+            .await
+            .map_err(|error| memory.error(error))
+    })
     .await
-    .map_err(external)?;
+    .map_err(external)
+}
+
+async fn emit_pairs(
+    wide: &RecordBatch,
+    pairs: &ExpandedPairs,
+    memory: &WorkMemory,
+    sender: &BatchSender,
+    schema: &SchemaRef,
+) -> Result<()> {
     let rows = output_rows(memory);
     for offset in (0..pairs.source_rows.len()).step_by(rows) {
         let work = Arc::new(memory.child("expand output chunk")?);
@@ -209,11 +216,7 @@ async fn emit_unbound(
 }
 
 pub(super) fn output_rows(memory: &WorkMemory) -> usize {
-    memory
-        .ctx
-        .session_config()
-        .batch_size()
-        .clamp(1, EXPAND_OUTPUT_ROWS)
+    memory.batch_rows().min(EXPAND_OUTPUT_ROWS)
 }
 
 pub(super) fn align_sources(
