@@ -212,8 +212,11 @@ pub(crate) fn record(kind: &str, value: serde_json::Value) {
             if events.overflow {
                 return;
             }
-            let event =
+            let mut event =
                 serde_json::json!({"kind": kind, "operation": events.operation, "value": value});
+            if let Ok(session) = crate::measure::SESSION.try_with(|s| s.label.slot) {
+                event["session"] = serde_json::json!(session);
+            }
             events.bytes += event.to_string().len();
             if events.bytes > LIMIT || events.values.len() + events.evidence.len() >= 100_000 {
                 events.overflow = true;
@@ -727,7 +730,11 @@ impl MeasureRow {
         match self.slot.as_str() {
             "setup" => "setup, before step 1".to_string(),
             "runner" => format!("runner, after step {}", self.step),
-            _ => format!("step {} (line {}, {})", self.step, self.line, self.kind),
+            "step" => format!("step {} (line {}, {})", self.step, self.line, self.kind),
+            session => format!(
+                "step {} (line {}, {session}: {})",
+                self.step, self.line, self.kind
+            ),
         }
     }
 
@@ -1401,7 +1408,7 @@ fn run_invocation(
         return Err("invalid_case: environment selector matches no declared environment".into());
     }
     for env in &selected_envs {
-        env.admit(!case.seams.is_empty())?;
+        env.admit(case.needs_dst())?;
     }
     for (ordinal, seams) in &case.seams {
         let step = case
@@ -1664,7 +1671,7 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
     {
         return Err("environment_changed: worker selection is not declared".into());
     }
-    input.environment.admit(!case.seams.is_empty())?;
+    input.environment.admit(case.needs_dst())?;
     match input.seed {
         None => {
             let settings::TokioRuntime::MultiThread {
@@ -1777,11 +1784,12 @@ impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for G
         _workload_seed: u64,
     ) -> Self::Output {
         use omnigraph::storage::StorageAdapter;
-        if self.input.measure {
+        let measure = self.input.measure.then(|| {
             let model = crate::measure::Model::named(&self.input.model)
                 .unwrap_or_else(|| crate::measure::Model::named("unit").expect("the unit model"));
-            crate::measure::install(model);
-        }
+            crate::measure::prepare(model)
+        });
+        crate::concurrent::install(measure);
         let base: std::sync::Arc<dyn StorageAdapter> = resources.adapter.clone();
         let decoration =
             omnigraph_dst::harness::FailingStorage::quiet(base, resources.root.clone());
