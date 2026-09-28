@@ -8,7 +8,7 @@ authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-28
 updated: 2026-09-28
-discussion: null
+discussion: "https://github.com/ModernRelay/omnigraph/pull/792"
 supersedes: []
 superseded_by: []
 blocked_on:
@@ -45,10 +45,10 @@ predicates live in `match`, a search call is a top-level conjunct, and the
 leading ranking call lives in `order`. This RFC adds a function, an argument
 type and a schema capability; it adds no clause. It is implemented on engine
 v2 and the compiler both engines share; engine v1 is frozen and refuses what
-it cannot run. RFC 0047 ([PR #PR0047](https://github.com/ModernRelay/omnigraph/pull/PR0047))
+it cannot run. RFC 0047 ([PR #791](https://github.com/ModernRelay/omnigraph/pull/791))
 owns the interim refusal of full-text search on an unindexed property, which
 this RFC's exact scan later lifts. RFC 0048
-([PR #PR0048](https://github.com/ModernRelay/omnigraph/pull/PR0048)) owns
+([PR #793](https://github.com/ModernRelay/omnigraph/pull/793)) owns
 retrieval beyond one lexical ranking: fusion, windows and populations.
 
 ## Motivation
