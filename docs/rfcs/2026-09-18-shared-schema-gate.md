@@ -91,9 +91,12 @@ No API, format, wire, or configuration change. Observable differences:
 
 - Cross-branch concurrent writers scale instead of serializing process-wide;
   same-branch writers keep today's ordering and conflict behavior.
-- A read no longer waits for an unrelated writer's publish window to capture
-  its catalog view; it waits only for an in-flight contract-lifecycle pass,
-  as it must.
+- A read no longer waits for another handle's publish window to capture its
+  catalog view; on the schema gate it waits only for an in-flight
+  contract-lifecycle pass, as it must. A read through the writer's own
+  handle still waits while that handle publishes on its bound branch: the
+  publish holds the handle's coordinator lock across the manifest
+  compare-and-swap, and the capture needs it (see Unresolved questions).
 - A schema apply or system-column upgrade still waits for every in-flight
   shared holder to drain, then excludes all of them — the same fairness as
   today's mutex, made explicit by a write-preferring lock: once the exclusive
@@ -270,6 +273,13 @@ one-commit revert.
 - Group commit (RFC 0067 path step 3) restructures the same critical section
   at the publisher; it composes with this change (it needs concurrent
   arrivals, which this change creates) and is a separate proposal.
+- Same-handle reads still wait on publication. A publish on a handle's bound
+  branch holds that handle's coordinator lock across the manifest
+  compare-and-swap (`commit_updates_on_branch_with_expected`), and a read
+  capture takes the same lock. The server shares one handle per graph, so its
+  reads on `main` still wait for its writes to `main`. Removing that wait means
+  publishing without holding the coordinator lock and installing the new view
+  afterwards; it is a separate change.
 
 ## Decision log
 
@@ -311,3 +321,38 @@ one-commit revert.
   the `omnigraph-core` extraction. The 22 acquisition sites, the classification
   and the DST arm carry over unchanged; the write capture's sentinel probe
   now uses the coordinator's `schema_apply_locked`.
+- 2026-09-28 — An independent review (Codex, `gpt-6-astra`) found three gaps,
+  each verified in the code. (1) The documentation overstated the read path:
+  a read on the writer's own handle still waits for that handle's coordinator
+  during a publish on its bound branch; the text now says so and the
+  remaining wait is listed under Unresolved questions. (2) The DST arm's
+  non-vacuity check counted only writer alternations; the harness now counts
+  applies that land between two writer commits, and requiring one exposed that
+  none ever had: the schema actor applied back to back the moment the start
+  barrier opened, and the write-preferring lock ran every apply before the
+  first writer commit. The actor now pauses a seeded 2–31 ms before each apply,
+  and every apply of every seed lands between writer commits. (3) The hunt ran
+  reader actors whose read-only opens take the exclusive side with no arbiter
+  hook, outside the turns `sched_escapes == 0` certifies; it runs without
+  readers now.
+- 2026-09-28 — The second half of RFC 0067's step 2, committing the detached
+  table effects before taking the gates, was measured and not adopted. With
+  timing probes in the write path, a single writer on one branch holds the
+  gates for 7.3 ms locally (revalidation 0.6 ms, detached commit 1.1 ms,
+  publication 5.6 ms) and 670 ms at +30 ms per round trip (298, 85 and 284 ms):
+  the detached commit is 13–15% of the hold. Revalidation fails on any move of
+  the branch head, so under same-branch contention nearly every attempt that
+  waited for the gate loses: 6.6 failed revalidations per publication locally
+  with eight writers, and 2.9 at +30 ms, where each failure holds the gate for
+  about 300 ms before giving up (about 19 s of a 30 s window, more than the
+  successful writes used). Committing detached before the gates would make
+  each of those losers write a commit that is dead on arrival — roughly seven
+  times the table writes, most of them garbage for the collector — to save at
+  most 15% of the hold. The per-table gate plan in RFC 0067 would also invert
+  the lock order: every production path takes table gates inside the branch
+  gate, and the key includes the branch, so they add no exclusion today. The
+  levers the measurement points to are a cheap in-process check that fails a
+  stale attempt before revalidation's round trips, fewer round trips in
+  revalidation itself, and footprint-granular admission, which is RFC 0067's
+  group-commit rule.
+

@@ -1895,8 +1895,8 @@ async fn cross_branch_writers_overlap_inside_schema_gate() {
     );
 }
 
-/// Reads capture their catalog under a SHARED schema permit, so a read no
-/// longer waits for a writer's publish hold (RFC
+/// Reads capture their catalog under a SHARED schema permit, so a read on
+/// another handle no longer waits for a writer's publish hold (RFC
 /// 2026-09-18-shared-schema-gate). Park a writer inside its envelope; a
 /// read on a second handle must complete while the writer is parked —
 /// under the former exclusive mutex this read would block until the
