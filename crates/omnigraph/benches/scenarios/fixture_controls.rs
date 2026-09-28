@@ -251,6 +251,10 @@ pub(super) async fn prepare_layout(uri: &str, args: &Args) -> serde_json::Value 
                     .keys()
                     .any(|key| key.starts_with("lance.auto_cleanup."))
             );
+            assert_eq!(
+                fragments_before, 1,
+                "copy-on-write publication leaves one __manifest fragment per branch"
+            );
             let versions = dataset
                 .versions()
                 .await
@@ -289,7 +293,6 @@ pub(super) async fn prepare_layout(uri: &str, args: &Args) -> serde_json::Value 
         }));
     }
     if let Some(before) = before {
-        assert!(removed > 0, "compacted arm must perform physical work");
         assert_eq!(
             graph_contract(uri).await,
             before,

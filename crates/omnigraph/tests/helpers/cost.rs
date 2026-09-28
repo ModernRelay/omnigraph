@@ -35,7 +35,7 @@ use object_store::{
 
 use omnigraph::db::Omnigraph;
 use omnigraph::instrumentation::{
-    MergeWriteProbes, QueryIoProbes, with_merge_write_probes, with_query_io_probes,
+    MergeWriteProbes, ProbedStores, QueryIoProbes, with_merge_write_probes, with_query_io_probes,
 };
 use omnigraph::loader::LoadMode;
 use omnigraph::settings::SessionSettings;
@@ -493,6 +493,40 @@ pub async fn cost_harness<F: Future>(body: F) -> F::Output {
         .await
 }
 
+/// Build persistent data and manifest probes whose counters a caller can extend.
+pub fn raw_io_probes(table: &IOTracker, manifest: &IOTracker) -> QueryIoProbes {
+    QueryIoProbes {
+        table_wrapper: Some(Arc::new(table.clone()) as Arc<dyn WrappingObjectStore>),
+        manifest_wrapper: Some(Arc::new(manifest.clone()) as Arc<dyn WrappingObjectStore>),
+        ..Default::default()
+    }
+}
+
+/// IO totals including Lance's direct local reader and writer.
+#[derive(Default)]
+pub struct ProbedIoCounts {
+    pub read_iops: u64,
+    pub read_bytes: u64,
+    pub write_iops: u64,
+    pub written_bytes: u64,
+}
+
+/// Use the same accounting as the concurrent-writes benchmark. Each store's
+/// tracker sees both object-store calls and direct local IO. The wrapper is
+/// drained only to bound its request log; adding it would double-count IO.
+pub fn drain_probed_io(wrapper: &IOTracker, stores: &ProbedStores) -> ProbedIoCounts {
+    let _ = wrapper.incremental_stats();
+    let mut totals = ProbedIoCounts::default();
+    for store in stores.stores() {
+        let stats = store.io_stats_incremental();
+        totals.read_iops += stats.read_iops;
+        totals.read_bytes += stats.read_bytes;
+        totals.write_iops += stats.write_iops;
+        totals.written_bytes += stats.written_bytes;
+    }
+    totals
+}
+
 /// Run a body with persistent raw Lance trackers for the data-table and graph-
 /// manifest stores. This is the shared wiring seam for instruments that need
 /// request-path attribution beyond [`IoCounts`] (for example recovery-object,
@@ -503,12 +537,7 @@ pub async fn with_raw_io_trackers<F: Future>(
     manifest: &IOTracker,
     body: F,
 ) -> F::Output {
-    let probes = QueryIoProbes {
-        table_wrapper: Some(Arc::new(table.clone()) as Arc<dyn WrappingObjectStore>),
-        manifest_wrapper: Some(Arc::new(manifest.clone()) as Arc<dyn WrappingObjectStore>),
-        ..Default::default()
-    };
-    with_query_io_probes(probes, body).await
+    with_query_io_probes(raw_io_probes(table, manifest), body).await
 }
 
 /// The tracker handles backing one measurement; read once into [`IoCounts`]. Data,

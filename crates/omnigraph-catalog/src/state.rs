@@ -128,16 +128,16 @@ struct ManifestScan {
     /// `lineage_rows`, it does not grow with commit history. OCC must distinguish
     /// a present head from an absent one (notably on a fresh named branch).
     graph_heads: HashMap<String, String>,
+    /// Every scanned row with all `manifest_schema()` columns, kept only on the
+    /// publish scan: the copy-on-write publish rewrites them.
+    live_rows: Vec<RecordBatch>,
 }
 
+/// The `__manifest` row schema. `object_id` keeps Lance's unenforced
+/// primary-key marker: every existing `__manifest` carries it and Lance treats
+/// the marker as fixed once set, so an overwrite must present it too. The
+/// publish CAS itself is the version commit of `commit::overwrite`.
 pub fn manifest_schema() -> SchemaRef {
-    // `object_id` is the merge-insert join key in the publisher; marking it as
-    // Lance's unenforced primary key engages row-level CAS at commit time, so
-    // two concurrent writers that try to land the same `object_id` row are
-    // detected by Lance via bloom-filter intersection (see
-    // `.context/merge-insert-cas-granularity.md`). Without this metadata,
-    // Lance's conflict resolver would silently rebase both writers' new
-    // fragments and admit duplicate rows.
     let object_id_metadata: HashMap<String, String> =
         [("lance-schema:unenforced-primary-key", "true")]
             .into_iter()
@@ -170,7 +170,7 @@ pub async fn read_manifest_state_with_registration_clocks(
             "registration-clock conversion requires a v6 source".to_string(),
         ));
     }
-    let scan = read_manifest_scan_with_clocks(dataset, false, None, true).await?;
+    let scan = read_manifest_scan_with_clocks(dataset, false, None, true, false).await?;
     manifest_state_from_scan(dataset.version().version, scan)
 }
 
@@ -197,6 +197,7 @@ pub async fn read_manifest_state_and_lineage(
         tombstones,
         lineage_rows,
         graph_heads,
+        live_rows: _,
     } = read_manifest_scan(dataset, true).await?;
     let state = assemble_manifest_state(
         version,
@@ -576,6 +577,8 @@ pub(crate) struct PublishScan {
     /// Exact `graph_head:<branch>` rows keyed by the branch suffix (`main` for
     /// main). Absence is meaningful and is preserved by a missing map entry.
     pub(crate) graph_heads: HashMap<String, String>,
+    /// The scanned rows themselves, the input of `commit::overwrite`.
+    pub(crate) live_rows: Vec<RecordBatch>,
 }
 
 pub(crate) async fn read_manifest_table_registrations(
@@ -592,7 +595,7 @@ pub(crate) async fn read_manifest_table_registrations(
 /// always on here (the publisher resolves a parent), so the lineage JSON decode
 /// rides the same pass as the table-state assembly instead of a second scan.
 pub(crate) async fn read_publish_scan(dataset: &Dataset) -> Result<PublishScan> {
-    let scan = read_manifest_scan(dataset, true).await?;
+    let scan = read_manifest_scan_with_clocks(dataset, true, None, false, true).await?;
     Ok(PublishScan {
         table_registrations: scan.table_registrations,
         version_entries: scan.version_entries,
@@ -608,6 +611,7 @@ pub(crate) async fn read_publish_scan(dataset: &Dataset) -> Result<PublishScan> 
             .collect(),
         lineage_rows: scan.lineage_rows,
         graph_heads: scan.graph_heads,
+        live_rows: scan.live_rows,
     })
 }
 
@@ -726,7 +730,7 @@ async fn read_manifest_scan_fragments(
     collect_lineage: bool,
     fragments: Option<Vec<lance_table::format::Fragment>>,
 ) -> Result<ManifestScan> {
-    read_manifest_scan_with_clocks(dataset, collect_lineage, fragments, false).await
+    read_manifest_scan_with_clocks(dataset, collect_lineage, fragments, false, false).await
 }
 
 async fn read_manifest_scan_with_clocks(
@@ -734,6 +738,7 @@ async fn read_manifest_scan_with_clocks(
     collect_lineage: bool,
     fragments: Option<Vec<lance_table::format::Fragment>>,
     use_row_update_versions: bool,
+    retain_live_rows: bool,
 ) -> Result<ManifestScan> {
     let historical;
     let dataset = if super::migrations::read_stamp(dataset) == Some(7)
@@ -753,20 +758,31 @@ async fn read_manifest_scan_with_clocks(
     // `object_id` is needed for the bounded graph-head authority decode on every
     // path; `base_objects` remains reserved/unused. Mirrors Lance's own
     // directory-catalog `__manifest` reads, which project only needed columns.
-    let mut projection: Vec<&str> = vec![
-        "object_id",
-        "object_type",
-        "location",
-        "metadata",
-        "table_key",
-        "stable_table_id",
-        "table_incarnation_id",
-        "table_version",
-        "table_branch",
-        "row_count",
-    ];
+    let mut projection: Vec<String> = if retain_live_rows {
+        manifest_schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect()
+    } else {
+        [
+            "object_id",
+            "object_type",
+            "location",
+            "metadata",
+            "table_key",
+            "stable_table_id",
+            "table_incarnation_id",
+            "table_version",
+            "table_branch",
+            "row_count",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    };
     if use_row_update_versions {
-        projection.push("_row_last_updated_at_version");
+        projection.push("_row_last_updated_at_version".to_string());
     }
     let is_delta_scan = fragments.is_some();
     let mut scanner = dataset.scan();
@@ -787,8 +803,12 @@ async fn read_manifest_scan_with_clocks(
     let mut tombstones = Vec::new();
     let mut lineage_rows = Vec::new();
     let mut graph_heads = HashMap::new();
+    let mut live_rows = Vec::new();
 
     while let Some(batch) = batches.try_next().await.map_err(OmniError::storage)? {
+        if retain_live_rows {
+            live_rows.push(batch.clone());
+        }
         // Reduce each batch before polling the next; the owned projection is
         // retained, but Arrow buffers for the complete journal are not.
         let batch = &batch;
@@ -1014,6 +1034,7 @@ async fn read_manifest_scan_with_clocks(
         tombstones,
         lineage_rows,
         graph_heads,
+        live_rows,
     })
 }
 

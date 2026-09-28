@@ -205,20 +205,14 @@ async fn optimize_after_load_then_again_is_idempotent() {
     );
 }
 
-/// RFC-013 step 2 + Phase 7 + Phase B: `optimize` compacts `__manifest`, which
-/// now accumulates one fragment per commit for BOTH the table-version rows and the
-/// folded-in graph-lineage rows (`graph_commit` + `graph_head`). Graph lineage
-/// lives entirely in `__manifest` (Phase B retired the commit-graph datasets), so
-/// `__manifest` is the only internal table optimize compacts. After compaction
-/// `__manifest` sheds fragments and writes no recovery sidecar (it is read at
-/// HEAD and every config/reserve/rewrite step is content-preserving), and the graph stays coherent for
+/// After 20 commits optimize finds `__manifest` (its only internal table) already
+/// one fragment, writes no recovery sidecar, and leaves the graph coherent for
 /// subsequent reads + strict writes.
 #[tokio::test]
-async fn optimize_compacts_internal_tables() {
+async fn optimize_leaves_the_one_fragment_manifest_alone() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
 
-    // Build version-history depth so `__manifest` accumulates fragments.
     for i in 0..20 {
         mutate_main(
             &db,
@@ -232,20 +226,13 @@ async fn optimize_compacts_internal_tables() {
 
     let stats = db.optimize().await.unwrap();
 
-    // `__manifest` carries every per-commit fragment (table versions + lineage)
-    // and compacts.
     let manifest_stats = stats
         .iter()
         .find(|s| s.type_key == "__manifest")
         .expect("optimize stats missing internal table __manifest");
     assert!(
-        manifest_stats.committed,
-        "__manifest should compact after 20 commits"
-    );
-    assert!(
-        manifest_stats.fragments_removed > 0,
-        "__manifest should shed fragments, removed {}",
-        manifest_stats.fragments_removed
+        !manifest_stats.committed && manifest_stats.fragments_removed == 0,
+        "every publish already rewrote __manifest as one fragment, so optimize must be a no-op on it: {manifest_stats:?}"
     );
 
     // `__manifest` is the only internal table optimize touches (Phase B retired

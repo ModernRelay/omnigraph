@@ -153,6 +153,7 @@ const ALLOW_LIST_FILES: &[&str] = &[
     "db/upgrade.rs",
     "db/upgrade/tests.rs",
     "omnigraph-catalog/migrations.rs",
+    "omnigraph-catalog/commit.rs",
     "omnigraph-core/lance_clone.rs",
 ];
 
@@ -790,8 +791,9 @@ durable_calls! {
     ("omnigraph-catalog/graph.rs", "Dataset::write(", 2, WriteProtocol::Bootstrap),
     ("omnigraph-catalog/publisher.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
     ("omnigraph-catalog/publisher.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("manifest publisher trait forwarding")),
-    ("omnigraph-catalog/publisher.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
-    ("omnigraph-catalog/publisher.rs", ".execute_reader(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
+    ("omnigraph-catalog/commit.rs", "InsertBuilder::new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
+    ("omnigraph-catalog/commit.rs", ".execute_uncommitted(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
+    ("omnigraph-catalog/commit.rs", "CommitBuilder::new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     // The persisted CSR/CSC adjacency artifact (`__graph_index/csr-current.bin`):
     // derived, regenerable topology written ONLY from `optimize`'s tail (never
     // the query path, which only loads), outside graph visibility — a stale or

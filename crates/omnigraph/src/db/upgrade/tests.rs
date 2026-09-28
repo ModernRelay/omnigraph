@@ -35,6 +35,7 @@ async fn synthetic_v6_fixture_with_branch(root: &str, create_branch: bool) {
     .unwrap();
     drop(db);
     settle_fixture_pins(root).await;
+    replay_manifest_as_merge_writer(root).await;
     let mut dataset = open(root, None).await.unwrap();
     dataset
         .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY, "6")])
@@ -57,6 +58,101 @@ async fn synthetic_v6_fixture_with_branch(root: &str, create_branch: bool) {
             .await
             .unwrap();
     }
+}
+
+/// Rebuild `__manifest` version by version with the merge-insert writer v6
+/// binaries used, so each row's `_row_last_updated_at_version` (the v6 → v7
+/// registration clock) is the version that wrote it, not the last overwrite.
+async fn replay_manifest_as_merge_writer(root: &str) {
+    use datafusion::arrow::compute::filter_record_batch;
+    use datafusion::arrow::util::display::array_value_to_string;
+    use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
+
+    let live = crate::db::manifest::manifest_uri(root);
+    let source = format!("{live}.overwrite");
+    std::fs::rename(&live, &source).unwrap();
+    let written = Dataset::open(&source).await.unwrap();
+    let row_keys = |batch: &RecordBatch| -> Vec<(String, String)> {
+        let ids = batch
+            .column_by_name("object_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        (0..batch.num_rows())
+            .map(|row| {
+                let values = batch
+                    .columns()
+                    .iter()
+                    .map(|column| array_value_to_string(column, row).unwrap())
+                    .collect::<Vec<_>>()
+                    .join("\u{1f}");
+                (ids.value(row).to_string(), values)
+            })
+            .collect()
+    };
+    let mut previous: HashMap<String, String> = HashMap::new();
+    let mut replayed: Option<Dataset> = None;
+    for version in written.versions().await.unwrap() {
+        let at = written.checkout_version(version.version).await.unwrap();
+        let schema = Arc::new(Schema::from(at.schema()));
+        let rows = at.scan().try_into_batch().await.unwrap();
+        let rows = RecordBatch::try_new(schema.clone(), rows.columns().to_vec()).unwrap();
+        let keys = row_keys(&rows);
+        let changed = arrow_array::BooleanArray::from_iter(
+            keys.iter()
+                .map(|(id, values)| Some(previous.get(id) != Some(values))),
+        );
+        let delta = filter_record_batch(&rows, &changed).unwrap();
+        previous = keys.into_iter().collect();
+        let next = match replayed.take() {
+            None => Dataset::write(
+                arrow_array::RecordBatchIterator::new(vec![Ok(rows)], schema),
+                &live,
+                Some(WriteParams {
+                    mode: WriteMode::Create,
+                    enable_stable_row_ids: true,
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    skip_auto_cleanup: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+            Some(mut dataset) if delta.num_rows() == 0 => {
+                let metadata = at.schema().metadata.clone();
+                dataset.update_schema_metadata(metadata).await.unwrap();
+                dataset
+            }
+            Some(dataset) => {
+                let mut merge =
+                    MergeInsertBuilder::try_new(Arc::new(dataset), vec!["object_id".to_string()])
+                        .unwrap();
+                merge.when_matched(WhenMatched::UpdateAll);
+                merge.when_not_matched(WhenNotMatched::InsertAll);
+                merge.conflict_retries(0);
+                merge.use_index(false);
+                merge.skip_auto_cleanup(true);
+                let (dataset, _) = merge
+                    .try_build()
+                    .unwrap()
+                    .execute_reader(Box::new(arrow_array::RecordBatchIterator::new(
+                        vec![Ok(delta)],
+                        schema,
+                    )))
+                    .await
+                    .unwrap();
+                Arc::try_unwrap(dataset).unwrap_or_else(|arc| (*arc).clone())
+            }
+        };
+        assert_eq!(
+            next.version().version,
+            version.version,
+            "the replay must land each written version at the same version number"
+        );
+        replayed = Some(next);
+    }
+    std::fs::remove_dir_all(&source).unwrap();
 }
 
 /// Replay every pin before a fixture is restamped as an older format: a
