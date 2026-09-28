@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - Azim Afroozeh
 created: 2026-09-09
-updated: 2026-09-13
+updated: 2026-09-28
 discussion: null
 supersedes: []
 superseded_by: []
@@ -18,7 +18,6 @@ blocked_on:
 
 # RFC 0064: Explicit storage upgrades
 
-> Number provisional: recheck the registry and open reservations before publication.
 > A term in ***bold italics*** is defined at that spot.
 
 ## Summary

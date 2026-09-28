@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - azimafroozeh
 created: 2026-09-09
-updated: 2026-09-10
+updated: 2026-09-28
 discussion: null
 supersedes: []
 superseded_by: []
@@ -19,8 +19,6 @@ blocked_on:
 ---
 
 # RFC 0065: Isolated branch merge publication
-
-> Number provisional: recheck the registry and open reservations before publication.
 
 ## Summary
 

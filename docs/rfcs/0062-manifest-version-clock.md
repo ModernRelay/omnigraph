@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-09-07
-updated: 2026-09-09
+updated: 2026-09-28
 discussion: null
 supersedes: []
 superseded_by: []
@@ -15,9 +15,6 @@ blocked_on: []
 ---
 
 # RFC 0062: Manifest version as the table registration clock
-
-> Number provisional: this RFC takes the registry's next available number at
-> drafting time; the number is re-checked when the PR opens.
 
 > A term set in ***bold italics*** is being defined at that exact spot.
 

@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-09-04
-updated: 2026-09-06
+updated: 2026-09-28
 discussion: https://github.com/ModernRelay/omnigraph/pull/626
 supersedes: []
 superseded_by: []
@@ -18,11 +18,6 @@ blocked_on: []
 
 > A term set in ***bold italics*** is being defined at that exact spot; it is
 > used plain everywhere after.
-
-> The number is provisional: `0055` is the next available number at the
-> upstream commit this document is anchored to, and the file, the heading,
-> the frontmatter, and the registry row are renumbered together before the
-> PR merges if another RFC has taken it by then.
 
 ## Summary
 
@@ -1284,11 +1279,10 @@ are not separate PRs, and no state between them ever exists on `main`.
    `omnigraph branch` verbs are
    untouched.
 
-The RFC PR adds this file as `docs/rfcs/0055-gq-branch-statements.md`, its
-registry row, and the next-number bump to `0056` in the same PR, with
-`scripts/check-docs.py` green. The one-language RFC's families land as
-their own PR sets, citing this RFC for the rules they inherit; neither its
-phase 1 nor this RFC's PR waits on the other: whichever lands first
+The RFC PR adds this file as `docs/rfcs/0055-gq-branch-statements.md` and its
+registry row, with `scripts/check-docs.py` green. The one-language RFC's
+families land as their own PR sets, citing this RFC for the rules they inherit;
+neither its phase 1 nor this RFC's PR waits on the other: whichever lands first
 introduces the `QueryFile` enum, and the other extends it (that RFC's Rollout names
 the variant it adds and the general spelling it gives the refusal strings
 in User and operational behavior).

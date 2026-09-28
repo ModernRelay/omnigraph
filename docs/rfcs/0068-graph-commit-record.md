@@ -7,21 +7,18 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-09-15
-updated: 2026-09-15
+updated: 2026-09-28
 discussion: null
 supersedes: []
 superseded_by: []
 blocked_on:
-  - "RFC 0068 accepted: the pin shape this record carries and the promotion reconciler that consumes it."
+  - "RFC 0067 accepted: the pin shape this record carries and the promotion reconciler that consumes it."
   - "Cost instrument: object operations per publication and per current-state read flat at depths 10, 100, 1,000 and 10,000 on file, S3 and Azure, checked in under the existing cost owners."
   - "Concurrency evidence: the probe-14 race and lost-acknowledgement cases on the configured S3 and Azure suites, and DST scenarios for concurrent publishers, stale hints and missing checkpoints."
   - "Conversion: a lossless offline route from the v10 `__manifest` journal to records and checkpoints, and the refusal fence for older binaries."
 ---
 
 # RFC 0068: Graph commit record
-
-> Number provisional: the registry names 0067 as next available at drafting
-> time; recheck when the PR opens.
 
 **Depends on:** [RFC 0067](0067-detached-table-commits.md) for private
 table effects, the three-field pin, and promotion. This RFC changes only
@@ -54,7 +51,7 @@ The `__manifest` Lance dataset, its per-branch native refs, its journal fold,
 the registration clock of RFC 0062, and the clone adapter that repairs
 inherited index bases for it are retired. Graph branches become
 ***streams*** of records with a metadata object each. Promotion under RFC
-0066 runs lazily, by the next writer or by `cleanup`, so a content write is
+0067 runs lazily, by the next writer or by `cleanup`, so a content write is
 staging, one detached commit per touched table in parallel, and one
 conditional create.
 
