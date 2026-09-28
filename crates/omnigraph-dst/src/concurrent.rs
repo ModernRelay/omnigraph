@@ -203,6 +203,11 @@ pub struct ConcurrentReport {
     /// maintenance actor, a dying/faulted writer's recovery pass, or a
     /// branch actor (none of these writes a writer-encoded person value).
     pub maintenance_commits: usize,
+    /// Empty person-diff commits (maintenance, schema applies) that landed
+    /// with a writer's data commit both before and after them in main's
+    /// lineage: evidence that such a commit interleaved with the writers
+    /// rather than running entirely before or after them.
+    pub era_commits_between_data: usize,
     /// Era commits legally unreadable at final audit because a concurrent
     /// Cleanup retired their versions (the retention horizon, live). The
     /// prefix-membership judge covers the claims that landed there.
@@ -1550,7 +1555,7 @@ fn schema_life(
     start: Arc<std::sync::Barrier>,
     sched_ctx: Option<(Arc<SeamScheduler>, usize)>,
 ) -> (usize, usize) {
-    let (runtime_seed, ulid_seed, _workload_seed) = seeds3;
+    let (runtime_seed, ulid_seed, workload_seed) = seeds3;
     let _ = rand::rng().reseed();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -1589,7 +1594,15 @@ fn schema_life(
         }
         let mut committed = 0usize;
         let mut retries = 0usize;
+        // Seeded pauses spread the applies across the writers' lifetime. A
+        // back-to-back burst queues the exclusive side the moment the barrier
+        // opens and, the lock being write-preferring, runs every apply before
+        // the first writer commit — no contention at all. REAL time, like the
+        // writers' think time: this universe holds no virtual clock.
+        let mut stream = SplitMix64(workload_seed);
         for count in 1..=ops {
+            let pause_ms = 2 + stream.next_u64() % 30;
+            tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
             let desired = schema_with_extras(count);
             let mut occ_retries = 0usize;
             loop {
@@ -2349,6 +2362,9 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                     let mut below_horizon = 0usize;
                     let mut islands = 0usize;
                     let mut maintenance_commit_count = 0usize;
+                    // `true` for a data commit, `false` for an empty-diff
+                    // commit, in lineage order.
+                    let mut era_sequence: Vec<bool> = Vec::new();
                     let mut attributed: Vec<AttributedCommit> = Vec::new();
                     let mut prev: Option<BTreeMap<String, i64>> = None;
                     let mut s0: Option<BTreeMap<String, i64>> = None;
@@ -2426,7 +2442,9 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                                                  schema actor — unattributable commit"
                                             );
                                             maintenance_commit_count += 1;
+                                            era_sequence.push(false);
                                         } else {
+                                            era_sequence.push(true);
                                             // Decode every change; ARM 3: a commit
                                             // whose changes ALL belong to the branch
                                             // actor is a MERGE commit folding a whole
@@ -2584,6 +2602,15 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                         maintenance_retries,
                         maintenance_cleanups,
                         maintenance_commits: maintenance_commit_count,
+                        era_commits_between_data: era_sequence
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, data)| {
+                                !**data
+                                    && era_sequence[..*i].iter().any(|d| *d)
+                                    && era_sequence[i + 1..].iter().any(|d| *d)
+                            })
+                            .count(),
                         schema_committed,
                         schema_retries,
                         below_horizon,

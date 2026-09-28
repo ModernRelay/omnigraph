@@ -4710,7 +4710,9 @@ fn dst_maintenance_actor_first_contact() {
 /// schema contention), every apply commits (writers cannot starve the
 /// exclusive side), each apply lands exactly one empty-person-diff era
 /// commit, and — across the seed budget — the writers genuinely interleaved
-/// (alternations ≥ 1 somewhere, or the green is vacuous). Plain mode only:
+/// (`alternations` ≥ 1 somewhere) and at least one apply landed between two
+/// writer commits (`era_commits_between_data` ≥ 1 somewhere); otherwise the
+/// green is vacuous. Plain mode only:
 /// an apply's table rewrite runs on the single `lance-cpu` pool thread,
 /// which the seam arbiter deliberately cannot see, so under the seam
 /// scheduler its stall budget trips on a loaded machine (measured: 0, 4,
@@ -4723,8 +4725,8 @@ fn dst_maintenance_actor_first_contact() {
 fn dst_schema_apply_racing_writers_first_contact() {
     use omnigraph_dst::concurrent::{ConcurrentScenario, run_concurrent_universe};
     let mut interleaved_somewhere = false;
+    let mut apply_between_writes = false;
     for seed in dst_seeds(&[24_301, 24_302, 24_303]) {
-        let sched = false;
         let root = format!("shared-memory://dst-s24-schema-{seed}");
         let sc = ConcurrentScenario {
             seed,
@@ -4736,7 +4738,7 @@ fn dst_schema_apply_racing_writers_first_contact() {
             branch_cycles: 0,
             readers: 1,
             writer_fault_pct: 0,
-            seam_schedule: sched,
+            seam_schedule: false,
             park_deleter_hold: false,
         };
         let report = run_concurrent_universe(&root, &sc);
@@ -4752,23 +4754,17 @@ fn dst_schema_apply_racing_writers_first_contact() {
             report.maintenance_commits, 3,
             "each apply lands exactly one empty-person-diff era commit"
         );
-        if sched {
-            assert_eq!(
-                report.sched_escapes, 0,
-                "the schema permits' turn/epoch protocol must keep the \
-                 interleaving seed-ordered (strict replay)"
-            );
-        }
         interleaved_somewhere |= report.alternations >= 1;
+        apply_between_writes |= report.era_commits_between_data >= 1;
         println!(
-            "dst s24 schema [seed={seed} sched={sched}]: committed={} occ_retries={} \
-             schema(committed={} retries={}) alternations={} sched_escapes={}",
+            "dst s24 schema [seed={seed}]: committed={} occ_retries={} \
+             schema(committed={} retries={}) alternations={} applies_between_writes={}",
             report.committed,
             report.occ_retries,
             report.schema_committed,
             report.schema_retries,
             report.alternations,
-            report.sched_escapes
+            report.era_commits_between_data
         );
     }
     assert!(
@@ -4776,11 +4772,19 @@ fn dst_schema_apply_racing_writers_first_contact() {
         "no seed produced interleaved writer commits — a vacuous green for the \
          concurrency claim; widen the seed budget"
     );
+    assert!(
+        apply_between_writes,
+        "no seed landed a schema apply between two writer commits — the applies \
+         never contended with the writers; widen the seed budget"
+    );
 }
 
 /// The schema-arm hunt instrument: wider seeds, scheduler on, faults on —
 /// run explicitly when hunting interleavings around the shared/exclusive
-/// boundary (`OMNIGRAPH_DST_SEEDS` widens the search).
+/// boundary (`OMNIGRAPH_DST_SEEDS` widens the search). No readers: a reader
+/// opens read-only handles, which take the schema gate's exclusive side with
+/// no arbiter hook, so their gate transitions would fall outside the turns
+/// that `sched_escapes == 0` certifies.
 #[test]
 #[serial]
 #[ignore = "hunt: schema-apply-vs-writers interleaving search — run explicitly"]
@@ -4800,7 +4804,7 @@ fn dst_schema_apply_racing_writers_hunt() {
             schema_ops: 4,
             kill_writer: None,
             branch_cycles: 0,
-            readers: 2,
+            readers: 0,
             writer_fault_pct: 10,
             seam_schedule: true,
             park_deleter_hold: false,
