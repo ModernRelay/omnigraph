@@ -13,7 +13,7 @@ supersedes: []
 superseded_by: []
 blocked_on:
   - "Dependency: the shared schema gate (PR #783) merged; the publisher takes its shared side once per batch."
-  - "Surface guard: the fragments of several strict inserts, each staged against one pin, commit as one detached transaction from a later pin of the same table: the rows are the union, row ids come fresh from the later pin's counter, Lance derives the row-version metadata at commit, and the change feed's one-transaction proof and merge's insert-absence proof accept the result."
+  - "Surface guard: the raw, unassigned fragments of several strict inserts and pure-insert upserts, each staged against one pin, commit as one detached transaction from a later pin of the same table: the rows are the union, fragment and row ids come fresh from the later pin's counters, Lance derives the row-version metadata at commit, and the change feed's one-transaction proof and merge's insert-absence proof accept the result."
   - "Correctness: the admission matrix under Evidence and tests, failpoints around the composed detached commits and the compare-and-swap including the in-doubt read-back, and the DST concurrent universe with the publisher on (every acknowledged write visible exactly once, one actor per commit)."
   - "Instrument: `concurrent-writes` with eight writers on one branch, local and on RustFS at +30 ms per round trip, above one writer's rate on the same build (31.7 and 0.87 commits/s on `b14c22c5` with PR #783), with one writer within noise of today and per-writer commit counts within a factor of two of each other (#784)."
 ---
@@ -60,9 +60,11 @@ Two decisions keep this small:
   publication, breaks every one of them (Alternatives).
 - **Same-table inserts compose by key.** Fragments that independent writers
   wrote against one table commit as one transaction, the shape Lance
-  documents for distributed writes. This is the case the measurement
-  needs: every writer in the `concurrent-writes` benchmark inserts rows into
-  one table, so admission by disjoint tables alone would batch nothing.
+  documents for distributed writes. This covers strict inserts, and upserts
+  that inserted every row because none of their keys existed yet. That is
+  the case the measurement needs: every writer in the `concurrent-writes`
+  benchmark inserts new keys into one `@key` table, which the engine stages
+  as upserts, so admission by disjoint tables alone would batch nothing.
 
 A batch holds the writes of one actor, because a commit row names one actor.
 A write that names an expected graph head always publishes alone. No storage
@@ -127,11 +129,20 @@ the tables other entries wrote. All eight benchmark writers insert `Chunk`
 rows, so that rule admits one entry per batch. Insert-heavy ingestion into
 a few types is the common production shape too.
 
+`Chunk` declares `slug: String @key`. An `insert` into a keyed node type is
+staged as an upsert (`PendingMode::Upsert`, `exec/mutation.rs`), so that a
+later update in the same query coalesces with it. Composition therefore has
+to cover upserts, not only strict inserts. An upsert whose keys all turned
+out absent has made the same read a strict insert makes, key absence at its
+base, and its staged transaction only appends.
+
 Lance itself tracks conflicts between concurrent inserts at key grain: a
 merge-insert `Update` carries `inserted_rows`, a key-existence filter "used
-for conflict detection" (transaction specification, Update). The engine
-already carries the exact ids of a production strict insert on its
-`StagedWrite`.
+for conflict detection" (transaction specification, Update). That filter is
+a Bloom filter, so the exact ids cannot be recovered from it. The engine
+knows an insert's ids while staging, but it does not keep them. A doc
+comment on `StagedWrite` (`table_store.rs`) still describes such a field;
+the field itself is gone. Keeping the ids is a prerequisite (Rollout).
 
 ## User and operational behavior
 
@@ -148,13 +159,23 @@ already carries the exact ids of a production strict insert on its
   (`Omnigraph-If-Graph-Commit`, or `expected_head` in the SDK) is always its
   own commit, and that commit's parent is the named head.
 - **Errors.** A write the publisher refuses at admission gets the typed
-  read-set conflict (`ReadSetChanged`). The existing bounded re-prepare
-  loop already handles it; for an insert-only mutation that loop retries up
-  to 32 times. A publication whose outcome is in doubt gives every write in
-  the batch the in-doubt error, naming the batch's commit id.
-- **Fairness.** Entries are admitted in arrival order. A refused entry
-  re-prepares and keeps its original place, so a writer that just published
-  cannot overtake the writers it made stale (#784).
+  read-set conflict (`ReadSetChanged`), as it does today when revalidation
+  fails. The existing retry contract is unchanged:
+  - an insert-only mutation re-prepares, up to 32 times;
+  - an Append or Merge load re-prepares;
+  - an update, a delete and an Overwrite load return the conflict to the
+    caller (`exec/mutation.rs`, `loader/mod.rs`).
+
+  A publication whose outcome is in doubt gives every write in the batch the
+  in-doubt error, naming the batch's commit id.
+- **Fewer conflicts.** Today any publication on the branch refuses every
+  write prepared before it. Under this RFC, a write is refused only when a
+  publication since its capture touched its footprint. An update that today
+  fails because an unrelated table changed now succeeds.
+- **Fairness.** Entries are admitted in arrival order. A refused entry that
+  re-prepares keeps its original place, so a writer that just published
+  cannot overtake the writers it made stale (#784). This holds for the kinds
+  that re-prepare automatically, which include the benchmark's writes.
 - **Cancellation.**
   - A caller that goes away before its entry is admitted is dropped from the
     queue.
@@ -186,36 +207,57 @@ before submission:
 Instead of taking the gates in `commit_all`, it submits an **entry** and
 waits for its outcome. An entry holds:
 
-- the captured authority: branch incarnation, graph head H0, schema
-  identity, and the caller's expected head if any;
+- the captured authority. That is the branch incarnation, the schema
+  identity, the caller's expected head if any, and the two heads the write
+  transaction already distinguishes (`WriteTxn`, `db/omnigraph.rs`):
+  - the **materialized head** H0, the branch's `graph_head` row, which the
+    publisher's `ExactGraphHead` compares;
+  - the **effective head**, which a fresh named branch inherits from its
+    fork point before its first publication, and which the caller's
+    expected head is compared against.
 - for each written table, the staged write, the pin it was staged from, and
   its class (below);
-- the **read footprint**: every table the write's validation read that it
-  does not write. Edge-endpoint existence reads the two endpoint node
-  tables. A node delete's cascade and referential checks read every edge
-  table incident to its type. An overwrite load's referential checks read
-  edge tables outside the load.
-- the actor and an arrival ticket.
+- the **footprint**: every table the write read or wrote, which is the union
+  of:
+  - its written tables;
+  - its **execution reads**: every table execution opened through
+    `ensure_path`. That includes a predicate scan that matched nothing and
+    therefore staged nothing. These are the tables
+    `MutationStaging.expected_versions` records today (`exec/staging.rs`).
+  - its **validation reads**, which today are derivable from the changeset
+    and the catalog but recorded nowhere:
+    - edge-endpoint existence reads the two endpoint node tables;
+    - a node delete's cascade and referential checks read every edge table
+      incident to its type;
+    - an overwrite load's referential checks read edge tables outside the
+      load.
 
-Today these reads are derivable from the changeset and the catalog but
-recorded nowhere. `MutationStaging.expected_versions` covers only the tables
-opened through `ensure_path` (`exec/staging.rs`, `validate.rs`). Recording
-them is the first rollout step.
+    Recording them is the first rollout step.
+- the actor and an arrival ticket.
 
 Each written table is in one of two classes:
 
 - **Append-only**, when all of these hold:
-  - the write is a strict insert;
-  - its staged transaction adds fragments and removes or updates none;
-  - its exact inserted ids fit the per-entry cap;
-  - its table is a node table with no non-key `@unique` group, or an edge
-    table with no bounded `@card`.
+  - the write on that table is a strict insert, or an upsert;
+  - its staged transaction on that table adds fragments and removes or
+    updates none, so an upsert matched no existing key;
+  - it carries the exact ids of its inserted rows, within the per-entry cap;
+  - the table has no non-key `@unique` group, whether it is a node table or
+    an edge table (`validate.rs` checks both against committed rows);
+  - an edge table has no bounded `@card`.
 
-  Validation of such a write reads only the key-absence probe on its own
-  table and, for an edge, the existence of its endpoints.
-- **Exclusive** covers everything else: update, delete, upsert, overwrite,
-  cascades, non-key uniqueness, bounded cardinality (whose check reads a
-  fresh live version, `validate.rs`), and oversized id sets.
+  Validation of such a write reads only key absence on its own table (the
+  strict-insert probe, or the upsert's join that matched nothing) and, for
+  an edge, the existence of its endpoints.
+- **Exclusive** covers everything else:
+  - updates, deletes, upserts that matched a key, and overwrites;
+  - cascades;
+  - non-key uniqueness;
+  - bounded cardinality, whose check reads a fresh live version
+    (`validate.rs`);
+  - oversized id sets.
+
+  An entry with any exclusive table is an exclusive entry.
 
 ### The publisher
 
@@ -232,18 +274,28 @@ It runs one batch at a time:
    the publisher does not take them.
 2. **Revalidate once** with the checks `revalidate_write_txn` runs per
    write today: the schema-apply sentinel, the branch authority probe and
-   the schema contract. This yields the current head Hc and its pins.
+   the schema contract. This yields the current materialized head Hc, the
+   current effective head, and the current pins. On a fresh named branch
+   before its first publication the materialized head is absent while the
+   effective head is the fork point. Below, Hc always means the
+   materialized head.
 3. **Log check.** If Hc is not the head the publisher's last batch
    produced, another publication landed; clear the effect log.
 4. **Admit** queued entries in ticket order, up to caps on entries and on
    composed fragments. The fragment cap keeps a composed transaction inline
    in its manifest.
    - An entry of another actor stays queued and leads the next batch.
-   - An entry with an expected head is admitted only as the batch's first
-     entry and only when Hc equals that head, and it closes the batch.
+   - An entry with an expected head is admitted only under all of these,
+     and it then closes the batch:
+     - it is the batch's first entry;
+     - the current effective head equals its expected head;
+     - Hc equals the materialized head it captured.
+
+     This is exactly the pair of checks `revalidate_write_txn` makes today.
 5. **Commit** each table's effect detached from the table's pin at Hc,
-   stamped with the staging witness (branch incarnation, Hc). Tables commit
-   in parallel.
+   stamped with the staging witness (branch incarnation, Hc). Hc is the
+   exact materialized head the publication's precondition names. Tables
+   commit in parallel.
 6. **Publish** with `publish_with_precondition`, passing:
    - one `DatasetUpdate` per table;
    - the expected versions at Hc for every table in the batch's footprints;
@@ -277,21 +329,32 @@ this batch. k is admitted when all three hold:
    batch's.
 2. **Horizon.** Every commit in (H0, Hc] is in the effect log, so this
    publisher published it, and there are at most K of them.
-3. **Conflicts.** k's footprint is its written tables plus its read
-   footprint.
-   - If k has any exclusive table, no writer wrote any table in k's
+3. **Conflicts.** Against k's footprint:
+   - If k is an exclusive entry, no writer wrote any table in its
      footprint.
    - If k is append-only:
-     - no writer wrote any table in k's footprint exclusively;
+     - no writer wrote any table in its footprint exclusively;
      - for every table that k and a writer both appended to, their id sets
        are disjoint.
 
-The second case follows from what validation read. An append-only entry
-read the absence of its own ids and the existence of its endpoints. Appends
-by other writers with other ids preserve both; an exclusive write to any
-footprint table may not. An exclusive entry read rows or absences of
-arbitrary shape, such as a predicate scan, a cascade, or referential
-emptiness, so any write to its footprint invalidates it.
+The second case follows from what the entry read. An append-only entry read
+three things:
+- the absence of its own ids;
+- the existence of its endpoints;
+- any tables its execution opened. For a write that only inserts, those are
+  its written tables.
+
+Appends by other writers with other ids preserve all three; an exclusive
+write to any footprint table may not.
+
+An exclusive entry read rows or absences of arbitrary shape, such as a
+predicate scan (including one that matched nothing), a cascade, or
+referential emptiness. So any write to its footprint invalidates it. Leaving
+out a table that execution scanned but did not write would admit write skew.
+For example, T1 updates A and scans B for a value only T2 would set, while
+T2 does the reverse. Admitted together, both find nothing in their second
+scan, which is a result no serial order gives. Execution reads are
+therefore part of the footprint.
 
 The batch is conflict-serializable in admission order:
 
@@ -321,11 +384,30 @@ append-only entries; the admission rule excludes a mix.
   - row-version metadata: "leave them as `None`. Lance derives both while
     building the manifest" (distributed write).
 
-  The composed transaction carries the markers its components carry.
-  `omnigraph.no_by_source_delete` is copied. `omnigraph.insert_absence` is
-  minted again for the composed base: the admission proof establishes
-  absence at Hc with no further read, and a guard pins that the proof and
-  the merge chain's reading of it agree.
+  The union must be taken from each staged write's raw transaction, whose
+  fragments are still unassigned. `StagedWrite::new_fragments()` is not
+  usable here. It is the read-your-writes copy, with fragment and row ids
+  already provisionally assigned from the entry's own base, and Lance keeps
+  nonzero fragment ids and complete row-id metadata as given.
+
+  The composed transaction keeps the insertion-only shape the components
+  have, a merge-insert `Update` in `RewriteRows` mode with new fragments
+  only, and its markers:
+  - the key-existence filter is rebuilt from the union of the ids;
+  - the field lists stay those of the components, which are identical for
+    one table under one schema;
+  - a marker is kept only when every component carries it.
+    `omnigraph.no_by_source_delete` is stamped at the keyed merge-insert
+    chokepoint (`table_store.rs`).
+    `omnigraph.insert_absence` is certified for strict inserts and for
+    pure-insert upserts. When every component carries it, it is certified
+    again for the composed base: the admission proof establishes absence at
+    Hc with no further read, and a guard pins that merge's certificate
+    reader accepts it. The change feed's fast path accepts either marker
+    (`transaction_is_row_set_preserving`).
+
+  Copying the properties onto an arbitrary `Append` would not do, because
+  merge's certificate reader checks the shape.
 
 The commit goes through the sealed table adapter, as a new entry the
 durable-call guard registers. The change feed's fast path still applies. It
@@ -369,8 +451,10 @@ An entry's fragments are unreferenced from preparation until its batch's
 detached commit. The collector deletes a file that no manifest references
 only when the file is older than `UNVERIFIED_THRESHOLD_DAYS`, which is seven
 days. Every write already relies on that window between preparation and
-its detached commit. A bounded queue and the horizon keep an entry's wait
-many orders of magnitude inside it. A refused entry's fragments are the
+its detached commit. The queue and the horizon bound an entry's wait in
+publications, not in wall-clock time: a suspended process can outlive the
+window today, and it still can. This RFC inherits that assumption; it
+neither adds to it nor removes it. A refused entry's fragments are the
 orphans every failed revalidation leaves today, and the same age rule
 reclaims them.
 
@@ -417,8 +501,13 @@ reclaims them.
 - **Wire:** none.
 - **Behavior:** commit grain under concurrent writes by one actor (User and
   operational behavior).
-- **Reversal:** a batch cap of one entry reproduces today's behavior and is
-  the rollback.
+- **Reversal:** two settings together reproduce today's behavior, and they
+  are the rollback:
+  - a batch cap of one entry;
+  - a horizon of zero, which admits only entries captured at Hc.
+
+  A cap of one alone does not: an entry captured before an unrelated
+  publication would still be admitted, where today it is refused.
 
 ## Alternatives
 
@@ -462,24 +551,37 @@ reclaims them.
 ## Evidence and tests
 
 - **`lance_surface_guards.rs`: the composition guard.**
-  - Setup: strict inserts staged against pin P0, with a further append
-    landing in between, committed as one detached transaction from the later
-    pin.
-  - Pinned: rows, row ids, fragment ids, row-version metadata, and both
+  - Setup: strict inserts and pure-insert upserts staged against pin P0,
+    with a further append landing in between, committed as one detached
+    transaction from the later pin.
+  - The composed transaction is built from the raw transactions' unassigned
+    fragments. A second cell shows that composing the read-your-writes
+    copies instead reuses ids allocated from P0.
+  - Pinned: rows, row ids, fragment ids, row-version metadata, and the
     markers.
   - `changes.rs` and the merge owners assert that the feed's fast path and
     the merge chain's insert-absence proof accept the composed commit.
 - **`writes.rs`: the admission matrix.** Each cell asserts the commit count,
-  the rows, and which entry re-prepared.
-  - two appends with disjoint ids make one commit;
-  - the same id makes one commit, and the other entry re-prepares into its
-    key conflict;
-  - an append against an exclusive write on the same table;
-  - an edge insert against a delete on its endpoint type;
-  - bounded `@card` is exclusive;
-  - an expected head publishes alone;
-  - two actors make two commits;
-  - a publication by merge or by another handle between capture and batch.
+  the rows, and which entry re-prepared or failed.
+  - Appends with disjoint ids make one commit. This covers strict inserts,
+    and `insert` into a `@key` type, which is staged as an upsert.
+  - The same id: one commit, and the other entry re-prepares. A strict
+    insert then fails with its key conflict; an upsert becomes an update.
+  - An append against an exclusive write on the same table.
+  - Edges with a non-key `@unique` group are exclusive: two edge inserts
+    with the same unique value but different generated ids never share a
+    batch.
+  - Write skew through execution reads: T1 updates A and scans B for a value
+    that matches nothing, and T2 does the reverse. They never share a batch,
+    and the second fails with the conflict.
+  - An edge insert against a delete on its endpoint type.
+  - Bounded `@card` is exclusive.
+  - An expected head publishes alone, including the first conditional write
+    on a fresh named branch, whose materialized head is absent
+    (`writes.rs` already guards that case for single writes).
+  - Two actors make two commits.
+  - A publication by merge or by another handle between capture and batch.
+  - Horizon zero with a cap of one reproduces today's refusals.
 - **`failpoints.rs`.** For each window, assert what did not move:
   - after the composed detached commits and before publication;
   - a refused compare-and-swap, whose detached manifests are deleted;
@@ -501,8 +603,13 @@ reclaims them.
 
 Each step leaves `main` shippable.
 
-1. Record the read footprint and each staged table's class on the
-   mutation and load staging. No behavior change.
+1. On the mutation and load staging, record:
+   - the footprint, which is `expected_versions` plus the validation reads;
+   - each staged table's class;
+   - the exact ids of inserted rows on the staged write.
+
+   Remove `StagedWrite`'s dangling doc comment for the id field that no
+   longer exists. No behavior change.
 2. Add the publisher with batches of one. It replaces the gate section of
    `commit_all`, behavior is identical, and the cost owner and DST stay
    green.
@@ -541,3 +648,40 @@ Each step leaves `main` shippable.
     workload writes one table.
   - Chose detached commits after admission, because the collector's staging
     rule would otherwise sweep admitted entries.
+- 2026-09-28 — An independent review (Codex, `gpt-6-astra`) of the first
+  draft found the admission rule unsound in two cases and five further
+  gaps. All seven were checked against the code and corrected.
+  - Edges with a non-key `@unique` group were admissible as append-only,
+    which lets two edges with one unique value publish together. Non-key
+    uniqueness is now exclusive for edge tables too.
+  - The footprint counted only validation reads. A predicate scan that
+    matched nothing stages nothing, so two updates could each read the
+    table the other wrote and be admitted together (write skew). The
+    footprint now includes every table execution opened, which is what
+    `expected_versions` already records.
+  - Hc conflated the materialized head, which the publisher compares, with
+    the effective head, which a caller's expected head is compared against.
+    They differ on a fresh named branch before its first publication. The
+    two are now distinct.
+  - A batch cap of one did not restore today's behavior, because
+    cross-publication admission stayed on. The rollback is now a cap of one
+    with a horizon of zero.
+  - The fairness claim assumed every refused entry re-prepares. Only
+    insert-only mutations and Append or Merge loads do. The text now
+    states the existing retry contract.
+  - `insert` into a keyed type is staged as an upsert, so the motivating
+    benchmark would not have composed. The append-only class now includes
+    upserts whose staged transaction only appends.
+  - The exact inserted ids are not carried on `StagedWrite`; only a stale
+    doc comment remains. Carrying them is now a rollout prerequisite.
+
+  The review confirmed the rest: one commit per batch leaves the
+  commit-to-version consumers intact, Lance 11 can compose the raw
+  unassigned fragments at a later pin, and the collector's staging rule
+  holds with the materialized head as the witness. From the same review,
+  the RFC now also states:
+  - composition must use the raw transaction's fragments;
+  - the composed commit keeps a marker only when every component carries
+    it;
+  - the seven-day orphan window is an inherited wall-clock assumption, not
+    one this RFC bounds.
