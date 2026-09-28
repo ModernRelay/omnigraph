@@ -8,7 +8,7 @@ authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-03
 updated: 2026-09-28
-discussion: null
+discussion: "https://github.com/ModernRelay/omnigraph/pull/793"
 supersedes: []
 superseded_by: []
 blocked_on:
@@ -51,10 +51,10 @@ search predicates live in `match` and the leading ranking call lives in
 6. **Agent use.** Stored queries are the door, the schema is the prompt, and
    an in-context competence measurement decides between spellings.
 
-Related decisions: RFC 0047 ([PR #PR0047](https://github.com/ModernRelay/omnigraph/pull/PR0047))
+Related decisions: RFC 0047 ([PR #791](https://github.com/ModernRelay/omnigraph/pull/791))
 owns diagnostics, the ranked-root rule, one total order and the first read
 descriptors; the analyzed lexical search RFC
-([PR #PRLEX](https://github.com/ModernRelay/omnigraph/pull/PRLEX)) owns
+([PR #792](https://github.com/ModernRelay/omnigraph/pull/792)) owns
 analyzers, `terms(…)`, `match_terms` and the `bm25_v1` scorer. This RFC owns
 everything a ranking does beyond one lexical or vector score.
 
