@@ -2,24 +2,25 @@
 rfc: "2026-09-10-server-lifecycle-and-online-deployment"
 title: "Server lifecycle and online deployment"
 track: maintainer
-status: draft
+status: superseded
 implementation: not-started
 authors:
   - OmniGraph maintainers
 created: 2026-09-10
-updated: 2026-09-26
+updated: 2026-09-29
 discussion: https://github.com/ModernRelay/omnigraph/pull/697
 supersedes: []
-superseded_by: []
-blocked_on:
-  - Crash and restart proof for deployment publication, finalization and activation
-  - Durable deployment-evidence encoding, publication ordering and downgrade refusal
-  - Effect-free candidate construction or qualified engine reuse for each supported change class
-  - Versioned active-witness and current-state compatibility contract, including the ledger fields the server binds as deployment identity
-  - Qualified resource budgets for replacement overlap and completion capacity
+superseded_by:
+  - "2026-09-29-server-runtime-and-online-deployment"
+blocked_on: []
 ---
 
 # RFC: Server lifecycle and online deployment
+
+> **Superseded on 2026-09-29** by [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md).
+> The replacement remains a draft and is not implemented. This document is
+> retained as historical rationale; its obsolete mechanisms and dependencies
+> are not current implementation requirements.
 
 ## Summary
 

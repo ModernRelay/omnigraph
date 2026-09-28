@@ -7,9 +7,10 @@ implementation: complete
 authors:
   - ragnorc
 created: 2026-09-14
-updated: 2026-09-25
+updated: 2026-09-29
 discussion: null
-supersedes: []
+supersedes:
+  - "0065"
 superseded_by: []
 blocked_on:
   - "Engine: the promotion reconciler with idempotent, order-preserving, uuid-checked replay and its crash and two-process evidence."
@@ -1483,3 +1484,6 @@ claims).
   unknown outcome. The v11 root descriptions now include selected merge bases
   and exact graph/table tagged snapshots, not only the live retention policy.
   The historical v10 mechanism is unchanged.
+- 2026-09-29: Recorded reciprocal supersession of RFC 0065, making the
+  existing Alternatives disposition of private native branches as subsumed
+  explicit in metadata. No storage decision or implementation status changes.

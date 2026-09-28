@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - azimafroozeh
 created: 2026-09-26
-updated: 2026-09-26
+updated: 2026-09-29
 discussion: null
 supersedes: []
 superseded_by: []
@@ -25,9 +25,10 @@ carries the executed result column types that `--- expect shape` compares;
 until then a rows step under a server route fails preflight with
 `unsupported_capability: result_types`, after route admission. Add sequential lifecycle
 steps on the real process: kill or restart the server process, request
-shutdown and a physical assertion after containment. Directed concurrency
-(named clients, holds, joins) is a separate later RFC amending RFC 0045; rows
-that need it are listed here with that prerequisite. Authors will not configure
+shutdown and a physical assertion after containment. Engine-DST already has
+ordered concurrent blocks; server concurrency controls (named clients, holds,
+joins) require a later amendment to RFC 0045. Rows that need those controls
+are listed here with that prerequisite. Authors will not configure
 a connection profile or start a server.
 
 ***Deterministic simulation testing (DST)*** runs the system under controlled
@@ -49,11 +50,18 @@ admission, authorization, body ownership and shutdown behavior.
 The current [GQT admission code](../../crates/omnigraph-gqt/src/runner_config.rs)
 still parses a declared `target` field, recognizes both server names there
 and admits only the ordinary engine route on local filesystem storage without
-seams and engine-DST on in-memory storage when built with `tokio_unstable`;
+seams or concurrent blocks and engine-DST on in-memory storage when built with
+`tokio_unstable`;
 RFC 0045's route derivation replaces that field with the API each step names. Its
-[step loop](../../crates/omnigraph-gqt/src/lib.rs) awaits each authored step through
-one session. Overlapping operations need runner scheduling and attribution
-support beyond parser forms; that work is deferred to a separate RFC.
+[concurrent block](../../crates/omnigraph-gqt/README.md#concurrent-block), landed
+in PR #797, runs two to four parameterless query or mutation declarations on
+one handle under engine-DST. It orders session starts, completions and named
+object-store requests, including parking a request before its backing-store
+call. Session outcomes and script failures are replay-compared; `--measure`
+attributes requests to each session. Row assertions inside a block, control statements,
+separate handles, seam holds and server transports remain unsupported.
+This engine control does not prove ownership of accepted I/O after caller
+termination, and admits no server coverage.
 
 The [server launcher](../../crates/omnigraph-server/src/lib.rs) combines real
 listener setup, signal handling and an OS shutdown watchdog. The shared
@@ -143,14 +151,15 @@ profile or external URL is needed for the local route. Unsupported route and
 storage combinations continue to fail admission until their rollout gate
 passes.
 
-### Deferred: directed concurrency
+### Deferred: server concurrency controls
 
-This RFC defers directed concurrency: named clients, the Start, Hold, Wait,
+This RFC defers server concurrency controls: named clients, the Start, Hold, Wait,
 Release and Join controls, the operation registry, identities beyond the
 server epoch, retained-write ownership, a control channel into a running
 server process, relational receipt assertions and per-client principals. That
-work will be specified in its own RFC amending RFC 0045. Coverage rows in this
-RFC that need overlapping work carry the prerequisite "Concurrent controls
+work extends RFC 0045's existing engine concurrent blocks; their scheduling
+alone supplies none of these server capabilities. Coverage rows in this RFC
+that need overlapping server work carry the prerequisite "Server concurrent controls
 (separate RFC amending RFC 0045)". The sequential lifecycle steps on the real
 process (process kill or restart, request shutdown and physical assertion after
 containment) are in scope here. Modeled server restart and virtual-time advance
@@ -247,14 +256,18 @@ product capability remains a prerequisite; the adapter cannot supply it.
 
 Static input and capability validation happens before fixture effects. The
 runner then guards partial acquisitions while creating the minimal cluster
-configuration, graphs and local credentials required to boot. Before scenario
-dispatch, readiness compares `/readyz`'s
+configuration, graphs and local credentials required to boot. Before initial
+scenario dispatch, readiness compares `/readyz`'s
 `booted_serving_digest` and `state_revision` with the applied revision the
 runner wrote, digests the executable it spawned, and reads the backend from the
 runner-owned graph configuration; `/readyz` does not report the backend. Setup
 failure supplies no executed product coverage. A server epoch is identified by
 the server alias and a boot ordinal; restart steps create a new epoch and the
-report records both.
+report records both. Online deployment assertions additionally compare the
+qualified versioned active witness with the achieved revision and resource
+digests. The boot digest/revision remain boot facts and cannot prove a later
+activation. Missing active evidence leaves that assertion unqualified without
+changing the initial Local HTTP gate.
 
 The outer supervisor owns every worker, server and helper from spawn. A retained
 handle and containment domain cover the spawn-to-registration interval;
@@ -385,8 +398,8 @@ simulation claims are not widened by a step naming a server API.
 What each decision forces:
 
 - No test-control HTTP endpoint: lifecycle steps are supervisor actions on the
-  process, any in-process control waits for the concurrency RFC, and no feature-gated server
-  build.
+  process; in-process server controls wait for the server concurrency amendment.
+  This proposal uses no feature-gated server build.
 
 The nearest precedents are GQT's immutable worker input and reports, the
 existing seam catalog and server/CLI lifecycle support. This proposal extends
@@ -435,9 +448,12 @@ never by editing the expected value or the oracle's read.
 The T and B identifiers below name scenario families in this proposal. They
 require the production guarantees being exercised; testing infrastructure does
 not implement those guarantees. Current storage expectations follow the recovery
-contract above. Proposed ownership and activation work remains separately owned
-by [RFC 0035](0035-served-operation-ownership.md) and
-[RFC 0036](0036-atomic-runtime-activation.md).
+contract above. Production guarantees belong to
+[Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md#qualification),
+including [operation ownership](2026-09-29-server-runtime-and-online-deployment.md#operation-ownership)
+and [serving views](2026-09-29-server-runtime-and-online-deployment.md#serving-views).
+That RFC owns delivery gates; this proposal owns their scenario and evidence
+requirements.
 
 #### Execution scopes
 
@@ -471,31 +487,31 @@ totals alone cannot prove atomic publication.
 
 | Assertion ID | Scope | Required control and assertion | Independent oracle and sensitivity failure | Required evidence / prerequisite |
 |---|---|---|---|---|
-| T1.receipt | H + D + E | Hold changing merge A after publication, or no-op A after its outcome is established, before response construction; publish B; release A. Cover no-op, fast-forward and three-way through `POST /mutate` with a `branch merge` statement; the `/branches/merge` route stays with the server route suites. | Expected A outcome, parents, actor and manifest version from its bound result/history; return B's valid receipt deliberately and require failure. No-op creates no commit and retains its established target identity. | Operation/outcome bindings, publication identity where present, reached hold, wire receipt and protected history. Prerequisite: Concurrent controls (separate RFC amending RFC 0045); product exact-receipt contract; no-op receipts must carry the established target `graph_commit_id` (today `commit` is null); until then the no-op variant is refused. |
+| T1.receipt | H + D + E | Hold changing merge A after publication, or no-op A after its outcome is established, before response construction; publish B; release A. Cover no-op, fast-forward and three-way through `POST /mutate` with a `branch merge` statement; the `/branches/merge` route stays with the server route suites. | For a changing merge, expect A's own outcome, parents, actor and manifest version; substituting B's receipt fails. For no-op, an independent held outcome observation and protected history bound to A prove that A published nothing; the wire result is `already_up_to_date` with `commit: null`. Fabricating a receipt for that no-op fails. | Harness operation identity, established outcome, reached hold, protected history and wire response; publication identity only where a publication exists. Prerequisite: Server concurrent controls (separate RFC amending RFC 0045); [exact outcomes](2026-09-29-server-runtime-and-online-deployment.md#exact-outcomes). No additional no-op wire identity is required. |
 | T2.delivery | H + E | Suppress/truncate an already successful response; separately proxy 504 and caller timeout. | CLI request census proves one submission; accepted graph state proves effects despite delivery loss. Deliberate automatic resubmission must fail. | Actual CLI/server/proxy processes, wire attempts and final content; no inferred idempotency. Prerequisite: a transport control (response truncation, proxy 504, caller timeout) spelled in a later RFC 0045 amendment; until then the row's evidence stays with the CLI Rust owner. |
-| T2.compound | H + E | Permit merge but deny optional source deletion. | Independently verify merged target and retained source. The established behavior of merge-with-`delete_branch` is exit 0, the merge receipt on stdout and `warning: merged, but could not delete branch` on stderr with `branch_delete_error` carrying the authorization error; the row asserts exactly that shape. Asserting `branch_deleted` and `branch_delete_error` needs a receipt-field expect the format does not define; it is a prerequisite of this row. Changing it to a nonzero exit is a CLI decision outside this RFC. A deletion failure absent from both stderr and `branch_delete_error`, or a lost receipt, fails. | Per-action authorization/outcomes and physical/publication evidence. Prerequisite: a case-declared policy (a `--- runner` field, format addition owned by RFC 0045, not specified here); a receipt-field expect (format addition owned by RFC 0045). |
-| T3.retry | H + E | Exercise typed pre-admission 429, generic 409/503, recovery-required (RFC 0035 §5 `RecoveryRequired`), malformed success, precondition failure and earlier compound effects. | Expected CLI classifications from the product contract plus request/effect census. Treating unknown effects as safe replay must fail. | Exit/output records. A retry-specific exit code and the 429/409/503 classification are CLI contract prerequisites; today remote errors exit 1 and a lost `--if-commit` precondition exits 4 (`EXIT_PRECONDITION_FAILED`), and the managed-run exit 4 for recovery required is a different command family. Prerequisite: those CLI contract items; a transport control for malformed success and a recovery-required state fixture (later RFC 0045 amendment); Concurrent controls (separate RFC amending RFC 0045) for pre-admission 429. |
+| T2.compound | H + E | Permit merge but deny optional source deletion. | Independently verify merged target and retained source. The established behavior of merge-with-`delete_branch` is exit 0, the merge receipt on stdout and `warning: merged, but could not delete branch` on stderr with `branch_delete_error` carrying the authorization error; increment A additionally requires structured `branch_delete_error_details` while preserving that behavior. Asserting these deletion fields needs a receipt-field expect the format does not define; it is a prerequisite of this row. Changing it to a nonzero exit is a CLI decision outside this RFC. A deletion failure absent from both stderr and `branch_delete_error`, missing required structured error details, or a lost receipt fails. | Per-action authorization/outcomes and physical/publication evidence. Prerequisite: a case-declared policy (a `--- runner` field, format addition owned by RFC 0045, not specified here); a receipt-field expect (format addition owned by RFC 0045). |
+| T3.retry | H + E | Exercise typed pre-admission 429, generic 409/503, recovery-required ([authority and completion](2026-09-29-server-runtime-and-online-deployment.md#authority-and-completion), `RecoveryRequired`), malformed success, precondition failure and earlier compound effects. Include older servers with absent or unqualified receipt fields and typed retry responses carrying `Retry-After`. | Expected whole-command classifications from [exact outcomes](2026-09-29-server-runtime-and-online-deployment.md#exact-outcomes), plus request/effect census and version evidence. Unknown effects must never permit replay; an older server's receipt cannot establish own publication; structured output preserves `Retry-After`. | Exit/output, response headers and server-version evidence. The retry-specific exit code and classifications remain product prerequisites; current remote errors exit 1 and a lost `--if-commit` precondition exits 4, separately from managed-run recovery exit 4. Prerequisite: those CLI contract items; transport controls for malformed success, older-version fixtures and recovery-required state; Server concurrent controls (separate RFC amending RFC 0045) for pre-admission 429. |
 | T4.visibility | E + D | Fault mutation, multi-table load, merge and optimize around detached effects and graph publication, including acknowledgment loss and named branches. | Exact authored rows/types, table pins and lineage; unpublished detached artifacts may remain unreachable, but a visible participant prefix or duplicate publication fails. | Reached phase, raw outcome, physical accepted-state evidence; one-graph atomicity, no invented cross-graph transaction. Prerequisite: none for E, which keeps its engine-DST owner; D is the Deterministic server execution proposal; not claimable from this RFC. |
 | T4.progress | E + D | Fail staged-schema installation or schema-sentinel release, then remove a supported transient fault and issue sentinel work on the same live handle; repeat reopen twice. | Published table pins are final; no reconciler is needed ([recovery](../dev/recovery.md): no reconciler over pins). Required schema completion restores coherent execution and supported writes resume without duplicate publication. Forced reopen-only success fails. | Same-handle/process identity, pin/schema evidence and writer-specific supported/refused outcomes. Prerequisite: none for E, which keeps its engine-DST owner; D is the Deterministic server execution proposal; not claimable from this RFC. |
 | T4.foreign | E + H | Introduce a foreign linear version above the registration's `omnigraph.last_linear_version`. | Reads/writes use published pins; `repair` reports `foreign_drift` without adoption; cleanup preserves foreign manifests/files. Substituting foreign rows fails. | Before/after accepted-pin and foreign-artifact census under current detached-only semantics. Prerequisite: a fixture that constructs a foreign linear version (later RFC 0045 amendment; schema and JSONL seed cannot); until then its Rust owner `crates/omnigraph/tests/maintenance.rs` keeps it. |
 | T4.legacy | E + H | Present legacy graph sidecars to current read-write open/upgrade; inspect read-only behavior separately. | Evidence remains unchanged; writable paths refuse and name originating-build recovery. Deleting or interpreting legacy evidence as current repair fails. | Before/after artifact census and typed diagnostics; cluster recovery remains separate. Prerequisite: a fixture that constructs legacy graph sidecars (later RFC 0045 amendment; schema and JSONL seed cannot); until then its Rust owner `crates/omnigraph/tests/recovery.rs` keeps it. |
-| T5.disconnect | H + D + E | Close an incomplete body, then disconnect admitted mutations/merges at each relevant T4 boundary. | No effects for incomplete pre-admission requests; admitted work remains counted and settles; same-PID sentinel write succeeds. Freeing a disconnected write's capacity early fails. | Real HTTP/1 close; actual HTTP/2 reset for that claim once HTTP/2 is a declared server capability (product prerequisite); request/admission/settlement evidence. D modeled disconnect is additional evidence. Prerequisite: Concurrent controls (separate RFC amending RFC 0045); HTTP/2 reset additionally needs HTTP/2 as a declared server capability. |
-| T6.pending | D + E; H where required for ordinary behavior | The storage decoration owns an accepted pending write after caller cancellation, returned error or contained panic; attempt drain, replacement and teardown before explicit release. | Pending storage owner is independent of server status. Early permit release, drain proof, duplicate execution or namespace deletion must fail. After release, verify the actual backing-store effect and permitted graph visibility, then settlement; deliberately dropping the retained write must fail. | Acceptance and completion events, original/registered-successor attribution, reservations, publication identity where present and unresolved effects. An engine-call hold alone is insufficient. Prerequisite: Concurrent controls (separate RFC amending RFC 0045); RFC 0035 §6.4 and retained-write ownership in the storage decoration (part of the separate RFC). |
-| T7.shutdown | H + D | Park a write and stream producer; request shutdown; race activation; attempt new admission. | No admission after closure, one absolute deadline, no premature drain and no reopening old epoch. A renewed deadline or omitted producer fails. | D transition/timer ordering; H actual signal, grace and exit status. Worker watchdog expiry is a harness failure, not a simulated pass. Prerequisite: Concurrent controls (separate RFC amending RFC 0045); RFC 0035 §8. |
+| T5.disconnect | H + D + E | Close an incomplete body, then disconnect admitted mutations/merges at each relevant T4 boundary. | No effects for incomplete pre-admission requests; admitted work remains counted and settles; same-PID sentinel write succeeds. Freeing a disconnected write's capacity early fails. | Real HTTP/1 close; actual HTTP/2 reset for that claim once HTTP/2 is a declared server capability (product prerequisite); request/admission/settlement evidence. D modeled disconnect is additional evidence. Prerequisite: Server concurrent controls (separate RFC amending RFC 0045); HTTP/2 reset additionally needs HTTP/2 as a declared server capability. |
+| T6.pending | D + E; H where required for ordinary behavior | The storage decoration owns an accepted pending write after caller cancellation, returned error or contained panic; attempt drain, replacement and teardown before explicit release. | Pending storage owner is independent of server status. Early permit release, drain proof, duplicate execution or namespace deletion must fail. After release, verify the actual backing-store effect and permitted graph visibility, then settlement; deliberately dropping the retained write must fail. | Acceptance and completion events, original/registered-successor attribution, reservations, publication identity where present and unresolved effects. An engine-call hold alone is insufficient. Prerequisite: Server concurrent controls (separate RFC amending RFC 0045); [accepted-I/O ownership](2026-09-29-server-runtime-and-online-deployment.md#operation-ownership) and retained-write ownership in the storage decoration (part of the separate RFC). |
+| T7.shutdown | H + D | Park a write and stream producer; request shutdown; race activation; attempt new admission. | No admission after closure, one absolute deadline, no premature drain and no reopening old epoch. A renewed deadline or omitted producer fails. | D transition/timer ordering; H actual signal, grace and exit status. Worker watchdog expiry is a harness failure, not a simulated pass. Prerequisite: Server concurrent controls (separate RFC amending RFC 0045); [shutdown and supervision](2026-09-29-server-runtime-and-online-deployment.md#availability-and-supervision). |
 | T7.restart | H + E | Kill the actual process between completed requests; restart the same owned root twice. | Reads resolve exact published detached versions and transaction identities; no table promotion is performed. Duplicate publication fails. | Distinct boot/process identity, preserved root, exact durable census and readiness. Handle reopen cannot discharge this row. Prerequisite: none. |
 | T7.boundary | H + E | Kill the actual process at durable boundaries (between detached effects, graph publication and schema installation); restart the same owned root. | Published-but-uninstalled schema contracts complete before coherent readiness; no table promotion is performed. Duplicate publication or falsely ready schema fails. | Reached boundary, distinct boot/process identity, preserved root and exact durable census. Prerequisite: a qualified hold or crash trigger inside the server process; until then its Rust owner `crates/omnigraph/tests/detached_commit_matrix.rs` keeps it. |
-| T8.live | H + D + E | Deploy valid schema/query changes with warm caches; invalid candidates; fault/crash deployment phases; observe an unaffected graph. | Exact matched schema/query projection, unchanged PID/listener for successful online change, safe partial convergence and unaffected progress. Mixed bindings or false full activation fails. | Captured identities, publication/activation events, live transport and per-resource outcome. Prerequisite: Concurrent controls (separate RFC amending RFC 0045); product deployment support (RFC 0036 §7). |
-| T8.history | H + D + E | Hold apply; progress an existing historical stream and admit a new retained-version query before release. Rename/drop-re-add and query-only deployment. | Fixture's exact historical data, schema, resource incarnation (RFC 0036 §5) and separately bound query revision. Completion only after apply, new incarnation substitution or current-query fallback fails. | Hold interval and within-interval results; exact view identities. Prerequisite: Concurrent controls (separate RFC amending RFC 0045); qualified historical views. |
-| T8.retention | H + D + E | Evict old views, restart, change current authorization, race acquisition/expiry with cleanup, hold producers and saturate old/new overlap. | Retained views reconstruct; expired/unavailable targets refuse; current-policy denial holds; admitted readers keep protection; insufficient overlap refuses/defer before effects. Hidden cache dependence or premature GC fails. | Durable references, current auth, capture/cleanup ordering, resource evidence and process restart. No second writable oracle during serving. Prerequisite: Concurrent controls (separate RFC amending RFC 0045); RFC 0036 and qualified historical views. |
-| T9.identity | H + D + E | Lose acceptance/result; concurrent same-key submission; change input/base; complete deployment 2 then look up deployment 1; change auth and expire retention. Crash identity/publication/finalization/activation boundaries. | One original execution/result; original key resolved before stale-base rejection; no deployment 1 replay/reactivation; unknown activation remains unknown. Duplicate apply, unauthorized lookup or fabricated activation fails. | Input/key/principal/incarnation bindings, request census, exact outcomes, restart and retention evidence. Prerequisite: Concurrent controls (separate RFC amending RFC 0045); product deployment identity, not general data idempotency. |
-| T10.admission | H + D | Saturate process and per-actor caps, declared queue capacity or refusal policy; disconnect held callers; submit extra work. | Independent admitted/executing/queued request and effect census. Premature reservation release permits extra effects and must fail. | Declared cap domain and queue semantics, multiple actors, retained inputs and resource lifetime. Prerequisite: Concurrent controls (separate RFC amending RFC 0045); served operation ownership (RFC 0035 §6.1). |
-| T10.reserve | H + D | Saturate ordinary traffic while finalization, qualified recovery, shutdown and status need capacity; separately keep storage faults persistent. | Actual completion/status actions use reserved capacity; persistent faults yield bounded refusal/unresolved evidence. A reserve consumed by ordinary work or fictitious storage progress fails. | Per-class reservation and effect observations; fault duration and deadline. Prerequisite: Concurrent controls (separate RFC amending RFC 0045); served operation ownership (RFC 0035 §6.1). |
-| T10.retained | H + D + E | Slow export/Blob/feed consumers, staged inputs, candidate preparation (RFC 0036 §7), repeated failed deployments and retained historical readers. | A test-side allocation/lifetime observer, separate from tested budget counters and deduplicating shared allocations, reconciles live buffers, owners and release; repeated failures cannot grow residency without bound. Early release or leaked retained view fails. | Aggregate allocation/queue counters with owner identities, backpressure, final baseline; larger resource/feed delivery. Prerequisite: Concurrent controls (separate RFC amending RFC 0045); RFC 0036 §7 for candidate and deployment inputs; qualified historical views for retained readers. |
+| T8.live | H + D + E | E1: deploy valid schema/query changes with warm caches; invalid candidates; fault/crash deployment phases; observe an unaffected graph. | Exact matched schema/query projection, unchanged PID/listener for successful online change, bounded admission closure while affected live work settles, safe partial convergence and unaffected progress. Prevalidation produces no graph effects; pending completion outside the authorized/drained scope refuses before apply. Mixed bindings or false full activation fails. Historical overlap is a separate E2 gate. | Captured identities, publication/activation events, live transport and per-resource outcome. Prerequisite: Server concurrent controls (separate RFC amending RFC 0045); [E1 online deployment](2026-09-29-server-runtime-and-online-deployment.md#online-deployment). |
+| T8.history | H + D + E | E2: hold apply; progress an existing historical stream and admit a new retained-version query before release. Rename/drop-re-add and query-only deployment. | Fixture's exact historical data, schema, [resource incarnation](2026-09-29-server-runtime-and-online-deployment.md#serving-views) and separately bound query revision. Completion only after apply, new incarnation substitution or current-query fallback fails. | Hold interval and within-interval results; exact view identities. Prerequisite: Server concurrent controls (separate RFC amending RFC 0045); [E2 historical reads](2026-09-29-server-runtime-and-online-deployment.md#historical-reads). |
+| T8.retention | H + D + E | E2: evict old views, restart, change current authorization, race acquisition/expiry with cleanup, hold producers and saturate old/new overlap. | Retained views reconstruct; expired/unavailable targets refuse; current-policy denial holds; admitted readers keep protection; insufficient overlap refuses/defer before effects. Hidden cache dependence or premature GC fails. | Durable references, current auth, capture/cleanup ordering, resource evidence and process restart. No second writable oracle during serving. Prerequisite: Server concurrent controls (separate RFC amending RFC 0045); [E2 historical reads](2026-09-29-server-runtime-and-online-deployment.md#historical-reads). |
+| T9.identity | H + D + E | Reobserve a validated ledger revision, including after restart. Supersede it before apply effects in one case and after effects start in another. Present broken base lineage; finish deployment 2, then inspect deployment 1; expire result lookup while completion remains unresolved. Crash publication, schema installation and activation boundaries. | Before effects, the superseded revision is skipped. After effects start, finish/classify the original revision with its original inputs; only then revalidate successors against achieved state. Broken lineage is refused before effects. One original execution/result per revision; restart must not duplicate apply. Applied results and proven activation stay distinct; unknown activation remains unknown. Expired lookup cannot discard unfinished authority, permit replay or reactivate an old result. | Ledger revision/base/parent identities, original input/principal/incarnations, reached effect boundary, exact per-resource results, publication/activation evidence, current authorization and restart. Prerequisite: Server concurrent controls (separate RFC amending RFC 0045); [online deployment](2026-09-29-server-runtime-and-online-deployment.md#online-deployment). The validated ledger revision is the deployment identity. |
+| T10.admission | H + D | Saturate process and per-actor caps, declared queue capacity or refusal policy; disconnect held callers; submit extra work. | Independent admitted/executing/queued request and effect census. Premature reservation release permits extra effects and must fail. | Declared cap domain and queue semantics, multiple actors, retained inputs and resource lifetime. Prerequisite: Server concurrent controls (separate RFC amending RFC 0045); [operation ownership](2026-09-29-server-runtime-and-online-deployment.md#operation-ownership) and [resource bounds](2026-09-29-server-runtime-and-online-deployment.md#resource-bounds). |
+| T10.reserve | H + D | Saturate ordinary traffic while finalization, qualified recovery, shutdown and status need capacity; separately keep storage faults persistent. | Actual completion/status actions use reserved capacity; persistent faults yield bounded refusal/unresolved evidence. A reserve consumed by ordinary work or fictitious storage progress fails. | Per-class reservation and effect observations; fault duration and deadline. Prerequisite: Server concurrent controls (separate RFC amending RFC 0045); [operation ownership](2026-09-29-server-runtime-and-online-deployment.md#operation-ownership) and [resource bounds](2026-09-29-server-runtime-and-online-deployment.md#resource-bounds). |
+| T10.retained | H + D + E | Slow export/Blob/feed consumers, staged inputs, [candidate preparation](2026-09-29-server-runtime-and-online-deployment.md#online-deployment), repeated failed deployments and retained historical readers. | A test-side allocation/lifetime observer, separate from tested budget counters and deduplicating shared allocations, reconciles live buffers, owners and release; repeated failures cannot grow residency without bound. Early release or leaked retained view fails. | Aggregate allocation/queue counters with owner identities, backpressure, final baseline; larger resource/feed delivery. Prerequisite: Server concurrent controls (separate RFC amending RFC 0045); [resource bounds](2026-09-29-server-runtime-and-online-deployment.md#resource-bounds) for candidate and deployment inputs; [E2 historical reads](2026-09-29-server-runtime-and-online-deployment.md#historical-reads) for retained readers. |
 | T11.feed | H + D + E | Page wide rows/keys/Blob values and encoding expansion; append sentinel commit; abandon bodies and resume under the cursor semantics of RFC 0030 §5.2. | Concatenated complete changes equal authored workload history, not another reader sharing pagination logic. Omission, torn commit, stalled cursor or leaked producer fails. | Full-body history, cursor sequence, reached sentinel, buffer/producer lifetimes and explicit oversize outcome. Prerequisite: an expect that reads change-feed bodies and cursors (later RFC 0045 amendment); D is the Deterministic server execution proposal. |
-| T11.status | H + D | Hold loading, recovery/drain and shutdown while polling through authorized and unauthorized clients. | Known fixture/transition availability and current authorization determine expected status independently. Hidden blocked polling, false readiness or leaked graph details fails. | Bounded status responses during holds, current actor, partial read/write availability and process-liveness distinction. Prerequisite: Concurrent controls (separate RFC amending RFC 0045); RFC 0036 §12 for transition status. |
+| T11.status | H + D | Hold loading, recovery/drain and shutdown while polling through authorized and unauthorized clients. | Known fixture/transition availability and current authorization determine expected status independently. Hidden blocked polling, false readiness or leaked graph details fails. | Bounded status responses during holds, current actor, partial read/write availability and process-liveness distinction. Prerequisite: Server concurrent controls (separate RFC amending RFC 0045); [availability and supervision](2026-09-29-server-runtime-and-online-deployment.md#availability-and-supervision) for transition status. |
 
-Rows whose control column parks, overlaps or disconnects in-flight work require
-the concurrent controls of the separate RFC; they are listed here so the
+Rows whose control column parks, overlaps or disconnects in-flight server work require
+the server concurrent controls of the separate RFC; they are listed here so the
 coverage mapping is complete, and none is claimable from this RFC alone.
 
 These rows retain the proposed product requirements while using the current
@@ -510,12 +526,12 @@ measured window. Existing backend qualification remains separately owned.
 
 | ID | Workload and measurements | Verification and sensitivity | Required records |
 |---|---|---|---|
-| B1 | Merge modes; target/history/delta size sweeps; latency, peak RSS, storage calls and response/request counts | Exact receipts and protected target content; no later-HEAD reconstruction. Invalid receipt or extra submission invalidates the result. | Server/driver builds, fixture identity, cache condition, request census and repetitions. |
+| B1 | Publication and merge modes; vary touched tables/rows, target/delta size, history depth and concurrency; latency, peak RSS, storage requests and bytes, retained catalog bytes and response/request counts | Exact own-publication receipts where present, explicit no-op, protected target content and history; no later-HEAD reconstruction. Invalid receipt, partial publication or extra submission invalidates the result. Flat request counts alone cannot establish bounded history-dependent cost. | Server/driver builds, fixture and history identity, cache condition, catalog byte/RSS curves, workload envelope, request census and repetitions. |
 | B2 | Read/write mix, clients, hot keys, shared/separate branches and graphs; offered/admitted/completed/refused/unknown/failed counts and tails | Authored operation/results census; retain refused, timed-out and unfinished work. Dropping non-successes invalidates the claim. | Arrival schedule, actual dispatch, queue/execution/body times, client attribution, isolated baseline, a heavy merge/load client, its burst-end event, light-traffic slowdown and recovery after release. |
 | B3 | Additive schema change, rename, rejected candidate and repeated activation under foreground load | Exact schema/query witness and unchanged server process for successful online deployment; rejected candidates preserve expected service. A candidate accepted with a changed server process invalidates the result. | Phase durations, admission pause, peer tails, RSS and retained generation lifetimes. |
-| B4 | Equal final data from bulk versus fragmented/deleted histories; optimize during foreground work | Exact rows/pins before and after, one productive publication where required. Different fixtures cannot support the comparison. | Fragment/history identity, maintenance calls, temporary storage/memory and foreground slowdown. |
+| B4 | Equal final data from bulk versus fragmented/deleted histories; owned optimize, rebuild and cleanup during foreground work | Exact rows/pins before and after, one productive publication where required and protection of every retained pin. Different fixtures or reclaimed protected history invalidate the comparison. | Fragment/history identity, maintenance calls, temporary storage/memory and foreground slowdown. |
 | B5 | T4 fault phases and participant widths; disconnect versus actual process death separately | Exact durable outcome and supported same-process progress; preserve refusal/unknown cases instead of omitting them. Omitting a refused or unknown case invalidates the comparison. | Fault delivery, result/settlement/admission times, process identity and affected graphs. |
-| B6 | Wide feed, escaping/Blob expansion, consumer throttling, pause and disconnect with fixed changed rows while unrelated extent grows independently | Complete expected history and sentinel reachability; assert buffer release and cursor progress. Truncated bodies cannot count as completed throughput. | Full-body bytes/times, owned/reserved bytes, storage work, disconnect-to-release and peer tails. |
+| B6 | Wide feed, export and Blob delivery; escaping/Blob expansion, consumer throttling, pause and disconnect. For feeds, hold changed rows fixed while unrelated extent grows independently. | Complete expected bodies/history; for feeds, sentinel reachability and cursor progress. Assert buffer/producer release. Truncated bodies cannot count as completed throughput. | Full-body bytes/times, owned/reserved bytes, storage work, disconnect-to-release and peer tails. |
 
 Use [RFC 0039](0039-end-to-end-benchmark.md) for fixture,
 manual variance assessment, warm-up, repetition, A/A and scheduled-load validity
@@ -532,7 +548,8 @@ at any CI stage; reviewed deterministic cost assertions retain their own policy.
 | Receipt/outcome | T1–T3, receipt sensitivity, physical request census and a deterministic merge cost recipe with operation-scoped counts excluding fixture/oracle traffic | B1 |
 | Ownership/completion | T4–T7, T10.admission and T10.reserve, including delayed-I/O and actual process/transport cases | B2 and B5 |
 | Resource/feed | Remaining T10 assertions and T11 | B6 |
-| Online deployment | T8–T9, activation/shutdown race, historical reconstruction and overlap | B3; B4 with owned maintenance |
+| E1 online deployment | T8.live and T9, including activation/shutdown races; [production rollout](2026-09-29-server-runtime-and-online-deployment.md#rollout) permits a bounded live pause | B3 without a historical-overlap claim; B4 with owned maintenance |
+| E2 historical reads | T8.history and T8.retention, historical reconstruction and protected overlap | B3 with qualified historical overlap |
 
 ### Preventing false qualification
 
@@ -574,7 +591,7 @@ owners and follow [the Lance reading protocol](../dev/lance.md).
 | Local HTTP | Automatically provisioned ordinary server and existing sequential comparisons. Prerequisite: executed result-type witness on the HTTP read response (additive `ReadOutput` field; owner RFC 0051 or its amendment). Move the cluster-boot lifecycle into a library test-support module both `omnigraph-cli` tests and `omnigraph-gqt` depend on; convergence through `omnigraph_cluster::apply_config_dir`, not the CLI binary, unless the case is a CLI scenario. Preflight resolves the server (and CLI) executable, records path and digest in the immutable input; the worker receives them through the input. | Executed result column types over HTTP, isolation, guarded partial setup and whole-process containment; refusal messages name the route, the step's API and storage, never a mode |
 | Sequential lifecycle steps | Process kill/restart, request shutdown and physical assertion after containment as step kinds; syntax owned by RFC 0045 | Parser and admission tests, distinct evidence for handle reopen and real process restart, process-group containment |
 | Sequential lifecycle coverage | Process restart between requests (T7.restart) | Rows without any prerequisite |
-| Coverage expansion | Historical views, deployment identity, feeds, generators and additional protocols; server-DST and concurrent controls arrive with their own proposals | Product prerequisites plus independent evidence for each selected assertion |
+| Coverage expansion | Historical views, deployment identity, feeds, generators and additional protocols; server-DST and server concurrent controls arrive with their own proposals | Product prerequisites plus independent evidence for each selected assertion |
 | Measurements | Server workload adapter for `omnigraph-bench` | Real measurements and verification under RFC 0039; variance established before broader automation |
 
 Two gates precede each admission: qualification of the `omnigraph-server`
@@ -596,8 +613,9 @@ the maintainer who confirms or reverses it and the event that forces that call.
   sets and records each bound at the Sequential-lifecycle-steps gate.
 - Result-type witness on the HTTP read response as the Local HTTP prerequisite:
   RFC 0051 owner; Local HTTP phase.
-- Directed concurrency (clients, holds, joins, registry): separate RFC amending
-  RFC 0045; GQT maintainer; before any overlap-prerequisite row is claimed.
+- Server concurrency controls (clients, holds, joins, registry): an amendment
+  extending RFC 0045's engine concurrent blocks; GQT maintainer; before any
+  server-overlap prerequisite row is claimed.
 - Deterministic server execution: separate proposal; server maintainer; before
   any D-scope row is claimed.
 - Step spellings for kill, restart and request shutdown: GQT maintainer;
@@ -606,3 +624,4 @@ the maintainer who confirms or reverses it and the event that forces that call.
 ## Decision log
 
 - 2026-09-26: drafted at `52ae6391`; amends RFC 0045 the same day.
+- 2026-09-29: production ownership moves to [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md); record the landed engine-DST concurrent subset, retain unqualified server controls, bind T9 to ledger revisions and distinguish E1 activation from E2 historical serving.

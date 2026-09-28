@@ -2,19 +2,25 @@
 rfc: "0034"
 title: "Durable recovery authority and outcomes"
 track: maintainer
-status: draft
+status: superseded
 implementation: not-started
 authors:
   - OmniGraph maintainers
 created: 2026-08-13
-updated: 2026-08-23
+updated: 2026-09-29
 discussion: null
 supersedes: []
-superseded_by: []
+superseded_by:
+  - "2026-09-29-server-runtime-and-online-deployment"
 blocked_on: []
 ---
 
 # RFC 0034: Durable recovery authority and outcomes
+
+> **Superseded on 2026-09-29** by [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md).
+> The replacement remains a draft and is not implemented. This document is
+> retained as historical rationale; its obsolete mechanisms and dependencies
+> are not current implementation requirements.
 
 - **Depends on:** RFC 0022 unified graph-write protocol; RFC 0023 exact effect
   fencing; internal manifest schema v6 and recovery-v9; Lance 10.0.0.
