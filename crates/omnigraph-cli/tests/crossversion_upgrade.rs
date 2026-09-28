@@ -1825,7 +1825,20 @@ query vectors($q: Vector(4)) {
         );
     }
     check_history(false);
-    for branch in ["main", "review"] {
+    let stamps = || {
+        ["main", "review"].map(|branch| {
+            support::parse_stdout_json(&output_success(
+                cli().args(["snapshot", uri, "--branch", branch, "--json"]),
+            ))["internal_schema_version"]
+                .clone()
+        })
+    };
+    assert_eq!(
+        stamps(),
+        [11, 11],
+        "the upgrade stops at v11 on every live branch"
+    );
+    for (branch, after_rebuild) in [("main", [12, 11]), ("review", [12, 12])] {
         output_success(cli().args([
             "rebuild-full-text-indexes",
             uri,
@@ -1834,6 +1847,11 @@ query vectors($q: Vector(4)) {
             "--json",
         ]));
         assert_eq!(
+            stamps(),
+            after_rebuild,
+            "the rebuild is {branch}'s first publish, so {branch} alone converts to v12"
+        );
+        assert_eq!(
             current_query("--branch", branch, "terms"),
             serde_json::json!([{"d.slug":"ml-intro"}])
         );
@@ -1841,25 +1859,9 @@ query vectors($q: Vector(4)) {
     output_success(cli().args([
         "mutate", "revise", "--query", query_path, "--store", uri, "--branch", "review",
     ]));
-    let stamp_of = |branch: &str| {
-        support::parse_stdout_json(&output_success(
-            cli().args(["snapshot", uri, "--branch", branch, "--json"]),
-        ))["internal_schema_version"]
-            .clone()
-    };
-    assert_eq!(
-        (stamp_of("review"), stamp_of("main")),
-        (serde_json::json!(12), serde_json::json!(11)),
-        "the genuine v11 graph converts branch by branch: the published branch is v12, the idle one v11"
-    );
     output_success(cli().args([
         "branch", "merge", "review", "--into", "main", "--store", uri, "--json",
     ]));
-    assert_eq!(
-        stamp_of("main"),
-        serde_json::json!(12),
-        "the merge is main's publish, so main converts too"
-    );
     let merged = current_query("--branch", "main", "docs");
     assert!(merged.as_array().unwrap().iter().any(
         |row| row["d.slug"] == "dl-basics" && row["d.body"] == "written after storage upgrade"
