@@ -5835,8 +5835,10 @@ version = "0.11.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "async-trait",
  "datatest-stable",
  "futures",
+ "object_store",
  "omnigraph-compiler",
  "omnigraph-dst",
  "omnigraph-engine",

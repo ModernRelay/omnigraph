@@ -53,9 +53,11 @@ use omnigraph_compiler::{
 use serde_json::Value;
 
 mod dst_runner;
+mod measure;
 mod runner_config;
 pub use dst_runner::{
-    replay_report, report_cli_refusal, run_corpus_case, run_selected, run_worker_if_requested,
+    MeasureOptions, replay_report, report_cli_refusal, run_corpus_case, run_selected,
+    run_worker_if_requested,
 };
 use omnigraph::storage::StorageAdapter;
 use runner_config::{Execution, RunnerConfig, SeamDirective, parse_runner, parse_seam};
@@ -99,6 +101,24 @@ struct Case {
 impl Case {
     fn has_loops(&self) -> bool {
         self.items.iter().any(|i| matches!(i, Item::Loop { .. }))
+    }
+}
+
+/// The latency models `--measure --model` accepts, by name.
+pub fn measure_model_names() -> Vec<&'static str> {
+    measure::MODELS.iter().map(|model| model.name).collect()
+}
+
+/// The step's kind as the measure report names it.
+fn step_kind(step: &Step) -> &'static str {
+    match step {
+        Step::Query(_) => "query",
+        Step::Mutate(_) => "mutate",
+        Step::Control(_) => "control",
+        Step::List(_) => "list",
+        Step::Settings(_) => "settings",
+        Step::Show(_) => "show",
+        Step::Restart { .. } => "restart",
     }
 }
 
@@ -2804,6 +2824,11 @@ async fn execute_steps_inner(
                 let seams = case.seams.get(&ordinal).map_or(&[][..], Vec::as_slice);
                 let armed = dst_runner::arm_seams(seams, step)?;
                 let lifetime_before = dst_runner::lifetime_counts();
+                dst_runner::measure_step_begin(
+                    ordinal as u64,
+                    case.source_lines.get(&ordinal).map(|line| *line as u64),
+                    step_kind(step),
+                );
                 let outcome = match step {
                     Step::Query(q) => {
                         run_query_step(&session, pinned_mode(&session), q, binding).await
@@ -2865,6 +2890,7 @@ async fn execute_steps_inner(
                     }
                 };
                 let seam_result = dst_runner::finish_seams(armed);
+                dst_runner::measure_step_end(ordinal as u64);
                 let lifetime_after = dst_runner::lifetime_counts();
                 dst_runner::record(
                     "engine_lifetime",

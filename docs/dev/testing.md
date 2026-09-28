@@ -170,6 +170,8 @@ configuration enables the DST runtime that corpus files request:
 cargo test -p omnigraph-gqt --locked                            # complete corpus and harness tests
 cargo test -p omnigraph-gqt --test gq_logic_tests issue_563      # matching case names
 cargo test -p omnigraph-gqt --test gq_logic_tests -- --list      # one line per case
+cargo run -p omnigraph-gqt --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --measure   # store requests per step under DST
+cargo run -p omnigraph-gqt --bin omnigraph-gqt -- cases --measure --baseline /tmp/gqt-cost.tsv --write-baseline   # record a cost baseline anywhere on disk; --baseline alone prints the delta
 ```
 
 Discovery includes every `.gqt` file below `cases/`, recursively. Shared
