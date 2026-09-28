@@ -255,7 +255,7 @@ NUMBERED_RFCS = frozenset(
 def rfc_id_of(path: Path, errors: list[str]) -> tuple[str, str] | None:
     """Return (id, prefix) for an RFC filename, or None after recording the error.
 
-    Numbered RFCs (0001 to 0066) keep the number as id; dated RFCs use the
+    Numbered RFCs (0001 to 0068) keep the number as id; dated RFCs use the
     whole stem, so the date prefix alone never has to be unique.
     """
     name = RFC_FILENAME.fullmatch(path.name)

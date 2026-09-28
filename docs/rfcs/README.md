@@ -2,8 +2,9 @@
 
 RFCs are durable decision records for changes that are costly to reverse or
 wide enough that implementation review alone cannot establish the right shape.
-All formal RFCs live in this directory and use one lifecycle, one metadata
-schema, and one number namespace. `track` records where a proposal came from;
+All formal RFCs live in this directory and use one lifecycle and one metadata
+schema. New RFCs use creation dates and slugs; existing numbered RFCs keep
+their identifiers. `track` records where a proposal came from;
 it does not change the review or acceptance rules.
 
 The architectural invariants remain the hard boundary for every change. An RFC
@@ -43,8 +44,9 @@ issue and implementation PR are usually enough.
 
 ### Numbered RFCs 0001 to 0068
 
-RFCs 0001 to 0068 use `NNNN-kebab-title.md`, the heading
-`# RFC NNNN: Title`, and the reference label `RFC NNNN`. That namespace is
+RFCs 0001 to 0068 retain `NNNN-kebab-title.md`, the heading
+`# RFC NNNN: Title`, and the identifier `NNNN`. Link by title when practical;
+`RFC NNNN` remains a valid reference label. That namespace is
 closed at 0068: no new number is allocated, and `scripts/check-docs.py`
 rejects any numbered filename outside the allocated and reserved numbers it
 lists. Numbers reserved by PRs that were open
@@ -150,12 +152,12 @@ extend existing owners according to [the test map](../dev/testing.md).
 
 ## Registry
 
-This table is the human index for the canonical RFC corpus. The first column
-links the canonical file; its text is the number for numbered RFCs and the
-`created` date for dated ones. Rows are in creation order: numbered RFCs first,
-then dated RFCs by date.
+Find proposals by title in this index. The first column links the canonical
+file and shows a legacy number or creation date. A date alone is not an RFC
+identifier: dated RFCs use the full filename stem. Existing numbered RFCs
+come first, followed by dated RFCs in creation-date order.
 
-| RFC | Decision | Track | Status | Implementation |
+| Legacy number / created | RFC title | Track | Status | Implementation |
 |---|---|---|---|---|
 | [0001](0001-fragment-adopt-branch-merge.md) | Branch merge by fragment adoption | maintainer | draft | not-started |
 | [0002](0002-config-cli-architecture.md) | Config and CLI architecture | maintainer | superseded | partial |
