@@ -355,4 +355,20 @@ one-commit revert.
   stale attempt before revalidation's round trips, fewer round trips in
   revalidation itself, and footprint-granular admission, which is RFC 0067's
   group-commit rule.
+- 2026-09-28 — The first lever was prototyped and measured, not adopted. A
+  stale attempt was failed from the handle's in-memory view (same branch
+  incarnation, a strictly newer manifest version than the capture, a
+  different head) before revalidation's round trips; it caught every failed
+  revalidation in both settings. With eight writers on one branch it raised
+  throughput from 0.40 to 0.53 commits/s at +30 ms and cut manifest reads per
+  commit from 60 to 43, but lowered it from 25.5 to 23.2 locally and widened
+  the local p95 from 232 ms to 1.9 s: where revalidation is already cheap,
+  failing faster only sends losers back to re-prepare and re-queue sooner.
+  It also left the starvation of #784 unchanged. The measurement bounds this
+  whole family of fixes. Because any publication invalidates every other
+  attempt on the branch, eight writers on one branch cannot exceed one writer
+  alone (31.7 commits/s locally, 0.87 at +30 ms); this change already reaches
+  80% and 46% of that. Raising the ceiling requires same-branch writes that
+  do not invalidate each other, which is the footprint admission of RFC
+  0067's group commit (step 3), not further work on the gate.
 
