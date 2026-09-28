@@ -361,14 +361,46 @@ one-commit revert.
   different head) before revalidation's round trips; it caught every failed
   revalidation in both settings. With eight writers on one branch it raised
   throughput from 0.40 to 0.53 commits/s at +30 ms and cut manifest reads per
-  commit from 60 to 43, but lowered it from 25.5 to 23.2 locally and widened
-  the local p95 from 232 ms to 1.9 s: where revalidation is already cheap,
-  failing faster only sends losers back to re-prepare and re-queue sooner.
-  It also left the starvation of #784 unchanged. The measurement bounds this
-  whole family of fixes. Because any publication invalidates every other
-  attempt on the branch, eight writers on one branch cannot exceed one writer
-  alone (31.7 commits/s locally, 0.87 at +30 ms); this change already reaches
-  80% and 46% of that. Raising the ceiling requires same-branch writes that
-  do not invalidate each other, which is the footprint admission of RFC
-  0067's group commit (step 3), not further work on the gate.
+  commit from 60 to 43. Locally it gave nothing: 23.2 commits/s sits inside
+  the 20–25 band that interleaved reruns later showed for every build (see
+  the attribution entry below). It also widened the local p95 from 232 ms to
+  1.9 s, because where revalidation is already cheap, failing faster only
+  sends losers back to re-prepare and re-queue sooner. It left the
+  starvation of #784 unchanged. The measurement bounds this whole family of
+  fixes. Because any publication invalidates every other attempt on the
+  branch, eight writers on one branch cannot exceed one writer alone (31.7
+  commits/s locally, 0.87 at +30 ms); eight writers reach about 65–80% and
+  46% of that. Raising the ceiling requires same-branch writes that do not
+  invalidate each other, which is the footprint admission of RFC 0067's group
+  commit (step 3), not further work on the gate.
+- 2026-09-28 — Attribution, after review asked for one effect at a time.
+  This change has two effects:
+  - read-view captures stop waiting behind another writer's publication;
+  - publications on different branches overlap.
+
+  A diagnostic build separated them: this change plus one process-wide lock
+  around every mutation and load publication, so captures overlap
+  publications but publications still serialize. It was never merged.
+
+  The three builds ran back to back in each cell, three runs per cell. The
+  comparison does not mix in the copy-on-write catalog publication (#781):
+  `main`'s side is `b14c22c5`, which is #781's own merge.
+
+  | Cell | `main` | Diagnostic | This change |
+  |---|---|---|---|
+  | local, 8 branches | 69.4 | 68.6 | 154.0 |
+  | +30 ms, 8 branches | 0.50 | 0.43 | 2.13 |
+
+  The whole eight-branch gain comes from overlapping publications; overlapping
+  captures adds nothing measurable. On one branch, locally, two interleaved
+  rounds gave, in commits/s:
+  - `main`: 24.4 and 20.3;
+  - diagnostic: 21.7 and 22.2;
+  - this change: 21.7 and 22.8.
+
+  That is no difference. The earlier +36% (18.8 to 25.5) compared runs from
+  two sessions, and that cell drifts by about 20% between sessions: it is
+  dominated by re-prepares, with 116 to 178 exhausted re-prepare budgets per
+  cell in every build. The capture overlap stays a mechanism that
+  `read_capture_proceeds_while_writer_parked` pins, not a throughput claim.
 
