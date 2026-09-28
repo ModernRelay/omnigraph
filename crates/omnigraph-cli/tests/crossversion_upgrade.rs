@@ -836,7 +836,7 @@ fn current_binary_reports_already_current_on_a_fresh_graph() {
     ] {
         let report = support::parse_stdout_json(&output_success(cli().args(&args)));
         assert_eq!(report["outcome"], "already_current", "{args:?}");
-        assert_eq!(report["observed_format"], 11, "{args:?}");
+        assert_eq!(report["observed_format"], 12, "{args:?}");
     }
 
     for lower in ["7", "8", "10"] {
@@ -1825,7 +1825,20 @@ query vectors($q: Vector(4)) {
         );
     }
     check_history(false);
-    for branch in ["main", "review"] {
+    let stamps = || {
+        ["main", "review"].map(|branch| {
+            support::parse_stdout_json(&output_success(
+                cli().args(["snapshot", uri, "--branch", branch, "--json"]),
+            ))["internal_schema_version"]
+                .clone()
+        })
+    };
+    assert_eq!(
+        stamps(),
+        [11, 11],
+        "the upgrade stops at v11 on every live branch"
+    );
+    for (branch, after_rebuild) in [("main", [12, 11]), ("review", [12, 12])] {
         output_success(cli().args([
             "rebuild-full-text-indexes",
             uri,
@@ -1833,6 +1846,11 @@ query vectors($q: Vector(4)) {
             branch,
             "--json",
         ]));
+        assert_eq!(
+            stamps(),
+            after_rebuild,
+            "the rebuild is {branch}'s first publish, so {branch} alone converts to v12"
+        );
         assert_eq!(
             current_query("--branch", branch, "terms"),
             serde_json::json!([{"d.slug":"ml-intro"}])

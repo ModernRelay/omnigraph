@@ -1,15 +1,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Array, RecordBatch, StringArray, UInt64Array, new_null_array};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
 use futures::TryStreamExt;
 use lance::Dataset;
 
 use crate::error::{OmniError, Result};
+use crate::record::{RECORD_COLUMN, StoredShape, expand_from_storage, stored_shape};
+/// The row schemas' public path; they are defined in the private `record` module.
+pub use crate::record::{flat_manifest_schema, manifest_schema};
 
 use super::layout::{manifest_version_from_object_id, table_object_id, version_object_id};
 use super::metadata::TableVersionMetadata;
+use super::migrations::read_stamp;
 use super::{
     MAIN_BRANCH_HEAD_KEY, OBJECT_TYPE_GRAPH_COMMIT, OBJECT_TYPE_GRAPH_HEAD, OBJECT_TYPE_TABLE,
     OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION, TableIdentity, TableRegistration,
@@ -128,38 +131,10 @@ struct ManifestScan {
     /// `lineage_rows`, it does not grow with commit history. OCC must distinguish
     /// a present head from an absent one (notably on a fresh named branch).
     graph_heads: HashMap<String, String>,
-    /// Every scanned row with all `manifest_schema()` columns, kept only on the
-    /// publish scan: the copy-on-write publish rewrites them.
+    /// Every scanned row in the logical `manifest_schema()` columns (expanded
+    /// from the packed shape when stored so), kept only on the publish scan:
+    /// the copy-on-write publish rewrites them.
     live_rows: Vec<RecordBatch>,
-}
-
-/// The `__manifest` row schema. `object_id` keeps Lance's unenforced
-/// primary-key marker: every existing `__manifest` carries it and Lance treats
-/// the marker as fixed once set, so an overwrite must present it too. The
-/// publish CAS itself is the version commit of `commit::overwrite`.
-pub fn manifest_schema() -> SchemaRef {
-    let object_id_metadata: HashMap<String, String> =
-        [("lance-schema:unenforced-primary-key", "true")]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-    Arc::new(Schema::new(vec![
-        Field::new("object_id", DataType::Utf8, false).with_metadata(object_id_metadata),
-        Field::new("object_type", DataType::Utf8, false),
-        Field::new("location", DataType::Utf8, true),
-        Field::new("metadata", DataType::Utf8, true),
-        Field::new(
-            "base_objects",
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-            true,
-        ),
-        Field::new("table_key", DataType::Utf8, false),
-        Field::new("stable_table_id", DataType::UInt64, true),
-        Field::new("table_incarnation_id", DataType::UInt64, true),
-        Field::new("table_version", DataType::UInt64, true),
-        Field::new("table_branch", DataType::Utf8, true),
-        Field::new("row_count", DataType::UInt64, true),
-    ]))
 }
 
 pub async fn read_manifest_state_with_registration_clocks(
@@ -733,6 +708,23 @@ async fn read_manifest_scan_fragments(
     read_manifest_scan_with_clocks(dataset, collect_lineage, fragments, false, false).await
 }
 
+/// The columns a `__manifest` scan projects: the three stored columns with `record` whole
+/// when packed (the `record` module doc: a fixed-width child cannot be projected alone),
+/// otherwise exactly the logical columns. `expand_from_storage` turns the packed rows logical.
+fn manifest_projection(shape: StoredShape) -> Vec<String> {
+    match shape {
+        StoredShape::Packed => ["object_id", "object_type", RECORD_COLUMN]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        StoredShape::Flat => manifest_schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect(),
+    }
+}
+
 async fn read_manifest_scan_with_clocks(
     dataset: &Dataset,
     collect_lineage: bool,
@@ -752,35 +744,11 @@ async fn read_manifest_scan_with_clocks(
     } else {
         dataset
     };
-    let legacy = super::migrations::read_stamp(dataset) == Some(6);
+    let stamp = read_stamp(dataset);
+    let legacy = stamp == Some(6);
+    let shape = stored_shape(stamp);
     crate::instrumentation::record_manifest_scan();
-    // Project only the columns the assembly below reads (RFC-013 PR2 #1c). The
-    // `object_id` is needed for the bounded graph-head authority decode on every
-    // path; `base_objects` remains reserved/unused. Mirrors Lance's own
-    // directory-catalog `__manifest` reads, which project only needed columns.
-    let mut projection: Vec<String> = if retain_live_rows {
-        manifest_schema()
-            .fields()
-            .iter()
-            .map(|field| field.name().clone())
-            .collect()
-    } else {
-        [
-            "object_id",
-            "object_type",
-            "location",
-            "metadata",
-            "table_key",
-            "stable_table_id",
-            "table_incarnation_id",
-            "table_version",
-            "table_branch",
-            "row_count",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect()
-    };
+    let mut projection = manifest_projection(shape);
     if use_row_update_versions {
         projection.push("_row_last_updated_at_version".to_string());
     }
@@ -806,6 +774,10 @@ async fn read_manifest_scan_with_clocks(
     let mut live_rows = Vec::new();
 
     while let Some(batch) = batches.try_next().await.map_err(OmniError::storage)? {
+        let batch = match shape {
+            StoredShape::Packed => expand_from_storage(&batch)?,
+            StoredShape::Flat => batch,
+        };
         if retain_live_rows {
             live_rows.push(batch.clone());
         }
@@ -1052,8 +1024,12 @@ pub async fn read_graph_lineage(
     dataset: &Dataset,
 ) -> Result<(Vec<GraphLineageRow>, HashMap<String, String>)> {
     crate::instrumentation::record_manifest_scan();
-    let mut batches = dataset
-        .scan()
+    let shape = stored_shape(read_stamp(dataset));
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&manifest_projection(shape))
+        .map_err(OmniError::storage)?;
+    let mut batches = scanner
         .try_into_stream()
         .await
         .map_err(OmniError::storage)?;
@@ -1062,6 +1038,10 @@ pub async fn read_graph_lineage(
     let mut graph_heads = HashMap::new();
 
     while let Some(batch) = batches.try_next().await.map_err(OmniError::storage)? {
+        let batch = match shape {
+            StoredShape::Packed => expand_from_storage(&batch)?,
+            StoredShape::Flat => batch,
+        };
         // Reduce each batch before polling the next; the owned projection is
         // retained, but Arrow buffers for the complete journal are not.
         let batch = &batch;
@@ -1334,10 +1314,6 @@ pub(crate) fn manifest_rows_batch(
             Arc::new(StringArray::from(object_types)),
             Arc::new(StringArray::from(locations)),
             Arc::new(StringArray::from(metadata)),
-            new_null_array(
-                &DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                len,
-            ),
             Arc::new(StringArray::from(table_keys)),
             Arc::new(UInt64Array::from(stable_table_ids)),
             Arc::new(UInt64Array::from(table_incarnation_ids)),

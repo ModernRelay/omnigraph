@@ -10,8 +10,10 @@
 //! only moves the label, and the report groups the ledger by it, so no
 //! request can fall outside a row.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -24,8 +26,8 @@ use object_store::{
     CopyOptions, GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart,
 };
-use omnigraph::object_store_seam::{DecorateObjectStore, OBJECT_STORE};
-use omnigraph::seams::{Behavior, Global, Installed};
+use omnigraph::object_store_seam::DecorateObjectStore;
+use omnigraph::seams::Behavior;
 
 /// One store request as the ledger keeps it. `path` is the object name with
 /// uuids redacted, so the two runs of one seed log the same text. `tick` is the
@@ -69,6 +71,38 @@ pub(crate) struct Label {
     pub line: Option<u64>,
     pub kind: &'static str,
 }
+
+tokio::task_local! {
+    /// The concurrent-block session whose future is being polled: the
+    /// ledger labels its requests with it, the block's gate attributes them
+    /// to it, and evidence rows carry its label.
+    pub(crate) static SESSION: SessionCtx;
+}
+
+pub(crate) struct SessionCtx {
+    pub index: usize,
+    pub label: Label,
+    /// The last decision seam the engine crossed in this session (the
+    /// measure phase), per session rather than per process.
+    pub phase: Cell<&'static str>,
+    /// Set by the block once it is aborted: every later request of the
+    /// session is the drain, filed under [`AFTER_ABORT_PHASE`].
+    pub draining: Arc<AtomicBool>,
+}
+
+impl SessionCtx {
+    pub(crate) fn new(index: usize, label: Label, draining: Arc<AtomicBool>) -> Self {
+        Self {
+            index,
+            label,
+            phase: Cell::new(START_PHASE),
+            draining,
+        }
+    }
+}
+
+/// The measure phase of a request made while a block's sessions drain.
+pub(crate) const AFTER_ABORT_PHASE: &str = "after_abort";
 
 /// What one request costs on the paused DST clock: a base latency plus the
 /// bytes moved at a bandwidth. Requests issued together overlap (a synchronous
@@ -190,12 +224,11 @@ const SETUP: Label = Label {
 };
 
 static MEASURE: OnceLock<Arc<Measure>> = OnceLock::new();
-static INSTALLED: OnceLock<Installed<dyn DecorateObjectStore, Global<dyn DecorateObjectStore>>> =
-    OnceLock::new();
 
-/// Install the measuring decorator for the rest of this process under
-/// `model`. Idempotent; the first call's model wins.
-pub(crate) fn install(model: Model) {
+/// The measuring decorator for the rest of this process under `model`, for
+/// the worker to install on the object-store seam (inside the concurrent
+/// block's gate, `concurrent::install`). The first call's model wins.
+pub(crate) fn prepare(model: Model) -> Arc<dyn DecorateObjectStore> {
     let measure = Arc::clone(MEASURE.get_or_init(|| {
         Arc::new(Measure {
             model,
@@ -208,7 +241,31 @@ pub(crate) fn install(model: Model) {
         })
     }));
     measure.epoch.get_or_init(tokio::time::Instant::now);
-    INSTALLED.get_or_init(|| OBJECT_STORE.install(Arc::new(MeasureDecorator { measure })));
+    Arc::new(MeasureDecorator { measure })
+}
+
+/// A block session's label: its label as the slot (leaked for the process,
+/// like every slot name), the block's step and the session's kind,
+/// registered so the report has a row per session with zero requests.
+pub(crate) fn session_label(
+    session: &str,
+    step: u64,
+    line: Option<u64>,
+    kind: &'static str,
+) -> Label {
+    let label = Label {
+        slot: Box::leak(session.to_string().into_boxed_str()),
+        step,
+        line,
+        kind,
+    };
+    if let Some(measure) = MEASURE.get() {
+        let mut labels = measure.labels.lock().unwrap();
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    label
 }
 
 /// The model the process measures under, when it measures.
@@ -236,8 +293,12 @@ pub(crate) fn set_label(slot: &'static str, step: u64, line: Option<u64>, kind: 
 }
 
 /// The engine crossed the decision seam `name`: every later request of the
-/// step is in that phase. A no-op when measuring is off.
+/// step is in that phase. Inside a concurrent block's session the phase is
+/// the session's own. A no-op when measuring is off.
 pub(crate) fn cross(name: &'static str) {
+    if SESSION.try_with(|session| session.phase.set(name)).is_ok() {
+        return;
+    }
     if let Some(measure) = MEASURE.get() {
         *measure.phase.lock().unwrap() = name;
     }
@@ -656,15 +717,29 @@ struct Started {
 }
 
 impl Started {
-    /// Reads the clock, the label and the phase, then sleeps the request's
-    /// cost on the paused clock: the bytes are the ones known before the call.
+    /// Reads the clock, the label and the phase (a block session's own while
+    /// it is polled, `after_abort` once its block is aborted), then sleeps the
+    /// request's cost on the paused clock: the bytes are known before the call.
     async fn enter(measure: &Arc<Measure>, bytes: u64) -> Self {
         let epoch = *measure.epoch.get_or_init(tokio::time::Instant::now);
         let start_us = tokio::time::Instant::now()
             .saturating_duration_since(epoch)
             .as_micros() as u64;
-        let label = *measure.label.lock().unwrap();
-        let phase = *measure.phase.lock().unwrap();
+        let (label, phase) = SESSION
+            .try_with(|session| {
+                let phase = if session.draining.load(std::sync::atomic::Ordering::Relaxed) {
+                    AFTER_ABORT_PHASE
+                } else {
+                    session.phase.get()
+                };
+                (session.label, phase)
+            })
+            .unwrap_or_else(|_| {
+                (
+                    *measure.label.lock().unwrap(),
+                    *measure.phase.lock().unwrap(),
+                )
+            });
         let cost_us = measure.model.cost_us(bytes);
         tokio::time::sleep(Duration::from_micros(cost_us)).await;
         Started {

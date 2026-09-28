@@ -5770,3 +5770,85 @@ async fn native_ref_unlink_keeps_descendant_head_and_fork_point_readable() {
         .expect("descendant fork-point history must open without the parent refs");
     assert_eq!(rfc_detached_only_values(&fork).await, fork_rows);
 }
+
+/// Lance 11 refuses a null VALUE inside a packed struct child (the children may be declared
+/// nullable) and cannot project a fixed-width child alone, so the stamp-12 `__manifest` keeps its
+/// nulls in `record`'s `present` child and scans `record` whole; red at the bump lifting either.
+#[tokio::test]
+async fn packed_struct_refuses_null_values_and_lone_child_projection_lance_11() {
+    let children = arrow_schema::Fields::from(vec![
+        Field::new("text", DataType::Utf8, true),
+        Field::new("number", DataType::UInt64, true),
+    ]);
+    let record = Field::new("record", DataType::Struct(children.clone()), false).with_metadata(
+        HashMap::from([("lance-encoding:packed".to_string(), "true".to_string())]),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        record,
+    ]));
+    let write = |text: StringArray, number: UInt64Array| {
+        let record = arrow_array::StructArray::new(
+            children.clone(),
+            vec![Arc::new(text), Arc::new(number)],
+            None,
+        );
+        let ids = StringArray::from(vec!["a", "b"]);
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ids), Arc::new(record)])
+                .unwrap();
+        let schema = Arc::clone(&schema);
+        async move {
+            let dir = tempfile::tempdir().unwrap();
+            let reader = RecordBatchIterator::new([Ok(batch)], schema);
+            let params = WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            };
+            let result = Dataset::write(reader, dir.path().to_str().unwrap(), Some(params)).await;
+            (dir, result)
+        }
+    };
+
+    let (_dir, refused) = write(
+        StringArray::from(vec![Some("x"), None]),
+        UInt64Array::from(vec![Some(1u64), Some(2)]),
+    )
+    .await;
+    let error = refused.expect_err("Lance 11 refuses a null inside a packed struct child");
+    assert!(
+        error
+            .to_string()
+            .contains("Per-value compression not yet supported for block type Nullable"),
+        "{error}"
+    );
+
+    let (_dir, written) = write(
+        StringArray::from(vec!["x", ""]),
+        UInt64Array::from(vec![1u64, 0]),
+    )
+    .await;
+    let dataset = written.expect("null-free children pack");
+    let fragments = dataset.get_fragments();
+    let file = &fragments[0].metadata().files[0];
+    assert_eq!(
+        file.column_indices.len(),
+        2,
+        "the packed struct is one physical column beside `id`: {:?}",
+        file.column_indices
+    );
+
+    let mut scanner = dataset.scan();
+    let child_alone = match scanner.project(&["id", "record.number"]) {
+        Ok(_) => scanner.try_into_batch().await.map(|batch| batch.num_rows()),
+        Err(error) => Err(error),
+    };
+    let error = child_alone
+        .expect_err("Lance 11 cannot decode a fixed-width child of a packed struct on its own");
+    assert!(
+        error
+            .to_string()
+            .contains("invalid variable-width layout for UInt64"),
+        "{error}"
+    );
+}
