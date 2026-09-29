@@ -7,14 +7,14 @@ implementation: not-started
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-03
-updated: 2026-09-28
+updated: 2026-09-29
 discussion: "https://github.com/ModernRelay/omnigraph/pull/793"
 supersedes: []
 superseded_by: []
 blocked_on:
   - "RFC 0047 accepted: diagnostics, the ranked-root rule and one total order"
   - "Shared expression model accepted: search calls in match, the leading ranking key in order"
-  - "One named-argument rule for calls, shared with terms(…) in the analyzed lexical search RFC"
+  - "The call rule of the shared expression model amendment (PR #805): operands, then options as name: value"
   - "Embedding recipe declaration and the SchemaIR version, coordinated with RFCs 0040, 0043 and 0044"
 ---
 
@@ -112,9 +112,10 @@ Relevance is neither confidence nor evidence that no other fact exists.
 A call takes its positional arguments, then named arguments written `name:
 value`, in any order, each name at most once. A value is a literal or a
 parameter; its type is fixed by the call. An unknown name is a type error that
-lists the names the call admits. The analyzed lexical search RFC uses the
-same rule for `terms($q, mode: all, max_edits: 1)`; whichever change lands
-first adds it to the grammar.
+lists the names the call admits. This is the call rule of the shared
+expression model's amendment ([PR #805](https://github.com/ModernRelay/omnigraph/pull/805)), which the analyzed lexical
+search RFC also uses for `terms($q, mode: all, max_edits: 1)`; its grammar
+lands with the first call that takes an option.
 
 | Call | Option | Type and range | Default | Meaning |
 |---|---|---|---|---|
@@ -309,9 +310,7 @@ bindings, fewer than 2 or more than 16 arms, a leading `nearest` without
 `candidates` in an aggregate query, and a raw vector argument of the wrong
 dimension. Plan and execution errors: exhausted memory, which is typed and
 never a partial result. A target missing from one arm is not an error; its
-arm metric is null. Engine v1 refuses every option this RFC adds at its door
-with the shared expression model's message, which names the switch to engine
-v2.
+arm metric is null.
 
 ## Design
 
@@ -373,15 +372,15 @@ and the engine never extrapolates a total from it.
 
 ### Where it lands
 
-| Piece | Compiler (both engines) | Engine v2 | Engine v1 door |
-|---|---|---|---|
-| Named options | grammar rule, per-call types and ranges, the errors above | options carried into the logical nodes | refused |
-| Windows | `candidates` rules, the aggregate requirement | `RankedAccess.fetch` from `candidates`; a target cut before fan-out when a leading ranking declares one | refused |
-| Fusion | 2 to 16 arms, identity rules, projected arm metrics | `RankFuse` takes a list of arms with weights and keeps each arm's score as a nullable column | refused |
-| Exact `nearest` | `exact` option | flat route (`use_index(false)`, already used for the exact rescan) | refused |
-| Vector distance | `Vector(n, distance=…)` in the schema grammar and SchemaIR | the index metric and the query metric read the field's distance | reads the same field distance |
-| Recipes | recipe declaration and default resolution in schema apply | query encoding uses the field's recipe | same |
-| Coverage | — | counts under `coverage = exact` | — |
+| Piece | Compiler | Engine v2 |
+|---|---|---|
+| Named options | grammar rule, per-call types and ranges, the errors above | options carried into the logical nodes |
+| Windows | `candidates` rules, the aggregate requirement | `RankedAccess.fetch` from `candidates`; a target cut before fan-out when a leading ranking declares one |
+| Fusion | 2 to 16 arms, identity rules, projected arm metrics | `RankFuse` takes a list of arms with weights and keeps each arm's score as a nullable column |
+| Exact `nearest` | `exact` option | flat route (`use_index(false)`, already used for the exact rescan) |
+| Vector distance | `Vector(n, distance=…)` in the schema grammar and SchemaIR | the index metric and the query metric read the field's distance |
+| Recipes | recipe declaration and default resolution in schema apply | query encoding uses the field's recipe |
+| Coverage | — | counts under `coverage = exact` |
 
 A target cut is the plan's own node: the ranking yields distinct targets, the
 cut keeps `n`, and a semi-join on target id restores their rows. The
@@ -541,3 +540,6 @@ and stable pagination of ranked results.
   the fused sum unable to overflow; per-group selection, cross-type discovery
   and scoring features are deferred. The drafts in PR #606 are superseded as
   a whole; this file replaces them.
+- 2026-09-29 — engine v2 became the only query engine (PR #795): the engine
+  v1 door column and refusals are removed. The named-option rule now cites
+  the shared expression model amendment ([PR #805](https://github.com/ModernRelay/omnigraph/pull/805)).
