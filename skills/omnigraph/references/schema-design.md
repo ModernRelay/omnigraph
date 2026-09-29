@@ -16,15 +16,16 @@ evolution mechanics, see [`schema.md`](schema.md).
   3. [Put a fact on what determines it](#3-put-a-fact-on-what-determines-it)
   4. [Keep independent questions on independent axes](#4-keep-independent-questions-on-independent-axes)
   5. [Make provenance structural](#5-make-provenance-structural)
-  6. [Store what was observed or decided; compute the rest](#6-store-what-was-observed-or-decided-compute-the-rest)
-  7. [Use narrow types and close vocabularies](#7-use-narrow-types-and-close-vocabularies)
-  8. [Enforce meaning, and keep the rules in the graph](#8-enforce-meaning-and-keep-the-rules-in-the-graph)
-  9. [Compose around a shared core](#9-compose-around-a-shared-core)
-  10. [Shape the graph for the questions agents ask](#10-shape-the-graph-for-the-questions-agents-ask)
-  11. [Let independence decide granularity](#11-let-independence-decide-granularity)
-  12. [Write the schema for a reader without context](#12-write-the-schema-for-a-reader-without-context)
-  13. [Keep meanings stable over time](#13-keep-meanings-stable-over-time)
-  14. [Measure convergence](#14-measure-convergence)
+  6. [Layer derived knowledge over raw sources](#6-layer-derived-knowledge-over-raw-sources)
+  7. [Store what was observed or decided; compute the rest](#7-store-what-was-observed-or-decided-compute-the-rest)
+  8. [Use narrow types and close vocabularies](#8-use-narrow-types-and-close-vocabularies)
+  9. [Enforce meaning, and keep the rules in the graph](#9-enforce-meaning-and-keep-the-rules-in-the-graph)
+  10. [Compose around a shared core, from general primitives](#10-compose-around-a-shared-core-from-general-primitives)
+  11. [Optimize for retrieval: recall and precision](#11-optimize-for-retrieval-recall-and-precision)
+  12. [Let independence decide granularity](#12-let-independence-decide-granularity)
+  13. [Write the schema for a reader without context](#13-write-the-schema-for-a-reader-without-context)
+  14. [Keep meanings stable over time](#14-keep-meanings-stable-over-time)
+  15. [Measure convergence](#15-measure-convergence)
 
 ## Foundations: Gruber's five criteria
 
@@ -85,10 +86,15 @@ shared vocabulary, which writers must converge on; open at declared extension
 points where the domain genuinely varies, with a review path for extending
 them.
 
+**Example:** `status: String` is too loose: agents write "closed", "Closed",
+"done" and "won" for one state. An enum with no `paused` value is too tight:
+agents file paused deals as `lost`, and the error is silent. The fix for both
+is the same enum with the missing value added.
+
 Measure the two failures separately. Looseness shows up as disagreement
 between independent writers given the same input. Tightness shows up as
 content they report they could not express, or both forced into the same
-awkward shape (see [principle 14](#14-measure-convergence)).
+awkward shape (see [principle 15](#15-measure-convergence)).
 
 **In Omnigraph:** loosening applies in place (enum widening, nullable
 additions); tightening is a rebuild, and loose data written in the meantime
@@ -99,14 +105,16 @@ matters and loosen deliberately when the evidence shows a real need.
 
 1. Write the questions the graph must answer as `.gq` queries first.
 2. Entities, and the stable key of each.
-3. Relationships worth their own edge, named for their meaning.
-4. Enum candidates, narrow types, and which properties are truly required.
-5. Uniqueness, bounds and cardinality.
-6. Search needs: which text gets `@embed`, which properties get `@index`.
-7. Provenance: who asserts what, from which source.
-8. Rules the schema cannot express, as `GraphPolicy` nodes (principle 8).
-9. Shared shape into interfaces.
-10. An evolution plan: what may change in place and what would be a rebuild.
+3. Layers: which types are raw spans, extracted facts and synthesized
+   conclusions, and how each links to what it came from.
+4. Relationships worth their own edge, named for their meaning.
+5. Enum candidates, narrow types, and which properties are truly required.
+6. Uniqueness, bounds and cardinality.
+7. Search needs: which text gets `@embed`, which properties get `@index`.
+8. Provenance: who asserts what, from which source.
+9. Rules the schema cannot express, as `GraphPolicy` nodes (principle 9).
+10. Shared shape into interfaces.
+11. An evolution plan: what may change in place and what would be a rebuild.
 
 Lint the queries against the schema after each step.
 
@@ -149,6 +157,17 @@ agents must deduplicate, populate it with `omnigraph embed`, and have writers
 run a `nearest(...)` lookup before inserting. Use `@rename_from` so a rename
 keeps identity and history.
 
+**Example:**
+
+```pg
+node Customer {
+    slug: String @key            // derived from the legal entity: "acme-gmbh", never a writer's UUID
+    name: String
+    name_embedding: Vector(3072)? @embed("name")   // writers run nearest() on it before inserting
+}
+edge Attended: Person -> Meeting { @key(@src, @dst) }   // recording the same attendance twice upserts
+```
+
 ### 2. Kinds are types; roles are edges
 
 Kinds rarely change; roles change constantly. A customer becomes a partner, a
@@ -168,6 +187,17 @@ hide the domain from every reader.
 **In Omnigraph:** express roles as typed edges (`AttacksClaim`, `CustomerOf`)
 and let queries find nodes by the edges they have.
 
+**Example:** a former customer is not a kind of organization; it is an
+organization whose customer relationship ended.
+
+```pg
+// avoid: node FormerCustomer { ... }
+edge CustomerOf: Organization -> Organization {
+    since: Date
+    until: Date?        // set when the relationship ends; no re-typing
+}
+```
+
 ### 3. Put a fact on what determines it
 
 This is normalization applied to meaning: a property belongs on the smallest
@@ -183,6 +213,16 @@ strength: enum(weak, moderate, strong)?, as_of: Date? }`. When the relationship
 itself has several participants, a lifecycle, or must be pointed at, promote it
 to a node.
 
+**Example:** a unit price depends on the contract, not only on the product.
+
+```pg
+// avoid: node Product { price: F64 }
+edge Prices: Contract -> Product {
+    unit_price: F64
+    valid_from: Date
+}
+```
+
 ### 4. Keep independent questions on independent axes
 
 Identity, content, who said it, why to believe it, how sure and for whom, when
@@ -195,6 +235,14 @@ to a `Source` for attribution, separate edges or nodes for justification,
 `DateTime` properties for valid time, and the commit history for record time.
 Do not overload one enum such as `relation: enum(asserts, supports)` to mean
 both "who says it" and "why believe it".
+
+**Example:**
+
+```pg
+// avoid: edge Cites: Assertion -> Document { relation: enum(says_so, supports) }
+edge StatedIn: Assertion -> Document { quote: String? }   // who says it
+edge Supports: Assertion -> Assertion                     // why believe it
+```
 
 ### 5. Make provenance structural
 
@@ -220,7 +268,75 @@ replacements with a `Supersedes` edge, propose changes that need judgment on a
 branch and merge them after review, and use `commit list` and `snapshot` to
 trace a wrong fact to the write that introduced it.
 
-### 6. Store what was observed or decided; compute the rest
+**Example:**
+
+```pg
+node Claim {
+    slug: String @key
+    statement: String
+    asserted_at: DateTime
+    confidence: F64?
+}
+edge ClaimAbout: Claim -> Customer
+edge AssertedBy: Claim -> Actor
+edge FromSource: Claim -> Source
+edge Supersedes: Claim -> Claim   // the newer claim points at the one it replaces
+```
+
+### 6. Layer derived knowledge over raw sources
+
+People curate a model; agents grow one. An agent-maintained graph is closer to
+an index than to a catalogue: agents continuously read raw material
+(transcripts, documents, messages, tickets) and write structured knowledge on
+top of it, and every later agent reads both. Design the layers explicitly:
+
+- **Raw**: what was captured, kept as captured and never rewritten by
+  interpretation, split into addressable spans (a transcript segment, a
+  document chunk) so later layers can point at exactly what they came from.
+- **Extracted**: entities, events and assertions an agent pulled out of the
+  raw layer, each linked to the span it came from and to the extractor that
+  produced it (model and prompt version).
+- **Synthesized**: conclusions, summaries and judgments built from extracted
+  facts, linked to what they rest on.
+
+Lineage makes enrichment compound and stay correctable. A better model
+re-extracts from the same spans; a discredited span takes down everything
+built on it; and an answer can be traced from a conclusion down to the words
+that support it. The layers also differ in what may be rebuilt. Raw material
+and human decisions are primary and are never regenerated. Machine extractions
+are materialized derivations: stored because they are expensive, but
+reproducible from raw plus the extractor, so key them deterministically (span
+plus extractor) and re-runs stay idempotent.
+
+**In Omnigraph:** model raw spans as nodes (`TranscriptSegment`, `Chunk`) keyed
+on their source and position; give extracted nodes an edge to their span and
+an `extracted_by` property; link synthesized nodes to what they derive from.
+Drive enrichment from `omnigraph changes poll`, and run a re-extraction on a
+branch so its effect can be reviewed before it replaces the old layer.
+
+**Example:**
+
+```pg
+node TranscriptSegment {                    // raw: kept as captured
+    slug: String @key                       // transcript slug + position
+    text: String
+    start_ms: I64
+}
+node Assertion {                            // extracted
+    slug: String @key                       // span + extractor, so re-runs upsert
+    statement: String
+    extracted_by: String                    // model and prompt version
+    embedding: Vector(3072)? @embed("statement")
+}
+edge ExtractedFrom: Assertion -> TranscriptSegment @card(1..)
+node Conclusion {                           // synthesized
+    slug: String @key
+    statement: String
+}
+edge DerivedFrom: Conclusion -> Assertion @card(1..)
+```
+
+### 7. Store what was observed or decided; compute the rest
 
 Derived facts stored as data drift out of sync the moment anyone writes, and
 with many writers that is constantly. Whether a claim is contested, how many
@@ -232,7 +348,20 @@ agents follow `omnigraph changes poll` to refresh anything they cache. Store a
 status only when it records a decision someone made (retracted, approved), not
 a condition the graph already implies.
 
-### 7. Use narrow types and close vocabularies
+**Example:** store `retracted_at` because someone decided it; compute how
+well supported an assertion is instead of storing a `support_count`.
+
+```gq
+query support_count($slug: String) {
+    match {
+        $a: Assertion { slug: $slug }
+        $s supports $a
+    }
+    return { count($s) as supporting }
+}
+```
+
+### 8. Use narrow types and close vocabularies
 
 A closed vocabulary with crisp, testable definitions makes agents agree; free
 text guarantees they will not. Use the narrowest type that fits: `Date` over
@@ -248,7 +377,24 @@ aggregate over the enum property; grouping is implicit) to spot a swelling
 catch-all. Route agent-proposed vocabulary or schema changes through `schema
 plan` (or `cluster plan`) and a human-approved apply.
 
-### 8. Enforce meaning, and keep the rules in the graph
+**Example:**
+
+```pg
+node Deal {
+    slug: String @key
+    stage: enum(prospecting, discovery, pilot, contract, won, lost, other)   // `other` is the visible catch-all
+    close_date: Date?                                                         // Date, not String
+}
+```
+
+```gq
+query stage_mix() {
+    match { $d: Deal }
+    return { $d.stage, count($d) as deals }   // a growing `other` means a stage is missing
+}
+```
+
+### 9. Enforce meaning, and keep the rules in the graph
 
 The schema is the contract: every invariant the schema can express belongs in
 it, not in application code. Meaning that is not checked drifts. Rules the
@@ -294,7 +440,22 @@ server's Cedar policy, which governs who may perform which actions (see
 structure, `GraphPolicy` nodes for everything else, and a stored query per
 mechanical rule.
 
-### 9. Compose around a shared core
+**Example:** "every strategic customer has an owner" is conditional
+cardinality, which `@card` cannot express, so it becomes a policy with a check
+query:
+
+```gq
+// GraphPolicy pol-strategic-has-owner, check_query: strategic_without_owner
+query strategic_without_owner() {
+    match {
+        $c: Customer { tier: "strategic" }
+        not { $c accountOwner $p }
+    }
+    return { $c.slug }
+}
+```
+
+### 10. Compose around a shared core, from general primitives
 
 A small core of shared identities (people, organizations, products, places)
 with domain modules attached lets each domain own its part while everything
@@ -303,26 +464,91 @@ existing ones. Outside vocabularies and frameworks enter as mappings and
 views, not as new core types. Two ontologies compose when they share
 identities, not when they share a top-level taxonomy.
 
+Modules add to the core and never modify it. When sales and support each need
+their own view of a customer, each attaches its own facet node or edge rather
+than widening the shared `Customer` type, so the core stays small and stable
+and a module can be added or removed without touching the others.
+
+Compose relations the same way. A few general primitives that combine, where
+a relation can target another relation, express new kinds of statement
+without new types. One `Reason` node with a `polarity` (pro or con) that
+targets either a claim or another reason yields support, objection, backing
+and undercut; four special-purpose edge types would express less and compose
+with nothing.
+
 **In Omnigraph:** keep core entity types and their keys stable and attach
 module-specific types by edges to them. Use interfaces when three or more node
 types genuinely share a property contract. Reference other graphs by slug (for
 example an `atlas_ref: String?` property) rather than copying their nodes.
 
-### 10. Shape the graph for the questions agents ask
+**Example:**
 
-The schema is where reasoning happens. The questions agents ask most should be
-short traversals, and relationships an agent would otherwise reconstruct at run
-time should be stored as links. A link written once saves every later reader a
-search that might miss it: it turns recall into enumeration. If an important
-question needs text search or a long chain of inference, a relation is missing.
-Search is a schema decision too: decide up front which text is embedded and
-which properties are indexed.
+```pg
+// core, shared by every module
+node Person { slug: String @key }
+node Organization { slug: String @key }
+// sales module
+node Deal { slug: String @key }
+edge DealWith: Deal -> Organization @card(1..1)
+// support module
+node Ticket { slug: String @key }
+edge RaisedBy: Ticket -> Person
+// a module's view of a core entity is a facet, not new core properties
+node SupportProfile {
+    slug: String @key
+    sla: enum(standard, priority)
+}
+edge ProfileOf: SupportProfile -> Organization @card(1..1)
+```
+
+### 11. Optimize for retrieval: recall and precision
+
+Agents answer from what they retrieve, and many agent failures are retrieval
+failures: they reason well over what they find but miss what they do not.
+Design for both halves of retrieval.
+
+- **Recall**: store as links the relationships an agent would otherwise search
+  for, so that from any node an agent sees everything that bears on it: the
+  assertions about it, the evidence behind them, the objections against them.
+  A link written once turns recall into enumeration, and the agent can tell
+  when it has everything. Where a link must exist, require it, so a missing
+  link is a visible gap instead of a silent miss.
+- **Precision**: specific edge types and filterable properties (time, status,
+  source kind, confidence) let an agent take exactly the part of a
+  neighbourhood it needs; a generic `RelatedTo` edge or a hub node returns
+  everything and therefore nothing. Make retrievable units the size of an
+  answer (a claim, a segment), not a whole document.
+- **Together**: traverse to scope the candidate set completely, then rank
+  inside it.
+
+If an important question needs text search over the whole graph or a long
+chain of inference, a relation is missing. Test retrieval like any other
+requirement: a set of questions with known answers, scored for what an agent
+found and what it missed. Search is a schema decision too: decide up front
+which text is embedded and which properties are indexed.
 
 **In Omnigraph:** write the questions first as `.gq` queries and lint them
-against the schema. Scope with traversal, then rank with `nearest`, `bm25` or
-`rrf` inside the scoped set (see [`search.md`](search.md)).
+against the schema. Use `@card(1..)` for links that must exist. Scope with
+traversal and filters, then rank with `nearest`, `bm25` or `rrf` inside the
+scoped set (see [`search.md`](search.md)), and put `@embed` on the unit you
+want back, not on a whole document.
 
-### 11. Let independence decide granularity
+**Example:** scope completely by traversal, then rank inside the scope.
+
+```gq
+query customer_evidence($slug: String, $q: String) {
+    match {
+        $c: Customer { slug: $slug }
+        $a: Assertion
+        $a about $c
+    }
+    return { $a.statement }
+    order { nearest($a.embedding, $q) }
+    limit 10
+}
+```
+
+### 12. Let independence decide granularity
 
 Split a node when its parts can be true, false, disputed, updated or cited
 independently; otherwise keep it whole. Too coarse, and agents cannot point at
@@ -333,7 +559,12 @@ which agents diverge.
 with its own key; a value that only ever changes with its parent stays a
 property.
 
-### 12. Write the schema for a reader without context
+**Example:** when clauses are negotiated, cited or disputed one by one,
+`Contract.terms: String` becomes `node Clause { kind: enum(...), text: String }`
+linked to its contract; `Contract.signed_at` stays a property, because it
+never changes on its own.
+
+### 13. Write the schema for a reader without context
 
 An agent reads the schema as instructions, and a human reviewer should
 understand the domain from it alone. One word should mean one thing,
@@ -346,7 +577,19 @@ differently by each agent, and nothing reconciles them.
 `schema show`. Name edges for their meaning (`AuthoredBy`, not `RelatedTo`),
 and keep enums explicit and keys obvious.
 
-### 13. Keep meanings stable over time
+**Example:**
+
+```pg
+node Deal
+    @instruction("One sales opportunity with one customer. Create it when the customer shows buying intent; never one per meeting.")
+{
+    slug: String @key
+    stage: enum(prospecting, discovery, pilot, won, lost, other) @description("Pipeline stage; `other` only when no stage fits, with a note")
+}
+edge OwnedBy: Deal -> Person   // named for its meaning; never RelatedTo
+```
+
+### 14. Keep meanings stable over time
 
 Never repurpose a field: deprecate it and add a new one, because agents built
 against the old meaning keep writing it. A meaning that shifts silently
@@ -357,7 +600,18 @@ intentional: rename rather than drop and re-add.
 properties, backfill, then drop the old property with a planned `schema
 apply` (see [`schema.md`](schema.md#rename-dont-replace)).
 
-### 14. Measure convergence
+**Example:** `Deal.value` held forecasts and later booked revenue. Split
+the meaning instead of repurposing the field.
+
+```pg
+node Deal {
+    slug: String @key
+    forecast_value: F64? @rename_from("value")
+    booked_value: F64?
+}
+```
+
+### 15. Measure convergence
 
 Looseness is measurable, so measure it before committing. Give two independent
 agents the same input and compare what they write. Agreement shows where the
@@ -375,3 +629,8 @@ answerable by traversal are the other gauges.
 
 **In Omnigraph:** load each agent's output into its own branch or scratch
 graph, and compare with the same aggregate queries you use in production.
+
+**Example:** two agents extract the same twenty transcripts onto branches
+`enc-a` and `enc-b`. Where they disagree on `stage`, write a rule; if both
+send paused deals to `other`, add a `paused` value; if both squeeze clauses
+into a note, add a `Clause` type.

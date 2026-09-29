@@ -206,13 +206,16 @@ first ·
 design identity first (`@key`, keyed edges, find before create) · kinds are
 types, roles are edges · put a fact on what determines it · keep attribution,
 justification, confidence and time on separate axes · provenance is structural
-(`Claim` → fact, `Actor`, `Source`), never a free-text `source` field · store
-decisions, compute derived facts · narrow types and closed vocabularies ·
+(`Claim` → fact, `Actor`, `Source`), never a free-text `source` field · layer
+extracted and synthesized knowledge over raw spans, with lineage back to them ·
+store decisions, compute derived facts · narrow types and closed vocabularies ·
 constraints in the schema, and every other rule as a `GraphPolicy` node agents
-lint the graph against · compose around shared identities · store the links
-agents would otherwise search for · write names, `@description` and
-`@instruction` for a reader without context · never repurpose a field ·
-measure convergence with two independent encoders. Full text with Omnigraph
+lint the graph against · compose around shared identities (modules add facets,
+never modify the core) from general primitives that combine · optimize
+retrieval: links for recall, specific edges, filters and answer-sized units for
+precision · write names, `@description` and `@instruction` for a reader without
+context · never repurpose a field · measure convergence with two independent
+encoders. Full text with Omnigraph
 mappings: [`references/schema-design.md`](references/schema-design.md).
 
 ## Storage & Credentials
