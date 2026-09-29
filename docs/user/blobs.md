@@ -39,6 +39,19 @@ Write mode determines ownership:
 - an existing external reference remains readable and exportable even when new
   external ingress is disabled.
 
+An `update` never reads the old value of a Blob it assigns. It carries every
+other Blob cell of a matched row: it reads the cell and rewrites it as managed
+bytes. Carrying a stored external reference therefore needs the graph's
+external Blob policy to admit the reference's source. Otherwise the update
+fails with a 400 that names the type, id, and property; assign that property in
+the same update, to a new value or to null, to replace or clear the reference
+without reading it.
+
+Export writes an external reference as a bare URI, which reloads as the whole
+object. A stored reference to a byte range of an object cannot be written that
+way, so export refuses it instead of widening it; so do the change feed and
+entity reads by id, which render Blob values the same way.
+
 OmniGraph never deletes the object named by an external reference.
 
 ## Query behavior

@@ -62,6 +62,10 @@ Storage mode determines ownership:
 
 An existing stored external reference remains classifiable and exportable even if current ingress policy would reject creating it. OmniGraph never deletes the referenced object.
 
+A null assigned to a nullable Blob clears the cell; `resolve_assignments` refuses a null on a non-nullable one before the update opens its table. An update omits the Blob columns it assigns from its materializing scan (`scan_with_pending_materialized_blobs`'s `omit_blob_columns`): their old cells are never taken, authorized, probed, read, or charged to the byte budget. Every other Blob cell of a matched row is carried, which means reading it and rewriting it as managed bytes, because the keyed writer has no external-reference option. Carrying a stored external reference therefore passes the graph's policy; a refusal on that path is `OmniError::StoredExternalBlobDenied`, naming the type, id and property, distinct from `ExternalBlobPolicy`, which refuses caller input. Merge and new-input admission keep `ExternalBlobPolicy`.
+
+A whole-object surface cannot carry a ranged external descriptor: `ExternalBlobRef::whole_object_uri` returns a `RangedExternalBlob` (whose display never includes the URI) for it, and the HTTP redirect, CLI delivery, schema rewrite and export all refuse it rather than widen it. The descriptor decoder refuses an external descriptor with an offset but size 0 as a Blob integrity error: Lance reads size 0 as the object's size but keeps the position, which would read past the object's end.
+
 ## HTTP and CLI delivery
 
 `GET` and `HEAD /graphs/{graph_id}/blob` select one logical cell. Managed delivery supports one bounded range, strong conditional requests, and constant-memory backpressure. `HEAD` does not read payload bytes.
@@ -74,7 +78,7 @@ There is currently no HTTP or CLI Blob put/clear surface.
 
 ## Maintenance and export
 
-Export emits managed values as base64 and external values as URI descriptors. Its scratch space is bounded at the row level.
+Export emits managed values as base64 and whole-object external values as URI descriptors; a ranged external descriptor is refused, because a bare URI reloads as the whole object. Its scratch space is bounded at the row level.
 
 `optimize` compacts Blob-bearing tables. The pinned Lance release must pass the substrate guard proving null, empty, non-empty, neighboring payloads, stable row IDs, and range reads survive fragment compaction. `cleanup` can reclaim old managed bytes with their dataset versions; callers must quiesce long-lived readers before destructive GC.
 

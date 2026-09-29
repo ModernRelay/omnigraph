@@ -560,6 +560,9 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     /// blobs; only matched rows are then taken and rebuilt as Lance's logical
     /// blob input arrays before unioning the in-memory pending view. This keeps
     /// the eventual merge source schema independent of scalar-index state.
+    /// `omit_blob_columns` names Blob columns the caller replaces: their old
+    /// cells are never read, and both sides return the schema without them.
+    #[allow(clippy::too_many_arguments)]
     async fn scan_with_pending_materialized_blobs(
         &self,
         snapshot: &SnapshotHandle,
@@ -567,6 +570,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         pending_schema: Option<SchemaRef>,
         filter: Option<Expr>,
         key_column: Option<&str>,
+        omit_blob_columns: &[&str],
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>>;
 
@@ -1070,6 +1074,7 @@ impl TableStorage for TableStore {
         pending_schema: Option<SchemaRef>,
         filter: Option<Expr>,
         key_column: Option<&str>,
+        omit_blob_columns: &[&str],
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>> {
         TableStore::scan_with_pending_materialized_blobs(
@@ -1079,6 +1084,7 @@ impl TableStorage for TableStore {
             pending_schema,
             filter,
             key_column,
+            omit_blob_columns,
             budget,
         )
         .await

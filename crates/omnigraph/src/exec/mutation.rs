@@ -345,10 +345,12 @@ fn build_blob_array_from_value(value: &str) -> Result<ArrayRef> {
     builder.finish().map_err(OmniError::lance_internal)
 }
 
-/// Build a null blob array with one element.
-fn build_null_blob_array() -> Result<ArrayRef> {
-    let mut builder = BlobArrayBuilder::new(1);
-    builder.push_null().map_err(OmniError::lance_internal)?;
+/// Build a null blob array with `num_rows` elements.
+fn build_null_blob_array(num_rows: usize) -> Result<ArrayRef> {
+    let mut builder = BlobArrayBuilder::new(num_rows);
+    for _ in 0..num_rows {
+        builder.push_null().map_err(OmniError::lance_internal)?;
+    }
     builder.finish().map_err(OmniError::lance_internal)
 }
 
@@ -369,7 +371,7 @@ fn build_insert_batch(
             if let Some(Literal::String(uri)) = assignments.get(field.name()) {
                 columns.push(build_blob_array_from_value(uri)?);
             } else if field.is_nullable() {
-                columns.push(build_null_blob_array()?);
+                columns.push(build_null_blob_array(1)?);
             } else {
                 return Err(OmniError::manifest(format!(
                     "missing required blob property '{}'",
@@ -434,13 +436,14 @@ fn first_unbound_param<'a>(expr: &'a IRExpr, params: &ParamMap) -> Option<&'a st
 
 /// Replace specific columns in a RecordBatch with new literal values.
 ///
-/// Blob-bearing updates always arrive with the full logical schema. Committed
-/// blob payloads were materialized by the caller and rebuilt as logical
-/// `Struct<data,uri>` arrays; pending batches already have that shape. An
-/// unassigned blob is copied through, while an assigned string URI is rebuilt
-/// with the same blob writer used by inserts. Consequently every update batch
-/// has the catalog schema and can safely share one pending merge stream with
-/// inserts and earlier updates.
+/// A Blob-bearing update arrives with every column except the Blobs it
+/// assigns, whose old cells the scan never read. Committed blob payloads were
+/// materialized by the caller and rebuilt as logical `Struct<data,uri>`
+/// arrays; pending batches already have that shape. An unassigned blob is
+/// copied through, an assigned string URI is rebuilt with the same blob writer
+/// used by inserts, and an assigned null becomes a null cell. Consequently
+/// every update batch has the catalog schema and can safely share one pending
+/// merge stream with inserts and earlier updates.
 fn apply_assignments(
     full_schema: &SchemaRef,
     batch: &RecordBatch,
@@ -450,26 +453,39 @@ fn apply_assignments(
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(full_schema.fields().len());
     for field in full_schema.fields().iter() {
         if blob_properties.contains(field.name()) {
-            if let Some(Literal::String(uri)) = assignments.get(field.name()) {
-                // Assigned: build a single blob column from the URI.
-                let mut builder = BlobArrayBuilder::new(batch.num_rows());
-                for _ in 0..batch.num_rows() {
-                    crate::loader::append_blob_value(&mut builder, uri)?;
+            let column = match assignments.get(field.name()) {
+                Some(Literal::String(uri)) => {
+                    // Assigned: build a single blob column from the URI.
+                    let mut builder = BlobArrayBuilder::new(batch.num_rows());
+                    for _ in 0..batch.num_rows() {
+                        crate::loader::append_blob_value(&mut builder, uri)?;
+                    }
+                    builder.finish().map_err(OmniError::lance_internal)?
                 }
-                columns.push(builder.finish().map_err(OmniError::lance_internal)?);
-            } else {
+                // Assigned null clears the cell; `resolve_assignments` already
+                // refused null on a non-nullable Blob.
+                Some(Literal::Null) => build_null_blob_array(batch.num_rows())?,
+                Some(other) => {
+                    return Err(OmniError::manifest_internal(format!(
+                        "Blob property '{}' assigned non-string constant {other:?}",
+                        field.name()
+                    )));
+                }
                 // Unassigned: the materializing scan must have normalized the
                 // committed value (or pending value) to the logical blob
                 // schema, so copying it preserves both bytes and full-schema
                 // merge compatibility.
-                let col = batch.column_by_name(field.name()).ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "blob column '{}' not found in full-schema mutation scan",
-                        field.name()
-                    ))
-                })?;
-                columns.push(col.clone());
-            }
+                None => batch
+                    .column_by_name(field.name())
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "blob column '{}' not found in full-schema mutation scan",
+                            field.name()
+                        ))
+                    })?
+                    .clone(),
+            };
+            columns.push(column);
         } else if let Some(lit) = assignments.get(field.name()) {
             columns.push(literal_to_typed_array(
                 lit,
@@ -1327,7 +1343,37 @@ impl Omnigraph {
 
         let schema = catalog.node_types[type_name].arrow_schema.clone();
         let pred_expr = mutation_predicate_expr(predicate, params, &schema)?;
+        // Resolved before any I/O, so a null on a non-nullable property is
+        // refused before the table is opened or scanned.
+        let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
         let blob_props = catalog.node_types[type_name].blob_properties.clone();
+        // An assigned Blob replaces every matched cell, so the scan never
+        // takes, authorizes or reads its old value. The scan schema keeps
+        // catalog order: the concat below binds batches by position.
+        let assigned_blobs = schema
+            .fields()
+            .iter()
+            .filter(|field| {
+                blob_props.contains(field.name()) && resolved.contains_key(field.name())
+            })
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        let scan_schema: SchemaRef = if assigned_blobs.is_empty() {
+            schema.clone()
+        } else {
+            let indices = schema
+                .fields()
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| !assigned_blobs.contains(&field.name().as_str()))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            Arc::new(
+                schema
+                    .project(&indices)
+                    .map_err(OmniError::arrow_internal)?,
+            )
+        };
 
         let table_key = format!("node:{}", type_name);
         let (handle, _full_path, _table_branch) = open_table_for_mutation(
@@ -1383,6 +1429,7 @@ impl Omnigraph {
                     pending_schema,
                     Some(pred_expr),
                     Some(catalog.system_columns.id),
+                    &assigned_blobs,
                     scan_budget,
                 )
                 .await?
@@ -1396,13 +1443,13 @@ impl Omnigraph {
         }
 
         // Concat the matched batches (committed + pending) into one. The
-        // helper binds both sides to the catalog's full logical schema. Any
-        // divergence here is an internal scan/staging contract violation.
-        let matched = concat_match_batches_to_schema(&schema, batches)?;
+        // helper binds both sides to the catalog's logical schema less the
+        // assigned Blobs. Any divergence here is an internal scan/staging
+        // contract violation.
+        let matched = concat_match_batches_to_schema(&scan_schema, batches)?;
 
         let affected_count = matched.num_rows();
 
-        let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
         let updated = apply_assignments(&schema, &matched, &resolved, &blob_props)?;
         // Validation (value/enum/unique) runs end-of-query via the evaluator.
 

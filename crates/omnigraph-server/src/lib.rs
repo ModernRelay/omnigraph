@@ -1448,6 +1448,7 @@ impl ApiError {
                 api::PreconditionFailureOutput { expected, actual },
             ),
             err @ OmniError::ExternalBlobPolicy { .. } => Self::bad_request(err.to_string()),
+            err @ OmniError::StoredExternalBlobDenied { .. } => Self::bad_request(err.to_string()),
             OmniError::ExternalBlobSource { uri, reason } => {
                 Self::external_blob_source(uri, reason)
             }
@@ -1955,6 +1956,27 @@ mod api_error_tests {
         let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
         assert_eq!(error.code, Some(ErrorCode::BadRequest));
         assert!(error.error.contains("outside every configured base"));
+    }
+
+    #[tokio::test]
+    async fn stored_external_blob_denial_is_400_bad_request() {
+        let response = ApiError::from_omni(OmniError::StoredExternalBlobDenied {
+            type_key: "node:Document".to_string(),
+            entity_id: "doc-1".to_string(),
+            property: "content".to_string(),
+            uri: "s3://denied/object".to_string(),
+            reason: "the graph's external Blob policy admits no source".to_string(),
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, Some(ErrorCode::BadRequest));
+        assert!(error.error.contains("node type 'Document' id 'doc-1'"));
+        assert!(error.error.contains("assign 'content'"));
     }
 
     #[tokio::test]

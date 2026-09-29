@@ -1299,12 +1299,17 @@ fn whole_external_uri_for_schema_rewrite(
     offset: u64,
     length: Option<u64>,
 ) -> Result<String> {
-    if offset != 0 || length.is_some() {
+    let reference = crate::blob::ExternalBlobRef {
+        uri,
+        offset,
+        length,
+    };
+    if let Err(ranged) = reference.whole_object_uri() {
         return Err(OmniError::manifest(format!(
-            "schema rewrite cannot preserve ranged external Blob descriptor (offset {offset}, length {length:?})"
+            "schema rewrite cannot preserve {ranged}"
         )));
     }
-    Ok(uri)
+    Ok(reference.uri)
 }
 
 #[cfg(test)]

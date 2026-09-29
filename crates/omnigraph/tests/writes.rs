@@ -1250,6 +1250,208 @@ query update_note($note: String) {
         !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
         "oversized update must fail before writing a recovery sidecar"
     );
+
+    // Assigning the oversized Blob replaces it without reading the old cell:
+    // no probe, no payload read, and no budget charge for the old bytes.
+    const REPLACE: &str = r#"
+query replace_content($c: Blob) {
+    update Document set { content: $c } where title = "wide"
+}
+"#;
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let result = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            REPLACE,
+            "replace_content",
+            &params(&[("$c", "base64:AQID")]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(probes.external_blob_probe_calls(), 0);
+    assert_eq!(probes.external_blob_payload_read_calls(), 0);
+    assert_eq!(probes.blob_payload_read_calls(), 0);
+    let bytes = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "wide", "content"),
+    )
+    .await;
+    assert_eq!(&bytes[..], &[1, 2, 3]);
+}
+
+/// An update carries every Blob cell it does not assign, so carrying a stored
+/// external reference needs the graph's policy to admit its source. Under the
+/// default Deny policy that refusal names the row and property, and assigning
+/// the property (a new value or null) replaces the reference without reading it.
+#[tokio::test]
+async fn mutation_update_replaces_stored_external_reference_under_deny() {
+    const SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    note: String?
+}
+"#;
+    const MUTATIONS: &str = r#"
+query update_note($note: String) {
+    update Document set { note: $note } where title = "doc"
+}
+
+query set_content($c: Blob?) {
+    update Document set { content: $c } where title = "doc"
+}
+"#;
+
+    // The external source directory is a sibling of the graph directory, so
+    // the admitted base never overlaps graph storage.
+    let root = tempfile::tempdir().unwrap();
+    let source_dir = root.path().join("sources");
+    std::fs::create_dir(&source_dir).unwrap();
+    let source = source_dir.join("stored.bin");
+    std::fs::write(&source, b"stored external bytes").unwrap();
+    let source_uri = url::Url::from_file_path(&source).unwrap().to_string();
+    let allow = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(&source_dir).unwrap(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_path = root.path().join("graph");
+    let uri = graph_path.to_str().unwrap().to_string();
+    {
+        let seeding = helpers::session(
+            Omnigraph::init(&uri, SCHEMA)
+                .await
+                .unwrap()
+                .with_external_blob_policy(allow)
+                .unwrap(),
+        );
+        let row = serde_json::json!({
+            "type": "Document",
+            "data": {"title": "doc", "content": source_uri, "note": "before"},
+        });
+        seeding
+            .load_jsonl(&row.to_string(), LoadMode::Overwrite)
+            .await
+            .unwrap();
+    }
+
+    // Reopened under the default policy, which admits no external source.
+    let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    let cell = || node_blob_cell("Document", "doc", "content");
+    let stored = db
+        .read_blob_at(ReadTarget::branch("main"), cell())
+        .await
+        .unwrap();
+    let omnigraph::BlobContent::External(stored) = stored.content else {
+        panic!("overwrite load must retain the external descriptor");
+    };
+    let before = snapshot_main(&db).await.unwrap();
+    let before_manifest = before.graph_manifest_version();
+    let before_table = before
+        .dataset("node:Document")
+        .unwrap()
+        .published_dataset_version;
+    let before_head = head_commit_id(&uri).await;
+
+    // (a) An update that carries the stored reference is refused by name.
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let error = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            MUTATIONS,
+            "update_note",
+            &params(&[("$note", "after")]),
+        ),
+    )
+    .await
+    .unwrap_err();
+    match &error {
+        OmniError::StoredExternalBlobDenied {
+            type_key,
+            entity_id,
+            property,
+            uri,
+            ..
+        } => {
+            assert_eq!(type_key, "node:Document");
+            assert_eq!(entity_id, "doc");
+            assert_eq!(property, "content");
+            assert_eq!(uri, &stored.uri);
+        }
+        other => panic!("expected StoredExternalBlobDenied, got {other:?}"),
+    }
+    assert!(error.to_string().contains("assign 'content'"), "{error}");
+    assert_eq!(probes.external_blob_probe_calls(), 0);
+    assert_eq!(probes.external_blob_payload_read_calls(), 0);
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(after.graph_manifest_version(), before_manifest);
+    assert_eq!(
+        after
+            .dataset("node:Document")
+            .unwrap()
+            .published_dataset_version,
+        before_table
+    );
+    assert_eq!(head_commit_id(&uri).await, before_head);
+
+    // (b) Assigning managed bytes replaces the reference without reading it.
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let result = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            MUTATIONS,
+            "set_content",
+            &params(&[("$c", "base64:AQID")]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(probes.external_blob_probe_calls(), 0);
+    assert_eq!(probes.external_blob_payload_read_calls(), 0);
+    let bytes = read_managed_blob_bytes(&db, ReadTarget::branch("main"), cell()).await;
+    assert_eq!(&bytes[..], &[1, 2, 3]);
+
+    // (c) Assigning null clears the cell.
+    let mut null_params = omnigraph_compiler::ir::ParamMap::new();
+    null_params.insert(
+        "c".to_string(),
+        omnigraph_compiler::query::ast::Literal::Null,
+    );
+    let result = db
+        .mutate("main", MUTATIONS, "set_content", &null_params)
+        .await
+        .unwrap();
+    assert_eq!(result.affected_nodes, 1);
+    let cleared = db
+        .read_blob_at(ReadTarget::branch("main"), cell())
+        .await
+        .unwrap_err();
+    assert!(cleared.to_string().contains("is null"), "{cleared}");
+
+    // (d) A new external URI is still caller input the policy refuses.
+    let error = db
+        .mutate(
+            "main",
+            MUTATIONS,
+            "set_content",
+            &params(&[("$c", url::Url::from_file_path(&source).unwrap().as_str())]),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, OmniError::ExternalBlobPolicy { .. }),
+        "new external input stays a policy refusal, got {error:?}"
+    );
 }
 
 /// D₂: a query mixing inserts/updates with deletes is rejected at parse

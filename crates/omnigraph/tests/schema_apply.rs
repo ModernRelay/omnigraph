@@ -960,9 +960,7 @@ node Document {
 #[cfg(feature = "failpoints")]
 #[serial_test::parallel]
 async fn schema_apply_rejects_ranged_external_blob_before_arm_or_effects() {
-    use arrow_array::{ArrayRef, RecordBatch, StringArray};
     use helpers::recovery::{branch_head_commit_id, sidecar_operation_ids};
-    use lance::blob::{BlobDescriptorArrayBuilder, BlobRange};
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -980,60 +978,7 @@ node Document {
 }
 "#;
     let db = Omnigraph::init(uri, initial).await.unwrap();
-    let entry = db
-        .snapshot_of(ReadTarget::branch("main"))
-        .await
-        .unwrap()
-        .dataset("node:Document")
-        .unwrap()
-        .clone();
-    let table_uri = format!("{uri}/{}", entry.dataset_path);
-    let mut raw = lance::Dataset::open(&table_uri).await.unwrap();
-    let logical_schema = arrow_schema::Schema::from(raw.schema());
-    let mut descriptor_builder = BlobDescriptorArrayBuilder::new("content");
-    descriptor_builder
-        .push_external("s3://bucket/object", Some(BlobRange { offset: 4, size: 8 }))
-        .unwrap();
-    let (descriptor_field, descriptor) = descriptor_builder.finish().unwrap().into_parts();
-    let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
-        logical_schema
-            .fields()
-            .iter()
-            .map(|field| {
-                if field.name() == "content" {
-                    Arc::new(descriptor_field.clone())
-                } else {
-                    field.clone()
-                }
-            })
-            .collect::<Vec<_>>(),
-        logical_schema.metadata().clone(),
-    ));
-    let mut field_names = schema
-        .fields()
-        .iter()
-        .map(|field| field.name().as_str())
-        .collect::<Vec<_>>();
-    field_names.sort_unstable();
-    assert_eq!(
-        field_names,
-        ["__id", "content", "title"],
-        "ranged-descriptor fixture is physical-schema specific"
-    );
-    let columns = schema
-        .fields()
-        .iter()
-        .map(|field| match field.name().as_str() {
-            "__id" | "title" => Arc::new(StringArray::from(vec!["ranged"])) as ArrayRef,
-            "content" => descriptor.clone(),
-            other => panic!("unexpected ranged-descriptor fixture field {other}"),
-        })
-        .collect::<Vec<_>>();
-    let batch = RecordBatch::try_new(schema, columns).unwrap();
-    helpers::lance_append_inline(&mut raw, batch).await;
-    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Document", None)
-        .await
-        .unwrap();
+    let table_uri = helpers::seed_ranged_external_blob_row(&db, uri).await;
 
     let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let manifest_before = before.graph_manifest_version();

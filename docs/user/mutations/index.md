@@ -49,9 +49,9 @@ A constant's value is fixed per invocation: parameters and `now()` are bound
 once before any retry, so a retried mutation computes the same value. It follows the read rules
 for null: with `$flag` null, `true or $flag` is `true` and `false and $flag`
 is `false`, and `$age > 30` with `$age` null is null. A null result assigned
-to a nullable property writes null, with one exception that predates this
-release: an `update` that assigns null to a nullable `Blob` property keeps
-the old value instead of clearing it. Assigned to a non-nullable property a
+to a nullable property writes null; on a `Blob` property it clears the cell.
+`null` is a reserved word, so clear a Blob through a nullable parameter such
+as `$content: Blob?`. Assigned to a non-nullable property a
 null result is refused with a typed error that names the property, never
 written as a default. A
 property or system field in a value is refused, for example ``T45: `age`

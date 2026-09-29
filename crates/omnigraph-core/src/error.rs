@@ -262,6 +262,22 @@ pub enum OmniError {
     /// or a misleading malformed-request response.
     #[error("external blob source '{uri}' is unavailable: {reason}")]
     ExternalBlobSource { uri: String, reason: String },
+    /// An update must carry a Blob cell it does not assign, the cell stores an
+    /// external reference, and the graph's external Blob policy refuses to
+    /// read that source. Distinct from `ExternalBlobPolicy`, which refuses
+    /// caller input. `uri` is the policy's normalized, credential-free
+    /// spelling.
+    #[error(
+        "{} id '{entity_id}' property '{property}' stores external Blob reference '{uri}', which this update must read to carry the row, and the graph's external Blob policy does not admit it ({reason}); assign '{property}' in the same update (a new value or null) to replace it without reading it, or admit its base in the graph's external Blob policy",
+        graph_type_subject(type_key)
+    )]
+    StoredExternalBlobDenied {
+        type_key: String,
+        entity_id: String,
+        property: String,
+        uri: String,
+        reason: String,
+    },
     /// Persisted dataset or Blob state contradicted the logical Blob contract.
     /// This is a typed integrity failure rather than a generic storage string so
     /// callers never reinterpret corrupt identity, metadata, or descriptors as

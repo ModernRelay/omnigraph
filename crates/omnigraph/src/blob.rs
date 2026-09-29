@@ -83,6 +83,42 @@ pub struct ExternalBlobRef {
     pub length: Option<u64>,
 }
 
+impl ExternalBlobRef {
+    /// The URI when the descriptor names its whole object. A ranged descriptor
+    /// is refused: a whole-object surface would widen it to bytes outside the
+    /// cell.
+    pub fn whole_object_uri(&self) -> std::result::Result<&str, RangedExternalBlob> {
+        if self.offset != 0 || self.length.is_some() {
+            Err(RangedExternalBlob {
+                offset: self.offset,
+                length: self.length,
+            })
+        } else {
+            Ok(&self.uri)
+        }
+    }
+}
+
+/// A persisted external descriptor naming a byte range. A whole-object surface
+/// (redirect, URI export, Lance's minimal logical Blob input) cannot carry it;
+/// widening it to the whole object would return bytes outside the cell.
+/// Display never includes the URI, which may carry credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangedExternalBlob {
+    pub offset: u64,
+    pub length: Option<u64>,
+}
+
+impl fmt::Display for RangedExternalBlob {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "ranged external Blob descriptor (offset {}, length {:?})",
+            self.offset, self.length
+        )
+    }
+}
+
 /// Snapshot-pinned, bounded reader for one managed Blob value.
 ///
 /// The Lance dataset and Blob handle remain private so callers cannot recover
@@ -1038,6 +1074,16 @@ impl<'a> BlobDescriptorDecoder<'a> {
                         "external row {row} blob_uri is not an absolute URI: {error}"
                     ))
                 })?;
+                // Lance's contract: a URI without range fields names the whole
+                // object, empty included, and an explicit range has size > 0.
+                // Lance's external reader substitutes the object size for a
+                // zero size but keeps the position, so offset > 0 with size 0
+                // would read past the object's end.
+                if size == 0 && position != 0 {
+                    return Err(malformed_descriptor(format!(
+                        "external row {row} has offset {position} with size 0; a whole-object reference has offset 0"
+                    )));
+                }
                 Ok(BlobDescriptor::External {
                     uri: blob_uri.to_owned(),
                     offset: position,
@@ -2234,6 +2280,41 @@ mod tests {
         let decoder = BlobDescriptorDecoder::try_new(&overflow).unwrap();
         assert_blob_integrity(decoder.classify(0).unwrap_err(), "overflows");
         assert_blob_integrity(decoder.classify(1).unwrap_err(), "outside");
+
+        // Lance reads size 0 as the object size but keeps the position, so an
+        // offset without a length would read past the object's end.
+        let offset_without_length =
+            descriptor(Some(3), Some(4), Some(0), Some(0), Some("s3://b/o"));
+        let decoder = BlobDescriptorDecoder::try_new(&offset_without_length).unwrap();
+        assert_blob_integrity(
+            decoder.classify(0).unwrap_err(),
+            "external row 0 has offset 4 with size 0",
+        );
+    }
+
+    #[test]
+    fn whole_object_uri_refuses_a_ranged_descriptor_without_naming_it() {
+        let whole = ExternalBlobRef {
+            uri: "s3://bucket/object".to_string(),
+            offset: 0,
+            length: None,
+        };
+        assert_eq!(whole.whole_object_uri().unwrap(), "s3://bucket/object");
+        for (offset, length) in [(4, Some(8)), (4, None), (0, Some(8))] {
+            let ranged = ExternalBlobRef {
+                uri: "s3://user:secret@bucket/object?signature=private".to_string(),
+                offset,
+                length,
+            };
+            let refused = ranged.whole_object_uri().unwrap_err();
+            assert_eq!(refused, RangedExternalBlob { offset, length });
+            let message = refused.to_string();
+            assert_eq!(
+                message,
+                format!("ranged external Blob descriptor (offset {offset}, length {length:?})")
+            );
+            assert!(!message.contains("secret") && !message.contains("bucket"));
+        }
     }
 
     #[test]

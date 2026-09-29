@@ -960,6 +960,44 @@ async fn export_jsonl_preserves_explicit_ids_for_non_key_graphs() {
 
 // ─── Regression: export with blob columns ────────────────────────────────────
 
+/// Export writes an external Blob as a bare URI, which reloads as the whole
+/// object. A ranged descriptor is refused instead of widened, and the refusal
+/// never echoes the stored URI.
+#[tokio::test]
+#[cfg(feature = "failpoints")]
+async fn export_jsonl_refuses_ranged_external_blob_descriptor() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(
+        uri,
+        r#"
+node Document {
+    title: String @key
+    content: Blob?
+}
+"#,
+    )
+    .await
+    .unwrap();
+    helpers::seed_ranged_external_blob_row(&db, uri).await;
+
+    let error = db.export_jsonl("main", &[]).await.unwrap_err();
+    let message = error.to_string();
+    assert!(
+        matches!(
+            &error,
+            OmniError::Manifest(manifest)
+                if manifest.kind == omnigraph::error::ManifestErrorKind::BadRequest
+        ),
+        "ranged export must be a BadRequest refusal, got {error:?}"
+    );
+    assert!(
+        message.contains("ranged external Blob descriptor (offset 4, length Some(8))"),
+        "{message}"
+    );
+    assert!(!message.contains("s3://bucket"), "{message}");
+}
+
 #[tokio::test]
 async fn export_jsonl_with_blob_type() {
     // Regression: export on types with blob columns failed with

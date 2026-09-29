@@ -999,7 +999,9 @@ a parser/validator hole without stranding a historical root.
 
 Export uses the central decoder. Null emits JSON null, managed zero bytes emits
 `base64:` with an empty payload, non-empty managed content emits base64, and an
-external reference emits its URI. Export's current one-row indivisible Blob
+external reference that names its whole object emits its URI. A ranged
+external descriptor is refused: a bare URI reloads as the whole object, so
+emitting it would widen the cell. Export's current one-row indivisible Blob
 scratch and chunked transport limits remain documented; the Blob GET endpoint is
 the preferred way to move a single large payload without base64 expansion.
 
@@ -1713,3 +1715,7 @@ publisher architecture.
   is superseded by the version that also rejects a base overlapping the cluster
   storage root (config validation, serve boot) or the handle's own graph root
   (engine policy install); §10 gains the matching risk row.
+- 2026-09-29: §8.3 now refuses a ranged external descriptor on export,
+  superseding "an external reference emits its URI", which widened the range
+  to the whole object on reload. The redirect, CLI delivery and schema rewrite
+  already refused it; export now shares their whole-object check.

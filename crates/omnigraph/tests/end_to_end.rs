@@ -1016,7 +1016,29 @@ query insert_doc($title: String, $content: Blob) {
 query update_doc_content($title: String, $content: Blob) {
     update Document set { content: $content } where title = $title
 }
+
+query clear_doc_content($title: String, $content: Blob?) {
+    update Document set { content: $content } where title = $title
+}
+
+query insert_then_clear_doc_content($title: String, $content: Blob, $cleared: Blob?) {
+    insert Document { title: $title, content: $content }
+    update Document set { content: $cleared } where title = $title
+}
 "#;
+
+/// Parameters binding `$content` (and `$cleared`, when present) to null: `null`
+/// is a reserved word in `.gq`, so a null reaches a Blob only as a parameter.
+fn null_blob_params(title: &str, names: &[&str]) -> ParamMap {
+    let mut map = params(&[("$title", title)]);
+    for name in names {
+        map.insert(
+            name.to_string(),
+            omnigraph_compiler::query::ast::Literal::Null,
+        );
+    }
+    map
+}
 
 #[tokio::test]
 async fn blob_schema_parses_and_init_succeeds() {
@@ -2156,10 +2178,10 @@ query get_article($slug: String) {
     assert!(attachment.is_empty());
 }
 
-// ─── Regression: blob update null → non-null ─────────────────────────────────
+// ─── Regression: blob update null → non-null → null ──────────────────────────
 
 #[tokio::test]
-async fn blob_update_null_to_non_null() {
+async fn blob_update_null_round_trip() {
     // Regression: updating a blob column that was previously all-null panicked
     // with assertion `left: 0, right: 1` in lance-table stream.rs because the
     // two-phase blob update sent a blob-only batch to merge_insert on a dataset
@@ -2191,6 +2213,66 @@ async fn blob_update_null_to_non_null() {
     )
     .await;
     assert_eq!(&bytes[..], &[1, 2, 3]);
+
+    // non-null → null: a null parameter clears the cell and publishes once.
+    let before = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let result = mutate_main(
+        &db,
+        BLOB_MUTATIONS,
+        "clear_doc_content",
+        &null_blob_params("kid-a", &["content"]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        before + 1
+    );
+    let assert_null = |error: OmniError| {
+        assert!(
+            matches!(
+                &error,
+                OmniError::Manifest(manifest)
+                    if manifest.kind == ManifestErrorKind::NotFound
+                        && manifest.message.contains("is null")
+            ),
+            "cleared Blob must read as null, got {error:?}"
+        );
+    };
+    assert_null(
+        db.read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "kid-a", "content"),
+        )
+        .await
+        .unwrap_err(),
+    );
+
+    // An update to null in the same mutation as the insert clears the
+    // pending row, too.
+    let mut insert_then_clear = null_blob_params("ok-computer", &["cleared"]);
+    insert_then_clear.insert(
+        "content".to_string(),
+        omnigraph_compiler::query::ast::Literal::String("base64:AQID".to_string()),
+    );
+    let result = mutate_main(
+        &db,
+        BLOB_MUTATIONS,
+        "insert_then_clear_doc_content",
+        &insert_then_clear,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.affected_nodes, 2);
+    assert_null(
+        db.read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "ok-computer", "content"),
+        )
+        .await
+        .unwrap_err(),
+    );
 }
 
 // ─── External Blob bases stay outside the graph's own storage ────────────────
@@ -2542,6 +2624,33 @@ async fn blob_load_external_file_uri() {
     assert_eq!(read_probes.external_blob_probe_calls(), 0);
     assert_eq!(read_probes.external_blob_payload_read_calls(), 0);
     assert_eq!(read_probes.blob_payload_read_calls(), 0);
+
+    // Clearing the cell after its source disappeared never reads the old
+    // reference: an assigned Blob replaces the cell without carrying it.
+    let clear_probes = MergeWriteProbes::default();
+    let result = with_merge_write_probes(
+        clear_probes.clone(),
+        db.mutate(
+            "main",
+            BLOB_MUTATIONS,
+            "clear_doc_content",
+            &null_blob_params("from-file", &["content"]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(clear_probes.external_blob_probe_calls(), 0);
+    assert_eq!(clear_probes.external_blob_payload_read_calls(), 0);
+    assert_eq!(clear_probes.blob_payload_read_calls(), 0);
+    let cleared = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "from-file", "content"),
+        )
+        .await
+        .unwrap_err();
+    assert!(cleared.to_string().contains("is null"), "{cleared}");
 }
 
 // ─── Regression: execute_update on edge type ─────────────────────────────────

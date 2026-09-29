@@ -868,10 +868,26 @@ async fn export_blob_column_values(
                 managed_row_ids.push(*row_id);
                 managed_positions.push(row);
             }
-            crate::blob::BlobDescriptor::External { uri, .. } => {
+            crate::blob::BlobDescriptor::External {
+                uri,
+                offset,
+                length,
+            } => {
                 // Export is descriptor-preserving. It must not open or probe a
-                // caller-owned object merely to reproduce the stored URI.
-                values[row] = Some(uri);
+                // caller-owned object merely to reproduce the stored URI. A
+                // bare URI reloads as the whole object, so a ranged descriptor
+                // is refused rather than widened.
+                let reference = crate::blob::ExternalBlobRef {
+                    uri,
+                    offset,
+                    length,
+                };
+                if let Err(ranged) = reference.whole_object_uri() {
+                    return Err(OmniError::manifest(format!(
+                        "export cannot represent {ranged} in '{column_name}': export writes an external Blob as a bare URI, which reloads as the whole object"
+                    )));
+                }
+                values[row] = Some(reference.uri);
             }
         }
     }
