@@ -7,16 +7,12 @@ implementation: complete
 authors:
   - ragnorc
 created: 2026-09-14
-updated: 2026-09-29
+updated: 2026-09-30
 discussion: null
 supersedes:
   - "0065"
 superseded_by: []
-blocked_on:
-  - "Engine: the promotion reconciler with idempotent, order-preserving, uuid-checked replay and its crash and two-process evidence."
-  - "Storage: cleanup that promotes pending pins first, reaps only UUID-verified promoted detached manifests, and keeps stock Lance version cleanup for the linear chain, on file, S3, and Azure."
-  - "Maintenance: Optimize staged as one detached Rewrite transaction built from the RewriteResults with fragment ids above the base high-water mark, lagging indexes rebuilt whole as a chained detached CreateIndex, published with an exact pin CAS and promoted by replay."
-  - "Compatibility: format stamp v10, the pin shape with target version, staged id and transaction uuid, and the refusal fence for older binaries."
+blocked_on: []
 ---
 
 # RFC 0067: Detached table commits
@@ -1095,6 +1091,8 @@ The extended run adds the same-handle, other-process and cleanup actors
 
 ## Rollout
 
+### Historical v10 rollout
+
 1. Independent of this RFC: quarantine mis-named and stale sidecars with a
    typed error naming the file (#601, #602); idempotency key on the lineage
    row (#513). File the upstream ask to include referenced detached manifests
@@ -1121,17 +1119,23 @@ The extended run adds the same-handle, other-process and cleanup actors
    linear commit that arrived before any pending pin, while how a blocked
    table is unblocked remains the open question below.
 
-Each stop leaves `main` shippable; the stamp gates activation. Roll the
-server out before any CLI that writes to the same bucket, because the v10
-stamp refuses an older binary.
+Each stop kept `main` shippable; the v10 stamp gated activation. That rollout
+required the server before any CLI writing the same bucket, because the v10
+stamp refused an older binary. The subsequent detached-only conversion and
+current qualification are separate from this completed rollout.
 
-Still not validated after the prototype, and therefore the gates that
-remain: an incremental index fold inside Optimize, which needs the upstream
-ask (the shipped fold is a whole rebuild); Azure; Lance 12 for probes 8 to
-14; the server's
-promotion-after-acknowledgement and its counters; and the
-manifest-byte cost on a copy of the production graph rather than a fixture.
-The DST gate is closed: the suite runs green over the detached protocol,
+### Qualification disposition
+
+The v10 prototype did not qualify an incremental index fold inside Optimize
+(the shipped fold was a whole rebuild), Azure, Lance 12 for probes 8 to 14, or
+manifest-byte cost on a production-graph copy. These are dated limits of the
+evidence below; current support boundaries belong in the
+[Lance guide](../dev/lance.md) and [testing guide](../dev/testing.md).
+The proposed server promotion-after-acknowledgement gate and its counters are
+obsolete: no serving writer or cleanup promotes a table pin. Promotion remains
+only in the one-time `detached-only-v10-to-v11` conversion described above.
+
+The v10 DST gate closed: the suite ran green over the detached protocol,
 including a Lance-realm ack-loss verb that loses acknowledgements of the
 `__manifest` commit puts themselves under seeded schedules (the workload's
 client retries converge against their own durable-but-denied commits), the
@@ -1140,9 +1144,10 @@ revived persisted-write lie verbs against the schema control objects, which
 the engine answers with a loud typed refusal. The failure matrix covers ten
 writers (load, the explicit full-text rebuild, and the system-column upgrade
 included), each across its own windows, every fault and every recovery actor.
-The `Cleanup` writer carries two of the six window kinds, `InPromotion` and
-`CleanupPreReap`; it has no detached effect or publication of its own to
-interrupt.
+The v10 `Cleanup` writer carried two of the six window kinds, `InPromotion` and
+`CleanupPreReap`; it had no detached effect or publication of its own to
+interrupt. Current collector qualification is owned by
+[detached-only tables](2026-09-21-detached-only-tables.md#evidence-and-tests).
 
 ## Throughput after this RFC
 
@@ -1499,3 +1504,12 @@ claims).
 - 2026-09-29: Recorded reciprocal supersession of RFC 0065, making the
   existing Alternatives disposition of private native branches as subsumed
   explicit in metadata. No storage decision or implementation status changes.
+- 2026-09-30: Removed the four obsolete `blocked_on` entries for the promotion
+  reconciler, promotion-first cleanup, Optimize replay and v10 compatibility.
+  They described the completed v10 rollout, whose runtime promotion machinery
+  detached-only tables subsequently removed. The Rollout sentence "Still not
+  validated after the prototype, and therefore the gates that remain" now
+  distinguishes dated qualification limits from active requirements; the
+  server promotion-after-acknowledgement gate is explicitly obsolete. The v10
+  rollout and its cleanup fault windows are historical. The one-time v10→v11
+  upgrade replay and its refusal rules remain; no storage decision changes.
