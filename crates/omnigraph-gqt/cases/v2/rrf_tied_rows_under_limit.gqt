@@ -87,32 +87,6 @@ node Probe {
 {"type":"Probe","data":{"slug":"p63","n":1}}
 
 --- query
-set engine = v1;
-query fused_v1($t: String) {
-    match {
-        $d: Doc
-        $p: Probe
-        $d.n = $p.n
-    }
-    return { $p.slug }
-    order { rrf(bm25($d.text, $t), bm25($d.text, $t)) }
-    limit 5
-}
-
---- params
-{"t":"needle"}
-
---- expect unordered
-{"p.slug":"p00"}
-{"p.slug":"p01"}
-{"p.slug":"p02"}
-{"p.slug":"p03"}
-{"p.slug":"p04"}
-
---- expect shape
-p.slug: String
-
---- query
 set engine = v2;
 query fused_v2($t: String) {
     match {
@@ -137,3 +111,4 @@ query fused_v2($t: String) {
 
 --- expect shape
 p.slug: String
+--- expect same as v1

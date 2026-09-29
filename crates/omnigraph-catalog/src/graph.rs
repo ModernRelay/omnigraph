@@ -20,9 +20,10 @@ use super::metadata::TableVersionMetadata;
 use super::migrations::{guard_stamp, stamp_entry, stamp_for_system_columns};
 use super::state::{
     DatasetEntry, GraphLineageRow, ManifestState, entries_to_batch, graph_lineage_row_parts,
-    manifest_schema, read_manifest_state, read_manifest_state_and_lineage,
+    read_manifest_state, read_manifest_state_and_lineage,
 };
 use super::{TableIdentity, table_path_for_identity};
+use crate::record::{compact_to_storage, manifest_storage_schema};
 use crate::seams::{decide_seam, fail};
 
 /// The manifest version the init `Dataset::write` produces (Lance datasets start
@@ -139,16 +140,9 @@ pub(crate) async fn init_manifest_graph(
     // key is deliberately not written: neither the pinned Lance substrate nor
     // this crate reads it.)
     let (stamp_key, stamp_value) = stamp_entry(attempt.stamp);
-    let schema: SchemaRef = Arc::new(
-        manifest_schema()
-            .as_ref()
-            .clone()
-            .with_metadata([(stamp_key, stamp_value)].into_iter().collect()),
-    );
-    let manifest_batch = RecordBatch::try_new(schema.clone(), manifest_batch.columns().to_vec())
-        .map_err(|e| {
-            OmniError::manifest_internal(format!("attach stamp metadata to init batch: {e}"))
-        })?;
+    let schema: SchemaRef =
+        manifest_storage_schema([(stamp_key, stamp_value)].into_iter().collect())?;
+    let manifest_batch = compact_to_storage(&manifest_batch, &schema)?;
     let reader = RecordBatchIterator::new(vec![Ok(manifest_batch)], schema);
     let manifest_path = manifest_uri(root);
     let params = WriteParams {

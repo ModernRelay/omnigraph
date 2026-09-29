@@ -158,10 +158,7 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
     // final publish all remain under schema -> main -> sorted-table gates. This
     // prevents a concurrent drop/re-add from pairing the old dataset path with
     // the replacement's same public alias and new identity.
-    let _schema_guard = db
-        .write_queue()
-        .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
-        .await;
+    let _schema_permit = db.write_queue().acquire_schema_shared().await;
     db.refresh_coordinator_only().await?;
     db.ensure_schema_apply_not_locked("repair").await?;
     let catalog = db.load_accepted_catalog_with_schema_gate_held().await?;

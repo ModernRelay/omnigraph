@@ -810,9 +810,11 @@ fn typecheck_mutation_where(
 fn first_boolean_literal(expr: &Expr) -> Option<bool> {
     match expr {
         Expr::Literal(Literal::Bool(value)) => Some(*value),
-        Expr::Binary { left, right, .. } => {
-            first_boolean_literal(left).or_else(|| first_boolean_literal(right))
-        }
+        Expr::Binary { left, right, .. }
+        | Expr::In {
+            needle: left,
+            list: right,
+        } => first_boolean_literal(left).or_else(|| first_boolean_literal(right)),
         Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => first_boolean_literal(inner),
         _ => None,
     }
@@ -1340,9 +1342,11 @@ const SEARCH_PREDICATE_SHAPE: &str =
 fn contains_search_call(expr: &Expr) -> bool {
     expr.is_search_call()
         || match expr {
-            Expr::Binary { left, right, .. } => {
-                contains_search_call(left) || contains_search_call(right)
-            }
+            Expr::Binary { left, right, .. }
+            | Expr::In {
+                needle: left,
+                list: right,
+            } => contains_search_call(left) || contains_search_call(right),
             Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => contains_search_call(inner),
             Expr::Aggregate { arg, .. } => contains_search_call(arg),
             Expr::Nearest { query, .. } => contains_search_call(query),
@@ -1470,8 +1474,10 @@ fn typecheck_comparison(
                 ));
             }
 
+            let empty_list_literal =
+                matches!(left, Expr::Literal(Literal::List(items)) if items.is_empty());
             let expected_member = PropType::scalar(l.scalar, l.nullable);
-            if !types_compatible(&expected_member, r) {
+            if !empty_list_literal && !types_compatible(&expected_member, r) {
                 return Err(CompilerError::Type(format!(
                     "T7: cannot test membership of {} in {}",
                     r.display_name(),
@@ -2067,6 +2073,27 @@ fn resolve_expr_type(
         } => Ok(ResolvedType::Scalar(typecheck_comparison(
             catalog, left, *op, right, ctx, params, scope,
         )?)),
+        Expr::In { needle, list } => {
+            if let Some(refusal) = membership_over_a_node(catalog, needle, list, ctx, params) {
+                return Err(refusal);
+            }
+            let list_type = resolve_expr_type(catalog, list, ctx, params, scope)?;
+            if !matches!(&list_type, ResolvedType::Scalar(list) if list.list) {
+                return Err(CompilerError::Type(format!(
+                    "T7: `in` needs a list on the right, got {}",
+                    list_type.display_name()
+                )));
+            }
+            Ok(ResolvedType::Scalar(typecheck_comparison(
+                catalog,
+                list,
+                CompOp::Contains,
+                needle,
+                ctx,
+                params,
+                scope,
+            )?))
+        }
         Expr::Binary { left, op, right } => {
             let left_type = resolve_expr_type(catalog, left, ctx, params, scope)?;
             let right_type = resolve_expr_type(catalog, right, ctx, params, scope)?;
@@ -2184,7 +2211,11 @@ fn check_projection(expr: &Expr, alias: Option<&str>, order_clause: &[Ordering])
         Expr::AliasRef(name) => Err(CompilerError::Type(format!(
             "T36: `{name}` cannot be projected in `return`; an alias is resolved in `order`, not projected again"
         ))),
-        Expr::Binary { left, right, .. } => {
+        Expr::Binary { left, right, .. }
+        | Expr::In {
+            needle: left,
+            list: right,
+        } => {
             require_projection_alias(alias)?;
             check_projection(left, alias, order_clause)?;
             check_projection(right, alias, order_clause)
@@ -2221,7 +2252,8 @@ fn rank_keyword(expr: &Expr) -> &'static str {
         | Expr::AliasRef(_)
         | Expr::Binary { .. }
         | Expr::Not(_)
-        | Expr::IsNull { .. } => "expression",
+        | Expr::IsNull { .. }
+        | Expr::In { .. } => "expression",
     }
 }
 
@@ -2312,7 +2344,9 @@ fn projection_name(expr: &Expr, alias: Option<&str>) -> String {
         }
         Expr::Aggregate { func, .. } => func.to_string(),
         Expr::AliasRef(name) => name.clone(),
-        Expr::Binary { .. } | Expr::Not(_) | Expr::IsNull { .. } => "expression".to_string(),
+        Expr::Binary { .. } | Expr::Not(_) | Expr::IsNull { .. } | Expr::In { .. } => {
+            "expression".to_string()
+        }
     }
 }
 
@@ -2376,6 +2410,34 @@ fn resolved_type_to_field_shape(
         }
         ResolvedType::Aggregate => Ok((DataType::Int64, true)),
     }
+}
+
+/// The refusal of `$a in $b` where `$a` is a node binding, the shape of a
+/// traversal over an edge `In`: it names the quoted form when that edge exists.
+fn membership_over_a_node(
+    catalog: &Catalog,
+    needle: &Expr,
+    list: &Expr,
+    ctx: &TypeContext,
+    params: &HashMap<String, PropType>,
+) -> Option<CompilerError> {
+    let (Expr::Variable(node), Expr::Variable(other)) = (needle, list) else {
+        return None;
+    };
+    let is_node = matches!(ctx.bindings.get(node), Some(BoundVariable::Node { .. }));
+    if params.contains_key(node) || !is_node {
+        return None;
+    }
+    let advice = match catalog.lookup_edge_by_name("in") {
+        Some(edge) => format!(
+            "to follow the edge `{}` write `${node} \"in\" ${other}`",
+            edge.name
+        ),
+        None => "`in` takes a value on the left and a list on the right".to_string(),
+    };
+    Some(CompilerError::Type(format!(
+        "T7: `${node} in ${other}` tests membership and `${node}` is a node; {advice}"
+    )))
 }
 
 fn literal_type(lit: &Literal) -> Result<PropType> {
@@ -2562,9 +2624,11 @@ fn expr_references_any(expr: &Expr, vars: &[String]) -> bool {
         }
         Expr::Variable(v) => vars.contains(v),
         Expr::Aggregate { arg, .. } => expr_references_any(arg, vars),
-        Expr::Binary { left, right, .. } => {
-            expr_references_any(left, vars) || expr_references_any(right, vars)
-        }
+        Expr::Binary { left, right, .. }
+        | Expr::In {
+            needle: left,
+            list: right,
+        } => expr_references_any(left, vars) || expr_references_any(right, vars),
         Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => expr_references_any(inner, vars),
         _ => false,
     }
@@ -2595,9 +2659,11 @@ fn expr_contains_standalone_nearest(expr: &Expr) -> bool {
         }
         // nearest() nested under rrf() is handled by T21 and should not trigger T17/T18 checks.
         Expr::Rrf { .. } => false,
-        Expr::Binary { left, right, .. } => {
-            expr_contains_standalone_nearest(left) || expr_contains_standalone_nearest(right)
-        }
+        Expr::Binary { left, right, .. }
+        | Expr::In {
+            needle: left,
+            list: right,
+        } => expr_contains_standalone_nearest(left) || expr_contains_standalone_nearest(right),
         Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => {
             expr_contains_standalone_nearest(inner)
         }
@@ -2621,7 +2687,11 @@ fn expr_contains_rrf(expr: &Expr) -> bool {
                 || expr_contains_rrf(query)
                 || max_edits.as_deref().is_some_and(expr_contains_rrf)
         }
-        Expr::Binary { left, right, .. } => expr_contains_rrf(left) || expr_contains_rrf(right),
+        Expr::Binary { left, right, .. }
+        | Expr::In {
+            needle: left,
+            list: right,
+        } => expr_contains_rrf(left) || expr_contains_rrf(right),
         Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => expr_contains_rrf(inner),
         _ => false,
     }

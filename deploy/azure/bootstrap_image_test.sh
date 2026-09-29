@@ -12,9 +12,27 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cat >"$work/base.Dockerfile" <<'EOF'
-FROM public.ecr.aws/debian/debian:bookworm-slim@sha256:1f6767130e3479e42348856acee11bbe78d26cc558b4bf52ac5106f3fcf594ff
-RUN groupadd --system omnigraph \
+base_ref=public.ecr.aws/debian/debian:bookworm-slim@sha256:1f6767130e3479e42348856acee11bbe78d26cc558b4bf52ac5106f3fcf594ff
+# TODO: pull the base from the repository's own GHCR mirror, so the anonymous
+# per-IP quota of public.ecr.aws never decides this job. Until then a quota
+# refusal skips the derived-image check loudly; every other pull failure is red.
+if ! pull_log=$(docker pull --quiet "$base_ref" 2>&1); then
+  case "$pull_log" in
+    *toomanyrequests*|*"Too Many Requests"*|*"Data limit exceeded"*)
+      echo "::warning title=azure bootstrap-image test skipped::public.ecr.aws refused the anonymous pull: $pull_log"
+      echo "azure bootstrap-image test: skipped (registry quota, derived-image check did not run)"
+      exit 0
+      ;;
+    *)
+      printf '%s\n' "$pull_log" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+cat >"$work/base.Dockerfile" <<EOF
+FROM $base_ref
+RUN groupadd --system omnigraph \\
     && useradd --system --gid omnigraph --create-home --home-dir /var/lib/omnigraph omnigraph
 USER omnigraph:omnigraph
 EOF

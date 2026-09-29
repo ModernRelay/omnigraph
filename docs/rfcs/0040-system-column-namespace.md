@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-08-23
-updated: 2026-09-13
+updated: 2026-09-29
 discussion: https://github.com/ModernRelay/omnigraph/issues/529
 supersedes: []
 superseded_by: []
@@ -371,6 +371,20 @@ substrate; nothing engine-owned is added outside the reserved namespace.**
 Per-name reservation lists must never come back.
 
 ### The upgrade
+
+**Current implementation.** [Detached table commits](0067-detached-table-commits.md)
+and [detached-only tables](2026-09-21-detached-only-tables.md) replaced the
+recovery-intent protocol below. The upgrade now stages detached renames, publishes
+once, and installs the schema contract using its publishing commit evidence;
+published table pins need no promotion and both column vintages use format v11.
+See [schema completion](../dev/recovery.md) and the supported
+[offline, standalone upgrade procedure](../user/operations/upgrade.md#system-column-upgrade-legacy-spellings).
+Cluster-managed system-column upgrades remain refused.
+
+**Historical protocol.** The following invocation, preflight, recovery-intent,
+stamp-advance, and fault-point description records the pre-detached proposal,
+including its then-proposed cluster surface. It is not the current upgrade
+procedure. The namespace and field-ID-preserving rename decisions remain valid.
 
 The upgrade is invoked explicitly through one engine operation exposed on
 two surfaces: a CLI command in single-graph mode, and a per-graph field in
@@ -980,3 +994,9 @@ None.
   tests per-image comparison; step 3 owns query planning across the upgrade.
   Entity lookup uses logical meta-field names. Constraint lists refuse `@id`
   because identity is already the row key; endpoint meta-fields remain valid.
+- 2026-09-29: The upgrade section now identifies its recovery-intent,
+  stamp-advance, `RollForwardOnly`, and cluster-apply procedure as historical.
+  RFC 0067 and detached-only tables supply the current detached publication and
+  schema completion; current operator instructions own the standalone-only
+  support boundary. This supersedes that section's claims of current recovery
+  behavior, not the accepted system-column namespace decision.

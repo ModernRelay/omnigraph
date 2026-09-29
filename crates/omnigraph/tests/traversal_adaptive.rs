@@ -4,13 +4,14 @@
 //!    the indexed path re-decides per hop with the observed frontier and swaps
 //!    to CSR when it has outgrown the dispatch decision, carrying its BFS state
 //!    across the swap. Results are contracted identical to both forced modes.
-//! 2. **Limit pushdown** — an unordered trailing `limit` on a final filterless
-//!    Expand bounds the traversal's emitted pairs; results are a valid subset
-//!    of the uncapped answer, exactly `limit` rows when enough exist.
+//! 2. **Unordered limit** — an unordered trailing `limit` on a final
+//!    filterless Expand returns a valid subset of the uncapped answer,
+//!    exactly `limit` rows when enough exist.
 //! 3. **Persisted adjacency artifact** — `optimize` writes it, traversals load
 //!    it, staleness and corruption are rejected fail-open.
 //!
-//! Mode forcing uses the `traversal` session setting, never an env var.
+//! Mode forcing uses the harness's traversal pin (`with_traversal`), never an
+//! env var.
 
 mod helpers;
 
@@ -206,9 +207,8 @@ query far($name: String) {
     assert_eq!(auto, csr, "min-hop emission gate must survive the swap");
 }
 
-// Limit pushdown returns exactly `limit` rows, each a member of the uncapped
-// answer, in every mode. The specific subset is not pinned — an unordered
-// limit is contracted as ANY n valid rows.
+/// An unordered limit returns exactly `limit` rows of the uncapped answer in
+/// every mode; which rows is not pinned (any n valid rows is the contract).
 #[tokio::test]
 async fn capped_unordered_limit_returns_valid_subset() {
     let dir = tempfile::tempdir().unwrap();
@@ -222,27 +222,13 @@ async fn capped_unordered_limit_returns_valid_subset() {
     assert_eq!(full.len(), 49);
 
     for mode in [None, Some("csr"), Some("indexed")] {
-        // Prove the cap actually stopped the traversal (subset validity alone
-        // stays green with pushdown disabled).
-        let cap_stops = Arc::new(AtomicU64::new(0));
-        let probes = QueryIoProbes {
-            expand_cap_stops: Arc::clone(&cap_stops),
-            ..Default::default()
-        };
         let run_db = match mode {
             Some(m) => with_traversal(&db, Traversal::from_spelling(m).unwrap()),
             None => db.clone(),
         };
-        let result = with_query_io_probes(
-            probes,
-            query_main(&run_db, REACH_3_CAPPED, "reach_capped", &p),
-        )
-        .await
-        .unwrap();
-        assert!(
-            cap_stops.load(Ordering::Relaxed) >= 1,
-            "the pushed-down limit must stop the traversal early (mode {mode:?})"
-        );
+        let result = query_main(&run_db, REACH_3_CAPPED, "reach_capped", &p)
+            .await
+            .unwrap();
         let rows = first_column_sorted(&result);
         assert_eq!(
             rows.len(),

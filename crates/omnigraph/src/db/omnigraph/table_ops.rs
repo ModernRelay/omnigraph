@@ -358,10 +358,7 @@ async fn maintain_indices_for_branch(
         .iter()
         .map(|target| (target.table_key.clone(), active_branch.clone()))
         .collect();
-    let _schema_guard = db
-        .write_queue()
-        .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
-        .await;
+    let _schema_permit = db.write_queue().acquire_schema_shared().await;
     let _branch_guard = db
         .write_queue()
         .acquire_branch(active_branch.as_deref())

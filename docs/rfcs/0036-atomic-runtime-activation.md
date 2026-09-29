@@ -2,22 +2,25 @@
 rfc: "0036"
 title: "Atomic runtime activation and graph availability supervision"
 track: maintainer
-status: draft
+status: superseded
 implementation: not-started
 authors:
   - OmniGraph maintainers
 created: 2026-08-13
-updated: 2026-09-26
+updated: 2026-09-29
 discussion: null
 supersedes: []
-superseded_by: []
-blocked_on:
-  - RFC 0034 acceptance and implementation
-  - RFC 0035 acceptance and implementation
-  - "Server lifecycle and online deployment RFC (2026-09-10): historical-read capture, retention and reconstruction interface (§5.1)"
+superseded_by:
+  - "2026-09-29-server-runtime-and-online-deployment"
+blocked_on: []
 ---
 
 # RFC 0036: Atomic runtime activation and graph availability supervision
+
+> **Superseded on 2026-09-29** by [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md).
+> The replacement remains a draft and is not implemented. This document is
+> retained as historical rationale; its obsolete mechanisms and dependencies
+> are not current implementation requirements.
 
 - **Depends on:** RFC 0034 durable recovery authority; RFC 0035 served-operation
   admission and lifetime; RFC 0038 typed storage-failure classification;

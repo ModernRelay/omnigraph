@@ -64,7 +64,7 @@ pub(super) use rank_fuse::{ArmOrder, RankFuseExec};
 use scan::{Filled, Needles};
 pub(super) use scan::{RuntimeFilterSlot, ScanExec, ScanSource};
 pub(super) use sort::{SortExec, SortKey};
-pub(crate) use subquery_aggregate::{RowCountPredicate, SubqueryAggregate, absorb_inner_batches};
+pub(crate) use subquery_aggregate::RowCountPredicate;
 
 /// The `polls` counter: one per `poll_next` of any stream the operator handed
 /// out, so a zero says no consumer ever asked the operator for a batch.

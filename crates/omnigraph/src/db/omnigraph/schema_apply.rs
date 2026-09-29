@@ -159,6 +159,13 @@ decide_seam! {
     pub static SCHEMA_APPLY_POST_LOCK_PRE_EFFECT = ("schema_apply.post_lock_pre_effect", Unreachable, [Fail]);
 }
 
+decide_seam! {
+    /// Right after the durable sentinel lands, under the exclusive schema
+    /// permit and before any planning: the first crossing proves the apply
+    /// got past every shared holder.
+    pub static SCHEMA_APPLY_POST_SENTINEL = ("schema_apply.post_sentinel", Unreachable, [Fail]);
+}
+
 async fn plan_schema_for_apply_from_accepted(
     db: &Omnigraph,
     desired_schema_source: &str,
@@ -254,18 +261,22 @@ where
     // before planning against the accepted contract.
     db.settle_pending_schema_install().await?;
 
-    // Process-local schema-control gate. RFC-022 mutation/load commit paths
-    // acquire this before their branch/table gates and retain it through
-    // publication. Taking it before the durable sentinel closes the old race in
-    // which schema apply could create the sentinel while a mutation already held
-    // a table queue, causing that mutation to advance Lance HEAD and only then
-    // discover the schema lock. The native sentinel remains the cross-handle /
-    // crash-visible authority; this queue removes the avoidable same-handle race.
-    let schema_gate_key = crate::db::write_queue::schema_apply_serial_queue_key();
-    let _schema_gate = db.write_queue().acquire(&schema_gate_key).await;
+    // Process-local schema gate, EXCLUSIVE side: schema apply is a
+    // contract-lifecycle pass, so it excludes every shared holder (writers,
+    // maintenance, branch control, read captures) and they exclude it. The
+    // permit is taken before the branch/table gates and before the durable
+    // sentinel, and retained through sentinel release, so no shared holder
+    // can revalidate against a contract this apply is about to replace.
+    // The native sentinel remains the cross-handle / crash-visible
+    // authority; this permit removes the avoidable same-handle race (RFC
+    // 2026-09-18-shared-schema-gate).
+    let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
     acquire_schema_apply_lock(db).await?;
-    let result =
-        apply_schema_with_lock(db, desired_schema_source, options, actor, validate_catalog).await;
+    let result = async {
+        fail(&SCHEMA_APPLY_POST_SENTINEL)?;
+        apply_schema_with_lock(db, desired_schema_source, options, actor, validate_catalog).await
+    }
+    .await;
     let release_result = release_schema_apply_lock(db).await;
     if release_result.is_err() {
         // Liveness: the next write entry on this handle retries the release
@@ -615,10 +626,12 @@ where
         .datasets()
         .map(|entry| (entry.type_key.clone(), entry.native_dataset_branch.clone()))
         .collect();
-    // The outer `apply_schema` holds the schema-control serialization key from
-    // before sentinel creation through sentinel release. Per-table guards here
-    // therefore cover only the concrete table effects; acquiring the schema key
-    // again would deadlock because these queues are intentionally non-reentrant.
+    // The outer `apply_schema` holds the exclusive schema permit from before
+    // sentinel creation through sentinel release. Per-table guards here
+    // therefore cover only the concrete table effects; re-acquiring either
+    // side of the schema gate on this task deadlocks — the gate is
+    // non-reentrant, and even a shared re-entry parks behind any queued
+    // writer under the plain-mode write-preferring lock.
     let _main_branch_guard = db.write_queue().acquire_branch(None).await;
     let _schema_apply_queue_guards = db
         .write_queue()
@@ -1197,8 +1210,15 @@ pub(super) async fn release_schema_apply_lock(db: &Omnigraph) -> Result<()> {
     db.refresh_coordinator_only().await
 }
 
+/// Whether a schema apply's durable sentinel stands on this graph: the
+/// cross-handle and cross-process signal that a contract-lifecycle pass is
+/// in flight.
+pub(super) async fn schema_apply_sentinel_present(db: &Omnigraph) -> Result<bool> {
+    db.coordinator.read().await.schema_apply_locked().await
+}
+
 pub(super) async fn ensure_schema_apply_not_locked(db: &Omnigraph, operation: &str) -> Result<()> {
-    if db.coordinator.read().await.schema_apply_locked().await? {
+    if schema_apply_sentinel_present(db).await? {
         return Err(OmniError::manifest_conflict(format!(
             "{} is unavailable while schema apply is in progress",
             operation

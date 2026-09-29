@@ -776,6 +776,14 @@ decide_seam! {
     pub static BRANCH_CREATE_POST_NATIVE = ("branch_create.post_native", BranchCreate, [Fail]);
 }
 
+decide_seam! {
+    /// After the namespace inventory (refs listed, path collision checked,
+    /// a ref-less tree reclaimed), before the native create. No CAS covers
+    /// this window: the caller's exclusive schema permit is what keeps a
+    /// sibling create from passing its own inventory meanwhile.
+    pub static BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE = ("branch_create.post_inventory_pre_native", BranchCreate, [Fail]);
+}
+
 /// Archived legacy ancestors still own their native path, even without refs.
 /// Flat generated names need no archive probe; slash names cost one per ancestor.
 async fn refuse_archived_path_ancestor(dataset: &Dataset, branch: &str) -> Result<()> {
@@ -848,6 +856,7 @@ pub async fn create_branch_recoverably(
     {
         return Err(authority_appeared_after_absence(source, branch).await?);
     }
+    fail(&BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE)?;
 
     for attempt in 0..2 {
         let native_error = match crate::lance_clone::create_branch(source, branch, source_version)

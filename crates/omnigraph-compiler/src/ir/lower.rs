@@ -773,9 +773,11 @@ fn text_search_subject(expr: &Expr) -> Option<&str> {
                 _ => None,
             }
         }
-        Expr::Binary { left, right, .. } => {
-            text_search_subject(left).or_else(|| text_search_subject(right))
-        }
+        Expr::Binary { left, right, .. }
+        | Expr::In {
+            needle: left,
+            list: right,
+        } => text_search_subject(left).or_else(|| text_search_subject(right)),
         Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => text_search_subject(inner),
         _ => None,
     }
@@ -810,9 +812,11 @@ fn find_outer_var(clauses: &[Clause], outer_bound: &HashSet<String>) -> Option<S
 /// operand in written order.
 fn outer_var_in_expr(expr: &Expr, outer_bound: &HashSet<String>) -> Option<String> {
     match expr {
-        Expr::Binary { left, right, .. } => {
-            outer_var_in_expr(left, outer_bound).or_else(|| outer_var_in_expr(right, outer_bound))
-        }
+        Expr::Binary { left, right, .. }
+        | Expr::In {
+            needle: left,
+            list: right,
+        } => outer_var_in_expr(left, outer_bound).or_else(|| outer_var_in_expr(right, outer_bound)),
         Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => {
             outer_var_in_expr(inner, outer_bound)
         }
@@ -823,7 +827,11 @@ fn outer_var_in_expr(expr: &Expr, outer_bound: &HashSet<String>) -> Option<Strin
 fn expr_var(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Now => None,
-        Expr::Binary { left, right, .. } => expr_var(left).or_else(|| expr_var(right)),
+        Expr::Binary { left, right, .. }
+        | Expr::In {
+            needle: left,
+            list: right,
+        } => expr_var(left).or_else(|| expr_var(right)),
         Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => expr_var(inner),
         Expr::PropAccess { variable, .. } => Some(variable.clone()),
         Expr::Variable(v) => Some(v.clone()),
@@ -862,6 +870,11 @@ fn lower_projection(expr: &Expr, ctx: &LowerCtx<'_>) -> IRExpr {
         ),
         Expr::Not(inner) => fold::not(lower_projection(inner, ctx)),
         Expr::IsNull { expr, negated } => fold::is_null(lower_projection(expr, ctx), *negated),
+        Expr::In { needle, list } => ctx.binary(
+            lower_projection(list, ctx),
+            BinaryOp::Compare(CompOp::Contains),
+            lower_projection(needle, ctx),
+        ),
         _ => match expr.score_column() {
             Some((variable, property)) => IRExpr::PropAccess {
                 variable: variable.to_string(),
@@ -962,6 +975,11 @@ fn lower_expr(expr: &Expr, ctx: &LowerCtx<'_>) -> IRExpr {
         Expr::Binary { left, op, right } => ctx.binary(lower(left), *op, lower(right)),
         Expr::Not(inner) => fold::not(lower(inner)),
         Expr::IsNull { expr, negated } => fold::is_null(lower(expr), *negated),
+        Expr::In { needle, list } => ctx.binary(
+            lower(list),
+            BinaryOp::Compare(CompOp::Contains),
+            lower(needle),
+        ),
     }
 }
 

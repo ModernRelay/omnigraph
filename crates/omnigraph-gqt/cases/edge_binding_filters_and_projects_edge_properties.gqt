@@ -1,0 +1,153 @@
+# issue: none
+# notes: A bound edge `$p $w:knows $f` exposes the edge row's properties to filters,
+# notes: projections and aggregates. Parallel Alice->Bob edges are distinct rows, null `since`
+# notes: values flow and `count` skips them, and zero-row results keep the declared Date type
+# notes: (empty source, no matching edge, and inside a correlated anti-join). Replaces the Rust
+# notes: test edge_binding_filters_and_projects_edge_properties (traversal.rs); the Rust test
+# notes: merge-loaded the two dated edges after the fixture, here they are seed rows.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32?
+}
+
+edge Knows: Person -> Person {
+    since: Date?
+}
+
+--- seed
+{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob","age":25}}
+{"type":"Person","data":{"name":"Charlie","age":35}}
+{"type":"Person","data":{"name":"Diana","age":28}}
+{"edge":"Knows","from":"Alice","to":"Bob"}
+{"edge":"Knows","from":"Alice","to":"Charlie"}
+{"edge":"Knows","from":"Bob","to":"Diana"}
+{"edge":"Knows","from":"Alice","to":"Bob","data":{"since":"2020-05-01"}}
+{"edge":"Knows","from":"Alice","to":"Diana","data":{"since":"2024-11-30"}}
+
+--- query
+query recent_friends($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p $w:knows $f
+        $w.since >= date("2023-01-01")
+    }
+    return { $f.name, $w.since }
+}
+
+--- params
+{"name": "Alice"}
+
+--- expect unordered
+{"f.name": "Diana", "w.since": "2024-11-30"}
+
+--- expect shape
+f.name: String
+w.since: Date?
+
+--- query
+query all_friend_edges($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p $w:knows $f
+    }
+    return { $f.name, $w.since }
+}
+
+--- params
+{"name": "Alice"}
+
+--- expect unordered
+{"f.name": "Bob"}
+{"f.name": "Bob", "w.since": "2020-05-01"}
+{"f.name": "Charlie"}
+{"f.name": "Diana", "w.since": "2024-11-30"}
+
+--- expect shape
+f.name: String
+w.since: Date?
+
+--- query
+query empty_source_edge_projection($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p $w:knows $f
+    }
+    return { $w.since }
+}
+
+--- params
+{"name": "Nobody"}
+
+--- expect unordered
+
+--- expect shape
+w.since: Date?
+
+--- query
+query no_outgoing_edge_filter($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p $w:knows $f
+        $w.since >= date("2023-01-01")
+    }
+    return { $w.since }
+}
+
+--- params
+{"name": "Diana"}
+
+--- expect unordered
+
+--- expect shape
+w.since: Date?
+
+--- query
+query no_future_friend() {
+    match {
+        $p: Person
+        not {
+            $p $w:knows $f
+            $w.since >= date("2030-01-01")
+        }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "Alice"}
+{"p.name": "Bob"}
+{"p.name": "Charlie"}
+{"p.name": "Diana"}
+
+--- expect shape
+p.name: String
+
+--- query
+query knows_counts($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p $w:knows $f
+    }
+    return { $f.name, count($w.since) }
+}
+
+--- params
+{"name": "Alice"}
+
+--- expect unordered
+{"f.name": "Bob", "w.since": 1}
+{"f.name": "Charlie", "w.since": 0}
+{"f.name": "Diana", "w.since": 1}
+
+--- expect shape
+f.name: String
+w.since: I64

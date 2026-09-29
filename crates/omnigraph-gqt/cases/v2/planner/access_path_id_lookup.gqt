@@ -127,6 +127,34 @@ pass access_path
 
 --- query
 set engine = v2;
+query member_needles($states: [String]) {
+    match {
+        $s: Source
+        $s links $d
+        $d.state in $states
+        search($d.body, "needle")
+    }
+    return { $s.slug, $d.slug }
+}
+--- params
+{"states":["open"]}
+--- expect unordered
+{"s.slug":"s1","d.slug":"a"}
+{"s.slug":"s2","d.slug":"a"}
+{"s.slug":"s3","d.slug":"d"}
+{"s.slug":"s3","d.slug":"f"}
+{"s.slug":"s4","d.slug":"d"}
+{"s.slug":"s4","d.slug":"f"}
+--- expect shape
+s.slug: String
+d.slug: String
+--- expect plan
+scan Doc as $d: access id_lookup
+scan Doc as $d: filter reads [d.state, d.body]
+pass access_path
+
+--- query
+set engine = v2;
 query every_link() {
     match {
         $s: Source

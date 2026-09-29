@@ -18,20 +18,6 @@ node Person {
 {"type":"Person","data":{"name":"bob","age":40}}
 
 --- query
-set engine = v1;
-query ordered_limit_zero_v1() {
-    match { $p: Person }
-    return { $p.name }
-    order { $p.name }
-    limit 0
-}
-
---- expect unordered
---- expect shape
-p.name: String
-
-
---- query
 set engine = v2;
 query ordered_limit_zero_v2() {
     match { $p: Person }
@@ -43,6 +29,7 @@ query ordered_limit_zero_v2() {
 --- expect unordered
 --- expect shape
 p.name: String
+--- expect same as v1
 
 
 --- query

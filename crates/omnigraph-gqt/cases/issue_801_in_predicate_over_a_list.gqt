@@ -1,0 +1,405 @@
+# issue: 801
+# red_on: 8bc9aa5f; step 1 fails with `type error: T41: a filter must be Boolean, got String`: with no `in` operator the match body parses as three filter clauses `$m.number`, `in`, `$ms` (v0.11.0: parse error `expected comp_op` at `in`).
+# notes: `expr in $list` and `expr in [..]` select the members of the set and push the test into the scan, on a plain
+# notes: scan and a traversal destination; a null needle reads null and an empty set matches nothing, under `not` too,
+# notes: in a read and in a mutation `where`. On a filter `in` selects what `=` selects, an F32 column included.
+# notes: The edge `In` is followed as `$p "in" $m`; a bare `$p in $m` is the membership test.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Matter {
+    mid: String @key
+    number: String
+    code: I64?
+    weight: F32?
+}
+node Passage {
+    pid: String @key
+}
+edge PassageOf: Passage -> Matter
+edge In: Passage -> Matter
+
+--- seed
+{"type":"Matter","data":{"mid":"m1","number":"M-1","code":1,"weight":0.1}}
+{"type":"Matter","data":{"mid":"m2","number":"M-2","code":2}}
+{"type":"Matter","data":{"mid":"m3","number":"M-3"}}
+{"type":"Matter","data":{"mid":"m4","number":"M-4"}}
+{"type":"Passage","data":{"pid":"p1"}}
+{"type":"Passage","data":{"pid":"p2"}}
+{"type":"Passage","data":{"pid":"p3"}}
+{"edge":"PassageOf","from":"p1","to":"m1"}
+{"edge":"PassageOf","from":"p2","to":"m2"}
+{"edge":"PassageOf","from":"p3","to":"m3"}
+{"edge":"In","from":"p1","to":"m2"}
+{"edge":"In","from":"p2","to":"m4"}
+
+--- query
+set engine = v2;
+query q($ms: [String]) { match { $m: Matter $m.number in $ms } return { $m.number } limit 5 }
+
+--- params
+{"ms": ["M-1", "M-3", "M-9"]}
+
+--- expect unordered
+{"m.number": "M-1"}
+{"m.number": "M-3"}
+
+--- expect shape
+m.number: String
+
+--- expect plan
+scan Matter as $m: filter reads [m.number]
+
+--- expect same as v1
+
+--- query
+set engine = v2;
+query literal_list() {
+    match {
+        $m: Matter
+        $m.number in ["M-1", "M-3", "M-9"]
+    }
+    return { $m.number }
+}
+
+--- expect unordered
+{"m.number": "M-1"}
+{"m.number": "M-3"}
+
+--- expect shape
+m.number: String
+
+--- expect plan
+scan Matter as $m: filter reads [m.number]
+
+--- query
+set engine = v2;
+query traversal_destination($ms: [String]) {
+    match {
+        $p: Passage
+        $p passageOf $m
+        $m.number in $ms
+    }
+    return { $p.pid }
+}
+
+--- params
+{"ms": ["M-1", "M-3", "M-9"]}
+
+--- expect unordered
+{"p.pid": "p1"}
+{"p.pid": "p3"}
+
+--- expect shape
+p.pid: String
+
+--- expect plan
+scan Matter as $m: filter reads [m.number]
+
+--- expect same as v1
+
+--- query
+set engine = v2;
+query edge_a_reserved_word_names($ms: [String]) {
+    match {
+        $p: Passage
+        $p "in" $m
+        $m.number in $ms
+    }
+    return { $p.pid, $m.number }
+}
+
+--- params
+{"ms": ["M-2", "M-9"]}
+
+--- expect unordered
+{"p.pid": "p1", "m.number": "M-2"}
+
+--- expect shape
+p.pid: String
+m.number: String
+
+--- query
+set engine = v2;
+query bare_word_is_the_membership_test() {
+    match {
+        $p: Passage
+        $p in $m
+    }
+    return { $p.pid }
+}
+
+--- expect error: T7: `$p in $m` tests membership and `$p` is a node; to follow the edge `In` write `$p "in" $m`
+
+--- query
+set engine = v2;
+query contains_spelling($ms: [String]) {
+    match {
+        $m: Matter
+        ($ms contains $m.number)
+    }
+    return { $m.number }
+}
+
+--- params
+{"ms": ["M-1", "M-3", "M-9"]}
+
+--- expect unordered
+{"m.number": "M-1"}
+{"m.number": "M-3"}
+
+--- expect shape
+m.number: String
+
+--- expect plan
+scan Matter as $m: filter reads [m.number]
+
+--- query
+set engine = v2;
+query null_needle_under_not($cs: [I64]) {
+    match {
+        $m: Matter
+        not ($m.code in $cs)
+    }
+    return { $m.mid }
+}
+
+--- params
+{"cs": [1]}
+
+--- expect unordered
+{"m.mid": "m2"}
+
+--- expect shape
+m.mid: String
+
+--- expect plan
+scan Matter as $m: filter reads [m.code]
+
+--- query
+set engine = v2;
+query empty_set_under_not($cs: [I64]) {
+    match {
+        $m: Matter
+        not ($m.code in $cs)
+    }
+    return { $m.mid }
+}
+
+--- params
+{"cs": []}
+
+--- expect unordered
+{"m.mid": "m1"}
+{"m.mid": "m2"}
+
+--- expect shape
+m.mid: String
+
+--- expect plan
+scan Matter as $m: filter reads [m.code]
+
+--- query
+set engine = v2;
+query empty_literal_on_an_integer_column() {
+    match {
+        $m: Matter
+        $m.code in []
+    }
+    return { $m.mid }
+}
+
+--- expect unordered
+
+--- expect shape
+m.mid: String
+
+--- expect plan
+scan Matter as $m: filter reads [m.code]
+
+--- query
+set engine = v2;
+query constant_date_member() {
+    match {
+        $m: Matter
+        date("2026-01-01") in [date("2026-02-01"), date("2026-01-01")]
+    }
+    return { $m.mid }
+}
+
+--- expect unordered
+{"m.mid": "m1"}
+{"m.mid": "m2"}
+{"m.mid": "m3"}
+{"m.mid": "m4"}
+
+--- expect shape
+m.mid: String
+
+--- query
+set engine = v2;
+query integers_beside_floats_projected() {
+    match { $m: Matter }
+    return { $m.mid, $m.code in [1, 2.5] as member }
+}
+
+--- expect unordered
+{"m.mid": "m1", "member": true}
+{"m.mid": "m2", "member": false}
+{"m.mid": "m3"}
+{"m.mid": "m4"}
+
+--- expect shape
+m.mid: String
+member: Bool?
+
+--- query
+set engine = v2;
+query member_of_an_f32_column() {
+    match {
+        $m: Matter
+        $m.weight in [0.1, 0.7]
+    }
+    return { $m.mid }
+}
+
+--- expect unordered
+{"m.mid": "m1"}
+
+--- expect shape
+m.mid: String
+
+--- expect plan
+scan Matter as $m: filter reads [m.weight]
+
+--- query
+set engine = v2;
+query equal_on_an_f32_column() {
+    match {
+        $m: Matter
+        $m.weight = 0.1
+    }
+    return { $m.mid }
+}
+
+--- expect unordered
+{"m.mid": "m1"}
+
+--- expect shape
+m.mid: String
+
+--- query
+set engine = v2;
+query float_members_of_an_integer_column() {
+    match {
+        $m: Matter
+        $m.code in [1.0, 2.5]
+    }
+    return { $m.mid }
+}
+
+--- expect unordered
+{"m.mid": "m1"}
+
+--- expect shape
+m.mid: String
+
+--- expect plan
+scan Matter as $m: filter reads [m.code]
+
+--- query
+set engine = v2;
+query type_mismatch($ns: [I64]) {
+    match {
+        $m: Matter
+        $m.number in $ns
+    }
+    return { $m.number }
+}
+
+--- params
+{"ns": [1]}
+
+--- expect error: membership
+
+--- query
+set engine = v2;
+query scalar_on_the_right() {
+    match {
+        $m: Matter
+        $m.number in $m.mid
+    }
+    return { $m.number }
+}
+
+--- expect error: `in` needs a list on the right
+
+--- mutate
+query recode($ms: [String]) {
+    update Matter set { code: 9 } where number in $ms
+}
+
+--- params
+{"ms": ["M-2", "M-3"]}
+
+--- expect affected: nodes=2 edges=0
+
+--- query
+set engine = v2;
+query recoded() {
+    match {
+        $m: Matter
+        $m.code = 9
+    }
+    return { $m.mid }
+}
+
+--- expect unordered
+{"m.mid": "m2"}
+{"m.mid": "m3"}
+
+--- expect shape
+m.mid: String
+
+--- mutate
+query recode_no_member($ms: [String]) {
+    update Matter set { code: 7 } where number in $ms
+}
+
+--- params
+{"ms": []}
+
+--- expect affected: nodes=0 edges=0
+
+--- mutate
+query recode_outside_the_empty_set($cs: [I64]) {
+    update Matter set { code: 7 } where not (code in $cs)
+}
+
+--- params
+{"cs": []}
+
+--- expect affected: nodes=3 edges=0
+
+--- query
+set engine = v2;
+query recoded_outside_the_empty_set() {
+    match {
+        $m: Matter
+        $m.code = 7
+    }
+    return { $m.mid }
+}
+
+--- expect unordered
+{"m.mid": "m1"}
+{"m.mid": "m2"}
+{"m.mid": "m3"}
+
+--- expect shape
+m.mid: String

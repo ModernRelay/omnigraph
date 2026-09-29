@@ -316,11 +316,15 @@ Supported: `count`, `sum`, `avg`, `min`, `max`. Grouping is implicit on non-aggr
 
 ## Filter Operators
 
-`starts_with`, `contains`, `>=`, `<=`, `!=`, `>`, `<`, `=`
+`starts_with`, `contains`, `in`, `>=`, `<=`, `!=`, `>`, `<`, `=`
 
 Both String predicates are exact and case-sensitive: `contains` matches a
 substring and `starts_with` matches a prefix. They remain correct without an
 index; a free-text String index does not accelerate these exact predicates.
+
+`$m.number in $numbers` keeps the rows whose value is a member of a list
+parameter or literal, one query instead of one per candidate; the right side
+must be a list of the value's type.
 
 ```gq
 match {

@@ -1,0 +1,110 @@
+# issue: none
+# notes: Full rank orders on the five-doc search fixture. `nearest` returns the k closest in
+# notes: ascending L2 order (the query vector equals ml-intro's embedding). The three `bm25`
+# notes: "Learning" matches tie on score, so their order is the id tie-break; a secondary
+# notes: `$d.slug desc` key decides before it (the distinct-score order is pinned by
+# notes: bm25_distinct_scores_rank_descending.gqt; a Lance scoring change that breaks the tie
+# notes: changes what these steps mean, re-probe before updating). `rrf` of both arms keeps
+# notes: limit 3. Replaces the Rust tests nearest_returns_k_closest, nearest_full_rank_order,
+# notes: bm25_returns_ranked_results, bm25_full_rank_order, search_order_secondary_keys_are_honored
+# notes: and rrf_fuses_vector_and_text (search.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    title: String @index
+    body: String @index
+    embedding: Vector(4)
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"ml-intro","title":"Introduction to Machine Learning","body":"Machine learning is a subset of artificial intelligence that focuses on algorithms","embedding":[0.1,0.2,0.3,0.4]}}
+{"type":"Doc","data":{"slug":"dl-basics","title":"Deep Learning Basics","body":"Deep learning uses neural networks with many layers to learn representations","embedding":[0.5,0.6,0.7,0.8]}}
+{"type":"Doc","data":{"slug":"nlp-guide","title":"Natural Language Processing Guide","body":"NLP applies machine learning to understand and generate human language","embedding":[0.2,0.3,0.4,0.5]}}
+{"type":"Doc","data":{"slug":"cv-overview","title":"Computer Vision Overview","body":"Computer vision enables machines to interpret visual information from images","embedding":[0.8,0.7,0.6,0.5]}}
+{"type":"Doc","data":{"slug":"rl-intro","title":"Reinforcement Learning Introduction","body":"Reinforcement learning trains agents through reward and punishment signals","embedding":[0.3,0.4,0.5,0.6]}}
+
+--- query
+query vector_search($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug, $d.title }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+
+--- params
+{"q": [0.1, 0.2, 0.3, 0.4]}
+
+--- expect ordered
+{"d.slug": "ml-intro", "d.title": "Introduction to Machine Learning"}
+{"d.slug": "nlp-guide", "d.title": "Natural Language Processing Guide"}
+{"d.slug": "rl-intro", "d.title": "Reinforcement Learning Introduction"}
+
+--- expect shape
+d.slug: String
+d.title: String
+
+--- query
+query bm25_search($q: String) {
+    match { $d: Doc }
+    return { $d.slug, $d.title }
+    order { bm25($d.title, $q) }
+    limit 3
+}
+
+--- params
+{"q": "Learning"}
+
+--- expect ordered
+{"d.slug": "dl-basics", "d.title": "Deep Learning Basics"}
+{"d.slug": "ml-intro", "d.title": "Introduction to Machine Learning"}
+{"d.slug": "rl-intro", "d.title": "Reinforcement Learning Introduction"}
+
+--- expect shape
+d.slug: String
+d.title: String
+
+--- query
+query bm25_then_slug($q: String) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { bm25($d.title, $q), $d.slug desc }
+    limit 3
+}
+
+--- params
+{"q": "Learning"}
+
+--- expect ordered
+{"d.slug": "rl-intro"}
+{"d.slug": "ml-intro"}
+{"d.slug": "dl-basics"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query hybrid_search($vq: Vector(4), $tq: String) {
+    match { $d: Doc }
+    return { $d.slug, $d.title }
+    order { rrf(nearest($d.embedding, $vq), bm25($d.title, $tq)) }
+    limit 3
+}
+
+--- params
+{"vq": [0.1, 0.2, 0.3, 0.4], "tq": "Learning"}
+
+--- expect unordered
+{"d.slug": "ml-intro", "d.title": "Introduction to Machine Learning"}
+{"d.slug": "dl-basics", "d.title": "Deep Learning Basics"}
+{"d.slug": "rl-intro", "d.title": "Reinforcement Learning Introduction"}
+
+--- expect shape
+d.slug: String
+d.title: String

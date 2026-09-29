@@ -142,7 +142,6 @@ takes the same `--branch`/`--snapshot` target and `--params` as the query
 itself and needs the same `read` policy decision. `mutate` and the deprecated
 routes refuse it, and so is a mutation declaration under `explain`.
 
-The session setting `engine` selects how ordinary reads execute: `v1` by
-default, or `v2` under `set engine = v2;`. Explain always describes v2, so
-with the default setting its operators describe the alternate execution
-route. See [session settings](index.md#session-settings).
+Every read executes on engine v2, the one value of the session setting
+`engine`, so explain describes the route the query runs. See
+[session settings](index.md#session-settings).
