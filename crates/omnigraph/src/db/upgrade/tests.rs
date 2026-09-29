@@ -95,9 +95,13 @@ async fn replay_manifest_as_merge_writer(root: &str) {
     let mut replayed: Option<Dataset> = None;
     for version in written.versions().await.unwrap() {
         let at = written.checkout_version(version.version).await.unwrap();
-        let schema = Arc::new(Schema::from(at.schema()));
         let rows = at.scan().try_into_batch().await.unwrap();
-        let rows = RecordBatch::try_new(schema.clone(), rows.columns().to_vec()).unwrap();
+        let mut flat_metadata = at.schema().metadata.clone();
+        flat_metadata.insert(INTERNAL_SCHEMA_VERSION_KEY.to_string(), "11".to_string());
+        let rows =
+            crate::db::manifest::migrations::flat_batch_for_test(&rows, flat_metadata.clone())
+                .unwrap();
+        let schema = rows.schema();
         let keys = row_keys(&rows);
         let changed = arrow_array::BooleanArray::from_iter(
             keys.iter()
@@ -120,8 +124,7 @@ async fn replay_manifest_as_merge_writer(root: &str) {
             .await
             .unwrap(),
             Some(mut dataset) if delta.num_rows() == 0 => {
-                let metadata = at.schema().metadata.clone();
-                dataset.update_schema_metadata(metadata).await.unwrap();
+                dataset.update_schema_metadata(flat_metadata).await.unwrap();
                 dataset
             }
             Some(dataset) => {
@@ -263,9 +266,9 @@ async fn storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v11() {
     assert!(person.dataset().schema().field("__id").is_none());
 }
 
-/// Stamp main and every physical `__manifest` ref at `stamp`, the shape of a
-/// graph an older binary left behind; fresh graphs of either vintage are born
-/// at the current stamp.
+/// Rewrite main and every physical `__manifest` ref flat at `stamp`, the shape
+/// of a graph an older binary left behind; fresh graphs of either vintage are
+/// born packed at the current stamp.
 async fn restamp_all_manifests(root: &str, stamp: u32) {
     let main = open(root, None).await.unwrap();
     let refs: Vec<String> = crate::branch_control::list_branch_contents(&main)
@@ -275,12 +278,12 @@ async fn restamp_all_manifests(root: &str, stamp: u32) {
         .collect();
     for native in refs {
         let mut branch = main.checkout_branch(&native).await.unwrap();
-        crate::db::manifest::migrations::set_stamp_for_test(&mut branch, stamp)
+        crate::db::manifest::migrations::restamp_flat_for_test(&mut branch, stamp)
             .await
             .unwrap();
     }
     let mut main = open(root, None).await.unwrap();
-    crate::db::manifest::migrations::set_stamp_for_test(&mut main, stamp)
+    crate::db::manifest::migrations::restamp_flat_for_test(&mut main, stamp)
         .await
         .unwrap();
 }
@@ -1098,8 +1101,7 @@ async fn storage_upgrade_preserves_prior_v6_to_v7_pending_intent_before_continui
             .unwrap(),
         );
         let mut dataset = open(root, None).await.unwrap();
-        dataset
-            .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY, "6")])
+        crate::db::manifest::migrations::restamp_flat_for_test(&mut dataset, 6)
             .await
             .unwrap();
         let source_version = dataset.version().version;
@@ -1358,7 +1360,7 @@ async fn storage_upgrade_current_vintage_is_already_current_without_a_route() {
     }
     let mut dataset = open(root, None).await.unwrap();
     dataset
-        .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY, "12")])
+        .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY, "13")])
         .await
         .unwrap();
     drop(dataset);
@@ -1595,6 +1597,98 @@ async fn storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v11() {
     }
 }
 
+/// Lazy conversion leaves a graph with v11 and v12 branches until every branch
+/// has published; `upgrade --check` and execute report it already current,
+/// whichever branch converted first.
+#[tokio::test]
+async fn storage_upgrade_accepts_a_graph_converting_branch_by_branch() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    for published in ["main", "feature"] {
+        let idle = if published == "main" {
+            "feature"
+        } else {
+            "main"
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(root, "node Person { name: String }")
+            .await
+            .unwrap();
+        db.branch_create("feature").await.unwrap();
+        drop(db);
+        restamp_all_manifests(root, 11).await;
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(Omnigraph::open(root).await.unwrap()),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
+        db.mutate(
+            published,
+            "query seed($name: String) { insert Person { name: $name } }",
+            "seed",
+            &HashMap::from([(
+                "name".to_string(),
+                omnigraph_compiler::query::ast::Literal::String("converting".to_string()),
+            )]),
+        )
+        .await
+        .unwrap();
+        drop(db);
+        let converting = Omnigraph::open(root).await.unwrap();
+        for (branch, stamp) in [(published, 12), (idle, 11)] {
+            assert_eq!(
+                converting
+                    .internal_schema_version_of(crate::db::ReadTarget::branch(branch))
+                    .await
+                    .unwrap(),
+                stamp,
+                "after one publish on {published}, {branch}"
+            );
+        }
+        drop(converting);
+        let before = stored_files(dir.path());
+        for check in [true, false] {
+            for to_format in [None, Some(11)] {
+                let report = upgrade_storage(root, UpgradeOptions { check, to_format })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    report.outcome,
+                    UpgradeOutcome::AlreadyCurrent,
+                    "publish on {published}, check {check}, target {to_format:?}: {report:?}"
+                );
+                assert_eq!(stored_files(dir.path()), before);
+            }
+            for (to_format, expected_code) in
+                [(10, "target_below_stamp"), (12, "unsupported_target")]
+            {
+                let refused = upgrade_storage(
+                    root,
+                    UpgradeOptions {
+                        check,
+                        to_format: Some(to_format),
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    refused.outcome,
+                    UpgradeOutcome::CheckFailed,
+                    "publish on {published}, check {check}, target {to_format}: {refused:?}"
+                );
+                assert!(
+                    refused
+                        .findings
+                        .iter()
+                        .any(|finding| finding.code == expected_code),
+                    "{refused:?}"
+                );
+                assert_eq!(stored_files(dir.path()), before);
+            }
+        }
+    }
+}
+
 /// A v9 graph, the 0.11.x current vintage, takes the v10 restamp and then the
 /// v11 step, with every branch restamped and no payload copied or rewritten.
 #[tokio::test]
@@ -1735,7 +1829,7 @@ async fn storage_upgrade_default_route_takes_a_v10_graph_to_v11() {
         Err(error) => error.to_string(),
     };
     assert!(
-        refused.contains("reads only v11 to v11"),
+        refused.contains("reads only v11 to v12"),
         "a v10 graph is refused by normal open: {refused}"
     );
 

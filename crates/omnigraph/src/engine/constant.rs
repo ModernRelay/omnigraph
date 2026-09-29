@@ -38,10 +38,13 @@ pub(crate) fn evaluate_constant(expr: &IRExpr, params: &ParamMap) -> Result<Lite
             if let Some(value) = fold::evaluate(*op, &left, &right) {
                 return Ok(value);
             }
-            match op {
-                BinaryOp::And => Err(not_boolean("and", non_boolean(&left, &right))),
-                BinaryOp::Or => Err(not_boolean("or", non_boolean(&left, &right))),
-                BinaryOp::Compare(op) => compare_dates(*op, &left, &right),
+            match (op, &left) {
+                (BinaryOp::And, _) => Err(not_boolean("and", non_boolean(&left, &right))),
+                (BinaryOp::Or, _) => Err(not_boolean("or", non_boolean(&left, &right))),
+                (BinaryOp::Compare(CompOp::Contains), Literal::List(items)) => {
+                    list_contains(items, &right)
+                }
+                (BinaryOp::Compare(op), _) => compare_dates(*op, &left, &right),
             }
         }
         other => Err(OmniError::manifest(format!(
@@ -77,6 +80,21 @@ fn compare_dates(op: CompOp, left: &Literal, right: &Literal) -> Result<Literal>
         }
     };
     Ok(Literal::Bool(holds))
+}
+
+/// Membership `fold::evaluate` declined, a list with a Date or DateTime
+/// element: each element against the needle by `=`.
+fn list_contains(items: &[Literal], needle: &Literal) -> Result<Literal> {
+    for item in items {
+        let equal = match fold::evaluate(BinaryOp::Compare(CompOp::Eq), item, needle) {
+            Some(value) => value,
+            None => compare_dates(CompOp::Eq, item, needle)?,
+        };
+        if equal == Literal::Bool(true) {
+            return Ok(Literal::Bool(true));
+        }
+    }
+    Ok(Literal::Bool(false))
 }
 
 /// The operand an `and`/`or` the fold declined was refused for: the first

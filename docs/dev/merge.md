@@ -62,9 +62,9 @@ interval is present and structurally proves:
 - physical-row totals matching the manifest delta;
 - exact source and target native branch incarnations under the final gates.
 
-History proof reads transaction records directly with an ordered window of
-eight reads and a 1,024-version limit; it does not open a Dataset for every
-historical version. Missing or unprovable history falls back.
+History proof follows the source's chain one `read_version` link at a time,
+reading each version's transaction record and opening its parent version,
+within a 1,024-version limit. Missing or unprovable history falls back.
 
 The route stages bounded immutable fragments, then commits the same certified
 filter-bearing Update shape. It performs no target MergeInsert join or target
@@ -250,9 +250,14 @@ tip as its `staged_version` (RFC 0067, detached-only). A merge onto main is
 a pointer switch: main's registration takes the source's pin, and the merge
 stages nothing; an empty source delta leaves main's registration untouched.
 Pointer-only siblings ride the same manifest CAS, and no table fork is
-created. The merge proofs walk the source's commit chain by `read_version`
-links from the source pin to the base pin (`try_proven_pure_insert_history`,
-`proven_chain_fragments`, `chain_reaches`, `plan_lineage_merge`).
+created. The pure-insert proof walks the source's commit chain by
+`read_version` links from the source pin to the base pin
+(`try_proven_pure_insert_history`, `proven_chain_fragments`). Lineage
+candidate discovery (`plan_lineage_merge`, `lineage_side_candidates`) walks
+no chain and reads no intervening commit: it compares the base and side
+manifests by file identity. Its work follows the fragment count at the three
+pins, the deletion files that differ between them and the rows in changed
+fragments, within the candidate budget.
 
 A failure anywhere before the CAS returns the original error and leaves the
 target untouched: the chunk chains are unpublished staging that `cleanup`'s

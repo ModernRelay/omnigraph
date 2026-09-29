@@ -1825,6 +1825,181 @@ async fn cross_handle_branch_gate_serializes_post_effect_publish() {
     );
 }
 
+/// The shared schema gate's headline behavior (RFC
+/// 2026-09-18-shared-schema-gate): writers on DISJOINT branches overlap
+/// inside the schema gate. Writer A parks inside its full write envelope
+/// (shared schema permit + b1 branch gate + table gates, detached commits
+/// done, publish pending); writer B on b2 must run to completion while A is
+/// parked — impossible under the former exclusive schema mutex, where B
+/// would queue behind A's publish hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn cross_branch_writers_overlap_inside_schema_gate() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    db.branch_create("b1").await.unwrap();
+    db.branch_create("b2").await.unwrap();
+    let db = std::sync::Arc::new(db);
+
+    let in_envelope =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER);
+
+    let writer_a_db = std::sync::Arc::clone(&db);
+    let writer_a = tokio::spawn(async move {
+        writer_a_db
+            .mutate(
+                "b1",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "OnBranchOne")], &[("$age", 41)]),
+            )
+            .await
+    });
+    in_envelope.wait_until_reached().await;
+
+    let writer_b_db = std::sync::Arc::clone(&db);
+    let writer_b = tokio::spawn(async move {
+        writer_b_db
+            .mutate(
+                "b2",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "OnBranchTwo")], &[("$age", 42)]),
+            )
+            .await
+    });
+    let b_result = tokio::time::timeout(std::time::Duration::from_secs(10), writer_b)
+        .await
+        .expect("B on a disjoint branch must complete while A holds its envelope parked")
+        .unwrap()
+        .expect("B's insert must publish");
+    assert_eq!(b_result.affected_nodes, 1);
+    assert!(
+        !writer_a.is_finished(),
+        "A must still be parked inside its envelope while B published"
+    );
+
+    in_envelope.release();
+    writer_a
+        .await
+        .unwrap()
+        .expect("A must publish normally after release");
+    assert_eq!(
+        helpers::count_rows_branch(&db, "b1", "node:Person").await,
+        5
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&db, "b2", "node:Person").await,
+        5
+    );
+}
+
+/// Branch create takes the schema gate's EXCLUSIVE side: no CAS covers its
+/// namespace inventory, so a sibling create with disjoint branch gates must
+/// wait at the gate, then refuse on the collision the first leaves behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn sibling_branch_creates_exclude_at_the_schema_gate() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    db.branch_create("b").await.unwrap();
+    let db = std::sync::Arc::new(db);
+
+    let after_inventory = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE,
+    );
+    let first_db = std::sync::Arc::clone(&db);
+    let first = tokio::spawn(async move { first_db.branch_create("feature").await });
+    after_inventory.wait_until_reached().await;
+
+    let second_db = std::sync::Arc::clone(&db);
+    let mut second = tokio::spawn(async move {
+        second_db
+            .branch_create_from(ReadTarget::branch("b"), "feature/x")
+            .await
+    });
+    let overtaking = tokio::time::timeout(std::time::Duration::from_secs(1), &mut second).await;
+    assert!(
+        overtaking.is_err(),
+        "a sibling create must wait at the schema gate while the first create sits \
+         between its inventory and its native create"
+    );
+
+    after_inventory.release();
+    first
+        .await
+        .unwrap()
+        .expect("the first create must land after release");
+    let err = second
+        .await
+        .unwrap()
+        .expect_err("the sibling create must refuse on the collision the first create left");
+    assert!(
+        err.to_string().contains("shares its physical Lance path"),
+        "unexpected refusal: {err}"
+    );
+    let branches = db.branch_list().await.unwrap();
+    assert!(
+        branches.iter().any(|name| name == "feature"),
+        "{branches:?}"
+    );
+    assert!(
+        !branches.iter().any(|name| name == "feature/x"),
+        "{branches:?}"
+    );
+}
+
+/// Reads capture their catalog under a SHARED schema permit, so a read on
+/// another handle no longer waits for a writer's publish hold (RFC
+/// 2026-09-18-shared-schema-gate). Park a writer inside its envelope; a
+/// read on a second handle must complete while the writer is parked —
+/// under the former exclusive mutex this read would block until the
+/// writer's guards dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn read_capture_proceeds_while_writer_parked() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    drop(db);
+
+    let db_a = std::sync::Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+    let db_b = std::sync::Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+
+    let in_envelope =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER);
+    let writer_db = std::sync::Arc::clone(&db_a);
+    let writer = tokio::spawn(async move {
+        writer_db
+            .mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "HoldsEnvelope")], &[("$age", 61)]),
+            )
+            .await
+    });
+    in_envelope.wait_until_reached().await;
+
+    let rows = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        count_rows(&db_b, "node:Person"),
+    )
+    .await
+    .expect("a read must capture its catalog while the writer's envelope is held");
+    assert_eq!(rows, 4, "the parked write must not be visible yet");
+
+    in_envelope.release();
+    writer
+        .await
+        .unwrap()
+        .expect("the parked writer must publish after release");
+    assert_eq!(count_rows(&db_b, "node:Person").await, 5);
+}
+
 // Atomic schema apply: schema apply writes staging files first, then commits
 // the manifest, then renames staging → final. Tests below inject crashes at
 // the two boundaries and assert that reopening the graph yields a consistent

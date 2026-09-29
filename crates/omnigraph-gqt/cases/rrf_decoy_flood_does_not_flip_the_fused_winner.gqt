@@ -1,0 +1,62 @@
+# issue: none
+# notes: The four best `alpha` scorers carry no edge, so the traversal evicts them. Fusing the
+# notes: complete rankings makes x the winner (1/61 + 1/62 beats n's 1/63 + 1/61 at k = 60);
+# notes: an alpha arm capped before the traversal would fuse on beta alone and flip the winner
+# notes: to n with the row count still full. Replaces the rows of the Rust test
+# notes: rrf_decoy_flood_does_not_flip_the_fused_winner (search.rs); its scan-row and retry
+# notes: counters measured the v1 executor and its forced postfilter `rrf_plan` is a process
+# notes: setting, so both stay out.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Chunk {
+    slug: String @key
+    text: String @index
+}
+
+node Artifact {
+    slug: String @key
+}
+
+edge ChunkOfArtifact: Chunk -> Artifact {
+    label: String
+}
+
+--- seed
+{"type":"Artifact","data":{"slug":"art-0"}}
+{"type":"Chunk","data":{"slug":"decoy-1","text":"alpha alpha alpha alpha alpha alpha alpha beta filler filler filler filler filler filler filler filler filler filler filler filler"}}
+{"type":"Chunk","data":{"slug":"decoy-2","text":"alpha alpha alpha alpha alpha alpha beta beta filler filler filler filler filler filler filler filler filler filler filler filler"}}
+{"type":"Chunk","data":{"slug":"decoy-3","text":"alpha alpha alpha alpha alpha beta beta beta filler filler filler filler filler filler filler filler filler filler filler filler"}}
+{"type":"Chunk","data":{"slug":"decoy-4","text":"alpha alpha alpha alpha beta beta beta beta filler filler filler filler filler filler filler filler filler filler filler filler"}}
+{"type":"Chunk","data":{"slug":"x","text":"alpha alpha alpha beta beta beta beta beta beta filler filler filler filler filler filler filler filler filler filler filler"}}
+{"type":"Chunk","data":{"slug":"y","text":"alpha alpha beta beta beta beta beta filler filler filler filler filler filler filler filler filler filler filler filler filler"}}
+{"type":"Chunk","data":{"slug":"n","text":"alpha beta beta beta beta beta beta beta filler filler filler filler filler filler filler filler filler filler filler filler"}}
+{"edge":"ChunkOfArtifact","id":"e-x","from":"x","to":"art-0","data":{"label":"of"}}
+{"edge":"ChunkOfArtifact","id":"e-y","from":"y","to":"art-0","data":{"label":"of"}}
+{"edge":"ChunkOfArtifact","id":"e-n","from":"n","to":"art-0","data":{"label":"of"}}
+
+--- query
+query recall_two_terms($q1: String, $q2: String) {
+    match {
+        $c: Chunk
+        $c chunkOfArtifact $a
+        search($c.text, $q1)
+    }
+    return { $c.slug }
+    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    limit 1
+}
+
+--- params
+{"q1": "alpha", "q2": "beta"}
+
+--- expect unordered
+{"c.slug": "x"}
+
+--- expect shape
+c.slug: String

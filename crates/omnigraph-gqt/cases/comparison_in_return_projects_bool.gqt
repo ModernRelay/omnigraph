@@ -2,8 +2,7 @@
 # notes: A comparison in return projects a Bool column under its alias on
 # notes: engine v2, null where an operand is null, and the inferred shape is
 # notes: `Bool?` when an operand is nullable. `is not null` in the filter keeps
-# notes: only the rows with an email. Engine v1 refuses the projection at the
-# notes: query door (engine_v1_refuses_compound_predicates.gqt).
+# notes: only the rows with an email.
 
 --- runner
 timeout_ms: 10000

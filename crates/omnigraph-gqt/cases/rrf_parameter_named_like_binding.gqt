@@ -28,27 +28,6 @@ edge Knows: Doc -> Doc {
 {"edge":"Knows","id":"e004_0","from":"d004","to":"d005","data":{}}
 
 --- query
-set engine = v1;
-query fused_v1($q: Vector(4), $t: String) {
-    match {
-        $d: Doc
-        $d knows $t
-    }
-    return { $d.slug }
-    order { rrf(nearest($d.embedding, $q), bm25($d.text, $t)) }
-    limit 1
-}
-
---- params
-{"q": [-0.3, 0.0, 0.0, 0.0], "t": "needle"}
-
---- expect unordered
-{"d.slug":"d002"}
-
---- expect shape
-d.slug: String
-
---- query
 set engine = v2;
 query fused_v2($q: Vector(4), $t: String) {
     match {
@@ -68,3 +47,4 @@ query fused_v2($q: Vector(4), $t: String) {
 
 --- expect shape
 d.slug: String
+--- expect same as v1

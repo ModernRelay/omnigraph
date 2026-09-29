@@ -110,6 +110,12 @@ pub trait PlanSource {
         false
     }
 
+    /// The element count of the list the parameter `name` is bound to; `None`
+    /// for any other value and for a source that holds no parameters.
+    fn list_parameter_len(&self, _name: &str) -> Option<usize> {
+        None
+    }
+
     /// The manifest-resident data-file bytes of the whole table `type_key`
     /// names; `None` when the source holds no such number.
     fn table_data_bytes(&self, _type_key: &str) -> Option<u64> {

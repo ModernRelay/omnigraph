@@ -236,8 +236,7 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
     // Canonical writer order: schema -> branch -> sorted tables. Planning reads
     // catalog index intent, so it must use an operation-local accepted catalog
     // under the same schema gate as schema apply and the exact RFC-022 writers.
-    let schema_gate_key = crate::db::write_queue::schema_apply_serial_queue_key();
-    let schema_guard = db.write_queue().acquire(&schema_gate_key).await;
+    let schema_permit = db.write_queue().acquire_schema_shared().await;
     db.refresh_coordinator_only().await?;
     db.ensure_schema_apply_not_locked("optimize").await?;
     let catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
@@ -358,7 +357,7 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
     stats.sort_by(|left, right| left.type_key.cmp(&right.type_key));
 
     drop(table_guards);
-    drop(schema_guard);
+    drop(schema_permit);
 
     // Compact the internal system tables too (RFC-013 step 2). They are not
     // catalog-tracked, so they take a separate, simpler path (`compact_internal_table`):
@@ -855,10 +854,7 @@ pub async fn cleanup_all_datasets(
     // envelope before deleting any version history.
     let authority_txn = db.open_write_txn(None).await?;
 
-    let _cleanup_schema_guard = db
-        .write_queue()
-        .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
-        .await;
+    let _cleanup_schema_permit = db.write_queue().acquire_schema_shared().await;
     db.refresh_coordinator_only().await?;
     db.ensure_schema_apply_not_locked("cleanup").await?;
     let cleanup_catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
@@ -1005,10 +1001,7 @@ pub struct BranchReconcileStats {
 /// Collect unreferenced table forks under cleanup's complete writer gates.
 #[cfg(all(test, feature = "failpoints"))]
 pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconcileStats> {
-    let _schema = db
-        .write_queue()
-        .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
-        .await;
+    let _schema = db.write_queue().acquire_schema_shared().await;
     let catalog = db.catalog();
     let graph_branches = cleanup_graph_branches(db).await?;
     let _branches = db.write_queue().acquire_branches(&graph_branches).await;

@@ -667,6 +667,27 @@ fn test_parse_boolean_words_are_word_bounded_and_reserved_words_never_edge_names
         &qf.single_decl().match_clause[1],
         Clause::Traversal(traversal) if traversal.edge_name == "andy"
     ));
+    for (clause, edge, undirected, binding) in [
+        (r#"$p "in" $f"#, "in", false, None),
+        (r#"$p "knows" $f"#, "knows", false, None),
+        (r#"$p <"not"> $f"#, "not", true, None),
+        (r#"$p $w:"in"{1,2} $f"#, "in", false, Some("w")),
+    ] {
+        let source =
+            format!("query q() {{ match {{ $p: Person  {clause} }} return {{ $p.name }} }}");
+        let qf = parse_query(&source).unwrap();
+        let Clause::Traversal(traversal) = &qf.single_decl().match_clause[1] else {
+            panic!("expected a traversal: {source}");
+        };
+        assert_eq!(traversal.edge_name, edge, "{source}");
+        assert_eq!(traversal.undirected, undirected, "{source}");
+        assert_eq!(traversal.edge_binding.as_deref(), binding, "{source}");
+    }
+    let unnamed = r#"query q() { match { $p: Person  $p "two words" $f } return { $p.name } }"#;
+    assert_eq!(
+        parse_query(unnamed).unwrap_err().to_string(),
+        "parse error: `\"two words\"` is not an edge name; a quoted edge is its bare name in quotes, as in `$a \"in\" $b`"
+    );
 }
 
 #[test]
@@ -676,7 +697,7 @@ fn test_parse_reserved_words() {
             "parse error: `{word}` is a reserved word; a property of that name is written `$p.{word}` in a read and cannot be named bare in a mutation `where`"
         )
     };
-    for word in ["and", "or", "not", "is", "null"] {
+    for word in ["and", "or", "not", "is", "null", "in"] {
         let read =
             format!("query q() {{ match {{ $p: Person  {word} = 1 }} return {{ $p.name }} }}");
         assert_eq!(
@@ -729,6 +750,29 @@ fn test_parse_reserved_words() {
     );
     assert_eq!(decl.return_clause[0].alias.as_deref(), Some("notnull"));
     assert_eq!(decl.return_clause[1].alias.as_deref(), Some("island"));
+    assert_eq!(
+        parse_filter_of("$p.in = 1"),
+        Expr::comparison(prop("p", "in"), CompOp::Eq, int(1))
+    );
+    assert_eq!(
+        parse_filter_of("$p.index in $inside"),
+        Expr::In {
+            needle: Box::new(prop("p", "index")),
+            list: Box::new(Expr::Variable("inside".to_string())),
+        }
+    );
+    assert_eq!(
+        parse_filter_of("not $p.age in [1, 2]"),
+        not(Expr::In {
+            needle: Box::new(prop("p", "age")),
+            list: Box::new(Expr::Literal(Literal::List(vec![
+                Literal::Integer(1),
+                Literal::Integer(2)
+            ]))),
+        })
+    );
+    let chained = "query q() { match { $p: Person  $p.age in $a in $b } return { $p.name } }";
+    assert!(parse_query(chained).is_err(), "{chained}");
 }
 
 #[test]

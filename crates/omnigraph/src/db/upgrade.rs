@@ -16,9 +16,9 @@ use crate::error::{OmniError, Result};
 use crate::storage::{normalize_root_uri, storage_for_uri};
 
 use crate::db::manifest::layout::open_manifest_dataset_native_with_session;
-use crate::db::manifest::migrations::{INTERNAL_SCHEMA_VERSION_KEY, read_stamp};
+use crate::db::manifest::migrations::{INTERNAL_SCHEMA_VERSION_KEY, is_served_stamp, read_stamp};
 use crate::db::manifest::state::{
-    read_manifest_state, read_manifest_state_with_registration_clocks,
+    flat_manifest_schema, read_manifest_state, read_manifest_state_with_registration_clocks,
 };
 use crate::db::manifest::{
     OBJECT_TYPE_GRAPH_COMMIT, OBJECT_TYPE_GRAPH_HEAD, OBJECT_TYPE_TABLE,
@@ -323,6 +323,17 @@ decide_seam! {
     pub static UPGRADE_AFTER_ACTIVATION = ("upgrade.after_activation", Unreachable, [Fail]);
 }
 
+/// Whether a live branch at `branch_stamp` belongs to a current graph whose
+/// main is at `main_stamp`: any served stamp when main is served (a v11 graph
+/// converts to v12 one branch per publish), else main's exact stamp.
+fn branch_stamp_is_current(main_stamp: u32, branch_stamp: Option<u32>) -> bool {
+    if is_served_stamp(main_stamp) {
+        branch_stamp.is_some_and(is_served_stamp)
+    } else {
+        branch_stamp == Some(main_stamp)
+    }
+}
+
 async fn run_step(
     root: &str,
     options: UpgradeOptions,
@@ -403,12 +414,14 @@ async fn run_step(
                 .checkout_branch(native)
                 .await
                 .map_err(OmniError::storage)?;
-            if read_stamp(&branch) != Some(expected)
+            let branch_stamp = read_stamp(&branch);
+            if !branch_stamp_is_current(expected, branch_stamp)
                 || branch.schema().metadata.contains_key(UPGRADE_PENDING_KEY)
             {
-                return Err(invalid(
-                    "current graph contains a branch with an incompatible format or pending upgrade",
-                ));
+                return Err(invalid(format!(
+                    "current graph contains a branch with an incompatible format or pending upgrade: '{native}' is stamped {} while main is v{expected}",
+                    branch_stamp.map_or("unreadably".to_string(), |stamp| format!("v{stamp}"))
+                )));
             }
             read_manifest_state(&branch).await?;
         }
@@ -814,7 +827,7 @@ async fn preflight(root: &str, intent: &UpgradeIntent, work: &mut UpgradeWork) -
             compare_states(old, &mut translated)?;
         }
         let schema: Schema = source.schema().into();
-        let expected = crate::db::manifest::state::manifest_schema();
+        let expected = flat_manifest_schema();
         if schema.fields().len() != expected.fields().len()
             || schema
                 .fields()

@@ -1,7 +1,7 @@
 # issue: none
 # notes: Show values and their sources across set, reset and scoped prefixes.
 # notes: Debug builds start merge_lineage at verify; its declared default is on.
-# notes: Pin engine to v1 so show all is identical under either runner baseline.
+# notes: Pin engine so its row reads the same under any runner baseline.
 
 --- runner
 timeout_ms: 10000
@@ -17,7 +17,7 @@ node Person {
 --- seed
 
 --- mutate
-set engine = v1;
+set engine = v2;
 
 --- expect ok
 
@@ -25,7 +25,7 @@ set engine = v1;
 show all;
 
 --- expect ordered
-{"name": "engine", "value": "v1", "default": "v1", "source": "file", "scope": "request"}
+{"name": "engine", "value": "v2", "default": "v2", "source": "file", "scope": "request"}
 {"name": "rrf_plan", "value": "auto", "default": "auto", "source": "default", "scope": "process"}
 {"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}
 {"name": "ann_nprobes", "value": "20", "default": "20", "source": "default", "scope": "request"}

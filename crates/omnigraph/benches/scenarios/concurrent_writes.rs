@@ -14,8 +14,9 @@
 //!
 //! Workload: insert-only `Chunk` rows with disjoint keys per worker
 //! (`cw-w{worker}-{seq}`), the shape that exercises the write path's real
-//! serialization — the process-global write queue and the exclusive schema
-//! gate every writer crosses in `commit_all` — without manufacturing key
+//! serialization — the process-global write queue and the schema gate
+//! every writer crosses in `commit_all` (shared since RFC
+//! 2026-09-18-shared-schema-gate) — without manufacturing key
 //! conflicts. `Omnigraph::mutate` replays a typed read-set/authority
 //! conflict (`ReadSetChanged`: the graph head moved under a concurrent
 //! writer) itself, up to `MAX_PRE_EFFECT_REPREPARES` times for an

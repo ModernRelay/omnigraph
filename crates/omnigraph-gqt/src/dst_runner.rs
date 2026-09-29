@@ -38,6 +38,19 @@ struct Observations {
     lifecycle: Option<[std::sync::Arc<std::sync::atomic::AtomicU64>; 2]>,
 }
 
+/// Whether this task runs under the DST runner, whose replay evidence and
+/// seam crossings a second, unrecorded query would perturb.
+pub(crate) fn active() -> bool {
+    #[cfg(tokio_unstable)]
+    {
+        DECORATION.try_with(|_| ()).is_ok()
+    }
+    #[cfg(not(tokio_unstable))]
+    {
+        false
+    }
+}
+
 pub(crate) fn observe(value: impl FnOnce() -> String) {
     OBSERVATIONS
         .try_with(|events| {
@@ -94,6 +107,98 @@ fn lifecycle_probe() -> (
     (counts, guards)
 }
 
+/// The phase observers of a measured run: one pass-through decider per
+/// catalog seam, so the ledger learns which seam the engine crossed last.
+#[cfg(tokio_unstable)]
+static PHASE_OBSERVERS: std::sync::Mutex<Vec<(&'static str, DecideGuard)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Install a phase observer on every empty decision seam; a no-op when the
+/// process is not measuring.
+#[cfg(tokio_unstable)]
+pub(crate) fn rearm_phase_observers() {
+    if crate::measure::model().is_none() {
+        return;
+    }
+    let mut observers = PHASE_OBSERVERS.lock().unwrap();
+    for entry in omnigraph::seams::catalog::ALL.iter() {
+        let Some(seam) = entry.as_decide() else {
+            continue;
+        };
+        let name = entry.name();
+        if observers.iter().any(|(held, _)| *held == name) || seam.with(|_| ()).is_some() {
+            continue;
+        }
+        observers.push((name, seam.observe(move || crate::measure::cross(name))));
+    }
+}
+
+/// Give the seam `name` back to a `--- seam` directive for its step.
+#[cfg(tokio_unstable)]
+pub(crate) fn release_phase_observer(name: &str) {
+    PHASE_OBSERVERS
+        .lock()
+        .unwrap()
+        .retain(|(held, _)| *held != name);
+}
+
+#[cfg(tokio_unstable)]
+fn clear_phase_observers() {
+    PHASE_OBSERVERS.lock().unwrap().clear();
+}
+
+/// Tag every request from here on as step `ordinal`'s, a step of `kind`.
+pub(crate) fn measure_step_begin(ordinal: u64, line: Option<u64>, kind: &'static str) {
+    crate::measure::set_label("step", ordinal, line, kind);
+}
+
+/// Tag every request from here on as the runner's own, made after step
+/// `ordinal` (its checks, the next step's setup) until the next step begins.
+pub(crate) fn measure_step_end(ordinal: u64) {
+    crate::measure::set_label("runner", ordinal, None, "runner");
+}
+
+/// The tick-derived counts, measurement-only: a detached commit's overlap moved
+/// by one tick between two runs of one seed (2026-09-24, in the seed load and
+/// in a step). The request counts are the replay-compared evidence.
+const SCHEDULE_COUNTS: [&str; 3] = ["makespan", "span", "phases"];
+
+/// At the end of the run, one `io` evidence row per label group (the counts)
+/// and one measurement per group (bytes, the request log); the groups cover
+/// every request the store saw.
+pub(crate) fn measure_finish() {
+    for group in crate::measure::finish() {
+        let label = group.label;
+        let mut counts = group.io.counts();
+        counts["slot"] = serde_json::json!(label.slot);
+        counts["step"] = serde_json::json!(label.step);
+        counts["line"] = serde_json::json!(label.line);
+        counts["kind"] = serde_json::json!(label.kind);
+        let mut detail = group.io.detail();
+        for key in SCHEDULE_COUNTS {
+            if let Some(value) = counts.as_object_mut().and_then(|c| c.remove(key)) {
+                detail[key] = value;
+            }
+        }
+        record("io", counts);
+        crate::measure::push_detail(
+            serde_json::json!({"slot": label.slot, "step": label.step, "value": detail}),
+        );
+    }
+}
+
+/// What `--measure` runs under and compares against.
+#[derive(Clone, Debug)]
+pub struct MeasureOptions {
+    /// One of [`crate::measure::MODELS`] by name.
+    pub model: String,
+    /// A baseline TSV to compare each measured case against, anywhere on
+    /// disk; the repository commits none. `None` measures without a delta.
+    pub baseline: Option<PathBuf>,
+    /// Rewrite the measured cases' rows in the baseline instead of comparing.
+    pub write_baseline: bool,
+}
+
 pub(crate) fn begin_operation(value: serde_json::Value) {
     OBSERVATIONS
         .try_with(|events| events.borrow_mut().operation = Some(value))
@@ -107,8 +212,11 @@ pub(crate) fn record(kind: &str, value: serde_json::Value) {
             if events.overflow {
                 return;
             }
-            let event =
+            let mut event =
                 serde_json::json!({"kind": kind, "operation": events.operation, "value": value});
+            if let Ok(session) = crate::measure::SESSION.try_with(|s| s.label.slot) {
+                event["session"] = serde_json::json!(session);
+            }
             events.bytes += event.to_string().len();
             if events.bytes > LIMIT || events.values.len() + events.evidence.len() >= 100_000 {
                 events.overflow = true;
@@ -191,13 +299,15 @@ struct Input {
     environment: Environment,
     seed: Option<u64>,
     effective_settings: settings::EffectiveSettings,
-    #[serde(default, skip_serializing_if = "is_v1")]
+    #[serde(default)]
     engine: Engine,
     bless: bool,
-}
-
-fn is_v1(engine: &Engine) -> bool {
-    *engine == Engine::V1
+    /// `--measure`: the DST worker records every store request per step.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    measure: bool,
+    /// The latency model of a `--measure` run, by name; empty when not measuring.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    model: String,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,6 +319,28 @@ struct WorkerReport {
     result: Result<(), String>,
     observations: Vec<String>,
     evidence: Vec<serde_json::Value>,
+    /// `--measure` bytes and request logs per step; outside the replay
+    /// comparison (`comparable`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    measurements: Vec<serde_json::Value>,
+}
+
+/// The report minus its measurements: Lance stamps manifests with wall-clock
+/// time, so byte counts may differ between two runs of one seed while every
+/// request count stays equal.
+fn comparable(report: &WorkerReport) -> Result<Vec<u8>, String> {
+    if report.measurements.is_empty() {
+        return json(report);
+    }
+    json(&WorkerReport {
+        code: report.code.clone(),
+        phase: report.phase.clone(),
+        input_digest: report.input_digest.clone(),
+        result: report.result.clone(),
+        observations: report.observations.clone(),
+        evidence: report.evidence.clone(),
+        measurements: Vec::new(),
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -449,11 +581,16 @@ pub fn run_corpus_case(path: &Path, executable: &Path, bless: bool) -> CaseOutco
             storage: None,
             seed: None,
             fast_tier: true,
+            measure: None,
+            artifacts: None,
         },
     )
 }
 
 /// Select only declared environment/seed values; omission executes the complete case.
+/// `measure` records every store request per step under the DST environments;
+/// `artifacts` is where the report and the measure TSV land, the build tree's
+/// `target/gqt-artifacts/` when `None`.
 pub fn run_selected(
     path: &Path,
     executable: &Path,
@@ -461,6 +598,8 @@ pub fn run_selected(
     target: Option<&str>,
     storage: Option<&str>,
     seed: Option<u64>,
+    measure: Option<MeasureOptions>,
+    artifacts: Option<PathBuf>,
 ) -> CaseOutcome {
     run_with_selection(
         path,
@@ -471,6 +610,8 @@ pub fn run_selected(
             storage,
             seed,
             fast_tier: false,
+            measure,
+            artifacts,
         },
     )
 }
@@ -480,6 +621,17 @@ struct Selection<'a> {
     storage: Option<&'a str>,
     seed: Option<u64>,
     fast_tier: bool,
+    measure: Option<MeasureOptions>,
+    artifacts: Option<PathBuf>,
+}
+
+/// The directory the report and the measure TSV are written to: the one the
+/// caller named, else `target/gqt-artifacts/` of the build tree.
+fn artifacts_root(custom: Option<&Path>) -> PathBuf {
+    custom.map_or_else(
+        || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/gqt-artifacts"),
+        Path::to_path_buf,
+    )
 }
 
 fn run_with_selection(
@@ -492,8 +644,16 @@ fn run_with_selection(
     let mut summary = new_summary(Some(path.to_path_buf()));
     summary.result = run_invocation(path, executable, bless, &selection, started, &mut summary);
     (summary.scope, summary.not_run) = coverage(&summary);
+    if let Some(options) = &selection.measure {
+        if let Err(error) = report_measurements(&summary, options, selection.artifacts.as_deref()) {
+            summary.result = Err(match summary.result {
+                Ok(()) => error,
+                Err(original) => format!("{original}\n{error}"),
+            });
+        }
+    }
     summary.code = summary_code(&summary).into();
-    let result = match save_summary(&summary) {
+    let result = match save_summary(&summary, selection.artifacts.as_deref()) {
         Ok(()) => summary.result,
         Err(error) => Err(format!("{error}; original result: {:?}", summary.result)),
     };
@@ -504,8 +664,573 @@ fn run_with_selection(
     }
 }
 
-fn save_summary(summary: &Summary) -> Result<(), String> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/gqt-artifacts");
+/// Render rows as an ASCII table; a cell that parses as a number is right-aligned.
+fn ascii_table(header: &[&str], rows: &[Vec<String>]) -> String {
+    let widths: Vec<usize> = (0..header.len())
+        .map(|i| {
+            rows.iter()
+                .map(|r| r.get(i).map_or(0, String::len))
+                .chain(std::iter::once(header[i].len()))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let rule = widths
+        .iter()
+        .map(|w| "-".repeat(w + 2))
+        .collect::<Vec<_>>()
+        .join("+");
+    let rule = format!("+{rule}+");
+    let line = |cells: &[String]| {
+        let cells = cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if c.parse::<f64>().is_ok() {
+                    format!(" {c:>w$} ", w = widths[i])
+                } else {
+                    format!(" {c:<w$} ", w = widths[i])
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        format!("|{cells}|")
+    };
+    let header: Vec<String> = header.iter().map(|h| h.to_string()).collect();
+    let mut out = vec![rule.clone(), line(&header), rule.clone()];
+    out.extend(rows.iter().map(|r| line(r)));
+    out.push(rule);
+    out.join("\n")
+}
+
+fn parallelism(requests: u64, makespan: u64, span: u64) -> String {
+    let ratio = |ticks: u64| requests as f64 / ticks.max(1) as f64;
+    format!("{:.1} / {:.1}", ratio(makespan), ratio(span))
+}
+
+/// One label group of one first run (replay 0), as the table, the TSV and
+/// the baseline read it: the compared counts merged with the schedule detail.
+struct MeasureRow {
+    environment: String,
+    seed: String,
+    slot: String,
+    step: u64,
+    line: String,
+    kind: String,
+    counts: serde_json::Value,
+    detail: serde_json::Value,
+}
+
+impl MeasureRow {
+    fn n(&self, key: &str) -> Option<u64> {
+        self.counts[key].as_u64()
+    }
+
+    fn position(&self) -> String {
+        match self.slot.as_str() {
+            "setup" => "setup, before step 1".to_string(),
+            "runner" => format!("runner, after step {}", self.step),
+            "step" => format!("step {} (line {}, {})", self.step, self.line, self.kind),
+            session => format!(
+                "step {} (line {}, {session}: {})",
+                self.step, self.line, self.kind
+            ),
+        }
+    }
+
+    /// A row whose change matters at any size: a mutation, a merge, a load,
+    /// a restart. A read step's cost is secondary and reported past a threshold.
+    fn primary(&self) -> bool {
+        !matches!(
+            self.kind.as_str(),
+            "query" | "show" | "list" | "runner" | "setup"
+        )
+    }
+
+    fn key(&self) -> (String, String, String, u64) {
+        (
+            self.environment.clone(),
+            self.seed.clone(),
+            self.slot.clone(),
+            self.step,
+        )
+    }
+}
+
+fn measure_rows(summary: &Summary) -> Vec<MeasureRow> {
+    let mut rows = Vec::new();
+    for attempt in &summary.attempts {
+        let Ok(report) = &attempt.outcome else {
+            continue;
+        };
+        if attempt.replay != 0 {
+            continue;
+        }
+        let seed = attempt.seed.map_or("-".to_string(), |s| s.to_string());
+        for row in &report.evidence {
+            if row["kind"] != "io" {
+                continue;
+            }
+            let value = &row["value"];
+            let slot = value["slot"].as_str().unwrap_or("step").to_string();
+            let step = value["step"].as_u64().unwrap_or(0);
+            let mut counts = value.clone();
+            let mut detail = serde_json::Value::Null;
+            if let Some(measured) = report
+                .measurements
+                .iter()
+                .find(|m| m["slot"] == slot.as_str() && m["step"] == step)
+            {
+                detail = measured["value"].clone();
+                for key in SCHEDULE_COUNTS {
+                    if !detail[key].is_null() {
+                        counts[key] = detail[key].clone();
+                    }
+                }
+            }
+            rows.push(MeasureRow {
+                environment: attempt.environment.to_string(),
+                seed: seed.clone(),
+                slot,
+                step,
+                line: value["line"].as_u64().map_or("-".into(), |l| l.to_string()),
+                kind: value["kind"].as_str().unwrap_or("").to_string(),
+                counts,
+                detail,
+            });
+        }
+    }
+    rows
+}
+
+/// The case's name in the baseline: its path under the corpus, whichever
+/// spelling named it (`cases/v2/x.gqt` and its absolute form are one case);
+/// a case outside the corpus is its absolute path.
+fn baseline_case_key(path: &Path) -> String {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let root = std::fs::canonicalize(crate::corpus_root()).unwrap_or_else(|_| crate::corpus_root());
+    canonical.strip_prefix(&root).map_or_else(
+        |_| canonical.to_string_lossy().into_owned(),
+        |rel| rel.to_string_lossy().into_owned(),
+    )
+}
+
+fn baseline_case_name(summary: &Summary) -> String {
+    summary
+        .case_path
+        .as_deref()
+        .map_or_else(String::new, baseline_case_key)
+}
+
+const BASELINE_HEADER: &str =
+    "case\tenvironment\tseed\tslot\tstep\tline\tkind\trequests\trepeat_reads\tafter_publish";
+
+fn baseline_line(case: &str, row: &MeasureRow) -> String {
+    format!(
+        "{case}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        row.environment,
+        row.seed,
+        row.slot,
+        row.step,
+        row.line,
+        row.kind,
+        row.n("requests").unwrap_or(0),
+        row.n("repeat_reads").unwrap_or(0),
+        row.n("after_publish")
+            .map_or("-".to_string(), |v| v.to_string())
+    )
+}
+
+/// A committed baseline row: the key columns and the three counts.
+struct BaselineRow {
+    key: (String, String, String, u64),
+    line: String,
+    kind: String,
+    requests: u64,
+    repeat_reads: u64,
+    after_publish: Option<u64>,
+}
+
+fn read_baseline(path: &Path, case: &str) -> Result<Vec<BaselineRow>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("baseline {}: cannot read: {e}", path.display()))?;
+    let mut rows = Vec::new();
+    for (index, line) in text.lines().enumerate().skip(1) {
+        let cells: Vec<&str> = line.split('\t').collect();
+        if cells.len() != 10 {
+            return Err(format!(
+                "baseline {}: line {} has {} columns, the header names 10",
+                path.display(),
+                index + 1,
+                cells.len()
+            ));
+        }
+        if cells[0] != case {
+            continue;
+        }
+        let count = |cell: &str, name: &str| {
+            cell.parse::<u64>().map_err(|e| {
+                format!(
+                    "baseline {}: line {}: {name} `{cell}`: {e}",
+                    path.display(),
+                    index + 1
+                )
+            })
+        };
+        rows.push(BaselineRow {
+            key: (
+                cells[1].to_string(),
+                cells[2].to_string(),
+                cells[3].to_string(),
+                count(cells[4], "step")?,
+            ),
+            line: cells[5].to_string(),
+            kind: cells[6].to_string(),
+            requests: count(cells[7], "requests")?,
+            repeat_reads: count(cells[8], "repeat_reads")?,
+            after_publish: if cells[9] == "-" {
+                None
+            } else {
+                Some(count(cells[9], "after_publish")?)
+            },
+        });
+    }
+    Ok(rows)
+}
+
+/// The (environment, seed) scopes the run measured: the only rows of the
+/// case a baseline write replaces or a delta can call gone.
+fn measured_scopes(rows: &[MeasureRow]) -> std::collections::BTreeSet<(String, String)> {
+    rows.iter()
+        .map(|row| (row.environment.clone(), row.seed.clone()))
+        .collect()
+}
+
+/// Replace the rows of the case's measured scopes with the run's and keep
+/// every other row (other cases, the scopes a `--target`/`--seed` selection
+/// left out); sorted by case, environment, seed, slot and step.
+fn write_baseline(path: &Path, case: &str, rows: &[MeasureRow]) -> Result<(), String> {
+    let scopes = measured_scopes(rows);
+    let replaced = |line: &str| {
+        let cells: Vec<&str> = line.split('\t').collect();
+        cells.first() == Some(&case)
+            && cells.len() > 2
+            && scopes.contains(&(cells[1].to_string(), cells[2].to_string()))
+    };
+    let mut kept: Vec<String> = match std::fs::read_to_string(path) {
+        Ok(text) => text
+            .lines()
+            .skip(1)
+            .filter(|line| !replaced(line))
+            .map(str::to_string)
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(format!("baseline {}: cannot read: {error}", path.display())),
+    };
+    kept.extend(rows.iter().map(|row| baseline_line(case, row)));
+    kept.sort_by_key(|line| {
+        let cells: Vec<&str> = line.split('\t').collect();
+        let cell = |i: usize| cells.get(i).copied().unwrap_or("").to_string();
+        let step = cells
+            .get(4)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let (rank, step) = match cells.get(3).copied() {
+            Some("setup") => (0, 0),
+            Some("runner") => (2, step),
+            _ => (1, step),
+        };
+        (cell(0), cell(1), cell(2), step, rank)
+    });
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("baseline {}: cannot create: {e}", path.display()))?;
+    }
+    let mut text = String::from(BASELINE_HEADER);
+    for line in &kept {
+        text.push('\n');
+        text.push_str(line);
+    }
+    text.push('\n');
+    std::fs::write(path, text)
+        .map_err(|e| format!("baseline {}: cannot write: {e}", path.display()))
+}
+
+/// The change a row reports against its baseline row, or `None` when the
+/// row is unchanged or, for a secondary row, changed within the relevance
+/// threshold (five percent of the baseline, two requests at least).
+fn delta_of(row: &MeasureRow, base: &BaselineRow) -> Option<String> {
+    let requests = row.n("requests").unwrap_or(0);
+    let repeat_reads = row.n("repeat_reads").unwrap_or(0);
+    let after_publish = row.n("after_publish");
+    let same = requests == base.requests
+        && repeat_reads == base.repeat_reads
+        && after_publish == base.after_publish;
+    if same {
+        return None;
+    }
+    if !row.primary() {
+        let threshold = (base.requests / 20).max(2);
+        let moved = requests.abs_diff(base.requests);
+        if moved <= threshold && after_publish == base.after_publish {
+            return None;
+        }
+    }
+    let signed = |now: u64, then: u64| format!("{then} -> {now} ({:+})", now as i64 - then as i64);
+    let window = |v: Option<u64>| v.map_or("-".to_string(), |v| v.to_string());
+    Some(format!(
+        "requests {}, repeat_reads {}, after_publish {} -> {}",
+        signed(requests, base.requests),
+        signed(repeat_reads, base.repeat_reads),
+        window(base.after_publish),
+        window(after_publish),
+    ))
+}
+
+/// Print the run against the named baseline: changed rows past the
+/// relevance filter (a primary row at any change), rows the baseline lacks,
+/// rows the run lacks. Report only; never fails the case.
+fn compare_baseline(path: &Path, case: &str, rows: &[MeasureRow]) -> Result<(), String> {
+    if !path.exists() {
+        println!(
+            "GQT cost delta: no baseline at {}; write one with --write-baseline",
+            path.display()
+        );
+        return Ok(());
+    }
+    let baseline = read_baseline(path, case)?;
+    if baseline.is_empty() {
+        println!(
+            "GQT cost delta: {} holds no rows for {case}; add them with --write-baseline",
+            path.display()
+        );
+        return Ok(());
+    }
+    let mut changed = Vec::new();
+    let mut primary = 0;
+    let mut new_rows = Vec::new();
+    for row in rows {
+        match baseline.iter().find(|base| base.key == row.key()) {
+            Some(base) => {
+                if let Some(delta) = delta_of(row, base) {
+                    primary += usize::from(row.primary());
+                    changed.push(format!(
+                        "  {} [{} seed={}]: {delta}",
+                        row.position(),
+                        row.environment,
+                        row.seed
+                    ));
+                }
+            }
+            None => new_rows.push(format!(
+                "  {} [{} seed={}]: new",
+                row.position(),
+                row.environment,
+                row.seed
+            )),
+        }
+    }
+    let scopes = measured_scopes(rows);
+    let gone: Vec<String> = baseline
+        .iter()
+        .filter(|base| scopes.contains(&(base.key.0.clone(), base.key.1.clone())))
+        .filter(|base| !rows.iter().any(|row| row.key() == base.key))
+        .map(|base| {
+            format!(
+                "  {} step {} (line {}, {}) [{} seed={}]: gone",
+                base.key.2, base.key.3, base.line, base.kind, base.key.0, base.key.1
+            )
+        })
+        .collect();
+    println!(
+        "GQT cost delta vs {} ({case}): {} changed ({primary} primary), {} new, {} gone",
+        path.display(),
+        changed.len(),
+        new_rows.len(),
+        gone.len()
+    );
+    for line in changed.iter().chain(&new_rows).chain(&gone) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Print every first run (replay 0) as one ASCII table, write the long-form
+/// TSV under `target/gqt-artifacts/cost/`, then write or compare the baseline.
+fn report_measurements(
+    summary: &Summary,
+    options: &MeasureOptions,
+    artifacts: Option<&Path>,
+) -> Result<(), String> {
+    let rows = measure_rows(summary);
+    let mut tsv = vec!["environment\tseed\tslot\tstep\tline\tkind\tmetric\tvalue".to_string()];
+    println!(
+        "GQT measure: store requests (DST environments, first run of each seed), model {}",
+        options.model
+    );
+    println!(
+        "step = one executing section of the case (a mutate, query, control or restart), numbered in file order; setup = the store, schema and seed before step 1; runner, after N = from step N's end to the next step's start (the runner's own checks)"
+    );
+    println!(
+        "requests = the work; repeats = reads of an object and range already read in the step; makespan = ticks the schedule took (one tick = 1 ms of virtual time); span = its critical path with the tables of each phase side by side; waiting = makespan - span; parallelism = requests per tick, achieved (makespan) / available (span); sim ms = virtual time under the model; u$ = microdollars at S3 list prices"
+    );
+    let cells = |requests: u64, makespan: Option<u64>, span: Option<u64>, tables: Option<u64>| {
+        let waiting = match (makespan, span) {
+            (Some(makespan), Some(span)) => {
+                let waiting = makespan.saturating_sub(span);
+                format!("{waiting} ({}%)", waiting * 100 / makespan.max(1))
+            }
+            _ => String::new(),
+        };
+        let parallelism = match (makespan, span) {
+            (Some(makespan), Some(span)) => parallelism(requests, makespan, span),
+            _ => String::new(),
+        };
+        vec![
+            requests.to_string(),
+            makespan.map_or(String::new(), |v| v.to_string()),
+            span.map_or(String::new(), |v| v.to_string()),
+            waiting,
+            tables.map_or(String::new(), |v| v.to_string()),
+            parallelism,
+        ]
+    };
+    let mut current: Option<(String, String)> = None;
+    let mut table_rows: Vec<Vec<String>> = Vec::new();
+    let flush = |current: &Option<(String, String)>, table_rows: &mut Vec<Vec<String>>| {
+        if let Some((environment, seed)) = current
+            && !table_rows.is_empty()
+        {
+            println!("\n{environment} seed={seed}");
+            println!(
+                "{}",
+                ascii_table(
+                    &[
+                        "step",
+                        "phase",
+                        "requests",
+                        "repeats",
+                        "makespan",
+                        "span",
+                        "waiting",
+                        "tables",
+                        "parallelism",
+                        "after the CAS",
+                        "sim ms",
+                        "u$",
+                    ],
+                    table_rows
+                )
+            );
+        }
+        table_rows.clear();
+    };
+    for row in &rows {
+        let group = (row.environment.clone(), row.seed.clone());
+        if current.as_ref() != Some(&group) {
+            flush(&current, &mut table_rows);
+            current = Some(group);
+        }
+        let mut step_row = vec![row.position(), "all".to_string()];
+        let (requests, makespan, span) = (
+            row.n("requests").unwrap_or(0),
+            row.n("makespan"),
+            row.n("span"),
+        );
+        let mut all = cells(requests, makespan, span, None);
+        all.insert(1, row.n("repeat_reads").unwrap_or(0).to_string());
+        step_row.extend(all);
+        step_row.push(
+            row.n("after_publish")
+                .map_or(String::new(), |v| v.to_string()),
+        );
+        step_row.push(
+            row.detail["simulated_us"]
+                .as_u64()
+                .map_or(String::new(), |us| format!("{:.1}", us as f64 / 1_000.0)),
+        );
+        step_row.push(
+            row.detail["usd_micro"]
+                .as_f64()
+                .map_or(String::new(), |usd| format!("{usd:.1}")),
+        );
+        table_rows.push(step_row);
+        let mut metrics = vec![("requests".to_string(), row.counts["requests"].clone())];
+        for key in ["repeat_reads", "makespan", "span", "after_publish"] {
+            if !row.counts[key].is_null() {
+                metrics.push((key.to_string(), row.counts[key].clone()));
+            }
+        }
+        for key in ["simulated_us", "usd_micro", "bytes_read", "bytes_written"] {
+            if !row.detail[key].is_null() {
+                metrics.push((key.to_string(), row.detail[key].clone()));
+            }
+        }
+        if let Some(classes) = row.counts["by_class"].as_object() {
+            metrics.extend(classes.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        for io in row.counts["phases"].as_array().into_iter().flatten() {
+            let phase = io["phase"].as_str().unwrap_or("?");
+            for field in ["makespan", "span", "requests", "tables"] {
+                metrics.push((format!("phase.{phase}.{field}"), io[field].clone()));
+            }
+            let p = |field: &str| io[field].as_u64().unwrap_or(0);
+            let mut phase_row = vec![String::new(), phase.to_string()];
+            let mut phase_cells = cells(
+                p("requests"),
+                Some(p("makespan")),
+                Some(p("span")),
+                Some(p("tables")),
+            );
+            phase_cells.insert(1, String::new());
+            phase_row.extend(phase_cells);
+            phase_row.extend([String::new(), String::new(), String::new()]);
+            table_rows.push(phase_row);
+        }
+        for (metric, v) in &metrics {
+            tsv.push(format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{metric}\t{v}",
+                row.environment, row.seed, row.slot, row.step, row.line, row.kind
+            ));
+        }
+    }
+    flush(&current, &mut table_rows);
+    let root = artifacts_root(artifacts).join("cost");
+    let path = root.join(format!("{}.tsv", summary.invocation_id));
+    match std::fs::create_dir_all(&root).and_then(|()| std::fs::write(&path, tsv.join("\n") + "\n"))
+    {
+        Ok(()) => println!("GQT measure TSV: {}", path.display()),
+        Err(error) => println!("GQT measure TSV not written: {error}"),
+    }
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let Some(baseline) = &options.baseline else {
+        return Ok(());
+    };
+    let case = baseline_case_name(summary);
+    if options.write_baseline {
+        if let Err(error) = &summary.result {
+            return Err(format!(
+                "GQT cost baseline: {} not written for {case}: the run failed ({})",
+                baseline.display(),
+                error.lines().next().unwrap_or("")
+            ));
+        }
+        write_baseline(baseline, &case, &rows)?;
+        println!(
+            "GQT cost baseline: {} rows for {case} written to {}",
+            rows.len(),
+            baseline.display()
+        );
+        Ok(())
+    } else {
+        compare_baseline(baseline, &case, &rows)
+    }
+}
+
+fn save_summary(summary: &Summary, artifacts: Option<&Path>) -> Result<(), String> {
+    let root = artifacts_root(artifacts);
     std::fs::create_dir_all(&root).map_err(|e| {
         format!(
             "report_failed: create artifact directory: {e}; original: {:?}",
@@ -613,7 +1338,7 @@ pub fn report_cli_refusal(
     summary.result = Err(error.clone());
     summary.code = summary_code(&summary).into();
     (summary.scope, summary.not_run) = coverage(&summary);
-    match save_summary(&summary) {
+    match save_summary(&summary, None) {
         Ok(()) => error,
         Err(report_error) => format!("{report_error}; original result: {error}"),
     }
@@ -683,7 +1408,7 @@ fn run_invocation(
         return Err("invalid_case: environment selector matches no declared environment".into());
     }
     for env in &selected_envs {
-        env.admit(!case.seams.is_empty())?;
+        env.admit(case.needs_dst())?;
     }
     for (ordinal, seams) in &case.seams {
         let step = case
@@ -753,6 +1478,11 @@ fn run_invocation(
                     effective_settings: settings::EffectiveSettings::for_seed(seed),
                     engine,
                     bless,
+                    measure: selection.measure.is_some(),
+                    model: selection
+                        .measure
+                        .as_ref()
+                        .map_or_else(String::new, |options| options.model.clone()),
                 };
                 let mut outcome = run_child(&input, executable, left);
                 if let Ok(report) = &outcome {
@@ -771,7 +1501,7 @@ fn run_invocation(
                                 env
                             ));
                         }
-                        reports.push(json(report)?);
+                        reports.push(comparable(report)?);
                     }
                     Err(error) => {
                         failures.push(error.clone());
@@ -908,6 +1638,7 @@ pub fn run_worker_if_requested(_path: &Path) -> Result<bool, String> {
                     result: Err(error),
                     observations: vec![],
                     evidence: vec![],
+                    measurements: vec![],
                 },
             };
             std::fs::write(output, json(&report)?)
@@ -940,7 +1671,7 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
     {
         return Err("environment_changed: worker selection is not declared".into());
     }
-    input.environment.admit(!case.seams.is_empty())?;
+    input.environment.admit(case.needs_dst())?;
     match input.seed {
         None => {
             let settings::TokioRuntime::MultiThread {
@@ -990,6 +1721,8 @@ async fn capture(
     {
         initial.lifecycle = None;
     }
+    #[cfg(tokio_unstable)]
+    rearm_phase_observers();
     OBSERVATIONS
         .scope(RefCell::new(initial), async {
             let result = std::panic::AssertUnwindSafe(future)
@@ -1001,6 +1734,9 @@ async fn capture(
                         crate::panic_message(panic.as_ref())
                     ))
                 });
+            #[cfg(tokio_unstable)]
+            clear_phase_observers();
+            measure_finish();
             let observations = OBSERVATIONS.with(|events| events.take());
             let result = if observations.overflow {
                 Err(format!(
@@ -1021,6 +1757,7 @@ async fn capture(
                 result,
                 observations: observations.values,
                 evidence: observations.evidence,
+                measurements: crate::measure::take_details(),
             })
         })
         .await
@@ -1047,6 +1784,12 @@ impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for G
         _workload_seed: u64,
     ) -> Self::Output {
         use omnigraph::storage::StorageAdapter;
+        let measure = self.input.measure.then(|| {
+            let model = crate::measure::Model::named(&self.input.model)
+                .unwrap_or_else(|| crate::measure::Model::named("unit").expect("the unit model"));
+            crate::measure::prepare(model)
+        });
+        crate::concurrent::install(measure);
         let base: std::sync::Arc<dyn StorageAdapter> = resources.adapter.clone();
         let decoration =
             omnigraph_dst::harness::FailingStorage::quiet(base, resources.root.clone());
@@ -1124,6 +1867,7 @@ fn dst_report(
             result: Err(format!("worker_failed: {error}")),
             observations: Vec::new(),
             evidence: Vec::new(),
+            measurements: Vec::new(),
         },
     };
     let cleanup = run
@@ -1165,7 +1909,7 @@ pub fn replay_report(path: &Path, executable: &Path) -> Result<(), String> {
             summary.code = "report_failed".into();
             summary.result = Err(error);
             (summary.scope, summary.not_run) = coverage(&summary);
-            save_summary(&summary)?;
+            save_summary(&summary, None)?;
             return summary.result;
         }
     };
@@ -1179,7 +1923,7 @@ pub fn replay_report(path: &Path, executable: &Path) -> Result<(), String> {
     summary.result = replay_attempts(&prior, executable, &mut summary.attempts);
     (summary.scope, summary.not_run) = coverage(&summary);
     summary.code = summary_code(&summary).into();
-    match save_summary(&summary) {
+    match save_summary(&summary, None) {
         Ok(()) => summary.result,
         Err(error) => Err(format!("{error}; original result: {:?}", summary.result)),
     }
@@ -1291,7 +2035,7 @@ fn replay_attempts(
                 return Err(failures.join("\n"));
             }
         };
-        if &report != prior {
+        if comparable(&report)? != comparable(prior)? {
             failures.push(format!(
                 "replay_mismatch: {} seed={:?}",
                 attempt.environment, attempt.seed
@@ -1350,5 +2094,60 @@ mod action_tests {
             None,
             "explicit contention cannot fall back to another effect"
         );
+    }
+
+    fn measured(environment: &str, seed: &str, step: u64, requests: u64) -> super::MeasureRow {
+        super::MeasureRow {
+            environment: environment.into(),
+            seed: seed.into(),
+            slot: "step".into(),
+            step,
+            line: "7".into(),
+            kind: "mutate".into(),
+            counts: serde_json::json!({"requests": requests, "repeat_reads": 0, "after_publish": 0}),
+            detail: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn a_baseline_write_replaces_only_the_scopes_the_run_measured() {
+        let dir = std::env::temp_dir().join(format!("gqt-baseline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("baseline.tsv");
+        let other_case_and_both_seeds_of_this_one = [
+            super::write_baseline(&path, "other.gqt", &[measured("dst", "0", 1, 5)]),
+            super::write_baseline(
+                &path,
+                "this.gqt",
+                &[measured("dst", "0", 1, 10), measured("dst", "42", 1, 11)],
+            ),
+        ];
+        assert!(
+            other_case_and_both_seeds_of_this_one
+                .iter()
+                .all(Result::is_ok)
+        );
+        super::write_baseline(&path, "this.gqt", &[measured("dst", "0", 1, 12)]).unwrap();
+        let rows = super::read_baseline(&path, "this.gqt").unwrap();
+        let kept: Vec<(String, u64)> = rows
+            .iter()
+            .map(|row| (row.key.1.clone(), row.requests))
+            .collect();
+        assert_eq!(kept, [("0".to_string(), 12), ("42".to_string(), 11)]);
+        assert_eq!(super::read_baseline(&path, "other.gqt").unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_case_has_one_baseline_name_whichever_way_it_was_spelled() {
+        let nested = "v2/planner/input_ann_nprobes.gqt";
+        let relative = std::path::Path::new("cases").join(nested);
+        assert!(relative.is_file(), "cargo test runs in the crate root");
+        let absolute = crate::corpus_root().join(nested);
+        assert_eq!(super::baseline_case_key(&relative), nested);
+        assert_eq!(super::baseline_case_key(&absolute), nested);
+        let outside = std::env::temp_dir().join("elsewhere.gqt");
+        assert!(super::baseline_case_key(&outside).ends_with("elsewhere.gqt"));
+        assert!(std::path::Path::new(&super::baseline_case_key(&outside)).is_absolute());
     }
 }

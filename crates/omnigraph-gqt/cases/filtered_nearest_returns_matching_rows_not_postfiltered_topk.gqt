@@ -1,0 +1,88 @@
+# issue: none
+# notes: A scalar filter on the ranked binding prefilters `nearest`: the three `miss` docs are
+# notes: the global top-3 around +e1 and the three `hit` docs sit around -e1, so a
+# notes: post-filtered top-k would return no rows. The inline-property spelling, the equality
+# notes: clause and a range clause (no inline spelling exists) all return the three hits in
+# notes: distance order. Replaces the Rust tests
+# notes: filtered_nearest_returns_matching_rows_not_postfiltered_topk and
+# notes: filtered_nearest_clause_spelling_prefilters_like_inline (search.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    status: String
+    embedding: Vector(4)
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"miss-1","status":"miss","embedding":[1.0,0.01,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"miss-2","status":"miss","embedding":[1.0,0.0,0.02,0.0]}}
+{"type":"Doc","data":{"slug":"miss-3","status":"miss","embedding":[1.0,0.0,0.0,0.03]}}
+{"type":"Doc","data":{"slug":"hit-1","status":"hit","embedding":[-1.0,0.01,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"hit-2","status":"hit","embedding":[-1.0,0.0,0.02,0.0]}}
+{"type":"Doc","data":{"slug":"hit-3","status":"hit","embedding":[-1.0,0.0,0.0,0.03]}}
+
+--- query
+query filtered_nearest($q: Vector(4)) {
+    match { $d: Doc { status: "hit" } }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+
+--- params
+{"q": [1.0, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug": "hit-1"}
+{"d.slug": "hit-2"}
+{"d.slug": "hit-3"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query filtered_nearest_clause_eq($q: Vector(4)) {
+    match { $d: Doc
+        $d.status = "hit" }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+
+--- params
+{"q": [1.0, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug": "hit-1"}
+{"d.slug": "hit-2"}
+{"d.slug": "hit-3"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query filtered_nearest_clause_range($q: Vector(4)) {
+    match { $d: Doc
+        $d.status <= "hit" }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+
+--- params
+{"q": [1.0, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug": "hit-1"}
+{"d.slug": "hit-2"}
+{"d.slug": "hit-3"}
+
+--- expect shape
+d.slug: String

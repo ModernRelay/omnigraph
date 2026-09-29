@@ -55,6 +55,11 @@ impl PlanSource for Recorded<'_> {
         self.source.is_unique_property(type_key, property)
     }
 
+    fn list_parameter_len(&self, name: &str) -> Option<usize> {
+        self.read.borrow_mut().params.insert(name.to_string());
+        self.source.list_parameter_len(name)
+    }
+
     fn table_data_bytes(&self, type_key: &str) -> Option<u64> {
         self.source.table_data_bytes(type_key)
     }

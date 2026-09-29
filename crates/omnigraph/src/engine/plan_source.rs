@@ -272,6 +272,13 @@ impl PlanSource for QuerySource<'_> {
         })
     }
 
+    fn list_parameter_len(&self, name: &str) -> Option<usize> {
+        match self.params.shared().get(name)? {
+            Literal::List(items) => Some(items.len()),
+            _ => None,
+        }
+    }
+
     /// The scan lowers exactly the conjuncts `ir_expr_to_df_expr` can express;
     /// the schema argument only types a literal, never the verdict.
     fn filter_pushable(&self, filter: &IRExpr) -> bool {
@@ -364,8 +371,12 @@ fn resolve_params(ir: &QueryIR, params: &ParamMap) -> Result<ResolvedParams> {
 
 /// Build the physical plan for execution without explain diagnostics.
 pub(crate) fn plan_query(source: &QuerySource<'_>) -> Result<PhysicalPlan> {
-    omnigraph_planner::plan_query(&source.ir, source, &source.bounds())
-        .map_err(|reason| no_plan(reason.to_json()))
+    omnigraph_planner::plan_query(&source.ir, source, &source.bounds()).map_err(|reason| {
+        match reason {
+            Unrouted::UnsupportedQuery { message } => OmniError::manifest(message),
+            reason => no_plan(reason.to_json()),
+        }
+    })
 }
 
 /// What the gate built for one compiled query: its explain document and the

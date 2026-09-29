@@ -13,4 +13,4 @@ pub use omnigraph_core::instrumentation::{
 
 // Keep this list sorted. Benchmark admission independently derives the same
 // registry from Cargo.toml and refuses execution on any mismatch.
-omnigraph_core::declare_engine_cargo_features!("default", "dst", "failpoints");
+omnigraph_core::declare_engine_cargo_features!("default", "dst", "failpoints", "test-util");

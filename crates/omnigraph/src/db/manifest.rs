@@ -9,5 +9,5 @@ pub(crate) use omnigraph_catalog::Snapshot as CatalogSnapshot;
 pub(crate) use omnigraph_catalog::*;
 pub use omnigraph_catalog::{
     DatasetEntry, DatasetUpdate, INTERNAL_MANIFEST_SCHEMA_VERSION,
-    READ_REFRESH_POST_STATE_PRE_LINEAGE,
+    MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, READ_REFRESH_POST_STATE_PRE_LINEAGE,
 };

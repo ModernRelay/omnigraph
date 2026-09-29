@@ -362,6 +362,7 @@ pub(crate) fn arm_seams(
         .iter()
         .zip(admitted)
         .map(|(seam, admitted)| {
+            super::release_phase_observer(&seam.at);
             let (guard, kind) = match admitted {
                 Admitted::Code(entry, effect) => {
                     let (guard, counted) =
@@ -460,6 +461,7 @@ pub(crate) fn finish_seams(mut armed: Vec<ArmedSeam>) -> Result<(), String> {
     for seam in &mut armed {
         drop(seam.guard.take());
     }
+    super::rearm_phase_observers();
     let cleared = DECORATION
         .try_with(|decoration| decoration.targets().clear())
         .ok();
