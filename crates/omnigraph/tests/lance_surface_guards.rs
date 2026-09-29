@@ -2833,6 +2833,21 @@ async fn scalar_index_use_requires_matched_literal_type() {
             col("d32").eq(lit("2024-01-01")),
             true,
         ),
+        (
+            "n32 in four Int32 values (GQ `in`, a list Lance keeps as IN)",
+            col("n32").in_list([1i32, 5, 9, 13].map(lit).to_vec(), false),
+            true,
+        ),
+        (
+            "d32 in four Date32 values",
+            col("d32").in_list(
+                [19000, 19723, 20000, 20500]
+                    .map(|days| lit(ScalarValue::Date32(Some(days))))
+                    .to_vec(),
+                false,
+            ),
+            true,
+        ),
     ];
 
     for (label, filter, expect_index) in cases {

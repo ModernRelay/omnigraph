@@ -107,9 +107,11 @@ GQ has no `null` literal, so `$p.x = null` is a parse error.
 not. A parameter bound to `null` makes every comparison on it null. `is null`
 refuses a `Blob`.
 
-`and`, `or`, `not`, `is` and `null` are reserved words: none is a bare operand
+`and`, `or`, `not`, `is`, `null` and `in` are reserved words: none is a bare operand
 or a return alias. `$p.and` after a dot and `and: 1` in an assignment or
 binding match stay legal; `nothing` and `android` are ordinary identifiers.
+A traversal names its edge bare or as a string, the one spelling for an edge
+a reserved word names: `$i "in" $b` follows the edge `In`; `$i in $b` tests membership.
 
 A mutation `where` takes the same expressions over the target type's
 properties, `@id`, `@src`, `@dst`, literals, parameters and `now()`, never a
@@ -161,6 +163,11 @@ query prolific($least: I64) {
 ### Strings and lists
 
 - `$x.tags contains "rust"` tests membership when `tags` is a list.
+- `$x.number in $numbers` tests membership in a list parameter or literal
+  (`$x.number in ["A-1", "A-2"]`): `$numbers contains $x.number` with the
+  list, of the value's type (`T7`), on the right. On a matched binding's
+  property it filters that binding's scan. An empty list has no member: `in`
+  keeps no row, `not (... in [])` keeps the rows whose value is not null.
 - `$x.title contains "graph"` tests exact, case-sensitive substring containment
   when `title` is a String.
 - `$x.title starts_with "Omni"` tests an exact, case-sensitive prefix.

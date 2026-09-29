@@ -228,3 +228,37 @@ b.name: String
 --- expect plan
 expand $a Links $b: mode indexed_scan
 scan Person as $b: access id_lookup
+
+--- query
+set engine = v2;
+query one_member() {
+    match { $a: Person $a.name in ["p000"] $a links{1,2} $b }
+    return { $b.name }
+}
+--- expect unordered
+{"b.name":"p001"}
+{"b.name":"p002"}
+--- expect shape
+b.name: String
+--- expect plan
+expand $a Links $b: mode indexed_scan
+scan Person as $b: access id_lookup
+
+--- query
+set engine = v2;
+query two_members($names: [String]) {
+    match { $a: Person $a.name in $names $a links{1,2} $b }
+    return { $b.name }
+}
+--- params
+{"names": ["p000", "p050"]}
+--- expect unordered
+{"b.name":"p001"}
+{"b.name":"p002"}
+{"b.name":"p051"}
+{"b.name":"p052"}
+--- expect shape
+b.name: String
+--- expect plan
+expand $a Links $b: mode indexed_scan
+scan Person as $b: access id_lookup

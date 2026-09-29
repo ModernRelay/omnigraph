@@ -789,7 +789,11 @@ fn walk_expr(expr: &Expr, params: &[Param], needs_indices: &mut bool) -> Result<
         | Expr::Literal(_)
         | Expr::AliasRef(_) => {}
         Expr::Aggregate { func: _, arg } => walk_expr(arg, params, needs_indices)?,
-        Expr::Binary { left, op: _, right } => {
+        Expr::Binary { left, op: _, right }
+        | Expr::In {
+            needle: left,
+            list: right,
+        } => {
             walk_expr(left, params, needs_indices)?;
             walk_expr(right, params, needs_indices)?;
         }
