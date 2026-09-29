@@ -159,10 +159,13 @@ type (except enum widening), changing edge endpoints or cardinality, changing a
 node's implemented interfaces, and adding or removing most constraints are
 rejected. The plan reports the exact unsupported step before anything changes.
 
-A normal drop removes the declaration from the current schema while older
-commits remain readable until destructive cleanup removes their storage.
-`schema apply --allow-data-loss` makes drops immediately destructive. Review its
-plan carefully; it cannot be undone.
+A drop removes the declaration from the current schema. Older commits still
+read the dropped data until `omnigraph cleanup` stops retaining them; after
+that, the dropped data cannot be recovered. `schema apply --allow-data-loss`
+marks drops as hard (destructive) in the plan, but it does not remove storage
+at apply either. Review the plan carefully, and treat the cleanup that follows
+as the step that cannot be undone. See
+[cleanup](../operations/maintenance.md#cleanup).
 
 Cluster-managed graphs change schema through `omnigraph cluster apply`. Direct
 schema apply and the server schema-apply endpoint refuse cluster-managed graphs.

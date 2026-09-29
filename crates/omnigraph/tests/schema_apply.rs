@@ -702,8 +702,8 @@ async fn apply_schema_unsupported_plan_does_not_advance_manifest() {
 // - DropProperty { Soft } via the schema-lint v1 chassis (commit #3 of MR-694)
 //   — the dropped column is removed from the current manifest version but
 //   remains reachable via Lance time travel at the prior version, until
-//   `omnigraph cleanup` runs. Hard mode (immediate data cleanup) lands in
-//   commit #5 gated by `--allow-data-loss`.
+//   `omnigraph cleanup` stops retaining it. Hard mode (`--allow-data-loss`)
+//   is executed the same way; see the hard-mode tests below.
 //
 // Every other destructive shape (drop type, narrow type, add required without
 // backfill, remove constraint) still returns an `UnsupportedChange` step that
@@ -1822,16 +1822,14 @@ node Anchor { name: String @key }
     assert_eq!(after.published_dataset_version, 1);
 }
 
-// ─── Hard-mode drops (chassis v1 commit #5 — --allow-data-loss) ──────────────
+// ─── Hard-mode drops (--allow-data-loss) ─────────────────────────────────────
 //
-// Hard mode promotes every `DropMode::Soft` step to `DropMode::Hard` and runs
-// `cleanup_old_versions` on affected datasets immediately after the manifest
-// publish. For DropProperty Hard, this removes the prior dataset version
-// (where the column lived), making `snapshot_at_graph_manifest_version(pre_drop)` unable to
-// open the dataset at that version. For DropType Hard, the dataset is
-// untouched by the schema apply itself (no per-table write), so
-// cleanup_old_versions is currently a no-op for it — the dataset directory
-// persists. Full orphan-dataset deletion is a separate follow-up.
+// `--allow-data-loss` promotes every `DropMode::Soft` step to `DropMode::Hard`.
+// Apply executes both modes the same way and reclaims nothing: the prior table
+// version (where a dropped column lived) stays pinned by the older
+// `__manifest` versions, so `snapshot_at_graph_manifest_version(pre_drop)`
+// still reads it. It becomes unreachable once `omnigraph cleanup --keep 1`
+// stops retaining those versions and the collector reclaims its files.
 
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
@@ -1911,9 +1909,9 @@ async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
         .unwrap()
         .graph_manifest_version();
 
-    // Hard drop the `age` column. Soft drop would leave the prior
-    // dataset version intact; Hard drop runs cleanup_old_versions on
-    // the dataset post-apply, removing the prior version.
+    // Hard drop the `age` column. Apply rewrites the table without it and
+    // reclaims nothing; the prior version stays pinned by the pre-drop
+    // `__manifest` version until cleanup stops retaining it.
     let desired = TEST_SCHEMA.replace("    age: I32?\n", "");
     let result = db
         .apply_schema_with_options(
@@ -1940,11 +1938,21 @@ async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
         "current Person schema must not include 'age' after hard drop; got {current_fields:?}",
     );
 
-    // Time travel: at the pre-drop manifest version, the entry points
-    // at the OLD dataset version which has been cleaned up. Opening
-    // the dataset at that snapshot should fail (Lance can't load the
-    // dropped version). This is the Hard-mode contract — the prior
-    // data is unreachable.
+    // Before cleanup the pre-drop snapshot still reads the dropped column:
+    // a hard drop reclaims nothing at apply.
+    let pre_drop = db
+        .snapshot_at_graph_manifest_version(before_version)
+        .await
+        .unwrap();
+    let pre_drop_ds = pre_drop.open_dataset("node:Person").await.unwrap();
+    assert!(
+        pre_drop_ds.schema().field("age").is_some(),
+        "before cleanup, the pre-drop snapshot must still carry 'age'"
+    );
+
+    // After `cleanup --keep 1` the pre-drop manifest version is no longer
+    // retained, so its table version is reclaimed and the snapshot's
+    // entry points at a version that no longer opens.
     reclaim_hard_dropped_history(&db).await;
     let pre_drop = db
         .snapshot_at_graph_manifest_version(before_version)
@@ -2035,12 +2043,10 @@ edge Knows: Person -> Person {
     assert!(current.dataset("node:Company").is_none());
     assert!(current.dataset("edge:WorksAt").is_none());
 
-    // NOTE: DropType Hard's cleanup of the orphan dataset directory
-    // is a known follow-up (the manifest entry is tombstoned and the
-    // dataset's prior versions are cleaned, but the directory itself
-    // persists until an orphan-cleanup pass is implemented). For the
-    // current contract, the data is *unreachable* via omnigraph
-    // (no manifest entry), which is the user-facing guarantee.
+    // The dropped tables' versions stay pinned by the pre-drop `__manifest`
+    // versions; `omnigraph cleanup` reclaims them once it stops retaining
+    // those versions. Through the current manifest the data is already
+    // unreachable (no manifest entry).
 }
 
 // Regression (bug 3 / dev-graph iss-848): schema apply records index intent but

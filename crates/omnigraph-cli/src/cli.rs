@@ -878,13 +878,11 @@ pub(crate) enum SchemaCommand {
         json: bool,
         /// Allow destructive (data-loss) schema changes.
         ///
-        /// Without this flag, drops are "soft": the property or type
-        /// is removed from the current graph-manifest version but prior
-        /// versions are retained, so `snapshot_at_graph_manifest_version(pre_drop)`
-        /// can still read the dropped data until `omnigraph cleanup`
-        /// runs. With this flag, drops are "hard": `cleanup_old_versions`
-        /// runs on the affected datasets immediately after the apply,
-        /// making the prior data unreachable.
+        /// With this flag, drops are planned as "hard" rather than "soft".
+        /// In either mode the property or type is removed from the current
+        /// graph-manifest version and nothing is reclaimed at apply: older
+        /// commits still read the dropped data until `omnigraph cleanup`
+        /// stops retaining them, after which it cannot be recovered.
         #[arg(long, default_value_t = false)]
         allow_data_loss: bool,
     },

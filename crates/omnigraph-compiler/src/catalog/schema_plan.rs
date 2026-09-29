@@ -20,19 +20,17 @@ pub enum SchemaTypeKind {
     Edge,
 }
 
-/// How a drop step interacts with data.
+/// The operator's declared intent for a drop step's data.
 ///
-/// - **`Soft`** — catalog tombstone only. The type / property is hidden
-///   from queries but the underlying Lance column / dataset is retained
-///   on disk. Reversible via `omnigraph schema unhide` (forthcoming).
-///   Tier: `safe`.
-/// - **`Hard`** — actual data removal. The Lance column is rewritten
-///   without the property, or the Lance dataset is dropped. Irreversible
-///   short of branch / snapshot restore. Tier: `destructive`; requires
-///   `--allow-data-loss` to apply.
+/// - **`Soft`** — the default the planner emits.
+/// - **`Hard`** — the caller passed `--allow-data-loss`, which promotes
+///   every drop to `Hard`.
 ///
-/// The planner emits `Soft` by default; `--allow-data-loss` on the apply
-/// CLI promotes drops to `Hard`. This is the dimension orthogonal to
+/// Apply executes both modes the same way: the type is tombstoned or the
+/// property is rewritten out of the current table version, and nothing is
+/// reclaimed at apply. Older graph commits keep reading the dropped data
+/// until `omnigraph cleanup` stops retaining them; after that it cannot
+/// be recovered. This is the dimension orthogonal to
 /// `SafetyTier` from the schema-lint chassis (`crate::lint`): tier
 /// describes the rule's class; mode describes the operator's intent for
 /// data treatment.
@@ -111,22 +109,17 @@ pub enum SchemaMigrationStep {
         property_name: String,
         annotations: Vec<Annotation>,
     },
-    /// Remove a node or edge type. Soft mode tombstones in the catalog
-    /// and retains data on disk; Hard mode drops the Lance dataset and
-    /// requires `--allow-data-loss`.
+    /// Remove a node or edge type by tombstoning its table in the catalog.
     ///
     /// The planner emits Soft mode; apply promotes it to Hard mode when
-    /// the caller explicitly allows data loss.
+    /// the caller explicitly allows data loss. See [`DropMode`].
     DropType {
         type_kind: SchemaTypeKind,
         name: String,
         mode: DropMode,
     },
-    /// Remove a property from an existing type. Soft mode tombstones
-    /// the property in the catalog and retains the Lance column; Hard
-    /// mode rewrites the column out and requires `--allow-data-loss`.
-    ///
-    /// Dormant in this commit.
+    /// Remove a property from an existing type: the table is rewritten
+    /// without the column. Older table versions keep it. See [`DropMode`].
     DropProperty {
         type_kind: SchemaTypeKind,
         type_name: String,
@@ -501,9 +494,9 @@ fn plan_nodes(
         // Node type removed from the desired schema: emit Soft mode.
         // Soft removes the table's entry from the current
         // __manifest version; data files retained; previous manifest
-        // versions still reference the table, so Lance time travel
-        // restores it until cleanup_old_versions ages out the older
-        // __manifest entries. Apply promotes the step to Hard mode when
+        // versions still reference the table, so older snapshots read it
+        // until `omnigraph cleanup` stops retaining those __manifest
+        // versions. Apply promotes the step to Hard mode when
         // --allow-data-loss is set.
         steps.push(SchemaMigrationStep::DropType {
             type_kind: SchemaTypeKind::Node,
@@ -756,10 +749,11 @@ fn plan_properties(
         // Soft mode reuses the existing
         // stage_overwrite rewrite path — batch_for_schema_apply_rewrite
         // iterates target_schema.fields(), so the dropped column is
-        // naturally projected away. The prior Lance version retains
-        // the column until cleanup_old_versions runs, matching the
-        // OG-DS-104 destructive-tier expectation that data remains
-        // recoverable via time travel until cleanup. Apply promotes the
+        // naturally projected away. The prior table version retains
+        // the column until `omnigraph cleanup` stops retaining the commits
+        // that pin it, matching the OG-DS-104 destructive-tier expectation
+        // that data remains recoverable via time travel until cleanup.
+        // Apply promotes the
         // step to Hard mode when --allow-data-loss is set.
         steps.push(SchemaMigrationStep::DropProperty {
             type_kind,

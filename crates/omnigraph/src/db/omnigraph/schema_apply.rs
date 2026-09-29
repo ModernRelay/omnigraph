@@ -8,18 +8,20 @@ const SCHEMA_BLOB_DESCRIPTOR_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Operator-supplied options that gate schema-apply behavior.
 ///
-/// Today the only knob is `allow_data_loss`, which promotes
-/// `DropMode::Soft` steps to `DropMode::Hard` (per chassis v1
-/// commit #5). Soft is the default — drops are reversible via Lance
-/// time travel until cleanup runs. Hard runs `cleanup_old_versions`
-/// on the affected datasets immediately after the manifest publish,
-/// making the prior column data unreachable.
+/// Today the only knob is `allow_data_loss`. Drops plan as
+/// `DropMode::Soft` by default; `allow_data_loss` promotes them to
+/// `DropMode::Hard`, recording the operator's intent in the plan. Apply
+/// executes both modes the same way, and neither reclaims storage:
+/// the prior table versions stay pinned by retained `__manifest` versions,
+/// so older graph commits still read the dropped data, until
+/// `omnigraph cleanup` stops retaining them (for example `--keep 1`) and
+/// the engine collector reclaims their files.
 #[derive(Debug, Clone, Default)]
 pub struct SchemaApplyOptions {
-    /// Allow destructive (data-loss) schema changes. When true, the
-    /// planner promotes every `DropMode::Soft` step to
-    /// `DropMode::Hard`, and the apply path runs
-    /// `cleanup_old_versions` on affected datasets after the publish.
+    /// Allow destructive (data-loss) schema changes: the planner promotes
+    /// every `DropMode::Soft` step to `DropMode::Hard`. Apply reclaims
+    /// nothing; `omnigraph cleanup` does once it stops retaining the
+    /// commits before the drop.
     pub allow_data_loss: bool,
 }
 
@@ -321,12 +323,6 @@ where
         .collect::<BTreeMap<_, _>>();
     let mut rewritten_tables = BTreeSet::new();
     let mut dropped_tables = BTreeSet::new();
-    // Hard-drop cleanup targets: (table_key, full_dataset_uri).
-    // Populated for DropProperty { Hard } and DropType { Hard }; the
-    // post-publish cleanup runs `cleanup_old_versions` on each
-    // dataset to reclaim prior versions, making time-travel back
-    // to pre-drop state unreachable.
-    let mut hard_cleanup_targets: Vec<(String, String)> = Vec::new();
     let mut property_renames = HashMap::<String, HashMap<String, String>>::new();
     let mut changed_edge_tables = false;
 
@@ -407,7 +403,6 @@ where
             SchemaMigrationStep::DropProperty {
                 type_kind,
                 type_name,
-                mode,
                 ..
             } => {
                 if matches!(type_kind, SchemaTypeKind::Interface) {
@@ -419,68 +414,33 @@ where
                 // absent from desired_catalog is naturally projected
                 // away in the rebuilt batch.
                 //
-                // The difference between Soft and Hard is what
-                // happens AFTER the manifest publish:
-                //   * Soft: nothing — the prior dataset version
-                //     retains the dropped column; reads at
-                //     snapshot_at_graph_manifest_version(pre_drop) still see it.
-                //   * Hard: run cleanup_old_versions on the dataset
-                //     post-publish, removing the prior version (and
-                //     reclaiming any fragments unique to it). After
-                //     cleanup, time-travel back fails.
+                // Neither mode reclaims anything after the publish: the
+                // prior table version keeps the dropped column and stays
+                // pinned by the older `__manifest` versions, so reads at
+                // snapshot_at_graph_manifest_version(pre_drop) still see it
+                // until `omnigraph cleanup` stops retaining those commits.
                 let table_key = schema_table_key(*type_kind, type_name);
                 if table_key.starts_with("edge:") {
                     changed_edge_tables = true;
                 }
-                if matches!(mode, DropMode::Hard) {
-                    let source_table_key = renamed_tables.get(&table_key).unwrap_or(&table_key);
-                    let entry = snapshot.dataset(source_table_key).ok_or_else(|| {
-                        OmniError::manifest(format!(
-                            "missing source table '{}' for hard property drop targeting '{}'",
-                            source_table_key, table_key
-                        ))
-                    })?;
-                    let full_uri = format!("{}/{}", db.root_uri, entry.dataset_path);
-                    hard_cleanup_targets.push((table_key.clone(), full_uri));
-                }
                 rewritten_tables.insert(table_key);
             }
             SchemaMigrationStep::DropType {
-                type_kind,
-                name,
-                mode,
+                type_kind, name, ..
             } => {
                 if matches!(type_kind, SchemaTypeKind::Interface) {
                     continue;
                 }
                 // Both Soft and Hard tombstone the table's entry in
                 // the current __manifest version (no per-table write).
-                //
-                // The difference is what happens after publish:
-                //   * Soft: dataset files retained; prior __manifest
-                //     versions still reference them; Lance time
-                //     travel + branch-from-snapshot can read the
-                //     dropped table.
-                //   * Hard: run cleanup_old_versions on the orphan
-                //     dataset post-publish. Prior dataset versions
-                //     (and their fragments) are reclaimed. The dataset
-                //     directory itself persists until a future
-                //     orphan-cleanup pass — operators who need the
-                //     directory gone too should run `omnigraph cleanup`
-                //     and (for now) remove the directory out-of-band.
+                // Neither reclaims anything after the publish: prior
+                // __manifest versions still pin the dataset's versions, so
+                // snapshots and branch-from-snapshot read the dropped table
+                // until `omnigraph cleanup` stops retaining those commits
+                // and the engine collector reclaims the files.
                 let table_key = schema_table_key(*type_kind, name);
                 if table_key.starts_with("edge:") {
                     changed_edge_tables = true;
-                }
-                if matches!(mode, DropMode::Hard) {
-                    let entry = snapshot.dataset(&table_key).ok_or_else(|| {
-                        OmniError::manifest(format!(
-                            "missing table '{}' for hard type drop",
-                            table_key
-                        ))
-                    })?;
-                    let full_uri = format!("{}/{}", db.root_uri, entry.dataset_path);
-                    hard_cleanup_targets.push((table_key.clone(), full_uri));
                 }
                 dropped_tables.insert(table_key);
             }
@@ -555,8 +515,8 @@ where
     }
     // Soft and hard DropType tombstone the table's manifest entry at
     // version+1 with no per-table write. The dataset files stay reachable
-    // through older manifest versions until cleanup (hard drops reclaim their
-    // old versions right after publication).
+    // through older manifest versions until `omnigraph cleanup` stops
+    // retaining them.
     for dropped_table_key in &dropped_tables {
         let entry = snapshot.dataset(dropped_table_key).ok_or_else(|| {
             OmniError::manifest(format!("missing table '{}' for drop", dropped_table_key))
@@ -987,71 +947,12 @@ where
         }
     };
 
-    // Hard-drop cleanup: run cleanup_old_versions on each dataset
-    // that had a Hard mode drop step. Best-effort — the schema apply
-    // is already durable. If cleanup fails, the prior data fragments
-    // remain on disk as orphans (reclaimable via `omnigraph cleanup`).
-    // We do NOT fail the apply on cleanup error; the manifest change
-    // is the load-bearing operation.
-    for (table_key, full_uri) in &stock_reclaim_targets() {
-        match cleanup_dataset_old_versions(db, full_uri).await {
-            Ok(()) => {}
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    table_key = table_key.as_str(),
-                    "hard-drop cleanup_old_versions failed; rerun `omnigraph cleanup` to reclaim",
-                );
-            }
-        }
-    }
-
     Ok(SchemaApplyResult {
         supported: true,
         applied: true,
         graph_manifest_version: manifest_version,
         steps: plan.steps,
     })
-}
-
-/// The hard-drop targets stock version GC may reclaim: none, since the prior
-/// version is a detached pin whose files stock GC would strip; `cleanup`
-/// reclaims it once `--keep` prunes its version.
-fn stock_reclaim_targets() -> Vec<(String, String)> {
-    Vec::new()
-}
-
-/// Run `cleanup_old_versions` on a dataset URI with `before_timestamp = now`.
-/// Removes every version older than the current, making time-travel back
-/// to those versions unreachable. Used by Hard mode drops to enforce
-/// "data is gone" semantics post-apply.
-///
-/// The dataset itself isn't deleted — for DropType { Hard }, the
-/// dataset directory persists with only its current version (or, if
-/// no current version was written, its pre-drop version). A future
-/// orphan-cleanup pass should remove the directory entirely.
-async fn cleanup_dataset_old_versions(db: &Omnigraph, full_uri: &str) -> Result<()> {
-    use lance::dataset::cleanup::CleanupPolicy;
-    let ds = crate::instrumentation::open_dataset(
-        full_uri,
-        crate::instrumentation::VersionResolution::Latest,
-        None,
-        crate::instrumentation::table_wrapper(),
-    )
-    .await?;
-    let policy = CleanupPolicy {
-        before_timestamp: Some(crate::dst_clock::now_utc()),
-        before_version: None,
-        delete_unverified: false,
-        error_if_tagged_old_versions: false,
-        clean_referenced_branches: false,
-        delete_rate_limit: None,
-    };
-    let _removed = lance::dataset::cleanup::cleanup_old_versions(&ds, policy)
-        .await
-        .map_err(OmniError::storage)?;
-    let _ = db;
-    Ok(())
 }
 
 pub(super) async fn batch_for_schema_apply_rewrite(

@@ -2668,7 +2668,9 @@ impl TableStore {
     // HEAD or commit a manifest entry. The returned `Transaction` is held by
     // the caller (typically `MutationStaging` or the loader's accumulator)
     // and committed at end-of-query via `commit_staged`. On failure the
-    // fragments remain unreferenced and are reclaimed by `cleanup_old_versions`.
+    // fragments remain unreferenced; `cleanup`'s collector deletes them under
+    // its orphan rule once they are older than Lance's unverified-object age
+    // (`collector::UNVERIFIED_THRESHOLD_DAYS`).
     //
     // The extracted `Vec<Fragment>` is for read-your-writes within the same
     // query: subsequent ops construct a `Scanner` and call
