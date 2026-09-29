@@ -9586,7 +9586,7 @@
         "properties": {
           "allow_data_loss": {
             "type": "boolean",
-            "description": "When true, promote every `DropMode::Soft` step in the plan to\n`DropMode::Hard`, making the prior property data unreachable\nafter the apply. Matches the CLI's `--allow-data-loss` flag.\nDefaults to `false` (drops remain reversible via time travel)."
+            "description": "When true, promote every `DropMode::Soft` step in the plan to\n`DropMode::Hard`, recording destructive intent in the plan.\nNeither mode reclaims storage at apply: older commits still read\nthe dropped data until `omnigraph cleanup` stops retaining them.\nMatches the CLI's `--allow-data-loss` flag. Defaults to `false`."
           },
           "schema_source": {
             "type": "string",
