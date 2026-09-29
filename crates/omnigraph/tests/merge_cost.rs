@@ -391,6 +391,56 @@ fn merge_lineage_setting_selects_the_completed_classifier() {
     });
 }
 
+/// After a three-way merge, main's pin does not descend from the base pin;
+/// merging main back must still take lineage discovery, not the walk (rows:
+/// `merge_back_after_three_way_merge.gqt`).
+#[test]
+fn merge_back_after_three_way_merge_uses_lineage() {
+    on_big_stack(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = with_setting(&local_graph(&dir).await, "merge_lineage", "on");
+        db.branch_create("feature").await.unwrap();
+        for (branch, name) in [("feature", "mb-carol"), ("main", "mb-dave")] {
+            db.mutate(
+                branch,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", name)], &[("$age", 50)]),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            db.branch_merge("feature", "main").await.unwrap(),
+            MergeOutcome::Merged
+        );
+        db.mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "mb-carol")], &[("$age", 51)]),
+        )
+        .await
+        .unwrap();
+
+        let probes = MergeWriteProbes::default();
+        let outcome = with_merge_write_probes(probes.clone(), db.branch_merge("main", "feature"))
+            .await
+            .unwrap();
+        assert_eq!(outcome, MergeOutcome::Merged);
+        assert_eq!(probes.completed_full_walk_classification_calls(), 0);
+        assert_eq!(probes.completed_lineage_classification_calls(), 1);
+
+        let names = collect_column_strings(
+            &read_table_branch(&db, "feature", "node:Person").await,
+            "name",
+        );
+        for name in ["mb-carol", "mb-dave"] {
+            assert_eq!(names.iter().filter(|n| *n == name).count(), 1, "{name}");
+        }
+    });
+}
+
 /// CLAIM 2: a merge's `__manifest` reads are flat in history on a graph that is
 /// never compacted: its four coherent scans (five for a non-bound target) each
 /// read the one live fragment.

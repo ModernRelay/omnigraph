@@ -1360,27 +1360,6 @@ fn opened_at_pin(dataset: &Dataset, entry: &crate::db::DatasetEntry) -> bool {
     opened == entry.published_dataset_version || opened == pin_version(entry)
 }
 
-/// Whether `dataset`'s commit chain reaches one of `base_pins` by
-/// `read_version` links within the history bound (one manifest read per
-/// link): a detached-only side descends from the base exactly when it does.
-async fn chain_reaches(dataset: &Dataset, base_pins: [u64; 2]) -> bool {
-    let mut current = dataset.clone();
-    for _ in 0..=PURE_INSERT_HISTORY_MAX_VERSIONS {
-        if base_pins.contains(&current.version().version) {
-            return true;
-        }
-        let Some(identity) = crate::table_store::StagedTransactionIdentity::recorded_by(&current)
-        else {
-            return false;
-        };
-        match current.checkout_version(identity.read_version).await {
-            Ok(parent) => current = parent,
-            Err(_) => return false,
-        }
-    }
-    false
-}
-
 /// Walk the source's chain of commits by `read_version` links down to either
 /// base pin, certifying each as an exact-id fenced insert; the new fragments
 /// are the source's fragments the base lacks, and the rows are the chain's.
@@ -2694,16 +2673,9 @@ async fn lineage_side_candidates(
     Ok(true)
 }
 
-/// The fail-closed precondition gate. Returns a plan only when every
-/// assumption verifiably holds; any miss falls back to the walk:
-/// scalar-only schema (Blob descriptor budgeting stays on the walk), one
-/// table path across the three pins, pinned versions matching the manifest
-/// entries, stable row ids and the exact-id primary-key contract on every
-/// present dataset, one Lance schema across the present pins, each present
-/// side a provable descendant of the base manifest state (same-branch linear
-/// history or a branch whose identifier references the base version — the
-/// same check `try_proven_pure_insert_history` applies), and a candidate set
-/// within the retained-byte budget.
+/// Fail-closed gate: a plan only when every precondition below holds, `None`
+/// (the walk) on any miss. No side needs to descend from the base, because
+/// discovery compares the two end manifests by file identity.
 async fn plan_lineage_merge(
     catalog: &Catalog,
     base_snapshot: &Snapshot,
@@ -2793,22 +2765,6 @@ async fn plan_lineage_merge(
                 tracing::debug!(
                     table_key,
                     "lineage merge gate: schemas differ across the pins; using the walk"
-                );
-                return Ok(None);
-            }
-        }
-    }
-
-    if let (Some(_), Some(base_entry)) = (&base, base_entry) {
-        let base_pins = [
-            pin_version(base_entry),
-            base_entry.published_dataset_version,
-        ];
-        for side_dataset in [&source, &target].into_iter().flatten() {
-            if !chain_reaches(side_dataset, base_pins).await {
-                tracing::debug!(
-                    table_key,
-                    "lineage merge gate: side's commit chain does not reach the base pin; using the walk"
                 );
                 return Ok(None);
             }

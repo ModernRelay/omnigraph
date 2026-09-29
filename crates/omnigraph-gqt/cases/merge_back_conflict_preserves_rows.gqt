@@ -1,0 +1,112 @@
+# issue: none
+# notes: Conflicting merge-back refuses in On and Verify modes without publishing partial changes.
+# notes: The source deletion and the untouched target both survive reopen.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob","age":40}}
+
+--- mutate
+branch create feature;
+
+--- expect ok
+
+--- mutate branch: feature
+query add_carol() {
+    insert Person { name: "carol", age: 50 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query add_dave() {
+    insert Person { name: "dave", age: 60 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+set merge_lineage = verify;
+branch merge feature into main;
+
+--- expect outcome: merged
+
+--- mutate
+query source_deletes_bob() {
+    delete Person where name = "bob"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query source_changes_alice() {
+    update Person set { age: 32 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: feature
+query target_changes_alice() {
+    update Person set { age: 31 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+set merge_lineage = verify;
+branch merge main into feature;
+
+--- expect error: merge conflicts
+
+--- mutate
+set merge_lineage = on;
+branch merge main into feature;
+
+--- expect error: merge conflicts
+
+--- restart
+
+--- query branch: feature
+query untouched_target() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":31}
+{"p.name":"bob","p.age":40}
+{"p.name":"carol","p.age":50}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- query
+query untouched_source() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":32}
+{"p.name":"carol","p.age":50}
+{"p.name":"dave","p.age":60}
+
+--- expect shape
+p.name: String
+p.age: I32
