@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-08-09
-updated: 2026-09-29
+updated: 2026-09-30
 discussion: null
 supersedes: []
 superseded_by: []
@@ -1235,14 +1235,20 @@ The implementation extends existing owners before creating new fixtures, per
   deduplication, chunk-bounded payload reuse, and pointer-only no-I/O adoption.
 - Existing schema-apply coverage gains an empty Blob and a neighboring non-empty
   Blob rather than adding a duplicate initialization fixture.
-- `failpoints.rs`: extend the existing Mutation publication matrix with Blob PUT
-  and clear cells stopped after detached effects but before publication, and
-  separately after publication with a lost acknowledgment. Reopen and prove the
-  exact old or published graph state from publication evidence, with no duplicate
-  commit. A published PUT has exact bytes and an ETag equal to a fresh read; a
-  published clear has null/NotFound, no ETag, and rejects the old ETag. The
-  injected call never invents a successful outcome; the proposed completion owner
-  preserves evidence and later progress.
+- `detached_commit_matrix.rs`: extend the existing writer × window × fault ×
+  recovery-actor matrix with Blob PUT and clear, stopped after detached effects
+  but before publication. Prove no visible Blob effect and the exact expected
+  graph state/publication census, accounting for an admitted competing writer.
+  Return-fault cells must resume writes on the same live handle
+  once faults stop, without reopening; fresh-handle/read-only actors retain
+  their independent state checks. Reuse the matrix's fixture and oracle.
+- `failpoints.rs`: extend the post-publication lost-acknowledgment owners with
+  Blob PUT and clear. Prove exact published state, no duplicate commit and
+  same-handle write progress once faults stop, as well as fresh-read agreement.
+  A published PUT has exact bytes and an ETag equal to a fresh read; a published
+  clear has null/NotFound, no ETag, and rejects the old ETag. The injected call
+  never invents a successful outcome; the proposed completion owner preserves
+  evidence and later progress.
 - Phase 3 registers new writes under Mutation in `forbidden_apis.rs`; no new
   durable call site appears.
 
@@ -1675,6 +1681,10 @@ publisher architecture.
 
 ## Decision log
 
+- 2026-09-30: Phase 3 Blob pre-publication coverage extends the detached-commit
+  matrix, including its default same-handle liveness actor; post-publication
+  acknowledgment loss remains with the failpoint owners. This assigns proposed
+  coverage, not implementation evidence.
 - 2026-09-29: The server runtime proposal replaces the dependency on RFCs
   0034–0036 in the served lifecycle, authority, and Phase 3 prerequisites.
   The publication and failure-test paragraphs now follow detached Mutation
