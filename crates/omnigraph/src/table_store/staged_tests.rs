@@ -1271,45 +1271,6 @@ async fn keyed_write_rejects_missing_or_non_id_primary_key() {
     assert!(wrong_error.to_string().contains("got [\"age\"]"));
 }
 
-#[tokio::test]
-async fn keyed_write_stream_stages_source_dataset_without_wide_collection() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let target_uri = format!("{root}/target.lance");
-    let source_uri = format!("{root}/source.lance");
-    let store = TableStore::new(root, test_session());
-    let target = TableStore::write_dataset(&target_uri, person_pk_batch(&[("alice", Some(30))]))
-        .await
-        .unwrap();
-    let source = TableStore::write_dataset(
-        &source_uri,
-        person_pk_batch(&[("bob", Some(25)), ("carol", Some(40))]),
-    )
-    .await
-    .unwrap();
-
-    let staged = store
-        .stage_keyed_write_stream(
-            target.clone(),
-            "Person",
-            &source,
-            KeyedWriteSemantics::StrictInsert,
-            SYSTEM_COLUMNS_LEGACY,
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        staged_key_filter(&staged).field_ids,
-        vec![target.schema().field("id").unwrap().id]
-    );
-    let committed = store.commit_staged(Arc::new(target), staged).await.unwrap();
-    assert_eq!(
-        collect_ids(&store.scan_batches(&committed).await.unwrap()),
-        vec!["alice", "bob", "carol"]
-    );
-    assert_eq!(source.version().version, 1, "source remains read-only");
-}
-
 #[test]
 fn proven_insert_delta_scan_never_enables_strict_batch_size() {
     let source = include_str!("../table_store.rs");

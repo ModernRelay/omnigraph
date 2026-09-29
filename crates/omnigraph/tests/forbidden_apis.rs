@@ -686,7 +686,7 @@ gateway_surfaces! {
         "open_snapshot_at_entry", "open_snapshot_at_table", "open_dataset_head",
         "branch_identifier", "list_native_branches",
         "ensure_expected_version", "scan", "scan_with_row_id", "scan_filtered", "scan_batches",
-        "scan_batches_for_rewrite", "count_rows", "count_rows_with_staged",
+        "count_rows", "count_rows_with_staged",
         "scan_with_staged", "scan_with_pending", "scan_with_pending_materialized_blobs",
         "first_row_id_for_filter", "table_state", "has_btree_index",
         "has_fts_index", "has_vector_index", "root_uri", "dataset_uri", "scan_stream",
@@ -725,10 +725,9 @@ gateway_surfaces! {
         "new", "root_uri", "dataset_uri", "open_snapshot_table", "open_at_entry",
         "open_at_entry_verified", "open_dataset_head", "list_native_branches",
         "named_fork_is_absent", "ensure_expected_version",
-        "scan_batches", "scan_batches_for_rewrite",
-        "scan_stream_for_rewrite", "scan_stream_for_rewrite_bounded",
+        "scan_batches", "scan_stream_for_rewrite_bounded",
         "scan_proven_insert_delta_bounded", "include_proven_insert_blob_selection",
-        "materialize_blob_batch", "scan_stream", "scan_stream_bounded",
+        "scan_stream", "scan_stream_bounded",
         "scan_stream_with", "scan_plan_with", "ordered_scan_error", "scan", "scan_with",
         "fts_covers_all_fragments",
         "count_rows",
@@ -868,7 +867,7 @@ durable_calls! {
     ("storage_layer.rs", ".promote_detached(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("db/omnigraph/promotion.rs", ".promote_detached(", 1, WriteProtocol::Exact("RFC 0067 promotion replay")),
     ("db/omnigraph/promotion.rs", "SnapshotHandle::new(", 1, WriteProtocol::ReadOnlyAccess),
-    ("storage_layer.rs", ".dataset()", 32, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".dataset()", 31, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".into_arc()", 6, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", "SnapshotHandle::new(", 4, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("table_store.rs", ".raw_dataset_append(", 1, WriteProtocol::EphemeralScratch),
@@ -2046,8 +2045,9 @@ fn callable_storage_and_manifest_gateway_surfaces_are_registered() {
 }
 
 /// RFC-023 closes the keyed-Append side door at the source boundary. The raw
-/// append primitives are test-only behind the sealed storage adapter; every
-/// production graph writer must select the exact-id fenced adapter.
+/// append primitive `stage_append` is test-only behind the sealed storage
+/// adapter; every production graph writer must select the exact-id fenced
+/// adapter.
 ///
 /// This walks syntax rather than text, so comments and test-only fixtures do
 /// not weaken the guard. A future call from mutation, load, branch merge, or a
@@ -2068,11 +2068,9 @@ fn graph_visible_keyed_writes_cannot_reach_unfenced_append() {
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
         let ast = parse_rust_source(&contents, &relative);
         let inventory = call_inventory(&ast);
-        for primitive in ["stage_append", "stage_append_stream"] {
-            let count = inventory.counts.get(primitive).copied().unwrap_or(0);
-            if count > 0 {
-                violations.push(format!("{relative}: {primitive} called {count} time(s)"));
-            }
+        let count = inventory.counts.get("stage_append").copied().unwrap_or(0);
+        if count > 0 {
+            violations.push(format!("{relative}: stage_append called {count} time(s)"));
         }
     }
 
