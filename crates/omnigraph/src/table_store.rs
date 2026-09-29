@@ -74,8 +74,8 @@ use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::seams::{decide_seam, skip};
 use crate::storage_layer::{
-    IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics,
-    PendingScanBudget, ProvenInsertChunk,
+    BLOB_REBUILD_IO_BUFFER_BYTES, IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS,
+    KeyedWriteSemantics, PendingScanBudget, ProvenInsertChunk,
 };
 
 pub(crate) use crate::error::is_scratch_exhaustion;
@@ -1947,41 +1947,54 @@ impl TableStore {
             descriptors.push(descriptor);
         }
 
-        let blob_files = if managed_row_ids.is_empty() {
-            Vec::new()
+        // Only managed rows are selected: given an external row, Lance would
+        // resolve and read the referenced object itself, bypassing the
+        // preflight that owns external admission and caching below.
+        let mut managed_blobs = if managed_row_ids.is_empty() {
+            None
         } else {
-            Arc::new(ds.clone())
-                .take_blobs(&managed_row_ids, column_name)
-                .await
-                .map_err(OmniError::storage)?
+            Some(
+                Arc::new(ds.clone())
+                    .read_blobs(column_name)
+                    .map_err(OmniError::storage)?
+                    .with_row_ids(managed_row_ids)
+                    .preserve_order(true)
+                    .with_io_buffer_size_bytes(BLOB_REBUILD_IO_BUFFER_BYTES)
+                    .try_into_stream()
+                    .await
+                    .map_err(OmniError::storage)?,
+            )
         };
 
-        let mut managed_files = blob_files.into_iter();
         for descriptor in descriptors {
             match descriptor {
                 BlobDescriptor::Null => builder.push_null().map_err(OmniError::lance_internal)?,
                 BlobDescriptor::Managed { length } => {
-                    let blob = managed_files
-                        .next()
+                    let next = match managed_blobs.as_mut() {
+                        Some(stream) => stream.try_next().await.map_err(OmniError::storage)?,
+                        None => None,
+                    };
+                    let data = next
                         .ok_or_else(|| {
                             OmniError::blob_integrity(format!(
                                 "Blob rewrite for '{column_name}' lost alignment with source rows"
                             ))
                         })?
+                        .data
                         .ok_or_else(|| {
                             OmniError::blob_integrity(format!(
                                 "Blob rewrite for '{column_name}' returned null for a managed descriptor"
                             ))
                         })?;
-                    if blob.size() != length {
+                    if data.len() as u64 != length {
                         return Err(OmniError::blob_integrity(format!(
                             "Blob rewrite for '{column_name}' observed managed length {}, descriptor recorded {length}",
-                            blob.size()
+                            data.len()
                         )));
                     }
                     crate::instrumentation::record_blob_payload_read();
                     builder
-                        .push_bytes(blob.read().await.map_err(OmniError::storage)?)
+                        .push_bytes(data)
                         .map_err(OmniError::lance_internal)?;
                 }
                 BlobDescriptor::External {
@@ -2006,7 +2019,13 @@ impl TableStore {
             }
         }
 
-        if managed_files.next().is_some() {
+        if let Some(stream) = managed_blobs.as_mut()
+            && stream
+                .try_next()
+                .await
+                .map_err(OmniError::storage)?
+                .is_some()
+        {
             return Err(OmniError::blob_integrity(format!(
                 "Blob rewrite for '{}' produced extra managed source blobs",
                 column_name

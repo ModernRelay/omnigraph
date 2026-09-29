@@ -1231,16 +1231,25 @@ async fn rebuild_blob_column(
         row_descriptors.push(descriptor);
     }
 
-    let blob_files = if managed_row_ids.is_empty() {
-        Vec::new()
+    // Only managed rows are selected: given an external row, Lance would
+    // resolve and read the referenced object, which a schema rewrite carries
+    // as its URI without touching.
+    let mut managed_blobs = if managed_row_ids.is_empty() {
+        None
     } else {
-        Arc::new(source_ds.dataset().clone())
-            .take_blobs(&managed_row_ids, column_name)
-            .await
-            .map_err(OmniError::storage)?
+        Some(
+            Arc::new(source_ds.dataset().clone())
+                .read_blobs(column_name)
+                .map_err(OmniError::storage)?
+                .with_row_ids(managed_row_ids)
+                .preserve_order(true)
+                .with_io_buffer_size_bytes(crate::storage_layer::BLOB_REBUILD_IO_BUFFER_BYTES)
+                .try_into_stream()
+                .await
+                .map_err(OmniError::storage)?,
+        )
     };
 
-    let mut files = blob_files.into_iter();
     for descriptor in row_descriptors {
         match descriptor {
             crate::blob::BlobDescriptor::Null => {
@@ -1254,35 +1263,47 @@ async fn rebuild_blob_column(
                 let uri = whole_external_uri_for_schema_rewrite(uri, offset, length)?;
                 builder.push_uri(uri).map_err(OmniError::lance_internal)?;
             }
-            crate::blob::BlobDescriptor::Managed { .. } => {
-                let blob = files
-                    .next()
+            crate::blob::BlobDescriptor::Managed { length } => {
+                let next = match managed_blobs.as_mut() {
+                    Some(stream) => stream.try_next().await.map_err(OmniError::storage)?,
+                    None => None,
+                };
+                let data = next
                     .ok_or_else(|| {
                         OmniError::blob_integrity(format!(
                             "blob rewrite for '{}' lost alignment with managed source rows",
                             column_name
                         ))
                     })?
+                    .data
                     .ok_or_else(|| {
                         OmniError::blob_integrity(format!(
-                            "blob rewrite for '{}' returned a null accessor for a managed description",
+                            "blob rewrite for '{}' returned null for a managed description",
                             column_name
                         ))
                     })?;
-                if blob.uri().is_some() {
+                if data.len() as u64 != length {
                     return Err(OmniError::blob_integrity(format!(
-                        "blob rewrite for '{}' resolved a managed description as external",
-                        column_name
+                        "blob rewrite for '{}' observed managed length {}, descriptor recorded {length}",
+                        column_name,
+                        data.len()
                     )));
                 }
+                crate::instrumentation::record_blob_payload_read();
                 builder
-                    .push_bytes(blob.read().await.map_err(OmniError::storage)?)
+                    .push_bytes(data)
                     .map_err(OmniError::lance_internal)?;
             }
         }
     }
 
-    if files.next().is_some() {
+    if let Some(stream) = managed_blobs.as_mut()
+        && stream
+            .try_next()
+            .await
+            .map_err(OmniError::storage)?
+            .is_some()
+    {
         return Err(OmniError::blob_integrity(format!(
             "blob rewrite for '{}' produced extra source blobs",
             column_name

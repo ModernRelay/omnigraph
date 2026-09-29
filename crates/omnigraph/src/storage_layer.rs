@@ -126,6 +126,13 @@ impl DeletedIdBudget {
     }
 }
 
+/// Scheduler I/O buffer for a batched read of the managed Blob payloads a
+/// materializing rewrite carries (`Dataset::read_blobs`). Lance's default is
+/// 32 MiB times the store's I/O parallelism, which reaches 2 GiB on cloud
+/// stores, so every such read sets it explicitly. The rewrite's own byte
+/// budget bounds what the stream yields; this bounds what Lance buffers ahead.
+pub(crate) const BLOB_REBUILD_IO_BUFFER_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Resource budget for a pending-aware keyed scan that will feed one mutation
 /// table transaction.
 ///

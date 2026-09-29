@@ -2067,6 +2067,154 @@ async fn compact_files_succeeds_on_blob_columns() {
         "deleted",
     )
     .await;
+
+    assert_batched_blob_reads_cover_every_placement(dir.path()).await;
+}
+
+/// Guard 10, continued: the batched managed-payload read the engine's
+/// materializing rewrites use. Every managed placement (inline, packed above
+/// 64 KiB, dedicated above 4 MiB), null and valid empty survive compaction,
+/// and `read_blobs` streamed under a small I/O buffer yields exactly what
+/// `execute()` collects, in request order and with duplicates. Given an
+/// external row, `read_blobs` resolves and reads the referenced object, which
+/// is why the engine passes it managed row ids only.
+async fn assert_batched_blob_reads_cover_every_placement(dir: &std::path::Path) {
+    use arrow_array::types::UInt64Type;
+
+    let external_path = dir.join("external-source.bin");
+    std::fs::write(&external_path, b"external payload bytes").unwrap();
+    let external_uri = url::Url::from_file_path(&external_path)
+        .unwrap()
+        .to_string();
+    let values: Vec<Option<Vec<u8>>> = vec![
+        Some(vec![b'i'; 80]),
+        Some(vec![b'p'; 96 * 1024]),
+        None,
+        Some(Vec::new()),
+        Some(vec![b'd'; 5 * 1024 * 1024]),
+        Some(vec![b'q'; 70 * 1024]),
+    ];
+    let external_row = values.len();
+    let mut content = BlobArrayBuilder::new(values.len() + 1);
+    for value in &values {
+        match value {
+            Some(value) => content.push_bytes(value).unwrap(),
+            None => content.push_null().unwrap(),
+        }
+    }
+    content.push_uri(external_uri.as_str()).unwrap();
+    let rows = values.len() + 1;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        lance::blob::blob_field("content", true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..rows as i32)),
+            content.finish().unwrap(),
+        ],
+    )
+    .unwrap();
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        dir.join("guard10-placements.lance").to_str().unwrap(),
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            allow_external_blob_outside_bases: true,
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(ds.get_fragments().len() > 1);
+    compact_files(&mut ds, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(ds.get_fragments().len(), 1);
+    let ds = Arc::new(ds);
+
+    let mut scanner = ds.scan();
+    scanner.with_row_id();
+    scanner.project(&["id", "content"]).unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+    let descriptions = batch.column_by_name("content").unwrap().as_struct();
+    let kinds = descriptions
+        .column_by_name("kind")
+        .unwrap()
+        .as_primitive::<arrow_array::types::UInt8Type>();
+    let placements = (0..descriptions.len())
+        .filter(|&row| descriptions.is_valid(row))
+        .map(|row| kinds.value(row))
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        placements,
+        HashSet::from([0, 1, 2, 3]),
+        "the guard needs inline, packed, dedicated and external rows"
+    );
+    let row_ids = batch
+        .column_by_name(ROW_ID)
+        .unwrap()
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec();
+    assert_eq!(row_ids.len(), rows);
+
+    // Scrambled, with duplicates, over every managed placement and null.
+    let request_order = [4_usize, 1, 3, 4, 0, 2, 5, 1];
+    let requested = request_order
+        .iter()
+        .map(|&index| row_ids[index])
+        .collect::<Vec<_>>();
+    let collected = ds
+        .read_blobs("content")
+        .unwrap()
+        .with_row_ids(requested.clone())
+        .preserve_order(true)
+        .execute()
+        .await
+        .unwrap();
+    let streamed: Vec<_> = ds
+        .read_blobs("content")
+        .unwrap()
+        .with_row_ids(requested)
+        .preserve_order(true)
+        .with_io_buffer_size_bytes(64 * 1024)
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        streamed, collected,
+        "a small-buffer read_blobs stream must equal execute()"
+    );
+    assert_eq!(streamed.len(), request_order.len());
+    for (blob, &index) in streamed.iter().zip(&request_order) {
+        assert_eq!(
+            blob.data.as_deref(),
+            values[index].as_deref(),
+            "read_blobs must keep request order, duplicates, null and valid empty (row {index})"
+        );
+    }
+
+    // An external row is resolved and read, not returned as a descriptor.
+    let external = ds
+        .read_blobs("content")
+        .unwrap()
+        .with_row_ids(vec![row_ids[external_row]])
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(
+        external[0].data.as_deref(),
+        Some(&b"external payload bytes"[..]),
+        "read_blobs reads an external row's object; the engine must pass managed rows only"
+    );
 }
 
 // --- Guard 10b: an explicit scanner batch size beats LANCE_DEFAULT_BATCH_SIZE --

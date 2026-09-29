@@ -1214,14 +1214,16 @@ pub struct MergeWriteProbes {
     /// statement that reaches `open_table_for_mutation`). A statement refused
     /// while its assignments resolve must leave this at zero.
     pub mutation_table_open_calls: Arc<AtomicU64>,
-    /// Blob payload reads performed while rebuilding descriptor rows into a
-    /// logical keyed-write source. Resource-limit tests use this to prove an
-    /// oversized descriptor is rejected from `BlobFile::size()` before the
-    /// payload allocation/read begins.
+    /// Blob payload values materialized while descriptor rows are rebuilt
+    /// into a logical rewrite source (a keyed write or a schema rewrite): one
+    /// per managed value taken from the batched managed read, and one per
+    /// external object read. Resource-limit tests use this to prove an
+    /// oversized descriptor is rejected from its recorded length before any
+    /// payload is read.
     pub blob_payload_read_calls: Arc<AtomicU64>,
     /// Payload reads issued against external sources specifically. Unlike the
-    /// aggregate Blob counter, this excludes managed Lance `BlobFile::read`
-    /// calls so normalized-alias GET deduplication is directly observable.
+    /// aggregate Blob counter, this excludes managed values, so
+    /// normalized-alias GET deduplication is directly observable.
     pub external_blob_payload_read_calls: Arc<AtomicU64>,
     /// External Blob cells presented to one operation-wide preflight and the
     /// distinct normalized object metadata probes that preflight performed.
@@ -1546,8 +1548,10 @@ pub fn record_mutation_table_open() {
     });
 }
 
-/// Record one impending `BlobFile::read` while logical blob arrays are rebuilt.
-/// No-op in production (no probes installed).
+/// Record one Blob payload value materialized while logical Blob arrays are
+/// rebuilt: a managed value as the rewrite consumes it from the batched
+/// managed read, or an external object read. No-op in production (no probes
+/// installed).
 pub fn record_blob_payload_read() {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
         p.blob_payload_read_calls.fetch_add(1, Ordering::Relaxed);
