@@ -233,14 +233,14 @@ chunk of the proven insertion chain or the bounded ordered diff commits as a
 detached version of the previous chunk (one link per chunk, within the
 merge's transaction ceiling); the target publishes once, with each chained
 table's pin naming `base + 1` as its `published_dataset_version` and the
-chain's tip as its `staged_version`, whatever the chain's length. The merge
-proofs walk the branch's commit chain by `read_version` links from the
-source pin back to the base pin (`try_proven_pure_insert_history`,
-`proven_chain_fragments`, `chain_reaches`, `plan_lineage_merge` in
-`exec/merge.rs`). A failure anywhere before publication leaves the target
-untouched and the chain as unpublished staging; a target that advanced
-meanwhile makes the merge lose its manifest CAS and return the ordinary
-conflict.
+chain's tip as its `staged_version`, whatever the chain's length. The
+pure-insert proof walks the branch's commit chain by `read_version` links
+from the source pin back to the base pin (`try_proven_pure_insert_history`,
+`proven_chain_fragments` in `exec/merge.rs`); lineage candidate discovery
+(`plan_lineage_merge`) compares the base and side manifests and walks no
+chain. A failure anywhere before publication leaves the target untouched
+and the chain as unpublished staging; a target that advanced meanwhile
+makes the merge lose its manifest CAS and return the ordinary conflict.
 
 Existing-table constructive transactions stage independently with bounded
 concurrency. The `stage_write_concurrency` session setting (`process` scope,

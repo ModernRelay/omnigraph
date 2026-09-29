@@ -132,9 +132,11 @@ when an applicable index is absent; a fail-closed
 precondition gate falls back to the full three-way scan whenever any
 assumption cannot be proven (Blob-bearing schema, differing schemas or storage
 paths across the pins, version pins not matching the manifest entries, missing
-stable identifiers or the exact-id primary-key contract, non-linear history,
-or a candidate set past its byte budget). `off` forces the full three-way scan
-everywhere — the operational fallback if merge results are ever in question.
+stable identifiers or the exact-id primary-key contract, or a candidate set
+past its byte budget). The table version a side pins need not descend from
+the one the merge base pins, so merging a branch back after an earlier merge
+still qualifies. `off` forces the full three-way scan everywhere — the
+operational fallback if merge results are ever in question.
 `verify` runs both, compares their decisions entity by entity, publishes the
 scan's result, and fails the merge loudly on any divergence (the debug-build
 default, used for validation; it costs both paths). A merge that succeeds
