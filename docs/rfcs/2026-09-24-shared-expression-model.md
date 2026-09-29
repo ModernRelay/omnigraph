@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-09-24
-updated: 2026-09-27
+updated: 2026-09-29
 discussion: null
 supersedes: []
 superseded_by: []
@@ -28,10 +28,12 @@ version in omnigraph's `Cargo.lock`, written as `lance-11.0.0/<path>`.
 GQ gets one ***expression*** type, a tree used by every clause that holds a
 value or a condition. Its leaves are property accesses, system fields
 (`@id`, `@src`, `@dst`), literals, parameters and `now()`, and its inner
-nodes are comparisons (`=`, `!=`, `<`, `<=`, `>`, `>=`,
-`starts_with`, `contains`), the null tests `is null` and `is not null`, the
-Boolean operators `and`, `or` and `not`, the aggregate calls, the search
-calls and the ranking calls that exist today. A
+nodes are comparisons (`=`, `!=`, `<`, `<=`, `>`, `>=`), membership
+(`in`), the null tests `is null` and `is not null`, the Boolean operators
+`and`, `or` and `not`, and calls: the string calls `starts_with()` and
+`contains()`, the aggregate calls, the search calls and the ranking calls
+that exist today. Logic is syntax and every operation of one domain is a
+call (Operators and calls, below). A
 match-block filter, a mutation `where`, a `return` item, an `order` key and an
 `update` assignment each hold an expression of that one type. What differs
 per clause is a ***context rule***: the type the clause requires of its
@@ -48,7 +50,9 @@ giving a `Bool` column. An `order` key may be any expression that appears
 in `return`, aggregates included, or a return alias; a property key sorts
 as today, returned or not. Every query that parses today parses after this
 RFC, except one whose bare mutation property or return alias is one of the
-five reserved words; that break is named in Compatibility. This is a consequence of the
+five reserved words, or `in` since PR [803](https://github.com/ModernRelay/omnigraph/pull/803), and, from phase 6, one
+that uses the infix `contains` or `starts_with`; those breaks are named in
+Compatibility. This is a consequence of the
 design, not a promise this RFC makes, since GQ is pre-stable and a better
 language wins over compatibility wherever the two conflict.
 
@@ -190,7 +194,7 @@ The rules that hold an expression change to hold `expr`:
 |---|---|---|
 | `filter = { expr ~ filter_op ~ expr }` | `filter = { expr }` | type `Bool`; no aggregate |
 | `clause = { negation \| binding \| traversal \| filter \| text_search_clause }` | `clause = { negation \| binding \| traversal \| filter }` | `text_search_clause = { search_call \| fuzzy_call \| match_text_call }` is removed: a bare search call is a `filter` whose expression is the call, lowered to that call `= true`, as today's parser lowers the standalone spelling (`query/parser.rs:579`) |
-| `mutation_predicate = { (meta_field \| ident) ~ comp_op ~ match_value }` | `mutation_predicate = { expr }` | type `Bool`; leaves are the target type's properties, `@id`, `@src`, `@dst`, literals, parameters, `now()`; no binding variable, no aggregate, no search or ranking call; `starts_with` and `contains` (substring and list membership) are legal as in a filter, lowered by the same `ir_expr_to_df_expr` arms |
+| `mutation_predicate = { (meta_field \| ident) ~ comp_op ~ match_value }` | `mutation_predicate = { expr }` | type `Bool`; leaves are the target type's properties, `@id`, `@src`, `@dst`, literals, parameters, `now()`; no binding variable, no aggregate, no search or ranking call; `in`, `starts_with()` and `contains()` are legal as in a filter, lowered by the same `ir_expr_to_df_expr` arms |
 | `mutation_assignment = { ident ~ ":" ~ match_value ~ ","? }` | `mutation_assignment = { ident ~ ":" ~ expr ~ ","? }` | type of the assigned property; constants only (below) |
 | `prop_match = { ident ~ ":" ~ match_value }` | `prop_match = { ident ~ ":" ~ expr }` | type of the matched property, or its scalar element type on a list property; constants only (below) |
 | `ordering = { nearest_ordering \| (expr ~ order_dir?) }` | unchanged text; a key other than a property access, a system field or the leading search key must be a return alias or an expression present in `return` (below) | a sortable value (context rules below) |
@@ -328,9 +332,11 @@ Type rules:
   text becomes ``T38: search predicates require a standalone call or `=
   true`, alone or joined by and``.
 - Comparison typing is unchanged: `types_compatible`
-  (`typecheck.rs:2137-2149`), the `contains` overload for lists and strings
-  (`:1201-1242`), the `starts_with` String rule (`:1244-1264`), the refusal of
-  list, vector and Blob comparisons (`:1197,1269,1274`).
+  (`typecheck.rs:2137-2149`) and the refusal of list, vector and Blob
+  comparisons (`:1197,1269,1274`). Membership and the string calls follow
+  Operators and calls below, which replaces the `contains` overload for
+  lists and strings (`:1201-1242`) and moves the `starts_with` String rule
+  (`:1244-1264`) to the call.
 - A mutation `where` that names a binding variable, an aggregate, a search or
   a ranking call is refused at compile time with a T-coded error naming the
   clause, as `T11` does today for an unknown property (`typecheck.rs:630`).
@@ -395,6 +401,100 @@ query per_market($slug: String) {
 }
 ```
 
+### Operators and calls
+
+Amended 2026-09-29 (Decision log), after issue [801](https://github.com/ModernRelay/omnigraph/issues/801) and PR [803](https://github.com/ModernRelay/omnigraph/pull/803),
+which added `in`. Anchors in this section are at `main` `baf10c94`.
+
+An expression's inner nodes are of three kinds, and each kind has one rule:
+
+| Kind | Members | Rule |
+|---|---|---|
+| Symbol | `=`, `!=`, `<`, `<=`, `>`, `>=` | compares two values |
+| Reserved word | `and`, `or`, `not`, `is null`, `is not null`, `in`; the pattern blocks `not { }`, `exists { }`, `count { }` and `sum(…) { }` | the logic of the language: truth values, null tests, membership and quantification over a pattern; none is a bare operand or a return alias, and an edge a reserved word names is written quoted, `$i "in" $b` (`query.pest:104`) |
+| Call | `now()`, `date()`, `datetime()`, the aggregates, `starts_with()`, `contains()`, the search calls, the ranking calls | an operation of one domain (strings, text search, vectors, time, aggregation), subject first, options after it by name |
+
+Four rules follow.
+
+1. **The reserved set is closed.** It holds what applies to values of every
+   type: truth values, null, membership and quantification. An operation
+   joins it only by amending this RFC; every other operation is a call, so
+   a new capability adds a function to the type checker and no grammar.
+   An infix word outside the reserved set collides with a traversal, whose
+   edge verb is any lowercase identifier (`edge_ident`, `query.pest:187`):
+   `$ms contains $m.number` parses as the traversal `$ms contains $m` and
+   fails at `.number` with `expected clause`. Reserving the word would fix
+   that parse, and since PR [803](https://github.com/ModernRelay/omnigraph/pull/803) it no longer costs an edge its
+   name, but it grows the grammar with each new operation: `ends_with`, a
+   regular expression match, list overlap. A call needs no grammar and is
+   never ambiguous, because its name is followed by `(`, which no traversal
+   is.
+2. **One spelling, one operation.** An operand's type decides whether an
+   expression is valid, never which operation it runs. `in` keeps to this:
+   a String on its right is refused (``T7: `in` needs a list on the right``,
+   `typecheck.rs:2083`). Infix `contains` does not: it runs membership on a
+   list and substring on a String (`typecheck.rs:1445`), so a parameter
+   declared `String` where `[String]` was meant switches operation without
+   an error. With `$ms: String` bound to `"M12"`, `($ms contains
+   $m.number)` returns the matter `M1` (measured on a build of `b14c22c5`;
+   PR [803](https://github.com/ModernRelay/omnigraph/pull/803) leaves infix `contains` unchanged). An inline match stays
+   one operation: `{ tags: "rust" }` asks whether the property has the
+   value, which is equality on a single-valued property and membership on a
+   list property, and the schema decides which, not a parameter's declared
+   type.
+3. **Every Boolean composes.** A `Bool` expression stands wherever a `Bool`
+   is allowed. `T38` is the one exception: a search, fuzzy or match_text
+   call stands only as a top-level conjunct, because the full-text index
+   evaluates it over a set of rows, not per row. The exception ends for a
+   call when an exact per-row evaluation of it exists; the analyzed lexical
+   search RFC's exact scan is that evaluation for `match_terms`.
+4. **A constant is a constant everywhere.** A list literal holds constants,
+   literals and parameters alike, so `$m.number in [$a, $b]` is valid.
+   Today `list_lit` takes literals only (`query.pest:195`), and `[$a, "M3"]`
+   is a parse error.
+
+**Membership** shipped in PR [803](https://github.com/ModernRelay/omnigraph/pull/803) and this amendment changes none
+of its behavior. `x in S` is the converse of list `contains`: it needs a
+list on the right, a literal or a parameter list is pushed into the scan as
+DataFusion's structured `InList` (`engine/scan.rs:942`), a key or unique
+property gets a bounded row estimate, a null `x` reads null, and an empty
+`S` matches nothing, under `not` too. The user guide states it
+(`docs/user/queries/index.md:166`); `issue_801_in_predicate_over_a_list.gqt`
+and `list_membership_over_indexed_columns_across_writes_and_restart.gqt`
+own it.
+
+**String calls.** `starts_with(text, prefix)` and `contains(text, part)`
+take two String operands and keep today's meaning: exact and case-sensitive,
+null when an operand is null. A list first operand of `contains()` is a type
+error whose fix is `x in L`. They lower to today's `StartsWith` and
+`StringContains` nodes.
+
+**Deprecated spellings.** For one release the infix `s starts_with p` and
+`x contains y` keep parsing and running, through a separate rule,
+`legacy_text_op = { "starts_with" | "contains" }`, which `filter_op`
+references and `compat/gq_language.deprecated.txt` lists. The type checker
+maps `L contains x` on a list to `x in L`, `s contains t` on a String to
+`contains(s, t)` and `s starts_with p` to `starts_with(s, p)`, so no result
+changes in that release. `omnigraph lint` reports every use as a warning
+that carries the rewrite (`QueryLintSeverity::Warning`, `query/lint.rs:27`),
+and phase 5 adds the same warning to `queries validate` and `cluster plan`,
+which report each stored query's compile result, so an operator sees it
+before upgrading; a query response has no warning channel, and this
+amendment adds none. The release after deletes the rule. While the rule
+exists, `$ms contains $m` still reads as a traversal; when a traversal's
+edge verb is `contains` or `starts_with` and the schema declares no such
+edge, the refusal carries the fix ``for membership write `x in $ms`; for a
+substring call `contains(text, part)` ``, and so does the parse refusal of
+`$ms contains $m.number`.
+
+**Options by name.** A call's operands are positional; its options follow
+them as `name: value`, the `:` that already pairs a name with a value in
+`$p: Person`, `{ name: "A" }` and `set { note: "x" }`. An unknown name is a
+type error that lists the names the call admits. No call on `main` takes an
+option yet, so the rule's grammar lands with the first one that does
+(`rrf(…, k: 60)` in RFC 0048, `terms(q, mode: any)` in the analyzed lexical
+search RFC), and `rrf`'s positional `k` becomes its deprecated spelling then.
+
 ### What a Cypher or GQL user finds different
 
 The ladder, the three-valued null rules, `is null`, aliased Boolean columns
@@ -408,7 +508,10 @@ needs an alias (`T43`); and there is no `null` literal, so `is null` and
 `is not null` are the only null tests. Deleting what a pattern bound, Cypher's `MATCH … DELETE`,
 is not a GQ form today and this RFC does not add it; the mutation `where`
 becoming the same expression type as a read filter is the step that a
-later RFC needs.
+later RFC needs. Membership is Cypher's `IN`. Cypher's `STARTS WITH`,
+`CONTAINS` and `ENDS WITH` are infix; here the first two are calls,
+`starts_with(s, p)` and `contains(s, part)`, and after phase 6 the infix
+spelling is a parse error whose fix names the call.
 
 ### Order keys bind against the return list
 
@@ -894,7 +997,9 @@ the `.gqt` case that pinned the old behavior is edited, as
 `order_clause_aggregate_refused.gqt` is in phase 3 (renamed
 `order_key_aggregate_or_node_binds_to_return_item.gqt`). Every query that parses
 today parses after this RFC, except one whose bare mutation property or
-return alias is one of the five reserved words; that break is named below. What the design does
+return alias is one of the five reserved words, or `in` since PR [803](https://github.com/ModernRelay/omnigraph/pull/803),
+and, from phase 6, one that uses the infix `contains` or `starts_with`;
+those breaks are named below. What the design does
 preserve, it preserves because of that and because the removed types are
 wrappers around the same fields, not because it set out to. The
 `.gqt` corpus is still the control for phase 1, whose whole point is a
@@ -935,6 +1040,15 @@ declares the alias. A survey of the `.gqt` corpus
 and the checked-in schemas for such a property or alias is an evidence
 item below.
 
+**Operators and calls (phases 4 to 6).** Reserving `in` in PR [803](https://github.com/ModernRelay/omnigraph/pull/803)
+is the same kind of break as the five words for a bare mutation property
+and a return alias; an edge named `in` stays reachable quoted. The infix
+`contains` and `starts_with` keep working for one release with a lint
+warning and then stop parsing. They appear on about 57 lines in 19 `.gqt`
+case files and on about ten lines of the user guide and the bundled skill;
+phase 5 rewrites those, and an operator rewrites every stored query that
+uses them within that release, with `queries validate` naming each one.
+
 **GQ language version.** The compatibility surfaces RFC
 (`docs/rfcs/2026-09-14-compatibility-surfaces.md`, draft) makes the GQ grammar
 a versioned surface: `GQ_LANGUAGE_VERSION: (u16, u16)` in
@@ -948,6 +1062,9 @@ declare its bumps under that rule:
 | 1 | none; `query.pest` is untouched; the deprecation marker `compat/gq_language.deprecated.txt` names `rule:match_value` and `rule:text_search_clause` | none | the rule hashes do not move, so the version does not either |
 | 2 | rewritten: `expr`, `clause`, `filter`, `mutation_predicate`, `mutation_assignment`, `prop_match`, `projection`; added: `or_expr`, `and_expr`, `not_expr`, `comparison`, `null_test`, `operand`, `kw_and`, `kw_or`, `kw_not`, `kw_is`, `kw_null`, `reserved`, `reserved_property`, `reserved_alias`, `expr_ident`; kept unreferenced and deprecated, text unchanged: `match_value`, `text_search_clause` (deleted in the release after this one); `ident`, `comp_op`, `filter_op`, `ordering` untouched | `(1, 0)` to `(2, 0)` | reserving five words narrows what an operand and a return alias accept |
 | 3 | none; `query.pest` is untouched | none | the refusal moves from the engine to the type checker; no rule hash moves |
+| 4 (PR [803](https://github.com/ModernRelay/omnigraph/pull/803)) | added: `kw_in`; rewritten: `comparison`, `reserved`, `traversal`, `undirected_edge` | none taken; `(2, 0)` stayed | reserving `in` narrows what an operand and a return alias accept, a major under the rule above; phase 5 records it |
+| 5 | added: `legacy_text_op`, the `starts_with` and `contains` call rules; rewritten: `filter_op`, `operand`, `list_lit`; deprecated: `legacy_text_op` | `(2, 0)` to `(3, 0)` | phase 4's reservation; phase 5 itself only widens |
+| 6 | deleted: `legacy_text_op` (the release after phase 5) | `(3, 0)` to `(4, 0)` | a removed rule is a major |
 
 Phase 2 stops referencing two rules, and the surfaces RFC requires a
 removal to be deprecated in one release first, its floor refusing a removal
@@ -1034,6 +1151,10 @@ downgrade must stay compatible with.
 | Extend `predicate_to_sql` to print `and`/`or` | smallest mutation diff | keeps the deny-listed string generation and a mutation-only evaluator; the read and write paths still disagree on null and type rules by construction |
 | Render the DataFusion `Expr` to SQL at the Lance boundary with `datafusion-sql`'s `Unparser` | one shared lowering, small change at the call site | unnecessary: Lance 11.0.0 accepts the `Expr` itself through `DeleteBuilder::from_expr` and `Scanner::filter_expr`; a renderer would reintroduce quoting and dialect rules (the camelCase case `exec/mutation.rs:1763` guards today) for nothing |
 | Hidden `order` items appended for any order key and pruned, as some SQL engines do | `order { max($d.amount) }` works without a return item | a hidden aggregate on a non-aggregated `return` changes the grouping and the rows; the explicit rule costs one typed error with an obvious fix |
+| Keep `contains` and `starts_with` infix and reserve them (phase 5 alternative) | fixes the parse collision without rewriting a query; since PR [803](https://github.com/ModernRelay/omnigraph/pull/803) an edge named by a reserved word stays reachable quoted | `contains` keeps two operations chosen by operand type, and every later string or list test grows the reserved set and the grammar, where a call needs neither |
+| `in` alone, as PR [803](https://github.com/ModernRelay/omnigraph/pull/803) shipped it | membership is correct and pushed into the scan | `$ms contains $m.number` still reads as a traversal, and a `String` parameter still switches infix `contains` to substring without an error |
+| Membership through the inline match with a list parameter, `{ number: $ms }` | no new word | equality or membership would be chosen by the parameter's declared type, the defect rule 2 removes |
+| A call, `in_list(x, S)`, instead of `in` | no reserved word | membership applies to values of every type, the defining property of the reserved set, and callers write `in`: the agent behind issue [801](https://github.com/ModernRelay/omnigraph/issues/801) wrote `$m.number in $ms` |
 | A separate `where { expr }` clause after `match` | a misplaced condition is a parse error; removes the binding-order trap (`T6` on a comparison written before the traversal that binds its variable) | drops the condition-beside-pattern form Cypher and ISO GQL allow and graph users expect; rewrites every stored query, fixture and case; the two spellings of conjunction are declared one plan instead |
 
 Precedent audit. `Predicate::And` in the planner (`logical.rs:103`) is the
@@ -1187,6 +1308,17 @@ staged-delete rebase test (`crates/omnigraph/src/table_store/staged_tests.rs:273
 runs with a `from_expr` delete once phase 1 lands, and is the control that
 a staged delete rebases as before.
 
+**Phase 5 evidence.** Measured on a build of `b14c22c5` with the
+diagnostics of PR #759, under `engine = v2`, and unchanged in those parts by
+PR [803](https://github.com/ModernRelay/omnigraph/pull/803): the bare `$ms contains $m.number` is `expected clause`; a
+`String` parameter bound to `"M12"` makes `($ms contains $m.number)` return
+the matter `M1`; `[$a, "M3"]` is `expected literal`. Phase 5 adds `.gqt`
+cases for the two string calls, for each deprecated spelling returning the
+rows its rewrite returns, for a list literal with a parameter element and
+for the traversal refusal's fix; compiler tests that `starts_with(` and
+`contains(` parse as calls and that `contains` stays a legal property name;
+and lint tests for the deprecation warning and its rewrite.
+
 **Generated evidence.** Grammar fuzzing of the expression ladder
 (precedence, De Morgan under three-valued logic, the null partition `a` /
 `not a` / `a is null`, mutation-read agreement) is generated evidence owned
@@ -1248,9 +1380,23 @@ is the deletion of the two unreferenced rules. `implementation` moves to
 changes no result, phase 2 adds text that was a parse error, phase 3
 accepts text that was a runtime refusal and turns the remaining runtime
 refusal into a compile-time one.
+4. **Membership** (PR [803](https://github.com/ModernRelay/omnigraph/pull/803), merged 2026-09-29). `in` in read
+   filters, projections and mutation predicates, with scan pushdown and
+   quoted edge names. Closed issue [801](https://github.com/ModernRelay/omnigraph/issues/801).
+5. **Operators and calls** (amended 2026-09-29, its own PR). The
+   `starts_with()` and `contains()` calls; `legacy_text_op` deprecated, with
+   the mapping and its warning in `omnigraph lint`, `queries validate` and
+   `cluster plan`; list literals of constants; the traversal refusal's fix;
+   the corpus, the user guide and the skill rewritten to the new spellings;
+   `GQ_LANGUAGE_VERSION` to `(3, 0)`. `docs/user/queries/index.md` gains the
+   three kinds of node.
+6. **Removal** (the release after phase 5). `legacy_text_op` is deleted and
+   the infix spelling becomes a parse error whose fix names the call;
+   `GQ_LANGUAGE_VERSION` to `(4, 0)`.
+
 Out of scope and not started by this RFC: arithmetic operators, scalar
-functions, and the move of write selection onto the read plan (a later
-RFC).
+functions beyond the two string calls of phase 5, and the move of write
+selection onto the read plan (a later RFC).
 
 The PR carries the three phases beside this text, so it adds the registry row `| [2026-09-24](2026-09-24-shared-expression-model.md) | Shared expression model | maintainer | draft | in-progress |`
 and sets `discussion` to the PR URL.
@@ -1279,3 +1425,24 @@ None.
   reference in `omnigraph-reference-engine`, and a user sees no gate
   error. `order_clause_aggregate_refused.gqt` is renamed
   `order_key_aggregate_or_node_binds_to_return_item.gqt`.
+- 2026-09-29, amendment after issue [801](https://github.com/ModernRelay/omnigraph/issues/801) and PR [803](https://github.com/ModernRelay/omnigraph/pull/803): the
+  operator vocabulary (Operators and calls; phases 4 to 6; four rows under
+  Alternatives; the phase 5 evidence). Reserved words hold the logic of the
+  language, `in` among them as PR [803](https://github.com/ModernRelay/omnigraph/pull/803) shipped it; every operation of one
+  domain is a call, so `starts_with` and `contains` become `starts_with()`
+  and `contains()` and their infix spelling is deprecated for one release;
+  list literals take constants; call options are named. Superseded
+  sentences: in Summary, "its inner nodes are comparisons (`=`, `!=`, `<`,
+  `<=`, `>`, `>=`, `starts_with`, `contains`), the null tests `is null` and
+  `is not null`, the Boolean operators `and`, `or` and `not`, the aggregate
+  calls, the search calls and the ranking calls that exist today"; in the
+  Grammar table's mutation `where` row, "`starts_with` and `contains`
+  (substring and list membership) are legal as in a filter"; in Type rules,
+  "Comparison typing is unchanged: `types_compatible`
+  (`typecheck.rs:2137-2149`), the `contains` overload for lists and strings
+  (`:1201-1242`), the `starts_with` String rule (`:1244-1264`), the refusal
+  of list, vector and Blob comparisons (`:1197,1269,1274`)"; in Rollout,
+  "Out of scope and not started by this RFC: arithmetic operators, scalar
+  functions, and the move of write selection onto the read plan (a later
+  RFC)"; in Summary and in Compatibility, the sentence that every query
+  parsing today parses after this RFC gains the breaks of phases 4 and 6.
