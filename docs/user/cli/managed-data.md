@@ -195,7 +195,8 @@ across types. Strict loads check projected in-memory size too. The NDJSON byte
 bound does not prove that a batch fits those
 [engine limits](../mutations/index.md#limits-and-conflicts).
 Split prepared `append` and `merge` inputs into suitable batches, preserving
-endpoint dependencies and recording each batch's returned commit.
+endpoint dependencies and recording each batch's returned commit. Blob values carry
+their own [limits](../blobs.md#limits).
 
 `overwrite` also refuses when the IDs it removes exceed **32 MiB per
 operation**, summed over all touched types. Each removed ID is charged its UTF-8
