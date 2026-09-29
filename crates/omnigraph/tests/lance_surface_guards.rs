@@ -2069,6 +2069,159 @@ async fn compact_files_succeeds_on_blob_columns() {
     .await;
 }
 
+// --- Guard 10b: an explicit scanner batch size beats LANCE_DEFAULT_BATCH_SIZE --
+//
+// Blob compaction materializes every managed payload of one scanner batch, and
+// `TableStore::stage_compaction` bounds that batch by setting
+// `CompactionOptions::batch_size`, which Lance hands to the compaction scanner.
+// The bounded rewrite stream likewise sets `Scanner::batch_size(1)`. Both rely
+// on the V2.x filtered read taking an explicit batch size over the
+// `LANCE_DEFAULT_BATCH_SIZE` environment value (the environment is only its
+// fallback; Lance's legacy `get_batch_size` reads it first). The environment
+// is read once per process, so the guard runs its body in a child process of
+// this test binary with the variable set.
+
+const BATCH_SIZE_ENV_GUARD_CHILD: &str = "OMNIGRAPH_BATCH_SIZE_ENV_GUARD_CHILD";
+
+#[test]
+fn explicit_scanner_batch_size_beats_lance_default_batch_size_env() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "explicit_scanner_batch_size_beats_lance_default_batch_size_env_process",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(BATCH_SIZE_ENV_GUARD_CHILD, "1")
+        .env("LANCE_DEFAULT_BATCH_SIZE", "4")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "batch-size guard child failed or did not run\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+#[ignore = "subprocess helper; exercised by explicit_scanner_batch_size_beats_lance_default_batch_size_env"]
+async fn explicit_scanner_batch_size_beats_lance_default_batch_size_env_process() {
+    if std::env::var_os(BATCH_SIZE_ENV_GUARD_CHILD).is_none() {
+        return;
+    }
+    assert_eq!(std::env::var("LANCE_DEFAULT_BATCH_SIZE").unwrap(), "4");
+
+    fn blob_batch(ids: std::ops::Range<i32>) -> (Arc<Schema>, RecordBatch) {
+        let mut content = BlobArrayBuilder::new(ids.len());
+        for id in ids.clone() {
+            content
+                .push_bytes(vec![u8::try_from(id).unwrap(); 96])
+                .unwrap();
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            lance::blob::blob_field("content", true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(ids)),
+                content.finish().unwrap(),
+            ],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+
+    async fn batch_rows(dataset: &Dataset, batch_size: Option<usize>) -> Vec<usize> {
+        let mut scanner = dataset.scan();
+        scanner.project(&["id", "content"]).unwrap();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        if let Some(batch_size) = batch_size {
+            scanner.batch_size(batch_size);
+        }
+        scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .map_ok(|batch| batch.num_rows())
+            .try_collect()
+            .await
+            .unwrap()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("batch-size-env.lance");
+    let uri = uri.to_str().unwrap();
+    let params = |mode| WriteParams {
+        mode,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let (schema, batch) = blob_batch(0..6);
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(params(WriteMode::Create)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ds.get_fragments().len(), 1);
+
+    // The environment is live in this process: without an explicit size the
+    // six-row fragment is read in batches of at most four rows.
+    let unset = batch_rows(&ds, None).await;
+    assert_eq!(unset.iter().sum::<usize>(), 6);
+    assert!(
+        unset.iter().all(|&rows| rows <= 4) && unset.len() >= 2,
+        "LANCE_DEFAULT_BATCH_SIZE=4 must shape an unconfigured scan, got {unset:?}"
+    );
+    // An explicit batch size wins over the environment.
+    assert_eq!(
+        batch_rows(&ds, Some(1)).await,
+        vec![1; 6],
+        "an explicit Scanner::batch_size must beat LANCE_DEFAULT_BATCH_SIZE"
+    );
+
+    // Compaction under an explicit batch size rewrites every payload exactly.
+    let (schema, batch) = blob_batch(6..8);
+    ds.append(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        Some(params(WriteMode::Append)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ds.get_fragments().len(), 2);
+    let metrics = compact_files(
+        &mut ds,
+        CompactionOptions {
+            batch_size: Some(1),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(metrics.fragments_removed, 2);
+    assert_eq!(ds.get_fragments().len(), 1);
+    let mut scanner = ds.scan();
+    scanner.project(&["id", "content"]).unwrap();
+    scanner.blob_handling(BlobHandling::AllBinary);
+    let batch = scanner.try_into_batch().await.unwrap();
+    let ids = batch
+        .column_by_name("id")
+        .unwrap()
+        .as_primitive::<arrow_array::types::Int32Type>();
+    let contents = batch.column_by_name("content").unwrap().as_binary::<i64>();
+    assert_eq!(batch.num_rows(), 8);
+    for row in 0..batch.num_rows() {
+        let id = ids.value(row);
+        assert_eq!(contents.value(row), vec![u8::try_from(id).unwrap(); 96]);
+    }
+}
+
 // --- Guard 11: scalar-index coverage surface (physical_rows + index details) ---
 //
 // `table_store.rs::key_column_index_coverage` mirrors Lance's `create_filter_plan`

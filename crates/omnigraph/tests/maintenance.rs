@@ -686,6 +686,146 @@ node Tag {\n    slug: String @key\n}\n";
     );
 }
 
+/// A Blob table whose rows are large compacts in batches derived from its
+/// largest row (32 rows of 1 MiB under the 32 MiB budget), not Lance's
+/// default batch. The widest fragment is wider than that batch, so the
+/// compaction reads it in several batches; every value, the null and the
+/// valid empty survive, and the fragments coalesce under one graph commit.
+/// `compaction_memory.rs` measures the allocation bound.
+#[tokio::test]
+async fn optimize_compacts_large_blob_rows_in_bounded_batches() {
+    const MIB: usize = 1024 * 1024;
+    // (1 MiB rows, 16-byte rows) per load. A load decodes at most 32 MiB of
+    // Blob input, so only a fragment mixing large and small rows can be wider
+    // than the derived batch: the first load's is 52 rows against 32.
+    const LOADS: [(usize, usize); 3] = [(20, 30), (10, 2), (10, 2)];
+    let payload = |row: usize, len: usize| vec![u8::try_from(row).unwrap(); len];
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = "node Doc {\n    slug: String @key\n    content: Blob?\n}\n";
+    let db = helpers::session(Omnigraph::init(uri, schema).await.unwrap());
+
+    let mut expected = vec![
+        ("empty".to_string(), Some(Vec::new())),
+        ("null".to_string(), None),
+    ];
+    let mut row = 0;
+    for (load, (large, small)) in LOADS.into_iter().enumerate() {
+        let mut lines = Vec::new();
+        if load == 0 {
+            lines.push(r#"{"type":"Doc","data":{"slug":"null","content":null}}"#.to_string());
+            lines.push(r#"{"type":"Doc","data":{"slug":"empty","content":"base64:"}}"#.to_string());
+        }
+        for index in 0..large + small {
+            row += 1;
+            let bytes = payload(row, if index < large { MIB } else { 16 });
+            lines.push(
+                serde_json::json!({
+                    "type": "Doc",
+                    "data": {
+                        "slug": format!("d{row:02}"),
+                        "content": format!(
+                            "base64:{}",
+                            base64::engine::general_purpose::STANDARD.encode(&bytes)
+                        ),
+                    },
+                })
+                .to_string(),
+            );
+            expected.push((format!("d{row:02}"), Some(bytes)));
+        }
+        let mode = if load == 0 {
+            LoadMode::Overwrite
+        } else {
+            LoadMode::Merge
+        };
+        db.load_jsonl(&lines.join("\n"), mode).await.unwrap();
+    }
+    expected.sort_by(|left, right| left.0.cmp(&right.0));
+    let fragments_before = helpers::open_pinned_dataset_for_test(&db, "main", "node:Doc")
+        .await
+        .get_fragments()
+        .len();
+    let largest_fragment_rows = helpers::open_pinned_dataset_for_test(&db, "main", "node:Doc")
+        .await
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.metadata().physical_rows.unwrap())
+        .max()
+        .unwrap();
+    assert!(
+        fragments_before >= LOADS.len() && largest_fragment_rows > 32,
+        "test precondition: one fragment per load and one fragment wider than the \
+         derived 32-row batch, got {fragments_before} fragments, the largest \
+         {largest_fragment_rows} rows"
+    );
+    let commits_before = db.list_commits(None).await.unwrap().len();
+
+    let stats = db.optimize().await.unwrap();
+    let doc = stats
+        .iter()
+        .find(|stat| stat.type_key == "node:Doc")
+        .expect("Doc stat present");
+    assert_eq!(doc.skipped, None);
+    assert!(doc.committed, "the Blob table compaction must be published");
+    assert_eq!(doc.fragments_removed, fragments_before);
+    assert_eq!(
+        db.list_commits(None).await.unwrap().len(),
+        commits_before + 1,
+        "optimize publishes one graph commit"
+    );
+    assert_eq!(
+        helpers::open_pinned_dataset_for_test(&db, "main", "node:Doc")
+            .await
+            .get_fragments()
+            .len(),
+        1,
+        "the compacted table is one fragment"
+    );
+
+    let snapshot = snapshot_main(&db).await.unwrap();
+    let table = snapshot.open_dataset("node:Doc").await.unwrap();
+    let mut scanner = table.scan();
+    scanner.project(&["slug", "content"]).unwrap();
+    scanner.blob_handling(BlobHandling::AllBinary);
+    let mut stream = scanner.try_into_stream().await.unwrap();
+    let mut actual = Vec::new();
+    while let Some(batch) = stream.try_next().await.unwrap() {
+        let slugs = batch
+            .column_by_name("slug")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let contents = batch
+            .column_by_name("content")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            actual.push((
+                slugs.value(row).to_owned(),
+                contents.is_valid(row).then(|| contents.value(row).to_vec()),
+            ));
+        }
+    }
+    actual.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(&expected) {
+        assert_eq!(actual.0, expected.0);
+        assert!(
+            actual.1 == expected.1,
+            "row {} changed through compaction (null {} -> {}, length {:?} -> {:?})",
+            expected.0,
+            expected.1.is_none(),
+            actual.1.is_none(),
+            expected.1.as_ref().map(Vec::len),
+            actual.1.as_ref().map(Vec::len),
+        );
+    }
+}
+
 /// `optimize` publishes its compaction to `__manifest` as a detached pin with
 /// fewer fragments, leaves the linear HEAD where it was, and a schema apply
 /// on the compacted table then succeeds.

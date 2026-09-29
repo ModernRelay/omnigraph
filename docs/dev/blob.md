@@ -80,7 +80,7 @@ There is currently no HTTP or CLI Blob put/clear surface.
 
 Export emits managed values as base64 and whole-object external values as URI descriptors; a ranged external descriptor is refused, because a bare URI reloads as the whole object; change-feed images, the change-feed baseline and entity reads describe it as `{uri, offset, length}`. Its scratch space is bounded at the row level.
 
-`optimize` compacts Blob-bearing tables. The pinned Lance release must pass the substrate guard proving null, empty, non-empty, neighboring payloads, stable row IDs, and range reads survive fragment compaction. `cleanup` can reclaim old managed bytes with their dataset versions; callers must quiesce long-lived readers before destructive GC.
+`optimize` compacts Blob-bearing tables. The pinned Lance release must pass the substrate guard proving null, empty, non-empty, neighboring payloads, stable row IDs, and range reads survive fragment compaction. Lance materializes every managed payload of a compaction scanner batch, so `stage_compaction` derives the batch size from the planned fragments' largest row (a descriptor-only scan) to hold about 32 MiB of payload per batch; see the compaction fence in [lance.md](lance.md#current-compatibility-fences). `cleanup` can reclaim old managed bytes with their dataset versions; callers must quiesce long-lived readers before destructive GC.
 
 ## Test owners
 

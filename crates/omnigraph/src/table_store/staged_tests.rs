@@ -2649,3 +2649,18 @@ async fn commit_staged_skips_auto_cleanup_so_pinned_versions_survive() {
          v{v1} survives; it was GC'd"
     );
 }
+
+#[test]
+fn compaction_blob_batch_rows_bounds_one_batch() {
+    use crate::table_store::compaction_blob_batch_rows;
+    const MIB: u64 = 1024 * 1024;
+    // No Blob bytes, or rows too small to reach the budget: Lance's fallback.
+    assert_eq!(compaction_blob_batch_rows(0), 8192);
+    assert_eq!(compaction_blob_batch_rows(1), 8192);
+    assert_eq!(compaction_blob_batch_rows(4 * 1024), 8192);
+    // Large rows: as many as fit the 32 MiB budget, never fewer than one.
+    assert_eq!(compaction_blob_batch_rows(MIB), 32);
+    assert_eq!(compaction_blob_batch_rows(32 * MIB), 1);
+    assert_eq!(compaction_blob_batch_rows(100 * MIB), 1);
+    assert_eq!(compaction_blob_batch_rows(u64::MAX), 1);
+}

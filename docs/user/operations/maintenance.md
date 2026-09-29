@@ -45,6 +45,15 @@ fragments only when the same indexes cover them, so a table whose index
 coverage was uneven before a run may coalesce fully only on the next run,
 after the rebuilt coverage is in place.
 
+Compacting a table with Blob properties reads each managed Blob value into
+memory to rewrite it. Optimize sizes each read batch from the table's largest
+row, so one table's compaction holds about 32 MiB of Blob payload plus up to
+twice its largest single value, whatever the fragment sizes. External Blob
+references are carried without reading the referenced object. Optimize works on
+up to `OMNIGRAPH_MAINTENANCE_CONCURRENCY` tables at once (default 8), so budget
+for that many Blob tables compacting together. `LANCE_DEFAULT_BATCH_SIZE` does
+not change this bound.
+
 Optimize also persists the traversal-adjacency artifact
 (`__graph_index/csr-current.bin`), which cold traversal builds load instead of
 scanning every edge dataset. The artifact is derived and regenerable: optimize

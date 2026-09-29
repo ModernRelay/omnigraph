@@ -3888,11 +3888,20 @@ impl TableStore {
         ds: &Dataset,
         options: &CompactionOptions,
     ) -> Result<Option<StagedCompaction>> {
-        let plan = plan_compaction(ds, options)
+        let mut plan = plan_compaction(ds, options)
             .await
             .map_err(OmniError::storage)?;
         if plan.num_tasks() == 0 {
             return Ok(None);
+        }
+        if ds.schema().fields_pre_order().any(|field| field.is_blob()) {
+            let fragments = plan
+                .tasks
+                .iter()
+                .flat_map(|task| task.fragments.iter().cloned())
+                .collect::<Vec<_>>();
+            let max_row_blob_bytes = Self::max_row_blob_bytes(ds, fragments).await?;
+            plan.options.batch_size = Some(compaction_blob_batch_rows(max_row_blob_bytes));
         }
         let mut results = Vec::with_capacity(plan.num_tasks());
         for task in plan.compaction_tasks() {
@@ -3936,6 +3945,76 @@ impl TableStore {
             staged: StagedWrite::new(transaction, new_fragments, removed_fragment_ids),
             metrics,
         }))
+    }
+
+    /// The largest Blob byte count any one row of `fragments` carries: the sum,
+    /// over the row's top-level Blob columns, of every non-null descriptor's
+    /// `size`. It reads descriptors only (the scanner's default Blob handling),
+    /// never a payload, and counts an external row's persisted size although
+    /// compaction carries external descriptors without reading them, which
+    /// only makes the derived batch smaller. A Blob nested inside another
+    /// field has no top-level descriptor to read, so it fails closed to
+    /// `u64::MAX` and one-row batches.
+    async fn max_row_blob_bytes(ds: &Dataset, fragments: Vec<Fragment>) -> Result<u64> {
+        let blob_columns = ds
+            .schema()
+            .fields
+            .iter()
+            .filter(|field| field.is_blob())
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>();
+        let top_level_blobs = blob_columns.len();
+        let all_blobs = ds
+            .schema()
+            .fields_pre_order()
+            .filter(|field| field.is_blob())
+            .count();
+        if top_level_blobs != all_blobs {
+            return Ok(u64::MAX);
+        }
+        if blob_columns.is_empty() || fragments.is_empty() {
+            return Ok(0);
+        }
+        let projection = blob_columns.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut stream =
+            Self::scan_stream_with(ds, Some(&projection), None, None, false, |scanner| {
+                scanner.with_fragments(fragments);
+                Ok(())
+            })
+            .await?;
+        let mut max = 0_u64;
+        while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+            let mut row_bytes = vec![0_u64; batch.num_rows()];
+            for column in batch.columns() {
+                let descriptions =
+                    column
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .ok_or_else(|| {
+                            OmniError::manifest_internal(format!(
+                                "compaction sizing of {} expected Blob descriptors, got {:?}",
+                                ds.uri(),
+                                column.data_type()
+                            ))
+                        })?;
+                let sizes = descriptions
+                    .column_by_name("size")
+                    .and_then(|sizes| sizes.as_any().downcast_ref::<UInt64Array>())
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "compaction sizing of {} found a Blob descriptor without a UInt64 size",
+                            ds.uri()
+                        ))
+                    })?;
+                for (row, total) in row_bytes.iter_mut().enumerate() {
+                    if descriptions.is_valid(row) && sizes.is_valid(row) {
+                        *total = total.saturating_add(sizes.value(row));
+                    }
+                }
+            }
+            max = row_bytes.into_iter().fold(max, u64::max);
+        }
+        Ok(max)
     }
 
     /// Stage creation of a new dataset without publishing its first manifest.
@@ -5545,6 +5624,36 @@ fn ensure_proven_insert_blobs_are_materialized(batch: &RecordBatch, table_key: &
         }
     }
     Ok(())
+}
+
+/// Byte budget for the Blob payloads one compaction batch materializes.
+///
+/// Lance 11 compaction cannot binary-copy a Blob table, so it rewrites the
+/// rows through a scanner and materializes every managed Blob-v2 payload of a
+/// scanner batch into one logical array before handing it to the writer
+/// (external descriptors are carried, never read). A batch never crosses a
+/// fragment, and without an explicit batch size the scanner reads up to its
+/// default row count per batch, so one batch of large values can hold
+/// `min(default rows, fragment rows) x largest value` bytes. Lance reads
+/// `CompactionOptions::batch_size` into the compaction scanner of every task
+/// of the plan and ignores it when planning, so the engine derives it per plan
+/// from the largest row. An explicit batch size also wins over
+/// `LANCE_DEFAULT_BATCH_SIZE` on the V2.x read path graph tables use.
+const COMPACTION_BLOB_BATCH_BYTES: u64 = KEYED_WRITE_MAX_BYTES;
+/// Upper bound on the rows of one Blob compaction batch: Lance's own fallback
+/// default, so tables of small values keep Lance's batching.
+const COMPACTION_MAX_BATCH_ROWS: usize = lance::dataset::scanner::BATCH_SIZE_FALLBACK;
+
+/// Scanner rows per compaction batch for a table whose largest row carries
+/// `max_row_blob_bytes` Blob bytes: as many rows as fit the byte budget, at
+/// least one, at most Lance's fallback batch size.
+pub(crate) fn compaction_blob_batch_rows(max_row_blob_bytes: u64) -> usize {
+    if max_row_blob_bytes == 0 {
+        return COMPACTION_MAX_BATCH_ROWS;
+    }
+    usize::try_from(COMPACTION_BLOB_BATCH_BYTES / max_row_blob_bytes)
+        .unwrap_or(COMPACTION_MAX_BATCH_ROWS)
+        .clamp(1, COMPACTION_MAX_BATCH_ROWS)
 }
 
 pub(crate) fn exact_id_primary_key_field_id(
