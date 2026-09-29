@@ -22,7 +22,7 @@ use axum::response::{IntoResponse, Response};
 use futures::future::BoxFuture;
 use futures::{Stream, StreamExt, stream};
 use headers::{ETag as TypedEtag, HeaderMapExt, IfMatch, IfNoneMatch, IfRange};
-use omnigraph::error::OmniError;
+use omnigraph::error::{ManifestErrorKind, OmniError, StorageFailureKind};
 use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobContent, BlobRead, BlobReader, ExternalBlobRef};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -35,6 +35,68 @@ const SNAPSHOT_ID_HEADER: HeaderName = HeaderName::from_static("omnigraph-snapsh
 pub(crate) const BLOB_BODY_MAX_RETAINED_CHUNKS: usize = 2;
 pub(crate) const BLOB_BODY_MAX_RETAINED_BYTES: u64 =
     BLOB_BODY_MAX_RETAINED_CHUNKS as u64 * BLOB_READ_RANGE_MAX_BYTES;
+
+/// Log-safe class of a redacted engine failure. Never carries message text:
+/// storage and integrity messages can hold object URIs, presigned query
+/// strings or credentials, and `OmniError`'s `Display` and `Debug` both
+/// include them.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RedactedCause {
+    pub variant: &'static str,
+    pub storage_kind: Option<StorageFailureKind>,
+    pub manifest_kind: Option<ManifestErrorKind>,
+}
+
+impl RedactedCause {
+    pub(crate) fn of(error: &OmniError) -> Self {
+        // Completion evidence wraps the typed cause; the log names the cause.
+        let mut error = error;
+        while let OmniError::Completion { source, .. } = error {
+            error = source;
+        }
+        // Exhaustive on purpose: a new variant must choose its log name here.
+        let variant = match error {
+            OmniError::Completion { .. } => "Completion",
+            OmniError::Compiler(_) => "Compiler",
+            OmniError::Storage(_) => "Storage",
+            OmniError::HistoricalVersionReclaimed { .. } => "HistoricalVersionReclaimed",
+            OmniError::FullTextIndexRebuildRequired { .. } => "FullTextIndexRebuildRequired",
+            OmniError::RetryableCommitConflict(_) => "RetryableCommitConflict",
+            OmniError::DataFusion(_) => "DataFusion",
+            OmniError::Io(_) => "Io",
+            OmniError::Manifest(_) => "Manifest",
+            OmniError::MergeConflicts(_) => "MergeConflicts",
+            OmniError::KeyConflict { .. } => "KeyConflict",
+            OmniError::ResourceLimitExceeded { .. } => "ResourceLimitExceeded",
+            OmniError::ChangeCursorRejected { .. } => "ChangeCursorRejected",
+            OmniError::BranchNotFound { .. } => "BranchNotFound",
+            OmniError::ChangeFeedGap { .. } => "ChangeFeedGap",
+            OmniError::CommitHasNoParent { .. } => "CommitHasNoParent",
+            OmniError::ChangeSchemaBoundary { .. } => "ChangeSchemaBoundary",
+            OmniError::ExternalBlobPolicy { .. } => "ExternalBlobPolicy",
+            OmniError::ExternalBlobSource { .. } => "ExternalBlobSource",
+            OmniError::StoredExternalBlobDenied { .. } => "StoredExternalBlobDenied",
+            OmniError::BlobIntegrity { .. } => "BlobIntegrity",
+            OmniError::BlobRangeNotSatisfiable { .. } => "BlobRangeNotSatisfiable",
+            OmniError::RecoveryRequired { .. } => "RecoveryRequired",
+            OmniError::PreconditionFailed { .. } => "PreconditionFailed",
+            OmniError::Policy(_) => "Policy",
+            OmniError::AlreadyInitialized { .. } => "AlreadyInitialized",
+            OmniError::InitializationCommitted { .. } => "InitializationCommitted",
+            OmniError::InitializationIndeterminate { .. } => "InitializationIndeterminate",
+            OmniError::InitializationClaimed { .. } => "InitializationClaimed",
+        };
+        let manifest_kind = match error {
+            OmniError::Manifest(manifest) => Some(manifest.kind),
+            _ => None,
+        };
+        Self {
+            variant,
+            storage_kind: error.storage_failure().map(|failure| failure.kind),
+            manifest_kind,
+        }
+    }
+}
 
 trait RangeReader: Send + Sync + 'static {
     fn read_range(&self, range: Range<u64>) -> BoxFuture<'static, Result<Bytes, OmniError>>;
@@ -487,10 +549,17 @@ async fn read_chunk(
     let start = range.start;
     let end = range.end;
     let expected = end - start;
-    let bytes = reader.read_range(range).await.map_err(|_error| {
+    let bytes = reader.read_range(range).await.map_err(|error| {
         // Engine/storage errors can contain physical object paths or
-        // credentials. Neither logs nor the HTTP body may expose them.
+        // credentials. Neither logs nor the HTTP body may expose them: log
+        // only the error's class, then drop the error unread.
+        let cause = RedactedCause::of(&error);
+        drop(error);
         tracing::error!(
+            error_kind = "blob_payload_read",
+            error_variant = cause.variant,
+            storage_kind = ?cause.storage_kind,
+            manifest_kind = ?cause.manifest_kind,
             range_start = start,
             range_end = end,
             "managed Blob payload read failed"
@@ -969,6 +1038,8 @@ mod tests {
 
     #[tokio::test]
     async fn body_error_does_not_expose_engine_or_physical_storage_detail() {
+        let capture = crate::test_log_capture::Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("info"));
         let error = read_chunk(
             Arc::new(FailingReader),
             Arc::new(Semaphore::new(BLOB_BODY_MAX_RETAINED_CHUNKS)),
@@ -978,6 +1049,46 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.to_string(), "managed Blob payload read failed");
         assert!(!error.to_string().contains("private-bucket"));
+
+        // The log names the failure's class and range, never its text.
+        let logs = capture.output();
+        for expected in [
+            r#"error_kind="blob_payload_read""#,
+            r#"error_variant="Storage""#,
+            "storage_kind=Some(Unknown)",
+            "manifest_kind=None",
+            "range_start=0",
+            "range_end=1",
+        ] {
+            assert!(logs.contains(expected), "missing {expected}: {logs}");
+        }
+        for leaked in ["private-bucket", "physical/object", "s3://"] {
+            assert!(!logs.contains(leaked), "log leaked {leaked}: {logs}");
+        }
+    }
+
+    #[test]
+    fn redacted_cause_names_the_cause_under_completion_evidence() {
+        let storage = || {
+            OmniError::Storage(omnigraph::error::StorageFailure::new(
+                omnigraph::error::StorageFailureKind::Unknown,
+                "storage: s3://private-bucket/physical/object",
+            ))
+        };
+        for error in [
+            storage().before_effect(),
+            storage()
+                .with_completion_evidence(omnigraph::error::CompletionEvidence::Uncertain)
+                .before_effect(),
+        ] {
+            let cause = RedactedCause::of(&error);
+            assert_eq!(cause.variant, "Storage");
+            assert_eq!(
+                cause.storage_kind,
+                Some(omnigraph::error::StorageFailureKind::Unknown)
+            );
+            assert!(cause.manifest_kind.is_none());
+        }
     }
 
     #[tokio::test]

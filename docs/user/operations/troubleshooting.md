@@ -32,7 +32,7 @@ means the data request was not sent. HTTP discovery refusals retain their status
 | 416 | Blob byte range is outside the value | Use the returned length to choose a valid range |
 | 424 | An allowed external Blob source could not be read | Restore source availability or correct its URI/credentials |
 | 429 | Server or per-actor admission limit reached | Use the whole-command outcome below before retrying; preserve `Retry-After` |
-| 500 | Server or stored-data integrity failure | Check server logs; do not assume partial success |
+| 500 | Server or stored-data integrity failure | Check server logs; do not assume partial success. A Blob delivery failure logs its error class (`error_variant`, and `storage_kind` for a storage failure), never its storage path |
 | 503 | Admission is closed, or a published schema change requires completion | Inspect the structured error; generic 503 is not permission to repeat a write |
 
 A graph-head `412` includes `precondition_failure` with `expected` and, when

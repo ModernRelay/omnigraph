@@ -955,9 +955,12 @@ async fn read_blob_for_delivery(
     actor: Option<&AuthenticatedActor>,
     query: BlobReadQuery,
 ) -> std::result::Result<omnigraph::BlobRead, ApiError> {
+    // The target stage already holds an `ApiError`, so its cause is logged as
+    // "unclassified": a known gap until target resolution returns the engine
+    // error it mapped.
     let target = resolve_authorized_read_target(handle, actor, query.branch, query.snapshot)
         .await
-        .map_err(redact_blob_api_error)?;
+        .map_err(|mapped| redact_blob_api_error(mapped, "target", None))?;
     let entity = match query.entity {
         api::BlobEntityKind::Node => omnigraph::EntityKind::Node,
         api::BlobEntityKind::Edge => omnigraph::EntityKind::Edge,
@@ -981,13 +984,25 @@ async fn read_blob_for_delivery(
 /// graph-level Blob surface. Selector/auth/not-found failures retain their
 /// typed client disposition; every pre-header internal failure is redacted.
 fn map_blob_read_error(error: OmniError) -> ApiError {
-    redact_blob_api_error(ApiError::from_omni(error))
+    let cause = blob_transport::RedactedCause::of(&error);
+    redact_blob_api_error(ApiError::from_omni(error), "cell", Some(cause))
 }
 
-fn redact_blob_api_error(mapped: ApiError) -> ApiError {
+/// Redact a pre-header internal failure. The log carries the stage and the
+/// error's class (never its message, which can hold object URIs or
+/// credentials); the response carries a constant.
+fn redact_blob_api_error(
+    mapped: ApiError,
+    stage: &'static str,
+    cause: Option<blob_transport::RedactedCause>,
+) -> ApiError {
     if mapped.status == StatusCode::INTERNAL_SERVER_ERROR {
         error!(
             error_kind = "blob_pre_header_internal",
+            stage,
+            error_variant = cause.map_or("unclassified", |cause| cause.variant),
+            storage_kind = ?cause.and_then(|cause| cause.storage_kind),
+            manifest_kind = ?cause.and_then(|cause| cause.manifest_kind),
             "Blob delivery failed before response headers"
         );
         ApiError::internal("Blob delivery failed before response headers")
@@ -3065,6 +3080,8 @@ mod blob_error_tests {
 
     #[tokio::test]
     async fn pre_header_internal_errors_do_not_expose_physical_storage_or_identity() {
+        let capture = crate::test_log_capture::Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("info"));
         for (error, secret) in [
             (
                 OmniError::Storage(omnigraph::error::StorageFailure::new(
@@ -3090,9 +3107,11 @@ mod blob_error_tests {
             assert!(!String::from_utf8_lossy(&body).contains(secret));
         }
 
-        let response = redact_blob_api_error(ApiError::internal(
-            "snapshot manifest at s3://private-bucket/graph/__manifest",
-        ))
+        let response = redact_blob_api_error(
+            ApiError::internal("snapshot manifest at s3://private-bucket/graph/__manifest"),
+            "target",
+            None,
+        )
         .into_response();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -3100,6 +3119,31 @@ mod blob_error_tests {
         let output: ErrorOutput = serde_json::from_slice(&body).unwrap();
         assert_eq!(output.error, "Blob delivery failed before response headers");
         assert!(!String::from_utf8_lossy(&body).contains("private-bucket"));
+
+        // The server log names each failure's class and stage, never its text.
+        let logs = capture.output();
+        for expected in [
+            r#"error_kind="blob_pre_header_internal""#,
+            r#"stage="cell""#,
+            r#"error_variant="Storage""#,
+            "storage_kind=Some(Unknown)",
+            r#"error_variant="BlobIntegrity""#,
+            r#"stage="target""#,
+            r#"error_variant="unclassified""#,
+        ] {
+            assert!(logs.contains(expected), "missing {expected}: {logs}");
+        }
+        for leaked in [
+            "private-bucket",
+            "tenant-a",
+            "token",
+            "secret",
+            "node:Secret",
+            "incarnation",
+            "__manifest",
+        ] {
+            assert!(!logs.contains(leaked), "log leaked {leaked}: {logs}");
+        }
     }
 }
 
