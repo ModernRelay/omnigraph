@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-28
-updated: 2026-09-28
+updated: 2026-09-29
 discussion: "https://github.com/ModernRelay/omnigraph/pull/792"
 supersedes: []
 superseded_by: []
@@ -44,8 +44,9 @@ The query surface is the [Shared expression model](2026-09-24-shared-expression-
 predicates live in `match`, a search call is a top-level conjunct, and the
 leading ranking call lives in `order`. This RFC adds a function, an argument
 type and a schema capability; it adds no clause. It is implemented on engine
-v2 and the compiler both engines share; engine v1 is frozen and refuses what
-it cannot run. RFC 0047 ([PR #791](https://github.com/ModernRelay/omnigraph/pull/791))
+v2, the only query engine since PR #795, and the compiler. Its named options
+follow the call rule of the shared expression model amendment
+([PR #805](https://github.com/ModernRelay/omnigraph/pull/805)). RFC 0047 ([PR #791](https://github.com/ModernRelay/omnigraph/pull/791))
 owns the interim refusal of full-text search on an unindexed property, which
 this RFC's exact scan later lifts. RFC 0048
 ([PR #793](https://github.com/ModernRelay/omnigraph/pull/793)) owns
@@ -199,11 +200,6 @@ says so. A predicate keeps its position: a search call inside `not { }` stays
 inside it as `match_terms`. The legacy spellings gain no new semantics during
 the window.
 
-Engine v1 is frozen. It keeps the legacy spellings' current behavior until
-they are removed, and it refuses `match_terms`, `terms(…)` and `@analyzed`
-ranking at its door with the shared expression model's message, which names
-the switch to engine v2.
-
 ### Errors and operations
 
 Type errors: a missing analyzed capability, a ranking call on a
@@ -341,8 +337,6 @@ results.
 - **Results:** rows change only where today's answer depended on index state
   or letter case, and scores change on adopting fields; that is the correction
   this RFC exists for.
-- **Engines:** engine v1 keeps legacy behavior and refuses the new constructs
-  until engine v2 is the default.
 - **Reverting:** before implementation, delete this document. After the
   removal release, reverting restores the legacy spellings and their
   index-dependent semantics behind another language boundary.
@@ -440,3 +434,6 @@ step 6 is performance work.
   uses `mode: any`, correcting the earlier mapping to the `all` default, which
   would have narrowed every multi-word search; the exact scan and every native
   route land on engine v2, and engine v1 refuses the new constructs.
+- 2026-09-29 — engine v2 became the only query engine (PR #795): the engine
+  v1 refusals are removed. Named options cite the shared expression model
+  amendment ([PR #805](https://github.com/ModernRelay/omnigraph/pull/805)).
