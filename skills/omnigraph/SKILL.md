@@ -199,7 +199,10 @@ refused; only `@index` additions, nullable additions, enum widening, renames and
 drops apply in place).
 
 In short: Gruber's five criteria (clarity · coherence · extendibility · minimal
-encoding bias · minimal commitment) · write the questions as `.gq` first ·
+encoding bias · minimal commitment) · neither too loose (one meaning, many
+encodings) nor too tight (a meaning with no encoding): tight where agents must
+converge, open at declared extension points · write the questions as `.gq`
+first ·
 design identity first (`@key`, keyed edges, find before create) · kinds are
 types, roles are edges · put a fact on what determines it · keep attribution,
 justification, confidence and time on separate axes · provenance is structural

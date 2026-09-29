@@ -8,6 +8,7 @@ evolution mechanics, see [`schema.md`](schema.md).
 ## Contents
 
 - [Foundations: Gruber's five criteria](#foundations-grubers-five-criteria)
+- [Too loose, too tight](#too-loose-too-tight)
 - [Design flow](#design-flow)
 - [Designing for many agents](#designing-for-many-agents)
   1. [Design identity first](#1-design-identity-first)
@@ -60,6 +61,39 @@ The criteria trade off: Clarity wants tight definitions, Minimal Commitment
 wants weak ones. Gruber's resolution is to decide conservatively what to model
 and, having decided a distinction is worth making, give it the tightest
 possible definition.
+
+## Too loose, too tight
+
+A schema fails in two opposite ways:
+
+- **Too loose**: the same meaning can be written in more than one valid way.
+  Independent writers produce different graphs, duplicates accumulate, and a
+  query finds only what happened to be written its way.
+- **Too tight**: some meaning cannot be written at all. Writers force it into
+  the nearest shape, park it in a note, or drop it, and the loss is silent.
+
+The goal is both properties at once: everything that matters can be
+expressed, and there is exactly one way to express it.
+
+These are not two ends of one slider. A missing category makes an enum too
+tight and, at the same time, turns its most generic value into a dumping
+ground. A property placed on the wrong node blocks what should be expressible
+and invites parallel workarounds. Adding or removing constraints fixes
+neither; putting the distinction where it lives fixes both. The lever is where
+constraints sit, not how many there are: tight on identity, kinds, roles and
+shared vocabulary, which writers must converge on; open at declared extension
+points where the domain genuinely varies, with a review path for extending
+them.
+
+Measure the two failures separately. Looseness shows up as disagreement
+between independent writers given the same input. Tightness shows up as
+content they report they could not express, or both forced into the same
+awkward shape (see [principle 14](#14-measure-convergence)).
+
+**In Omnigraph:** loosening applies in place (enum widening, nullable
+additions); tightening is a rebuild, and loose data written in the meantime
+must be reconciled first. When many agents write, lean tight where convergence
+matters and loosen deliberately when the evidence shows a real need.
 
 ## Design flow
 
@@ -334,6 +368,7 @@ schema is crisp; disagreement points to the fix:
 | One value absorbs most writes | a category |
 | Agents choose consistently but differently | a rule |
 | Both force the same content into an awkward shape | a type |
+| Writers report content they cannot express | an extension point, or a property on the wrong node |
 
 Duplicate rate, `GraphPolicy` breaks per write, and the share of key questions
 answerable by traversal are the other gauges.
