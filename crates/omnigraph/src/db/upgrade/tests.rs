@@ -34,6 +34,13 @@ async fn synthetic_v6_fixture_with_branch(root: &str, create_branch: bool) {
     .await
     .unwrap();
     drop(db);
+    finish_synthetic_v6_fixture(root, create_branch).await;
+}
+
+/// Turn a freshly written graph into the synthetic v6 shape: settled pins, a
+/// merge-writer `__manifest` history stamped 6, old versions cleaned, and
+/// optionally a native `feature` branch.
+async fn finish_synthetic_v6_fixture(root: &str, create_branch: bool) {
     settle_fixture_pins(root).await;
     persist_legacy_schema_contract(root).await;
     replay_manifest_as_merge_writer(root).await;
@@ -59,6 +66,58 @@ async fn synthetic_v6_fixture_with_branch(root: &str, create_branch: bool) {
             .await
             .unwrap();
     }
+}
+
+/// A synthetic v6 graph whose `Document` table holds a null, a valid empty,
+/// an inline and a packed (above 64 KiB) managed Blob, and a whole-object
+/// external reference to `external_uri`, which `base` admits.
+async fn synthetic_v6_fixture_with_blobs(root: &str, external_uri: &str, base: &Path) {
+    use base64::Engine;
+    let policy = crate::blob::ExternalBlobPolicy::allow(vec![
+        crate::blob::ExternalBlobBase::new(
+            url::Url::from_directory_path(base).unwrap(),
+            crate::blob::ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let db = crate::Session::from_defaults(
+        std::sync::Arc::new(
+            Omnigraph::init_with_legacy_system_columns_for_tests(
+                root,
+                "node Document { title: String @key\n content: Blob? }",
+            )
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+        ),
+        omnigraph_compiler::settings::SessionSettings::default(),
+    );
+    let encode = |bytes: &[u8]| {
+        format!(
+            "base64:{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
+    };
+    let rows = [
+        serde_json::json!({"title": "null", "content": null}),
+        serde_json::json!({"title": "empty", "content": encode(b"")}),
+        serde_json::json!({"title": "inline", "content": encode(b"inline bytes")}),
+        serde_json::json!({"title": "packed", "content": encode(&vec![b'p'; 96 * 1024])}),
+        serde_json::json!({"title": "external", "content": external_uri}),
+    ]
+    .into_iter()
+    .map(|data| serde_json::json!({"type": "Document", "data": data}).to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    // A full-table overwrite keeps the admitted external reference as a
+    // descriptor instead of copying its bytes.
+    db.load_jsonl(&rows, crate::loader::LoadMode::Overwrite)
+        .await
+        .unwrap();
+    drop(db);
+    finish_synthetic_v6_fixture(root, false).await;
 }
 
 /// Rebuild `__manifest` version by version with the merge-insert writer v6
@@ -1273,6 +1332,126 @@ async fn storage_upgrade_tracks_metadata_writes_and_no_payload_effects() {
             _ => {}
         }
     }
+}
+
+/// Upgrade validates a source table's Blob dependencies without contacting an
+/// external store: the external reference is reported by URI although its
+/// object no longer exists, and every managed value, the packed one
+/// included, is read back through the table store.
+#[tokio::test]
+async fn storage_upgrade_validates_managed_blobs_without_contacting_external_stores() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    let graph = tempfile::tempdir().unwrap();
+    let root = graph.path().to_str().unwrap();
+    let sources = tempfile::tempdir().unwrap();
+    let external_path = sources.path().join("external.bin");
+    std::fs::write(&external_path, b"external bytes").unwrap();
+    let external_uri = url::Url::from_file_path(&external_path)
+        .unwrap()
+        .to_string();
+    synthetic_v6_fixture_with_blobs(root, &external_uri, sources.path()).await;
+    // Admission stored the canonical spelling.
+    let stored_uri = url::Url::from_file_path(std::fs::canonicalize(&external_path).unwrap())
+        .unwrap()
+        .to_string();
+    // Any read of the external object, even its size, now fails.
+    std::fs::remove_file(&external_path).unwrap();
+
+    let tracker = lance_io::utils::tracking_store::IOTracker::default();
+    let probes = crate::instrumentation::QueryIoProbes {
+        manifest_wrapper: Some(Arc::new(tracker.clone())),
+        table_wrapper: Some(Arc::new(tracker.clone())),
+        ..Default::default()
+    };
+    let report = crate::instrumentation::with_query_io_probes(
+        probes,
+        upgrade_storage(
+            root,
+            UpgradeOptions {
+                check: false,
+                to_format: Some(8),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.outcome, UpgradeOutcome::Completed, "{report:?}");
+    assert_eq!(
+        report.work.external_blob_exclusions,
+        BTreeSet::from([stored_uri]),
+        "{report:?}"
+    );
+    let stats = tracker.stats();
+    assert!(
+        stats
+            .requests
+            .iter()
+            .all(|request| !request.path.as_ref().contains("external.bin")),
+        "upgrade must not touch the external object: {stats:?}"
+    );
+    assert!(
+        stats
+            .requests
+            .iter()
+            .any(|request| request.path.as_ref().ends_with(".blob")),
+        "the packed managed value is read back from its sidecar: {stats:?}"
+    );
+}
+
+/// A managed Blob whose stored payload is shorter than its descriptor fails
+/// the upgrade before any effect.
+#[tokio::test]
+async fn storage_upgrade_refuses_a_truncated_managed_blob() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    let graph = tempfile::tempdir().unwrap();
+    let root = graph.path().to_str().unwrap();
+    let sources = tempfile::tempdir().unwrap();
+    let external_path = sources.path().join("external.bin");
+    std::fs::write(&external_path, b"external bytes").unwrap();
+    let external_uri = url::Url::from_file_path(&external_path)
+        .unwrap()
+        .to_string();
+    synthetic_v6_fixture_with_blobs(root, &external_uri, sources.path()).await;
+    let sidecars = stored_files(graph.path())
+        .into_keys()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "blob")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sidecars.len(), 1, "the packed value has one sidecar");
+    let sidecar = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&sidecars[0])
+        .unwrap();
+    sidecar.set_len(1024).unwrap();
+    drop(sidecar);
+    let before = stored_files(graph.path());
+
+    let report = upgrade_storage(
+        root,
+        UpgradeOptions {
+            check: false,
+            to_format: Some(8),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.outcome, UpgradeOutcome::CheckFailed, "{report:?}");
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == "preflight_failed"),
+        "{report:?}"
+    );
+    assert_eq!(
+        stored_files(graph.path()),
+        before,
+        "no effect before refusal"
+    );
 }
 
 #[tokio::test]

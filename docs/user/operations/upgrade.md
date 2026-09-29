@@ -37,8 +37,8 @@ for physical layouts and retained-history decoding.
    its handler has effects; a passing check does not pre-approve them.
    Resolve source recovery with the compatible source executable before retrying.
    Shared Lance files outside the root refuse.
-   `work.external_blob_exclusions` lists external URI bytes whose immutability
-   and backup are outside the migration guarantee; their descriptors are retained.
+   `work.external_blob_exclusions` lists retained external Blob URIs, read from
+   descriptors without contacting their stores; their bytes are outside the guarantee.
    `work.historical_blob_identity_limits` lists pre-0.10 Blob fields without
    stable property IDs. Their bytes are preserved, but existing historical
    delivery restrictions remain after their current physical entry changes;

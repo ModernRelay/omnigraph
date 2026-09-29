@@ -1493,20 +1493,45 @@ fn convert_batch(
 #[path = "upgrade/tests.rs"]
 mod tests;
 
+/// Bytes of one managed Blob read per range request while validating.
+const BLOB_VALIDATION_WINDOW_BYTES: u64 = 1024 * 1024;
+
+/// Validate every Blob dependency of a source table without touching an
+/// external store. Each row's persisted descriptor is classified first: an
+/// external reference is recorded by URI in `external_blob_exclusions` and
+/// never opened, and a managed value is read back in bounded windows through
+/// one batched range read, so a truncated managed payload fails the upgrade.
+/// Only Blob-v2 columns exist in graphs this route accepts; any other Blob
+/// encoding, like a descriptor the decoder refuses, fails closed.
 async fn validate_blobs(table: &Dataset, work: &mut UpgradeWork) -> Result<()> {
-    let columns: Vec<_> = table
-        .schema()
-        .fields
-        .iter()
-        .filter(|field| field.is_blob())
-        .map(|field| field.name.clone())
-        .collect();
+    let mut columns = Vec::new();
+    for field in table.schema().fields.iter().filter(|field| field.is_blob()) {
+        if !field.is_blob_v2() {
+            return Err(invalid(format!(
+                "Blob column '{}' is not a Blob-v2 column; this upgrade route validates Blob-v2 descriptors only",
+                field.name
+            )));
+        }
+        columns.push(field.name.clone());
+    }
     if columns.is_empty() {
         return Ok(());
     }
+    if table
+        .schema()
+        .fields_pre_order()
+        .filter(|field| field.is_blob())
+        .count()
+        != columns.len()
+    {
+        return Err(invalid(
+            "nested Blob field; this upgrade route validates top-level Blob columns only",
+        ));
+    }
     let table = Arc::new(table.clone());
     let mut scan = table.scan();
-    scan.project::<&str>(&[]).map_err(OmniError::storage)?;
+    let projection = columns.iter().map(String::as_str).collect::<Vec<_>>();
+    scan.project(&projection).map_err(OmniError::storage)?;
     scan.with_row_id();
     scan.batch_size(1024);
     let mut stream = scan.try_into_stream().await.map_err(OmniError::storage)?;
@@ -1519,32 +1544,61 @@ async fn validate_blobs(table: &Dataset, work: &mut UpgradeWork) -> Result<()> {
             return Err(invalid("null stable row ID in Blob dependency scan"));
         }
         for column in &columns {
-            for blob in table
-                .take_blobs(ids.values(), column)
-                .await
-                .map_err(OmniError::storage)?
-                .into_iter()
-                .flatten()
-            {
-                if let Some(uri) = blob.uri() {
-                    if work.external_blob_exclusions.len() >= MAX_ROWS {
-                        return Err(invalid("external Blob dependency limit exceeded"));
-                    }
-                    work.external_blob_exclusions.insert(uri.to_string());
-                } else {
-                    let mut offset: u64 = 0;
-                    while offset < blob.size() {
-                        let end = offset.saturating_add(1024 * 1024).min(blob.size());
-                        let bytes = blob
-                            .read_range(offset..end)
-                            .await
-                            .map_err(OmniError::storage)?;
-                        if bytes.len() as u64 != end - offset {
-                            return Err(invalid("truncated managed Blob dependency"));
+            let descriptions = batch
+                .column_by_name(column)
+                .and_then(|column| column.as_any().downcast_ref::<arrow_array::StructArray>())
+                .ok_or_else(|| invalid(format!("missing Blob descriptors for '{column}'")))?;
+            let decoder = crate::blob::BlobDescriptorDecoder::try_new(descriptions)?;
+            let mut requests = Vec::new();
+            for (row, row_id) in ids.values().iter().enumerate() {
+                match decoder.classify(row)? {
+                    crate::blob::BlobDescriptor::Null => {}
+                    crate::blob::BlobDescriptor::External { uri, .. } => {
+                        if !work.external_blob_exclusions.contains(&uri)
+                            && work.external_blob_exclusions.len() >= MAX_ROWS
+                        {
+                            return Err(invalid("external Blob dependency limit exceeded"));
                         }
-                        offset = end;
+                        work.external_blob_exclusions.insert(uri);
+                    }
+                    crate::blob::BlobDescriptor::Managed { length } => {
+                        let mut offset = 0_u64;
+                        while offset < length {
+                            let window = (length - offset).min(BLOB_VALIDATION_WINDOW_BYTES);
+                            requests.push(lance::dataset::BlobRangeRequest::new(
+                                *row_id, offset, window,
+                            ));
+                            offset += window;
+                        }
                     }
                 }
+            }
+            if requests.is_empty() {
+                continue;
+            }
+            let expected = requests.len();
+            let mut ranges = table
+                .read_blob_ranges(column)
+                .map_err(OmniError::storage)?
+                .with_row_ids(requests)
+                .preserve_order(true)
+                .with_io_buffer_size_bytes(crate::storage_layer::BLOB_REBUILD_IO_BUFFER_BYTES)
+                .try_into_stream()
+                .await
+                .map_err(OmniError::storage)?;
+            let mut read = 0_usize;
+            while let Some(range) = ranges.try_next().await.map_err(OmniError::storage)? {
+                read += 1;
+                let complete = range
+                    .data
+                    .as_ref()
+                    .is_some_and(|bytes| bytes.len() as u64 == range.range.length);
+                if !complete {
+                    return Err(invalid("truncated managed Blob dependency"));
+                }
+            }
+            if read != expected {
+                return Err(invalid("truncated managed Blob dependency"));
             }
         }
     }
