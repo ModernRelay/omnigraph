@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-01
-updated: 2026-09-28
+updated: 2026-09-29
 discussion: "https://github.com/ModernRelay/omnigraph/pull/791"
 supersedes: []
 superseded_by: []
@@ -16,22 +16,20 @@ blocked_on: []
 
 # RFC 0047: Search plan truth: loud search failures and one total order
 
-Every code reference is at `main` `b14c22c5`. Behaviour marked as observed was
-reproduced there, or at `80406fee` where noted, with a logic-test probe on
-engine v2 or through the CLI.
+Every code reference is at `main` `baf10c94`. Behaviour marked as observed was
+reproduced at `b14c22c5` with a logic-test probe on engine v2 or through the
+CLI, and the code it rests on is unchanged at `baf10c94`.
 
 ## Summary
 
 This is the correctness slice of search. It removes every search shape that
 returns a silent wrong answer, gives every search order one total order, and
 makes every refused query describe itself in the same four fields. It lands on
-engine v2, the planned read route, and on the compiler both engines share;
-engine v1 stays frozen and refuses the shapes it would answer wrongly.
+engine v2, the only query engine since v0.12.0 (PR #795), and on the compiler.
 
 1. **Diagnostics.** Every refused query carries a stable code, where the
-   failure is, what was expected, and one fix. This covers parse and type
-   refusals, planner refusals and the engine v1 door, and a refusal by design
-   is a bad request on every path.
+   failure is, what was expected, and one fix. This covers parse, type and
+   planner refusals, and a refusal by design is a bad request on every path.
 2. **Full-text search on an unindexed property.** A property the schema does
    not declare `@index` is refused at compile time (`T27`); a declared index
    that is not built is refused at planning (`FullTextIndexRequired`). Neither
@@ -48,8 +46,8 @@ engine v1 stays frozen and refuses the shapes it would answer wrongly.
 6. **The served read floor** is attributed to its phases and reported.
 
 Boundaries that do not change: no storage format change, no change to BM25 or
-vector scoring, the deprecated `POST /read` envelope stays byte-stable, engine
-v1's executor keeps its bytes, and GQ gains no syntax.
+vector scoring, the deprecated `POST /read` envelope stays byte-stable, the
+frozen reference engine keeps its bytes, and GQ gains no syntax.
 
 Related decisions: [Shared expression model](2026-09-24-shared-expression-model.md)
 owns the query surface this RFC works within; RFC 0048
@@ -73,15 +71,16 @@ Each item below was reproduced; the issue carries the reproduction.
   refuses a query shape as the caller's error (`PlanError::Unsupported`), but
   the ordinary path reports it as an internal error, HTTP 500, wrapped in JSON
   (#786).
-- **Confident false negatives from full-text search.** On both engines,
+- **Confident false negatives from full-text search.** On engine v2,
   `search()` on a property without an index runs Lance's flat scan with a bare,
   case-sensitive tokenizer: `"deep"` matched only "deep dive" and `"Deep"`
   only "Deep Learning" (#747). A real report of an absent entity came from
   this.
 - **Ranking that depends on declaration order.** Ranking a binding reached by
   a traversal fails when that binding is declared after the one it is reached
-  from: engine v1 fails with `search-ordered query produced rows without its
-  'd._score' ranking column`, engine v2 refuses it (#789). It was reported twice
+  from: engine v2 refuses it (#789), and engine v1 failed with
+  `search-ordered query produced rows without its 'd._score' ranking column`
+  before v2 replaced it. It was reported twice
   from real graph work, once for passages scoped by a matter and once for the
   neighbours of one key-selected node.
 - **Orders that ignore the query.** `rrf()` drops the order keys written after
@@ -117,7 +116,7 @@ error[Q002]: parse error: expected `(`: a query declares its parameters even whe
 ```
 
 Codes are grouped by who refuses: `Q…` the parser, `T…` the type checker,
-`P…` the planner, `V…` the engine v1 door. A code's meaning is frozen once
+`P…` the planner. A code's meaning is frozen once
 published; its message may improve. The numbers are assigned in the one
 catalogue by the change that adds each refusal.
 
@@ -130,11 +129,6 @@ catalogue by the change that adds each refusal.
   print the API's error body on stdout, pretty or as one line.
 - **Stored queries.** `queries validate --json` and `cluster plan --json`
   carry the same object beside their messages.
-- **Engine v1 door.** A refusal of a query v1 cannot answer correctly keeps
-  the existing message, which names the construct and both switches (`set
-  engine = v2;`, `OMNIGRAPH_ENGINE=v2`); its `fix` names the one that applies:
-  the process setting for a stored query, which carries no settings, and the
-  query prefix otherwise.
 
 ### Full-text search needs its index
 
@@ -173,8 +167,8 @@ query passages($matter: String, $q: String) {
 The ranked binding is where the component's scan starts. When the other end
 of the component is far more selective (one node selected by its key), engine
 v2 may instead start there and rank only the rows the traversal reaches; the
-answer is the same, only the cost differs. One shape stays refused on both
-engines as a type error: `rrf()` arms that rank two different bindings of one
+answer is the same, only the cost differs. One shape stays refused, as a
+type error: `rrf()` arms that rank two different bindings of one
 traversal-connected component, since one scan cannot start at both.
 
 ### One total order
@@ -240,26 +234,25 @@ object, so a slow read is attributed without instrumentation (#752).
 `T27` refuses queries the compiler accepts today, and stored queries are
 recompiled when a server starts, where a failure quarantines the graph. Run
 `omnigraph queries validate` and `omnigraph cluster plan` before upgrading; a
-refused stored query is a pre-upgrade finding, never a boot failure. The v1
-door refusals appear at invocation, not at boot; the release note lists them.
+refused stored query is a pre-upgrade finding, never a boot failure.
 
 ## Design
 
 ### Where each item lands
 
-| Item | Compiler (both engines) | Engine v2 (planner and operators) | Engine v1 door (`exec/query_doors.rs`) |
-|---|---|---|---|
-| Diagnostics | `QueryDiagnostic`, one code catalogue | `PlanError::Unsupported` carries a diagnostic; the ordinary path maps it to a bad request | `V1Refusal` carries a diagnostic |
-| Full-text index | `T27` | index presence as a planning fact | refuses an unbuilt index with the same `FullTextIndexRequired` |
-| Ranking a destination | lowering roots the component at the ranked binding; type error for `rrf` arms on two bindings of one component | optional reversal when the other end is selective | none needed: the lowering fixes v1 too |
-| Total order | `T33` admits a projected `rrf()`; `T37` retired | fused score column, `Sort` over the fusion and over a search-ordered aggregate | refuses keys after `rrf()` and keys after a search order in an aggregate |
-| Descriptors | — | derived from the physical plan's ranked scans and fusion | none; v1 reads carry no descriptors |
-| Read floor | — | — | — (server instrumentation) |
+| Item | Compiler | Engine v2 (planner and operators) |
+|---|---|---|
+| Diagnostics | `QueryDiagnostic`, one code catalogue | `PlanError::Unsupported` carries a diagnostic; the ordinary path maps it to a bad request |
+| Full-text index | `T27` | index presence as a planning fact |
+| Ranking a destination | lowering roots the component at the ranked binding; type error for `rrf` arms on two bindings of one component | optional reversal when the other end is selective |
+| Total order | `T33` admits a projected `rrf()`; `T37` retired | fused score column, `Sort` over the fusion and over a search-ordered aggregate |
+| Descriptors | — | derived from the physical plan's ranked scans and fusion |
+| Read floor | — | — (server instrumentation) |
 
-Nothing changes a byte of engine v1's frozen files. The v1 door is the one
-place v1 learns a new rule, following the rule the shared expression model
-set: when v1 cannot run a query and v2 can, the error says so; when neither
-can, the ordinary error stands alone.
+Engine v1 is the frozen reference engine (`crates/omnigraph-reference-engine`),
+reached only through a logic-test step's `--- expect same as v1`; this RFC
+changes none of its bytes. A case for a shape the reference answers wrongly
+does not use that comparison.
 
 ### Diagnostics
 
@@ -297,7 +290,7 @@ component's scan: today the first-declared binding, or a searched binding
 inside a correlated block. It gains one rule: at the top level, a component
 that holds the binding the leading order key ranks (both arms' binding, for an
 `rrf()` over one binding) roots there. The traversal is lowered from that
-root; the lowering already expands in either direction. Both engines rank a
+root; the lowering already expands in either direction. Engine v2 ranks a
 root scan, so no engine change is needed for correctness. Engine v2's
 `nearest_prefilter_gate` applies as it does to any ranked root with
 traversals leaving it.
@@ -338,7 +331,7 @@ either arm is.
 ## Invariants
 
 - **Integrity failures are loud (8).** Strengthened: every silent wrong answer
-  this RFC names becomes a correct answer or a typed refusal on both engines.
+  this RFC names becomes a correct answer or a typed refusal.
 - **Query semantics are typed structures (9).** Strengthened: refusals carry
   a typed diagnostic instead of a string with a code prefix; the root choice is
   a lowering rule, not a textual accident.
@@ -361,8 +354,6 @@ either arm is.
   omitted when absent. `POST /read` is untouched. OpenAPI regenerates.
 - **Language:** `T27` and the `rrf()` arms type error refuse queries the
   compiler accepts today; both previously produced wrong or failing results.
-  The v1 door refuses four shapes v1 answered wrongly; each refusal names the
-  switch to engine v2.
 - **Order:** results change only where an order was not total: ties inside a
   fused score, keys after `rrf()`, several rows per entity under `rrf()`, and
   search-ordered aggregates.
@@ -385,11 +376,6 @@ either arm is.
 - **Record the retrieval in the `QueryIR`.** Rejected: engine v2's planner
   already states it once as typed plan nodes; a second record would be a
   second source of truth.
-- **Fix engine v1's executor.** Rejected: v1 is frozen, and its defects are
-  fixed on v2; the v1 door refuses what v1 would answer wrongly.
-- **Leave v1's silent wrong answers until v2 is the default.** Rejected: v1
-  stays the default for at least one release, and the door check costs one
-  walk of the compiled query.
 
 ## Evidence and tests
 
@@ -406,7 +392,6 @@ Each change lands with its regression at the owner the
 - server `data_routes` and `openapi`, CLI `cli_queries` and `parity_matrix`
   for the error body and the envelope.
 
-The frozen `tests/search.rs` cannot grow, so no retrieval golden lives there.
 The four probe results in the motivation are reproductions, not tests; each
 issue restates its shape for the case that will own it.
 
@@ -418,25 +403,21 @@ and closes its issues.
 | Step | Delivers | Closes |
 |---|---|---|
 | 1 | Diagnostics contract for parse and type refusals (PR #759) | — |
-| 2 | Planner and v1 door refusals carry diagnostics; a refusal by design is a bad request | #786 |
-| 3 | `T27` and `FullTextIndexRequired`; the v1 door refuses an unbuilt index | #747 |
+| 2 | Planner refusals carry diagnostics; a refusal by design is a bad request | #786 |
+| 3 | `T27` and `FullTextIndexRequired` | #747 |
 | 4 | The ranked binding roots its component; the `rrf()` arms type error | #789 |
-| 5 | One total order: fused score column, `Sort` over fusion and search-ordered aggregates, `T37` retired; the v1 door refuses both shapes | #787, #788 |
+| 5 | One total order: fused score column, `Sort` over fusion and search-ordered aggregates, `T37` retired | #787, #788 |
 | 6 | Read descriptors | — |
 | 7 | Served read floor | #752 |
 | 8 | Engine v2 reverses a ranked component whose other end is selective | — (performance) |
 
-Steps 2 and 3 to 5 extend the v1 door beyond the new-feature rule it has
-today; that extension and the refusal-as-bad-request rule need the engine
-owner's agreement before this RFC is accepted. `implementation` becomes
+`implementation` becomes
 `in-progress` when step 1 lands and `complete` when step 7 does; step 8 is a
 performance follow-up.
 
 ## Unresolved questions
 
-1. Does the engine owner agree that the v1 door refuses known v1 defects
-   (steps 3 to 5), not only features v1 lacks, and that planner refusals by
-   design become bad requests carrying diagnostics (step 2)?
+None.
 
 ## Decision log
 
@@ -453,3 +434,10 @@ performance follow-up.
   full-text refusal is a planning fact, and the v1 door refuses the shapes v1
   answers wrongly. The drafts in PR #606 are superseded as a whole; this file
   replaces them.
+- 2026-09-29 — engine v2 became the only query engine in v0.12.0 (PR #795),
+  and engine v1 the frozen reference engine. Removed: the engine v1 door
+  refusals of steps 2, 3 and 5, the `V…` code group, the two alternatives
+  about engine v1, the note about the frozen `tests/search.rs`, and the
+  unresolved question, which asked the engine owner to agree to those
+  refusals. The planner-refusal rule of step 2 stays. Every defect this RFC
+  names was checked again in code at `baf10c94`.
