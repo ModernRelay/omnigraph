@@ -1,0 +1,80 @@
+# issue: none
+# notes: A `nearest` rank survives the traversal after it. The edge table is loaded in reverse
+# notes: rank order and rank-1 has two parallel edges, so a bound-edge fan-out must keep the
+# notes: incoming rank and both edge rows (A1 before A2 is the tie-break). Over a {1,2} hop
+# notes: range every seed's hop 1 comes before any hop 2, so `limit 2` must still return both
+# notes: reaches of the best seed (their tie order is not asserted). Replaces the Rust tests
+# notes: nearest_rank_survives_bound_edge_fanout and nearest_rank_survives_multi_hop_expansion (search.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node RankedDoc {
+    slug: String @key
+    embedding: Vector(4)
+}
+
+edge RankedLink: RankedDoc -> RankedDoc {
+    label: String
+}
+
+--- seed
+{"type":"RankedDoc","data":{"slug":"rank-1","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"RankedDoc","data":{"slug":"rank-2","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"RankedDoc","data":{"slug":"rank-3","embedding":[2.0,0.0,0.0,0.0]}}
+{"type":"RankedDoc","data":{"slug":"sink","embedding":[9.0,0.0,0.0,0.0]}}
+{"edge":"RankedLink","id":"edge-c","from":"rank-3","to":"sink","data":{"label":"C"}}
+{"edge":"RankedLink","id":"edge-b","from":"rank-2","to":"sink","data":{"label":"B"}}
+{"edge":"RankedLink","id":"edge-a2","from":"rank-1","to":"sink","data":{"label":"A2"}}
+{"edge":"RankedLink","id":"edge-a1","from":"rank-1","to":"sink","data":{"label":"A1"}}
+{"edge":"RankedLink","id":"edge-d","from":"sink","to":"rank-3","data":{"label":"D"}}
+
+--- query
+query nearest_edges($q: Vector(4)) {
+    match {
+        $d: RankedDoc
+        $d $w:rankedLink $target
+    }
+    return { $d.slug, $w.label }
+    order { nearest($d.embedding, $q) }
+    limit 4
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug": "rank-1", "w.label": "A1"}
+{"d.slug": "rank-1", "w.label": "A2"}
+{"d.slug": "rank-2", "w.label": "B"}
+{"d.slug": "rank-3", "w.label": "C"}
+
+--- expect shape
+d.slug: String
+w.label: String
+
+--- query
+query nearest_hops($q: Vector(4)) {
+    match {
+        $d: RankedDoc
+        $d rankedLink{1,2} $target
+    }
+    return { $d.slug, $target.slug }
+    order { nearest($d.embedding, $q) }
+    limit 2
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+
+--- expect unordered
+{"d.slug": "rank-1", "target.slug": "sink"}
+{"d.slug": "rank-1", "target.slug": "rank-3"}
+
+--- expect shape
+d.slug: String
+target.slug: String

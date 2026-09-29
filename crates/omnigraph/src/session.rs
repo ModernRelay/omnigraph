@@ -17,6 +17,9 @@ use omnigraph_compiler::settings::{
 use crate::db::Omnigraph;
 use crate::error::{OmniError, Result};
 
+#[cfg(feature = "test-util")]
+use omnigraph_catalog::read_executor::ReadExecutor;
+
 /// The scope of `set`: one file at the CLI, one request at the server, one
 /// value an embedded caller builds. Never persisted; never shared between
 /// requests.
@@ -27,6 +30,8 @@ pub struct Session {
     sources: Sources,
     baseline: SessionSettings,
     baseline_sources: Sources,
+    #[cfg(feature = "test-util")]
+    read_executor: Option<Arc<dyn ReadExecutor>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -50,6 +55,8 @@ impl Omnigraph {
             baseline_sources: sources,
             settings,
             sources,
+            #[cfg(feature = "test-util")]
+            read_executor: None,
         }
     }
 }
@@ -83,7 +90,22 @@ impl Session {
             sources: self.sources,
             baseline: self.baseline,
             baseline_sources: self.baseline_sources,
+            #[cfg(feature = "test-util")]
+            read_executor: self.read_executor,
         }
+    }
+
+    /// This session with its reads run on `executor` instead of the engine's
+    /// planner; survives `detach` and `rebind`.
+    #[cfg(feature = "test-util")]
+    pub fn with_read_executor(mut self, executor: Arc<dyn ReadExecutor>) -> Self {
+        self.read_executor = Some(executor);
+        self
+    }
+
+    #[cfg(feature = "test-util")]
+    pub(crate) fn read_executor(&self) -> Option<&Arc<dyn ReadExecutor>> {
+        self.read_executor.as_ref()
     }
 
     pub fn db(&self) -> &Arc<Omnigraph> {
@@ -196,6 +218,8 @@ pub struct Detached {
     sources: Sources,
     baseline: SessionSettings,
     baseline_sources: Sources,
+    #[cfg(feature = "test-util")]
+    read_executor: Option<Arc<dyn ReadExecutor>>,
 }
 
 impl Detached {
@@ -207,6 +231,8 @@ impl Detached {
             sources: self.sources,
             baseline: self.baseline,
             baseline_sources: self.baseline_sources,
+            #[cfg(feature = "test-util")]
+            read_executor: self.read_executor,
         }
     }
 }

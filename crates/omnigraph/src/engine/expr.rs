@@ -491,20 +491,31 @@ pub(super) fn literal_list_to_array(items: &[Literal], num_rows: usize) -> Resul
     }
 }
 
+/// The element type of a list literal: the type its non-null elements share,
+/// `F64` for integers beside floats, `String` when every element is null.
 pub(super) fn list_scalar_type(items: &[Literal]) -> Result<ScalarType> {
-    let first = items
-        .first()
-        .ok_or_else(|| OmniError::manifest("empty list literal"))?;
-    let expected = literal_scalar_type(first)?;
-    for item in items.iter().skip(1) {
-        let item_type = literal_scalar_type(item)?;
-        if item_type != expected {
-            return Err(OmniError::manifest(
-                "list literal elements must share a compatible scalar type".to_string(),
-            ));
-        }
+    if items.is_empty() {
+        return Err(OmniError::manifest("empty list literal"));
     }
-    Ok(expected)
+    let mut expected = None;
+    for item in items.iter().filter(|item| !matches!(item, Literal::Null)) {
+        let item_type = literal_scalar_type(item)?;
+        expected = Some(match expected {
+            None => item_type,
+            Some(seen) if seen == item_type => seen,
+            Some(ScalarType::I64 | ScalarType::F64)
+                if matches!(item_type, ScalarType::I64 | ScalarType::F64) =>
+            {
+                ScalarType::F64
+            }
+            Some(_) => {
+                return Err(OmniError::manifest(
+                    "list literal elements must share a compatible scalar type".to_string(),
+                ));
+            }
+        });
+    }
+    Ok(expected.unwrap_or(ScalarType::String))
 }
 
 pub(super) fn literal_scalar_type(lit: &Literal) -> Result<ScalarType> {

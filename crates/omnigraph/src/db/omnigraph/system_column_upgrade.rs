@@ -155,8 +155,6 @@ pub(super) async fn upgrade_system_columns(
         &omnigraph_policy::ResourceScope::TargetBranch("main".to_string()),
         actor,
     )?;
-    let from_stamp = crate::db::manifest::stamp_for_system_columns(SYSTEM_COLUMNS_LEGACY)?;
-    let to_stamp = crate::db::manifest::stamp_for_system_columns(SYSTEM_COLUMNS_V3)?;
     let mut report = SystemColumnUpgradeReport {
         location: db.uri().to_string(),
         mode: if options.check {
@@ -175,8 +173,17 @@ pub(super) async fn upgrade_system_columns(
     if !options.check {
         db.settle_pending_schema_install().await?;
     }
-    let schema_gate_key = crate::db::write_queue::schema_apply_serial_queue_key();
-    let _schema_gate = db.write_queue().acquire(&schema_gate_key).await;
+    let (_shared_gate, _exclusive_gate): (
+        Option<crate::db::write_queue::SchemaSharedPermit>,
+        Option<crate::db::write_queue::SchemaExclusivePermit>,
+    ) = if options.check {
+        (Some(db.write_queue().acquire_schema_shared().await), None)
+    } else {
+        (
+            None,
+            Some(db.write_queue().acquire_schema_exclusive().await),
+        )
+    };
     db.refresh_coordinator_only().await?;
     let stamp = crate::db::manifest::internal_schema_stamp_at(db.uri(), None)
         .await?
@@ -190,7 +197,7 @@ pub(super) async fn upgrade_system_columns(
         return Ok(report);
     }
 
-    preflight(db, &accepted_ir, stamp, from_stamp, &mut report).await?;
+    preflight(db, &accepted_ir, stamp, &mut report).await?;
     if !report.findings.is_empty() {
         return Ok(report);
     }
@@ -213,7 +220,9 @@ pub(super) async fn upgrade_system_columns(
         (Ok(_), Err(err)) | (Err(err), _) => return Err(err),
     };
     report.outcome = SystemColumnUpgradeOutcome::Completed;
-    report.stamp_after = to_stamp;
+    report.stamp_after = crate::db::manifest::internal_schema_stamp_at(db.uri(), None)
+        .await?
+        .unwrap_or(stamp);
     report.graph_manifest_version = Some(graph_manifest_version);
     Ok(report)
 }
@@ -222,7 +231,6 @@ async fn preflight(
     db: &Omnigraph,
     accepted_ir: &SchemaIR,
     stamp: u32,
-    from_stamp: u32,
     report: &mut SystemColumnUpgradeReport,
 ) -> Result<()> {
     let coordinator = db.coordinator.read().await;
@@ -253,9 +261,11 @@ async fn preflight(
             offenders.join(", ")
         ));
     }
-    if stamp != from_stamp {
+    if !crate::db::manifest::is_served_stamp(stamp) {
         report.refuse(format!(
-            "__manifest is stamped at v{stamp}; the system-column upgrade converts a v{from_stamp} graph, so run `omnigraph upgrade` for the storage conversions first"
+            "__manifest is stamped at v{stamp}; the system-column upgrade respells a served graph (v{} to v{}), so run `omnigraph upgrade` for the storage conversions first",
+            crate::db::manifest::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+            crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
         ));
     }
     if report.findings.is_empty() {

@@ -71,11 +71,12 @@ impl Environment {
         }
     }
 
-    pub(crate) fn admit(&self, has_seams: bool) -> Result<(), String> {
+    /// `needs_dst` is `Case::needs_dst`: what only the DST runner can host.
+    pub(crate) fn admit(&self, needs_dst: bool) -> Result<(), String> {
         match self.execution {
             Execution::Engine {
                 storage: Storage::LocalFilesystem,
-            } if !has_seams => Ok(()),
+            } if !needs_dst => Ok(()),
             Execution::Dst {
                 storage: Storage::InMemoryObjectStore,
                 ..
@@ -87,7 +88,7 @@ impl Environment {
                 }
             }
             _ => Err(format!(
-                "unsupported_environment: {} requests an unavailable combination; implemented combinations are omnigraph-engine/local-filesystem without seams and omnigraph-engine-dst/in-memory-object-store",
+                "unsupported_environment: {} requests an unavailable combination; implemented combinations are omnigraph-engine/local-filesystem without seams or concurrent blocks and omnigraph-engine-dst/in-memory-object-store",
                 self
             )),
         }
@@ -251,7 +252,7 @@ pub(crate) fn parse_seam(body: &str) -> Result<SeamDirective, String> {
     }
     if seam.action == SeamAction::Hold {
         return Err(
-            "invalid_case: `action: hold` is refused until a case can express two concurrent steps"
+            "invalid_case: `action: hold` is refused a named interleaving is a `--- concurrent` block, whose `park` entry holds a session at a store request; `hold` on a seam is not supported"
                 .into(),
         );
     }

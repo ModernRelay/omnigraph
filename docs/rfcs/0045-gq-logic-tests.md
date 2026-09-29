@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - azimafroozeh
 created: 2026-08-29
-updated: 2026-09-26
+updated: 2026-09-28
 discussion: https://github.com/ModernRelay/omnigraph/pull/584
 supersedes: []
 superseded_by: []
@@ -506,10 +506,7 @@ in Seams at an explicit step. A step is one of:
   `OMNIGRAPH_GQ_BLESS=1` and review the diff. A rows step may carry one
   optional `--- expect plan` section, the ***plan section***, directly after
   its shape section: one assertion per line over the plan the step's query
-  runs under, in nine forms. The query's effective engine must
-  be v2, after applying the runner baseline, case settings and query prefix.
-  Under v1 the runner fails the step before execution or explain because
-  v1 produces no plan. A `scan <Type>[ as $var]:` head
+  runs under, in nine forms. A `scan <Type>[ as $var]:` head
   selects the scans of that node type (every scan of it, or the one bound
   to `$var`) and claims one fact of each: `columns [<a>, <b>]` the exact
   columns it projects; `not columns [<a>, <b>]` columns it must not read;
@@ -536,6 +533,21 @@ in Seams at an explicit step. A step is one of:
   after a shape section, an empty one, or a line outside the nine forms is
   refused with the forms spelled out. A plan section on a step that names
   any API (Execution routes, below) but `engine` is refused.
+  A query step may end with one `--- expect same as v1` section, the
+  ***reference comparison***, directly after its shape section or, when it
+  has one, its plan section; the section has no body. The runner runs the
+  step's query a second time on a copy of the case session whose reads run
+  on the frozen engine v1 (`omnigraph_reference_engine::ReferenceEngine`,
+  installed through `Session::with_read_executor`), and compares those rows
+  with the step's v2 rows under the step's own mode word, `ordered` or
+  `unordered`. The step's rows expect still applies; the comparison is added
+  to it, never a replacement. Any v1 error, a v1 gate refusal included, or a
+  row difference fails the step. The section is refused on a mutate step, an
+  error expect, a `show` step and a `branch list` step, and anywhere but
+  directly after a query step's shape or plan section. The DST runner skips
+  the comparison. The reference answers `not { ... }` among the correlated
+  blocks only and refuses count predicates and a string `nearest` argument,
+  so a step using those carries no reference comparison.
 - `--- mutate via <api>` (one API of Execution routes, below) holding exactly one GQ declaration with a mutation body,
   followed by an optional `--- params` and a mandatory `--- expect` with
   mode word `ok` (success, counts unasserted),
@@ -945,8 +957,9 @@ root-relative name. `scope` accepts only `next_step`; `action` is `fail`,
 selects the declared `Fail` effect, falling back to `Contention` for
 compatibility when `Fail` is absent. Explicit `contention` selects only `Contention`, and `skip`
 selects only `Skip`; undeclared effects are refused. Thus a seam declaring
-both `Fail` and `Contention` lets a case choose either. `hold` is refused
-until a case can express two concurrent steps. `occurrence` is 1 to 1000000 and counts crossings of
+both `Fail` and `Contention` lets a case choose either. `hold` is refused: a
+named interleaving is a `--- concurrent` block (below), whose `park` entry
+holds a session at a store request. `occurrence` is 1 to 1000000 and counts crossings of
 that seam attributable to the selected operation, including its production
 retries. It starts at zero when the operation is armed. The installed
 decision passes the first N-1 crossings, fires on the Nth, and passes every
@@ -1076,8 +1089,98 @@ route refuses `--- restart` as `unsupported_capability: restart` until a
 handle-reopen control is qualified. Process restart
 is a distinct step under the sequential server lifecycle steps below; modeled
 server restart belongs to the Deterministic server execution proposal.
-Multi-connection interleavings and randomized fault discovery remain outside
-this format extension.
+Randomized fault discovery remains outside this format extension; a named
+multi-session interleaving is the `--- concurrent` block below.
+
+### Concurrent block
+
+A `--- concurrent` section runs two to four labeled GQ statements at the
+same time on the case's one handle, under the DST runner only, in an order
+the block names. It is one step of the case, with one ordinal, and the
+steps before and after it stay sequential.
+
+```text
+--- concurrent
+w1: query add_bob() { insert Person { name: "bob" } }
+r1: query all() { match { $p: Person } return { $p.name } }
+order: w1 park put __manifest/_versions/, r1 start, r1, w1 put __manifest/_versions/
+--- expect
+w1: ok
+r1: ok
+```
+
+A session line is `<label>[ on <branch>]: <statement>` at column 0, its
+statement continuing on the lines that follow up to the next session line
+or `order:` (a column-0 line shaped `word: …` opens a session); the label
+is `[a-z][a-z0-9]*`, unique in the block and not one of the reserved
+`setup`, `runner`, `step`, `order`; the branch is `main` when unspelled,
+and the statement is one query or mutation declaration with no parameters
+(`show`, branch, settings and `explain` statements are refused). Every
+session is a `Session` over the case handle, so the sessions share the
+handle's in-process locks the way a server's requests do, and a `#
+traversal:` pin applies to every session.
+
+`order:` is the block's last line: comma-separated entries, each one of
+
+- `<label> start`: the session's statement begins; the runner holds the
+  session before it, so a session can be made to begin inside another's
+  hold without naming a request the engine makes under a lock (a read's
+  first request is already under the handle's coordinator lock);
+- `<label>`: the session's completion (reported as `done`);
+- `<label> <verb> <key-suffix>`: the session's next store request whose
+  verb is `<verb>` (`get`, `head`, `put`, `list`, `delete`, `copy`) and
+  whose key contains `<key-suffix>`, run in turn: it starts when the cursor
+  reaches the entry and the cursor moves past the entry when the request
+  completes (a multipart write when its upload completes or aborts, a
+  listing when its first item or end arrives; a `copy` is named by its
+  destination key);
+- `<label> park <verb> <key-suffix>`: the session arrives at that request
+  and is held there, inside whatever the engine holds at that point, until
+  the label's next entry is due; arrival moves the cursor.
+
+A request an entry names waits until the cursor reaches it; a request no
+entry names runs at once, and a request made outside any session's future
+(a Lance pool thread, a task the engine spawned) can never be named; a
+session's completion waits for its `<label>` entry when the script has
+one. The runner refuses an entry naming an undeclared label, a `start`
+that is not its label's first entry, a `park` whose label's next entry is
+neither that request without `park` nor the label's completion, a
+completion entry followed by a later entry of the same label, and a block
+inside a `--- loop`. An entry naming a request the engine makes while
+holding a lock another session needs starves the block (the writer's
+manifest `put` is safe to park at; a read's `__manifest` listing is under
+the coordinator read lock and is not). The `--- expect` after the block is
+bare and its body names each session once, `<label>: ok` or
+`<label>: error: <needle>`, compared as a mutate or query step's `ok` and
+`error:` are; rows are not compared inside a block.
+
+The paused clock is the block's one hazard: the runtime auto-advances it
+to the next pending timer whenever it is idle, and a session waiting on the
+script is idle, so a parked writer would let the clock reach the engine's
+own far timers and the engine would time itself out. While a session waits
+on the script the block therefore drives the clock itself, one tick per
+scheduler turn up to ten virtual seconds past the last cursor move or
+request, so the other sessions' modeled request costs elapse and nothing
+farther fires; past that budget the clock stands still. The block fails as
+starved when neither an entry nor a request arrives for half the case's
+`timeout_ms` of wall time, at most ten seconds, or when a session finishes
+without a request entry of its own; a session blocked in the engine while
+no session waits on the script ends as the case's timeout. The evidence
+row `concurrent_block` carries each session's outcome, the entry the
+cursor stopped at and the block's failure, replay-compared; the grant
+sequence with its wall times and the count of requests made outside any
+session are measurements. Under `--measure`, each session is its own row
+of the cost report, labeled by its session label, and the block's own row
+holds the requests made outside any session, so a read's virtual time
+beside a write is a number a case can state. Once a block is starved its
+sessions drain, and the requests they make from then on are in phase
+`after_abort`, never in the session's own phases.
+
+The block names interleavings only. It does not choose them: a case whose
+sessions run by seed alone, with no `order:` line, is refused, because that
+is the DST fleet's job. Store requests are the only points a v1 entry can
+name; engine seams and in-process gates as entries, control statements as
+sessions, and sessions on separate handles are later amendments.
 
 ### Sequential server lifecycle steps
 
@@ -1093,7 +1196,9 @@ Each Failure cell is a requirement.
 | Physical read (`--- query via engine` after containment) | Owned root after containment; a read-only open comparing rows/pins against expectation | Refused while a serving process owns the root |
 
 These are sequential steps under the same one-at-a-time rule as every other
-step in a case. Named clients, holds and joins are a separate proposal.
+step in a case. A `--- concurrent` block's sessions are engine sessions on
+the case handle, not server clients; named server clients, holds and joins
+at the server are a separate proposal.
 This amendment spells no lifecycle step; until a later amendment adds their
 `--- <step>` forms no file contains one, and `via engine` in a file naming a
 server API is refused as `unsupported_capability: physical_read`; once they
@@ -1386,14 +1491,16 @@ and then parse; a substitution that produces an invalid section fails with
 the iteration named. Every surface named here is public today.
 
 Every case owns its store, so cases run concurrently (Runner mechanics
-below); within a case, steps are strictly sequential. Cases needing
+below); within a case, steps are strictly sequential, and a `--- concurrent`
+block is one step whose sessions overlap inside it. Cases needing
 process-global state stay Rust tests: the harness refuses a schema using
 `@embed` and a `nearest` over a string argument, both of which resolve an
 embedding provider from process environment variables
 (`EmbeddingClient::from_env`); a `nearest` over an explicit vector
 parameter stays in scope. Fault cases expressible by Faults at an explicit
 step may use GQT; other failpoint cases stay Rust tests. Interleaved writers
-and transaction races stay in the existing DST suites. Fault-enabled GQT
+and transaction races with a named interleaving are `--- concurrent` blocks;
+randomized interleavings stay in the existing DST suites. Fault-enabled GQT
 executions require the isolation described above; they cannot share a
 process-global hook with unrelated cases.
 
@@ -1532,7 +1639,7 @@ is registered at run time as its own libtest-compatible test (a libtest-mimic
 trial under `datatest-stable`) named `case::<relative/path>.gqt`. Shared cases
 live directly under `cases/`; v2-specific cases live in `cases/v2/`, with
 plan assertions in `cases/v2/planner/`. Directory placement is organizational:
-a case that requires v2 still explicitly selects `engine = v2`, and discovery
+every case runs on engine v2, the `engine` setting's one value, and discovery
 never supplies a setting. The runner it
 calls (parser, execution, comparison, bless) is the crate's library,
 `crates/omnigraph-gqt/src/lib.rs`, and the format self-tests are unit
@@ -1731,8 +1838,9 @@ forces the question:
   existing owner, `tests/proptest_equivalence.rs`.
 
 Whole-case execution across declared environments is distinct from the
-per-query second-plan verification deferred above. Multi-connection
-interleaving remains outside GQT and retains its existing DST owner.
+per-query second-plan verification deferred above. Randomized
+multi-connection interleaving remains outside GQT and retains its existing
+DST owner; a named interleaving is a `--- concurrent` block.
 
 ## Alternatives
 
@@ -1855,11 +1963,13 @@ the format defines:
 - `issue_563_underfill_retry.gqt`: edges only on the middle band the capped
   scan window excludes; red (retry disabled) returned zero rows, green
   returns exactly `chunk-08` and `chunk-09`.
-- `order_clause_aggregate_refused.gqt`, an `expect error` case pinning a
-  refusal on the order clause: an aggregate
-  written out in full in `order { }` rather than by its projection alias is
-  refused with the bare message `unsupported ordering expression` (the #566
-  shape), so the error path is exercised from day one.
+- `order_key_aggregate_or_node_binds_to_return_item.gqt` (named
+  `order_clause_aggregate_refused.gqt` until the 2026-09-27 entry of the
+  Decision log): an aggregate written out in full in `order { }` binds to the
+  `return` item that writes it. The case first pinned the engine v1 refusal
+  `unsupported ordering expression` (the
+  [#566](https://github.com/ModernRelay/omnigraph/issues/566) shape), so the
+  error path was exercised from day one.
 - `restart_survives_reopen.gqt` (feature case, `# issue: none`): the
   multi-step example in the Design section, inserts via mutate steps inside
   a `foreach`, asserts affected counts, restarts, reads back; pins that
@@ -1975,6 +2085,23 @@ supersedes their implicit execution and ambient-budget rules and assigns the
 complete corpus to the separate configured `GQ Logic Tests` context. Their
 historical command and configuration descriptions are not migration aliases.
 
+- 2026-09-28, the `--- concurrent` block: the format admits NAMED
+  multi-session interleavings, two to four sessions on the case handle
+  under the DST runner with an `order:` line over store requests and
+  completions, and a `park` entry that holds a session inside an engine
+  hold. Replaced sentences: "`hold` is refused until a case can express two
+  concurrent steps" (§Seams at an explicit step), "Multi-connection
+  interleavings and randomized fault discovery remain outside this format
+  extension" (§Explicit execution environments), "Named clients, holds and
+  joins are a separate proposal" (§Sequential server lifecycle steps),
+  "within a case, steps are strictly sequential" and "Interleaved writers
+  and transaction races stay in the existing DST suites" (§Execution
+  semantics), and "Multi-connection interleaving remains outside GQT and
+  retains its existing DST owner" (§Compatibility and reversibility).
+  Randomized interleavings keep their DST owner; a block with no `order:`
+  line is refused. First customer: a read on the writer's handle during a
+  publish, which waits behind the publish on this engine; its fix is a
+  separate change.
 - 2026-09-14, from the implementation of RFC 0066: the hook form of
   `--- fault` is replaced by `--- seam`. Replaced sentences: the directive
   definition ("A fault directive is a `--- fault` YAML section..."), the
@@ -2457,3 +2584,19 @@ historical command and configuration descriptions are not migration aliases.
   sentences on step kinds, step identity, migration and server `--- restart`
   are reworded for `via` and `--- cli`. Per
   [Self-contained server testing with GQT and DST](2026-09-26-self-contained-server-testing.md).
+- 2026-09-27, amendment from the PR that made engine v2 the only engine:
+  the `engine` setting keeps the one value `v2`, engine v1 moved into the
+  frozen crate `omnigraph-reference-engine`, and a query step reaches it only
+  through the new `--- expect same as v1` section (§Design, the reference
+  comparison). Superseded sentences: in the plan section, "The query's
+  effective engine must be v2, after applying the runner baseline, case
+  settings and query prefix. Under v1 the runner fails the step before
+  execution or explain because v1 produces no plan."; in §Runner mechanics,
+  "a case that requires v2 still explicitly selects `engine = v2`". The CI
+  mode that ran the corpus a second time with `OMNIGRAPH_GQ_ENGINE=v2` is
+  deleted; `OMNIGRAPH_GQ_ENGINE` accepts only `v2` or empty. The corpus
+  lost its `set engine = v1;` lines; two cases were renamed,
+  `order_clause_aggregate_refused.gqt` to
+  `order_key_aggregate_or_node_binds_to_return_item.gqt` (§Evidence and
+  tests) and `engine_v1_refuses_compound_predicates.gqt` to
+  `compound_and_bare_boolean_filters.gqt`.

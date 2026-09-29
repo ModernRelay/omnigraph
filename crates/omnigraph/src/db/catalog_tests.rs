@@ -283,7 +283,7 @@ async fn open_refuses_a_stamp_below_the_served_floor_before_any_effect() {
             };
             let error = result.err().expect("a v9 stamp is below the served floor");
             assert!(
-                error.to_string().contains("reads only v11 to v11"),
+                error.to_string().contains("reads only v11 to v12"),
                 "{error}"
             );
             assert!(error.to_string().contains("omnigraph upgrade"), "{error}");
@@ -1007,7 +1007,7 @@ mod migrations_tests {
         .unwrap();
         set_stamp(&mut manifest, 10).await.unwrap();
         let refused = guard_stamp(&manifest).unwrap_err().to_string();
-        assert!(refused.contains("reads only v11 to v11"), "{refused}");
+        assert!(refused.contains("reads only v11 to v12"), "{refused}");
         {
             let _admission = admit_conversion_source(root, 10);
             assert_eq!(guard_stamp(&manifest).unwrap(), 10);

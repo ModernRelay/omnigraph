@@ -1,6 +1,8 @@
 use super::*;
 
-use crate::engine::{evaluate_constant, id_in_list_expr, ir_expr_to_df_expr};
+use crate::engine::{
+    check_param_date_literals, evaluate_constant, id_in_list_expr, ir_expr_to_df_expr,
+};
 use crate::seams::{decide_seam, fail};
 use crate::session::Session;
 use crate::storage_layer::PendingScanBudget;
@@ -879,7 +881,7 @@ impl Omnigraph {
                         "prepared mutation authority changed before effects; repreparing"
                     );
                     crate::instrumentation::record_mutation_reprepare();
-                    self.refresh().await?;
+                    self.refresh_for_reprepare().await?;
                 }
                 result => return result,
             }
@@ -946,7 +948,7 @@ impl Omnigraph {
         // execution. A lowering/validation error returns exactly as it did
         // when this happened inside execute_named_mutation.
         let ir = self.lower_named_mutation(&txn.catalog, query_source, query_name)?;
-        super::query::check_param_date_literals(params, &ir.params)?;
+        check_param_date_literals(params, &ir.params)?;
         // Only an insert-only mutation is safe to replay automatically after a
         // pre-effect authority mismatch. Update/Delete keep strict caller-visible
         // `ReadSetChanged`; replaying their stale read-modify-write plan would be
@@ -974,12 +976,10 @@ impl Omnigraph {
                     // A no-op has no table transaction, so it never reaches
                     // `commit_all`. It still needs a linearization point for
                     // the caller's CAS promise: under the same schema -> branch
-                    // ordering as effectful writes, re-read the complete
+                    // ordering as effectful writes (shared permit — this pass
+                    // only reads the accepted view), re-read the complete
                     // authority and map a moved caller head to terminal 412.
-                    let _schema_guard = self
-                        .write_queue()
-                        .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
-                        .await;
+                    let _schema_permit = self.write_queue().acquire_schema_shared().await;
                     let _branch_guard = self
                         .write_queue()
                         .acquire_branch(requested.as_deref())
@@ -1000,7 +1000,7 @@ impl Omnigraph {
                 let lineage_intent = self
                     .new_lineage_intent_for_branch(requested.as_deref(), actor_id)
                     .await?;
-                // `_queue_guards` holds the root-shared schema gate, branch
+                // `_held_gates` holds the shared schema permit, branch
                 // effect gate, and sorted table gates acquired by `commit_all`.
                 // They remain held through manifest publication, covering the
                 // complete same-process effect lifetime. They are a local
@@ -1009,7 +1009,7 @@ impl Omnigraph {
                 let super::staging::CommittedMutation {
                     updates,
                     expected_versions,
-                    guards: _queue_guards,
+                    gates: _held_gates,
                 } = staged.commit_all(self, requested.as_deref(), &txn).await?;
                 // Failpoint for the detached-effects → publisher boundary:
                 // every table effect is committed detached but nothing is

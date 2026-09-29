@@ -463,10 +463,11 @@ sample.
 
 ## Diagnostic engine comparison
 
-`examples/compare_engines.rs` compares v1 and v2 through `Session::query`
-on the same synthetic graph and engine handle. It checks result columns,
-row counts and complete result equality before timing, then checks every
-measured result again outside the timer. The ten shapes cover lookup, narrow
+`examples/compare_engines.rs` times engine v2 through `Session::query` on a
+synthetic graph (engine v1 is the frozen test reference and has no production
+door to time). It checks row counts and records each shape's complete result
+before timing, then checks every measured result against it outside the
+timer. The ten shapes cover lookup, narrow
 and whole-node scans, filtering, counting, grouped aggregation, ordered top-k,
 traversal, filtered traversal and negation.
 
@@ -476,8 +477,8 @@ RUSTFLAGS= cargo run --release --locked -p omnigraph-bench --example compare_eng
 ```
 
 Setup, index construction, JSON conversion and verification are outside the
-measured window. Five warm-up passes precede 20 measured pairs; engine order
-alternates and query order rotates. The timer includes query compilation/cache
+measured window. Five warm-up passes precede 20 measured rounds; query order
+rotates. The timer includes query compilation/cache
 lookup, planning and execution through materialized result batches. Tokio uses
 four workers. The fixture has one edge per two nodes, a 1,080-byte biography
 and a 32-dimensional vector per node. Run sizes must be multiples of 100,
@@ -506,13 +507,10 @@ commit, dirty-state and compiler facts identify the compiled code; the memory
 diagnostic additionally hashes its executable and embedded source before
 measurement. Output is diagnostic evidence, never a qualified performance claim.
 
-Before timing, both engines are checked against complete fixture-derived
-results and against each other. A known v1 destination-search mismatch is
-recorded and that engine/shape is excluded from timing; every other mismatch
-refuses the run. Every timed answer is checked outside the timer. Each
-engine/shape/repeat uses a fresh child, so peak RSS cannot inherit another
-engine's high-water mark. `ru_maxrss` includes opening, warmups and result
+Before timing, engine v2 is checked against complete fixture-derived
+results; a mismatch refuses the run. Every timed answer is checked outside
+the timer. Each shape/repeat uses a fresh child, so peak RSS cannot inherit
+another shape's high-water mark. `ru_maxrss` includes opening, warmups and result
 verification: it is a process upper bound, not operator live memory. The OS
-page cache is uncontrolled. An even repeat count balances which engine runs
-first. `--out` is required and existing output files are refused. `--store`,
+page cache is uncontrolled. `--out` is required and existing output files are refused. `--store`,
 when supplied, must be empty; an old fixture is not trusted from its row count.

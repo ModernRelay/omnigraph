@@ -345,6 +345,62 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
     );
 }
 
+/// A legacy-column graph reaches this binary at v11 (every upgrade route ends
+/// there) and is respelled as it is; the respelling's own publish converts
+/// main to v12 like any publish, and the report says so.
+#[tokio::test]
+async fn system_column_upgrade_respells_a_v11_graph_and_its_publish_converts_it() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = legacy_graph_with_data(&dir).await;
+    let export_before = db.export_jsonl("main", &[]).await.unwrap();
+    drop(db);
+    let mut manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
+        .await
+        .unwrap();
+    omnigraph_catalog::migrations::restamp_flat_for_test(&mut manifest, 11)
+        .await
+        .unwrap();
+    drop(manifest);
+
+    let db = helpers::session(Omnigraph::open(uri).await.unwrap());
+    let check = db
+        .upgrade_system_columns(SystemColumnUpgradeOptions { check: true })
+        .await
+        .unwrap();
+    assert_eq!(
+        check.outcome,
+        SystemColumnUpgradeOutcome::CheckPassed,
+        "{check:?}"
+    );
+    assert_eq!((check.stamp_before, check.stamp_after), (11, 11));
+
+    let report = db
+        .upgrade_system_columns(SystemColumnUpgradeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        report.outcome,
+        SystemColumnUpgradeOutcome::Completed,
+        "{report:?}"
+    );
+    assert_eq!((report.stamp_before, report.stamp_after), (11, 12));
+    assert_eq!(
+        db.internal_schema_version_of(omnigraph::db::ReadTarget::branch("main"))
+            .await
+            .unwrap(),
+        12,
+        "the respelling's publish converts main like any publish"
+    );
+    assert_eq!(db.export_jsonl("main", &[]).await.unwrap(), export_before);
+    assert_eq!(count_rows(&db, "node:Person").await, 2);
+    let result = query_main(&db, COMPANY_QUERY, "company_identity", &ParamMap::new())
+        .await
+        .unwrap();
+    assert_eq!(collect_column_strings(result.batches(), "c.name"), ["Acme"]);
+}
+
 #[tokio::test]
 async fn system_column_upgrade_keeps_history_readable_after_a_user_id_property() {
     let _scenario = FailScenario::setup();

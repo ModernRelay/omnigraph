@@ -1,0 +1,145 @@
+# issue: none
+# notes: `search`, `fuzzy` and `match_text` as match filters over full-text indexed columns.
+# notes: `search` keeps the docs whose title holds the token, an unknown token keeps none,
+# notes: `fuzzy` matches nothing under the default tokenizer (a documented limitation: if a
+# notes: Lance or tokenizer change makes it match, promote the step to a matched set), and
+# notes: `match_text` keeps exactly the docs whose body holds the phrase or, as its FTS
+# notes: fallback, its tokens. Replaces the Rust tests text_search_filters_results,
+# notes: text_search_no_results, fuzzy_search_tolerates_typos, fuzzy_does_not_match_under_default_tokenizer,
+# notes: phrase_search_matches_exact_phrase, phrase_search_is_documented_fts_fallback and
+# notes: match_text_matches_exact_set_excludes_unrelated (search.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    title: String @index
+    body: String @index
+    embedding: Vector(4)
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"ml-intro","title":"Introduction to Machine Learning","body":"Machine learning is a subset of artificial intelligence that focuses on algorithms","embedding":[0.1,0.2,0.3,0.4]}}
+{"type":"Doc","data":{"slug":"dl-basics","title":"Deep Learning Basics","body":"Deep learning uses neural networks with many layers to learn representations","embedding":[0.5,0.6,0.7,0.8]}}
+{"type":"Doc","data":{"slug":"nlp-guide","title":"Natural Language Processing Guide","body":"NLP applies machine learning to understand and generate human language","embedding":[0.2,0.3,0.4,0.5]}}
+{"type":"Doc","data":{"slug":"cv-overview","title":"Computer Vision Overview","body":"Computer vision enables machines to interpret visual information from images","embedding":[0.8,0.7,0.6,0.5]}}
+{"type":"Doc","data":{"slug":"rl-intro","title":"Reinforcement Learning Introduction","body":"Reinforcement learning trains agents through reward and punishment signals","embedding":[0.3,0.4,0.5,0.6]}}
+
+--- query
+query text_search($q: String) {
+    match {
+        $d: Doc
+        search($d.title, $q)
+    }
+    return { $d.slug, $d.title }
+}
+
+--- params
+{"q": "Learning"}
+
+--- expect unordered
+{"d.slug": "ml-intro", "d.title": "Introduction to Machine Learning"}
+{"d.slug": "dl-basics", "d.title": "Deep Learning Basics"}
+{"d.slug": "rl-intro", "d.title": "Reinforcement Learning Introduction"}
+
+--- expect shape
+d.slug: String
+d.title: String
+
+--- query
+query text_search_unknown($q: String) {
+    match {
+        $d: Doc
+        search($d.title, $q)
+    }
+    return { $d.slug, $d.title }
+}
+
+--- params
+{"q": "xyznonexistent"}
+
+--- expect unordered
+
+--- expect shape
+d.slug: String
+d.title: String
+
+--- query
+query fuzzy_search($q: String) {
+    match {
+        $d: Doc
+        fuzzy($d.title, $q, 2)
+    }
+    return { $d.slug, $d.title }
+}
+
+--- params
+{"q": "Introductio"}
+
+--- expect unordered
+
+--- expect shape
+d.slug: String
+d.title: String
+
+--- query
+query phrase_search($q: String) {
+    match {
+        $d: Doc
+        match_text($d.body, $q)
+    }
+    return { $d.slug, $d.title }
+}
+
+--- params
+{"q": "neural networks"}
+
+--- expect unordered
+{"d.slug": "dl-basics", "d.title": "Deep Learning Basics"}
+
+--- expect shape
+d.slug: String
+d.title: String
+
+--- query
+query phrase_search_token_fallback($q: String) {
+    match {
+        $d: Doc
+        match_text($d.body, $q)
+    }
+    return { $d.slug, $d.title }
+}
+
+--- params
+{"q": "networks layers"}
+
+--- expect unordered
+{"d.slug": "dl-basics", "d.title": "Deep Learning Basics"}
+
+--- expect shape
+d.slug: String
+d.title: String
+
+--- query
+query phrase_search_one_token($q: String) {
+    match {
+        $d: Doc
+        match_text($d.body, $q)
+    }
+    return { $d.slug, $d.title }
+}
+
+--- params
+{"q": "neural"}
+
+--- expect unordered
+{"d.slug": "dl-basics", "d.title": "Deep Learning Basics"}
+
+--- expect shape
+d.slug: String
+d.title: String

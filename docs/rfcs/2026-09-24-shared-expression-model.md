@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-09-24
-updated: 2026-09-24
+updated: 2026-09-27
 discussion: null
 supersedes: []
 superseded_by: []
@@ -92,8 +92,9 @@ An `order` key is a property access or a return alias and nothing else
 `hidden_columns` arms, `crates/omnigraph/src/engine/lower.rs:752-757,832-835`,
 refuse a key of any other shape with an internal error, since the planner
 binds every key before the engine sees it). `order { count($d) desc }`
-is refused; the `.gqt` case `order_clause_aggregate_refused.gqt` pins the
-refusal. That is part 3 of issue
+is refused; the `.gqt` case `order_clause_aggregate_refused.gqt` (renamed
+`order_key_aggregate_or_node_binds_to_return_item.gqt`, Decision log
+2026-09-27) pins the refusal. That is part 3 of issue
 [566](https://github.com/ModernRelay/omnigraph/issues/566).
 
 The three gaps have one cause. A condition exists in four AST shapes: `Filter
@@ -492,11 +493,14 @@ stored query can take, since a stored query carries no settings (see
 query, the ordinary error stands alone: a type error or a parse error names
 the fault and says nothing about engines, because switching would not help.
 The door decides which of the two it is: it runs the compile first, so a
-query that fails to compile never reaches the engine check. The setting stays explicit on purpose: v2 becomes the
-default in the release after it has served one full release without a
-finding from the `engine-v2` mode of the GQ logic-test matrix, and that flip is a release decision outside this RFC.
-Mutations have one execution path shared by both settings, so a compound
-`where` works under either.
+query that fails to compile never reaches the engine check. Amended
+2026-09-27 (Decision log): v2 became the only engine in v0.12.0, the same
+release as this RFC, instead of the release after, so the gate and its
+error text above never reach a user. The `engine` setting keeps the one
+value `v2`, `v1` is refused as an unknown value, and engine v1 is the frozen
+test reference `omnigraph-reference-engine`, reached only through a GQT
+step's `--- expect same as v1`.
+Mutations have one execution path, so a compound `where` works as before.
 
 ### Errors and explain
 
@@ -887,7 +891,8 @@ side channel or precondition.
 compatibility promise for query text, plan hashes or explain output. Where
 a better language and an unchanged behavior conflict, the language wins and
 the `.gqt` case that pinned the old behavior is edited, as
-`order_clause_aggregate_refused.gqt` is in phase 3. Every query that parses
+`order_clause_aggregate_refused.gqt` is in phase 3 (renamed
+`order_key_aggregate_or_node_binds_to_return_item.gqt`). Every query that parses
 today parses after this RFC, except one whose bare mutation property or
 return alias is one of the five reserved words; that break is named below. What the design does
 preserve, it preserves because of that and because the removed types are
@@ -1102,7 +1107,9 @@ are the ones that do not.
   `return` sorts by tree equality; `order { max($d.amount) }` with no
   matching return item expects `T42`. `order_clause_aggregate_refused.gqt`
   flips its first step to a positive case and keeps its second as the `T42`
-  control. A property key absent from `return` keeps sorting through the
+  control; it is now `order_key_aggregate_or_node_binds_to_return_item.gqt`,
+  and the `T42` control lives in
+  `issue_566_order_key_binds_to_return_item.gqt`. A property key absent from `return` keeps sorting through the
   hidden column: the five corpus files that do this today
   (`parallel_edge_ties_keep_page_boundaries.gqt`,
   `limit_page_boundary_under_tied_keys_of_two_bindings.gqt`,
@@ -1260,3 +1267,15 @@ None.
   [566](https://github.com/ModernRelay/omnigraph/issues/566) part 3 and a
   source survey of two open-source query engines; rationales
   are in the body.
+- 2026-09-27, amendment from the PR that made engine v2 the only engine
+  (v0.12.0): the flip this RFC left to "the release after" happened in the
+  same release. Superseded sentence in "User and operational behavior":
+  "The setting stays explicit on purpose: v2 becomes the default in the
+  release after it has served one full release without a finding from the
+  `engine-v2` mode of the GQ logic-test matrix, and that flip is a release
+  decision outside this RFC." The `engine-v2` matrix mode is deleted. The
+  v1 gate text, its error and the both-settings evidence below stay as the
+  record of what phase 2 shipped; engine v1 now runs only as the frozen
+  reference in `omnigraph-reference-engine`, and a user sees no gate
+  error. `order_clause_aggregate_refused.gqt` is renamed
+  `order_key_aggregate_or_node_binds_to_return_item.gqt`.

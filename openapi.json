@@ -4884,7 +4884,7 @@
           "internal_schema_version": {
             "type": "integer",
             "format": "int32",
-            "description": "The internal-schema (storage-format) version this binary serves; a\ngraph at any other stamp is refused until an explicit upgrade.",
+            "description": "The internal-schema (storage-format) version this binary writes, the\ntop of the range it serves (v11 and v12 today; a v11 branch converts on\nits next publish); a graph outside that range is refused until an\nexplicit upgrade.",
             "minimum": 0
           },
           "source_version": {
@@ -5651,9 +5651,8 @@
           },
           "engine": {
             "type": "string",
-            "description": "whether a read query runs through engine version 2, the plan runner; this setting does not change change-feed or merge execution",
+            "description": "the engine a read query runs on; `v2`, the plan runner, is the one value; this setting does not change change-feed or merge execution",
             "enum": [
-              "v1",
               "v2"
             ]
           },
@@ -5732,7 +5731,7 @@
           "internal_schema_version": {
             "type": "integer",
             "format": "int32",
-            "description": "The on-disk internal-schema (storage-format) version this graph's branch\nis stamped at.",
+            "description": "The on-disk internal-schema (storage-format) version this graph's branch\nis stamped at. Branches of one graph can differ (v11 beside v12) while a\nv11 graph converts branch by branch on publish.",
             "minimum": 0
           }
         }

@@ -41,7 +41,7 @@ fn assert_memory_refusal(error: OmniError, limit: u64) {
     );
 }
 
-/// Compare ordered aggregate rows to the frozen executor while proving that
+/// Compare ordered aggregate rows to the unbounded run while proving that
 /// AggregateExec spilled. A successful non-spilling run is not acceptance.
 #[tokio::test]
 #[serial]
@@ -119,11 +119,11 @@ node Item {
         }
         out
     }
-    let v1_session = with_setting(&db, "engine", "v1");
-    let v1 = query_main(&v1_session, &query, "totals", &params(&[]))
+    let v2 = with_setting(&db, "engine", "v2");
+    let unbounded = query_main(&v2, &query, "totals", &params(&[]))
         .await
         .unwrap();
-    let expected = rows(v1.batches());
+    let expected = rows(unbounded.batches());
     assert_eq!(expected.len(), 32);
     assert_eq!(
         expected
@@ -137,7 +137,6 @@ node Item {
     assert!(expected.iter().all(|(_, count, values)| *count == 1
         && values.len() == 9
         && values.iter().all(|value| *value == 1.0_f64.to_bits())));
-    let v2 = with_setting(&db, "engine", "v2");
     let mut spilled = false;
     let mut diagnostics = Vec::new();
     for limit in [
@@ -1609,4 +1608,83 @@ async fn a_contains_join_and_its_cross_join_agree_on_generated_texts_over_severa
         assert_eq!(joined, crossed, "{extra}");
         assert_eq!(joined, expected, "{extra}");
     }
+}
+
+/// GQT reads no operator counter, so the pairs the multi-hop BFS handed on
+/// before a trailing `limit` dropped its stream are visible only here.
+#[tokio::test]
+#[serial]
+async fn multi_hop_expand_stops_at_the_limit_it_feeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = session(
+        Omnigraph::init(
+            dir.path().to_str().unwrap(),
+            "node Person { name: String @key } edge Knows: Person -> Person",
+        )
+        .await
+        .unwrap(),
+    );
+    let width = 64;
+    let mut lines = vec![serde_json::json!({"type":"Person","data":{"name":"hub"}}).to_string()];
+    for i in 0..width {
+        for role in ["s", "t"] {
+            lines.push(
+                serde_json::json!({"type":"Person","data":{"name":format!("{role}{i:03}")}})
+                    .to_string(),
+            );
+        }
+    }
+    for i in 0..width {
+        lines.push(
+            serde_json::json!({"edge":"Knows","from":format!("s{i:03}"),"to":"hub"}).to_string(),
+        );
+        lines.push(
+            serde_json::json!({"edge":"Knows","from":"hub","to":format!("t{i:03}")}).to_string(),
+        );
+    }
+    db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let v2 = with_setting(&db, "engine", "v2");
+    let queries = r#"
+query first() {
+    match { $p: Person $p knows{1,2} $f }
+    return { $f.name }
+    limit 1
+}
+query all() {
+    match { $p: Person $p knows{1,2} $f }
+    return { count($f) as n }
+}"#;
+    let pairs = width * (width + 1) + width;
+    let emitted = |probes: &QueryMemoryProbes| -> usize {
+        probes
+            .execution_metrics()
+            .iter()
+            .filter(|metric| metric.operator == "ExpandExec")
+            .filter_map(|metric| metric.values.get("expand_pairs").copied())
+            .sum()
+    };
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        query_main(&v2, queries, "first", &params(&[])),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first_column_sorted(&result).len(), 1);
+    let stopped = emitted(&probes);
+    assert!(
+        (1..=4 * 256).contains(&stopped),
+        "the walk handed on {stopped} of {pairs} pairs before the limit dropped its stream; \
+         at most four 256-pair chunks fit: one consumed, two queued, one blocked at send"
+    );
+    let probes = QueryMemoryProbes::default();
+    with_query_memory_probes(
+        probes.clone(),
+        query_main(&v2, queries, "all", &params(&[])),
+    )
+    .await
+    .unwrap();
+    assert_eq!(emitted(&probes), pairs, "a full drain hands on every pair");
 }
