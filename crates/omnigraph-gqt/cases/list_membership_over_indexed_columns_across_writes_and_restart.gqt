@@ -1,0 +1,596 @@
+# issue: none
+# traversal: indexed
+# notes: `in` over indexed columns across writes and a restart: setup builds indexes because traversal is pinned.
+# notes: The system String identity, I32 and Date have scalar indexes; word has none.
+# notes: Mutations leave uncovered tail rows and changed covered rows, then restart reopens them.
+# notes: Rows and planner placement are asserted; this does not assert a Lance ScalarIndexQuery.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Root {
+    rid: String @key
+}
+node Item {
+    slug: String @key
+    code: I32? @index
+    day: Date? @index
+    word: String?
+    unused: String?
+}
+edge Holds: Root -> Item
+
+--- seed
+{"type":"Root","data":{"rid":"root"}}
+{"type":"Item","data":{"slug":"a","code":1,"day":"2024-01-01","word":"alpha"}}
+{"type":"Item","data":{"slug":"b","code":2,"day":"2024-02-02","word":"beta"}}
+{"type":"Item","data":{"slug":"c","code":3,"day":"2024-03-03","word":"gamma"}}
+{"type":"Item","data":{"slug":"z"}}
+{"edge":"Holds","from":"root","to":"a"}
+{"edge":"Holds","from":"root","to":"b"}
+{"edge":"Holds","from":"root","to":"c"}
+{"edge":"Holds","from":"root","to":"z"}
+
+--- query
+set engine = v2;
+query membership_of_a_node() {
+    match {
+        $r: Root
+        $r in $i
+    }
+    return { $r.rid }
+}
+
+--- expect error: T7: `$r in $i` tests membership and `$r` is a node; `in` takes a value on the left and a list on the right
+
+--- query
+set engine = v2;
+query indexed_identity($ids: [String]) {
+    match {
+        $i: Item
+        $i.@id in $ids
+    }
+    return { $i.slug }
+}
+
+--- params
+{"ids":["a","c","tail","absent"]}
+
+--- expect unordered
+{"i.slug":"a"}
+{"i.slug":"c"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: filter reads [i.__id]
+scan Item as $i: not columns [unused]
+pass predicate_pushdown
+
+
+--- query
+set engine = v2;
+query indexed_integer() {
+    match {
+        $i: Item
+        $i.code in [1, 3, 7, 9]
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug":"a"}
+{"i.slug":"c"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: filter reads [i.code]
+scan Item as $i: not columns [unused]
+pass predicate_pushdown
+
+
+--- query
+set engine = v2;
+query indexed_date($days: [Date]) {
+    match {
+        $i: Item
+        $i.day in $days
+    }
+    return { $i.slug }
+}
+
+--- params
+{"days":["2024-01-01","2024-03-03","2024-07-07","2024-09-09"]}
+
+--- expect unordered
+{"i.slug":"a"}
+{"i.slug":"c"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: filter reads [i.day]
+scan Item as $i: not columns [unused]
+pass predicate_pushdown
+
+
+--- query
+set engine = v2;
+query string_without_an_index() {
+    match {
+        $i: Item
+        $i.word in ["alpha", "gamma", "theta", "omega"]
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug":"a"}
+{"i.slug":"c"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: filter reads [i.word]
+scan Item as $i: not columns [unused]
+pass predicate_pushdown
+
+
+--- query
+set engine = v2;
+query indexed_negated() {
+    match {
+        $i: Item
+        not ($i.code in [1, 3, 7, 9])
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug":"b"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: filter reads [i.code]
+scan Item as $i: not columns [unused]
+pass predicate_pushdown
+
+
+--- mutate
+query append_tail() {
+    insert Item { slug: "tail", code: 7, day: date("2024-07-07"), word: "theta" }
+    insert Item { slug: "tail_miss", code: 8, day: date("2024-08-08"), word: "other" }
+    insert Holds { from: "root", to: "tail" }
+    insert Holds { from: "root", to: "tail_miss" }
+}
+
+--- expect affected: nodes=2 edges=2
+
+--- query
+set engine = v2;
+query tail_identity($ids: [String]) {
+    match {
+        $r: Root { rid: "root" }
+        $r holds $i
+        $i.@id in $ids
+    }
+    return { $i.slug }
+}
+
+--- params
+{"ids":["a","c","tail","absent"]}
+
+--- expect unordered
+{"i.slug":"a"}
+{"i.slug":"c"}
+{"i.slug":"tail"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: filter reads [i.__id]
+scan Item as $i: not columns [unused]
+pass predicate_pushdown
+expand $r Holds $i: mode indexed_scan ran indexed_scan
+
+
+--- query
+set engine = v2;
+query tail_integer() {
+    match {
+        $r: Root { rid: "root" }
+        $r holds $i
+        $i.code in [1, 3, 7, 9]
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug":"a"}
+{"i.slug":"c"}
+{"i.slug":"tail"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: filter reads [i.code]
+scan Item as $i: not columns [unused]
+pass predicate_pushdown
+expand $r Holds $i: mode indexed_scan ran indexed_scan
+
+
+--- query
+set engine = v2;
+query tail_date($days: [Date]) {
+    match {
+        $r: Root { rid: "root" }
+        $r holds $i
+        $i.day in $days
+    }
+    return { $i.slug }
+}
+
+--- params
+{"days":["2024-01-01","2024-03-03","2024-07-07","2024-09-09"]}
+
+--- expect unordered
+{"i.slug":"a"}
+{"i.slug":"c"}
+{"i.slug":"tail"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: filter reads [i.day]
+scan Item as $i: not columns [unused]
+pass predicate_pushdown
+expand $r Holds $i: mode indexed_scan ran indexed_scan
+
+
+--- query
+set engine = v2;
+query tail_string() {
+    match {
+        $r: Root { rid: "root" }
+        $r holds $i
+        $i.word in ["alpha", "gamma", "theta", "omega"]
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug":"a"}
+{"i.slug":"c"}
+{"i.slug":"tail"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: filter reads [i.word]
+scan Item as $i: not columns [unused]
+pass predicate_pushdown
+expand $r Holds $i: mode indexed_scan ran indexed_scan
+
+
+--- mutate
+query change_covered_rows() {
+    update Item set { code: 10, day: date("2024-10-10"), word: "outside" } where slug = "a"
+    update Item set { code: 7, day: date("2024-07-07"), word: "theta" } where slug = "b"
+}
+
+--- expect affected: nodes=2 edges=0
+
+--- query
+set engine = v2;
+query updated_integer() {
+    match {
+        $r: Root { rid: "root" }
+        $r holds $i
+        $i.code in [1, 3, 7, 9]
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug":"b"}
+{"i.slug":"c"}
+{"i.slug":"tail"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: filter reads [i.code]
+scan Item as $i: not columns [unused]
+pass predicate_pushdown
+expand $r Holds $i: mode indexed_scan ran indexed_scan
+
+
+--- query
+set engine = v2;
+query updated_date($days: [Date]) {
+    match {
+        $r: Root { rid: "root" }
+        $r holds $i
+        $i.day in $days
+    }
+    return { $i.slug }
+}
+
+--- params
+{"days":["2024-01-01","2024-03-03","2024-07-07","2024-09-09"]}
+
+--- expect unordered
+{"i.slug":"b"}
+{"i.slug":"c"}
+{"i.slug":"tail"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: filter reads [i.day]
+scan Item as $i: not columns [unused]
+pass predicate_pushdown
+expand $r Holds $i: mode indexed_scan ran indexed_scan
+
+
+--- query
+set engine = v2;
+query updated_string() {
+    match {
+        $r: Root { rid: "root" }
+        $r holds $i
+        $i.word in ["alpha", "gamma", "theta", "omega"]
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug":"b"}
+{"i.slug":"c"}
+{"i.slug":"tail"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: filter reads [i.word]
+scan Item as $i: not columns [unused]
+pass predicate_pushdown
+expand $r Holds $i: mode indexed_scan ran indexed_scan
+
+
+--- mutate
+query delete_covered_member() {
+    delete Item where slug = "c"
+}
+
+--- expect affected: nodes=1 edges=1
+
+--- query
+set engine = v2;
+query deleted_identity($ids: [String]) {
+    match {
+        $r: Root { rid: "root" }
+        $r holds $i
+        $i.@id in $ids
+    }
+    return { $i.slug }
+}
+
+--- params
+{"ids":["a","c","tail","absent"]}
+
+--- expect unordered
+{"i.slug":"a"}
+{"i.slug":"tail"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: filter reads [i.__id]
+scan Item as $i: not columns [unused]
+pass predicate_pushdown
+expand $r Holds $i: mode indexed_scan ran indexed_scan
+
+
+--- query
+set engine = v2;
+query deleted_integer() {
+    match {
+        $r: Root { rid: "root" }
+        $r holds $i
+        $i.code in [1, 3, 7, 9]
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug":"b"}
+{"i.slug":"tail"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: filter reads [i.code]
+scan Item as $i: not columns [unused]
+pass predicate_pushdown
+expand $r Holds $i: mode indexed_scan ran indexed_scan
+
+
+--- query
+set engine = v2;
+query deleted_negated() {
+    match {
+        $r: Root { rid: "root" }
+        $r holds $i
+        not ($i.code in [1, 3, 7, 9])
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug":"a"}
+{"i.slug":"tail_miss"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: filter reads [i.code]
+scan Item as $i: not columns [unused]
+pass predicate_pushdown
+expand $r Holds $i: mode indexed_scan ran indexed_scan
+
+
+--- restart
+
+--- query
+set engine = v2;
+query reopened_identity($ids: [String]) {
+    match {
+        $r: Root { rid: "root" }
+        $r holds $i
+        $i.@id in $ids
+    }
+    return { $i.slug }
+}
+
+--- params
+{"ids":["a","c","tail","absent"]}
+
+--- expect unordered
+{"i.slug":"a"}
+{"i.slug":"tail"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: filter reads [i.__id]
+scan Item as $i: not columns [unused]
+pass predicate_pushdown
+expand $r Holds $i: mode indexed_scan ran indexed_scan
+
+
+--- query
+set engine = v2;
+query reopened_integer() {
+    match {
+        $r: Root { rid: "root" }
+        $r holds $i
+        $i.code in [1, 3, 7, 9]
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug":"b"}
+{"i.slug":"tail"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: filter reads [i.code]
+scan Item as $i: not columns [unused]
+pass predicate_pushdown
+expand $r Holds $i: mode indexed_scan ran indexed_scan
+
+
+--- query
+set engine = v2;
+query reopened_date($days: [Date]) {
+    match {
+        $r: Root { rid: "root" }
+        $r holds $i
+        $i.day in $days
+    }
+    return { $i.slug }
+}
+
+--- params
+{"days":["2024-01-01","2024-03-03","2024-07-07","2024-09-09"]}
+
+--- expect unordered
+{"i.slug":"b"}
+{"i.slug":"tail"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: filter reads [i.day]
+scan Item as $i: not columns [unused]
+pass predicate_pushdown
+expand $r Holds $i: mode indexed_scan ran indexed_scan
+
+
+--- query
+set engine = v2;
+query reopened_string() {
+    match {
+        $r: Root { rid: "root" }
+        $r holds $i
+        $i.word in ["alpha", "gamma", "theta", "omega"]
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug":"b"}
+{"i.slug":"tail"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: filter reads [i.word]
+scan Item as $i: not columns [unused]
+pass predicate_pushdown
+expand $r Holds $i: mode indexed_scan ran indexed_scan
+
+
+--- query
+set engine = v2;
+query reopened_negated() {
+    match {
+        $r: Root { rid: "root" }
+        $r holds $i
+        not ($i.code in [1, 3, 7, 9])
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug":"a"}
+{"i.slug":"tail_miss"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: filter reads [i.code]
+scan Item as $i: not columns [unused]
+pass predicate_pushdown
+expand $r Holds $i: mode indexed_scan ran indexed_scan
+
+

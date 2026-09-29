@@ -735,10 +735,10 @@ fn parse_traversal(pair: pest::iterators::Pair<Rule>) -> Result<Traversal> {
     let (edge_name, undirected) = match edge_pair.as_rule() {
         // `<edge>` — the inner edge_ident carries the name.
         Rule::undirected_edge => (
-            edge_pair.into_inner().next().unwrap().as_str().to_string(),
+            parse_edge_name(edge_pair.into_inner().next().unwrap())?,
             true,
         ),
-        _ => (edge_pair.as_str().to_string(), false),
+        _ => (parse_edge_name(edge_pair)?, false),
     };
     let mut min_hops = 1u32;
     let mut max_hops = Some(1u32);
@@ -767,6 +767,27 @@ fn parse_traversal(pair: pest::iterators::Pair<Rule>) -> Result<Traversal> {
         undirected,
         edge_binding,
     })
+}
+
+/// The edge a traversal names, bare or as a string; the string holds what the
+/// bare form would, so `"in"` names the edge a reserved word cannot.
+fn parse_edge_name(pair: pest::iterators::Pair<Rule>) -> Result<String> {
+    if pair.as_rule() != Rule::string_lit {
+        return Ok(pair.as_str().to_string());
+    }
+    let name = parse_string_lit(pair.as_str())?;
+    let mut chars = name.chars();
+    let starts = chars
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase() || first == '_');
+    if starts && chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        Ok(name)
+    } else {
+        Err(CompilerError::Parse(format!(
+            "`{}` is not an edge name; a quoted edge is its bare name in quotes, as in `$a \"in\" $b`",
+            pair.as_str()
+        )))
+    }
 }
 
 fn parse_traversal_bounds(pair: pest::iterators::Pair<Rule>) -> Result<(u32, Option<u32>)> {
@@ -825,6 +846,13 @@ fn parse_expr(pair: pest::iterators::Pair<Rule>, scope: NameScope<'_>) -> Result
                     let op = parse_filter_op(part)?;
                     let right = parse_operand(parts.next().unwrap(), scope)?;
                     Ok(Expr::comparison(left, op, right))
+                }
+                Some(part) if part.as_rule() == Rule::kw_in => {
+                    let list = parse_operand(parts.next().unwrap(), scope)?;
+                    Ok(Expr::In {
+                        needle: Box::new(left),
+                        list: Box::new(list),
+                    })
                 }
                 Some(null_test) => {
                     let negated = null_test

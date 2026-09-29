@@ -866,6 +866,9 @@ fn comparison_to_df_expr(
     use datafusion::functions_nested::expr_fn::array_has;
 
     if matches!(op, CompOp::Contains) {
+        if let Some(items) = list_constant(left, params) {
+            return list_membership_to_df_expr(items, right, params, schema);
+        }
         let left = ir_expr_to_expr(left, params, None)?;
         let right = ir_expr_to_expr(right, params, None)?;
         return Some(array_has(left, right));
@@ -896,6 +899,47 @@ fn comparison_to_df_expr(
             unreachable!("handled above")
         }
     })
+}
+
+/// The elements of a list literal or a parameter bound to a list.
+fn list_constant<'a>(expr: &'a IRExpr, params: &'a ParamMap) -> Option<&'a [Literal]> {
+    let literal = match expr {
+        IRExpr::Literal(literal) => literal,
+        IRExpr::Param(name) => params.get(name)?,
+        _ => return None,
+    };
+    match literal {
+        Literal::List(items) => Some(items),
+        _ => None,
+    }
+}
+
+/// `[a, b] contains $x.p` as `p IN (a, b)`, each value typed toward the column
+/// so a scalar index serves it; a null element matches nothing and is left out.
+/// A set with no value is `p IS NULL AND NULL`: null for a null needle, else false.
+fn list_membership_to_df_expr(
+    items: &[Literal],
+    needle: &IRExpr,
+    params: &ParamMap,
+    schema: Option<&Schema>,
+) -> Option<datafusion::prelude::Expr> {
+    use datafusion::prelude::lit as df_lit;
+    use datafusion::scalar::ScalarValue;
+
+    if !matches!(needle, IRExpr::PropAccess { .. }) {
+        return None;
+    }
+    let column = ir_expr_to_expr(needle, params, None)?;
+    let target = prop_data_type(needle, schema);
+    let values = items
+        .iter()
+        .filter(|item| !matches!(item, Literal::Null))
+        .map(|item| literal_to_expr_coerced(item, target.as_ref()))
+        .collect::<Option<Vec<_>>>()?;
+    if values.is_empty() {
+        return Some(column.is_null().and(df_lit(ScalarValue::Boolean(None))));
+    }
+    Some(column.in_list(values, false))
 }
 
 /// One side of an ordering comparison: a Boolean subtree (`(age > 30) = true`)
@@ -1075,11 +1119,31 @@ pub(super) fn hconcat_batches(left: &RecordBatch, right: &RecordBatch) -> Result
 
 #[cfg(test)]
 mod coercion_tests {
-    use super::literal_to_expr_coerced;
+    use super::{ir_expr_to_df_expr, literal_to_expr_coerced};
     use arrow_schema::DataType;
     use datafusion::prelude::Expr;
     use datafusion::scalar::ScalarValue;
-    use omnigraph_compiler::query::ast::Literal;
+    use omnigraph_compiler::ir::{IRExpr, ParamMap};
+    use omnigraph_compiler::query::ast::{BinaryOp, CompOp, Literal};
+
+    /// GQ's JSON parameters refuse a null list element; an embedded `ParamMap` carries one.
+    #[test]
+    fn a_null_list_element_is_left_out_of_the_pushed_membership() {
+        let lowered = |items: Vec<Literal>| {
+            let filter = IRExpr::Binary {
+                left: Box::new(IRExpr::Literal(Literal::List(items))),
+                op: BinaryOp::Compare(CompOp::Contains),
+                right: Box::new(IRExpr::PropAccess {
+                    variable: "n".to_string(),
+                    property: "name".to_string(),
+                }),
+            };
+            ir_expr_to_df_expr(&filter, &ParamMap::new(), None).expect("a pushable membership")
+        };
+        let a = Literal::String("a".to_string());
+        assert_eq!(lowered(vec![a.clone(), Literal::Null]), lowered(vec![a]));
+        assert_eq!(lowered(vec![Literal::Null]), lowered(vec![]));
+    }
 
     /// GQT cannot inspect the typed literal that preserves a scan's index eligibility.
     #[test]

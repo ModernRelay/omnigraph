@@ -272,6 +272,13 @@ impl PlanSource for QuerySource<'_> {
         })
     }
 
+    fn list_parameter_len(&self, name: &str) -> Option<usize> {
+        match self.params.shared().get(name)? {
+            Literal::List(items) => Some(items.len()),
+            _ => None,
+        }
+    }
+
     /// The scan lowers exactly the conjuncts `ir_expr_to_df_expr` can express;
     /// the schema argument only types a literal, never the verdict.
     fn filter_pushable(&self, filter: &IRExpr) -> bool {
