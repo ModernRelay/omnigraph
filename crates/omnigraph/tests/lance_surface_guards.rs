@@ -2398,6 +2398,326 @@ async fn explicit_scanner_batch_size_beats_lance_default_batch_size_env_process(
     }
 }
 
+// --- Guard 10c: a filtered scan projects Blob-v2 descriptors -----------------
+//
+// History: before Lance 9, a scan that combined a filter with a projected
+// Blob-v2 column tripped the nested-field projection assertion in
+// `Field::apply_projection` (lance#7707): the descriptor's synthetic children
+// could be projected away while the parent stayed requested. lance#7664 fixed
+// it before Lance 9 by treating a Blob descriptor as an atomic layout, like a
+// map. OmniGraph's single-cell read (`read_blob_at`) depends on that fix: it
+// scans exactly one Blob column as descriptors under an `id` equality filter,
+// with stable row ids, and OmniGraph has no fallback read shape. A future
+// Lance bump that turns this guard red is blocked until the fix is back.
+//
+// The table has what the production read meets: stable row ids, a BTREE on
+// `id`, several fragments, a deletion, and an unindexed appended tail, so the
+// filter runs through `ScalarIndexQuery` plus a scan of the uncovered
+// fragment. The guard also pins the original report's shape (a predicate on
+// the Blob column itself under a full projection) for every `BlobHandling`,
+// and repeats everything after compaction.
+#[tokio::test]
+async fn filtered_scan_projects_blob_descriptors_on_indexed_multi_fragment_table() {
+    use arrow_array::types::{UInt8Type, UInt32Type, UInt64Type};
+    use datafusion::physical_plan::displayable;
+    use datafusion::prelude::{col, lit};
+    use lance_core::datatypes::BlobKind;
+
+    fn blob_batch(schema: &Arc<Schema>, rows: &[(&str, BlobValue)]) -> RecordBatch {
+        let mut content = BlobArrayBuilder::new(rows.len());
+        for (_, value) in rows {
+            match value {
+                BlobValue::Bytes(bytes) => content.push_bytes(bytes).unwrap(),
+                BlobValue::Null => content.push_null().unwrap(),
+                BlobValue::External(uri) => content.push_uri(uri.as_str()).unwrap(),
+            }
+        }
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(
+                    rows.iter().map(|(id, _)| *id),
+                )),
+                content.finish().unwrap(),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[derive(Clone)]
+    enum BlobValue {
+        Bytes(Vec<u8>),
+        Null,
+        External(String),
+    }
+
+    fn write_params(mode: WriteMode) -> WriteParams {
+        WriteParams {
+            mode,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            allow_external_blob_outside_bases: true,
+            max_rows_per_file: 2,
+            ..Default::default()
+        }
+    }
+
+    /// The exact `read_blob_at` scan. Returns the one selected row's stable
+    /// row id and descriptor children, or `None` when no row matched.
+    async fn read_blob_at_scan(ds: &Dataset, id: &str) -> Option<(u64, u8, u64, String)> {
+        let mut scanner = ds.scan();
+        scanner.project(&["content"]).unwrap();
+        scanner.filter_expr(col("id").eq(lit(id.to_string())));
+        scanner.blob_handling(BlobHandling::BlobsDescriptions);
+        scanner.with_row_id();
+        scanner.limit(Some(2), None).unwrap();
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .expect("the read_blob_at scan must plan and open")
+            .try_collect()
+            .await
+            .expect("the read_blob_at scan must execute");
+        let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        assert!(
+            rows <= 1,
+            "id '{id}' must match at most one row, got {rows}"
+        );
+        let batch = batches.into_iter().find(|batch| batch.num_rows() == 1)?;
+        let columns = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            columns,
+            ["content", ROW_ID],
+            "the scan must return exactly the projected descriptor and the stable row id"
+        );
+        let descriptor = batch.column(0).as_struct();
+        let children = descriptor
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            children,
+            ["kind", "position", "size", "blob_id", "blob_uri"],
+            "a filtered descriptor scan must keep all five Blob-v2 descriptor children"
+        );
+        let row_id = batch.column(1).as_primitive::<UInt64Type>().value(0);
+        let kind = descriptor
+            .column_by_name("kind")
+            .unwrap()
+            .as_primitive::<UInt8Type>()
+            .value(0);
+        let size = descriptor
+            .column_by_name("size")
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .value(0);
+        let _blob_id = descriptor
+            .column_by_name("blob_id")
+            .unwrap()
+            .as_primitive::<UInt32Type>()
+            .value(0);
+        let uri = descriptor
+            .column_by_name("blob_uri")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0)
+            .to_string();
+        Some((row_id, kind, size, uri))
+    }
+
+    async fn assert_contract(
+        ds: &Dataset,
+        live: &[(&str, BlobValue)],
+        missing: &[&str],
+        external_uri: &str,
+        case: &str,
+    ) {
+        let shared = Arc::new(ds.clone());
+        for (id, value) in live {
+            let (row_id, kind, size, uri) = read_blob_at_scan(ds, id)
+                .await
+                .unwrap_or_else(|| panic!("{case}: id '{id}' must match exactly one row"));
+            let file = shared
+                .take_blobs(&[row_id], "content")
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            match value {
+                BlobValue::Null => assert!(
+                    file.is_none(),
+                    "{case}: '{id}' is null and take_blobs must say so"
+                ),
+                BlobValue::Bytes(bytes) => {
+                    let file = file.unwrap_or_else(|| panic!("{case}: '{id}' is not null"));
+                    assert_ne!(kind, BlobKind::External as u8, "{case}: '{id}' is managed");
+                    assert_eq!(size, bytes.len() as u64, "{case}: '{id}' descriptor size");
+                    assert_eq!(file.size(), bytes.len() as u64, "{case}: '{id}' file size");
+                    assert_eq!(
+                        file.read().await.unwrap().as_ref(),
+                        bytes.as_slice(),
+                        "{case}: '{id}' bytes"
+                    );
+                }
+                BlobValue::External(expected) => {
+                    assert_eq!(kind, BlobKind::External as u8, "{case}: '{id}' kind");
+                    assert_eq!(&uri, expected, "{case}: '{id}' descriptor uri");
+                    let file = file.unwrap_or_else(|| panic!("{case}: '{id}' is not null"));
+                    assert_eq!(file.kind(), BlobKind::External);
+                    assert_eq!(file.uri(), Some(external_uri));
+                }
+            }
+        }
+        for id in missing {
+            assert!(
+                read_blob_at_scan(ds, id).await.is_none(),
+                "{case}: deleted or absent id '{id}' must match no row"
+            );
+        }
+
+        // The original report's shape: a predicate on the Blob column itself
+        // under a full projection, for every Blob handling mode.
+        let content_id = ds.schema().field("content").unwrap().id as u32;
+        let nulls = live
+            .iter()
+            .filter(|(_, value)| matches!(value, BlobValue::Null))
+            .count();
+        let handlings = [
+            ("AllBinary", BlobHandling::AllBinary),
+            ("BlobsDescriptions", BlobHandling::BlobsDescriptions),
+            ("AllDescriptions", BlobHandling::AllDescriptions),
+            (
+                "SomeBlobsBinary",
+                BlobHandling::SomeBlobsBinary(HashSet::from([content_id])),
+            ),
+            (
+                "SomeBinary",
+                BlobHandling::SomeBinary(HashSet::from([content_id])),
+            ),
+        ];
+        for (name, handling) in handlings {
+            for (predicate, expected) in [
+                (col("content").is_null(), nulls),
+                (col("content").is_not_null(), live.len() - nulls),
+            ] {
+                let label = format!("{case}: {name} {predicate}");
+                let mut scanner = ds.scan();
+                scanner.project(&["id", "content"]).unwrap();
+                scanner.filter_expr(predicate);
+                scanner.blob_handling(handling.clone());
+                let batches: Vec<RecordBatch> = scanner
+                    .try_into_stream()
+                    .await
+                    .unwrap_or_else(|error| panic!("{label} must plan: {error}"))
+                    .try_collect()
+                    .await
+                    .unwrap_or_else(|error| panic!("{label} must execute: {error}"));
+                let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+                assert_eq!(rows, expected, "{label} row count");
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let external_path = dir.path().join("external-source.bin");
+    std::fs::write(&external_path, b"external payload bytes").unwrap();
+    let external_uri = url::Url::from_file_path(&external_path)
+        .unwrap()
+        .to_string();
+    let uri = dir.path().join("guard10c-filtered-blob.lance");
+    let uri = uri.to_str().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        lance::blob::blob_field("content", true),
+    ]));
+    let base: Vec<(&str, BlobValue)> = vec![
+        ("a", BlobValue::Bytes(vec![b'a'; 80])),
+        ("b", BlobValue::Null),
+        ("c", BlobValue::Bytes(Vec::new())),
+        ("d", BlobValue::External(external_uri.clone())),
+        ("e", BlobValue::Bytes(vec![b'e'; 80])),
+        ("f", BlobValue::Bytes(vec![b'f'; 96 * 1024])),
+        ("g", BlobValue::Bytes(vec![b'g'; 80])),
+        ("h", BlobValue::Bytes(vec![b'h'; 80])),
+    ];
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(blob_batch(&schema, &base))], schema.clone()),
+        uri,
+        Some(write_params(WriteMode::Create)),
+    )
+    .await
+    .unwrap();
+    ds.create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+        .replace(true)
+        .await
+        .unwrap();
+    assert_eq!(ds.delete("id = 'e'").await.unwrap().num_deleted_rows, 1);
+    let mut ds = Dataset::open(uri).await.unwrap();
+    let tail: Vec<(&str, BlobValue)> = vec![
+        ("i", BlobValue::Bytes(vec![b'i'; 80])),
+        ("j", BlobValue::Null),
+    ];
+    ds.append(
+        RecordBatchIterator::new(vec![Ok(blob_batch(&schema, &tail))], schema.clone()),
+        Some(write_params(WriteMode::Append)),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        ds.get_fragments().len() > 2,
+        "the guard needs a multi-fragment table"
+    );
+    let id_field = ds.schema().field("id").unwrap().id;
+    let indices = ds.load_indices().await.unwrap();
+    let bitmap = indices
+        .iter()
+        .find(|index| index.fields == [id_field])
+        .and_then(|index| index.fragment_bitmap.clone())
+        .expect("the guard needs a BTREE with a fragment bitmap on id");
+    assert!(
+        ds.fragments()
+            .iter()
+            .any(|fragment| !bitmap.contains(fragment.id as u32)),
+        "the appended tail must be a fragment the BTREE does not cover"
+    );
+    let mut scanner = ds.scan();
+    scanner.project(&["content"]).unwrap();
+    scanner.filter_expr(col("id").eq(lit("a")));
+    scanner.blob_handling(BlobHandling::BlobsDescriptions);
+    scanner.with_row_id();
+    let plan = scanner.create_plan().await.unwrap();
+    let plan = format!("{}", displayable(plan.as_ref()).indent(true));
+    assert!(
+        plan.contains("ScalarIndexQuery"),
+        "the read_blob_at filter must route through the BTREE, got:\n{plan}"
+    );
+
+    let live = base
+        .iter()
+        .filter(|(id, _)| *id != "e")
+        .chain(&tail)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_contract(&ds, &live, &["e", "zz"], &external_uri, "before compaction").await;
+
+    let metrics = compact_files(&mut ds, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    assert!(
+        metrics.fragments_removed > 1,
+        "compaction must rewrite: {metrics:?}"
+    );
+    assert_contract(&ds, &live, &["e", "zz"], &external_uri, "after compaction").await;
+}
+
 // --- Guard 11: scalar-index coverage surface (physical_rows + index details) ---
 //
 // `table_store.rs::key_column_index_coverage` mirrors Lance's `create_filter_plan`

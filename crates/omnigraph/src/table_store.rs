@@ -3367,13 +3367,15 @@ impl TableStore {
             ));
         }
 
-        // Beta.21 cannot safely combine a predicate with a full blob-v2
-        // descriptor projection. Select the interval using only ordinary
-        // columns plus stable row ids, then take and materialize each exact
-        // matched row. The one-row materialization shape is intentionally
-        // conservative for blobs: it bounds payload allocation; the stream
-        // normalizer below then coalesces those rows into ordinary bounded
-        // transaction chunks.
+        // Select the interval using only ordinary columns plus stable row
+        // ids, then take and materialize each exact matched row. The per-row
+        // `take_rows` is a redundant second read, not a substrate
+        // requirement: Lance 11 returns Blob-v2 descriptors with stable row
+        // ids from one filtered scan (pinned by the lance_surface_guards test
+        // `filtered_scan_projects_blob_descriptors_on_indexed_multi_fragment_table`).
+        // It is kept because the one-row materialization bounds payload
+        // allocation and accounting per row; the stream normalizer below then
+        // coalesces those rows into ordinary bounded transaction chunks.
         let raw = Self::scan_proven_insert_blob_row_ids(source, interval, system_columns).await?;
         let materialized = futures::stream::try_unfold(
             (
@@ -3454,11 +3456,14 @@ impl TableStore {
     ///
     /// The proof has already established that every logical change in the
     /// interval is a new row, so a base/source ordered diff would repeat work
-    /// and defeat the certified path. Lance cannot safely combine the version
-    /// predicate with a Blob-v2 descriptor projection on the pinned release;
-    /// select stable row ids through ordinary columns, then take one exact
-    /// descriptor row at a time. The one-row shape is deliberate: URI limits
-    /// are charged before the selection retains a copy, and no payload or
+    /// and defeat the certified path. Stable row ids are selected through
+    /// ordinary columns, then one exact descriptor row is taken at a time.
+    /// That second read is redundant, not a substrate requirement: Lance 11
+    /// returns Blob-v2 descriptors with stable row ids from one filtered scan
+    /// (pinned by the lance_surface_guards test
+    /// `filtered_scan_projects_blob_descriptors_on_indexed_multi_fragment_table`).
+    /// The one-row shape is kept for bounded accounting: URI limits are
+    /// charged before the selection retains a copy, and no payload or
     /// external object is read here.
     pub(crate) async fn include_proven_insert_blob_selection(
         &self,
@@ -4563,8 +4568,9 @@ impl TableStore {
     /// the representation mismatch.
     ///
     /// A first scan evaluates `filter` with blob columns excluded and retains
-    /// stable row ids. Full descriptor rows are then taken by those ids without
-    /// a filter, and only their payloads are rebuilt as logical
+    /// stable row ids, so the matched rows' non-blob bytes are charged before
+    /// any descriptor is read. Full descriptor rows are then taken by those
+    /// ids without a filter, and only their payloads are rebuilt as logical
     /// [`BlobArrayBuilder`] columns. Pending rows already carry logical blob
     /// arrays; both sides have the dataset's full logical schema before the
     /// existing shadow union. The resulting batch is therefore valid for either
@@ -4616,14 +4622,16 @@ impl TableStore {
                 .await;
         }
 
-        // The pinned Lance revision cannot combine a predicate filter with a
-        // full blob-v2 projection: `FilteredReadExec` applies the descriptor
-        // child projection to the logical blob field and panics. Select the
-        // matched rows without blob columns, retaining stable `_rowid`, then
-        // take exactly those full descriptor rows without a filter and rebuild
-        // their logical blobs. Thus payload I/O remains proportional to matched
-        // rows while avoiding any dependence on which merge/index plan Lance
-        // selects later.
+        // Select the matched rows without blob columns, retaining stable
+        // `_rowid`, then take exactly those full descriptor rows without a
+        // filter and rebuild their logical blobs. The two-read shape is kept
+        // for its accounting order: the non-blob bytes of a match are charged
+        // before any descriptor is read. It no longer avoids a Lance defect:
+        // Lance 11 projects Blob-v2 descriptors in a filtered scan (pinned by
+        // the lance_surface_guards test
+        // `filtered_scan_projects_blob_descriptors_on_indexed_multi_fragment_table`).
+        // Payload I/O remains proportional to matched rows and independent of
+        // which merge/index plan Lance selects later.
         let non_blob_columns = committed_ds
             .schema()
             .fields
