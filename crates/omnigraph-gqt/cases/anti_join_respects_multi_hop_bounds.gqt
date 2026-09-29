@@ -1,0 +1,45 @@
+# issue: none
+# notes: `not { $p knows{2,2} $x }` removes only a node with a two-hop path; a with a one-hop
+# notes: neighbour but no two-hop path stays. Replaces the Rust test
+# notes: anti_join_respects_multi_hop_bounds (traversal.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"c"}}
+{"type":"Person","data":{"name":"d"}}
+{"type":"Person","data":{"name":"e"}}
+{"edge":"Knows","from":"a","to":"b"}
+{"edge":"Knows","from":"c","to":"d"}
+{"edge":"Knows","from":"d","to":"e"}
+
+--- query
+query no_two_hop() {
+    match {
+        $p: Person
+        not { $p knows{2,2} $x }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "a"}
+{"p.name": "b"}
+{"p.name": "d"}
+{"p.name": "e"}
+
+--- expect shape
+p.name: String

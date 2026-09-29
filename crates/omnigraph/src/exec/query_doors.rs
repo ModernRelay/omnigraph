@@ -1,155 +1,21 @@
-//! Session and compiled-query read entry points. The `engine` setting selects
-//! v1 (`super::execute_query`) or v2 (`crate::engine::execute_query`), each
-//! with its own graph-index handle and embedding resolver. Explain requests
-//! always describe v2.
+//! Session and compiled-query read entry points. Every read plans and runs
+//! through `crate::engine::execute_query`; a test session may carry a
+//! `ReadExecutor` that runs its reads instead (feature `test-util`).
 
-use super::*;
+use std::sync::Arc;
+
+use omnigraph_compiler::catalog::Catalog;
+use omnigraph_compiler::ir::{IROp, ParamMap, QueryIR};
+use omnigraph_compiler::lower_query;
+use omnigraph_compiler::query::typecheck::typecheck_query;
+use omnigraph_compiler::result::QueryResult;
+use omnigraph_compiler::settings::SessionSettings;
+
+use crate::db::{Omnigraph, ReadTarget, Snapshot};
 use crate::engine;
+use crate::error::{OmniError, Result};
 use crate::runtime_cache::CompiledRead;
-use omnigraph_compiler::error::CompilerError;
-use omnigraph_compiler::query::ast::{BinaryOp, CompOp, Literal};
-use omnigraph_compiler::settings::Engine;
-
-/// The tail of every refusal of a query v1 cannot run and v2 can, the
-/// construct named in front (RFC 2026-09-24-shared-expression-model, "Engine
-/// setting").
-const V1_SWITCHES: &str = " are not supported on engine v1; engine v2 runs them: add \"set \
-                           engine = v2;\" before the query, or start the server with \
-                           OMNIGRAPH_ENGINE=v2";
-
-/// What the v1 door refuses in a compiled read: each variant names the
-/// construct in front of `V1_SWITCHES`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum V1Refusal {
-    CompoundPredicate,
-    ReturnOrOrderComparison,
-    FilterShape,
-    OrderKey,
-}
-
-impl V1Refusal {
-    fn construct(self) -> &'static str {
-        match self {
-            Self::CompoundPredicate => "compound predicates (and, or, not, is null)",
-            Self::ReturnOrOrderComparison => "comparisons in return or order",
-            Self::FilterShape => "filters other than one comparison or search call",
-            Self::OrderKey => {
-                "order keys other than a property, a system field, an alias or the leading \
-                 search key"
-            }
-        }
-    }
-
-    fn error(self) -> OmniError {
-        CompilerError::Plan(format!("{}{V1_SWITCHES}", self.construct())).into()
-    }
-}
-
-/// The first shape of `ir` engine v1 does not evaluate: a filter beyond one
-/// comparison over property, literal and parameter operands or the search call,
-/// a Boolean node in `return` or `order`, or an order key of another shape.
-fn v1_refusal(ir: &QueryIR) -> Option<V1Refusal> {
-    if let Some(refusal) = pipeline_refusal(&ir.pipeline) {
-        return Some(refusal);
-    }
-    if ir
-        .return_exprs
-        .iter()
-        .any(|projection| has_boolean_node(&projection.expr))
-    {
-        return Some(V1Refusal::ReturnOrOrderComparison);
-    }
-    for (index, key) in ir.order_by.iter().enumerate() {
-        if has_boolean_node(&key.expr) {
-            return Some(V1Refusal::ReturnOrOrderComparison);
-        }
-        let accepted = match &key.expr {
-            IRExpr::PropAccess { .. } | IRExpr::AliasRef(_) => true,
-            IRExpr::Nearest { .. } | IRExpr::Bm25 { .. } | IRExpr::Rrf { .. } => index == 0,
-            _ => false,
-        };
-        if !accepted {
-            return Some(V1Refusal::OrderKey);
-        }
-    }
-    None
-}
-
-fn pipeline_refusal(pipeline: &[IROp]) -> Option<V1Refusal> {
-    pipeline.iter().find_map(|op| match op {
-        IROp::NodeScan { filters, .. }
-        | IROp::Expand {
-            dst_filters: filters,
-            ..
-        } => filters.iter().find_map(filter_refusal),
-        IROp::Filter(filter) => filter_refusal(filter),
-        IROp::AntiJoin { inner, .. } => pipeline_refusal(inner),
-    })
-}
-
-fn filter_refusal(filter: &IRExpr) -> Option<V1Refusal> {
-    let v1_operand = |expr: &IRExpr| {
-        matches!(
-            expr,
-            IRExpr::PropAccess { .. } | IRExpr::Literal(_) | IRExpr::Param(_)
-        )
-    };
-    match filter {
-        IRExpr::Binary {
-            op: BinaryOp::And | BinaryOp::Or,
-            ..
-        }
-        | IRExpr::Not(_)
-        | IRExpr::IsNull { .. } => Some(V1Refusal::CompoundPredicate),
-        IRExpr::Binary {
-            left,
-            op: BinaryOp::Compare(op),
-            right,
-        } => {
-            let search_call = matches!(
-                **left,
-                IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. }
-            ) && *op == CompOp::Eq
-                && **right == IRExpr::Literal(Literal::Bool(true));
-            (!search_call && !(v1_operand(left) && v1_operand(right)))
-                .then_some(V1Refusal::FilterShape)
-        }
-        _ => Some(V1Refusal::FilterShape),
-    }
-}
-
-fn has_boolean_node(expr: &IRExpr) -> bool {
-    match expr {
-        IRExpr::Binary { .. } | IRExpr::Not(_) | IRExpr::IsNull { .. } => true,
-        IRExpr::Aggregate { arg, .. } | IRExpr::Nearest { query: arg, .. } => has_boolean_node(arg),
-        IRExpr::Search { field, query }
-        | IRExpr::MatchText { field, query }
-        | IRExpr::Bm25 { field, query } => has_boolean_node(field) || has_boolean_node(query),
-        IRExpr::Fuzzy {
-            field,
-            query,
-            max_edits,
-        } => {
-            has_boolean_node(field)
-                || has_boolean_node(query)
-                || max_edits.as_deref().is_some_and(has_boolean_node)
-        }
-        IRExpr::Rrf {
-            primary,
-            secondary,
-            k,
-        } => {
-            has_boolean_node(primary)
-                || has_boolean_node(secondary)
-                || k.as_deref().is_some_and(has_boolean_node)
-        }
-        IRExpr::PropAccess { .. }
-        | IRExpr::Variable(_)
-        | IRExpr::Param(_)
-        | IRExpr::Literal(_)
-        | IRExpr::AliasRef(_) => false,
-    }
-}
+use crate::session::Session;
 
 /// Where a route builds its CSR graph index when the query traverses:
 /// the cross-query `RuntimeCache` entry of a live target, or a build against
@@ -243,8 +109,8 @@ impl Session {
 
     /// Return a named query's v2 planner document without executing the query.
     ///
-    /// Includes the logical and physical plans and optimizer passes, regardless
-    /// of the selected execution engine; a traversal mode pinned on this
+    /// Includes the logical and physical plans and optimizer passes; a
+    /// traversal mode pinned on this
     /// session (`SessionSettings::with_traversal`) is the mode the document
     /// records. The source may declare the query or wrap it in `explain`. This
     /// document does not include a DataFusion tree.
@@ -279,8 +145,8 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Beside the errors of [`Self::query`], refuses a source whose effective
-    /// engine is not `v2`, and an `explain` statement, which runs nothing.
+    /// Beside the errors of [`Self::query`], refuses an `explain` statement,
+    /// which runs nothing.
     #[doc(hidden)]
     pub async fn query_inspected(
         &self,
@@ -290,11 +156,6 @@ impl Session {
         params: &ParamMap,
     ) -> Result<engine::Executed> {
         let settings = self.effective(query_source)?;
-        if settings.engine() != Engine::V2 {
-            return Err(OmniError::manifest(
-                "the inspection door runs engine = v2 only",
-            ));
-        }
         let (resolved, catalog) = self.capture_read_view(target).await?;
         let CompiledRead::Query(ir) =
             self.compile_named_query(&catalog, query_source, query_name)?
@@ -367,9 +228,9 @@ impl Session {
         engine::execute(bound, &context).await
     }
 
-    /// One compiled query on the route `settings.engine()` names. Each route
-    /// builds its own lazy graph-index handle: an index-served query with no
-    /// `AntiJoin` never builds the CSR on either.
+    /// One compiled query through the engine, or through the installed
+    /// `ReadExecutor`. The lazy graph-index handle means an index-served query
+    /// with no `AntiJoin` never builds the CSR.
     async fn execute_on_route(
         &self,
         settings: &SessionSettings,
@@ -379,73 +240,45 @@ impl Session {
         index_source: IndexSource<'_>,
         catalog: &Arc<Catalog>,
     ) -> Result<QueryResult> {
+        #[cfg(feature = "test-util")]
+        if let Some(executor) = self.read_executor() {
+            let request = omnigraph_catalog::read_executor::ReadRequest {
+                ir,
+                params,
+                snapshot: snapshot.raw(),
+                catalog,
+                settings,
+            };
+            return executor.execute(request).await;
+        }
         let needs_graph = ir
             .pipeline
             .iter()
             .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
-        match settings.engine() {
-            Engine::V1 => {
-                if let Some(refusal) = v1_refusal(ir) {
-                    return Err(refusal.error());
-                }
-                let graph_index = match (&index_source, needs_graph) {
-                    (_, false) => GraphIndexHandle::none(),
-                    (IndexSource::Cached(resolved), true) => GraphIndexHandle::cached(
-                        self,
-                        resolved,
-                        referenced_edge_types(&ir.pipeline, catalog),
-                        catalog.system_columns,
-                    ),
-                    (IndexSource::Direct, true) => GraphIndexHandle::direct(
-                        snapshot,
-                        referenced_edge_types(&ir.pipeline, catalog),
-                        catalog.system_columns,
-                    ),
-                };
-                execute_query(
-                    ir,
-                    params,
-                    snapshot,
-                    &graph_index,
-                    catalog,
-                    &EmbeddingResolver {
-                        cell: self.embedding_cell(),
-                        config: self.embedding_config_ref(),
-                    },
-                    settings,
-                )
-                .await
-            }
-            Engine::V2 => {
-                let graph_index = match (&index_source, needs_graph) {
-                    (_, false) => engine::GraphIndexHandle::none(),
-                    (IndexSource::Cached(resolved), true) => engine::GraphIndexHandle::cached(
-                        Arc::clone(&**self),
-                        (*resolved).clone(),
-                        engine::referenced_edge_types(&ir.pipeline, catalog),
-                        catalog.system_columns,
-                    ),
-                    (IndexSource::Direct, true) => engine::GraphIndexHandle::direct(
-                        snapshot.clone(),
-                        engine::referenced_edge_types(&ir.pipeline, catalog),
-                        catalog.system_columns,
-                    ),
-                };
-                engine::execute_query(
-                    ir,
-                    params,
-                    snapshot,
-                    graph_index,
-                    catalog,
-                    &engine::EmbeddingResolver::new(
-                        self.embedding_cell(),
-                        self.embedding_config_ref(),
-                    ),
-                    settings,
-                )
-                .await
-            }
-        }
+        let graph_index = match (&index_source, needs_graph) {
+            (_, false) => engine::GraphIndexHandle::none(),
+            (IndexSource::Cached(resolved), true) => engine::GraphIndexHandle::cached(
+                Arc::clone(&**self),
+                (*resolved).clone(),
+                engine::referenced_edge_types(&ir.pipeline, catalog),
+                catalog.system_columns,
+            ),
+            (IndexSource::Direct, true) => engine::GraphIndexHandle::direct(
+                snapshot.clone(),
+                engine::referenced_edge_types(&ir.pipeline, catalog),
+                catalog.system_columns,
+            ),
+        };
+        engine::execute_query(
+            ir,
+            params,
+            snapshot,
+            graph_index,
+            catalog,
+            &engine::EmbeddingResolver::new(self.embedding_cell(), self.embedding_config_ref()),
+            settings,
+        )
+        .await
     }
 }
 

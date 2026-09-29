@@ -1,0 +1,65 @@
+# issue: none
+# notes: With nodes but no edge rows, a traversal returns no rows and a `not { }` over the
+# notes: empty edge table keeps every person. Replaces the Rust test
+# notes: traversal_no_edges_returns_empty (traversal.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32?
+}
+
+node Company {
+    name: String @key
+}
+
+edge Knows: Person -> Person {
+    since: Date?
+}
+
+edge WorksAt: Person -> Company
+
+--- seed
+{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob","age":25}}
+{"type":"Company","data":{"name":"Acme"}}
+
+--- query
+query friends_of($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows $f
+    }
+    return { $f.name, $f.age }
+}
+
+--- params
+{"name": "Alice"}
+
+--- expect unordered
+
+--- expect shape
+f.name: String
+f.age: I32?
+
+--- query
+query unemployed() {
+    match {
+        $p: Person
+        not { $p worksAt $_ }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "Alice"}
+{"p.name": "Bob"}
+
+--- expect shape
+p.name: String

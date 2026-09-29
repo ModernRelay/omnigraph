@@ -6,7 +6,7 @@
 //! switch of issue #533), both computed with the functions below.
 
 use omnigraph_compiler::ir::IRExpr;
-use omnigraph_compiler::query::ast::CompOp;
+use omnigraph_compiler::query::ast::{CompOp, Literal};
 use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
 
@@ -273,10 +273,11 @@ pub fn direction_probe_factor(direction: Direction) -> f64 {
 }
 
 /// The rows one query scan reads: the node type's row count, or at most one
-/// row when the pushed filter equates every `@key` column, or one unique
-/// property, of the scan's binding with a literal or a parameter. Any other
-/// pushed filter leaves the row count as it is. `None` when the source holds
-/// no row count for the type.
+/// row per value when the pushed filter holds every `@key` column, or one
+/// unique property, of the scan's binding to a bounded number of values: one
+/// for `=` with a literal or a parameter, the element count for membership in
+/// a list. Any other pushed filter leaves the row count as it is. `None` when
+/// the source holds no row count for the type.
 pub fn scan_row_estimate(spec: &ScanSpec, source: &dyn PlanSource) -> Option<u64> {
     let node_type = source.node_type(spec.table.node_type_name()?).ok()?;
     let rows = node_type.row_count?;
@@ -286,40 +287,58 @@ pub fn scan_row_estimate(spec: &ScanSpec, source: &dyn PlanSource) -> Option<u64
         .as_ref()
         .map(|predicate| predicate.gq_filters())
         .unwrap_or_default();
-    let equated: Vec<&str> = filters
+    let bounded: Vec<(&str, u64)> = filters
         .iter()
-        .filter_map(|filter| equated_property(filter, binding))
+        .filter_map(|filter| bounded_property(filter, binding, source))
         .collect();
-    let whole_key = !node_type.key.is_empty()
-        && node_type
-            .key
+    let values_of = |property: &str| {
+        bounded
             .iter()
-            .all(|key| equated.contains(&key.as_str()));
-    let unique = equated
+            .filter(|(name, _)| *name == property)
+            .map(|(_, values)| *values)
+            .min()
+    };
+    let whole_key = node_type
+        .key
         .iter()
-        .any(|property| source.is_unique_property(&spec.table.type_key, property));
-    Some(if whole_key || unique {
-        rows.min(1)
-    } else {
-        rows
+        .map(|key| values_of(key))
+        .try_fold(1u64, |rows, values| Some(rows.saturating_mul(values?)))
+        .filter(|_| !node_type.key.is_empty());
+    let unique = bounded
+        .iter()
+        .filter(|(property, _)| source.is_unique_property(&spec.table.type_key, property))
+        .map(|(_, values)| *values)
+        .min();
+    Some(match whole_key.into_iter().chain(unique).min() {
+        Some(bound) => rows.min(bound),
+        None => rows,
     })
 }
 
-/// The property of `binding` a conjunct equates with a literal or a
-/// parameter. Only a comparison root is inspected: an `or`, a `not` or a
-/// null test gives no estimate and the row count stands.
-fn equated_property<'a>(filter: &'a IRExpr, binding: &str) -> Option<&'a str> {
+/// The property of `binding` a conjunct holds to a bounded number of values,
+/// with that number, at least one. Only a comparison root is inspected: an
+/// `or`, a `not` or a null test gives no estimate and the row count stands.
+fn bounded_property<'a>(
+    filter: &'a IRExpr,
+    binding: &str,
+    source: &dyn PlanSource,
+) -> Option<(&'a str, u64)> {
     let (left, op, right) = filter.comparison_parts()?;
-    if op != CompOp::Eq {
-        return None;
-    }
     let constant = |expr: &IRExpr| matches!(expr, IRExpr::Literal(_) | IRExpr::Param(_));
-    match (left, right) {
-        (IRExpr::PropAccess { variable, property }, other)
-        | (other, IRExpr::PropAccess { variable, property })
-            if variable == binding && constant(other) =>
-        {
-            Some(property.as_str())
+    let of_binding = |expr: &'a IRExpr| match expr {
+        IRExpr::PropAccess { variable, property } if variable == binding => Some(property.as_str()),
+        _ => None,
+    };
+    match op {
+        CompOp::Eq if constant(right) => Some((of_binding(left)?, 1)),
+        CompOp::Eq if constant(left) => Some((of_binding(right)?, 1)),
+        CompOp::Contains => {
+            let members = match left {
+                IRExpr::Literal(Literal::List(items)) => items.len(),
+                IRExpr::Param(name) => source.list_parameter_len(name)?,
+                _ => return None,
+            };
+            Some((of_binding(right)?, members.max(1) as u64))
         }
         _ => None,
     }

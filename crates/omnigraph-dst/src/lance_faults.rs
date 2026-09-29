@@ -256,7 +256,8 @@ fn seam_scheduler() -> Option<(Arc<crate::concurrent::SeamScheduler>, usize)> {
 
 /// Thread-name attribution: the actors' OS threads carry their
 /// identities — `dst-writer-N` (scheduler id N), `dst-branch-actor` (id =
-/// writers), `dst-maintenance` (id = writers+1). Lance-realm calls executed
+/// writers), `dst-maintenance` (id = writers+1), `dst-schema-actor` (id =
+/// writers+2). Lance-realm calls executed
 /// INLINE on an actor's thread inherit its name and take turns; calls from
 /// Lance's own pool threads (lance-cpu, lance-io) carry other names and run
 /// UNGATED — the measured coverage gap (`note_unattributed`), never a
@@ -270,6 +271,7 @@ fn actor_from_thread(writers: usize) -> Option<usize> {
     match name {
         "dst-branch-actor" => Some(writers),
         "dst-maintenance" => Some(writers + 1),
+        "dst-schema-actor" => Some(writers + 2),
         _ => None,
     }
 }

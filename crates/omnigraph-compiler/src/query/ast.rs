@@ -444,6 +444,12 @@ pub enum Expr {
         expr: Box<Expr>,
         negated: bool,
     },
+    /// `needle in list`: list membership with the list on the right. Lowered
+    /// to `list contains needle`, so the IR carries no `in`.
+    In {
+        needle: Box<Expr>,
+        list: Box<Expr>,
+    },
 }
 
 impl Expr {
@@ -551,7 +557,8 @@ impl Expr {
                 op: BinaryOp::Compare(_),
                 ..
             }
-            | Expr::IsNull { .. } => Precedence::Comparison,
+            | Expr::IsNull { .. }
+            | Expr::In { .. } => Precedence::Comparison,
             _ => Precedence::Atom,
         }
     }
@@ -595,6 +602,11 @@ impl std::fmt::Display for Expr {
             Expr::IsNull { expr, negated } => {
                 expr.fmt_operand(f, Precedence::Comparison, false)?;
                 f.write_str(if *negated { " is not null" } else { " is null" })
+            }
+            Expr::In { needle, list } => {
+                needle.fmt_operand(f, Precedence::Comparison, false)?;
+                f.write_str(" in ")?;
+                list.fmt_operand(f, Precedence::Comparison, true)
             }
             Expr::Now => f.write_str("now()"),
             Expr::PropAccess { variable, property } => write!(f, "${variable}.{property}"),

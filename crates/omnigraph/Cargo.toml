@@ -27,6 +27,9 @@ failpoints = ["omnigraph-seams/decide", "omnigraph-core/failpoints", "omnigraph-
 # through the omnigraph-dst dev crate — release artifacts build with
 # `-p` and stay clean, and dst.yml lints the `-p` shape per PR.
 dst = ["omnigraph-storage/dst", "omnigraph-seams/install", "dep:lance-io", "omnigraph-core/dst", "omnigraph-catalog/dst"]
+# Test-only: `Session::with_read_executor`, the seam through which a session's
+# reads run on another executor (the reference engine GQT compares against).
+test-util = ["omnigraph-catalog/test-util"]
 
 [dependencies]
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.11.0" }

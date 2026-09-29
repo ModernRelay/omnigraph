@@ -1,7 +1,6 @@
-//! v2's copy of v1's graph operators: the expand family with its mode
-//! choice and ID emission, the anti-join arms, the RRF fusion, and the
-//! handles (`GraphIndexHandle`, `EmbeddingResolver`) the doors build for
-//! the v2 route (phase 4). Copied, never referenced.
+//! The graph operators: the expand family with its mode choice and ID
+//! emission, the anti-join arms, the RRF fusion, and the handles
+//! (`GraphIndexHandle`, `EmbeddingResolver`) the doors build.
 
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
@@ -10,7 +9,7 @@ use omnigraph_planner::{ExpandCostInputs, ExpandMode, choose_expand_mode, should
 use datafusion::physical_plan::metrics::Gauge;
 
 use super::operators::memory::WorkMemory;
-use super::operators::{ExpandStep, RowCountPredicate, Switch};
+use super::operators::{ExpandStep, GraphEnv, RowCountPredicate, Switch};
 use super::*;
 
 /// Bundles the per-handle embedding client cell with the optional injected
@@ -413,24 +412,28 @@ pub(super) fn endpoint_probes(
     probes
 }
 
+/// At most `batch_size` emitted ID pairs, charged to `_memory`.
 pub(super) struct ExpandedPairs {
     pub(super) source_rows: Vec<u32>,
     pub(super) destination_ids: Vec<String>,
     _memory: WorkMemory,
 }
 
-/// Run the topology path the plan recorded on `step` and retain its emitted
-/// ID pairs: the multi-hop breaker (a single unbound hop streams through
-/// `operators::single_hop`). The start is `decide_expand_start`'s.
-pub(super) async fn execute_expand(
+/// Run the topology path the plan recorded on `step` (the multi-hop breaker)
+/// and pass its ID pairs to `emit` a chunk at a time, so the consumer ends
+/// the walk once it has its rows; a later multi-hop `Expand` drains this one
+/// whole before it walks. The start is `decide_expand_start`'s.
+pub(super) async fn execute_expand<F>(
     wide: &RecordBatch,
-    graph_index: &GraphIndexHandle,
-    snapshot: &Snapshot,
-    catalog: &Catalog,
+    env: &GraphEnv,
     step: &ExpandStep,
     switch: &Gauge,
     memory: &WorkMemory,
-) -> Result<ExpandedPairs> {
+    emit: impl FnMut(ExpandedPairs) -> F + Send,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>> + Send,
+{
     let work = memory
         .child("execute_expand")
         .map_err(|error| memory.error(error))?;
@@ -438,9 +441,9 @@ pub(super) async fn execute_expand(
     memory.check().map_err(|error| memory.error(error))?;
     let start = decide_expand_start(
         Some(wide.num_rows()),
-        graph_index,
-        snapshot,
-        catalog,
+        &env.graph_index,
+        &env.snapshot,
+        &env.catalog,
         step,
         memory,
     )
@@ -460,13 +463,14 @@ pub(super) async fn execute_expand(
     };
     execute_expand_bfs(
         wide,
-        graph_index,
-        catalog,
+        &env.graph_index,
+        &env.catalog,
         step,
         start_indexed,
         hop_policy,
         switch,
         memory,
+        emit,
     )
     .await
 }
@@ -713,7 +717,7 @@ where
     let dataset = snapshot
         .open_lance_dataset(&format!("edge:{edge_type}"))
         .await?;
-    let row_limit = memory.ctx.session_config().batch_size().max(1);
+    let row_limit = memory.batch_rows();
     let byte_limit = memory.batch_bytes();
     for (probe, orientation) in endpoint_probes(direction, catalog.system_columns)
         .into_iter()
@@ -930,7 +934,7 @@ pub(super) fn resolve_csr<'g>(
 /// unreachable.
 ///
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn execute_expand_bfs(
+pub(super) async fn execute_expand_bfs<F>(
     wide: &RecordBatch,
     graph_index: &GraphIndexHandle,
     catalog: &Catalog,
@@ -939,7 +943,11 @@ pub(super) async fn execute_expand_bfs(
     hop_policy: HopPolicy,
     side: &Gauge,
     memory: &WorkMemory,
-) -> Result<ExpandedPairs> {
+    mut emit: impl FnMut(ExpandedPairs) -> F + Send,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>> + Send,
+{
     let src_var = &step.src;
     let edge_type = &step.edge_type;
     let direction = step.direction;
@@ -1011,14 +1019,15 @@ pub(super) async fn execute_expand_bfs(
     }
 
     memory.checkpoint().map_err(|error| memory.error(error))?;
-    let emission_memory = memory
+    let chunk_rows = memory.batch_rows();
+    let mut emission_memory = memory
         .child("expand emissions")
         .map_err(|error| memory.error(error))?;
     let mut frontier_memory = memory
         .child("expand frontier")
         .map_err(|error| memory.error(error))?;
-    let mut emitted_src: Vec<u32> = Vec::new();
-    let mut emitted_dst: Vec<String> = Vec::new();
+    let mut emitted_src: Vec<u32> = Vec::with_capacity(chunk_rows);
+    let mut emitted_dst: Vec<String> = Vec::with_capacity(chunk_rows);
     let mut prev_union_len: usize = 0;
 
     for hop in 1..=max {
@@ -1204,6 +1213,24 @@ pub(super) async fn execute_expand_bfs(
                                 .map_err(|error| memory.error(error))?;
                             emitted_src.push(i as u32);
                             emitted_dst.push(dst_id.to_string());
+                            if emitted_src.len() >= chunk_rows {
+                                let next = memory
+                                    .child("expand emissions")
+                                    .map_err(|error| memory.error(error))?;
+                                memory.metric("expand_pairs", emitted_src.len());
+                                emit(ExpandedPairs {
+                                    source_rows: std::mem::replace(
+                                        &mut emitted_src,
+                                        Vec::with_capacity(chunk_rows),
+                                    ),
+                                    destination_ids: std::mem::replace(
+                                        &mut emitted_dst,
+                                        Vec::with_capacity(chunk_rows),
+                                    ),
+                                    _memory: std::mem::replace(&mut emission_memory, next),
+                                })
+                                .await?;
+                            }
                         }
                     }
                 }
@@ -1222,11 +1249,16 @@ pub(super) async fn execute_expand_bfs(
     drop(frontier_memory);
     memory.release_work();
 
-    Ok(ExpandedPairs {
+    if emitted_src.is_empty() {
+        return Ok(());
+    }
+    memory.metric("expand_pairs", emitted_src.len());
+    emit(ExpandedPairs {
         source_rows: emitted_src,
         destination_ids: emitted_dst,
         _memory: emission_memory,
     })
+    .await
 }
 
 /// The bulk mask of a row-count block over one edge (`Lowering::bulk_row_count`
@@ -1437,7 +1469,7 @@ async fn scan_edges_stream(
         false,
         |scanner| {
             scanner.filter_expr(filter);
-            scanner.batch_size(memory.ctx.session_config().batch_size().max(1));
+            scanner.batch_size(memory.batch_rows());
             scanner.batch_size_bytes(memory.batch_bytes() as u64);
             Ok(())
         },

@@ -2228,7 +2228,7 @@ async fn settings_show_all_lists_the_definition_in_order() {
     assert_eq!(
         body,
         show_output(&[
-            show_row("engine", "v1", "v1", "default", "request"),
+            show_row("engine", "v2", "v2", "default", "request"),
             show_row("rrf_plan", "auto", "auto", "default", "process"),
             show_row(
                 "merge_lineage",
@@ -2450,7 +2450,7 @@ async fn settings_reset_all_at_the_http_door_returns_to_the_process_defaults() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["rows"][0],
-        show_row("engine", "v1", "v1", "default", "request"),
+        show_row("engine", "v2", "v2", "default", "request"),
         "{body}"
     );
     assert_eq!(

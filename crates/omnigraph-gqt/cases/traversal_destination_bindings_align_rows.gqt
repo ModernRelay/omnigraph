@@ -1,0 +1,191 @@
+# issue: none
+# notes: A destination binding filter constrains the traversal source, and the projected
+# notes: columns of every binding stay row-aligned across one hop, two hops and a fan-out to
+# notes: two destination types. Replaces the Rust tests
+# notes: traversal_destination_binding_constrains_source, traversal_multi_variable_projection_aligned,
+# notes: multi_hop_projection_aligned, multi_hop_with_intermediate_binding_filters,
+# notes: traversal_destination_filter_with_multi_return, traversal_destination_filter_pushdown_with_param,
+# notes: fan_out_two_destinations and traversal_destination_filter_no_match (traversal.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32?
+}
+
+node Company {
+    name: String @key
+}
+
+edge Knows: Person -> Person {
+    since: Date?
+}
+
+edge WorksAt: Person -> Company
+
+--- seed
+{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob","age":25}}
+{"type":"Person","data":{"name":"Charlie","age":35}}
+{"type":"Person","data":{"name":"Diana","age":28}}
+{"type":"Company","data":{"name":"Acme"}}
+{"type":"Company","data":{"name":"Globex"}}
+{"edge":"Knows","from":"Alice","to":"Bob"}
+{"edge":"Knows","from":"Alice","to":"Charlie"}
+{"edge":"Knows","from":"Bob","to":"Diana"}
+{"edge":"WorksAt","from":"Alice","to":"Acme"}
+{"edge":"WorksAt","from":"Bob","to":"Globex"}
+
+--- query
+query at_acme() {
+    match {
+        $p: Person
+        $p worksAt $c
+        $c: Company { name: "Acme" }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "Alice"}
+
+--- expect shape
+p.name: String
+
+--- query
+query employee_companies() {
+    match {
+        $p: Person
+        $p worksAt $c
+        $c: Company
+    }
+    return { $p.name, $c.name }
+}
+
+--- expect unordered
+{"p.name": "Alice", "c.name": "Acme"}
+{"p.name": "Bob", "c.name": "Globex"}
+
+--- expect shape
+p.name: String
+c.name: String
+
+--- query
+query fof_chain($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows $mid
+        $mid knows $fof
+    }
+    return { $p.name, $mid.name, $fof.name }
+}
+
+--- params
+{"name": "Alice"}
+
+--- expect unordered
+{"p.name": "Alice", "mid.name": "Bob", "fof.name": "Diana"}
+
+--- expect shape
+p.name: String
+mid.name: String
+fof.name: String
+
+--- query
+query fof_via($name: String, $mid_name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows $mid
+        $mid: Person { name: $mid_name }
+        $mid knows $fof
+    }
+    return { $fof.name }
+}
+
+--- params
+{"name": "Alice", "mid_name": "Bob"}
+
+--- expect unordered
+{"fof.name": "Diana"}
+
+--- expect shape
+fof.name: String
+
+--- query
+query at_acme_named() {
+    match {
+        $p: Person
+        $p worksAt $c
+        $c: Company { name: "Acme" }
+    }
+    return { $p.name, $c.name }
+}
+
+--- expect unordered
+{"p.name": "Alice", "c.name": "Acme"}
+
+--- expect shape
+p.name: String
+c.name: String
+
+--- query
+query at_company($company: String) {
+    match {
+        $p: Person
+        $p worksAt $c
+        $c: Company { name: $company }
+    }
+    return { $p.name, $c.name }
+}
+
+--- params
+{"company": "Globex"}
+
+--- expect unordered
+{"p.name": "Bob", "c.name": "Globex"}
+
+--- expect shape
+p.name: String
+c.name: String
+
+--- query
+query fan_out($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows $f
+        $p worksAt $c
+    }
+    return { $f.name, $c.name }
+}
+
+--- params
+{"name": "Alice"}
+
+--- expect unordered
+{"f.name": "Bob", "c.name": "Acme"}
+{"f.name": "Charlie", "c.name": "Acme"}
+
+--- expect shape
+f.name: String
+c.name: String
+
+--- query
+query at_phantom() {
+    match {
+        $p: Person
+        $p worksAt $c
+        $c: Company { name: "NonExistent" }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+
+--- expect shape
+p.name: String

@@ -1,0 +1,177 @@
+# issue: none
+# notes: A ranked scan reads only the columns its query needs: `return { $d.slug }` under a
+# notes: `nearest` or `bm25` order reads the id and the key alone, and a bare `$d` reads the node's
+# notes: returned scalar properties but not the unreturned `embedding`. Sixty docs alternate
+# notes: "alpha doc" / "beta doc" titles, doc n sits at distance n from the origin, and every
+# notes: alpha doc ties on BM25 score, so the bm25 step's ten rows are the id tie-break's
+# notes: first ten alpha docs. Replaces the Rust test
+# notes: search_scans_project_needed_columns_and_the_scoring_column (search.rs); its
+# notes: `node_scan_projections` probe is the `columns` plan line here (the v2 scan projection
+# notes: does not list the `_distance`/`_score` column the retrieval appends), and its "no gate
+# notes: verdict" assertion has no v2 plan or row form.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    title: String @index
+    embedding: Vector(4) @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"n00000","title":"alpha doc","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00001","title":"beta doc","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00002","title":"alpha doc","embedding":[2.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00003","title":"beta doc","embedding":[3.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00004","title":"alpha doc","embedding":[4.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00005","title":"beta doc","embedding":[5.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00006","title":"alpha doc","embedding":[6.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00007","title":"beta doc","embedding":[7.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00008","title":"alpha doc","embedding":[8.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00009","title":"beta doc","embedding":[9.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00010","title":"alpha doc","embedding":[10.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00011","title":"beta doc","embedding":[11.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00012","title":"alpha doc","embedding":[12.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00013","title":"beta doc","embedding":[13.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00014","title":"alpha doc","embedding":[14.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00015","title":"beta doc","embedding":[15.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00016","title":"alpha doc","embedding":[16.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00017","title":"beta doc","embedding":[17.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00018","title":"alpha doc","embedding":[18.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00019","title":"beta doc","embedding":[19.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00020","title":"alpha doc","embedding":[20.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00021","title":"beta doc","embedding":[21.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00022","title":"alpha doc","embedding":[22.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00023","title":"beta doc","embedding":[23.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00024","title":"alpha doc","embedding":[24.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00025","title":"beta doc","embedding":[25.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00026","title":"alpha doc","embedding":[26.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00027","title":"beta doc","embedding":[27.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00028","title":"alpha doc","embedding":[28.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00029","title":"beta doc","embedding":[29.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00030","title":"alpha doc","embedding":[30.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00031","title":"beta doc","embedding":[31.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00032","title":"alpha doc","embedding":[32.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00033","title":"beta doc","embedding":[33.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00034","title":"alpha doc","embedding":[34.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00035","title":"beta doc","embedding":[35.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00036","title":"alpha doc","embedding":[36.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00037","title":"beta doc","embedding":[37.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00038","title":"alpha doc","embedding":[38.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00039","title":"beta doc","embedding":[39.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00040","title":"alpha doc","embedding":[40.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00041","title":"beta doc","embedding":[41.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00042","title":"alpha doc","embedding":[42.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00043","title":"beta doc","embedding":[43.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00044","title":"alpha doc","embedding":[44.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00045","title":"beta doc","embedding":[45.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00046","title":"alpha doc","embedding":[46.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00047","title":"beta doc","embedding":[47.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00048","title":"alpha doc","embedding":[48.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00049","title":"beta doc","embedding":[49.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00050","title":"alpha doc","embedding":[50.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00051","title":"beta doc","embedding":[51.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00052","title":"alpha doc","embedding":[52.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00053","title":"beta doc","embedding":[53.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00054","title":"alpha doc","embedding":[54.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00055","title":"beta doc","embedding":[55.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00056","title":"alpha doc","embedding":[56.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00057","title":"beta doc","embedding":[57.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00058","title":"alpha doc","embedding":[58.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"n00059","title":"beta doc","embedding":[59.0,0.0,0.0,0.0]}}
+
+--- query
+query nearest_slug($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 10
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug": "n00000"}
+{"d.slug": "n00001"}
+{"d.slug": "n00002"}
+{"d.slug": "n00003"}
+{"d.slug": "n00004"}
+{"d.slug": "n00005"}
+{"d.slug": "n00006"}
+{"d.slug": "n00007"}
+{"d.slug": "n00008"}
+{"d.slug": "n00009"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan Doc as $d: ranked nearest fetch 10
+scan Doc as $d: columns [__id, slug]
+
+--- query
+query bm25_slug($q: String) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { bm25($d.title, $q) }
+    limit 10
+}
+
+--- params
+{"q": "alpha"}
+
+--- expect ordered
+{"d.slug": "n00000"}
+{"d.slug": "n00002"}
+{"d.slug": "n00004"}
+{"d.slug": "n00006"}
+{"d.slug": "n00008"}
+{"d.slug": "n00010"}
+{"d.slug": "n00012"}
+{"d.slug": "n00014"}
+{"d.slug": "n00016"}
+{"d.slug": "n00018"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan Doc as $d: ranked bm25
+scan Doc as $d: columns [__id, slug]
+
+--- query
+query nearest_whole($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d }
+    order { nearest($d.embedding, $q) }
+    limit 10
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d": {"@id": "n00000", "slug": "n00000", "title": "alpha doc"}}
+{"d": {"@id": "n00001", "slug": "n00001", "title": "beta doc"}}
+{"d": {"@id": "n00002", "slug": "n00002", "title": "alpha doc"}}
+{"d": {"@id": "n00003", "slug": "n00003", "title": "beta doc"}}
+{"d": {"@id": "n00004", "slug": "n00004", "title": "alpha doc"}}
+{"d": {"@id": "n00005", "slug": "n00005", "title": "beta doc"}}
+{"d": {"@id": "n00006", "slug": "n00006", "title": "alpha doc"}}
+{"d": {"@id": "n00007", "slug": "n00007", "title": "beta doc"}}
+{"d": {"@id": "n00008", "slug": "n00008", "title": "alpha doc"}}
+{"d": {"@id": "n00009", "slug": "n00009", "title": "beta doc"}}
+
+--- expect shape
+d: Doc
+
+--- expect plan
+scan Doc as $d: ranked nearest fetch 10
+scan Doc as $d: columns [__id, slug, title]
+scan Doc as $d: not columns [embedding]

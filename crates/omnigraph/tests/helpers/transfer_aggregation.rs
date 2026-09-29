@@ -132,13 +132,6 @@ pub async fn assert_streaming_contract(db: &Session, scale: usize, limit: u64) {
             (account(sender), count, (count as f64 * 2.0).to_bits())
         })
         .collect();
-    let v1 = with_setting(db, "engine", "v1");
-    let old = query_main(&v1, QUERY, "top_senders", &params(&[]))
-        .await
-        .unwrap();
-    assert_eq!(rows(old.batches()), expected);
-    drop(old);
-
     let v2 = with_setting(db, "engine", "v2");
     let probes = QueryMemoryProbes::default();
     let result = with_query_memory_probes(
@@ -177,13 +170,13 @@ pub async fn assert_streaming_contract(db: &Session, scale: usize, limit: u64) {
             .any(|metric| metric.operator == "AggregateExec")
     );
 
-    let ordered_v1 = query_main(&v1, QUERY, "first_transfers", &params(&[]))
+    let unbounded = query_main(&v2, QUERY, "first_transfers", &params(&[]))
         .await
         .unwrap()
         .concat_batches()
         .unwrap();
-    assert_eq!(ordered_v1.num_rows(), 1_025);
-    let edge_ids = ordered_v1
+    assert_eq!(unbounded.num_rows(), 1_025);
+    let edge_ids = unbounded
         .column_by_name("edge_id")
         .unwrap()
         .as_any()
@@ -213,7 +206,7 @@ pub async fn assert_streaming_contract(db: &Session, scale: usize, limit: u64) {
     .concat_batches()
     .unwrap();
     assert_eq!(
-        ordered_v2, ordered_v1,
+        ordered_v2, unbounded,
         "an explicitly ordered bound-edge LIMIT must preserve its total key across output batches"
     );
 }

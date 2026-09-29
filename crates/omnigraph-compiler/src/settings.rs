@@ -58,11 +58,11 @@ pub struct SettingSpec {
 pub const DEFINITIONS: &[SettingSpec] = &[
     SettingSpec {
         name: "engine",
-        kind: SettingKind::Enum(&["v1", "v2"]),
-        default: "v1",
+        kind: SettingKind::Enum(&["v2"]),
+        default: "v2",
         scope: SettingScope::Request,
         env: "OMNIGRAPH_ENGINE",
-        doc: "whether a read query runs through engine version 2, the plan runner; this setting does not change change-feed or merge execution",
+        doc: "the engine a read query runs on; `v2`, the plan runner, is the one value; this setting does not change change-feed or merge execution",
     },
     SettingSpec {
         name: "rrf_plan",
@@ -239,13 +239,12 @@ pub enum Traversal {
     Csr,
 }
 
-/// `engine`: the route a read query runs on. `V1` is the executor, `V2` the
-/// plan runner.
+/// `engine`: the route a read query runs on. `V2`, the plan runner, is the
+/// only value; a later engine version is a new variant.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Engine {
     #[default]
-    V1,
     V2,
 }
 
@@ -286,7 +285,7 @@ macro_rules! enum_spelling {
     };
 }
 
-enum_spelling!(Engine { V1 => "v1", V2 => "v2" });
+enum_spelling!(Engine { V2 => "v2" });
 enum_spelling!(Traversal { Auto => "auto", Indexed => "indexed", Csr => "csr" });
 enum_spelling!(RrfPlan { Auto => "auto", ForcePrefilter => "force_prefilter", ForcePostfilter => "force_postfilter" });
 enum_spelling!(MergeLineage { Off => "off", On => "on", Verify => "verify" });
@@ -337,7 +336,7 @@ impl Default for SessionSettings {
     fn default() -> Self {
         let mut settings = SessionSettings {
             traversal: Traversal::Auto,
-            engine: Engine::V1,
+            engine: Engine::V2,
             rrf_plan: RrfPlan::Auto,
             merge_lineage: MergeLineage::On,
             ann_nprobes: None,
@@ -682,10 +681,10 @@ mod tests {
             err.to_string(),
             "unknown setting `merge_linage`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency"
         );
-        let err = SessionSettings::default().with("engine", "v3").unwrap_err();
+        let err = SessionSettings::default().with("engine", "v1").unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown value `v3` for setting `engine`; expected one of v1, v2"
+            "unknown value `v1` for setting `engine`; expected one of v2"
         );
         let err = SessionSettings::default()
             .with("merge_lineage", "v3")
@@ -803,7 +802,7 @@ mod tests {
             sources[SettingId::StageWriteConcurrency as usize],
             Source::Default
         );
-        assert_eq!(settings.engine(), Engine::V1);
+        assert_eq!(settings.engine(), Engine::V2);
         assert_eq!(sources[SettingId::Engine as usize], Source::Default);
         let (v2, sources) =
             from_env_with(|variable| (variable == "OMNIGRAPH_ENGINE").then(|| "v2".to_string()))
@@ -814,8 +813,8 @@ mod tests {
         for (variable, value, expected) in [
             (
                 "OMNIGRAPH_ENGINE",
-                "v3",
-                "OMNIGRAPH_ENGINE: unknown value `v3` for setting `engine`; expected one of v1, v2",
+                "v1",
+                "OMNIGRAPH_ENGINE: unknown value `v1` for setting `engine`; expected one of v2",
             ),
             (
                 "OMNIGRAPH_LOAD_CONCURRENCY",

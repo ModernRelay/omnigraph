@@ -7,6 +7,7 @@ use omnigraph_seams::DecideSeam;
 
 omnigraph_seams::catalog! {
     crate::blob::BLOB_READ_POST_CAPTURE,
+    crate::branch_control::BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE,
     crate::branch_control::BRANCH_CREATE_POST_NATIVE,
     crate::branch_control::BRANCH_DELETE_POST_NATIVE,
     crate::branch_control::BRANCH_DELETE_POST_ARCHIVE,
@@ -52,6 +53,7 @@ omnigraph_seams::catalog! {
     crate::db::omnigraph::schema_apply::SCHEMA_APPLY_AFTER_STAGING_WRITE,
     crate::db::omnigraph::schema_apply::SCHEMA_APPLY_BEFORE_STAGING_WRITE,
     crate::db::omnigraph::schema_apply::SCHEMA_APPLY_POST_LOCK_PRE_EFFECT,
+    crate::db::omnigraph::schema_apply::SCHEMA_APPLY_POST_SENTINEL,
     crate::db::omnigraph::schema_apply::SCHEMA_APPLY_POST_TABLE_COMMIT,
     crate::db::omnigraph::table_ops::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
     crate::db::omnigraph::table_ops::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,

@@ -40,6 +40,41 @@ fn refuses_unknown_or_unobserved_faults() {
     }
 }
 
+/// A concurrent block runs under the DST runner only; a script entry the run
+/// never makes starves the block (the session names the entry), and a script
+/// whose next entry never arrives starves it after half the case budget.
+#[test]
+fn concurrent_block_refusals() {
+    let expected = if cfg!(tokio_unstable) {
+        [
+            "omnigraph-engine/local-filesystem without seams or concurrent blocks",
+            "finished without its entry 2 `put no_such_object_is_ever_written`",
+            "starved: neither an entry nor a request arrived for 2.0 s of wall time after entry 2 `start`",
+        ]
+    } else {
+        [
+            "omnigraph-engine/local-filesystem without seams or concurrent blocks",
+            "DST runner is unavailable",
+            "DST runner is unavailable",
+        ]
+    };
+    for (name, expected) in ["concurrent_on_engine", "starved_order", "starved_wall"]
+        .into_iter()
+        .zip(expected)
+    {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/runner")
+            .join(format!("{name}.gqt"));
+        let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+            .arg(path)
+            .output()
+            .expect("run GQT concurrent fixture");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "accepted {name}");
+        assert!(stderr.contains(expected), "{name}: {stderr}");
+    }
+}
+
 #[cfg(tokio_unstable)]
 #[test]
 fn binary_dispatches_both_runner_modes() {

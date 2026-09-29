@@ -104,9 +104,12 @@ match_value = { literal | variable | now_call }
 // An optional edge binding names the matched edge row: $p $w:knows $f.
 // A node binding also starts `variable ~ ":"`; the case of the next token
 // (lowercase edge_ident vs uppercase type_name) keeps the choice unambiguous.
-traversal = { variable ~ edge_binding? ~ (undirected_edge | edge_ident) ~ traversal_bounds? ~ variable }
+// The edge is named bare, or as a string, the one spelling for an edge a
+// reserved word names: `$i "in" $b` follows the edge `In`, as a quoted
+// `branch_name` does for a branch.
+traversal = { variable ~ edge_binding? ~ (undirected_edge | edge_ident | string_lit) ~ traversal_bounds? ~ variable }
 edge_binding = { variable ~ ":" }
-undirected_edge = { "<" ~ edge_ident ~ ">" }
+undirected_edge = { "<" ~ (edge_ident | string_lit) ~ ">" }
 traversal_bounds = { "{" ~ integer ~ "," ~ integer? ~ "}" }
 
 // Filter: a Boolean expression, `$f.age > 25 and not $f.retired`
@@ -138,13 +141,13 @@ limit_clause = { "limit" ~ integer }
 // Expressions: a precedence ladder, lowest binding first. A comparison is
 // non-associative, so `$a < $b < $c` fails in the enclosing rule. Every
 // keyword is word-bounded like `kw_set`, so `nothing` and `android` stay
-// identifiers; the five keywords are reserved in operand position and as a
+// identifiers; the six keywords are reserved in operand position and as a
 // return alias (`reserved_property`, `reserved_alias` name the collision).
 expr              = { or_expr }
 or_expr           = { and_expr ~ (kw_or ~ and_expr)* }
 and_expr          = { not_expr ~ (kw_and ~ not_expr)* }
 not_expr          = { (kw_not ~ not_expr) | comparison }
-comparison        = { operand ~ ((filter_op ~ operand) | null_test)? }
+comparison        = { operand ~ ((filter_op ~ operand) | (kw_in ~ operand) | null_test)? }
 null_test         = { kw_is ~ kw_not? ~ kw_null }
 operand           = { "(" ~ expr ~ ")" | now_call | nearest_ordering | search_call
                     | fuzzy_call | match_text_call | bm25_call | rrf_call | agg_call
@@ -155,7 +158,8 @@ kw_or             = @{ "or" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_not            = @{ "not" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_is             = @{ "is" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_null           = @{ "null" ~ !(ASCII_ALPHANUMERIC | "_") }
-reserved          = { kw_and | kw_or | kw_not | kw_is | kw_null }
+kw_in             = @{ "in" ~ !(ASCII_ALPHANUMERIC | "_") }
+reserved          = { kw_and | kw_or | kw_not | kw_is | kw_null | kw_in }
 reserved_property = { reserved }
 reserved_alias    = { reserved }
 expr_ident        = @{ !reserved ~ ident }
