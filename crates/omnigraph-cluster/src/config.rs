@@ -618,6 +618,14 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
         };
     };
     let settings = validate_cluster_header(&raw, &mut diagnostics);
+    // Every graph root and the cluster ledger live under this one root, so a
+    // Blob base disjoint from it is disjoint from all of them. An invalid
+    // declared root already carries its own error, and has no layout to guard.
+    let storage_root = match (&raw.storage, &settings.storage_root) {
+        (_, Some(root)) => Some(root.clone()),
+        (None, None) => Some(config_dir.to_string_lossy().into_owned()),
+        (Some(_), None) => None,
+    };
 
     let mut resources = BTreeMap::new();
     let mut dependencies = BTreeSet::new();
@@ -666,7 +674,12 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
         let schema_address = schema_address(graph_id);
         graph_external_blob_policies.insert(
             graph_id.clone(),
-            validate_external_blob_policy(graph_id, &graph.external_blobs, &mut diagnostics),
+            validate_external_blob_policy(
+                graph_id,
+                &graph.external_blobs,
+                storage_root.as_deref(),
+                &mut diagnostics,
+            ),
         );
         dependencies.insert(Dependency {
             from: schema_address.clone(),
@@ -1048,6 +1061,7 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
 fn validate_external_blob_policy(
     graph_id: &str,
     config: &ExternalBlobsConfig,
+    storage_root: Option<&str>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> omnigraph::ExternalBlobPolicy {
     if config.allow.is_empty() {
@@ -1057,13 +1071,27 @@ fn validate_external_blob_policy(
     let mut bases = Vec::with_capacity(config.allow.len());
     let mut invalid = false;
     for (index, configured) in config.allow.iter().enumerate() {
+        let path = format!("graphs.{graph_id}.external_blobs.allow[{index}].base");
         match omnigraph::ExternalBlobBase::new(&configured.base, configured.scope.into()) {
-            Ok(base) => bases.push(base),
+            Ok(base) => {
+                if let Some(Err(error)) =
+                    storage_root.map(|root| base.ensure_disjoint_from_storage_root(root))
+                {
+                    invalid = true;
+                    diagnostics.push(Diagnostic::error(
+                        "external_blob_base_overlaps_storage_root",
+                        path,
+                        error.to_string(),
+                    ));
+                } else {
+                    bases.push(base);
+                }
+            }
             Err(error) => {
                 invalid = true;
                 diagnostics.push(Diagnostic::error(
                     "invalid_external_blob_base",
-                    format!("graphs.{graph_id}.external_blobs.allow[{index}].base"),
+                    path,
                     error.to_string(),
                 ));
             }

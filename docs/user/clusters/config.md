@@ -130,6 +130,18 @@ embedded host and may permit a local `file://` directory; it is not installed
 by the HTTP server or direct-store CLI. Bases must be absolute, non-overlapping,
 and free of credentials, query strings, fragments, and path traversal.
 
+A base must also name storage outside the cluster's storage root: the config
+directory when `storage` is omitted, or the `storage` URI. That root holds every
+graph and the applied state, and ingress reads with the process's own storage
+credentials, so a base over it would let any writer copy another graph's data
+or the cluster ledger into a readable Blob value. `cluster validate`, `plan`,
+and `apply` refuse such a base with `external_blob_base_overlaps_storage_root`,
+whatever its scope. Put external objects under a sibling prefix instead, for
+example `s3://company-assets/cluster-external/` beside
+`storage: s3://company-assets/cluster`. A server that finds an overlapping
+`server_safe` base in the applied state quarantines that graph, and an embedded
+handle refuses a policy whose base overlaps its own graph root.
+
 The allow-list controls which external objects an authorized writer may cause
 the process to inspect. Cedar policy separately decides who may write. See
 [Blob values](../blobs.md).

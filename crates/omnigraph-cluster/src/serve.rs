@@ -49,9 +49,10 @@ pub struct ServingSnapshot {
     pub state_cas: Option<String>,
     /// Every graph the applied revision names, sorted.
     pub applied_graphs: Vec<String>,
-    /// Applied graphs this snapshot does not serve because pending recovery
-    /// quarantined them, sorted. A sidecar for a graph the revision does not
-    /// name is not in this list.
+    /// Applied graphs this snapshot does not serve, sorted: pending recovery
+    /// quarantined them, or their applied external Blob policy has a
+    /// server-safe base overlapping the cluster storage root. A sidecar for a
+    /// graph the revision does not name is not in this list.
     pub quarantined_graphs: Vec<String>,
 }
 
@@ -348,6 +349,18 @@ async fn read_snapshot_with_store(
     let boot_state_revision = state.state_revision;
     let boot_state_cas = observations.state_cas.clone();
     let boot_applied_graphs = applied_graph_ids(&state);
+    for (graph_id, reason) in
+        overlapping_served_external_blob_policies(&state, backend.display_root())
+    {
+        quarantined_graphs.insert(graph_id.clone());
+        startup_diagnostics.push(Diagnostic::warning(
+            "external_blob_base_overlaps_storage_root",
+            graph_address(&graph_id),
+            format!(
+                "graph `{graph_id}` is quarantined because its applied external Blob policy is unsafe to serve: {reason}; move the base to a prefix outside the cluster storage root, run `cluster apply`, and restart"
+            ),
+        ));
+    }
 
     let required_embedding_providers: BTreeSet<String> = state
         .applied_revision
@@ -555,6 +568,41 @@ async fn read_snapshot_with_store(
             .collect(),
         applied_graphs: boot_applied_graphs,
     })
+}
+
+/// Applied graphs whose served external Blob policy has a base overlapping the
+/// cluster storage root, with the refusal reason.
+///
+/// The policy is projected to the server-safe bases the server would install,
+/// then each base is compared with the one root that holds every graph and the
+/// cluster ledger. A config validated before this check existed can still
+/// carry such a base in the ledger; serving it would let any writer copy
+/// another graph's or the ledger's bytes into a readable Blob cell. A policy
+/// that does not project is left to the server's own install to refuse.
+pub(crate) fn overlapping_served_external_blob_policies(
+    state: &crate::types::ClusterState,
+    storage_root: &str,
+) -> Vec<(String, String)> {
+    state
+        .applied_revision
+        .resources
+        .iter()
+        .filter_map(|(address, entry)| {
+            let ResourceKind::Graph(graph_id) = resource_kind(address) else {
+                return None;
+            };
+            let policy = entry
+                .external_blob_policy
+                .clone()
+                .unwrap_or_default()
+                .server_safe_only()
+                .ok()?;
+            policy
+                .ensure_disjoint_from_storage_root(storage_root)
+                .err()
+                .map(|error| (graph_id, error.to_string()))
+        })
+        .collect()
 }
 
 #[cfg(test)]

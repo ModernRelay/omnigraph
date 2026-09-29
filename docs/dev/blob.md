@@ -50,6 +50,8 @@ Bulk load and mutation inputs use these values:
 
 New external references are denied by default. A configured policy permits only normalized URIs beneath declared bases. Credentials must not be persisted in URIs. Cluster serving projects only server-safe bases; `file://` may be useful to a deliberate embedded process but is never admitted by the HTTP server.
 
+A base may not overlap OmniGraph storage. Ingress reads with the process's storage principal, so a base over a graph or cluster root would let a writer copy manifest, table, or ledger bytes into a managed cell that Cedar then serves as graph data. Three checks hold the rule, each against the roots it knows: cluster validation compares every base with the cluster storage root (`external_blob_base_overlaps_storage_root`), serve boot quarantines a graph whose applied server-safe base overlaps that root, and `Omnigraph::with_external_blob_policy` refuses a base overlapping the handle's own graph root. The comparison is by URI component in either direction, using the lexical and canonical forms of both sides (`ExternalBlobBase::ensure_disjoint_from_storage_root`); a root in a scheme no base may use cannot overlap.
+
 Admission is done after last-write-wins coalescing, so superseded input cannot trigger target I/O. Equivalent normalized references are probed and read once per bounded operation where materialization is required. URI metadata, selected reference count, and carried payload bytes all participate in pre-effect limits.
 
 Storage mode determines ownership:
@@ -79,6 +81,7 @@ Export emits managed values as base64 and external values as URI descriptors. It
 ## Test owners
 
 - Engine logical reads and ingestion: `crates/omnigraph/tests/end_to_end.rs`, `branching.rs`, and in-source Blob/table-store tests.
+- Base and storage-root disjointness: in-source `blob.rs` tests (root forms and S3/local overlap), `end_to_end.rs::external_blob_policy_refuses_base_overlapping_graph_root`, and the `omnigraph-cluster` tests `external_blob_config_rejects_bases_overlapping_storage_root`, `external_blob_base_overlapping_storage_root_refuses_apply_over_existing_state`, and `serving_quarantines_applied_policies_overlapping_storage_root`.
 - Lance compatibility: `crates/omnigraph/tests/lance_surface_guards.rs`.
 - Cluster policy persistence and serving projection: `omnigraph-cluster` in-source tests.
 - HTTP transport: `crates/omnigraph-server/tests/data_routes.rs`, `auth_policy.rs`, and `openapi.rs`.

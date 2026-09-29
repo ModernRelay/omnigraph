@@ -256,6 +256,32 @@ impl ExternalBlobBase {
     fn lexical_normalized(&self) -> Result<NormalizedExternalUri> {
         NormalizedExternalUri::parse(&self.uri, UriRole::Base)
     }
+
+    /// Refuse a base that contains, or lies inside, an OmniGraph storage root.
+    ///
+    /// Blob ingress reads with the process's storage principal, so a base over
+    /// a graph or cluster root would let any authorized writer copy manifest,
+    /// table, or cluster-ledger bytes into a managed cell that Cedar then
+    /// serves as graph data. Both the operator spelling and the canonical
+    /// filesystem form are compared against every form of the root; the error
+    /// names the base only, never the root.
+    pub fn ensure_disjoint_from_storage_root(&self, storage_root: &str) -> Result<()> {
+        let roots = NormalizedExternalUri::storage_root_forms(storage_root)?;
+        if roots.is_empty() {
+            return Ok(());
+        }
+        let bases = [self.lexical_normalized()?, self.normalized()?];
+        let overlaps = bases
+            .iter()
+            .any(|base| roots.iter().any(|root| base.overlaps_base(root)));
+        if overlaps {
+            return Err(policy_error(format!(
+                "external Blob base '{}' overlaps an OmniGraph storage root; bases must name storage outside every graph and cluster root",
+                self.uri
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Graph-level trust policy for new external Blob references.
@@ -344,6 +370,16 @@ impl ExternalBlobPolicy {
         }
     }
 
+    /// Refuse a policy with any base overlapping `storage_root`, the root of a
+    /// graph or of the cluster that stores it. Bases are validated again first
+    /// so a deserialized policy regains its canonical filesystem forms.
+    pub fn ensure_disjoint_from_storage_root(&self, storage_root: &str) -> Result<()> {
+        for base in self.validated()?.bases() {
+            base.ensure_disjoint_from_storage_root(storage_root)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn authorize(&self, uri: &str) -> Result<NormalizedExternalBlobUri> {
         let candidate = NormalizedExternalUri::parse(uri, UriRole::Input)?;
         let requested_uri = candidate.uri();
@@ -406,6 +442,11 @@ impl NormalizedExternalBlobUri {
     }
 }
 
+/// Every URI scheme an external Blob base may use. [`NormalizedExternalUri::parse`]
+/// refuses any other, and [`NormalizedExternalUri::storage_root_forms`] must
+/// produce comparable forms for a storage root in each of them.
+const EXTERNAL_BASE_SCHEMES: [&str; 2] = ["s3", "file"];
+
 #[derive(Debug, Clone, Copy)]
 enum UriRole {
     Base,
@@ -461,6 +502,14 @@ impl NormalizedExternalUri {
         }
 
         let scheme = parsed.scheme().to_ascii_lowercase();
+        let unsupported = || {
+            policy_error(format!(
+                "external Blob URI scheme '{scheme}' is not supported by this build"
+            ))
+        };
+        if !EXTERNAL_BASE_SCHEMES.contains(&scheme.as_str()) {
+            return Err(unsupported());
+        }
         let authority = match scheme.as_str() {
             "s3" => parsed
                 .host_str()
@@ -475,11 +524,7 @@ impl NormalizedExternalUri {
                 }
                 String::new()
             }
-            _ => {
-                return Err(policy_error(format!(
-                    "external Blob URI scheme '{scheme}' is not supported by this build"
-                )));
-            }
+            _ => return Err(unsupported()),
         };
 
         let encoded_path = parsed.path();
@@ -523,6 +568,51 @@ impl NormalizedExternalUri {
             path,
             trailing_slash,
         })
+    }
+
+    /// Base-shaped forms of a normalized storage root, for overlap checks.
+    ///
+    /// Dispatch is on the root's URI text: an S3 root yields its one spelling;
+    /// a `file://` or plain-path root yields its canonical form (the deepest
+    /// existing ancestor resolved through symlinks, the missing suffix appended)
+    /// and, when it parses, its lexical absolute form. A root in any scheme no
+    /// base may use (`az://`, in-memory test schemes) cannot overlap a base and
+    /// yields no forms. A required form that cannot be derived fails closed.
+    fn storage_root_forms(root: &str) -> Result<Vec<Self>> {
+        let unrepresentable =
+            || policy_error("could not compare external Blob bases with the storage root");
+        let path = match root.split_once("://") {
+            Some((scheme, _)) if scheme.eq_ignore_ascii_case("s3") => {
+                let root = format!("{}/", root.trim_end_matches('/'));
+                return Self::parse(&root, UriRole::Base)
+                    .map(|form| vec![form])
+                    .map_err(|_| unrepresentable());
+            }
+            Some((scheme, _)) if scheme.eq_ignore_ascii_case("file") => url::Url::parse(root)
+                .ok()
+                .and_then(|parsed| parsed.to_file_path().ok())
+                .ok_or_else(unrepresentable)?,
+            Some(_) => return Ok(Vec::new()),
+            None => std::path::PathBuf::from(root),
+        };
+        let absolute = std::path::absolute(&path).map_err(|_| unrepresentable())?;
+        let canonical = canonical_existing_prefix(&absolute).ok_or_else(unrepresentable)?;
+        let canonical = url::Url::from_directory_path(&canonical)
+            .ok()
+            .and_then(|uri| Self::parse(uri.as_str(), UriRole::Base).ok())
+            .ok_or_else(unrepresentable)?;
+        let mut forms = vec![canonical];
+        // The lexical spelling is what a base written against the same path
+        // compares with before canonicalization; a `..` spelling does not parse
+        // and is covered by the canonical form alone.
+        if let Some(lexical) = url::Url::from_directory_path(&absolute)
+            .ok()
+            .and_then(|uri| Self::parse(uri.as_str(), UriRole::Base).ok())
+            && lexical != forms[0]
+        {
+            forms.push(lexical);
+        }
+        Ok(forms)
     }
 
     fn canonical_file_base(self) -> Result<Self> {
@@ -634,6 +724,30 @@ fn reject_raw_dot_path_components(raw: &str) -> Result<()> {
         decode_path_component(component)?;
     }
     Ok(())
+}
+
+/// Resolve the deepest existing ancestor of an absolute path through the
+/// filesystem and append the missing suffix unchanged, so a root that does not
+/// exist yet still compares through its symlinked ancestors. `None` when the
+/// missing suffix itself holds a `.` or `..` component, which has no single
+/// resolution.
+fn canonical_existing_prefix(absolute: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut ancestor = absolute;
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(mut canonical) = std::fs::canonicalize(ancestor) {
+            for component in suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return Some(canonical);
+        }
+        let mut components = ancestor.components();
+        match components.next_back()? {
+            std::path::Component::Normal(name) => suffix.push(name.to_os_string()),
+            _ => return None,
+        }
+        ancestor = components.as_path();
+    }
 }
 
 fn file_path_from_normalized_uri(uri: &str) -> Result<std::path::PathBuf> {
@@ -1712,6 +1826,134 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn assert_overlaps_storage_root(result: Result<()>) {
+        match result {
+            Err(OmniError::ExternalBlobPolicy { uri, reason }) => {
+                assert_eq!(uri, "<redacted>");
+                assert!(
+                    reason.contains("overlaps an OmniGraph storage root"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected an overlap refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn storage_root_forms_cover_every_base_scheme() {
+        let directory = tempfile::tempdir().unwrap();
+        let file_root = url::Url::from_directory_path(directory.path()).unwrap();
+        for scheme in EXTERNAL_BASE_SCHEMES {
+            let root = match scheme {
+                "s3" => "s3://bucket/cluster".to_string(),
+                "file" => file_root.to_string(),
+                other => panic!("no storage root sample for base scheme '{other}'"),
+            };
+            assert!(
+                !NormalizedExternalUri::storage_root_forms(&root)
+                    .unwrap()
+                    .is_empty(),
+                "a '{scheme}' storage root must yield comparable forms"
+            );
+        }
+        for root in ["s3://b", "s3://b/", "s3://b/c"] {
+            assert_eq!(
+                NormalizedExternalUri::storage_root_forms(root)
+                    .unwrap()
+                    .len(),
+                1,
+                "{root}"
+            );
+        }
+        for root in [
+            "az://container/c",
+            "memory://graph",
+            "shared-memory://universe/g",
+        ] {
+            assert!(
+                NormalizedExternalUri::storage_root_forms(root)
+                    .unwrap()
+                    .is_empty(),
+                "{root}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_blob_base_must_be_disjoint_from_s3_storage_roots() {
+        let base =
+            |uri: &str| ExternalBlobBase::new(uri, ExternalBlobExecutionScope::ServerSafe).unwrap();
+        for (uri, root) in [
+            ("s3://b/", "s3://b/c"),
+            ("s3://b/c/", "s3://b"),
+            ("s3://b/anything/", "s3://b/"),
+            ("s3://b/c/graphs/x.omni/", "s3://b/c"),
+            ("s3://b/c/__cluster/", "s3://b/c/"),
+            ("s3://B/c/graphs/", "s3://b/c"),
+        ] {
+            assert_overlaps_storage_root(base(uri).ensure_disjoint_from_storage_root(root));
+        }
+        for (uri, root) in [
+            ("s3://b/c-external/", "s3://b/c"),
+            ("s3://other/c/", "s3://b/c"),
+            ("s3://b/c/", "az://b/c"),
+        ] {
+            base(uri).ensure_disjoint_from_storage_root(root).unwrap();
+        }
+        let policy = ExternalBlobPolicy::allow(vec![
+            base("s3://b/c-external/"),
+            base("s3://b/c/graphs/x.omni/"),
+        ])
+        .unwrap();
+        assert_overlaps_storage_root(policy.ensure_disjoint_from_storage_root("s3://b/c"));
+        ExternalBlobPolicy::Deny
+            .ensure_disjoint_from_storage_root("s3://b/c")
+            .unwrap();
+    }
+
+    #[test]
+    fn external_blob_base_must_be_disjoint_from_local_storage_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("cluster");
+        let external = directory.path().join("cluster-external");
+        std::fs::create_dir_all(root.join("graphs").join("x.omni")).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let base = |path: &std::path::Path| {
+            ExternalBlobBase::new(
+                url::Url::from_directory_path(path).unwrap().as_str(),
+                ExternalBlobExecutionScope::EmbeddedOnly,
+            )
+            .unwrap()
+        };
+        let plain_root = root.to_str().unwrap();
+        let file_root = url::Url::from_directory_path(&root).unwrap().to_string();
+        // A root spelled through `..` is compared by its canonical form only.
+        let dotted_root = format!("{}/graphs/../", root.display());
+        for storage_root in [plain_root, file_root.as_str(), dotted_root.as_str()] {
+            for overlapping in [
+                directory.path().to_path_buf(),
+                root.clone(),
+                root.join("graphs").join("x.omni"),
+            ] {
+                assert_overlaps_storage_root(
+                    base(&overlapping).ensure_disjoint_from_storage_root(storage_root),
+                );
+            }
+            base(&external)
+                .ensure_disjoint_from_storage_root(storage_root)
+                .unwrap();
+        }
+        // A root that does not exist yet still compares through its existing
+        // ancestors.
+        let future_root = directory.path().join("future").join("graph.omni");
+        assert_overlaps_storage_root(
+            base(directory.path()).ensure_disjoint_from_storage_root(future_root.to_str().unwrap()),
+        );
+        base(&external)
+            .ensure_disjoint_from_storage_root(future_root.to_str().unwrap())
+            .unwrap();
     }
 
     #[cfg(unix)]

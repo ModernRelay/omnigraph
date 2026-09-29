@@ -78,7 +78,7 @@ The current distributed support boundary is still one mutation-capable writer pr
 
 A directory lets the server resolve the storage root from `cluster.yaml`; a URI reads the applied deployment artifact directly. There is no single-graph positional boot, `--target`, or runtime graph add/remove API.
 
-Serving verifies ledger/resource digests, builds each graph's query registry and embedding provider, projects external-Blob policy to the server-safe subset, and binds at most one Cedar bundle per graph plus one cluster-level bundle. A graph-local open or registry failure quarantines that graph while healthy graphs may continue. `--require-all-graphs` makes any quarantine a startup failure; zero healthy graphs always fails.
+Serving verifies ledger/resource digests, builds each graph's query registry and embedding provider, projects external-Blob policy to the server-safe subset, and binds at most one Cedar bundle per graph plus one cluster-level bundle. A graph-local open or registry failure quarantines that graph while healthy graphs may continue, and so does an applied server-safe external-Blob base that overlaps the cluster storage root (a ledger written before validation refused such bases). `--require-all-graphs` makes any quarantine a startup failure; zero healthy graphs always fails.
 
 Servers do not hot-reload applied graph configuration. Apply the new revision and restart every server that should serve it. Explicit OIDC public-admission snapshots have a separate bounded refresh contract below.
 

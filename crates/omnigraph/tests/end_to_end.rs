@@ -2199,6 +2199,125 @@ async fn blob_update_null_to_non_null() {
     assert_eq!(&bytes[..], &[1, 2, 3]);
 }
 
+// ─── External Blob bases stay outside the graph's own storage ────────────────
+
+/// A base over the graph root would let any authorized writer copy manifest
+/// and table bytes into a managed cell served as ordinary Blob data. Every
+/// spelling of an overlap is refused at install time, before any write, and a
+/// graph-internal URI stays outside a disjoint base.
+#[tokio::test]
+async fn external_blob_policy_refuses_base_overlapping_graph_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let graph = dir.path().join("graph");
+    let graph_uri = graph.to_str().unwrap().to_string();
+    let external = dir.path().join("external");
+    std::fs::create_dir_all(&external).unwrap();
+    let db = helpers::session(Omnigraph::init(&graph_uri, BLOB_SCHEMA).await.unwrap());
+    db.load_jsonl(
+        &serde_json::json!({
+            "type": "Document",
+            "data": {"title": "seed", "content": "base64:AQID"},
+        })
+        .to_string(),
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    drop(db);
+
+    let graph_state = |uri: String| async move {
+        let db = Omnigraph::open_read_only(&uri).await.unwrap();
+        (
+            version_main(&db).await.unwrap(),
+            pinned_version(&db, "main", "node:Document").await,
+        )
+    };
+    let before = graph_state(graph_uri.clone()).await;
+
+    let directory_base = |path: &std::path::Path| {
+        url::Url::from_directory_path(path)
+            .expect("base path is absolute")
+            .to_string()
+    };
+    let mut overlapping = vec![
+        directory_base(&graph),
+        directory_base(dir.path()),
+        directory_base(&graph.join("__manifest")),
+        // On macOS the temporary directory is `/var/...`, a symlink to
+        // `/private/var/...`: the canonical spelling must overlap as well.
+        directory_base(&std::fs::canonicalize(&graph).unwrap()),
+    ];
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("graph-link");
+        std::os::unix::fs::symlink(&graph, &link).unwrap();
+        overlapping.push(directory_base(&link));
+    }
+    for base in overlapping {
+        let policy = ExternalBlobPolicy::allow(vec![
+            ExternalBlobBase::new(&base, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
+        ])
+        .unwrap();
+        match Omnigraph::open(&graph_uri)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+        {
+            Err(OmniError::ExternalBlobPolicy { reason, .. }) => assert!(
+                reason.contains("overlaps an OmniGraph storage root"),
+                "{base}: {reason}"
+            ),
+            Err(other) => panic!("{base}: expected a policy refusal, got {other}"),
+            Ok(_) => panic!("{base}: a base overlapping the graph root must be refused"),
+        }
+    }
+    assert_eq!(graph_state(graph_uri.clone()).await, before);
+
+    // A sibling base is admitted, and a URI naming the graph's own ledger is
+    // outside it: the keyed load that would have copied it is refused with the
+    // graph unchanged.
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            directory_base(&external),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let db = helpers::session(
+        Omnigraph::open(&graph_uri)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
+    let transaction = std::fs::read_dir(graph.join("__manifest").join("_transactions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_file())
+        .expect("the graph ledger holds a transaction file");
+    let error = db
+        .load_jsonl(
+            &serde_json::json!({
+                "type": "Document",
+                "data": {
+                    "title": "ledger",
+                    "content": url::Url::from_file_path(&transaction).unwrap().to_string(),
+                },
+            })
+            .to_string(),
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, OmniError::ExternalBlobPolicy { .. }),
+        "unexpected error: {error}"
+    );
+    drop(db);
+    assert_eq!(graph_state(graph_uri).await, before);
+}
+
 // ─── Regression: blob load with external file URI ────────────────────────────
 
 #[tokio::test]

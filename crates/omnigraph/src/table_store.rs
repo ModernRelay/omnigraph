@@ -1188,7 +1188,9 @@ impl TableStore {
     }
 
     pub(crate) fn with_external_blob_policy(mut self, policy: ExternalBlobPolicy) -> Result<Self> {
-        self.external_blob_policy = Arc::new(policy.validated()?);
+        let policy = policy.validated()?;
+        policy.ensure_disjoint_from_storage_root(&self.root_uri)?;
+        self.external_blob_policy = Arc::new(policy);
         Ok(self)
     }
 
@@ -6834,8 +6836,10 @@ mod tests {
             .unwrap(),
         ])
         .unwrap();
+        // The graph root must lie outside every external base.
+        let graph_root = tempfile::tempdir().unwrap();
         let store = TableStore::new(
-            directory.path().to_string_lossy().as_ref(),
+            graph_root.path().to_string_lossy().as_ref(),
             crate::lance_access::LanceAccessContext::new().data_session(),
         )
         .with_external_blob_policy(policy)
@@ -6944,8 +6948,10 @@ mod tests {
             .unwrap(),
         ])
         .unwrap();
+        // The graph root must lie outside every external base.
+        let graph_root = tempfile::tempdir().unwrap();
         let store = TableStore::new(
-            directory.path().to_string_lossy().as_ref(),
+            graph_root.path().to_string_lossy().as_ref(),
             crate::lance_access::LanceAccessContext::new().data_session(),
         )
         .with_external_blob_policy(policy)
