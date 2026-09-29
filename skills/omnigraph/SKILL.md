@@ -217,6 +217,27 @@ cannot be node-typed. Don't stash provenance into a free-text `source: String`
 or a metadata dump—structural provenance is queryable and migratable;
 free-form provenance is neither.
 
+## Ontologies as Agent Coordination
+
+When many agents share one graph, the ontology is their coordinate system: it
+decides where a fact goes, what a stored value means, and which paths agents
+reason along. Design for **convergence**: two agents given the same input
+should write the same graph and read the same meaning back. Every free choice
+at write time is a coordination cost later; every relation not stored is a
+reasoning cost later.
+
+In short: design identity first (`@key`, keyed edges, find before create) ·
+kinds are types, roles are edges · put a fact on what determines it (often an
+edge property) · keep who-said-it, why-believe-it, how-sure and when on
+separate axes · represent assertions and contradictions, not only truth ·
+store decisions, compute derived facts · close vocabularies where agents must
+agree, and watch the catch-all · keep semantic rules in the graph where agents
+can read them · compose modules around shared identities · store the links
+agents would otherwise search for · split nodes by independence · write names
+and `@description`/`@instruction` for a reader without context · never
+repurpose a field · measure convergence with two independent encoders. Full
+text with Omnigraph mappings: [`references/ontology-design.md`](references/ontology-design.md).
+
 ## Storage & Credentials
 
 A graph's bytes live in one of three supported URI families:
@@ -350,6 +371,7 @@ For anything beyond the basics, load the relevant reference file. Each is self-c
 | Reference | When to load |
 |-----------|--------------|
 | [`references/schema.md`](references/schema.md) | Editing `.pg` files, running `schema plan`/`apply`, renaming types, backfilling required fields |
+| [`references/ontology-design.md`](references/ontology-design.md) | Designing a schema that many agents read and write: identity, roles, stance, rules as data, composition, measuring convergence |
 | [`references/queries.md`](references/queries.md) | Writing or linting `.gq` files, search functions, aggregations, multi-hop patterns |
 | [`references/data.md`](references/data.md) | Choosing between `mutate` and `load` (required `--mode`, `--from` to fork a review branch); branch review workflow; exact overwrite scope |
 | [`references/blobs.md`](references/blobs.md) | Writing and reading managed/external Blob values, selectors/ranges, security and lifecycle boundaries |
