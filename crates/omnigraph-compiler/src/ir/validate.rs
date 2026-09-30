@@ -46,8 +46,8 @@ fn validate_pipeline(pipeline: &[IROp], introduced: &mut HashSet<String>) -> Res
             IROp::Expand {
                 src_var,
                 dst_var,
-                edge_type: _,
-                direction: _,
+                edges: _,
+                src_type: _,
                 dst_type: _,
                 min_hops: _,
                 max_hops: _,
@@ -159,6 +159,7 @@ fn check_expr(expr: &IRExpr, introduced: &HashSet<String>) -> Result<()> {
 mod tests {
     use super::*;
     use crate::query::ast::CompOp;
+    use crate::traversal::{EdgeMember, EdgeSelection};
     use crate::types::Direction;
 
     fn scan(variable: &str) -> IROp {
@@ -173,8 +174,11 @@ mod tests {
         IROp::Expand {
             src_var: src.to_string(),
             dst_var: dst.to_string(),
-            edge_type: "Knows".to_string(),
-            direction: Direction::Out,
+            edges: EdgeSelection::Named(EdgeMember {
+                edge_type: "Knows".to_string(),
+                direction: Direction::Out,
+            }),
+            src_type: "Person".to_string(),
             dst_type: "Person".to_string(),
             min_hops: 1,
             max_hops: Some(1),

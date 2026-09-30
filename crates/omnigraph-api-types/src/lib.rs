@@ -115,6 +115,10 @@ pub struct SettingsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = ann_nprobes_schema)]
     pub ann_nprobes: Option<i64>,
+    /// Positive query-wide traversal row-work cap for statements using edge selectors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(schema_with = traversal_work_limit_schema)]
+    pub traversal_work_limit: Option<i64>,
 }
 
 impl SettingsRequest {
@@ -136,6 +140,9 @@ impl SettingsRequest {
         }
         if let Some(ann_nprobes) = self.ann_nprobes {
             assignments.push((SettingId::AnnNprobes, SettingValue::Integer(ann_nprobes)));
+        }
+        if let Some(limit) = self.traversal_work_limit {
+            assignments.push((SettingId::TraversalWorkLimit, SettingValue::Integer(limit)));
         }
         assignments
     }
@@ -169,6 +176,10 @@ fn merge_lineage_schema() -> utoipa::openapi::schema::Object {
 
 fn ann_nprobes_schema() -> utoipa::openapi::schema::Object {
     setting_schema(SettingId::AnnNprobes)
+}
+
+fn traversal_work_limit_schema() -> utoipa::openapi::schema::Object {
+    setting_schema(SettingId::TraversalWorkLimit)
 }
 
 /// Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.
@@ -2162,12 +2173,13 @@ mod tests {
             engine: Some(Engine::V2),
             merge_lineage: Some(MergeLineage::Off),
             ann_nprobes: Some(7),
+            traversal_work_limit: Some(123),
         };
         let expected = format!(
-            "{{\"{}\":\"v2\",\"{}\":\"off\",\"{}\":7}}",
-            request_rows[0], request_rows[1], request_rows[2]
+            "{{\"{}\":\"v2\",\"{}\":\"off\",\"{}\":7,\"{}\":123}}",
+            request_rows[0], request_rows[1], request_rows[2], request_rows[3]
         );
-        assert_eq!(request_rows.len(), 3);
+        assert_eq!(request_rows.len(), 4);
         assert_eq!(serde_json::to_string(&populated).unwrap(), expected);
         assert_eq!(
             populated
@@ -2209,6 +2221,22 @@ mod tests {
             "a negative cap reaches the settings validation with its own spelling"
         );
         assert!(serde_json::from_str::<SettingsRequest>("{\"traversal\": \"csr\"}").is_err());
+        let parsed: SettingsRequest =
+            serde_json::from_str("{\"traversal_work_limit\": 123}").unwrap();
+        assert_eq!(
+            parsed.assignments(),
+            vec![(SettingId::TraversalWorkLimit, SettingValue::Integer(123))]
+        );
+        assert!(
+            serde_json::from_str::<SettingsRequest>("{\"traversal_work_limit\": \"many\"}")
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<SettingsRequest>(
+                "{\"traversal_work_limit\": 9223372036854775808}"
+            )
+            .is_err()
+        );
     }
 
     #[test]

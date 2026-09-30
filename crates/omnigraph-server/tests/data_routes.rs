@@ -2302,6 +2302,13 @@ async fn settings_show_all_lists_the_definition_in_order() {
             ),
             show_row("ann_nprobes", "20", "20", "default", "request"),
             show_row("stage_write_concurrency", "8", "8", "default", "process"),
+            show_row(
+                "traversal_work_limit",
+                "1000000",
+                "1000000",
+                "default",
+                "request"
+            ),
         ])
     );
 }
