@@ -778,36 +778,47 @@ fn validate_subst_tokens(body: &str, loop_var: Option<&str>) -> Result<(), Strin
 /// Walks one expression for the index decision and the string-`nearest`
 /// refusal. Exhaustive over `Expr` so a newly added construct is a compile
 /// error, never a silent skip.
-fn walk_expr(expr: &Expr, params: &[Param], needs_indices: &mut bool) -> Result<(), String> {
+fn walk_expr(
+    expr: &Expr,
+    params: &[Param],
+    needs_indices: &mut bool,
+    reject_edge_type: bool,
+) -> Result<(), String> {
     match expr {
-        Expr::Now
-        | Expr::PropAccess {
-            variable: _,
-            property: _,
+        Expr::PropAccess { property, .. }
+            if reject_edge_type && property == omnigraph_compiler::traversal::EDGE_TYPE_META =>
+        {
+            return Err(
+                "expect same as v1: the reference engine does not support edge @type access".into(),
+            );
         }
+        Expr::Now
+        | Expr::PropAccess { .. }
         | Expr::Variable(_)
         | Expr::Literal(_)
         | Expr::AliasRef(_) => {}
-        Expr::Aggregate { func: _, arg } => walk_expr(arg, params, needs_indices)?,
+        Expr::Aggregate { func: _, arg } => {
+            walk_expr(arg, params, needs_indices, reject_edge_type)?
+        }
         Expr::Binary { left, op: _, right }
         | Expr::In {
             needle: left,
             list: right,
         } => {
-            walk_expr(left, params, needs_indices)?;
-            walk_expr(right, params, needs_indices)?;
+            walk_expr(left, params, needs_indices, reject_edge_type)?;
+            walk_expr(right, params, needs_indices, reject_edge_type)?;
         }
         Expr::Not(inner)
         | Expr::IsNull {
             expr: inner,
             negated: _,
-        } => walk_expr(inner, params, needs_indices)?,
+        } => walk_expr(inner, params, needs_indices, reject_edge_type)?,
         Expr::Search { field, query }
         | Expr::MatchText { field, query }
         | Expr::Bm25 { field, query } => {
             *needs_indices = true;
-            walk_expr(field, params, needs_indices)?;
-            walk_expr(query, params, needs_indices)?;
+            walk_expr(field, params, needs_indices, reject_edge_type)?;
+            walk_expr(query, params, needs_indices, reject_edge_type)?;
         }
         Expr::Fuzzy {
             field,
@@ -815,10 +826,10 @@ fn walk_expr(expr: &Expr, params: &[Param], needs_indices: &mut bool) -> Result<
             max_edits,
         } => {
             *needs_indices = true;
-            walk_expr(field, params, needs_indices)?;
-            walk_expr(query, params, needs_indices)?;
+            walk_expr(field, params, needs_indices, reject_edge_type)?;
+            walk_expr(query, params, needs_indices, reject_edge_type)?;
             if let Some(max_edits) = max_edits {
-                walk_expr(max_edits, params, needs_indices)?;
+                walk_expr(max_edits, params, needs_indices, reject_edge_type)?;
             }
         }
         Expr::Nearest {
@@ -828,7 +839,7 @@ fn walk_expr(expr: &Expr, params: &[Param], needs_indices: &mut bool) -> Result<
         } => {
             *needs_indices = true;
             refuse_string_nearest(query, params)?;
-            walk_expr(query, params, needs_indices)?;
+            walk_expr(query, params, needs_indices, reject_edge_type)?;
         }
         Expr::Rrf {
             primary,
@@ -836,10 +847,10 @@ fn walk_expr(expr: &Expr, params: &[Param], needs_indices: &mut bool) -> Result<
             k,
         } => {
             *needs_indices = true;
-            walk_expr(primary, params, needs_indices)?;
-            walk_expr(secondary, params, needs_indices)?;
+            walk_expr(primary, params, needs_indices, reject_edge_type)?;
+            walk_expr(secondary, params, needs_indices, reject_edge_type)?;
             if let Some(k) = k {
-                walk_expr(k, params, needs_indices)?;
+                walk_expr(k, params, needs_indices, reject_edge_type)?;
             }
         }
     }
@@ -871,17 +882,23 @@ fn walk_clauses(
     clauses: &[Clause],
     params: &[Param],
     needs_indices: &mut bool,
+    reject_edge_type: bool,
 ) -> Result<(), String> {
     for clause in clauses {
         match clause {
-            Clause::Binding(_) | Clause::Traversal(_) => {}
-            Clause::Filter(f) => walk_expr(f, params, needs_indices)?,
-            Clause::Subquery(subquery) => {
-                walk_clauses(&subquery.clauses, params, needs_indices)?;
-                if let Some(arg) = &subquery.arg {
-                    walk_expr(arg, params, needs_indices)?;
+            Clause::Binding(binding) => {
+                for property in &binding.prop_matches {
+                    walk_expr(&property.value, params, needs_indices, reject_edge_type)?;
                 }
-                walk_expr(&subquery.right, params, needs_indices)?;
+            }
+            Clause::Traversal(_) => {}
+            Clause::Filter(f) => walk_expr(f, params, needs_indices, reject_edge_type)?,
+            Clause::Subquery(subquery) => {
+                walk_clauses(&subquery.clauses, params, needs_indices, reject_edge_type)?;
+                if let Some(arg) = &subquery.arg {
+                    walk_expr(arg, params, needs_indices, reject_edge_type)?;
+                }
+                walk_expr(&subquery.right, params, needs_indices, reject_edge_type)?;
             }
         }
     }
@@ -901,7 +918,7 @@ fn ordered_refusal(decl: &QueryDecl) -> Option<String> {
     ) {
         return Some(
             "`expect ordered` is refused for an `order` clause led by `rrf()`; fusion sorts by \
-             score alone, with no tie-break"
+             ranked identity and downstream metadata; the harness does not promise a total order for every fusion shape"
                 .into(),
         );
     }
@@ -921,12 +938,35 @@ fn ordered_refusal(decl: &QueryDecl) -> Option<String> {
 }
 
 fn inspect_decl(decl: &QueryDecl, needs_indices: &mut bool) -> Result<(), String> {
-    walk_clauses(&decl.match_clause, &decl.params, needs_indices)?;
+    inspect_decl_with_policy(decl, needs_indices, false)
+}
+
+fn inspect_decl_with_policy(
+    decl: &QueryDecl,
+    needs_indices: &mut bool,
+    reject_edge_type: bool,
+) -> Result<(), String> {
+    walk_clauses(
+        &decl.match_clause,
+        &decl.params,
+        needs_indices,
+        reject_edge_type,
+    )?;
     for projection in &decl.return_clause {
-        walk_expr(&projection.expr, &decl.params, needs_indices)?;
+        walk_expr(
+            &projection.expr,
+            &decl.params,
+            needs_indices,
+            reject_edge_type,
+        )?;
     }
     for ordering in &decl.order_clause {
-        walk_expr(&ordering.expr, &decl.params, needs_indices)?;
+        walk_expr(
+            &ordering.expr,
+            &decl.params,
+            needs_indices,
+            reject_edge_type,
+        )?;
     }
     Ok(())
 }
@@ -2488,6 +2528,7 @@ async fn check_same_as_v1(
     v2: &QueryResult,
     ordered: bool,
 ) -> Result<(), String> {
+    inspect_decl_with_policy(&step.decl, &mut false, true)?;
     let reference = session
         .clone()
         .with_read_executor(Arc::new(omnigraph_reference_engine::ReferenceEngine));

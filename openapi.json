@@ -8574,6 +8574,12 @@
               "on",
               "verify"
             ]
+          },
+          "traversal_work_limit": {
+            "type": "integer",
+            "description": "the finite work budget shared by edge selections in one query; exhaustion terminates the query with an error",
+            "maximum": 9223372036854775807,
+            "minimum": 1
           }
         },
         "additionalProperties": false

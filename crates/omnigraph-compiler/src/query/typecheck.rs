@@ -3,9 +3,10 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
-use crate::catalog::Catalog;
 use crate::catalog::schema_ir::{SYSTEM_COLUMNS_META, SystemFieldRole};
+use crate::catalog::{Catalog, EdgeType};
 use crate::error::{CompilerError, Result};
+use crate::traversal::{EDGE_TYPE_META, EdgeMember, EdgeSelection, common_edge_property};
 use crate::types::{Direction, PropType, ScalarType};
 
 use super::ast::*;
@@ -21,7 +22,7 @@ use super::codes::*;
 #[derive(Debug, Clone)]
 pub enum BoundVariable {
     Node { type_name: String },
-    Edge { type_name: String },
+    Edge { type_names: Vec<String> },
 }
 
 impl BoundVariable {
@@ -47,6 +48,13 @@ pub struct TypeContext {
     pub bindings: HashMap<String, BoundVariable>,
     pub aliases: HashMap<String, ResolvedType>,
     pub traversals: Vec<ResolvedTraversal>,
+    pub(crate) subqueries: Vec<CheckedSubquery>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CheckedSubquery {
+    pub outer_bindings: HashMap<String, BoundVariable>,
+    pub inner: TypeContext,
 }
 
 impl TypeContext {
@@ -57,6 +65,7 @@ impl TypeContext {
             bindings: HashMap::new(),
             aliases: HashMap::new(),
             traversals: Vec::new(),
+            subqueries: Vec::new(),
         }
     }
 }
@@ -159,8 +168,9 @@ fn call_keyword(expr: &Expr) -> Option<String> {
 pub struct ResolvedTraversal {
     pub src: String,
     pub dst: String,
-    pub edge_type: String,
-    pub direction: Direction,
+    pub edges: EdgeSelection,
+    pub src_type: String,
+    pub dst_type: String,
     pub min_hops: u32,
     pub max_hops: Option<u32>,
     /// Variable bound to the matched edge (`$p $w:knows $f`), if any;
@@ -321,17 +331,19 @@ fn refuse_reserved_variable_names(clauses: &[Clause]) -> Result<()> {
 }
 
 fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeContext> {
-    let mut ctx = TypeContext {
-        bindings: HashMap::new(),
-        aliases: HashMap::new(),
-        traversals: Vec::new(),
-    };
+    let mut ctx = TypeContext::empty();
     let params = parse_declared_param_types(&query.params)?;
 
     refuse_reserved_variable_names(&query.match_clause)?;
 
     // Typecheck match clauses
-    typecheck_clauses(catalog, &query.match_clause, &mut ctx, &params, false)?;
+    typecheck_clauses(
+        catalog,
+        &query.match_clause,
+        &mut ctx,
+        &params,
+        &mut HashSet::new(),
+    )?;
 
     // Typecheck return projections
     let mut result_columns: HashSet<String> = HashSet::new();
@@ -715,19 +727,23 @@ fn ensure_no_duplicate_assignment_names(assignments: &[MutationAssignment]) -> R
     Ok(())
 }
 
-/// The system role a meta-field spelling names (RFC 0040 Query language):
-/// `@id` on any binding, `@src`/`@dst` on an edge; `None` for a bare name.
-fn meta_field_role(property: &str) -> Option<Option<SystemFieldRole>> {
+enum MetaField {
+    System(SystemFieldRole),
+    EdgeType,
+}
+
+/// A query meta-field, including the virtual edge type; `None` for a bare name.
+fn meta_field_role(property: &str) -> Option<Option<MetaField>> {
     property.starts_with('@').then(|| match property {
-        name if name == SYSTEM_COLUMNS_META.id => Some(SystemFieldRole::Id),
-        name if name == SYSTEM_COLUMNS_META.src => Some(SystemFieldRole::Src),
-        name if name == SYSTEM_COLUMNS_META.dst => Some(SystemFieldRole::Dst),
+        name if name == SYSTEM_COLUMNS_META.id => Some(MetaField::System(SystemFieldRole::Id)),
+        name if name == SYSTEM_COLUMNS_META.src => Some(MetaField::System(SystemFieldRole::Src)),
+        name if name == SYSTEM_COLUMNS_META.dst => Some(MetaField::System(SystemFieldRole::Dst)),
+        EDGE_TYPE_META => Some(MetaField::EdgeType),
         _ => None,
     })
 }
 
-/// The type of every meta-field: the system identity and endpoints are
-/// non-null strings on both vintages.
+/// Every metadata value is a non-null string.
 fn meta_field_type() -> PropType {
     PropType::scalar(ScalarType::String, false)
 }
@@ -780,9 +796,9 @@ fn mutation_property_type(
     }
     if let Some(role) = meta_field_role(property) {
         let admitted = match role {
-            Some(SystemFieldRole::Id) => true,
-            Some(SystemFieldRole::Src | SystemFieldRole::Dst) => is_edge,
-            None => false,
+            Some(MetaField::System(SystemFieldRole::Id)) => true,
+            Some(MetaField::System(SystemFieldRole::Src | SystemFieldRole::Dst)) => is_edge,
+            Some(MetaField::EdgeType) | None => false,
         };
         if !admitted {
             let known = if is_edge {
@@ -984,17 +1000,46 @@ fn typecheck_clauses(
     clauses: &[Clause],
     ctx: &mut TypeContext,
     params: &HashMap<String, PropType>,
-    _in_negation: bool,
+    declared_nodes: &mut HashSet<String>,
 ) -> Result<()> {
+    let mut declarations = TypeContext {
+        bindings: ctx.bindings.clone(),
+        ..TypeContext::empty()
+    };
+    let mut local_declared = declared_nodes.clone();
+    for clause in clauses {
+        if let Clause::Binding(binding) = clause {
+            typecheck_binding(catalog, binding, &mut declarations, params)?;
+            if binding.variable != "_" {
+                local_declared.insert(binding.variable.clone());
+            }
+        }
+    }
     for clause in clauses {
         match clause {
-            Clause::Binding(b) => typecheck_binding(catalog, b, ctx, params)?,
-            Clause::Traversal(t) => typecheck_traversal(catalog, t, ctx)?,
+            Clause::Binding(binding) => {
+                bind_node(binding, ctx)?;
+                if binding.variable != "_" {
+                    declared_nodes.insert(binding.variable.clone());
+                }
+            }
+            Clause::Traversal(t) => {
+                typecheck_traversal(catalog, t, ctx, &local_declared, &declarations.bindings)?
+            }
             Clause::Filter(f) => typecheck_filter(catalog, f, ctx, params)?,
             Clause::Subquery(subquery) => {
                 let outer_vars: Vec<String> = ctx.bindings.keys().cloned().collect();
-                let mut inner_ctx = ctx.clone();
-                typecheck_clauses(catalog, &subquery.clauses, &mut inner_ctx, params, true)?;
+                let mut inner_ctx = TypeContext {
+                    bindings: ctx.bindings.clone(),
+                    ..TypeContext::empty()
+                };
+                typecheck_clauses(
+                    catalog,
+                    &subquery.clauses,
+                    &mut inner_ctx,
+                    params,
+                    &mut declared_nodes.clone(),
+                )?;
                 if !block_references_outer(&subquery.clauses, &outer_vars) {
                     let rule = match subquery.keyword {
                         BlockKeyword::Not => T9,
@@ -1009,7 +1054,57 @@ fn typecheck_clauses(
                     ));
                 }
                 typecheck_subquery_predicate(catalog, subquery, &inner_ctx, ctx, params)?;
+                ctx.subqueries.push(CheckedSubquery {
+                    outer_bindings: ctx.bindings.clone(),
+                    inner: inner_ctx,
+                });
             }
+        }
+    }
+    validate_traversal_anchors(clauses, &declarations.bindings)
+}
+
+fn validate_traversal_anchors(
+    clauses: &[Clause],
+    bindings: &HashMap<String, BoundVariable>,
+) -> Result<()> {
+    let mut reachable: HashSet<&str> = bindings
+        .iter()
+        .filter_map(|(name, binding)| {
+            (name != "_" && matches!(binding, BoundVariable::Node { .. })).then_some(name.as_str())
+        })
+        .collect();
+    let mut remaining: Vec<_> = clauses
+        .iter()
+        .filter_map(|clause| match clause {
+            Clause::Traversal(traversal) => Some(traversal),
+            Clause::Binding(_) | Clause::Filter(_) | Clause::Subquery(_) => None,
+        })
+        .collect();
+    while !remaining.is_empty() {
+        let count = remaining.len();
+        remaining.retain(|traversal| {
+            if !reachable.contains(traversal.src.as_str())
+                && !reachable.contains(traversal.dst.as_str())
+            {
+                return true;
+            }
+            for endpoint in [&traversal.src, &traversal.dst] {
+                if endpoint != "_" {
+                    reachable.insert(endpoint.as_str());
+                }
+            }
+            false
+        });
+        if remaining.len() == count {
+            let traversal = remaining[0];
+            return Err(CompilerError::typed(
+                T5,
+                format!(
+                    "traversal from `${}` to `${}` requires an executable source or destination node binding",
+                    traversal.src, traversal.dst
+                ),
+            ));
         }
     }
     Ok(())
@@ -1153,17 +1248,27 @@ fn typecheck_binding(
         )?;
     }
 
+    bind_node(binding, ctx)
+}
+
+fn bind_node(binding: &Binding, ctx: &mut TypeContext) -> Result<()> {
     // Don't overwrite if already bound to the same node type (re-binding the
     // same node var is OK). Node and edge namespaces are independent, so a
     // matching type name does not make a cross-kind rebind valid.
     if let Some(existing) = ctx.bindings.get(&binding.variable) {
         match existing {
-            BoundVariable::Edge { type_name } => {
+            BoundVariable::Edge { type_names } => {
                 return Err(CompilerError::typed(
                     T23,
                     format!(
-                        "variable `${}` is bound to edge type `{}` and cannot be rebound as node type `{}`",
-                        binding.variable, type_name, binding.type_name
+                        "variable `${}` is an edge binding ({}) and cannot be rebound as node type `{}`",
+                        binding.variable,
+                        if type_names.is_empty() {
+                            "empty selection".to_string()
+                        } else {
+                            type_names.join(" | ")
+                        },
+                        binding.type_name
                     ),
                 ));
             }
@@ -1271,14 +1376,74 @@ fn typecheck_traversal(
     catalog: &Catalog,
     traversal: &Traversal,
     ctx: &mut TypeContext,
+    declared_nodes: &HashSet<String>,
+    declarations: &HashMap<String, BoundVariable>,
 ) -> Result<()> {
-    // T4: edge must exist
-    let edge = catalog
-        .lookup_edge_by_name(&traversal.edge_name)
-        .ok_or_else(|| {
-            CompilerError::typed(T4, format!("unknown edge type `{}`", traversal.edge_name))
-        })?;
+    if matches!(traversal.selector, EdgeSelector::Wildcard)
+        && (!declared_nodes.contains(&traversal.src) || !declared_nodes.contains(&traversal.dst))
+    {
+        return Err(CompilerError::typed(
+            T5,
+            "wildcard traversal requires explicitly declared source and destination node bindings"
+                .to_string(),
+        ));
+    }
+    let resolved = resolve_traversal(catalog, traversal, &ctx.bindings, declarations)?;
+    if let Some(binding) = &resolved.edge_binding {
+        if binding == &traversal.src || binding == &traversal.dst {
+            return Err(CompilerError::typed(
+                T23,
+                format!(
+                    "edge binding `${binding}` cannot reuse a traversal endpoint name; edge bindings and node endpoints need distinct names"
+                ),
+            ));
+        }
+        if let Some(existing) = ctx.bindings.get(binding) {
+            let kind = match existing {
+                BoundVariable::Node { .. } => "node",
+                BoundVariable::Edge { .. } => "edge",
+            };
+            return Err(CompilerError::typed(
+                T23,
+                format!(
+                    "variable `${binding}` is already a {kind} binding; an edge binding needs a fresh name"
+                ),
+            ));
+        }
+        ctx.bindings.insert(
+            binding.clone(),
+            BoundVariable::Edge {
+                type_names: resolved
+                    .edges
+                    .members()
+                    .iter()
+                    .map(|member| member.edge_type.clone())
+                    .collect(),
+            },
+        );
+    }
+    for (var, type_name) in [
+        (&traversal.src, &resolved.src_type),
+        (&traversal.dst, &resolved.dst_type),
+    ] {
+        if var != "_" {
+            ctx.bindings
+                .entry(var.clone())
+                .or_insert_with(|| BoundVariable::Node {
+                    type_name: type_name.clone(),
+                });
+        }
+    }
+    ctx.traversals.push(resolved);
+    Ok(())
+}
 
+fn resolve_traversal(
+    catalog: &Catalog,
+    traversal: &Traversal,
+    bindings: &HashMap<String, BoundVariable>,
+    declarations: &HashMap<String, BoundVariable>,
+) -> Result<ResolvedTraversal> {
     if traversal.min_hops == 0 {
         return Err(CompilerError::typed(
             T15,
@@ -1301,11 +1466,140 @@ fn typecheck_traversal(
             "unbounded traversal is disabled; use bounded traversal {min,max}".to_string(),
         ));
     }
+    if let Some(binding) = &traversal.edge_binding
+        && (traversal.min_hops != 1 || traversal.max_hops != Some(1))
+    {
+        return Err(CompilerError::typed(
+            T23,
+            format!(
+                "edge binding `${binding}` cannot be combined with traversal bounds; a multi-hop traversal matches a path of edges, not one edge"
+            ),
+        ));
+    }
+    let src = bindings
+        .get(&traversal.src)
+        .or_else(|| declarations.get(&traversal.src))
+        .filter(|_| traversal.src != "_")
+        .map(|binding| binding.require_traversal_endpoint(&traversal.src))
+        .transpose()?;
+    let dst = bindings
+        .get(&traversal.dst)
+        .or_else(|| declarations.get(&traversal.dst))
+        .filter(|_| traversal.dst != "_")
+        .map(|binding| binding.require_traversal_endpoint(&traversal.dst))
+        .transpose()?;
+    let (edges, src_type, dst_type) = match &traversal.selector {
+        EdgeSelector::Named(name) => {
+            let edge = lookup_traversal_edge(catalog, name)?;
+            let (member, src_type, dst_type) = resolve_member(edge, traversal, src, dst)?;
+            (EdgeSelection::Named(member), src_type, dst_type)
+        }
+        EdgeSelector::Alternation(names) => {
+            let Some((first, rest)) = names.split_first() else {
+                return Err(CompilerError::typed(
+                    T4,
+                    "edge alternation must name at least one edge type".to_string(),
+                ));
+            };
+            let edge = lookup_traversal_edge(catalog, first)?;
+            if src.is_none() && dst.is_none() {
+                for name in rest {
+                    let other = lookup_traversal_edge(catalog, name)?;
+                    if edge.from_type != other.from_type || edge.to_type != other.to_type {
+                        return Err(CompilerError::typed(T5, "an edge alternation with mixed endpoint orientations requires a declared endpoint type".to_string(),
+                        ));
+                    }
+                }
+            }
+            let (member, src_type, dst_type) = resolve_member(edge, traversal, src, dst)?;
+            let mut seen = HashSet::from([member.edge_type.clone()]);
+            let mut members = vec![member];
+            for name in rest {
+                let edge = lookup_traversal_edge(catalog, name)?;
+                if seen.insert(edge.name.clone()) {
+                    let (member, _, _) =
+                        resolve_member(edge, traversal, Some(&src_type), Some(&dst_type))?;
+                    members.push(member);
+                }
+            }
+            members.sort_by(|left, right| left.edge_type.cmp(&right.edge_type));
+            (EdgeSelection::Alternation(members), src_type, dst_type)
+        }
+        EdgeSelector::Wildcard => {
+            let (Some(src), Some(dst)) = (src, dst) else {
+                return Err(CompilerError::typed(
+                    T5,
+                    "wildcard traversal requires known source and destination node types"
+                        .to_string(),
+                ));
+            };
+            if traversal.undirected && src != dst {
+                return Err(CompilerError::typed(
+                    T22,
+                    "undirected wildcard traversal requires the same node type at both endpoints"
+                        .to_string(),
+                ));
+            }
+            let mut members = Vec::new();
+            for edge in catalog.edge_types.values() {
+                if (edge.from_type == src && edge.to_type == dst)
+                    || (edge.to_type == src && edge.from_type == dst)
+                {
+                    let (member, _, _) = resolve_member(edge, traversal, Some(src), Some(dst))?;
+                    members.push(member);
+                }
+            }
+            members.sort_by(|left, right| left.edge_type.cmp(&right.edge_type));
+            (
+                EdgeSelection::Wildcard(members),
+                src.to_string(),
+                dst.to_string(),
+            )
+        }
+    };
+    if traversal.src == traversal.dst && traversal.src != "_" && src_type != dst_type {
+        return Err(CompilerError::typed(
+            T5,
+            format!(
+                "traversal endpoint `${}` cannot have both type `{src_type}` and type `{dst_type}`",
+                traversal.src
+            ),
+        ));
+    }
+    if edges.named().is_none() && traversal.max_hops != Some(1) && src_type != dst_type {
+        return Err(CompilerError::typed(
+            T5,
+            "recursive edge selection requires the same node type at both endpoints".to_string(),
+        ));
+    }
+    Ok(ResolvedTraversal {
+        src: traversal.src.clone(),
+        dst: traversal.dst.clone(),
+        edges,
+        src_type,
+        dst_type,
+        min_hops: traversal.min_hops,
+        max_hops: traversal.max_hops,
+        edge_binding: traversal
+            .edge_binding
+            .as_deref()
+            .filter(|name| *name != "_")
+            .map(str::to_string),
+    })
+}
 
-    // Undirected (`$a <edge> $b`): only meaningful when both orientations
-    // carry the same endpoint types — for an asymmetric edge the pattern is
-    // well-typed in at most one direction, so the undirected form is either
-    // pointless or a type error; require the directional form instead.
+fn lookup_traversal_edge<'a>(catalog: &'a Catalog, name: &str) -> Result<&'a EdgeType> {
+    catalog
+        .lookup_edge_by_name(name)
+        .ok_or_else(|| CompilerError::typed(T4, format!("unknown edge type `{name}`")))
+}
+
+fn resolve_member(
+    edge: &EdgeType,
+    traversal: &Traversal,
+    src: Option<&str>,
+    dst: Option<&str>,
+) -> Result<(EdgeMember, String, String)> {
     if traversal.undirected && edge.from_type != edge.to_type {
         return Err(CompilerError::typed(
             T22,
@@ -1315,150 +1609,62 @@ fn typecheck_traversal(
             ),
         ));
     }
-
-    // T23: a {min,max} traversal matches a path of edges; there is no single
-    // row for a binding to name.
-    let edge_binding = traversal
-        .edge_binding
-        .as_deref()
-        .filter(|binding| *binding != "_")
-        .map(str::to_string);
-    if traversal.edge_binding.is_some()
-        && (traversal.min_hops != 1 || traversal.max_hops != Some(1))
+    let direction = if let Some(src) = src {
+        if src == edge.from_type {
+            Direction::Out
+        } else if src == edge.to_type {
+            Direction::In
+        } else {
+            return Err(endpoint_type_error(&traversal.src, src, edge));
+        }
+    } else if let Some(dst) = dst {
+        if dst == edge.to_type {
+            Direction::Out
+        } else if dst == edge.from_type {
+            Direction::In
+        } else {
+            return Err(endpoint_type_error(&traversal.dst, dst, edge));
+        }
+    } else {
+        Direction::Out
+    };
+    let (src_type, dst_type) = match direction {
+        Direction::Out | Direction::Both => (&edge.from_type, &edge.to_type),
+        Direction::In => (&edge.to_type, &edge.from_type),
+    };
+    if let Some(dst) = dst
+        && dst != dst_type
     {
         return Err(CompilerError::typed(
-            T23,
+            T5,
             format!(
-                "edge binding `${}` cannot be combined with traversal bounds; a multi-hop traversal matches a path of edges, not one edge",
-                traversal.edge_binding.as_deref().unwrap_or("_")
+                "endpoint `${}` resolves to type `{dst}` but edge `{}` expects `{dst_type}`",
+                traversal.dst, edge.name
             ),
         ));
     }
-    if let Some(binding) = &edge_binding {
-        if binding == &traversal.src || binding == &traversal.dst {
-            return Err(CompilerError::typed(
-                T23,
-                format!(
-                    "edge binding `${binding}` cannot reuse a traversal endpoint name; edge bindings and node endpoints need distinct names"
-                ),
-            ));
-        }
-        if ctx.bindings.contains_key(binding) {
-            return Err(CompilerError::typed(
-                T23,
-                format!(
-                    "variable `${}` is already bound; an edge binding needs a fresh name",
-                    binding
-                ),
-            ));
-        }
-        ctx.bindings.insert(
-            binding.clone(),
-            BoundVariable::Edge {
-                type_name: edge.name.clone(),
+    Ok((
+        EdgeMember {
+            edge_type: edge.name.clone(),
+            direction: if traversal.undirected {
+                Direction::Both
+            } else {
+                direction
             },
-        );
-    }
-
-    // Determine direction based on bound variables and edge endpoints
-    let src_bound = ctx.bindings.get(&traversal.src);
-    let dst_bound = ctx.bindings.get(&traversal.dst);
-
-    let mut direction;
-
-    if let Some(src_bv) = src_bound {
-        let src_type = src_bv.require_traversal_endpoint(&traversal.src)?;
-        // T5: src type must match one endpoint of the edge
-        if src_type == edge.from_type {
-            direction = Direction::Out;
-            // dst should be edge.to_type
-            bind_traversal_endpoint(ctx, &traversal.dst, &edge.to_type, edge)?;
-        } else if src_type == edge.to_type {
-            direction = Direction::In;
-            // dst should be edge.from_type
-            bind_traversal_endpoint(ctx, &traversal.dst, &edge.from_type, edge)?;
-        } else {
-            return Err(CompilerError::typed(
-                T5,
-                format!(
-                    "variable `${}` has type `{}`, which is not an endpoint of edge `{}: {} -> {}`",
-                    traversal.src, src_type, edge.name, edge.from_type, edge.to_type
-                ),
-            ));
-        }
-    } else if let Some(dst_bv) = dst_bound {
-        let dst_type = dst_bv.require_traversal_endpoint(&traversal.dst)?;
-        // dst is bound, infer direction from it
-        if dst_type == edge.to_type {
-            direction = Direction::Out;
-            bind_traversal_endpoint(ctx, &traversal.src, &edge.from_type, edge)?;
-        } else if dst_type == edge.from_type {
-            direction = Direction::In;
-            bind_traversal_endpoint(ctx, &traversal.src, &edge.to_type, edge)?;
-        } else {
-            return Err(CompilerError::typed(
-                T5,
-                format!(
-                    "variable `${}` has type `{}`, which is not an endpoint of edge `{}: {} -> {}`",
-                    traversal.dst, dst_type, edge.name, edge.from_type, edge.to_type
-                ),
-            ));
-        }
-    } else {
-        // Neither bound — default Out direction, bind both
-        direction = Direction::Out;
-        bind_traversal_endpoint(ctx, &traversal.src, &edge.from_type, edge)?;
-        bind_traversal_endpoint(ctx, &traversal.dst, &edge.to_type, edge)?;
-    }
-
-    if traversal.undirected {
-        // The orientation inference above is a no-op for a same-type edge
-        // (both arms resolve identically); the user asked for both ways.
-        direction = Direction::Both;
-    }
-
-    ctx.traversals.push(ResolvedTraversal {
-        src: traversal.src.clone(),
-        dst: traversal.dst.clone(),
-        edge_type: edge.name.clone(),
-        direction,
-        min_hops: traversal.min_hops,
-        max_hops: traversal.max_hops,
-        edge_binding,
-    });
-
-    Ok(())
+        },
+        src_type.clone(),
+        dst_type.clone(),
+    ))
 }
 
-fn bind_traversal_endpoint(
-    ctx: &mut TypeContext,
-    var: &str,
-    expected_type: &str,
-    edge: &crate::catalog::EdgeType,
-) -> Result<()> {
-    if var == "_" {
-        return Ok(()); // anonymous variable
-    }
-    if let Some(existing) = ctx.bindings.get(var) {
-        let existing_type = existing.require_traversal_endpoint(var)?;
-        if existing_type != expected_type {
-            return Err(CompilerError::typed(
-                T5,
-                format!(
-                    "variable `${}` has type `{}` but edge `{}` expects `{}`",
-                    var, existing_type, edge.name, expected_type
-                ),
-            ));
-        }
-    } else {
-        ctx.bindings.insert(
-            var.to_string(),
-            BoundVariable::Node {
-                type_name: expected_type.to_string(),
-            },
-        );
-    }
-    Ok(())
+fn endpoint_type_error(var: &str, type_name: &str, edge: &EdgeType) -> CompilerError {
+    CompilerError::typed(
+        T5,
+        format!(
+            "endpoint `${var}` resolves to type `{type_name}`, which is not an endpoint of edge `{}: {} -> {}`",
+            edge.name, edge.from_type, edge.to_type
+        ),
+    )
 }
 
 /// A match filter is an expression the checker proves Boolean; a search
@@ -1754,14 +1960,14 @@ fn read_property_type(
 
     if let Some(role) = meta_field_role(property) {
         let admitted = match (bv, role) {
-            (_, Some(SystemFieldRole::Id)) => true,
+            (_, Some(MetaField::System(SystemFieldRole::Id))) => true,
             (BoundVariable::Edge { .. }, Some(_)) => true,
             (BoundVariable::Node { .. }, Some(_)) | (_, None) => false,
         };
         if !admitted {
             let known = match bv {
-                BoundVariable::Node { .. } => "`@id`",
-                BoundVariable::Edge { .. } => "`@id`, `@src`, `@dst`",
+                BoundVariable::Node { .. } => "`@id`".to_string(),
+                BoundVariable::Edge { .. } => format!("`@id`, `@src`, `@dst`, `{EDGE_TYPE_META}`"),
             };
             return Err(CompilerError::typed(
                 T6,
@@ -1790,24 +1996,17 @@ fn read_property_type(
                 )
             })?
         }
-        BoundVariable::Edge { type_name } => {
-            let edge_type = catalog.lookup_edge_by_name(type_name).ok_or_else(|| {
-                CompilerError::typed(
-                    T6,
-                    format!("edge type `{}` not found in catalog", type_name),
-                )
-            })?;
-            edge_type.properties.get(property).ok_or_else(|| {
-                CompilerError::typed(
-                    T6,
-                    format!(
-                        "edge `{}` has no property `{}`{}",
-                        type_name,
-                        property,
-                        system_field_hint(property, Some(variable), true)
-                    ),
-                )
-            })?
+        BoundVariable::Edge { type_names } => {
+            return common_edge_property(catalog, type_names, property).ok_or_else(|| {
+                let detail = if let [type_name] = type_names.as_slice() {
+                    format!("edge `{type_name}` has no property `{property}`")
+                } else if type_names.is_empty() {
+                    format!("empty wildcard has no inferable property `{property}`")
+                } else {
+                    format!("property `{property}` must exist with compatible types on every selected edge ({})", type_names.join(" | "))
+                };
+                CompilerError::typed(T6, format!("{detail}{}", system_field_hint(property, Some(variable), true)))
+            });
         }
     };
     Ok(prop.clone())

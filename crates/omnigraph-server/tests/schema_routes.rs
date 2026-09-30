@@ -20,6 +20,66 @@ use serde_json::json;
 mod support;
 use support::*;
 
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_apply_refuses_a_wildcard_member_missing_a_used_property_issue_659() {
+    let source = r#"query neighbor_since() {
+        match { $p: Person { name: "Alice" } $f: Person $p $e:* $f }
+        return { $f.name, $e.since }
+        order { $f.name }
+    }"#;
+    let (temp, app) = app_with_stored_queries(
+        &[("neighbor_since", source, true)],
+        &[("act-ragnor", "admin-token")],
+        STORED_QUERY_SCHEMA_APPLY_POLICY_YAML,
+    )
+    .await;
+    let (status, before) = json_response(
+        &app,
+        invoke_request("neighbor_since", "admin-token", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert_eq!(before["row_count"], 2);
+    let desired = format!(
+        "{}\nedge Likes: Person -> Person\n",
+        fs::read_to_string(fixture("test.pg")).unwrap()
+    );
+    let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+        .method(Method::POST)
+        .uri(g("/schema/apply"))
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer admin-token")
+        .body(Body::from(
+            serde_json::to_vec(&SchemaApplyRequest {
+                schema_source: desired,
+                ..Default::default()
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, payload) = json_response(&app, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{payload}");
+    let message = payload["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("neighbor_since")
+            && message.contains("schema check")
+            && message.contains("since"),
+        "{payload}"
+    );
+    let reopened = Omnigraph::open(graph_path(temp.path()).to_str().unwrap())
+        .await
+        .unwrap();
+    assert!(!reopened.catalog().edge_types.contains_key("Likes"));
+    let (status, after) = json_response(
+        &app,
+        invoke_request("neighbor_since", "admin-token", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert_eq!(after["rows"], before["rows"]);
+}
+
 #[tokio::test]
 async fn schema_apply_route_updates_graph_for_authorized_admin() {
     let (temp, app) = app_for_graph_with_auth_tokens_and_policy(

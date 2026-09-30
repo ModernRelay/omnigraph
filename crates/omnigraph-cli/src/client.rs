@@ -497,6 +497,10 @@ impl GraphClient {
                 SettingId::AnnNprobes => {
                     request.ann_nprobes = Some(given.get(SettingId::AnnNprobes).parse()?)
                 }
+                SettingId::TraversalWorkLimit => {
+                    request.traversal_work_limit =
+                        Some(given.get(SettingId::TraversalWorkLimit).parse()?)
+                }
                 SettingId::RrfPlan | SettingId::StageWriteConcurrency => {
                     bail!(
                         "setting `{}` has request scope but no request field; add it to \

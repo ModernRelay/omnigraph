@@ -1,0 +1,43 @@
+# issue: 659
+# red_on: 7f1233bb
+# traversal: csr
+# notes: Selected traversal cannot initialize an unadmitted CSR cache.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person { name: String @key }
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"edge":"Knows","from":"a","to":"b"}
+
+--- query
+query selected() {
+    match { $a: Person $b: Person $a * $b }
+    return { $b.name }
+}
+
+--- expect error: edge selections do not support traversal = csr
+
+--- query
+query named_csr_control() {
+    match { $a: Person $a knows $b }
+    return { $b.name }
+}
+
+--- expect unordered
+{"b.name":"b"}
+
+--- expect shape
+b.name: String
+
+--- expect plan
+expand $a $b: selection named [Knows out]
+expand $a Knows $b: mode csr ran csr
