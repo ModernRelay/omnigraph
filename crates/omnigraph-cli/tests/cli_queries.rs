@@ -1016,34 +1016,53 @@ fn queries_validate_exits_zero_on_clean_registry() {
 }
 
 #[test]
-fn cluster_import_rejects_a_type_broken_query() {
-    // In the cluster model a stored query is type-checked at the cluster
-    // boundary (import/apply), so a broken query can never reach the applied
-    // state `queries validate` reads — the gate is upstream. `Widget` is not in
-    // the fixture schema, so import must reject it, naming the query.
-    let temp = tempdir().unwrap();
-    let dir = temp.path();
-    std::fs::copy(fixture("test.pg"), dir.join("graph.pg")).unwrap();
-    write_query_file(
-        &dir.join("ghost.gq"),
-        "query ghost() { match { $w: Widget } return { $w.name } }",
-    );
-    std::fs::write(
-        dir.join("cluster.yaml"),
-        "version: 1\nmetadata:\n  name: sys\nstate:\n  backend: cluster\n  lock: true\n\
-         graphs:\n  knowledge:\n    schema: ./graph.pg\n    queries:\n      ghost:\n        file: ./ghost.gq\n",
-    )
-    .unwrap();
-    let output = output_failure(cli().arg("cluster").arg("import").arg("--config").arg(dir));
-    let combined = format!(
-        "{}{}",
-        stdout_string(&output),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        combined.contains("ghost"),
-        "cluster import must reject the broken query, naming it; got:\n{combined}"
-    );
+fn cluster_import_rejects_a_broken_query_naming_it_and_where() {
+    // In the cluster model a stored query is checked at the cluster boundary
+    // (import/apply), so a broken query can never reach the applied state
+    // `queries validate` reads — the gate is upstream. `Widget` is not in the
+    // fixture schema, so import must reject `ghost`, naming it; `broken` does
+    // not parse, and the human report also says where, from the diagnostic.
+    let cases: [(&str, &str, &[&str]); 2] = [
+        (
+            "ghost",
+            "query ghost() { match { $w: Widget } return { $w.name } }",
+            &["ghost"],
+        ),
+        (
+            "broken",
+            "query broken() { match { $p: Person $p.age > } return { $p.name } }",
+            &[
+                "broken: parse error: expected operand",
+                "  --> line 1, column 46",
+            ],
+        ),
+    ];
+    for (name, source, expected) in cases {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        std::fs::copy(fixture("test.pg"), dir.join("graph.pg")).unwrap();
+        write_query_file(&dir.join(format!("{name}.gq")), source);
+        std::fs::write(
+            dir.join("cluster.yaml"),
+            format!(
+                "version: 1\nmetadata:\n  name: sys\nstate:\n  backend: cluster\n  lock: true\n\
+                 graphs:\n  knowledge:\n    schema: ./graph.pg\n    queries:\n      {name}:\n        file: ./{name}.gq\n"
+            ),
+        )
+        .unwrap();
+        let output = output_failure(cli().arg("cluster").arg("import").arg("--config").arg(dir));
+        let combined = format!(
+            "{}{}",
+            stdout_string(&output),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for needle in expected {
+            assert!(
+                combined.contains(needle),
+                "cluster import must reject `{name}` with {needle:?}; got:\n{combined}"
+            );
+        }
+    }
 }
 
 #[test]

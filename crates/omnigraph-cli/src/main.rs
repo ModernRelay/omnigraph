@@ -238,17 +238,7 @@ fn render_diagnostic(
     diagnostic: &omnigraph_api_types::DiagnosticOutput,
 ) -> String {
     let mut lines = vec![format!("error[{}]: {}", diagnostic.code, output.error)];
-    if let Some(at) = &diagnostic.position {
-        lines.push(format!("  --> line {}, column {}", at.line, at.column));
-    } else if let Some(stage) = &diagnostic.stage {
-        match &diagnostic.expression {
-            Some(expression) => lines.push(format!("  --> {stage}: {expression}")),
-            None => lines.push(format!("  --> {stage}")),
-        }
-    }
-    if let Some(fix) = &diagnostic.fix {
-        lines.push(format!("  fix: {fix}"));
-    }
+    lines.extend(output::diagnostic_detail_lines(diagnostic));
     lines.join("\n")
 }
 

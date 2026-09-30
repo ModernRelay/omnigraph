@@ -1112,12 +1112,11 @@ pub(crate) async fn execute_queries_validate(
             );
         }
         for issue in &output.breakages {
-            match issue.diagnostic.as_ref().and_then(|d| d.fix.as_deref()) {
-                Some(fix) => println!(
-                    "ERROR  query '{}': {}; fix: {fix}",
-                    issue.query, issue.message
-                ),
-                None => println!("ERROR  query '{}': {}", issue.query, issue.message),
+            println!("ERROR  query '{}': {}", issue.query, issue.message);
+            if let Some(diagnostic) = &issue.diagnostic {
+                for line in crate::output::diagnostic_detail_lines(diagnostic) {
+                    println!("{line}");
+                }
             }
         }
         for issue in &output.warnings {
