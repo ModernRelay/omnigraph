@@ -1,29 +1,46 @@
-name: 💡 Feature proposal
-description: Propose a change. A maintainer triages it; work starts once it is labelled `accepted`.
-labels: ["feature", "needs-triage"]
+name: 💡 Feature or design proposal
+description: Request a new capability or a change to intended behavior or architecture.
+labels: ["needs-triage"]
 body:
   - type: markdown
     attributes:
       value: |
-        Every change starts as an issue (see [GOVERNANCE.md](https://github.com/ModernRelay/omnigraph/blob/main/GOVERNANCE.md)).
-        A maintainer triages this: **`accepted`** is the green light for a PR, and a
-        larger design gets **`needs-rfc`** and goes through an RFC first
-        ([docs/rfcs/README.md](https://github.com/ModernRelay/omnigraph/blob/main/docs/rfcs/README.md)).
+        Use this form for **new capabilities or changes to intended behavior or architecture**,
+        including design ideas and amendments to accepted RFCs. Describe the need and a
+        possible direction; do not write the full RFC yet.
+        For broken existing functionality, incorrect results, or regressions, use the
+        [bug report form](https://github.com/ModernRelay/omnigraph/issues/new?template=bug_report.yml).
+        For a security vulnerability, follow [SECURITY.md](https://github.com/ModernRelay/omnigraph/blob/main/SECURITY.md). Do **not** file it here.
+
+        New proposals start with **`needs-triage`**. Maintainers decide classification,
+        acceptance, and whether an RFC is needed (see [GOVERNANCE.md](https://github.com/ModernRelay/omnigraph/blob/main/GOVERNANCE.md)).
+        If an RFC is needed, maintainers apply **`needs-rfc`** to this same issue.
+        Do not open a second issue for the RFC. Wait for maintainer agreement before
+        writing it; implementation starts only after the RFC's lifecycle is **`accepted`**
+        ([RFC process](https://github.com/ModernRelay/omnigraph/blob/main/docs/rfcs/README.md)).
+        Otherwise, **`accepted`** means a code PR may follow.
         Trivial fixes (typos, obvious small corrections) can skip the issue and go straight to a PR.
   - type: textarea
     id: problem
     attributes:
       label: Problem
-      description: What can't you do today, or what costs too much? Concrete scenarios beat abstractions.
+      description: What need does the current design not meet? Describe the use case and who benefits.
     validations:
       required: true
   - type: textarea
     id: proposal
     attributes:
       label: Proposed change
-      description: What should exist? If it adds user-visible surface (CLI, API, query/schema language), sketch it.
+      description: What capability or intended behavior should be added or changed? For design ideas, give a direction without writing the full RFC.
     validations:
       required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Affected areas
+      description: If known, name affected CLI/API/query features, storage or wire formats, dependencies, or accepted RFCs. Link relevant documents.
+    validations:
+      required: false
   - type: textarea
     id: alternatives
     attributes:

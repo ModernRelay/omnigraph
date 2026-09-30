@@ -2,6 +2,31 @@
 
 Workflow YAML under `.github/workflows/` is the source of truth. This page explains the boundaries; it does not duplicate every job or pinned version.
 
+## Issue triage
+
+Issue forms apply `needs-triage` at submission. `issue-triage.yml` provides an
+asynchronous fallback for newly opened issues submitted through other paths.
+It skips opening events already carrying `needs-triage`, then checks the current
+issue before writing. Closed issues and issues with any lifecycle status are
+left unchanged. It only adds `needs-triage`; it never replaces other labels or
+runs in response to later label edits.
+
+Failed API operations are retried up to three attempts, with a fresh status
+check before each write attempt. Runs for the same issue are serialized; issues
+with different numbers run independently. The workflow uses only `issues: write`
+and does not check out or execute repository or issue content.
+
+To repair missed intake, a maintainer with write access can select **Actions >
+Issue triage > Run workflow** on the default branch and enter one positive issue
+number. Manual runs use the same lifecycle checks and reject pull request
+numbers. They do not scan or relabel the backlog.
+
+Actions must be enabled and the run must succeed. Issues created using
+`GITHUB_TOKEN` do not trigger this workflow automatically; their creators must
+set `needs-triage`, or a maintainer can use the manual repair. Status reads and
+label writes are separate API calls, so a maintainer edit can still race a write.
+Who can change labels is controlled by repository permissions, not this workflow.
+
 ## Pull-request gates
 
 `ci.yml` always classifies the diff (from the merge base with the base branch,
