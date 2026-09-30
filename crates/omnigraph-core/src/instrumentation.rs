@@ -1221,6 +1221,16 @@ pub struct MergeWriteProbes {
     /// oversized descriptor is rejected from its recorded length before any
     /// payload is read.
     pub blob_payload_read_calls: Arc<AtomicU64>,
+    /// Batched managed Blob reads (`Dataset::read_blobs`) a materializing
+    /// rewrite issued: one per rewritten batch column holding a managed cell,
+    /// however many managed values it carries. Distinguishes the batched read
+    /// from one read per value, which `blob_payload_read_calls` cannot.
+    pub blob_managed_batch_read_calls: Arc<AtomicU64>,
+    /// Blob-table compactions planned and the row batch the last one passed to
+    /// Lance (0 when it passed none), so the derived batch is a structural
+    /// assertion rather than an inferred memory claim.
+    pub compaction_blob_batch_calls: Arc<AtomicU64>,
+    pub compaction_blob_batch_rows: Arc<AtomicU64>,
     /// Payload reads issued against external sources specifically. Unlike the
     /// aggregate Blob counter, this excludes managed values, so
     /// normalized-alias GET deduplication is directly observable.
@@ -1317,6 +1327,15 @@ impl MergeWriteProbes {
     }
     pub fn blob_payload_read_calls(&self) -> u64 {
         self.blob_payload_read_calls.load(Ordering::Relaxed)
+    }
+    pub fn blob_managed_batch_read_calls(&self) -> u64 {
+        self.blob_managed_batch_read_calls.load(Ordering::Relaxed)
+    }
+    pub fn compaction_blob_batch_calls(&self) -> u64 {
+        self.compaction_blob_batch_calls.load(Ordering::Relaxed)
+    }
+    pub fn compaction_blob_batch_rows(&self) -> u64 {
+        self.compaction_blob_batch_rows.load(Ordering::Relaxed)
     }
     pub fn external_blob_payload_read_calls(&self) -> u64 {
         self.external_blob_payload_read_calls
@@ -1555,6 +1574,26 @@ pub fn record_mutation_table_open() {
 pub fn record_blob_payload_read() {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
         p.blob_payload_read_calls.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one batched managed Blob read issued by a materializing rewrite.
+/// No-op in production (no probes installed).
+pub fn record_blob_managed_batch_read() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.blob_managed_batch_read_calls
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one Blob-table compaction and the row batch it passes to Lance
+/// (`None` when it passes none). No-op in production (no probes installed).
+pub fn record_compaction_blob_batch(batch_rows: Option<usize>) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.compaction_blob_batch_calls
+            .fetch_add(1, Ordering::Relaxed);
+        p.compaction_blob_batch_rows
+            .store(batch_rows.unwrap_or(0) as u64, Ordering::Relaxed);
     });
 }
 

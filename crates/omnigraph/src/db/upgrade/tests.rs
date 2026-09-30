@@ -2989,3 +2989,200 @@ async fn storage_upgrade_then_cleanup_sweeps_linear_history_below_the_last_linea
         "the row still resolves through the permanent root"
     );
 }
+
+/// A Lance table with the given Blob-bearing schema and one row, written the
+/// way graph tables are (stable row IDs, file format 2.2).
+async fn blob_validation_table(
+    root: &Path,
+    schema: Arc<Schema>,
+    columns: Vec<arrow_array::ArrayRef>,
+) -> Dataset {
+    let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+    Dataset::write(
+        arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema),
+        root.to_str().unwrap(),
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            skip_auto_cleanup: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+fn one_blob(bytes: &[u8]) -> arrow_array::ArrayRef {
+    let mut builder = lance::blob::BlobArrayBuilder::new(1);
+    builder.push_bytes(bytes).unwrap();
+    builder.finish().unwrap()
+}
+
+/// Planning is bounded by the chunk, not by what a descriptor claims: a
+/// corrupt length of `u64::MAX` costs one chunk of 64 requests, which the
+/// first short window refuses, and the windows of the values before it are
+/// exact and in order.
+#[tokio::test]
+async fn blob_validation_plans_one_bounded_chunk_for_a_huge_descriptor() {
+    let window = BLOB_VALIDATION_WINDOW_BYTES;
+    let mut chunks = Vec::new();
+    let error =
+        drain_blob_validation_windows(vec![(1, 3 * window + 5), (2, u64::MAX)], |requests| {
+            let refuse = requests.iter().any(|request| request.row == 2);
+            chunks.push(requests);
+            async move {
+                if refuse {
+                    Err(invalid("truncated managed Blob dependency"))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("truncated managed Blob dependency"),
+        "{error}"
+    );
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].len(), BLOB_VALIDATION_REQUESTS_PER_READ);
+    let first_value = chunks[0]
+        .iter()
+        .take(4)
+        .map(|request| (request.row, request.range.offset, request.range.length))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        first_value,
+        vec![
+            (1, 0, window),
+            (1, window, window),
+            (1, 2 * window, window),
+            (1, 3 * window, 5)
+        ]
+    );
+    assert!(
+        chunks[0][4..]
+            .iter()
+            .all(|request| request.row == 2 && request.range.length == window)
+    );
+
+    // Values spanning several chunks are read chunk by chunk, every window once.
+    let mut read = Vec::new();
+    drain_blob_validation_windows(vec![(3, 150 * window + 1), (4, 0), (5, 7)], |requests| {
+        assert!(requests.len() <= BLOB_VALIDATION_REQUESTS_PER_READ);
+        read.extend(requests);
+        async { Ok(()) }
+    })
+    .await
+    .unwrap();
+    assert_eq!(read.len(), 152);
+    assert_eq!(read[150].range.length, 1);
+    assert_eq!(
+        (
+            read[151].row,
+            read[151].range.offset,
+            read[151].range.length
+        ),
+        (5, 0, 7)
+    );
+}
+
+/// A managed value spanning several windows validates, and the same value
+/// over a truncated sidecar refuses.
+#[tokio::test]
+async fn blob_validation_reads_a_multi_window_value_and_refuses_it_truncated() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, false),
+        lance::blob::blob_field("content", true),
+    ]));
+    let payload = vec![b'w'; 5 * BLOB_VALIDATION_WINDOW_BYTES as usize + 3];
+    let table = blob_validation_table(
+        dir.path(),
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["large"])),
+            one_blob(&payload),
+        ],
+    )
+    .await;
+    let mut work = UpgradeWork::default();
+    validate_blobs(&table, &mut work).await.unwrap();
+    assert!(work.external_blob_exclusions.is_empty());
+
+    let sidecars = stored_files(dir.path())
+        .into_keys()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "blob")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sidecars.len(), 1, "the large value has one sidecar");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&sidecars[0])
+        .unwrap()
+        .set_len(1024)
+        .unwrap();
+    let table = Dataset::open(dir.path().to_str().unwrap()).await.unwrap();
+    assert!(
+        validate_blobs(&table, &mut UpgradeWork::default())
+            .await
+            .is_err()
+    );
+}
+
+/// A nested Blob field fails closed whether or not the table also has a
+/// top-level Blob column; with only nested Blob fields there is no top-level
+/// column, and validation must not return early as if there were no Blob.
+#[tokio::test]
+async fn blob_validation_refuses_nested_blob_fields() {
+    let nested = |name: &str| {
+        let field = lance::blob::blob_field("inner", true);
+        let array = arrow_array::StructArray::new(
+            vec![Arc::new(field.clone())].into(),
+            vec![one_blob(b"nested")],
+            None,
+        );
+        (
+            arrow_schema::Field::new(name, array.data_type().clone(), true),
+            Arc::new(array) as arrow_array::ArrayRef,
+        )
+    };
+    let id = || {
+        (
+            arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, false),
+            Arc::new(StringArray::from(vec!["row"])) as arrow_array::ArrayRef,
+        )
+    };
+    let top = || {
+        (
+            lance::blob::blob_field("content", true),
+            one_blob(b"top-level"),
+        )
+    };
+    for (case, fields) in [
+        ("nested only", vec![id(), nested("meta")]),
+        ("mixed", vec![id(), top(), nested("meta")]),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (fields, columns): (Vec<_>, Vec<_>) = fields.into_iter().unzip();
+        let table = blob_validation_table(dir.path(), Arc::new(Schema::new(fields)), columns).await;
+        let before = stored_files(dir.path());
+        let error = validate_blobs(&table, &mut UpgradeWork::default())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("nested Blob field"),
+            "{case}: {error}"
+        );
+        assert_eq!(
+            stored_files(dir.path()),
+            before,
+            "{case}: no effect before refusal"
+        );
+    }
+}

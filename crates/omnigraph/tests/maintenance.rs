@@ -761,7 +761,20 @@ async fn optimize_compacts_large_blob_rows_in_bounded_batches() {
     );
     let commits_before = db.list_commits(None).await.unwrap().len();
 
-    let stats = db.optimize().await.unwrap();
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let stats = omnigraph::instrumentation::with_merge_write_probes(probes.clone(), db.optimize())
+        .await
+        .unwrap();
+    assert_eq!(
+        probes.compaction_blob_batch_calls(),
+        1,
+        "one Blob table compacts"
+    );
+    assert_eq!(
+        probes.compaction_blob_batch_rows(),
+        32,
+        "the compaction passes the batch derived from its largest row"
+    );
     let doc = stats
         .iter()
         .find(|stat| stat.type_key == "node:Doc")

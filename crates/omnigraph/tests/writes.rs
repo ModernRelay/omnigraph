@@ -1290,7 +1290,8 @@ query replace_content($c: Blob) {
 /// admitted object, and rewrites each exactly: inline, packed (above 64 KiB)
 /// and valid-empty managed values keep their bytes, the null stays null, and
 /// the external reference is copied into a managed value. The payload probe
-/// counts one read per managed value plus the one external read.
+/// counts one read per managed value plus the one external read, and the
+/// batched-read probe counts one read for all managed values.
 #[tokio::test]
 async fn mutation_update_carries_mixed_blob_rows_through_batched_managed_read() {
     use base64::Engine;
@@ -1391,6 +1392,11 @@ query update_shelf($note: String) {
         probes.blob_payload_read_calls() - probes.external_blob_payload_read_calls(),
         managed.len() as u64,
         "one payload read per carried managed value"
+    );
+    assert_eq!(
+        probes.blob_managed_batch_read_calls(),
+        1,
+        "the managed values are read through one batched read, not one read per value"
     );
 
     for (title, bytes) in &managed {

@@ -1953,6 +1953,7 @@ impl TableStore {
         let mut managed_blobs = if managed_row_ids.is_empty() {
             None
         } else {
+            crate::instrumentation::record_blob_managed_batch_read();
             Some(
                 Arc::new(ds.clone())
                     .read_blobs(column_name)
@@ -3921,6 +3922,7 @@ impl TableStore {
                 .collect::<Vec<_>>();
             let max_row_blob_bytes = Self::max_row_blob_bytes(ds, fragments).await?;
             plan.options.batch_size = Some(compaction_blob_batch_rows(max_row_blob_bytes));
+            crate::instrumentation::record_compaction_blob_batch(plan.options.batch_size);
         }
         let mut results = Vec::with_capacity(plan.num_tasks());
         for task in plan.compaction_tasks() {

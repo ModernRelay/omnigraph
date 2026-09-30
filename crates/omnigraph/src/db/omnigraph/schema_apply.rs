@@ -1237,6 +1237,7 @@ async fn rebuild_blob_column(
     let mut managed_blobs = if managed_row_ids.is_empty() {
         None
     } else {
+        crate::instrumentation::record_blob_managed_batch_read();
         Some(
             Arc::new(source_ds.dataset().clone())
                 .read_blobs(column_name)

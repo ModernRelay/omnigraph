@@ -126,11 +126,15 @@ impl DeletedIdBudget {
     }
 }
 
-/// Scheduler I/O buffer for a batched read of the managed Blob payloads a
-/// materializing rewrite carries (`Dataset::read_blobs`). Lance's default is
-/// 32 MiB times the store's I/O parallelism, which reaches 2 GiB on cloud
-/// stores, so every such read sets it explicitly. The rewrite's own byte
-/// budget bounds what the stream yields; this bounds what Lance buffers ahead.
+/// Scheduler I/O buffer for a batched read of managed Blob payloads
+/// (`Dataset::read_blobs`, `read_blob_ranges`). Lance's default is 32 MiB
+/// times the store's I/O parallelism, which reaches 2 GiB on cloud stores, so
+/// every such read sets it explicitly. This bounds only what Lance buffers
+/// ahead of the consumer, not what the consumer keeps. A keyed write's carry
+/// is bounded by that write's byte budget, and upgrade validation reads at
+/// most 64 windows of 1 MiB per call and keeps none of them. A schema-apply
+/// rewrite has no byte ceiling: it materializes the whole table and
+/// accumulates every managed payload of the column it rebuilds.
 pub(crate) const BLOB_REBUILD_IO_BUFFER_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Resource budget for a pending-aware keyed scan that will feed one mutation
