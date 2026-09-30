@@ -107,9 +107,9 @@ context rather than restating metadata.
 ## Lifecycle
 
 ```text
-draft ──maintainer decision──▶ accepted ──later replacement──▶ superseded
-  │                                  │
-  └──maintainer decision──▶ rejected └──implementation progresses separately
+draft ──maintainer decision──▶ accepted ──accepted replacement──▶ superseded
+  ├──maintainer decision──▶ rejected
+  └──maintainer-approved draft replacement────────────────────▶ superseded
 ```
 
 - **Draft**: under design and review. A draft may live on the main branch so
@@ -120,8 +120,17 @@ draft ──maintainer decision──▶ accepted ──later replacement──�
 - **Rejected**: the decision was not adopted. Keep the record and concise
   rationale; use `removed` if an experiment shipped and was later deleted,
   otherwise `n/a` or `not-started` as appropriate.
-- **Superseded**: another RFC owns the current decision. Link both directions
+- **Superseded**: another RFC owns the current decision or proposal. Link both directions
   and keep the old rationale intact.
+
+A maintainer may consolidate or replace an unaccepted draft with another draft
+and mark the previous draft `superseded`. This transfers the proposal's ownership,
+not acceptance or implementation authority; the disposition must say that the
+replacement is still a draft. Reserve `rejected` for a decision not to adopt the
+proposal, rather than merely moving its continuing design into a replacement.
+An accepted RFC remains authoritative until its replacement is accepted: a draft
+cannot retire an accepted contract. Record reciprocal supersession metadata only
+when that disposition takes effect.
 
 Acceptance requires all invariants, compatibility consequences, operational
 boundaries, and owned evidence gates to be explicit. A blocker owned by another
