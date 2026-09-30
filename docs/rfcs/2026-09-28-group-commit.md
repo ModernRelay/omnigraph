@@ -7,12 +7,11 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-09-28
-updated: 2026-09-28
+updated: 2026-09-30
 discussion: "https://github.com/ModernRelay/omnigraph/pull/785"
 supersedes: []
 superseded_by: []
 blocked_on:
-  - "Dependency: the shared schema gate (PR #783) merged; the publisher takes its shared side once per batch."
   - "Surface guard: the raw, unassigned fragments of several strict inserts and pure-insert upserts, each staged against one pin, commit as one detached transaction from a later pin of the same table: the rows are the union, fragment and row ids come fresh from the later pin's counters, Lance derives the row-version metadata at commit, and the change feed's one-transaction proof and merge's insert-absence proof accept the result."
   - "Correctness: the admission matrix under Evidence and tests, failpoints around the composed detached commits and the compare-and-swap including the in-doubt read-back, and the DST concurrent universe with the publisher on (every acknowledged write visible exactly once, one actor per commit)."
   - "Instrument: `concurrent-writes` with eight writers on one branch, local and on RustFS at +30 ms per round trip, above one writer's rate on the same build (31.7 and 0.87 commits/s on `b14c22c5` with PR #783), with one writer within noise of today and per-writer commit counts within a factor of two of each other (#784)."
@@ -35,7 +34,10 @@ publication path in `omnigraph-catalog` (`publisher.rs`, `commit.rs`,
 (`db/omnigraph/collector.rs`); the complete Lance
 [distributed write](https://lance.org/guide/distributed_write/) guide and
 [transaction specification](https://lance.org/format/table/transaction/),
-read 2026-09-28.
+read 2026-09-28. Rechecked 2026-09-30 against `main` at `c6f24757`, after:
+- #783 merged;
+- #813, which reuses a write's captured authority at revalidation;
+- #797 and #794, the `.gqt` concurrent block and request measurement.
 
 ## Summary
 
@@ -275,8 +277,11 @@ It runs one batch at a time:
    no exclusion inside the branch gate (the shared gate's decision log), so
    the publisher does not take them.
 2. **Revalidate once** with the checks `revalidate_write_txn` runs per
-   write today: the schema-apply sentinel, the branch authority probe and
-   the schema contract. This yields the current materialized head Hc, the
+   write today: the schema-apply sentinel (read twice), the branch
+   authority and the schema contract. Since #813, a write to a branch other
+   than the handle's bound branch reuses its captured authority when a
+   probe finds the `__manifest` version unchanged; the publisher can reuse
+   its own last published authority the same way. This yields the current materialized head Hc, the
    current effective head, and the current pins. On a fresh named branch
    before its first publication the materialized head is absent while the
    effective head is the fork point. Below, Hc always means the
@@ -542,7 +547,9 @@ reclaims them.
   publication is in flight batches without a timer.
 - **A leader-follower write group without a task**, the RocksDB write-thread
   shape. The leader's future would own everyone's publication, so cancelling
-  one caller would abandon the others'.
+  one caller would abandon the others'. It would also keep publication
+  requests inside a session's future, where a `.gqt` concurrent block can
+  name them and `--measure` attributes them (see Unresolved questions).
 - **Failing fast before revalidation.** Measured, and bounded by the
   single-writer ceiling (shared gate decision log).
 - **Batches across actors.** Needs per-write attribution in the commit row, a
@@ -563,8 +570,24 @@ reclaims them.
     markers.
   - `changes.rs` and the merge owners assert that the feed's fast path and
     the merge chain's insert-absence proof accept the composed commit.
-- **`writes.rs`: the admission matrix.** Each cell asserts the commit count,
-  the rows, and which entry re-prepared or failed.
+- **The admission matrix.** Each cell asserts the commit count, the rows,
+  and which entry re-prepared or failed.
+
+  The cells that differ only in outcome are `.gqt` cases with a
+  `--- concurrent` block (#797), the testing guide's default for behavior
+  visible in outcomes:
+  - two to four sessions on one handle;
+  - an `order:` that holds each writer after its preparation until every
+    writer has prepared. It parks at a request made in the writer's own
+    future and under no lock another session needs. Which request
+    qualifies is not settled: fragment writes may run on Lance's pool,
+    which no order can name. Finding one is part of rollout step 2's
+    evidence.
+  - one `ok` or `error:` line per session;
+  - the rows checked in the step after the block.
+
+  Commit counts and which entry re-prepared are not expressible there, so
+  those assertions stay in `writes.rs`. The cells are:
   - Appends with disjoint ids make one commit. This covers strict inserts,
     and `insert` into a `@key` type, which is staged as an upsert.
   - The same id: one commit, and the other entry re-prepares. A strict
@@ -634,10 +657,25 @@ Each step leaves `main` shippable.
 - **Where per-write attribution belongs.** It is needed for batches across
   actors and for #513's per-write idempotency key: in this format or in RFC
   0068's record. Decided when either is proposed.
+- **Where publication requests are attributed.**
+  - A request made on a task the engine spawns can never be named in a
+    `--- concurrent` block's `order:`.
+  - `--measure` puts such requests on the block's own row, not a session's
+    (GQT README, Concurrent block).
+  - A spawned publisher therefore moves every publication request out of a
+    test's reach, and out of the writer's measured cost.
+
+  Recommended: the publisher runs its batch on a task that carries the
+  batch's first entry's session identity for the harness, so an `order:`
+  can name the batch's manifest `put` and `--measure` attributes it to that
+  session. Decided in rollout step 2, with the DST seam scheduler's actor
+  mapping, which needs the same identity.
 - **The next lever after this one.** Once publication is amortized, a
   writer's cycle at +30 ms is dominated by preparation's own round trips:
-  the sentinel, the schema contract and the branch probe. A capture served
-  from the publisher's known head is the next step. Not part of this RFC.
+  the sentinel, the schema contract and the branch probe. #813 removed the
+  branch probe's reopen for writes to a branch other than the handle's bound
+  branch. A capture served from the publisher's known head is the next
+  step. Not part of this RFC.
 
 ## Decision log
 
@@ -687,3 +725,13 @@ Each step leaves `main` shippable.
     it;
   - the seven-day orphan window is an inherited wall-clock assumption, not
     one this RFC bounds.
+- 2026-09-30 — Rechecked against `main` after #783, #813, #797 and #794
+  merged.
+  - #783's dependency left `blocked_on`.
+  - The outcome cells of the admission matrix moved to `.gqt` concurrent
+    blocks. The commit-count assertions stay in Rust.
+  - The GQT concurrent block cannot name a request made on a spawned task.
+    That turned publisher-task attribution into an unresolved question with
+    a recommendation.
+  - #813's reuse of captured authority is noted where revalidation and the
+    next lever are described.
