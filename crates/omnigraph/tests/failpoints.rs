@@ -2084,6 +2084,97 @@ async fn same_target_merges_serialize_issue_643() {
     );
 }
 
+/// Issue 643, delete boundary: deleting a merge's target or source while
+/// the merge is parked before its manifest commit waits on that branch's
+/// gate. The merge then publishes, and the delete succeeds after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn merge_endpoint_delete_waits_for_the_merge_issue_643() {
+    for victim in ["t", "s"] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let db = helpers::init_and_load(&dir).await;
+        diverged_merge_pair(&db, "s", "t").await;
+        let db = std::sync::Arc::new(db);
+
+        let parked = helpers::failpoint::Rendezvous::park_first(
+            &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+        );
+        let merge_db = std::sync::Arc::clone(&db);
+        let merge = tokio::spawn(async move { merge_db.branch_merge("s", "t").await });
+        parked.wait_until_reached().await;
+
+        let delete_db = std::sync::Arc::clone(&db);
+        let mut delete = tokio::spawn(async move { delete_db.branch_delete(victim).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut delete)
+                .await
+                .is_err(),
+            "deleting {victim} must wait while the merge holds its gate"
+        );
+
+        parked.release();
+        assert_eq!(
+            merge
+                .await
+                .unwrap()
+                .expect("the merge must publish after release"),
+            omnigraph::db::MergeOutcome::Merged,
+            "deleting {victim}"
+        );
+        delete
+            .await
+            .unwrap()
+            .unwrap_or_else(|error| panic!("deleting {victim} after the merge: {error}"));
+        assert!(
+            !db.branch_list().await.unwrap().iter().any(|b| b == victim),
+            "{victim} is gone"
+        );
+    }
+}
+
+/// Issue 643, same-source case: two merges from one source into two targets
+/// both land, and each target gets the source's row. Whether they may overlap
+/// is not pinned: today both take the source's branch gate, so they
+/// serialize, although a merge only reads its source.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn same_source_merges_both_land_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s", "t1").await;
+    db.branch_create("t2").await.unwrap();
+    db.mutate(
+        "t2",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "On-t2")], &[("$age", 54)]),
+    )
+    .await
+    .unwrap();
+    let db = std::sync::Arc::new(db);
+
+    let first_db = std::sync::Arc::clone(&db);
+    let second_db = std::sync::Arc::clone(&db);
+    let (first, second) = tokio::join!(
+        tokio::spawn(async move { first_db.branch_merge("s", "t1").await }),
+        tokio::spawn(async move { second_db.branch_merge("s", "t2").await }),
+    );
+    for (target, outcome) in [("t1", first), ("t2", second)] {
+        assert_eq!(
+            outcome.unwrap().expect("merge must land"),
+            omnigraph::db::MergeOutcome::Merged,
+            "{target}"
+        );
+        assert_eq!(
+            helpers::count_rows_branch(&db, target, "node:Person").await,
+            6,
+            "{target} holds the seed rows, its own insert and the source's"
+        );
+    }
+}
+
 /// Branch create takes the schema gate's EXCLUSIVE side: no CAS covers its
 /// namespace inventory, so a sibling create with disjoint branch gates must
 /// wait at the gate, then refuse on the collision the first leaves behind.
