@@ -7,7 +7,7 @@ rules and decision authority behind it live in [GOVERNANCE.md](GOVERNANCE.md).
 
 | I want to… | Go to | Notes |
 |---|---|---|
-| **Report broken existing functionality**, incorrect results, or a regression | **[Bug report](../../issues/new?template=bug_report.yml)** | Include a concrete reproduction. Maintainers decide classification and acceptance. |
+| **Report broken existing functionality**, incorrect results, or a regression | **[Bug report](../../issues/new?template=bug_report.yml)** | Include a concrete reproduction. Maintainers review classification and decide acceptance. |
 | **Request a new capability or change to intended behavior or architecture** | **[Feature or design proposal](../../issues/new?template=feature_request.yml)** | Includes RFC ideas and amendments. Maintainers decide whether the same issue needs an RFC. |
 | **Fix something / implement a change** | **A pull request** | Must link an `accepted` issue or accepted RFC — unless it's trivial (below). |
 | **Report a security vulnerability** | **[SECURITY.md](SECURITY.md)** | Do **not** open a public Issue. |
@@ -17,7 +17,11 @@ GitHub Discussions are not used — Issues are the only inbound channel.
 Choose one form for the underlying problem; a suggested fix does not turn a bug
 report into a feature proposal. If an issue already covers the problem or idea,
 add details there. If unsure which form applies, describe the behavior and
-expectation once; maintainers classify it during triage.
+expectation once; maintainers review its classification during triage.
+
+Both forms automatically apply `needs-triage`. The bug form also applies `bug`,
+and the feature or design proposal form applies `feature`. These initial labels
+do not imply acceptance; maintainers can correct them during triage.
 
 An RFC is a later design step, not a separate intake form. Wait for maintainer
 agreement before writing one. Maintainers apply `needs-rfc` to the existing issue,
@@ -37,8 +41,7 @@ steps and commands. Maintainers decide whether an exception is appropriate.
 Running GQT before filing is optional because the runner requires a source
 checkout. If you ran it, include the command and failure output.
 
-New reports start with `needs-triage`. A reproduction does not automatically
-accept a report; maintainers decide classification and acceptance.
+A reproduction does not automatically accept a report; maintainers decide acceptance.
 
 ### When can I just open a PR?
 The **trivial fast-lane** — open directly, no prior issue/RFC needed, when the

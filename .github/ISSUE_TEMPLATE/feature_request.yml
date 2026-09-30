@@ -1,6 +1,6 @@
 name: 💡 Feature or design proposal
 description: Request a new capability or a change to intended behavior or architecture.
-labels: ["needs-triage"]
+labels: ["feature", "needs-triage"]
 body:
   - type: markdown
     attributes:
@@ -12,8 +12,8 @@ body:
         [bug report form](https://github.com/ModernRelay/omnigraph/issues/new?template=bug_report.yml).
         For a security vulnerability, follow [SECURITY.md](https://github.com/ModernRelay/omnigraph/blob/main/SECURITY.md). Do **not** file it here.
 
-        New proposals start with **`needs-triage`**. Maintainers decide classification,
-        acceptance, and whether an RFC is needed (see [GOVERNANCE.md](https://github.com/ModernRelay/omnigraph/blob/main/GOVERNANCE.md)).
+        New proposals start with **`feature`** and **`needs-triage`**. Maintainers review
+        the classification and decide acceptance and whether an RFC is needed (see [GOVERNANCE.md](https://github.com/ModernRelay/omnigraph/blob/main/GOVERNANCE.md)).
         If an RFC is needed, maintainers apply **`needs-rfc`** to this same issue.
         Do not open a second issue for the RFC. Wait for maintainer agreement before
         writing it; implementation starts only after the RFC's lifecycle is **`accepted`**

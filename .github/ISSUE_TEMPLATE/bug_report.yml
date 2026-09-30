@@ -1,7 +1,7 @@
 name: Bug report
 description: Report existing functionality that fails, gives incorrect results, or regresses.
 title: "bug: <short summary>"
-labels: ["needs-triage"]
+labels: ["bug", "needs-triage"]
 body:
   - type: markdown
     attributes:
@@ -12,8 +12,9 @@ body:
         [feature or design proposal form](https://github.com/ModernRelay/omnigraph/issues/new?template=feature_request.yml).
         For a security vulnerability, follow [SECURITY.md](https://github.com/ModernRelay/omnigraph/blob/main/SECURITY.md). Do **not** file it here.
 
-        New reports start with **`needs-triage`**. Maintainers decide classification,
-        GQT exceptions, and acceptance. A reproduction does not automatically accept a report.
+        New reports start with **`bug`** and **`needs-triage`**. Maintainers review the
+        classification and decide GQT exceptions and acceptance.
+        A reproduction does not automatically accept a report.
         Once labelled **`accepted`**, it's open for a pull request
         (see [GOVERNANCE.md](https://github.com/ModernRelay/omnigraph/blob/main/GOVERNANCE.md)).
   - type: textarea

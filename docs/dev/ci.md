@@ -4,8 +4,9 @@ Workflow YAML under `.github/workflows/` is the source of truth. This page expla
 
 ## Issue triage
 
-Issue forms apply `needs-triage` at submission. `issue-triage.yml` provides an
-asynchronous fallback for newly opened issues submitted through other paths.
+Issue forms apply `needs-triage` plus `bug` or `feature` according to the selected
+form. `issue-triage.yml` provides an asynchronous fallback for newly opened
+issues submitted through other paths.
 It skips opening events already carrying `needs-triage`, then checks the current
 issue before writing. Closed issues and issues with any lifecycle status are
 left unchanged. It only adds `needs-triage`; it never replaces other labels or
