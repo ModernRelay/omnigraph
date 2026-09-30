@@ -229,8 +229,11 @@ pub enum Unrouted {
     /// planner defect. A read query fails with this message.
     PlannerError { message: String },
     /// A well-formed query shape the planner refuses by design
-    /// (`PlanError::Unsupported`); the caller's error, not a planner defect.
-    UnsupportedQuery { message: String },
+    /// (`PlanError::Unsupported`); the caller's error, not a planner defect,
+    /// with the diagnostic the caller answers with.
+    UnsupportedQuery {
+        diagnostic: Box<omnigraph_compiler::QueryDiagnostic>,
+    },
 }
 
 impl Unrouted {
@@ -238,7 +241,7 @@ impl Unrouted {
     /// everything else is a planner error.
     fn of(error: PlanError) -> Self {
         match error {
-            PlanError::Unsupported { detail } => Self::UnsupportedQuery { message: detail },
+            PlanError::Unsupported(diagnostic) => Self::UnsupportedQuery { diagnostic },
             other => Self::PlannerError {
                 message: other.to_string(),
             },
@@ -266,9 +269,12 @@ impl Unrouted {
             Self::RegistryRouteExecutor { entry } => json!({ "kind": self.kind(), "entry": entry }),
             Self::DeclaredBytesOverBound { node } => json!({ "kind": self.kind(), "node": node }),
             Self::Override => json!({ "kind": self.kind() }),
-            Self::PlannerError { message } | Self::UnsupportedQuery { message } => {
-                json!({ "kind": self.kind(), "message": message })
-            }
+            Self::PlannerError { message } => json!({ "kind": self.kind(), "message": message }),
+            Self::UnsupportedQuery { diagnostic } => json!({
+                "kind": self.kind(),
+                "code": diagnostic.code.as_str(),
+                "message": diagnostic.message,
+            }),
         }
     }
 }

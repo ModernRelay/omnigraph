@@ -22,7 +22,8 @@ pub struct QueryCodeSpec {
 
 /// A stable diagnostic code, a pointer-sized handle to its catalog entry so
 /// a diagnostic stays small enough to travel in a `Result`. Parse codes are
-/// `Q…`, typecheck codes are `T…`; the catalog is `super::codes`.
+/// `Q…`, typecheck codes are `T…`, planner codes are `P…`; the catalog is
+/// `super::codes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryCode(pub &'static QueryCodeSpec);
 
@@ -50,12 +51,13 @@ impl std::fmt::Display for QueryCode {
     }
 }
 
-/// Which compiler phase refused the source; decides the rendered prefix.
+/// Which phase refused the source; decides the rendered prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryDiagnosticKind {
     Parse,
     Type,
+    Plan,
 }
 
 /// A source position: 1-based line and column (in characters) plus the byte
@@ -172,6 +174,23 @@ impl QueryDiagnostic {
         }
     }
 
+    /// A planner diagnostic: a well-formed, type-checked query shape the
+    /// planner refuses by design, so it carries the `plan` stage.
+    pub fn plan(code: QueryCode, message: impl Into<String>) -> Self {
+        Self {
+            kind: QueryDiagnosticKind::Plan,
+            code,
+            message: message.into(),
+            position: None,
+            stage: Some(Box::new(Stage {
+                name: "plan",
+                expression: None,
+            })),
+            fix: None,
+            suggestion: None,
+        }
+    }
+
     pub fn with_fix(mut self, fix: impl Into<String>) -> Self {
         self.fix = Some(fix.into());
         self
@@ -204,6 +223,9 @@ impl std::fmt::Display for QueryDiagnostic {
             QueryDiagnosticKind::Type => {
                 write!(f, "type error: {}: {}", self.code, self.message)
             }
+            QueryDiagnosticKind::Plan => {
+                write!(f, "plan error: {}: {}", self.code, self.message)
+            }
         }
     }
 }
@@ -213,7 +235,7 @@ impl std::error::Error for QueryDiagnostic {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::codes::{Q001, T1};
+    use crate::query::codes::{P001, Q001, T1};
 
     #[test]
     fn position_counts_lines_and_character_columns() {
@@ -230,6 +252,12 @@ mod tests {
         assert_eq!(parse.to_string(), "parse error: expected `(`");
         let typed = QueryDiagnostic::typecheck(T1, "unknown node type `X`").with_fix("declare X");
         assert_eq!(typed.to_string(), "type error: T1: unknown node type `X`");
+        let plan = QueryDiagnostic::plan(P001, "`nearest()` orders `$t`").with_expression("x");
+        assert_eq!(
+            plan.to_string(),
+            "plan error: P001: `nearest()` orders `$t`"
+        );
+        assert_eq!(plan.stage.as_ref().map(|stage| stage.name), Some("plan"));
     }
 
     #[test]

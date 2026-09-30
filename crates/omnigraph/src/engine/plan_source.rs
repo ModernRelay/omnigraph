@@ -338,6 +338,12 @@ impl PlanSource for QuerySource<'_> {
     }
 }
 
+/// A query shape the planner refuses by design: the caller's error, a bad
+/// request carrying the planner's diagnostic on every door.
+fn unsupported_query(diagnostic: Box<omnigraph_compiler::QueryDiagnostic>) -> OmniError {
+    OmniError::Compiler(omnigraph_compiler::error::CompilerError::Query(diagnostic))
+}
+
 fn no_plan(reason: impl std::fmt::Display) -> OmniError {
     OmniError::manifest_internal(format!(
         "the planner built no plan for this query: {reason}"
@@ -379,7 +385,7 @@ fn resolve_params(ir: &QueryIR, params: &ParamMap) -> Result<ResolvedParams> {
 pub(crate) fn plan_query(source: &QuerySource<'_>) -> Result<PhysicalPlan> {
     omnigraph_planner::plan_query(&source.ir, source, &source.bounds()).map_err(|reason| {
         match reason {
-            Unrouted::UnsupportedQuery { message } => OmniError::manifest(message),
+            Unrouted::UnsupportedQuery { diagnostic } => unsupported_query(diagnostic),
             reason => no_plan(reason.to_json()),
         }
     })
@@ -407,9 +413,9 @@ pub(crate) fn explain_query(source: &QuerySource<'_>) -> Result<ExplainedQuery> 
             physical: plan,
         }),
         Decision::Executor {
-            reason: Unrouted::UnsupportedQuery { message },
+            reason: Unrouted::UnsupportedQuery { diagnostic },
             ..
-        } => Err(OmniError::manifest(message)),
+        } => Err(unsupported_query(diagnostic)),
         Decision::Executor { reason, .. } => Err(no_plan(reason.to_json())),
         Decision::Routed { entry, .. } => Err(OmniError::manifest_internal(format!(
             "the registry routed a GQ query through entry `{}`; a read query runs only \
