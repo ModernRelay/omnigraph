@@ -282,10 +282,22 @@ fn branch_statements_remote_round_trip_and_delete_needs_consent() {
             .arg("branch delete b0")
             .arg("--json"),
     );
+    let refusal = parse_stdout_json(&refused_json);
     assert!(
-        stderr_string(&refused_json).contains("pass --yes to confirm"),
-        "--json fails closed too"
+        refusal["error"]
+            .as_str()
+            .unwrap()
+            .contains("pass --yes to confirm"),
+        "--json fails closed too: {refusal}"
     );
+    assert_eq!(
+        refusal["command_outcome"],
+        serde_json::json!({
+            "execution":"not_started", "effects":"none", "action":"refresh"
+        })
+    );
+    assert!(refusal.get("http_status").is_none());
+    assert!(refused_json.stderr.is_empty());
     let listed = output_success(
         served("query", &server)
             .arg("-e")
@@ -557,7 +569,23 @@ fn a_source_this_cli_cannot_parse_is_sent_to_the_server_verbatim() {
                 .arg("g")
                 .arg("--json"),
         );
-        assert_eq!(parse_stdout_json(&output), refusal, "{verb}");
+        let mut actual = parse_stdout_json(&output);
+        if verb == "mutate" {
+            assert_eq!(actual["http_status"], 400);
+            assert_eq!(
+                actual["command_outcome"],
+                serde_json::json!({
+                    "execution":"unknown", "effects":"unknown", "action":"reconcile"
+                })
+            );
+            let fields = actual.as_object_mut().unwrap();
+            fields.remove("http_status");
+            fields.remove("command_outcome");
+        }
+        assert_eq!(
+            actual, refusal,
+            "{verb} must preserve every original server field"
+        );
         assert!(output.stderr.is_empty(), "{verb}: {output:?}");
         let requests = server.requests();
         assert_eq!(requests.len(), 2, "one discovery and one data request");

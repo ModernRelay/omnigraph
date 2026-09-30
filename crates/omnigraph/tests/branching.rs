@@ -11,7 +11,7 @@ use lance_index::is_system_index;
 
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
-use omnigraph::error::{ManifestErrorKind, MergeConflictKind, OmniError};
+use omnigraph::error::{CompletionEvidence, ManifestErrorKind, MergeConflictKind, OmniError};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
 use omnigraph::{
@@ -3959,6 +3959,11 @@ async fn branch_delete_retires_native_parent_and_cleanup_preserves_live_child() 
         .unwrap();
     let refused = main.branch_delete("feature").await.expect_err(
         "native graph tags retain the deletion fence until graph-wide tagged table pins exist",
+    );
+    assert_eq!(
+        refused.completion_evidence(),
+        Some(CompletionEvidence::BeforeEffect),
+        "a native-tag refusal precedes retirement publication: {refused}"
     );
     assert!(
         refused.to_string().contains("native manifest tag"),

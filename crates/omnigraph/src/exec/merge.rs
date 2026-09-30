@@ -5156,7 +5156,9 @@ impl Session {
             },
             actor_id,
         )?;
-        self.ensure_schema_apply_idle("branch_merge").await?;
+        self.ensure_schema_apply_idle("branch_merge")
+            .await
+            .map_err(OmniError::before_effect)?;
         // Keep the planning/publication future out of the public API's callers;
         // deeply composed loads and merges otherwise retain large debug
         // construction frames throughout execution. Poll it in the same task.
@@ -5167,7 +5169,17 @@ impl Session {
             self.settings().merge_lineage(),
         ))
         .await;
-        fail(&BRANCH_MERGE_PRE_RETURN)?;
+        if let Err(error) = fail(&BRANCH_MERGE_PRE_RETURN) {
+            // This boundary is after the result is fixed. A simulated lost
+            // receipt cannot turn an acknowledged publication into a normal
+            // validation refusal. Preserve an existing failure's evidence.
+            return match result {
+                Ok(_) => {
+                    Err(error.with_completion_evidence(crate::error::CompletionEvidence::Uncertain))
+                }
+                Err(original) => Err(original),
+            };
+        }
         result
     }
 }
@@ -5301,20 +5313,30 @@ impl Omnigraph {
         // same root-shared schema -> branch order used by native branch controls.
         // Holding both branch gates through publication prevents a target
         // delete/recreate from reusing the branch name underneath a plan (ABA).
-        self.settle_pending_schema_install().await?;
+        let completed_prior_work = self.settle_pending_schema_install().await?;
+        let preparation_error = |error: OmniError| {
+            if completed_prior_work {
+                error.without_pre_effect_evidence()
+            } else {
+                error.before_effect()
+            }
+        };
         let _schema_permit = self.write_queue().acquire_schema_shared().await;
         let _branch_guards = self
             .write_queue()
             .acquire_branches(&[source_branch.clone(), target_branch.clone()])
             .await;
-        self.ensure_schema_apply_not_locked("branch_merge").await?;
+        self.ensure_schema_apply_not_locked("branch_merge")
+            .await
+            .map_err(preparation_error)?;
         // Capture each branch as one coherent RFC-022 authority token plus
         // immutable snapshot. The target token is the coarse publish read set;
         // the source token pins the exact merge input without requiring the
         // source head to remain latest until the target CAS.
         let (source_txn, target_txn, source_commits, target_commits) = self
             .open_merge_write_txns(source_branch.as_deref(), target_branch.as_deref())
-            .await?;
+            .await
+            .map_err(preparation_error)?;
         let source_head_commit_id = source_txn
             .effective_graph_head
             .clone()
@@ -5331,7 +5353,8 @@ impl Omnigraph {
                 &target_head_commit_id,
                 &relevant_branches,
             )
-            .await?;
+            .await
+            .map_err(preparation_error)?;
 
         if source_head_commit_id == target_head_commit_id
             || base_commit.graph_commit_id == source_head_commit_id

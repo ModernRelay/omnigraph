@@ -34,8 +34,8 @@ use omnigraph_api_types::{
     BranchListOutput, BranchMergeOutcome, BranchMergeOutput, BranchMergeRequest,
     BranchOutcomeOutput, ChangeBaselineOutput, ChangeBaselineRecord, ChangeBaselineRequest,
     ChangeFeedOutput, ChangeOpOutput, ChangeOutput, ChangeRequest, CommitChangesOutput,
-    CommitListOutput, CommitOutput, EntityKindOutput, ErrorOutput, ExportRequest,
-    GraphBatchLoadOutput, GraphDiscoveryResponse, GraphListResponse, IngestOutput, IngestRequest,
+    CommitListOutput, CommitOutput, EntityKindOutput, ExportRequest, GraphBatchLoadOutput,
+    GraphDiscoveryResponse, GraphListResponse, IngestOutput, IngestRequest,
     InvokeStoredQueryRequest, QueryRequest, ReadOutput, SchemaApplyOutput, SchemaApplyRequest,
     SchemaOutput, SettingsRequest, SnapshotOutput, branch_list_read_output, change_baseline_output,
     change_feed_output, change_scope, commit_changes_output, commit_output, ingest_receipt_output,
@@ -55,7 +55,7 @@ use crate::blob_cli::{
 use crate::cli::CliLoadMode;
 use crate::graph_http::{ApiContractError, GraphHttpClient};
 use crate::helpers::{
-    RemoteErrorCli, apply_bearer_token, apply_server_flag, branch_statement_change_request,
+    apply_bearer_token, apply_server_flag, branch_statement_change_request,
     branch_statement_query_request, is_remote_uri, legacy_change_request_body,
     precondition_failed_cli, query_params_from_json, remote_json, remote_json_bounded,
     remote_response_json_bounded, remote_url, resolve_cli_actor, resolve_cli_graph,
@@ -472,6 +472,7 @@ impl GraphClient {
     /// the source's own `set` lines apply per call, on top.
     async fn open_session(uri: &str, settings: &[(SettingId, SettingValue)]) -> Result<Session> {
         let (defaults, sources) = omnigraph::settings::from_env()?;
+        crate::command_outcome::writable_open();
         let mut session = Arc::new(Omnigraph::open(uri).await?).session(defaults, sources);
         for (id, value) in settings {
             session.set(*id, value, Source::Request)?;
@@ -850,11 +851,8 @@ impl GraphClient {
                 let mut response = http.send(request).await?;
                 let status = response.status();
                 if !status.is_success() {
-                    let text = response.text().await?;
-                    if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
-                        return Err(RemoteErrorCli { output: error }.into());
-                    }
-                    bail!("server returned {}: {}", status, text);
+                    // Share structured status/backoff handling with JSON responses.
+                    return remote_response_json_bounded(response, token.as_deref(), None).await;
                 }
                 // Hold back the most recent complete line while streaming: at
                 // EOF it must be the terminal handshake record. Everything
@@ -1031,8 +1029,9 @@ impl GraphClient {
     ///
     /// `expected_head` is the `--if-commit` compare-and-swap precondition:
     /// the write runs only if the branch head commit still equals it. A
-    /// mismatch surfaces as the typed [`PreconditionFailedCli`] on both
-    /// transports so the verb can exit with `EXIT_PRECONDITION_FAILED` (4).
+    /// mismatch preserves typed precondition details on both transports.
+    /// The command boundary reserves exit 4 for verified remote refusals
+    /// without earlier whole-command effects.
     ///
     /// A `--set` value travels in the `settings` field of `POST /mutate`
     /// (the deprecated `/change` route refuses the field), so the legacy
@@ -1639,11 +1638,8 @@ impl GraphClient {
                 let mut response = http.send(request).await?;
                 let status = response.status();
                 if !status.is_success() {
-                    let text = response.text().await?;
-                    if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
-                        return Err(RemoteErrorCli { output: error }.into());
-                    }
-                    bail!("server returned {}: {}", status, text);
+                    // Share structured status/backoff handling with JSON responses.
+                    return remote_response_json_bounded(response, token.as_deref(), None).await;
                 }
                 while let Some(chunk) = response.chunk().await? {
                     writer.write_all(&chunk)?;
@@ -1966,6 +1962,7 @@ fn parse_change_feed_start(start: &str) -> Result<omnigraph::changes::ChangeFeed
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::helpers::{RemoteErrorCli, remote_json_with_graph_commit_precondition};
     use crate::managed_http_fixture::{IntentApiFixture, IntentReply};
     use serde_json::json;
 
@@ -2272,6 +2269,103 @@ mod tests {
             server.assert_complete();
         }
         assert!(target.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn command_outcome_keeps_earlier_effects_and_scopes_independent_invocations() {
+        async fn attempt(
+            earlier_request: bool,
+            read_refusal: bool,
+            conditional: bool,
+        ) -> crate::command_outcome::Failure {
+            let mut refusal = contract_reply(
+                if conditional { 412 } else { 429 },
+                if conditional {
+                    json!({"error":"head changed", "precondition_failure":{"expected":"head-a","actual":"head-b"}})
+                } else {
+                    json!({"error":"actor is busy", "code":"too_many_requests"})
+                },
+            );
+            refusal
+                .headers
+                .push(("Retry-After".into(), "Wed, 21 Oct 2026 07:28:00 GMT".into()));
+            let replies = if earlier_request {
+                vec![contract_reply(200, json!({"created":true})), refusal]
+            } else {
+                vec![refusal]
+            };
+            let server = IntentApiFixture::graph(replies);
+            let http = GraphHttpClient::new(&server.origin).unwrap();
+            let (error, evidence) = crate::command_outcome::observe(async {
+                if earlier_request {
+                    remote_json::<Value>(
+                        &http,
+                        Method::POST,
+                        format!("{}/graphs/knowledge/branches", server.origin),
+                        Some(json!({"name":"review"})),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                }
+                remote_json_with_graph_commit_precondition::<Value>(
+                    &http,
+                    if read_refusal {
+                        Method::GET
+                    } else {
+                        Method::POST
+                    },
+                    format!("{}/graphs/knowledge/mutate", server.origin),
+                    Some(json!({"query":"mutation m() {}"})),
+                    None,
+                    conditional.then_some("head-a"),
+                )
+                .await
+                .unwrap_err()
+            })
+            .await;
+            assert_eq!(
+                server.workflow_requests().len(),
+                if earlier_request { 2 } else { 1 }
+            );
+            server.assert_complete();
+            crate::command_outcome::Failure::classify(error, evidence)
+        }
+        // Poll concurrently: invocation evidence must never leak to a peer.
+        let (compound, single) =
+            tokio::join!(attempt(true, false, false), attempt(false, false, false));
+        assert_eq!(compound.exit, 1);
+        assert_eq!(single.exit, 75);
+        assert_eq!(
+            serde_json::to_value(compound).unwrap()["command_outcome"],
+            json!({
+                "execution":"unknown", "effects":"unknown", "action":"reconcile"
+            })
+        );
+        let single = serde_json::to_value(single).unwrap();
+        assert_eq!(single["retry_after"], "Wed, 21 Oct 2026 07:28:00 GMT");
+        assert_eq!(
+            single["command_outcome"],
+            json!({
+                "execution":"not_started", "effects":"none", "action":"retry"
+            })
+        );
+        // A later read's typed refusal cannot erase an earlier successful
+        // write; likewise a later conditional refusal closes only its request.
+        for (read_refusal, conditional) in [(true, false), (false, true), (true, true)] {
+            let compound = attempt(true, read_refusal, conditional).await;
+            assert_eq!(compound.exit, 1);
+            assert_eq!(
+                serde_json::to_value(compound).unwrap()["command_outcome"]["effects"],
+                "unknown"
+            );
+        }
+        let conditional = attempt(false, false, true).await;
+        assert_eq!(conditional.exit, 4);
+        assert_eq!(
+            serde_json::to_value(conditional).unwrap()["command_outcome"],
+            json!({"execution":"not_started","effects":"none","action":"refresh"})
+        );
     }
 
     #[tokio::test]

@@ -866,6 +866,7 @@ impl Omnigraph {
                     actor_id,
                     expected_head,
                     stage_write_concurrency,
+                    attempt == 0,
                     &mut retryable,
                 )
                 .await
@@ -898,6 +899,7 @@ impl Omnigraph {
         actor_id: Option<&str>,
         expected_head: Option<&str>,
         stage_write_concurrency: usize,
+        first_attempt: bool,
         retryable: &mut bool,
     ) -> Result<crate::MutationReceipt> {
         let requested = Self::normalize_branch_name(branch)?;
@@ -911,132 +913,155 @@ impl Omnigraph {
         // Install this handle's published-but-uninstalled schema contract, if
         // any. This MUST run before `open_write_txn`, which captures the
         // accepted schema identity and catalog.
-        self.settle_pending_schema_install().await?;
-        // Capture one branch-wide write authority: native branch identity,
-        // exact optional graph head, accepted schema identity/catalog, and the
-        // base table snapshot. Execution, validation, staging, and publication
-        // all use this immutable attempt. `commit_all` revalidates the complete
-        // token under the root-shared schema → branch → sorted-table gates
-        // before its first detached commit.
-        let mut txn = self.open_write_txn(requested.as_deref()).await?;
-        // Caller CAS gate against the pinned view this attempt executes with —
-        // a separate head lookup would reopen the race. Re-checked per
-        // reprepare; not `ReadSetChanged`, so the retry loop never replays it.
-        if let Some(expected) = expected_head {
-            let actual = txn.effective_graph_head.as_deref();
-            if actual != Some(expected) {
-                return Err(OmniError::precondition_failed(
-                    requested.as_deref().unwrap_or("main"),
-                    expected,
-                    actual.map(str::to_string),
-                ));
-            }
-            txn.caller_expected_graph_head = Some(expected.to_string());
-        }
-        let resolved_params = params.clone();
-
-        // Per-query staging accumulator. Inserts and updates push batches into
-        // `pending`; deletes push predicates into `delete_predicates`. At the
-        // boundary, `stage_all` prepares one exact transaction per touched table
-        // and `commit_all` commits each as a detached version of its pinned
-        // base (RFC 0067). The publisher then makes the complete result
-        // graph-visible in one manifest CAS. Branch is threaded explicitly — no
-        // coordinator swap.
-        let mut staging = MutationStaging::default();
-
-        // Lower + validate up front so the touched-dataset set is known before
-        // execution. A lowering/validation error returns exactly as it did
-        // when this happened inside execute_named_mutation.
-        let ir = self.lower_named_mutation(&txn.catalog, query_source, query_name)?;
-        check_param_date_literals(params, &ir.params)?;
-        // Only an insert-only mutation is safe to replay automatically after a
-        // pre-effect authority mismatch. Update/Delete keep strict caller-visible
-        // `ReadSetChanged`; replaying their stale read-modify-write plan would be
-        // a semantic rebase rather than a fresh execution contract.
-        *retryable = ir
-            .ops
-            .iter()
-            .all(|op| matches!(op, MutationOpIR::Insert { .. }));
-
-        let exec_result = self
-            .execute_named_mutation(
-                &ir,
-                &resolved_params,
-                requested.as_deref(),
-                &mut staging,
-                &txn,
-            )
-            .await;
-
-        match exec_result {
-            Err(e) => Err(e),
-            Ok(total) if staging.is_empty() => {
-                if txn.caller_expected_graph_head.is_some() {
-                    fail(&MUTATION_POST_NO_EFFECT_PRE_GATE)?;
-                    // A no-op has no table transaction, so it never reaches
-                    // `commit_all`. It still needs a linearization point for
-                    // the caller's CAS promise: under the same schema -> branch
-                    // ordering as effectful writes (shared permit — this pass
-                    // only reads the accepted view), revalidate the complete
-                    // authority and map a moved caller head to terminal 412.
-                    let _schema_permit = self.write_queue().acquire_schema_shared().await;
-                    let _branch_guard = self
-                        .write_queue()
-                        .acquire_branch(requested.as_deref())
-                        .await;
-                    self.revalidate_write_txn(&txn).await?;
+        let completed_prior_work = self.settle_pending_schema_install().await?;
+        let result = async {
+            // Capture one branch-wide write authority: native branch identity,
+            // exact optional graph head, accepted schema identity/catalog, and the
+            // base table snapshot. Execution, validation, staging, and publication
+            // all use this immutable attempt. `commit_all` revalidates the complete
+            // token under the root-shared schema → branch → sorted-table gates
+            // before its first detached commit.
+            let mut txn = self
+                .open_write_txn(requested.as_deref())
+                .await
+                .map_err(|error| {
+                    if first_attempt && !completed_prior_work {
+                        error.before_effect()
+                    } else {
+                        error.without_pre_effect_evidence()
+                    }
+                })?;
+            // Caller CAS gate against the pinned view this attempt executes with —
+            // a separate head lookup would reopen the race. Re-checked per
+            // reprepare; not `ReadSetChanged`, so the retry loop never replays it.
+            if let Some(expected) = expected_head {
+                let actual = txn.effective_graph_head.as_deref();
+                if actual != Some(expected) {
+                    return Err(OmniError::precondition_failed(
+                        requested.as_deref().unwrap_or("main"),
+                        expected,
+                        actual.map(str::to_string),
+                    ));
                 }
-                Ok(crate::MutationReceipt {
-                    result: total,
-                    commit: None,
-                })
+                txn.caller_expected_graph_head = Some(expected.to_string());
             }
-            Ok(total) => {
-                self.validate_staged_mutation(&staging, &txn).await?;
-                let staged = staging
-                    .stage_all_with_concurrency(self, requested.as_deref(), stage_write_concurrency)
-                    .await?;
-                fail(&MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
-                let lineage_intent = self
-                    .new_lineage_intent_for_branch(requested.as_deref(), actor_id)
-                    .await?;
-                // `_held_gates` holds the shared schema permit, branch
-                // effect gate, and sorted table gates acquired by `commit_all`.
-                // They remain held through manifest publication, covering the
-                // complete same-process effect lifetime. They are a local
-                // serialization aid; the exact publisher precondition remains
-                // the correctness authority.
-                let super::staging::CommittedMutation {
-                    updates,
-                    expected_versions,
-                    gates: _held_gates,
-                } = staged.commit_all(self, requested.as_deref(), &txn).await?;
-                // Failpoint for the detached-effects → publisher boundary:
-                // every table effect is committed detached but nothing is
-                // graph-visible. A failure here leaves the graph unchanged and
-                // the detached versions as reclaimable garbage. See
-                // `tests/failpoints.rs::finalize_publisher_residual_does_not_drift_untouched_tables`.
-                fail(&MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
-                let publish_result = self
-                    .commit_updates_on_branch_with_expected(
-                        requested.as_deref(),
-                        &updates,
-                        &expected_versions,
-                        actor_id,
-                        &txn,
-                        lineage_intent,
-                    )
-                    .await;
-                // RFC 0067: every effect is a detached commit of its pinned base,
-                // so a publish failure leaves the graph unchanged; the error
-                // is returned as is (a moved head is `ReadSetChanged`).
-                let commit = publish_result?;
-                Ok(crate::MutationReceipt {
-                    result: total,
-                    commit: Some(commit),
-                })
+            let resolved_params = params.clone();
+
+            // Per-query staging accumulator. Inserts and updates push batches into
+            // `pending`; deletes push predicates into `delete_predicates`. At the
+            // boundary, `stage_all` prepares one exact transaction per touched table
+            // and `commit_all` commits each as a detached version of its pinned
+            // base (RFC 0067). The publisher then makes the complete result
+            // graph-visible in one manifest CAS. Branch is threaded explicitly — no
+            // coordinator swap.
+            let mut staging = MutationStaging::default();
+
+            // Lower + validate up front so the touched-dataset set is known before
+            // execution. A lowering/validation error returns exactly as it did
+            // when this happened inside execute_named_mutation.
+            let ir = self.lower_named_mutation(&txn.catalog, query_source, query_name)?;
+            check_param_date_literals(params, &ir.params)?;
+            // Only an insert-only mutation is safe to replay automatically after a
+            // pre-effect authority mismatch. Update/Delete keep strict caller-visible
+            // `ReadSetChanged`; replaying their stale read-modify-write plan would be
+            // a semantic rebase rather than a fresh execution contract.
+            *retryable = ir
+                .ops
+                .iter()
+                .all(|op| matches!(op, MutationOpIR::Insert { .. }));
+
+            let exec_result = self
+                .execute_named_mutation(
+                    &ir,
+                    &resolved_params,
+                    requested.as_deref(),
+                    &mut staging,
+                    &txn,
+                )
+                .await;
+
+            match exec_result {
+                Err(e) => Err(e),
+                Ok(total) if staging.is_empty() => {
+                    if txn.caller_expected_graph_head.is_some() {
+                        fail(&MUTATION_POST_NO_EFFECT_PRE_GATE)?;
+                        // A no-op has no table transaction, so it never reaches
+                        // `commit_all`. It still needs a linearization point for
+                        // the caller's CAS promise: under the same schema -> branch
+                        // ordering as effectful writes (shared permit — this pass
+                        // only reads the accepted view), revalidate the complete
+                        // authority and map a moved caller head to terminal 412.
+                        let _schema_permit = self.write_queue().acquire_schema_shared().await;
+                        let _branch_guard = self
+                            .write_queue()
+                            .acquire_branch(requested.as_deref())
+                            .await;
+                        self.revalidate_write_txn(&txn).await?;
+                    }
+                    Ok(crate::MutationReceipt {
+                        result: total,
+                        commit: None,
+                    })
+                }
+                Ok(total) => {
+                    self.validate_staged_mutation(&staging, &txn).await?;
+                    let staged = staging
+                        .stage_all_with_concurrency(
+                            self,
+                            requested.as_deref(),
+                            stage_write_concurrency,
+                        )
+                        .await?;
+                    fail(&MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
+                    let lineage_intent = self
+                        .new_lineage_intent_for_branch(requested.as_deref(), actor_id)
+                        .await?;
+                    // `_held_gates` holds the shared schema permit, branch
+                    // effect gate, and sorted table gates acquired by `commit_all`.
+                    // They remain held through manifest publication, covering the
+                    // complete same-process effect lifetime. They are a local
+                    // serialization aid; the exact publisher precondition remains
+                    // the correctness authority.
+                    let super::staging::CommittedMutation {
+                        updates,
+                        expected_versions,
+                        gates: _held_gates,
+                    } = staged.commit_all(self, requested.as_deref(), &txn).await?;
+                    // Failpoint for the detached-effects → publisher boundary:
+                    // every table effect is committed detached but nothing is
+                    // graph-visible. A failure here leaves the graph unchanged and
+                    // the detached versions as reclaimable garbage. See
+                    // `tests/failpoints.rs::finalize_publisher_residual_does_not_drift_untouched_tables`.
+                    fail(&MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
+                    let publish_result = self
+                        .commit_updates_on_branch_with_expected(
+                            requested.as_deref(),
+                            &updates,
+                            &expected_versions,
+                            actor_id,
+                            &txn,
+                            lineage_intent,
+                        )
+                        .await;
+                    // RFC 0067: every effect is a detached commit of its pinned base,
+                    // so a publish failure leaves the graph unchanged; the error
+                    // is returned as is (a moved head is `ReadSetChanged`).
+                    let commit = publish_result?;
+                    Ok(crate::MutationReceipt {
+                        result: total,
+                        commit: Some(commit),
+                    })
+                }
             }
         }
+        .await;
+        result.map_err(|error: OmniError| {
+            if completed_prior_work {
+                error.without_pre_effect_evidence()
+            } else {
+                error
+            }
+        })
     }
 
     /// Lower + validate a named mutation query into its IR.

@@ -5925,6 +5925,7 @@ dependencies = [
  "dashmap",
  "futures",
  "headers",
+ "http-body-util",
  "jsonwebtoken",
  "lance",
  "lance-index",

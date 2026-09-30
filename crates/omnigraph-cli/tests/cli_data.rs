@@ -2148,18 +2148,21 @@ fn explain_statement_answers_the_plan_as_rows() {
             .arg(EXPLAIN_ADULTS)
             .arg("--json"),
     );
-    let stderr = String::from_utf8_lossy(&refused.stderr);
+    let refusal: Value = serde_json::from_slice(&refused.stdout).unwrap();
     assert!(
-        stderr.contains("statement 'explain' is a read; use POST /query"),
-        "{stderr}"
+        refusal["error"]
+            .as_str()
+            .unwrap()
+            .contains("statement 'explain' is a read; use POST /query"),
+        "{refusal}"
     );
 }
 
 /// GitHub #365: the embedded transport must preserve the typed stale-head
-/// outcome all the way through the CLI boundary. This is deliberately local
-/// and non-ignored so exit code 4 cannot depend on loopback/server coverage.
+/// details all the way through the CLI boundary. A writable open may complete
+/// older work, so this cannot claim whole-command no effects or exit 4.
 #[test]
-fn mutate_if_commit_lost_cas_exits_4_embedded_issue_365() {
+fn mutate_if_commit_lost_cas_preserves_details_embedded_issue_365() {
     const FIND_PERSON: &str =
         "query find($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
     const SET_AGE: &str = "query set_age($name: String, $age: I32) { update Person set { age: $age } where name = $name }";
@@ -2212,8 +2215,8 @@ fn mutate_if_commit_lost_cas_exits_4_embedded_issue_365() {
         .unwrap();
     assert_eq!(
         lost.status.code(),
-        Some(4),
-        "lost embedded --if-commit must exit 4; stderr: {}",
+        Some(1),
+        "embedded writable open prevents whole-command no-effect proof; stderr: {}",
         String::from_utf8_lossy(&lost.stderr)
     );
     let body: Value = serde_json::from_slice(&lost.stdout)
@@ -2221,6 +2224,10 @@ fn mutate_if_commit_lost_cas_exits_4_embedded_issue_365() {
     assert_eq!(
         body["precondition_failure"]["expected"],
         Value::String(stale_head)
+    );
+    assert_eq!(
+        body["command_outcome"],
+        serde_json::json!({"execution":"unknown","effects":"unknown","action":"refresh"})
     );
 
     let verify = output_success(
@@ -2269,6 +2276,12 @@ fn remote_if_commit_fails_closed_against_an_older_server() {
     assert_eq!(error["code"], "api_contract_mismatch");
     assert_eq!(error["http_status"], 404);
     assert_eq!(error["request_dispatched"], false);
+    assert_eq!(
+        error["command_outcome"],
+        serde_json::json!({
+            "execution":"not_started", "effects":"none", "action":"refresh"
+        })
+    );
     let requests = server.requests();
     assert_eq!(
         requests.len(),
@@ -2321,6 +2334,43 @@ fn remote_json_errors_preserve_server_codes_and_details() {
             }),
             4,
         ),
+        (
+            vec!["mutate", "restricted", "--if-commit", "head-before"],
+            409,
+            serde_json::json!({
+                "error":"wrong status cannot establish a conditional refusal",
+                "precondition_failure":{"expected":"head-before","actual":"head-after"}
+            }),
+            1,
+        ),
+        (
+            vec!["mutate", "restricted", "--if-commit", "head-before"],
+            412,
+            serde_json::json!({
+                "error":"wrong condition cannot establish this request's refusal",
+                "precondition_failure":{"expected":"another-condition","actual":"head-after"}
+            }),
+            1,
+        ),
+        (
+            vec!["mutate", "restricted"],
+            412,
+            serde_json::json!({
+                "error":"unsolicited condition cannot establish a refusal",
+                "precondition_failure":{"expected":"head-before","actual":"head-after"}
+            }),
+            1,
+        ),
+        (
+            vec!["mutate", "restricted", "--if-commit", "head-before"],
+            412,
+            serde_json::json!({
+                "error":"contradictory effect evidence cannot establish a refusal",
+                "precondition_failure":{"expected":"head-before","actual":"head-after"},
+                "recovery_required":{"operation_id":"published"}
+            }),
+            1,
+        ),
     ] {
         let formats: &[&[&str]] = if arguments[0] == "query" {
             &[&["--json"], &["--format", "json"]]
@@ -2341,11 +2391,25 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 Some(exit),
                 "{arguments:?} {format:?}: {output:?}"
             );
+            let mut actual = serde_json::from_slice::<Value>(&output.stdout).unwrap_or_else(|error| {
+                panic!("{arguments:?} {format:?} lost structured HTTP {status}: {error}; {output:?}")
+            });
+            if arguments[0] == "mutate" {
+                assert_eq!(actual["http_status"], status);
+                assert_eq!(
+                    actual["command_outcome"]["execution"],
+                    if exit == 4 { "not_started" } else { "unknown" }
+                );
+                assert_eq!(
+                    actual["command_outcome"]["effects"],
+                    if exit == 4 { "none" } else { "unknown" }
+                );
+                let fields = actual.as_object_mut().unwrap();
+                fields.remove("http_status");
+                fields.remove("command_outcome");
+            }
             assert_eq!(
-                serde_json::from_slice::<Value>(&output.stdout).unwrap_or_else(|error| {
-                    panic!("{arguments:?} {format:?} lost structured HTTP {status}: {error}; {output:?}")
-                }),
-                body,
+                actual, body,
                 "{arguments:?} {format:?} must preserve the server's complete error contract"
             );
             assert!(
@@ -2354,6 +2418,164 @@ fn remote_json_errors_preserve_server_codes_and_details() {
             );
             server.assert_complete();
         }
+    }
+}
+
+/// Whole-command retry classification needs real CLI processes and a wire
+/// census; row/error GQT expectations cannot observe exits or resubmission.
+#[test]
+fn data_write_outcomes_and_retry_permission_issue_466() {
+    use support::managed_http::{IntentApiFixture, IntentReply};
+
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("batch.ndjson");
+    fs::write(&data, "").unwrap();
+    let schema = temp.path().join("schema.pg");
+    fs::write(&schema, "node Person { name: String }").unwrap();
+    let data = data.to_str().unwrap();
+    let schema = schema.to_str().unwrap();
+    let commands = [
+        vec!["mutate", "stored_write"],
+        vec!["mutate", "-e", "mutation write() {}"],
+        vec!["change", "-e", "branch create review"],
+        vec!["branch", "create", "review"],
+        vec!["branch", "delete", "review", "--yes"],
+        vec!["branch", "merge", "review"],
+        vec!["load", "--data", data, "--mode", "append"],
+        vec![
+            "load", "--data", data, "--mode", "merge", "--branch", "review", "--from", "main",
+        ],
+        vec!["ingest", "--data", data],
+        vec!["schema", "apply", "--schema", schema],
+    ];
+    let cases = [
+        (
+            429,
+            serde_json::json!({"error":"actor is busy","code":"too_many_requests"}),
+            75,
+            "retry",
+        ),
+        (
+            429,
+            serde_json::json!({"error":"unqualified proxy throttle"}),
+            1,
+            "reconcile",
+        ),
+        (
+            409,
+            serde_json::json!({"error":"conflict","code":"conflict"}),
+            1,
+            "reconcile",
+        ),
+        (
+            503,
+            serde_json::json!({"error":"unavailable"}),
+            1,
+            "reconcile",
+        ),
+        (
+            409,
+            serde_json::json!({"error":"authority changed","read_set_conflict":{"member":"graph_head","expected":"before","actual":"after"}}),
+            1,
+            "refresh",
+        ),
+        (
+            409,
+            serde_json::json!({"error":"input too large","resource_limit":{"resource":"entities","limit":10,"actual":11}}),
+            1,
+            "refresh",
+        ),
+        (
+            503,
+            serde_json::json!({"error":"schema completion required","recovery_required":{"operation_id":"published-commit"}}),
+            1,
+            "recover",
+        ),
+        (
+            429,
+            serde_json::json!({"error":"contradictory refusal","code":"too_many_requests","recovery_required":{"operation_id":"published-commit"}}),
+            1,
+            "recover",
+        ),
+    ];
+    for arguments in &commands {
+        for (status, body, exit, action) in &cases {
+            let mut reply = IntentReply::json(*status, body.clone());
+            reply.headers.push(("Retry-After".into(), "17".into()));
+            let server = IntentApiFixture::graph(vec![reply]);
+            let output = cli()
+                .env_remove("OMNIGRAPH_BEARER_TOKEN")
+                .args([
+                    "--quiet",
+                    "--server",
+                    &server.origin,
+                    "--graph",
+                    "knowledge",
+                ])
+                .args(arguments)
+                .arg("--json")
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(*exit),
+                "{arguments:?} HTTP {status}: {output:?}"
+            );
+            let mut actual = parse_stdout_json(&output);
+            assert_eq!(actual["http_status"], *status);
+            assert_eq!(actual["retry_after"], "17");
+            assert_eq!(
+                actual["command_outcome"],
+                serde_json::json!({
+                    "execution": if *exit == 75 {"not_started"} else {"unknown"},
+                    "effects": if *exit == 75 {"none"} else {"unknown"},
+                    "action": action,
+                }),
+                "{arguments:?} HTTP {status}"
+            );
+            let fields = actual.as_object_mut().unwrap();
+            fields.remove("command_outcome");
+            fields.remove("http_status");
+            fields.remove("retry_after");
+            assert_eq!(&actual, body, "preserve every typed detail");
+            assert_eq!(
+                server.requests().len(),
+                2,
+                "one discovery and one submission, without replay"
+            );
+            server.assert_complete();
+        }
+    }
+
+    // Both bad JSON and a severed body may follow graph publication. The
+    // fixture writes fewer bytes than Content-Length in the second case.
+    for headers in [vec![], vec![("Content-Length".into(), "1024".into())]] {
+        let server = IntentApiFixture::graph(vec![IntentReply {
+            status: 200,
+            headers,
+            body: b"{unfinished".to_vec(),
+        }]);
+        let output = cli()
+            .args([
+                "--server",
+                &server.origin,
+                "--graph",
+                "knowledge",
+                "mutate",
+                "stored_write",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let actual = parse_stdout_json(&output);
+        assert_eq!(
+            actual["command_outcome"],
+            serde_json::json!({"execution":"unknown","effects":"unknown","action":"reconcile"})
+        );
+        assert_eq!(actual["http_status"], 200);
+        assert_eq!(server.requests().len(), 2);
+        server.assert_complete();
     }
 }
 
@@ -2922,11 +3144,10 @@ fn branch_delete_against_non_local_scope_refuses_without_yes() {
             .arg("feature")
             .arg("--json"),
     );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("refusing destructive `branch delete`") && stderr.contains("--yes"),
-        "expected a non-local destructive refusal; stderr: {stderr}"
-    );
+    let output = parse_stdout_json(&output);
+    let error = output["error"].as_str().unwrap();
+    assert!(error.contains("refusing destructive `branch delete`") && error.contains("--yes"));
+    assert_eq!(output["command_outcome"]["effects"], "none");
 }
 
 #[test]
@@ -2963,11 +3184,14 @@ fn overwrite_load_against_non_local_scope_refuses_without_yes() {
             .arg("s3://fake-bucket/g.omni")
             .arg("--json"),
     );
-    let stderr = String::from_utf8(output.stderr).unwrap();
+    let output = parse_stdout_json(&output);
     assert!(
-        stderr.contains("refusing destructive `load --mode overwrite`"),
-        "expected a non-local overwrite refusal; stderr: {stderr}"
+        output["error"]
+            .as_str()
+            .unwrap()
+            .contains("refusing destructive `load --mode overwrite`")
     );
+    assert_eq!(output["command_outcome"]["effects"], "none");
 }
 
 #[test]

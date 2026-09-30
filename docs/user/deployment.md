@@ -36,14 +36,72 @@ the authenticated `GET /graphs` lists the served graphs and, as `quarantined`,
 the applied graphs this process does not serve. Add `--require-all-graphs`
 when a quarantined graph should make the whole process fail startup.
 
-Shutdown is bounded: at SIGTERM the server stops accepting connections and
-drains in-flight requests for at most `--shutdown-grace-seconds` (else
+An admitted write continues if its client disconnects. The server keeps its
+capacity reserved through the whole operation, including optional source deletion
+after a merge. A lost response can still leave the caller unsure whether the
+write committed; follow the [failure outcome](operations/troubleshooting.md#failed-data-write-commands)
+before submitting it again.
+
+Shutdown is bounded: at SIGTERM the server closes operation admission and stops
+accepting connections. It waits for admitted writes, read bodies and server
+stream producers for at most `--shutdown-grace-seconds` (else
 `OMNIGRAPH_SHUTDOWN_GRACE_SECONDS`, else 25), then exits 2 with the unfinished
 work logged. The deadline is kept by a thread, so a stalled request or a
-blocked runtime cannot extend it, and the signal is handled from process start,
-so it covers startup too. A clean drain exits 0. Set the orchestrator's own
+blocked runtime cannot extend it. Signal handling begins after configuration
+loading, before graph opening, and covers serving startup. Disconnected callers do not remove their writes from
+this wait. A panic or uncertain completion in an admitted write closes admission
+for every graph in that process and starts the same shutdown path without renewing
+an existing deadline. After HTTP connections and the other known logical owners
+finish, the process exits 2 immediately; the watchdog remains the upper bound.
+Unresolved reservations stay charged until exit. This is process containment,
+not proof that native storage I/O settled or that the engine can be reused.
+A proven pre-effect failure, such as a failed initial schema read or a native-tag
+retirement refusal, releases its reservation and keeps admission open. Error
+status or a transient storage category alone does not establish that proof.
+A clean drain exits 0. Set the orchestrator's own
 termination grace longer than this value; a cutoff is crash-equivalent for the
 work it interrupts, and the next open recovers it as after any crash.
+
+## Admission limits
+
+Operation and input admission refuse excess work immediately. Configure these
+process-wide environment variables before startup. Byte values are integers
+in bytes. Invalid numeric values log a warning and use the default; zero capacity
+refuses the corresponding admission lane.
+
+| Variable | Default | Resource |
+|---|---:|---|
+| `OMNIGRAPH_GLOBAL_INFLIGHT_MAX` | 64 | Admitted write operations across actors |
+| `OMNIGRAPH_GLOBAL_BYTES_MAX` | 268435456 (256 MiB) | Estimated retained write-input bytes across actors |
+| `OMNIGRAPH_PER_ACTOR_INFLIGHT_MAX` | 16 | Admitted writes per actor |
+| `OMNIGRAPH_PER_ACTOR_BYTES_MAX` | 4294967296 (4 GiB) | Estimated retained write-input bytes per actor |
+| `OMNIGRAPH_ACTIVE_ACTORS_MAX` | 1024 | Actors with admitted writes; idle records are removed |
+| `OMNIGRAPH_INGRESS_INFLIGHT_MAX` | 64 | Write requests retained by collection, operations or responses |
+| `OMNIGRAPH_INGRESS_BYTES_MAX` | 268435456 (256 MiB) | Reserved/retained write-body bytes |
+| `OMNIGRAPH_READ_INGRESS_INFLIGHT_MAX` | 64 | Read/MCP requests with bodies retained by collection or responses |
+| `OMNIGRAPH_READ_INGRESS_BYTES_MAX` | 67108864 (64 MiB) | Reserved/retained read/MCP body bytes |
+| `OMNIGRAPH_BODY_TIMEOUT_SECONDS` | 30 | Time allowed to collect one complete request body |
+
+The default ingress allowances total 320 MiB across the independent lanes;
+configure both byte limits when setting an instance's input budget.
+Body timeouts above 86400 seconds also warn and use the 30-second default.
+Ingress reserves the route's maximum before reading, then reduces the reservation
+to the actual body size. Body collection limits remain 1 MiB for ordinary JSON
+requests, 32 MiB for bulk load/ingest and 64 KiB for MCP. MCP uses the read-body
+lane after authentication. Registered bulk routes alone
+receive the larger limit; a stored query named `load` or `ingest` keeps the
+ordinary JSON limit. Stored-query admission uses the registry's typed read/write
+kind. Disconnect does not release input or
+operation capacity already transferred to a running write. The body timeout does
+not cancel an admitted write. These input limits do not bound total process RSS
+or all memory and I/O used by the engine. Size an instance for the graph, workload
+and configured concurrency as well as request bytes.
+
+The server allows 128 read-response observers and, independently, 64 write-response
+observers. Bodies, yielded bytes and their server producers retain the slot until
+their final owner releases it. Bodyless reads consume only a read observer; slow
+reads cannot exhaust write-body or write-response capacity. Status routes bypass
+ordinary admission so they remain callable during saturation.
 
 ## Container
 

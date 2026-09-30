@@ -1501,6 +1501,11 @@ fn mutate_if_commit_lost_cas_exits_4_issue_365() {
     let body: serde_json::Value = serde_json::from_slice(&lost.stdout)
         .expect("--json must emit the structured body on stdout");
     assert_eq!(body["precondition_failure"]["expected"], json!(stale_id));
+    assert_eq!(body["http_status"], 412);
+    assert_eq!(
+        body["command_outcome"],
+        json!({"execution":"not_started","effects":"none","action":"refresh"})
+    );
 
     // An id from a fresh read passes with exit 0.
     let read = parse_stdout_json(&output_success(

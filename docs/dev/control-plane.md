@@ -137,6 +137,28 @@ default 25), kept by a thread and armed
 by a listener installed before graphs open, after which the process exits 2
 without claiming success.
 
+Admitted HTTP writes run as registered server-owned operations. Their immutable
+inputs, trusted actor, Session and capacity reservations survive a lost response
+waiter. Merge and optional source deletion share one owner. Registration and
+permanent admission closure have one synchronous ordering boundary; shutdown
+waits for admitted writes and registered read bodies/server producers after HTTP
+connections finish. Panic or explicitly indeterminate owned completion closes
+admission for every graph and signals the same bounded process shutdown, retaining
+unresolved reservations until exit. Proven engine pre-effect refusals remain
+nonfatal. Read/write body and response lanes have independent capacity; bodyless
+reads consume only read observers. Once HTTP connections and the remaining known
+logical owners finish, uncertain completion exits 2 immediately, with the original
+watchdog as the upper bound. This does not establish native-I/O settlement.
+
+These registrations account for server lifetimes, not universal storage-I/O
+settlement. A joined future or zero operation counter cannot authorize runtime
+replacement, schema activation, cleanup or replay. Native accepted I/O and
+protected completion memory/local-I/O capacity remain unqualified. Schema and
+stored-query deployment still uses apply followed by restart. The accepted
+[Owned server operations](../rfcs/2026-09-30-owned-server-operations.md) decision
+owns this boundary and its evidence; the [workload module](../../crates/omnigraph-server/src/workload.rs)
+owns admission limits.
+
 ### Public embedding APIs
 
 Ordinary callers use `read_serving_snapshot` or
