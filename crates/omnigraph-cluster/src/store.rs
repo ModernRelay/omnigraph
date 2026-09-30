@@ -151,7 +151,7 @@ impl ClusterStore {
     /// compares applied server-safe external Blob bases, which are `s3://`
     /// only, with this root; a test can therefore reach that comparison
     /// through the real snapshot reader without an object store.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn with_display_root(mut self, display_root: &str) -> Self {
         self.display_root = display_root.to_string();
         self

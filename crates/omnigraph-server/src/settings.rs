@@ -481,6 +481,10 @@ pub(crate) fn server_bearer_tokens_from_env() -> Result<Vec<(String, String)>> {
 #[cfg(test)]
 mod tests {
     use super::{
+        BTreeMap, DEFAULT_SHUTDOWN_GRACE, Path, PathBuf, open_multi_graph_state,
+        settings_from_snapshot,
+    };
+    use super::{
         GraphStartupConfig, ServerConfig, ServerConfigMode, ServerRuntimeState,
         classify_server_runtime_state, hash_bearer_token, normalize_bearer_token,
         parse_bearer_tokens_json, serve, server_bearer_tokens_from_env,
@@ -488,6 +492,8 @@ mod tests {
     use serial_test::serial;
     use std::env;
     use std::fs;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use tempfile::tempdir;
 
     /// `authorize` returns the allow/deny **decision** (`Authz`) and reserves
@@ -957,5 +963,142 @@ mod tests {
                 ("team-02".to_string(), "token-two".to_string()),
             ]
         );
+    }
+
+    /// Every file under `root` with its bytes, so a boot attempt can prove it
+    /// moved neither the ledger nor any graph's storage.
+    fn tree_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let bytes = std::fs::read(&path).unwrap();
+                    files.insert(path, bytes);
+                }
+            }
+        }
+        files
+    }
+
+    /// A graph whose applied server-safe external Blob base overlaps the
+    /// cluster storage root is quarantined at boot: an ordinary boot serves
+    /// the healthy sibling and reports the quarantine, a strict boot refuses,
+    /// and neither moves the ledger or any graph. Server-safe bases are
+    /// `s3://` only, so the cluster is applied in a local directory (where
+    /// the base is disjoint and apply accepts it) and the production snapshot
+    /// reader then reads it with the storage root spelled as the overlapping
+    /// `s3://` prefix. Graph roots derived from that spelling name the same
+    /// bytes, so the served sibling is opened at its local root.
+    #[tokio::test]
+    async fn boot_quarantines_overlapping_external_blob_base_and_strict_boot_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("people.pg"),
+            "\nnode Person {\n  name: String @key\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("cluster.yaml"),
+            r#"
+version: 1
+graphs:
+  knowledge:
+    schema: ./people.pg
+    external_blobs:
+      allow:
+        - base: s3://assets/cluster/graphs/
+          scope: server_safe
+  archive:
+    schema: ./people.pg
+"#,
+        )
+        .unwrap();
+        let import = omnigraph_cluster::import_config_dir(dir.path()).await;
+        assert!(import.ok, "{:?}", import.diagnostics);
+        let apply = omnigraph_cluster::apply_config_dir(dir.path()).await;
+        assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+        let before = tree_bytes(dir.path());
+
+        let snapshot = omnigraph_cluster::read_serving_snapshot_with_display_root(
+            dir.path(),
+            "s3://assets/cluster",
+        )
+        .await
+        .unwrap();
+        assert_eq!(snapshot.quarantined_graphs, vec!["knowledge".to_string()]);
+        assert!(snapshot.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "external_blob_base_overlaps_storage_root"
+                && diagnostic.path == "graph.knowledge"
+        }));
+
+        // Strict boot refuses on the quarantine diagnostic before building
+        // any graph's settings.
+        let refused =
+            settings_from_snapshot(dir.path(), None, true, true, snapshot.clone()).unwrap_err();
+        let refused = refused.to_string();
+        assert!(
+            refused.contains("strict cluster boot")
+                && refused.contains("external_blob_base_overlaps_storage_root")
+                && refused.contains("graph.knowledge"),
+            "{refused}"
+        );
+
+        // Ordinary boot serves the sibling and reports the quarantine.
+        let config = settings_from_snapshot(dir.path(), None, true, false, snapshot).unwrap();
+        assert!(!config.require_all_graphs);
+        assert_eq!(
+            config.witness.applied_graphs,
+            vec!["archive".to_string(), "knowledge".to_string()]
+        );
+        let ServerConfigMode::Multi {
+            mut graphs,
+            config_path,
+            server_policy,
+        } = config.mode;
+        assert_eq!(
+            graphs
+                .iter()
+                .map(|graph| graph.graph_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["archive"]
+        );
+        assert_eq!(graphs[0].uri, "s3://assets/cluster/graphs/archive.omni");
+        graphs[0].uri = dir
+            .path()
+            .join("graphs/archive.omni")
+            .to_string_lossy()
+            .to_string();
+        let state = open_multi_graph_state(
+            graphs,
+            Vec::new(),
+            server_policy.as_ref(),
+            config_path,
+            false,
+        )
+        .await
+        .unwrap()
+        .with_boot_witness(
+            config.witness,
+            Arc::new(AtomicBool::new(false)),
+            DEFAULT_SHUTDOWN_GRACE,
+        );
+        assert_eq!(
+            state
+                .routing
+                .registry
+                .list()
+                .iter()
+                .map(|handle| handle.key.graph_id.as_str().to_string())
+                .collect::<Vec<_>>(),
+            vec!["archive".to_string()]
+        );
+        assert_eq!(state.quarantined_graphs(), vec!["knowledge".to_string()]);
+        drop(state);
+
+        assert_eq!(tree_bytes(dir.path()), before);
     }
 }

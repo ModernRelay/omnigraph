@@ -130,6 +130,20 @@ pub async fn read_serving_snapshot_from_storage(
     read_snapshot_with_store(&backend).await
 }
 
+/// Test support: read a local cluster's serving snapshot through the
+/// production reader while its storage root reads as `display_root`. Serving
+/// compares applied server-safe external Blob bases, which are `s3://` only,
+/// with that root, so a test can reach the overlap quarantine without an
+/// object store. Graph roots in the snapshot derive from `display_root` too.
+#[cfg(any(test, feature = "test-util"))]
+pub async fn read_serving_snapshot_with_display_root(
+    config_dir: impl AsRef<Path>,
+    display_root: &str,
+) -> Result<ServingSnapshot, Vec<Diagnostic>> {
+    let backend = ClusterStore::for_config_dir(config_dir.as_ref()).with_display_root(display_root);
+    read_snapshot_with_store(&backend).await
+}
+
 /// Read an applied snapshot and its canonical store root for managed boot trust.
 /// Ordinary snapshot reads do not perform this extra canonicalization step.
 pub async fn read_root_bound_serving_snapshot(
