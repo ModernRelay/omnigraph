@@ -896,7 +896,13 @@ pub(super) async fn open_for_mutation_on_branch(
     op_kind: crate::db::MutationOpKind,
     txn: Option<&crate::db::WriteTxn>,
 ) -> Result<OpenedForMutation> {
-    db.ensure_schema_apply_not_locked("write").await?;
+    // With a `WriteTxn` the capture already checked the schema-apply sentinel
+    // after its authority read, and `commit_all` checks it again under the
+    // gates before any effect, so a per-table check here would only fail
+    // earlier. Without one this is the check.
+    if txn.is_none() {
+        db.ensure_schema_apply_not_locked("write").await?;
+    }
     // Source the resolved (snapshot, branch). With a `WriteTxn` the contract was
     // validated once at capture, so use the pinned base + resolved branch instead
     // of `resolved_branch_target` (which re-runs `ensure_schema_state_valid`). The

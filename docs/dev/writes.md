@@ -104,7 +104,10 @@ recaptures under the promoted contract. A sentinel under a free gate is
 another process's apply and gets the typed refusal at once. Only `mutate`
 and `load` reach the park: merge, index maintenance, optimize, cleanup and
 repair call `ensure_schema_apply_idle` before their capture, so a standing
-sentinel refuses them one call earlier.
+sentinel refuses them one call earlier. A captured write does not check the
+sentinel again as it opens each table: the capture checked it after its
+authority read, and `commit_all` checks it again under the gates before any
+effect.
 
 Finalization acquires the root-shared gate order:
 
