@@ -47,10 +47,14 @@ fails with a 400 that names the type, id, and property; assign that property in
 the same update, to a new value or to null, to replace or clear the reference
 without reading it.
 
-Export writes an external reference as a bare URI, which reloads as the whole
-object. A stored reference to a byte range of an object cannot be written that
-way, so export refuses it instead of widening it; so do the change feed and
-entity reads by id, which render Blob values the same way.
+Only a graph written outside OmniGraph can hold a stored reference to a byte
+range of an object. Export writes an external reference as a bare URI, which
+reloads as the whole object, so export refuses a ranged reference instead of
+widening it. The change-feed baseline is an export and refuses it too.
+Change-feed images and entity reads by id are not reloaded, so they describe
+it exactly, as `{"uri": …, "offset": …, "length": …}` (`length` is null when
+the range runs to the end of the object), without reading the object; the feed
+passes the commit that holds it like any other.
 
 OmniGraph never deletes the object named by an external reference.
 

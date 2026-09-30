@@ -24,8 +24,10 @@ pub use omnigraph::{
     SystemColumnUpgradeFinding, SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome,
     SystemColumnUpgradeReport, TableCollectionPlan, UnpublishedManifest,
 };
+pub(crate) use omnigraph::{
+    LogicalBlobValue, RangedExternalBlobs, export_blob_values, logical_row_image,
+};
 pub(crate) use omnigraph::{WriteAuthorityToken, WriteTxn};
-pub(crate) use omnigraph::{export_blob_values, logical_row_image};
 pub(crate) use omnigraph_core::metadata::now_micros;
 pub(crate) use schema_state::SchemaContractIdentity;
 pub use snapshot::{Snapshot, SnapshotDataset, SnapshotScanner};

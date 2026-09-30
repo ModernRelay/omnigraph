@@ -996,6 +996,18 @@ node Document {
         "{message}"
     );
     assert!(!message.contains("s3://bucket"), "{message}");
+
+    // An entity read is not reloadable input, so it describes the exact
+    // reference instead of refusing, and never contacts the object.
+    let entity = db
+        .entity_at_target(ReadTarget::branch("main"), "node:Document", "ranged")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        entity["content"],
+        serde_json::json!({"uri": "s3://bucket/object", "offset": 4, "length": 8})
+    );
 }
 
 #[tokio::test]

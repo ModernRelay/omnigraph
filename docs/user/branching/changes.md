@@ -22,7 +22,10 @@ with its first parent. Each response includes:
   optional actor, and authorship time in Unix microseconds.
 - `changes`: inserts with `after`, updates with `before` and `after`,
   and deletes with `before`. Each image contains `properties`; an edge image
-  also contains `endpoints: {from, to}`.
+  also contains `endpoints: {from, to}`. A Blob property holds its export
+  value (`base64:…` or an external URI), or, for a stored reference to a byte
+  range of an object, `{"uri", "offset", "length"}` (see
+  [Blobs](../blobs.md)).
 
 Filter with repeatable `--kind node|edge`, `--type <name>`, and
 `--op insert|update|delete` options. `--limit` defaults to 1,000 and may be

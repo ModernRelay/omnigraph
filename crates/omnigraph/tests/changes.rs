@@ -1158,6 +1158,78 @@ async fn change_feed_detects_same_length_blob_only_update() {
     );
 }
 
+/// A ranged external Blob descriptor, which only a writer outside OmniGraph
+/// can create, has no load-format spelling, so export refuses it. The change
+/// feed must still cross the commit that introduced it: its image describes
+/// the exact reference as `{uri, offset, length}` without contacting the
+/// object (`s3://bucket/object` does not exist), and the cursor advances past
+/// it to the next commit.
+#[tokio::test]
+#[cfg(feature = "failpoints")]
+async fn change_feed_describes_ranged_external_blob_and_advances_past_it() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedStart, ChangeOpKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(
+        uri,
+        "node Document {\n    title: String @key\n    content: Blob?\n}\n",
+    )
+    .await
+    .unwrap();
+    let now = db
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::Now),
+        ))
+        .await
+        .unwrap();
+    let (cursor, _) = boundary_cursor(&now);
+
+    helpers::seed_ranged_external_blob_row(&db, uri).await;
+    let db = helpers::session(db);
+    db.load(
+        "main",
+        r#"{"type":"Document","data":{"title":"later","content":"base64:QQ=="}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+
+    let one_commit = |cursor: String| {
+        let mut request = feed_request(None, ChangeFeedPosition::Cursor(cursor));
+        request.max_commits = Some(1);
+        request
+    };
+    let ranged_page = db
+        .poll_change_feed(one_commit(cursor))
+        .await
+        .expect("a ranged external descriptor must not wedge the feed");
+    assert_eq!(ranged_page.blocks.len(), 1);
+    let changes = &ranged_page.blocks[0].changes;
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].id, "ranged");
+    assert_eq!(changes[0].op, ChangeOpKind::Insert);
+    assert_eq!(
+        changes[0].after.as_ref().unwrap().properties["content"],
+        serde_json::json!({"uri": "s3://bucket/object", "offset": 4, "length": 8})
+    );
+    let (cursor, caught_up) = boundary_cursor(&ranged_page);
+    assert!(!caught_up, "the later commit is still unread");
+
+    let later_page = db.poll_change_feed(one_commit(cursor)).await.unwrap();
+    assert_eq!(later_page.blocks.len(), 1);
+    let changes = &later_page.blocks[0].changes;
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].id, "later");
+    assert_eq!(
+        changes[0].after.as_ref().unwrap().properties["content"],
+        serde_json::json!("base64:QQ==")
+    );
+    let (_, caught_up) = boundary_cursor(&later_page);
+    assert!(caught_up);
+}
+
 /// Acceptance #7: the cross-branch net diff shares the same comparator, so a
 /// same-length Blob-only update on a forked branch must surface through
 /// `diff_commits` too.

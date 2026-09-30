@@ -554,12 +554,40 @@ where
             // onto the `TableStorage` trait surface (the trait covers
             // staged-write and snapshot-scan primitives; blob descriptor
             // materialization sits outside that surface).
-            let blob_values =
-                export_blob_values(ds.dataset(), &row, &[row_id], blob_properties).await?;
+            let blob_values = export_blob_values(
+                ds.dataset(),
+                &row,
+                &[row_id],
+                blob_properties,
+                RangedExternalBlobs::Refuse,
+            )
+            .await?;
             emit_export_rows_from_batch(catalog, table_key, &row, Some(&blob_values), emit).await?;
         }
     }
     Ok(())
+}
+
+/// One logical Blob cell value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LogicalBlobValue {
+    /// Managed bytes as `base64:…`, or an external reference to a whole
+    /// object as its URI: the load format's own spelling.
+    Text(String),
+    /// An external descriptor naming a byte range of its object. The load
+    /// format has no spelling for it; only a caller that asked to describe
+    /// ranges receives one.
+    RangedExternal(crate::blob::ExternalBlobRef),
+}
+
+/// What a Blob value reader does with a ranged external descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RangedExternalBlobs {
+    /// Fail: the output is reloadable, and a bare URI reloads as the whole
+    /// object, which would widen the cell.
+    Refuse,
+    /// Return the exact reference as [`LogicalBlobValue::RangedExternal`].
+    Describe,
 }
 
 pub(crate) async fn export_blob_values(
@@ -567,7 +595,8 @@ pub(crate) async fn export_blob_values(
     batch: &RecordBatch,
     row_ids: &[u64],
     blob_properties: &std::collections::HashSet<String>,
-) -> Result<HashMap<String, Vec<Option<String>>>> {
+    ranged: RangedExternalBlobs,
+) -> Result<HashMap<String, Vec<Option<LogicalBlobValue>>>> {
     let mut values = HashMap::with_capacity(blob_properties.len());
     let mut __dst_props: Vec<_> = blob_properties.iter().collect();
     __dst_props.sort();
@@ -583,14 +612,16 @@ pub(crate) async fn export_blob_values(
             })?;
         values.insert(
             property.clone(),
-            export_blob_column_values(source_ds, property, descriptions, row_ids).await?,
+            export_blob_column_values(source_ds, property, descriptions, row_ids, ranged).await?,
         );
     }
     Ok(values)
 }
 
 /// Convert one descriptor-scanned row into the same logical value shape used
-/// by export, materializing at most that row's Blob values.
+/// by export, materializing at most that row's Blob values. A ranged external
+/// descriptor, which export refuses, is described exactly as the object
+/// `{"uri", "offset", "length"}` without contacting the object.
 ///
 /// A pinned Lance version is the commit-era schema authority: the image is
 /// decoded from the batch's own schema, never the live catalog, so retained
@@ -618,7 +649,7 @@ pub(crate) async fn logical_row_image(
             }
         })
         .collect::<Result<std::collections::HashSet<_>>>()?;
-    let blob_values = if blob_properties.is_empty() {
+    let mut blob_values = if blob_properties.is_empty() {
         None
     } else {
         let row_id = row_batch
@@ -626,8 +657,28 @@ pub(crate) async fn logical_row_image(
             .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
             .ok_or_else(|| OmniError::manifest_internal("change row is missing _rowid"))?
             .value(0);
-        Some(export_blob_values(source_ds, &row_batch, &[row_id], &blob_properties).await?)
+        Some(
+            export_blob_values(
+                source_ds,
+                &row_batch,
+                &[row_id],
+                &blob_properties,
+                RangedExternalBlobs::Describe,
+            )
+            .await?,
+        )
     };
+    // The JSON renderer writes Blob cells as strings; a ranged reference is
+    // rendered as null there and replaced by its object below.
+    let mut ranged = Vec::new();
+    for (name, cells) in blob_values.iter_mut().flatten() {
+        for cell in cells.iter_mut() {
+            if let Some(LogicalBlobValue::RangedExternal(reference)) = cell {
+                ranged.push((name.clone(), reference.clone()));
+                *cell = None;
+            }
+        }
+    }
 
     let fields = row_batch
         .schema()
@@ -647,6 +698,16 @@ pub(crate) async fn logical_row_image(
     for name in fields {
         image.entry(name).or_insert(serde_json::Value::Null);
     }
+    for (name, reference) in ranged {
+        image.insert(
+            name,
+            serde_json::json!({
+                "uri": reference.uri,
+                "offset": reference.offset,
+                "length": reference.length,
+            }),
+        );
+    }
     Ok(image)
 }
 
@@ -657,7 +718,7 @@ async fn emit_export_rows_from_batch<Emit, EmitFuture>(
     catalog: &Catalog,
     table_key: &str,
     batch: &RecordBatch,
-    blob_values: Option<&HashMap<String, Vec<Option<String>>>>,
+    blob_values: Option<&HashMap<String, Vec<Option<LogicalBlobValue>>>>,
     emit: &mut Emit,
 ) -> Result<()>
 where
@@ -778,11 +839,13 @@ fn render_windows(rows: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
 
 /// `batch` rendered by `QueryResult::to_json_lines` with its columns in `fields`
 /// order; a column named in `blob_values` is emitted from those strings (indexed
-/// from `first_row`) instead of the batch column. Iterate the rows with [`json_rows`].
+/// from `first_row`) instead of the batch column. A ranged external value has no
+/// string form and fails; its caller describes it. Iterate the rows with
+/// [`json_rows`].
 fn row_json_lines(
     batch: &RecordBatch,
     fields: &[String],
-    blob_values: Option<&HashMap<String, Vec<Option<String>>>>,
+    blob_values: Option<&HashMap<String, Vec<Option<LogicalBlobValue>>>>,
     first_row: usize,
     id_col: &str,
 ) -> Result<Vec<u8>> {
@@ -792,14 +855,21 @@ fn row_json_lines(
     for name in fields {
         if let Some(values) = blob_values.and_then(|values| values.get(name)) {
             schema_fields.push(Arc::new(Field::new(name, DataType::Utf8, true)));
-            columns.push(Arc::new(
-                values
-                    .iter()
-                    .skip(first_row)
-                    .take(batch.num_rows())
-                    .map(Option::as_deref)
-                    .collect::<StringArray>(),
-            ));
+            let cells = values
+                .iter()
+                .skip(first_row)
+                .take(batch.num_rows())
+                .map(|cell| match cell {
+                    None => Ok(None),
+                    Some(LogicalBlobValue::Text(text)) => Ok(Some(text.as_str())),
+                    Some(LogicalBlobValue::RangedExternal(_)) => {
+                        Err(OmniError::manifest_internal(format!(
+                            "Blob column '{name}' reached the JSON renderer with a ranged external value"
+                        )))
+                    }
+                })
+                .collect::<Result<StringArray>>()?;
+            columns.push(Arc::new(cells));
             continue;
         }
         let (index, _) = source.column_with_name(name).ok_or_else(|| {
@@ -855,7 +925,8 @@ async fn export_blob_column_values(
     column_name: &str,
     descriptions: &StructArray,
     row_ids: &[u64],
-) -> Result<Vec<Option<String>>> {
+    ranged: RangedExternalBlobs,
+) -> Result<Vec<Option<LogicalBlobValue>>> {
     let decoder = crate::blob::BlobDescriptorDecoder::try_new(descriptions)?;
     let mut managed_row_ids = Vec::new();
     let mut managed_positions = Vec::new();
@@ -873,21 +944,26 @@ async fn export_blob_column_values(
                 offset,
                 length,
             } => {
-                // Export is descriptor-preserving. It must not open or probe a
-                // caller-owned object merely to reproduce the stored URI. A
-                // bare URI reloads as the whole object, so a ranged descriptor
-                // is refused rather than widened.
+                // Descriptor-preserving: never open or probe a caller-owned
+                // object merely to reproduce the stored reference. A bare URI
+                // reloads as the whole object, so a ranged descriptor is
+                // refused or described, never widened.
                 let reference = crate::blob::ExternalBlobRef {
                     uri,
                     offset,
                     length,
                 };
-                if let Err(ranged) = reference.whole_object_uri() {
-                    return Err(OmniError::manifest(format!(
-                        "export cannot represent {ranged} in '{column_name}': export writes an external Blob as a bare URI, which reloads as the whole object"
-                    )));
-                }
-                values[row] = Some(reference.uri);
+                values[row] = Some(match (reference.whole_object_uri(), ranged) {
+                    (Ok(_), _) => LogicalBlobValue::Text(reference.uri),
+                    (Err(_), RangedExternalBlobs::Describe) => {
+                        LogicalBlobValue::RangedExternal(reference)
+                    }
+                    (Err(refused), RangedExternalBlobs::Refuse) => {
+                        return Err(OmniError::manifest(format!(
+                            "export cannot represent {refused} in '{column_name}': export writes an external Blob as a bare URI, which reloads as the whole object"
+                        )));
+                    }
+                });
             }
         }
     }
@@ -935,7 +1011,7 @@ async fn export_blob_column_values(
             "base64:{}",
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
         );
-        values[position] = Some(value);
+        values[position] = Some(LogicalBlobValue::Text(value));
     }
 
     Ok(values)

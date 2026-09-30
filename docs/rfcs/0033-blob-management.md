@@ -1001,7 +1001,10 @@ Export uses the central decoder. Null emits JSON null, managed zero bytes emits
 `base64:` with an empty payload, non-empty managed content emits base64, and an
 external reference that names its whole object emits its URI. A ranged
 external descriptor is refused: a bare URI reloads as the whole object, so
-emitting it would widen the cell. Export's current one-row indivisible Blob
+emitting it would widen the cell. Change-feed images and entity reads, which
+are not reloaded, share the decoder but describe a ranged descriptor exactly
+as `{"uri", "offset", "length"}` without reading the object, so a feed cursor
+passes its commit. Export's current one-row indivisible Blob
 scratch and chunked transport limits remain documented; the Blob GET endpoint is
 the preferred way to move a single large payload without base64 expansion.
 
@@ -1719,3 +1722,8 @@ publisher architecture.
   superseding "an external reference emits its URI", which widened the range
   to the whole object on reload. The redirect, CLI delivery and schema rewrite
   already refused it; export now shares their whole-object check.
+- 2026-09-30: §8.3 adds that change-feed images and entity reads describe a
+  ranged external descriptor as `{"uri", "offset", "length"}` instead of
+  refusing it. Refusing there made a feed page holding such a row fail on
+  every poll, so its cursor could never pass the commit. No earlier sentence
+  is superseded; the change-feed baseline, an export, still refuses.
