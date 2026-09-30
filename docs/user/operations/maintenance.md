@@ -46,10 +46,15 @@ coverage was uneven before a run may coalesce fully only on the next run,
 after the rebuilt coverage is in place.
 
 Compacting a table with Blob properties reads each managed Blob value into
-memory to rewrite it. Optimize sizes each read batch from the table's largest
-row, so one table's compaction holds about 32 MiB of Blob payload plus up to
-twice its largest single value, whatever the fragment sizes. External Blob
-references are carried without reading the referenced object. Optimize works on
+memory to rewrite it. Optimize sizes each compaction read batch from the
+largest row of the fragments it compacts, summing that row's Blob columns, so
+one batch materializes at most 32 MiB of managed Blob payload whatever the
+fragment sizes. A single row whose Blob values together exceed 32 MiB is
+compacted in a batch of its own and materialized whole. This bounds the
+payload of a batch, not the process heap: Lance's writer copies each inline
+payload into the arrays it prepares while it still holds the batch, so memory
+use exceeds the payload. External Blob references are carried without reading
+the referenced object. Optimize works on
 up to `OMNIGRAPH_MAINTENANCE_CONCURRENCY` tables at once (default 8), so budget
 for that many Blob tables compacting together. `LANCE_DEFAULT_BATCH_SIZE` does
 not change this bound.

@@ -844,6 +844,7 @@ node Document {
     assert!(result.applied);
     // The three managed values (valid empty, inline, packed) come from one
     // batched managed read; the external descriptor is carried unread.
+    assert_eq!(probes.blob_managed_batch_read_calls(), 1);
     assert_eq!(probes.blob_payload_read_calls(), 3);
     assert_eq!(probes.external_blob_payload_read_calls(), 0);
     assert_exact_id_primary_key(&db, "node:Document").await;
