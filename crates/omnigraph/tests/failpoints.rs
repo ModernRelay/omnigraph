@@ -3911,7 +3911,7 @@ async fn branch_merge_pointer_keeps_an_unregistered_target_ref() {
         "the source's write is its own detached pin"
     );
     assert_eq!(
-        db.branch_merge("source", "target").await.unwrap(),
+        db.branch_merge("source", "target").await.unwrap().outcome,
         omnigraph::db::MergeOutcome::FastForward
     );
     assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
@@ -4019,7 +4019,7 @@ async fn branch_merge_pointer_failure_retries_without_sidecar() {
     );
     assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
     assert_eq!(
-        db.branch_merge("source", "target").await.unwrap(),
+        db.branch_merge("source", "target").await.unwrap().outcome,
         omnigraph::db::MergeOutcome::FastForward
     );
     assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
@@ -5439,14 +5439,25 @@ async fn branch_merge_fences_target_delete_recreate_aba() {
         "the target's write keeps main's registration: branch writes never fork"
     );
     let old_target_ref = helpers::graph_native_ref(&uri, "target").await;
+    let target_head_before = branch_head_commit_id(dir.path(), "target").await.unwrap();
+    let source_head_before = branch_head_commit_id(dir.path(), "source").await.unwrap();
 
     let merge_rv =
         helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+    let return_rv = helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_MERGE_PRE_RETURN);
     let control_rv = helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_CONTROL_PRE_GATES);
 
     let merge_handle = std::sync::Arc::clone(&merge_db);
-    let merge_task =
-        tokio::spawn(async move { merge_handle.branch_merge("source", "target").await });
+    // Hold blocks its crossing thread. Keep A off B's runtime so releasing
+    // the branch gate cannot queue B in A's non-stealable Tokio LIFO slot
+    // immediately before A parks at the return seam.
+    let merge_task = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(merge_handle.branch_merge("source", "target"))
+    });
     merge_rv.wait_until_reached().await;
 
     let control_handle = std::sync::Arc::clone(&control_db);
@@ -5486,9 +5497,40 @@ async fn branch_merge_fences_target_delete_recreate_aba() {
         "the target ref incarnation changed while merge authority was parked"
     );
 
-    let outcome = merge_task.await.unwrap().unwrap();
-    assert_eq!(outcome, omnigraph::db::MergeOutcome::Merged);
-    control_task.await.unwrap().unwrap();
+    // The operation result survives later control work: once publication has
+    // finished, the return boundary must not retain the branch write gates.
+    return_rv.wait_until_reached().await;
+    let control_result =
+        tokio::time::timeout(std::time::Duration::from_secs(10), &mut control_task).await;
+    let merge_still_held = !merge_task.is_finished();
+    return_rv.release();
+    let outcome = merge_task.join().unwrap().unwrap();
+    control_result
+        .expect("target replacement must finish while the merge receipt is held")
+        .unwrap()
+        .unwrap();
+    assert!(
+        merge_still_held,
+        "the merge must still be held before returning its receipt"
+    );
+    assert_eq!(outcome.outcome, omnigraph::db::MergeOutcome::Merged);
+    let commit = outcome
+        .commit
+        .expect("the original merge published a commit");
+    assert_eq!(commit.graph_branch.as_deref(), Some("target"));
+    assert_eq!(
+        commit.parent_commit_id.as_deref(),
+        Some(target_head_before.as_str())
+    );
+    assert_eq!(
+        commit.merged_parent_commit_id.as_deref(),
+        Some(source_head_before.as_str())
+    );
+    assert_ne!(
+        commit.graph_commit_id,
+        branch_head_commit_id(dir.path(), "target").await.unwrap(),
+        "the receipt must not identify the replacement branch's later writer"
+    );
 
     let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
     assert_eq!(
@@ -5561,7 +5603,7 @@ async fn branch_merge_fences_concurrent_sync_on_same_handle() {
     );
 
     assert_eq!(
-        merge_task.await.unwrap().unwrap(),
+        merge_task.await.unwrap().unwrap().outcome,
         omnigraph::db::MergeOutcome::Merged
     );
     sync_task.await.unwrap().unwrap();
@@ -5673,7 +5715,7 @@ async fn branch_merge_source_advance_keeps_captured_source_parent() {
     merge_rv.release();
 
     assert_eq!(
-        merge_task.await.unwrap().unwrap(),
+        merge_task.await.unwrap().unwrap().outcome,
         omnigraph::db::MergeOutcome::Merged
     );
     let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
@@ -5759,7 +5801,10 @@ async fn branch_merge_captured_source_survives_concurrent_cleanup() {
     eprintln!(
         "captured pin {captured}: present after cleanup={captured_survived}; merge={merged:?}"
     );
-    assert_eq!(merged.unwrap(), omnigraph::db::MergeOutcome::FastForward);
+    assert_eq!(
+        merged.unwrap().outcome,
+        omnigraph::db::MergeOutcome::FastForward
+    );
 
     let reader = helpers::session(Omnigraph::open(&uri).await.unwrap());
     let published = pinned_version(&reader, "target", "node:Person").await;
@@ -6496,7 +6541,8 @@ async fn assert_merge_onto_main_is_a_pointer_switch(seam: &'static omnigraph::se
         assert_eq!(
             with_merge_write_probes(probes.clone(), db.branch_merge("feature", "main"))
                 .await
-                .unwrap(),
+                .unwrap()
+                .outcome,
             omnigraph::db::MergeOutcome::FastForward,
             "a merge onto main never reaches {}",
             seam.name()
@@ -6637,7 +6683,7 @@ async fn assert_multichunk_merge_onto_main_is_a_pointer_switch(
     {
         let _fp = seam.fire_always();
         assert_eq!(
-            db.branch_merge("feature", "main").await.unwrap(),
+            db.branch_merge("feature", "main").await.unwrap().outcome,
             omnigraph::db::MergeOutcome::FastForward,
             "a merge onto main never reaches {}",
             seam.name()
@@ -6859,7 +6905,7 @@ async fn branch_merge_into_a_named_target_stages_on_the_inherited_table() {
     let inherited_pin = pinned_version(&db, "target", "node:Person").await;
     let (head_before, _) = person_versions(&db, "target").await;
     assert_eq!(
-        db.branch_merge("source", "target").await.unwrap(),
+        db.branch_merge("source", "target").await.unwrap().outcome,
         omnigraph::db::MergeOutcome::Merged,
         "a merge into a named target whose target advanced is a three-way merge"
     );
@@ -6913,7 +6959,7 @@ async fn branch_merge_pointer_adoption_carries_the_source_pin() {
     let source_pin = pinned_version(&db, "source", "node:Person").await;
 
     assert_eq!(
-        db.branch_merge("source", "target").await.unwrap(),
+        db.branch_merge("source", "target").await.unwrap().outcome,
         omnigraph::db::MergeOutcome::FastForward
     );
     assert!(sidecar_operation_ids(dir.path()).is_empty());
@@ -8513,7 +8559,11 @@ async fn cleanup_keeps_a_late_retired_merge_base_provider() {
     }
     let merger = helpers::session(Omnigraph::open(&uri).await.unwrap());
     assert_eq!(
-        merger.branch_merge("source", "target").await.unwrap(),
+        merger
+            .branch_merge("source", "target")
+            .await
+            .unwrap()
+            .outcome,
         omnigraph::db::MergeOutcome::Merged
     );
     let snapshot = helpers::snapshot_branch(&merger, "target").await.unwrap();

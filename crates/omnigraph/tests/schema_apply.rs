@@ -295,7 +295,8 @@ query insert_project($name: String) {
         stale_handle
             .branch_merge("source", "target")
             .await
-            .expect("merge planning must use the schema-gated post-apply catalog"),
+            .expect("merge planning must use the schema-gated post-apply catalog")
+            .outcome,
         MergeOutcome::FastForward
     );
     assert_eq!(

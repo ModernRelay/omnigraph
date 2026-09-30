@@ -323,8 +323,30 @@ fn parity_branch_merge() {
     let p = parity();
     let (l, r) = p.run(&["branch", "create", "--from", "main", "feature", "--json"]);
     assert_parity("branch create (merge setup)", &l, &r);
+    let (l, r) = p.run(&[
+        "mutate",
+        "--branch",
+        "feature",
+        "-e",
+        "query add() { insert Person { name: \"Receipt\", age: 31 } }",
+        "--json",
+    ]);
+    assert_write_parity("merge source write", &l, &r);
+    let (l, r) = p.run(&["branch", "merge", " feature ", "--into", " main ", "--json"]);
+    assert_write_parity("branch merge own publication", &l, &r);
+    for output in [&l, &r] {
+        let payload = parse_stdout_json(output);
+        assert_eq!(payload["source"], "feature");
+        assert_eq!(payload["target"], "main");
+        assert_eq!(payload["commit"]["graph_branch"], serde_json::Value::Null);
+    }
     let (l, r) = p.run(&["branch", "merge", "feature", "--into", "main", "--json"]);
     assert_parity("branch merge", &l, &r);
+    assert_eq!(parse_stdout_json(&l)["outcome"], "already_up_to_date");
+    assert_eq!(
+        parse_stdout_json(&l).get("commit"),
+        Some(&serde_json::Value::Null)
+    );
     // `--delete-branch` composes merge + delete at each arm's own boundary
     // (embedded: two engine calls; remote: the server handler) — this row is
     // the referee that keeps the two composition sites from drifting.
@@ -333,15 +355,82 @@ fn parity_branch_merge() {
     let (l, r) = p.run(&[
         "branch",
         "merge",
-        "feature2",
+        " feature2 ",
         "--into",
-        "main",
+        " main ",
         "--delete-branch",
         "--json",
     ]);
     assert_parity("branch merge --delete-branch", &l, &r);
+    for output in [&l, &r] {
+        assert!(output.status.success(), "{output:?}");
+        let payload = parse_stdout_json(output);
+        assert_eq!(payload["source"], "feature2");
+        assert_eq!(payload["target"], "main");
+        assert_eq!(payload["branch_deleted"], true);
+    }
     let (l, r) = p.run(&["branch", "list", "--json"]);
     assert_parity("branch list (post delete-branch)", &l, &r);
+    assert!(
+        !parse_stdout_json(&l)["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|branch| branch == "feature2")
+    );
+
+    let (l, r) = p.run(&["branch", "create", "retained", "--json"]);
+    assert_parity("branch create (deletion refusal setup)", &l, &r);
+    let (l, r) = p.run(&[
+        "mutate",
+        "-e",
+        "query add() { insert Person { name: \"Retained\", age: 32 } }",
+        "--json",
+    ]);
+    assert_write_parity("refused deletion source write", &l, &r);
+    let (l, r) = p.run(&[
+        "branch",
+        "merge",
+        "main",
+        "--into",
+        "retained",
+        "--delete-branch",
+        "--json",
+    ]);
+    assert_write_parity("merge succeeds despite source deletion refusal", &l, &r);
+    for output in [&l, &r] {
+        let payload = parse_stdout_json(output);
+        assert_eq!(payload["branch_deleted"], false);
+        assert!(payload["branch_delete_error_details"]["code"].is_string());
+        assert!(payload.get("branch_delete_error").is_none());
+    }
+    let (l, r) = p.run(&["branch", "list", "--json"]);
+    assert_parity("branch list (source retained after refusal)", &l, &r);
+    assert!(
+        parse_stdout_json(&l)["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b == "main")
+    );
+
+    let before = p.run(&["commit", "list", "--json"]);
+    for (source, target) in [(" ", "main"), ("retained", "\t")] {
+        let (l, r) = p.run(&["branch", "merge", source, "--into", target]);
+        for output in [&l, &r] {
+            assert_eq!(output.status.code(), Some(1));
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("branch merge source and target must not be empty"),
+                "{output:?}"
+            );
+        }
+    }
+    let after = p.run(&["commit", "list", "--json"]);
+    for (before, after) in [(&before.0, &after.0), (&before.1, &after.1)] {
+        assert!(before.status.success() && after.status.success());
+        assert_eq!(parse_stdout_json(before), parse_stdout_json(after));
+    }
 }
 
 fn listed_statement_names(output: &std::process::Output) -> Vec<String> {
@@ -384,7 +473,7 @@ fn parity_branch_statements() {
     assert_write_parity("mutate on the statement branch", &l, &r);
     let (l, r) = p.run(&["mutate", "-e", "branch merge stmt into main", "--json"]);
     assert_write_parity(
-        "branch merge statement (fast_forward: both arms report the target's new head)",
+        "branch merge statement (fast_forward: both arms report their own publication)",
         &l,
         &r,
     );

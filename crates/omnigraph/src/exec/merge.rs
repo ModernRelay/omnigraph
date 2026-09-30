@@ -5124,8 +5124,14 @@ decide_seam! {
     pub static BRANCH_MERGE_POST_AUTHORITY_CAPTURE = ("branch_merge.post_authority_capture", BranchMerge, [Fail]);
 }
 
+decide_seam! {
+    /// The merge result is fixed and its write gates have been released,
+    /// before the caller can construct its receipt or run follow-up work.
+    pub static BRANCH_MERGE_PRE_RETURN = ("branch_merge.pre_return", BranchMerge, [Fail]);
+}
+
 impl Session {
-    pub async fn branch_merge(&self, source: &str, target: &str) -> Result<MergeOutcome> {
+    pub async fn branch_merge(&self, source: &str, target: &str) -> Result<MergeResult> {
         self.branch_merge_as(source, target, None).await
     }
 
@@ -5134,7 +5140,7 @@ impl Session {
         source: &str,
         target: &str,
         actor_id: Option<&str>,
-    ) -> Result<MergeOutcome> {
+    ) -> Result<MergeResult> {
         // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
         // `BranchTransition { source, target }` — matches the HTTP-layer
         // convention at `server_branch_merge` (branch=Some(source),
@@ -5154,8 +5160,15 @@ impl Session {
         // Keep the planning/publication future out of the public API's callers;
         // deeply composed loads and merges otherwise retain large debug
         // construction frames throughout execution. Poll it in the same task.
-        Box::pin(self.branch_merge_impl(source, target, actor_id, self.settings().merge_lineage()))
-            .await
+        let result = Box::pin(self.branch_merge_impl(
+            source,
+            target,
+            actor_id,
+            self.settings().merge_lineage(),
+        ))
+        .await;
+        fail(&BRANCH_MERGE_PRE_RETURN)?;
+        result
     }
 }
 
@@ -5263,7 +5276,7 @@ impl Omnigraph {
         target: &str,
         actor_id: Option<&str>,
         lineage: MergeLineage,
-    ) -> Result<MergeOutcome> {
+    ) -> Result<MergeResult> {
         let outer_prepare_timing = crate::instrumentation::start_merge_timing(
             crate::instrumentation::MergeTimingPhase::OuterPrepare,
         );
@@ -5323,7 +5336,10 @@ impl Omnigraph {
         if source_head_commit_id == target_head_commit_id
             || base_commit.graph_commit_id == source_head_commit_id
         {
-            return Ok(MergeOutcome::AlreadyUpToDate);
+            return Ok(MergeResult {
+                outcome: MergeOutcome::AlreadyUpToDate,
+                commit: None,
+            });
         }
         let is_fast_forward = base_commit.graph_commit_id == target_head_commit_id;
 
@@ -5433,7 +5449,7 @@ impl Omnigraph {
         is_fast_forward: bool,
         actor_id: Option<&str>,
         lineage: MergeLineage,
-    ) -> Result<MergeOutcome> {
+    ) -> Result<MergeResult> {
         let source_snapshot = &source_txn.base;
         let target_snapshot = &target_txn.base;
         let catalog = target_txn.catalog.as_ref();
@@ -5961,7 +5977,7 @@ impl Omnigraph {
         }
         final_revalidation_timing.finish();
 
-        let changed_edge_tables = Box::pin(async {
+        let (changed_edge_tables, commit) = Box::pin(async {
             let physical_publish_timing = crate::instrumentation::start_merge_timing(
                 crate::instrumentation::MergeTimingPhase::PhysicalPublish,
             );
@@ -6077,7 +6093,7 @@ impl Omnigraph {
             // physical planner. Erase that substrate-heavy future at the graph
             // publication boundary instead of making this envelope's generated
             // state carry it inline.
-            Box::pin(self.commit_updates_on_branch_with_expected(
+            let commit = Box::pin(self.commit_updates_on_branch_with_expected(
                 target_branch,
                 &updates,
                 &expected_versions,
@@ -6087,7 +6103,7 @@ impl Omnigraph {
             ))
             .await?;
             manifest_publish_timing.finish();
-            Ok::<_, OmniError>(changed_edge_tables)
+            Ok::<_, OmniError>((changed_edge_tables, commit))
         })
         .await?;
 
@@ -6095,10 +6111,13 @@ impl Omnigraph {
             self.invalidate_graph_index().await;
         }
 
-        Ok(if is_fast_forward {
-            MergeOutcome::FastForward
-        } else {
-            MergeOutcome::Merged
+        Ok(MergeResult {
+            outcome: if is_fast_forward {
+                MergeOutcome::FastForward
+            } else {
+                MergeOutcome::Merged
+            },
+            commit: Some(commit),
         })
     }
 }

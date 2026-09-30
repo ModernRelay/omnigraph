@@ -2780,7 +2780,7 @@ async fn execute_rep_body<S: MeasurementSignals>(
     let manifest_calls = manifest_counter.take();
     let table_calls = table_counter.take();
     let control_calls = control_before.delta(ControlSnapshot::read(&control_counts))?;
-    if outcome != MergeOutcome::Merged {
+    if outcome.outcome != MergeOutcome::Merged {
         return Err(RunnerError::new(
             "vacuous_merge",
             format!(

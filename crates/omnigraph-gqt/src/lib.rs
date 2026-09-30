@@ -2824,6 +2824,7 @@ async fn run_control_step(
             let outcome = db
                 .branch_merge_as(source, target, None)
                 .await
+                .map(|result| result.outcome)
                 .inspect_err(dst_runner::observe_fault);
             dst_runner::observe(|| format!("actual merge: {outcome:?}"));
             match expect {

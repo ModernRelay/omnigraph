@@ -82,6 +82,15 @@ pub enum MergeOutcome {
     Merged,
 }
 
+/// A merge's disposition and the graph commit published by that invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeResult {
+    pub outcome: MergeOutcome,
+    /// `None` only when the merge was already up to date. This receipt is
+    /// captured at publication, so later writers cannot replace its identity.
+    pub commit: Option<GraphCommit>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SchemaApplyResult {
     pub supported: bool,

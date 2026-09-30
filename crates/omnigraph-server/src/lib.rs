@@ -1466,6 +1466,15 @@ impl IntoResponse for ApiError {
                 axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
             );
         }
+        let status = self.status;
+        (status, headers, Json(self.into_output())).into_response()
+    }
+}
+
+impl ApiError {
+    /// Preserve the same typed details in a compound result as in an ordinary
+    /// error response.
+    fn into_output(self) -> ErrorOutput {
         let mut output = ErrorOutput::message(self.message);
         output.code = self.code;
         if let Some(details) = self.details {
@@ -1495,8 +1504,14 @@ impl IntoResponse for ApiError {
                 ApiErrorDetails::Diagnostic(value) => output.diagnostic = Some(value),
             }
         }
-        (self.status, headers, Json(output)).into_response()
+        output
     }
+}
+
+/// Project an engine failure into the shared error body, including structured
+/// details, for embedded callers that compose a second effect after success.
+pub fn engine_error_output(error: OmniError) -> api::ErrorOutput {
+    ApiError::from_omni(error).into_output()
 }
 
 #[cfg(test)]

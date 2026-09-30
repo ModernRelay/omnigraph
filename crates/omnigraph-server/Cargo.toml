@@ -54,6 +54,7 @@ aws-config = { version = "1", optional = true, default-features = false, feature
 aws-sdk-secretsmanager = { version = "1", optional = true, default-features = false, features = ["rustls", "rt-tokio"] }
 
 [dev-dependencies]
+omnigraph = { package = "omnigraph-engine", path = "../omnigraph", features = ["failpoints"] }
 tempfile = { workspace = true }
 tower = { workspace = true }
 serial_test = "3"
