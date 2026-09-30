@@ -1,6 +1,6 @@
 # issue: none
 # red_on: none; guard case
-# notes: Two writes on a named branch, one overtaking the other between capture and commit: the overtaken insert lands, the overtaken update is refused with graph_head:feature, main is untouched, and feature survives a reopen. End results only; the probe-first revalidation itself is guarded by failpoints.rs.
+# notes: An overtaken insert succeeds; overtaken updates and deletes are refused. Branch results stay isolated and survive reopen.
 
 --- runner
 timeout_ms: 10000
@@ -18,14 +18,11 @@ node Company { name: String @key }
 
 --- seed
 {"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob","age":31}}
 
 --- mutate
 branch create feature
 --- expect ok
-
---- mutate branch: feature
-query first_write_on_feature() { insert Person { name: "bob", age: 31 } }
---- expect affected: nodes=1 edges=0
 
 --- concurrent
 w1 on feature: query add_carol() { insert Person { name: "carol", age: 32 } }
@@ -43,11 +40,16 @@ order: u1 park put nodes/, i1, u1 put nodes/, u1
 u1: error: graph_head:feature
 i1: ok
 
+--- concurrent
+d1 on feature: query delete_alice() { delete Person where name = "alice" }
+i2 on feature: query add_initech() { insert Company { name: "initech" } }
+order: d1 park put _deletions/, i2, d1 put _deletions/, d1
+--- expect
+d1: error: graph_head:feature
+i2: ok
+
 --- query branch: feature
-query people_on_feature() {
-    match { $p: Person }
-    return { $p.name, $p.age }
-}
+query people_on_feature() { match { $p: Person } return { $p.name, $p.age } }
 --- expect unordered
 {"p.name":"alice","p.age":30}
 {"p.name":"bob","p.age":31}
@@ -56,35 +58,25 @@ query people_on_feature() {
 p.name: String
 p.age: I32
 
---- query branch: feature
-query companies_on_feature() {
-    match { $c: Company }
-    return { $c.name }
-}
---- expect unordered
-{"c.name":"acme"}
-{"c.name":"globex"}
---- expect shape
-c.name: String
-
 --- query
-query people_on_main() {
-    match { $p: Person }
-    return { $p.name, $p.age }
-}
+query people_on_main() { match { $p: Person } return { $p.name, $p.age } }
 --- expect unordered
 {"p.name":"alice","p.age":30}
+{"p.name":"bob","p.age":31}
 --- expect shape
 p.name: String
 p.age: I32
+
+--- query
+query no_companies_on_main() { match { $c: Company } return { $c.name } }
+--- expect unordered
+--- expect shape
+c.name: String
 
 --- restart
 
 --- query branch: feature
-query people_on_feature_after_reopen() {
-    match { $p: Person }
-    return { $p.name, $p.age }
-}
+query people_on_feature_after_reopen() { match { $p: Person } return { $p.name, $p.age } }
 --- expect unordered
 {"p.name":"alice","p.age":30}
 {"p.name":"bob","p.age":31}
@@ -92,3 +84,12 @@ query people_on_feature_after_reopen() {
 --- expect shape
 p.name: String
 p.age: I32
+
+--- query branch: feature
+query companies_on_feature_after_reopen() { match { $c: Company } return { $c.name } }
+--- expect unordered
+{"c.name":"acme"}
+{"c.name":"globex"}
+{"c.name":"initech"}
+--- expect shape
+c.name: String
