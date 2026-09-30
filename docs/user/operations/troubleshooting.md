@@ -84,7 +84,9 @@ between graph roots.
 - `external_blob_base_overlaps_storage_root`: an `external_blobs` base lies
   inside, or contains, the cluster storage root that holds every graph and the
   applied state. Move the base to a sibling prefix, run `cluster apply`, and
-  restart the server; until then the server quarantines the graph. See
+  restart the server; until then the server quarantines the graph, and fails
+  to start with `cluster_no_healthy_graphs` if every applied graph is
+  quarantined. See
   [External Blob references](../clusters/config.md#external-blob-references).
 
 See [Operating a cluster](../clusters/index.md).

@@ -1462,6 +1462,126 @@ fn serving_quarantines_applied_policies_overlapping_storage_root() {
     );
 }
 
+/// The serving snapshot reader quarantines a graph whose applied server-safe
+/// base overlaps the storage root and keeps serving a healthy sibling; with no
+/// healthy graph left, it refuses. Server-safe bases are `s3://` only, so the
+/// ledger lives in a local directory and the store reports an `s3://` root
+/// through `ClusterStore::with_display_root`: the reader, the comparison and
+/// the quarantine are the production ones, only the root spelling is forged.
+#[tokio::test]
+async fn serving_snapshot_quarantines_graph_whose_applied_base_overlaps_storage_root() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n  archive:\n    schema: ./people.pg\n",
+    )
+    .unwrap();
+    let desired = validate_config_dir(dir.path());
+    assert!(desired.ok, "{:?}", desired.diagnostics);
+    let schema_digest = desired.resource_digests["schema.knowledge"].clone();
+    let empty_queries = BTreeMap::new();
+    let policy = omnigraph::ExternalBlobPolicy::allow(vec![
+        omnigraph::ExternalBlobBase::new(
+            "s3://assets/cluster/graphs/",
+            omnigraph::ExternalBlobExecutionScope::ServerSafe,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let knowledge_digest = graph_digest_with_external_blob_policy(
+        "knowledge",
+        Some(&schema_digest),
+        Some(&empty_queries),
+        None,
+        None,
+        &policy,
+    );
+    let archive_digest = graph_digest(
+        "archive",
+        Some(&schema_digest),
+        Some(&empty_queries),
+        None,
+        None,
+    );
+    let write_ledger = |with_archive: bool| {
+        let mut resources = vec![
+            ("graph.knowledge", knowledge_digest.as_str()),
+            ("schema.knowledge", schema_digest.as_str()),
+        ];
+        if with_archive {
+            resources.push(("graph.archive", archive_digest.as_str()));
+            resources.push(("schema.archive", schema_digest.as_str()));
+        }
+        write_state_resources(dir.path(), &resources);
+        let mut state = read_state_json(dir.path());
+        state["applied_revision"]["resources"]["graph.knowledge"]["external_blob_policy"] =
+            serde_json::to_value(&policy).unwrap();
+        fs::write(
+            dir.path().join(CLUSTER_STATE_FILE),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap()
+    };
+    let overlapping_root =
+        || store::ClusterStore::for_config_dir(dir.path()).with_display_root("s3://assets/cluster");
+
+    let ledger = write_ledger(true);
+    // Against the local root the base is disjoint, and the ledger's digests
+    // hold: both graphs serve.
+    let control = read_serving_snapshot(dir.path()).await.unwrap();
+    assert_eq!(control.graphs.len(), 2);
+    assert!(control.quarantined_graphs.is_empty());
+
+    let snapshot = serve::read_snapshot_with_store(&overlapping_root())
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .graphs
+            .iter()
+            .map(|graph| graph.graph_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["archive"]
+    );
+    assert_eq!(snapshot.quarantined_graphs, vec!["knowledge".to_string()]);
+    assert_eq!(
+        snapshot.applied_graphs,
+        vec!["archive".to_string(), "knowledge".to_string()]
+    );
+    assert!(snapshot.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "external_blob_base_overlaps_storage_root"
+            && diagnostic.path == "graph.knowledge"
+            && diagnostic.severity == DiagnosticSeverity::Warning
+    }));
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger
+    );
+
+    // With every applied graph quarantined the reader refuses to serve.
+    let ledger = write_ledger(false);
+    let refused = serve::read_snapshot_with_store(&overlapping_root())
+        .await
+        .unwrap_err();
+    assert!(
+        refused
+            .iter()
+            .any(|diagnostic| diagnostic.code == "cluster_no_healthy_graphs"),
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .iter()
+            .any(|diagnostic| diagnostic.code == "external_blob_base_overlaps_storage_root"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger
+    );
+}
+
 #[test]
 fn query_key_mismatch_fails() {
     let dir = fixture();

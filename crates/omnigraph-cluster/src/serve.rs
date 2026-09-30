@@ -280,7 +280,7 @@ fn cluster_root_of_graph_layout(graph_uri: &str) -> Option<String> {
     Some(root.to_string())
 }
 
-async fn read_snapshot_with_store(
+pub(crate) async fn read_snapshot_with_store(
     backend: &ClusterStore,
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
     let mut diagnostics: Vec<Diagnostic> = Vec::new();

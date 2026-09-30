@@ -2204,13 +2204,31 @@ async fn blob_update_null_to_non_null() {
 /// A base over the graph root would let any authorized writer copy manifest
 /// and table bytes into a managed cell served as ordinary Blob data. Every
 /// spelling of an overlap is refused at install time, before any write, and a
-/// graph-internal URI stays outside a disjoint base.
+/// graph-internal URI stays outside a disjoint base. The root is also opened
+/// through a local path that contains `://` (a directory literally named
+/// `og:`), which is a local root and not a URI scheme.
 #[tokio::test]
 async fn external_blob_policy_refuses_base_overlapping_graph_root() {
-    let dir = tempfile::tempdir().unwrap();
-    let graph = dir.path().join("graph");
-    let graph_uri = graph.to_str().unwrap().to_string();
-    let external = dir.path().join("external");
+    let plain = tempfile::tempdir().unwrap();
+    let graph = plain.path().join("graph");
+    assert_graph_root_refuses_overlapping_bases(plain.path(), &graph, graph.to_str().unwrap())
+        .await;
+
+    let colon = tempfile::tempdir().unwrap();
+    let graph = colon.path().join("og:").join("graph");
+    std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
+    let graph_uri = format!("{}/og://graph", colon.path().display());
+    assert_graph_root_refuses_overlapping_bases(colon.path(), &graph, &graph_uri).await;
+}
+
+async fn assert_graph_root_refuses_overlapping_bases(
+    dir: &std::path::Path,
+    graph: &std::path::Path,
+    graph_uri: &str,
+) {
+    let graph = graph.to_path_buf();
+    let graph_uri = graph_uri.to_string();
+    let external = dir.join("external");
     std::fs::create_dir_all(&external).unwrap();
     let db = helpers::session(Omnigraph::init(&graph_uri, BLOB_SCHEMA).await.unwrap());
     db.load_jsonl(
@@ -2241,7 +2259,7 @@ async fn external_blob_policy_refuses_base_overlapping_graph_root() {
     };
     let mut overlapping = vec![
         directory_base(&graph),
-        directory_base(dir.path()),
+        directory_base(dir),
         directory_base(&graph.join("__manifest")),
         // On macOS the temporary directory is `/var/...`, a symlink to
         // `/private/var/...`: the canonical spelling must overlap as well.
@@ -2249,7 +2267,7 @@ async fn external_blob_policy_refuses_base_overlapping_graph_root() {
     ];
     #[cfg(unix)]
     {
-        let link = dir.path().join("graph-link");
+        let link = dir.join("graph-link");
         std::os::unix::fs::symlink(&graph, &link).unwrap();
         overlapping.push(directory_base(&link));
     }

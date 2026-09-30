@@ -139,8 +139,10 @@ and `apply` refuse such a base with `external_blob_base_overlaps_storage_root`,
 whatever its scope. Put external objects under a sibling prefix instead, for
 example `s3://company-assets/cluster-external/` beside
 `storage: s3://company-assets/cluster`. A server that finds an overlapping
-`server_safe` base in the applied state quarantines that graph, and an embedded
-handle refuses a policy whose base overlaps its own graph root.
+`server_safe` base in the applied state quarantines that graph and serves the
+others; if no applied graph is left to serve, startup fails with
+`cluster_no_healthy_graphs`. An embedded handle refuses a policy whose base
+overlaps its own graph root.
 
 The allow-list controls which external objects an authorized writer may cause
 the process to inspect. Cedar policy separately decides who may write. See

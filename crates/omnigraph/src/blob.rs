@@ -572,28 +572,42 @@ impl NormalizedExternalUri {
 
     /// Base-shaped forms of a normalized storage root, for overlap checks.
     ///
-    /// Dispatch is on the root's URI text: an S3 root yields its one spelling;
-    /// a `file://` or plain-path root yields its canonical form (the deepest
-    /// existing ancestor resolved through symlinks, the missing suffix appended)
-    /// and, when it parses, its lexical absolute form. A root in any scheme no
-    /// base may use (`az://`, in-memory test schemes) cannot overlap a base and
-    /// yields no forms. A required form that cannot be derived fails closed.
+    /// The root is classified by the storage layer's own rule
+    /// ([`omnigraph_storage::storage_kind_for_uri`]), never by searching the
+    /// text for `://`: an absolute local path may contain that sequence
+    /// (`/tmp/og://graph` names `/tmp/og:/graph`). An S3 root yields its one
+    /// spelling; a `file://` or plain-path root yields its canonical form (the
+    /// deepest existing ancestor resolved through symlinks, the missing suffix
+    /// appended) and, when it parses, its lexical absolute form. A root in a
+    /// known scheme no base may use (`az://`, the in-memory test schemes)
+    /// cannot overlap a base and yields no forms. Any other root, and a
+    /// required form that cannot be derived, fails closed.
     fn storage_root_forms(root: &str) -> Result<Vec<Self>> {
         let unrepresentable =
             || policy_error("could not compare external Blob bases with the storage root");
-        let path = match root.split_once("://") {
-            Some((scheme, _)) if scheme.eq_ignore_ascii_case("s3") => {
+        // Lance's in-memory store and the DST harness's shared-memory store
+        // hold nothing a `file` or `s3` base can name. The storage layer
+        // refuses the first and admits the second only in DST builds, so both
+        // are matched exactly here, before classification.
+        if root.starts_with("memory://") || root.starts_with("shared-memory://") {
+            return Ok(Vec::new());
+        }
+        let kind = omnigraph_storage::storage_kind_for_uri(root).map_err(|_| unrepresentable())?;
+        let path = match kind {
+            omnigraph_storage::StorageKind::S3 => {
                 let root = format!("{}/", root.trim_end_matches('/'));
                 return Self::parse(&root, UriRole::Base)
                     .map(|form| vec![form])
                     .map_err(|_| unrepresentable());
             }
-            Some((scheme, _)) if scheme.eq_ignore_ascii_case("file") => url::Url::parse(root)
-                .ok()
-                .and_then(|parsed| parsed.to_file_path().ok())
-                .ok_or_else(unrepresentable)?,
-            Some(_) => return Ok(Vec::new()),
-            None => std::path::PathBuf::from(root),
+            omnigraph_storage::StorageKind::Azure => return Ok(Vec::new()),
+            omnigraph_storage::StorageKind::Local if root.starts_with("file://") => {
+                url::Url::parse(root)
+                    .ok()
+                    .and_then(|parsed| parsed.to_file_path().ok())
+                    .ok_or_else(unrepresentable)?
+            }
+            omnigraph_storage::StorageKind::Local => std::path::PathBuf::from(root),
         };
         let absolute = std::path::absolute(&path).map_err(|_| unrepresentable())?;
         let canonical = canonical_existing_prefix(&absolute).ok_or_else(unrepresentable)?;
@@ -1879,6 +1893,52 @@ mod tests {
                 "{root}"
             );
         }
+        // A scheme the storage layer does not recognize fails closed instead
+        // of being treated as storage no base can name.
+        for root in ["gs://bucket/graph", "og://graph", "S3://bucket/graph"] {
+            assert!(
+                matches!(
+                    NormalizedExternalUri::storage_root_forms(root),
+                    Err(OmniError::ExternalBlobPolicy { .. })
+                ),
+                "{root}"
+            );
+        }
+    }
+
+    /// An absolute local path may contain `://`: `/tmp/og://graph` names the
+    /// directory `graph` inside a directory literally called `og:`. It is a
+    /// local root, compared like any other, not a URI with scheme `/tmp/og`.
+    #[test]
+    fn external_blob_base_must_be_disjoint_from_local_root_spelled_with_scheme_separator() {
+        let directory = tempfile::tempdir().unwrap();
+        let colon_dir = directory.path().join("og:");
+        let graph = colon_dir.join("graph");
+        let external = directory.path().join("external");
+        std::fs::create_dir_all(&graph).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let root = format!("{}/og://graph", directory.path().display());
+        assert!(root.contains("://"));
+        assert!(
+            !NormalizedExternalUri::storage_root_forms(&root)
+                .unwrap()
+                .is_empty()
+        );
+        let base = |path: &std::path::Path| {
+            ExternalBlobBase::new(
+                url::Url::from_directory_path(path).unwrap().as_str(),
+                ExternalBlobExecutionScope::EmbeddedOnly,
+            )
+            .unwrap()
+        };
+        for overlapping in [directory.path(), colon_dir.as_path(), graph.as_path()] {
+            assert_overlaps_storage_root(
+                base(overlapping).ensure_disjoint_from_storage_root(&root),
+            );
+        }
+        base(&external)
+            .ensure_disjoint_from_storage_root(&root)
+            .unwrap();
     }
 
     #[test]
