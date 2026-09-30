@@ -58,17 +58,14 @@ body:
       description: Output of `omnigraph --version` (or the engine/crate version), installation method, and exact commit SHA for source builds. For a failed installation, give the version or commit you tried to install.
     validations:
       required: true
-  - type: dropdown
+  - type: input
     id: execution-path
     attributes:
       label: Execution path
-      description: How did you encounter the problem? Describe other paths in the reproduction above.
-      options:
-        - CLI
-        - HTTP API / server
-        - Embedded Rust API
-        - Build / installation
-        - Other (describe in reproduction)
+      description: >-
+        How did you encounter the problem? Enter CLI, HTTP API / server,
+        Embedded Rust API, Build / installation, or Other (describe in reproduction).
+        Describe other paths in the reproduction above.
     validations:
       required: true
   - type: input
