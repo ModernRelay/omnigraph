@@ -173,7 +173,11 @@ resolution after the detached commits, not before them; the graph is
 unchanged and the staging is reclaimed the same way. The published pin is final:
 readers open `staged_version` directly, and `published_dataset_version`
 keeps its number, `base + 1`, as the table's logical version inside its
-`__manifest` lineage without naming a Lance version. Every registration
+`__manifest` lineage without naming a Lance version. Once the publication
+succeeds, the writer holds each version it committed in the read-handle
+cache under the pin that now names it (`hold_published_handles`), so the
+next write or read of that table on the same handle opens nothing; a refused
+or in-doubt publication holds nothing. Every registration
 records `omnigraph.last_linear_version`, the highest linear version a pin
 ever reached (`1` for a table created under v11), and every writer that
 rebuilds the row copies it forward (`TableVersionMetadata`,

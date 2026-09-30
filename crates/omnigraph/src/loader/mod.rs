@@ -903,6 +903,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
         updates,
         expected_versions,
         gates: _held_gates,
+        committed,
     } = staged.commit_all(db, branch, &txn).await?;
     // Same detached-effects → publisher boundary as mutations: every table
     // effect is committed detached, but the graph manifest has not published
@@ -920,6 +921,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
         )
         .await;
     let commit = publish_result?;
+    crate::exec::staging::hold_published_handles(db, committed).await;
 
     Ok(LoadReceipt { result, commit })
 }

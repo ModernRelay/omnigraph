@@ -97,8 +97,9 @@ pub struct TableHandleKey {
 /// the shared `Session`. Version, pin and e_tag are in the key, so a write (or a
 /// delete/recreate that reuses a version number on object stores with e_tags) is
 /// simply a new key. A same-branch manifest refresh clears this cache as the
-/// fallback for e_tag-less table locations. Only read-path Data opens use this —
-/// writes open HEAD directly and never receive a pinned handle.
+/// fallback for e_tag-less table locations. Reads open through it, a writer
+/// opens the pin it stages on through it, and a writer holds the version it
+/// committed once its publication succeeds.
 #[derive(Default)]
 pub struct TableHandleCache {
     inner: Mutex<TableHandleCacheInner>,
@@ -185,6 +186,30 @@ impl TableHandleCache {
         };
         let mut inner = self.inner.lock().await;
         inner.entries.get(&key).cloned()
+    }
+
+    /// Hold the handle a writer committed, under the pin its publication
+    /// registered, so the next write or read of that pin opens nothing. Call
+    /// it only after the publication succeeded: the key names an immutable
+    /// detached version, so the handle can never go stale.
+    pub async fn hold_published(
+        &self,
+        dataset_path: &str,
+        table_branch: Option<&str>,
+        version: u64,
+        staged_version: Option<u64>,
+        e_tag: Option<&str>,
+        dataset: Dataset,
+    ) {
+        let key = TableHandleKey {
+            table_path: dataset_path.to_string(),
+            table_branch: table_branch.map(str::to_string),
+            version,
+            staged_version,
+            e_tag: e_tag.map(str::to_string),
+        };
+        let mut inner = self.inner.lock().await;
+        inner.insert(key, dataset);
     }
 }
 

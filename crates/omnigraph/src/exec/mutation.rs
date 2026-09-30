@@ -1010,6 +1010,7 @@ impl Omnigraph {
                     updates,
                     expected_versions,
                     gates: _held_gates,
+                    committed,
                 } = staged.commit_all(self, requested.as_deref(), &txn).await?;
                 // Failpoint for the detached-effects → publisher boundary:
                 // every table effect is committed detached but nothing is
@@ -1031,6 +1032,7 @@ impl Omnigraph {
                 // so a publish failure leaves the graph unchanged; the error
                 // is returned as is (a moved head is `ReadSetChanged`).
                 let commit = publish_result?;
+                super::staging::hold_published_handles(self, committed).await;
                 Ok(crate::MutationReceipt {
                     result: total,
                     commit: Some(commit),
