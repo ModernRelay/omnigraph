@@ -285,7 +285,7 @@ fn token_arguments_bound_authority_and_keep_direct_compatibility() {
 
 #[tokio::test]
 async fn minted_data_credential_is_separate_and_works_after_api_stops() {
-    let data = IntentApiFixture::new(vec![
+    let data = IntentApiFixture::graph(vec![
         IntentReply::json(200, read_reply()),
         IntentReply::json(200, change_reply()),
         IntentReply::json(200, read_reply()),
@@ -373,7 +373,7 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
         .invoke_named("q", false, None, Some("main".into()), None, None)
         .await
         .unwrap();
-    let requests = data.requests();
+    let requests = data.workflow_requests();
     assert_eq!(
         requests.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
         [
@@ -418,7 +418,7 @@ async fn identity_issuance_caches_no_permissions_and_discovers_without_control_c
     let discovery = json!({"graphs":[{"graph_id":"hidden","display_name":"hidden"}]});
     let commit = json!({"graph_commit_id":"head-a","graph_branch":"main","graph_manifest_version":7,
         "parent_commit_id":null,"merged_parent_commit_id":null,"actor_id":"principal:alice","created_at":12345});
-    let data = IntentApiFixture::new(vec![
+    let data = IntentApiFixture::graph(vec![
         IntentReply::json(200, discovery.clone()),
         IntentReply::json(
             403,
@@ -466,7 +466,7 @@ async fn identity_issuance_caches_no_permissions_and_discovers_without_control_c
         .unwrap();
     let result = client.discover_graphs().await.unwrap();
     assert_eq!(serde_json::to_value(result).unwrap(), discovery);
-    assert_eq!(data.requests()[0].path, "/graphs/discovery");
+    assert_eq!(data.workflow_requests()[0].path, "/graphs/discovery");
     // Identity credentials deliberately have no local action ceiling. Load
     // and lineage commands reach the exact cached endpoint, where current
     // policy decides permission, even after the control API is gone.
@@ -535,7 +535,7 @@ async fn identity_issuance_caches_no_permissions_and_discovers_without_control_c
                 commit
             ),
         }
-        let requests = data.requests();
+        let requests = data.workflow_requests();
         let request = requests.last().unwrap();
         assert_eq!(request.path, path);
         assert_eq!(
@@ -544,7 +544,11 @@ async fn identity_issuance_caches_no_permissions_and_discovers_without_control_c
         );
         assert!(!request.headers.contains_key("x-actor-id"));
     }
-    assert_eq!(data.requests().len(), 4, "one attempt per operation");
+    assert_eq!(
+        data.workflow_requests().len(),
+        4,
+        "one attempt per operation"
+    );
     assert_eq!(
         serde_json::from_str::<Value>(&store.get(&key(&context)).unwrap().unwrap()).unwrap(),
         saved
@@ -915,7 +919,7 @@ async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fal
         "merged_parent_commit_id":"imported-head", "actor_id":"principal:alice",
         "created_at":123456,
     });
-    let server = IntentApiFixture::new(vec![
+    let server = IntentApiFixture::graph(vec![
         IntentReply::json(200, json!({"commits":[commit.clone()]})),
         IntentReply::json(200, commit.clone()),
     ]);
@@ -972,7 +976,7 @@ async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fal
             "graph_required"
         );
     }
-    let requests = server.requests();
+    let requests = server.workflow_requests();
     assert_eq!(requests.len(), 2);
     for (request, path) in requests.iter().zip([
         "/graphs/knowledge/commits?branch=main",
@@ -1144,7 +1148,7 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
         ),
     ] {
         for operation in ["query", "load", "commit-list", "commit-show"] {
-            let server = IntentApiFixture::new(vec![reply.clone()]);
+            let server = IntentApiFixture::graph(vec![reply.clone()]);
             let client =
                 GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
             let error = match operation {
@@ -1195,7 +1199,7 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
         ),
     ] {
       for operation in ["mutate", "load", "commit-list", "commit-show"] {
-        let server = IntentApiFixture::new(vec![IntentReply { status, headers: vec![], body: body.as_bytes().to_vec() }]);
+        let server = IntentApiFixture::graph(vec![IntentReply { status, headers: vec![], body: body.as_bytes().to_vec() }]);
         let client = GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
         let error = match operation {
             "load" => client.load("main", None, batch.path().to_str().unwrap(), crate::cli::CliLoadMode::Append, &[]).await.unwrap_err(),
@@ -1238,7 +1242,7 @@ async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
     let reply = json!({"branch":"review","base_branch":"main","branch_created":true,"mode":"append","nodes":[{"name":"Person","entities_loaded":2}],"edges":[],"total_entities":2,"actor_id":"principal:alice","commit":commit});
     // This is a real response past the ordinary managed 30-second deadline.
     // The request-construction owner separately pins load's 300-second ceiling.
-    let server = IntentApiFixture::with_response_delay(
+    let server = IntentApiFixture::graph_with_response_delay(
         vec![IntentReply::json(200, reply)],
         std::time::Duration::from_millis(30_750),
     );
@@ -1281,7 +1285,7 @@ async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
     assert_eq!(result["branch_created"], true);
     assert_eq!(result["total_entities"], 2);
     assert_eq!(result["branch"], "review");
-    let requests = server.requests();
+    let requests = server.workflow_requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].method, "POST");
     assert_eq!(
@@ -1347,7 +1351,7 @@ async fn managed_load_refuses_local_overflow_before_io_and_never_replays_failed_
         },
         IntentReply::json(200, json!({"not":"a receipt"})),
     ] {
-        let server = IntentApiFixture::new(vec![reply]);
+        let server = IntentApiFixture::graph(vec![reply]);
         let client = GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
         assert!(
             client

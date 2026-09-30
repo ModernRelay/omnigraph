@@ -82,6 +82,12 @@ Serving verifies ledger/resource digests, builds each graph's query registry and
 
 Servers do not hot-reload applied graph configuration. Apply the new revision and restart every server that should serve it. Explicit OIDC public-admission snapshots have a separate bounded refresh contract below.
 
+Protected graph and registry HTTP calls require the v0.12 contract header after
+authentication and before graph resolution. CLI discovery and response validation
+are specified by [wire compatibility](versioning.md#wire-compatibility); the
+managed control-plane API and standard MCP/OAuth protocols are separate surfaces.
+This admission check changes no ledger or serving-reload behavior.
+
 Bearer authentication is a server concern. Cedar mutation enforcement also lives in the engine's `_as` APIs so embedded and CLI writers cannot bypass it. Cluster policy application publishes the bundles and bindings; it does not replace either enforcement layer.
 
 The optional [offline signed-token trust](../rfcs/0053-offline-data-token-verification.md)

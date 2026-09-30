@@ -53,12 +53,13 @@ use crate::blob_cli::{
     managed_response_headers, map_embedded_blob_error, remote_blob_error, whole_external_uri,
 };
 use crate::cli::CliLoadMode;
+use crate::graph_http::{ApiContractError, GraphHttpClient};
 use crate::helpers::{
     RemoteErrorCli, apply_bearer_token, apply_server_flag, branch_statement_change_request,
-    branch_statement_query_request, build_blob_http_client, build_http_client, is_remote_uri,
-    legacy_change_request_body, precondition_failed_cli, query_params_from_json, remote_json,
-    remote_json_bounded, remote_response_json_bounded, remote_url, resolve_cli_actor,
-    resolve_cli_graph, resolve_remote_bearer_token, resolve_server_flag, select_named_query,
+    branch_statement_query_request, is_remote_uri, legacy_change_request_body,
+    precondition_failed_cli, query_params_from_json, remote_json, remote_json_bounded,
+    remote_response_json_bounded, remote_url, resolve_cli_actor, resolve_cli_graph,
+    resolve_remote_bearer_token, resolve_server_flag, select_named_query,
 };
 use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_receipt};
 
@@ -97,6 +98,14 @@ fn load_request(
         .body(data)
 }
 
+fn blob_transport_error(error: color_eyre::Report) -> color_eyre::Report {
+    if error.downcast_ref::<reqwest::Error>().is_some() {
+        eyre!("Blob server request failed")
+    } else {
+        error
+    }
+}
+
 /// Why a served `load`/`ingest` refuses a `--set`: neither route's request
 /// type carries a `settings` field, so a value could only be dropped.
 const SETTINGS_AT_SERVED_LOAD: &str = "load and ingest take --set only on an embedded store; \
@@ -125,7 +134,7 @@ pub(crate) enum GraphClient {
     /// Remote HTTP server. The actor is resolved server-side from the
     /// token; the client never sets identity.
     Remote {
-        http: reqwest::Client,
+        http: GraphHttpClient,
         base_url: String,
         token: Option<String>,
         response_limit: Option<usize>,
@@ -136,25 +145,28 @@ pub(crate) enum GraphClient {
 /// `default_graph`) must not silently fall through to the bare server URL when
 /// the server is multi-graph. Best-effort probe `GET /graphs`: a populated list
 /// forces `--graph` (listing the candidates); a single-graph/flat server (405),
-/// a policy-gated `/graphs`, or an unreachable server all proceed — the bare URL
+/// a policy-gated `/graphs` proceeds — the bare URL
 /// is then correct, or the real request surfaces the failure. Only fires on the
-/// no-graph path, so a `--graph`/`default_graph` happy path does no extra I/O.
+/// no-graph path. Contract/discovery failures always stop without fallback.
 async fn require_graph_for_multi_graph_server(scope: &crate::scope::ResolvedScope) -> Result<()> {
     let (Some(server), None) = (scope.server.as_deref(), scope.graph.as_deref()) else {
         return Ok(());
     };
     let probe = GraphClient::registry_client(server)?;
-    if let Ok(resp) = probe.list_graphs().await {
-        if !resp.graphs.is_empty() {
-            let ids: Vec<&str> = resp.graphs.iter().map(|g| g.graph_id.as_str()).collect();
-            bail!(
-                "server scope '{server}' has {} {}: [{}]; pass --graph <id> to select one \
-                 (or set `default_graph` in your operator config)",
-                ids.len(),
-                if ids.len() == 1 { "graph" } else { "graphs" },
-                ids.join(", ")
-            );
-        }
+    let resp = match probe.list_graphs().await {
+        Ok(resp) => resp,
+        Err(error) if error.downcast_ref::<ApiContractError>().is_some() => return Err(error),
+        Err(_) => return Ok(()),
+    };
+    if !resp.graphs.is_empty() {
+        let ids: Vec<&str> = resp.graphs.iter().map(|g| g.graph_id.as_str()).collect();
+        bail!(
+            "server scope '{server}' has {} {}: [{}]; pass --graph <id> to select one \
+             (or set `default_graph` in your operator config)",
+            ids.len(),
+            if ids.len() == 1 { "graph" } else { "graphs" },
+            ids.join(", ")
+        );
     }
     Ok(())
 }
@@ -175,21 +187,20 @@ fn reject_positional_remote(via_server: bool, uri: &str) -> Result<()> {
 impl GraphClient {
     /// An already validated managed credential never enters legacy scope or token resolution.
     pub(crate) fn managed(endpoint: &str, graph: &str, token: String) -> Result<Self> {
-        Self::managed_url(remote_url(endpoint, &["graphs", graph], &[])?, token)
+        Self::managed_url(
+            endpoint,
+            remote_url(endpoint, &["graphs", graph], &[])?,
+            token,
+        )
     }
 
     pub(crate) fn managed_registry(endpoint: &str, token: String) -> Result<Self> {
-        Self::managed_url(endpoint.to_owned(), token)
+        Self::managed_url(endpoint, endpoint.to_owned(), token)
     }
 
-    fn managed_url(base_url: String, token: String) -> Result<Self> {
+    fn managed_url(endpoint: &str, base_url: String, token: String) -> Result<Self> {
         Ok(Self::Remote {
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .retry(reqwest::retry::never())
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(30))
-                .build()?,
+            http: GraphHttpClient::managed(endpoint)?,
             base_url,
             token: Some(token),
             response_limit: Some(8 * 1024 * 1024),
@@ -205,7 +216,7 @@ impl GraphClient {
         let base = resolve_server_flag(Some(server), None)?.expect("server name is present");
         let token = resolve_remote_bearer_token(Some(&base))?;
         Ok(GraphClient::Remote {
-            http: build_http_client()?,
+            http: GraphHttpClient::new(&base)?,
             base_url: base,
             token,
             response_limit: None,
@@ -287,13 +298,14 @@ impl GraphClient {
         require_graph_for_multi_graph_server(&scope).await?;
         let (server, graph, uri) = (scope.server.as_deref(), scope.graph.as_deref(), scope.uri);
         let via_server = server.is_some();
-        let uri = apply_server_flag(server, graph, uri)?;
+        let server_root = resolve_server_flag(server, None)?;
+        let uri = apply_server_flag(server_root.as_deref(), graph, uri)?;
         let token = resolve_remote_bearer_token(uri.as_deref())?;
         let uri = crate::helpers::resolve_uri(uri)?;
         reject_positional_remote(via_server, &uri)?;
         if is_remote_uri(&uri) {
             Ok(GraphClient::Remote {
-                http: build_http_client()?,
+                http: GraphHttpClient::new(server_root.as_deref().expect("remote server scope"))?,
                 base_url: uri,
                 token,
                 response_limit: None,
@@ -340,10 +352,10 @@ impl GraphClient {
         scope: crate::scope::ResolvedScope,
         cli_as: Option<&str>,
     ) -> Result<Self> {
-        require_graph_for_multi_graph_server(&scope).await?;
-        let (server, graph, uri) = (scope.server.as_deref(), scope.graph.as_deref(), scope.uri);
+        let (server, graph) = (scope.server.as_deref(), scope.graph.as_deref());
         let via_server = server.is_some();
-        let uri = apply_server_flag(server, graph, uri)?;
+        let server_root = resolve_server_flag(server, None)?;
+        let uri = apply_server_flag(server_root.as_deref(), graph, scope.uri.clone())?;
         let token = resolve_remote_bearer_token(uri.as_deref())?;
         let resolved = resolve_cli_graph(uri)?;
         reject_positional_remote(via_server, &resolved.uri)?;
@@ -357,8 +369,10 @@ impl GraphClient {
                      storage with `--store <uri>`."
                 );
             }
+            // Complete local addressing/identity validation before discovery.
+            require_graph_for_multi_graph_server(&scope).await?;
             Ok(GraphClient::Remote {
-                http: build_http_client()?,
+                http: GraphHttpClient::new(server_root.as_deref().expect("remote server scope"))?,
                 base_url: resolved.uri,
                 token,
                 response_limit: None,
@@ -767,7 +781,7 @@ impl GraphClient {
                     r#type: filter.types.to_vec(),
                     op: filter.ops.to_vec(),
                 });
-                let mut response = request.send().await?;
+                let mut response = http.send(request).await?;
                 let status = response.status();
                 if !status.is_success() {
                     let text = response.text().await?;
@@ -860,7 +874,7 @@ impl GraphClient {
                 );
                 // One attempt only. A lost response may follow a committed
                 // load or a created branch; neither can be replayed blindly.
-                let response = request.send().await?;
+                let response = http.send(request).await?;
                 let output: GraphBatchLoadOutput =
                     remote_response_json_bounded(response, token.as_deref(), *response_limit)
                         .await?;
@@ -1525,7 +1539,7 @@ impl GraphClient {
                     branch: Some(branch.to_string()),
                     type_names: type_names.to_vec(),
                 });
-                let mut response = request.send().await?;
+                let mut response = http.send(request).await?;
                 let status = response.status();
                 if !status.is_success() {
                     let text = response.text().await?;
@@ -1601,9 +1615,12 @@ impl GraphClient {
                 }
             }
             GraphClient::Remote {
-                base_url, token, ..
+                http,
+                base_url,
+                token,
+                ..
             } => {
-                let http = build_blob_http_client()?;
+                let http = http.blob_delivery()?;
                 let mut request = apply_bearer_token(
                     http.request(Method::GET, blob_url(base_url, query)?),
                     token.as_deref(),
@@ -1611,10 +1628,7 @@ impl GraphClient {
                 if let Some(range) = range {
                     request = request.header(RANGE, range.header_value());
                 }
-                let mut response = request
-                    .send()
-                    .await
-                    .map_err(|_| color_eyre::eyre::eyre!("Blob server request failed"))?;
+                let mut response = http.send(request).await.map_err(blob_transport_error)?;
                 let status = response.status();
                 if status == StatusCode::FOUND {
                     let (uri, _snapshot_id) = external_response_headers(response.headers())?;
@@ -1684,16 +1698,17 @@ impl GraphClient {
                 }
             }
             GraphClient::Remote {
-                base_url, token, ..
+                http,
+                base_url,
+                token,
+                ..
             } => {
-                let http = build_blob_http_client()?;
-                let response = apply_bearer_token(
+                let http = http.blob_delivery()?;
+                let request = apply_bearer_token(
                     http.request(Method::HEAD, blob_url(base_url, query)?),
                     token.as_deref(),
-                )
-                .send()
-                .await
-                .map_err(|_| color_eyre::eyre::eyre!("Blob server request failed"))?;
+                );
+                let response = http.send(request).await.map_err(blob_transport_error)?;
                 match response.status() {
                     StatusCode::OK => {
                         let headers = managed_response_headers(response.headers())?;
@@ -1857,6 +1872,267 @@ mod tests {
     use crate::managed_http_fixture::{IntentApiFixture, IntentReply};
     use serde_json::json;
 
+    fn contract_reply(status: u16, body: Value) -> IntentReply {
+        let mut reply = IntentReply::json(status, body);
+        reply.headers.push((
+            omnigraph_api_types::HTTP_API_CONTRACT_HEADER.into(),
+            omnigraph_api_types::HTTP_API_CONTRACT.into(),
+        ));
+        reply
+    }
+
+    #[tokio::test]
+    async fn graph_http_discovery_refuses_before_data_dispatch() {
+        use omnigraph_api_types::HTTP_API_CONTRACT_HEADER as HEADER;
+
+        let target = IntentApiFixture::new(vec![]);
+        for managed in [false, true] {
+            for (status, headers) in [
+                (200, vec![]),
+                (200, vec![(HEADER.into(), "0.11".into())]),
+                (200, vec![(HEADER.into(), "0.12, 0.12".into())]),
+                (
+                    200,
+                    vec![
+                        (HEADER.into(), "0.12".into()),
+                        (HEADER.into(), "0.12".into()),
+                    ],
+                ),
+                (503, vec![(HEADER.into(), "0.12".into())]),
+                (
+                    302,
+                    vec![
+                        (HEADER.into(), "0.12".into()),
+                        ("Location".into(), target.origin.clone()),
+                    ],
+                ),
+            ] {
+                let server = IntentApiFixture::new(vec![IntentReply {
+                    status,
+                    headers,
+                    body: b"secret untrusted body".to_vec(),
+                }]);
+                let http = if managed {
+                    GraphHttpClient::managed(&server.origin)
+                } else {
+                    GraphHttpClient::new(&server.origin)
+                }
+                .unwrap();
+                let error = remote_json::<Value>(
+                    &http,
+                    Method::POST,
+                    format!("{}/graphs/knowledge/change", server.origin),
+                    Some(json!({"query":"mutation m() {}"})),
+                    Some("secret-bearer"),
+                )
+                .await
+                .unwrap_err();
+                let contract = error.downcast_ref::<ApiContractError>().unwrap();
+                assert!(!contract.request_dispatched);
+                assert_eq!(contract.http_status, Some(status));
+                assert!(!format!("{error:?}").contains("secret"));
+                let requests = server.requests();
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].method, "HEAD");
+                assert_eq!(requests[0].path, "/healthz");
+                assert!(!requests[0].headers.contains_key("authorization"));
+                server.assert_complete();
+            }
+        }
+        assert!(
+            target.requests().is_empty(),
+            "discovery never follows redirects"
+        );
+        let server = IntentApiFixture::new(vec![IntentReply::json(200, json!(null))]);
+        let scope = crate::scope::ResolvedScope {
+            server: Some(server.origin.clone()),
+            ..Default::default()
+        };
+        let error = require_graph_for_multi_graph_server(&scope)
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<ApiContractError>().is_some());
+        server.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn graph_http_discovery_keeps_proxy_prefix_and_probes_every_request() {
+        let server = IntentApiFixture::new(vec![
+            contract_reply(200, json!(null)),
+            contract_reply(200, json!({"one": 1})),
+            contract_reply(204, json!(null)),
+            contract_reply(200, json!({"two": 2})),
+        ]);
+        let endpoint = format!("{}/proxy/graphs/front/", server.origin);
+        let client = GraphClient::managed(&endpoint, "knowledge", "data-bearer".into()).unwrap();
+        for expected in [json!({"one":1}), json!({"two":2})] {
+            let value: Value = client
+                .invoke_named("read", false, None, None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(value, expected);
+        }
+        let requests = server.requests();
+        assert_eq!(requests.len(), 4);
+        for pair in requests.chunks_exact(2) {
+            assert_eq!(pair[0].method, "HEAD");
+            assert_eq!(pair[0].path, "/proxy/graphs/front/healthz");
+            assert!(!pair[0].headers.contains_key("authorization"));
+            assert_eq!(
+                pair[1].path,
+                "/proxy/graphs/front/graphs/knowledge/queries/read"
+            );
+            assert_eq!(pair[1].headers["authorization"], "Bearer data-bearer");
+            assert_eq!(
+                pair[1].headers[omnigraph_api_types::HTTP_API_CONTRACT_HEADER],
+                "0.12"
+            );
+        }
+        server.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn graph_http_discovery_has_its_own_five_second_bound() {
+        let server = IntentApiFixture::with_response_delay(
+            vec![contract_reply(200, json!(null))],
+            std::time::Duration::from_millis(5_250),
+        );
+        let http = GraphHttpClient::new(&server.origin).unwrap();
+        let started = std::time::Instant::now();
+        let error = remote_json::<Value>(
+            &http,
+            Method::GET,
+            format!("{}/graphs", server.origin),
+            None,
+            Some("secret"),
+        )
+        .await
+        .unwrap_err();
+        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let contract = error.downcast_ref::<ApiContractError>().unwrap();
+        assert!(!contract.request_dispatched);
+        assert_eq!(contract.http_status, None);
+        server.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn graph_http_checks_json_ndjson_and_streams_before_exposing_any_body() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "{}\n").unwrap();
+        let blob = BlobReadQuery {
+            entity: omnigraph_api_types::BlobEntityKind::Node,
+            r#type: "Document".into(),
+            id: "document-one".into(),
+            property: "data".into(),
+            branch: None,
+            snapshot: None,
+        };
+        for form in [
+            "json",
+            "ndjson",
+            "baseline",
+            "export",
+            "blob-get",
+            "blob-head",
+        ] {
+            for dispatched in [false, true] {
+                let mut replies = Vec::new();
+                if dispatched {
+                    replies.push(contract_reply(200, json!(null)));
+                }
+                replies.push(IntentReply {
+                    status: 200,
+                    headers: vec![],
+                    body: b"untrusted body must not escape\n".to_vec(),
+                });
+                let server = IntentApiFixture::new(replies);
+                let client =
+                    GraphClient::managed(&server.origin, "knowledge", "data-bearer".into())
+                        .unwrap();
+                let mut output = Vec::new();
+                let result = match form {
+                    "json" => client
+                        .invoke_named::<Value>("write", true, None, None, None, None)
+                        .await
+                        .map(|_| ()),
+                    "ndjson" => client
+                        .load(
+                            "main",
+                            None,
+                            file.path().to_str().unwrap(),
+                            CliLoadMode::Append,
+                            &[],
+                        )
+                        .await
+                        .map(|_| ()),
+                    "baseline" => client
+                        .change_baseline(
+                            None,
+                            &ChangeFilterArgs {
+                                kinds: &[],
+                                types: &[],
+                                ops: &[],
+                            },
+                            &mut output,
+                        )
+                        .await
+                        .map(|_| ()),
+                    "export" => client.export("main", &[], &mut output).await,
+                    "blob-get" => client.blob_get(&blob, None, &mut output).await,
+                    "blob-head" => client.blob_stat(&blob).await.map(|_| ()),
+                    _ => unreachable!(),
+                };
+                let error = result.unwrap_err();
+                let contract = error
+                    .downcast_ref::<ApiContractError>()
+                    .unwrap_or_else(|| panic!("{form}: {error:?}"));
+                assert_eq!(contract.request_dispatched, dispatched, "{form}");
+                assert_eq!(contract.http_status, Some(200));
+                assert!(
+                    output.is_empty(),
+                    "{form} must validate before writing any bytes"
+                );
+                assert_eq!(
+                    server.requests().len(),
+                    if dispatched { 2 } else { 1 },
+                    "{form}"
+                );
+                server.assert_complete();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn graph_http_does_not_follow_or_retry_data_responses() {
+        let target = IntentApiFixture::new(vec![]);
+        for status in [302, 429, 503] {
+            let mut reply = contract_reply(status, json!({"error":"stop"}));
+            reply
+                .headers
+                .push(("Location".into(), target.origin.clone()));
+            let server = IntentApiFixture::graph(vec![reply]);
+            let http = GraphHttpClient::new(&server.origin).unwrap();
+            let error = remote_json::<Value>(
+                &http,
+                Method::POST,
+                format!("{}/graphs/knowledge/change", server.origin),
+                Some(json!({})),
+                Some("data-bearer"),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.downcast_ref::<RemoteErrorCli>().is_some());
+            assert_eq!(
+                server.requests().len(),
+                2,
+                "one discovery and one data request"
+            );
+            server.assert_complete();
+        }
+        assert!(target.requests().is_empty());
+    }
+
     #[tokio::test]
     async fn managed_mutations_use_thirty_second_deadline_without_retrying() {
         // Exercise every mutation request owner through actual HTTP. Receipts
@@ -1896,7 +2172,7 @@ mod tests {
                         "merge": "fast_forward"
                     });
                 }
-                let server = IntentApiFixture::with_response_delay(
+                let server = IntentApiFixture::graph_with_response_delay(
                     vec![IntentReply::json(200, reply)],
                     delay,
                 );
@@ -1971,7 +2247,7 @@ mod tests {
                         );
                         assert!(started.elapsed() >= std::time::Duration::from_secs(30));
                     }
-                    let requests = server.requests();
+                    let requests = server.workflow_requests();
                     assert_eq!(requests.len(), 1, "{form} must not retry");
                     assert_eq!(requests[0].path, path);
                     assert_eq!(
@@ -2021,7 +2297,7 @@ mod tests {
                             "graph_commit_id": "head"
                         }),
                     };
-                    let server = IntentApiFixture::with_response_delay(
+                    let server = IntentApiFixture::graph_with_response_delay(
                         vec![IntentReply::json(200, reply.clone())],
                         delay,
                     );
@@ -2090,7 +2366,7 @@ mod tests {
                             assert!(started.elapsed() >= std::time::Duration::from_secs(10));
                             assert_eq!(output, reply);
                         }
-                        let requests = server.requests();
+                        let requests = server.workflow_requests();
                         assert_eq!(requests.len(), 1, "read must not retry");
                         assert_eq!(requests[0].path, path);
                         assert_eq!(
@@ -2197,7 +2473,7 @@ mod tests {
             "source": "review", "target": "main", "outcome": "merged",
             "actor_id": "principal:alice"
         });
-        let server = IntentApiFixture::new(vec![
+        let server = IntentApiFixture::graph(vec![
             IntentReply::json(200, read),
             IntentReply::json(200, change.clone()),
             IntentReply::json(200, change),
@@ -2238,7 +2514,7 @@ mod tests {
             .await
             .unwrap();
 
-        let requests = server.requests();
+        let requests = server.workflow_requests();
         assert_eq!(requests.len(), 4);
         let field = json!({"merge_lineage": "off", "ann_nprobes": 1});
         assert_eq!(requests[0].path, "/graphs/knowledge/query");

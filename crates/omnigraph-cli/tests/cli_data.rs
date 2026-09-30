@@ -2,9 +2,6 @@
 //! Moved verbatim from tests/cli.rs in the modularization.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
-use std::sync::mpsc;
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -2240,39 +2237,22 @@ fn mutate_if_commit_lost_cas_exits_4_embedded_issue_365() {
     assert_eq!(parse_stdout_json(&verify)["rows"][0]["p.age"], 31);
 }
 
-/// A conditional remote mutation must advertise the capability in its path,
-/// not only in an optional header. An older server can ignore an unknown
-/// header after executing `/change` or `/mutate`; it cannot accidentally run a
-/// route it does not have, so the new CLI must receive 404 before any mutation
-/// handler is reachable.
+/// An older server cannot establish the v0.12 HTTP contract. Discovery must
+/// stop even a conditional mutation before its data request is dispatched.
 #[test]
 fn remote_if_commit_fails_closed_against_an_older_server() {
     const SET_AGE: &str = "query set_age($name: String, $age: I32) { update Person set { age: $age } where name = $name }";
 
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let (line_tx, line_rx) = mpsc::channel();
-    let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut reader = BufReader::new(stream);
-        let mut request_line = String::new();
-        reader.read_line(&mut request_line).unwrap();
-        line_tx.send(request_line).unwrap();
-        let body = r#"{"error":"not found"}"#;
-        write!(
-            reader.get_mut(),
-            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        )
-        .unwrap();
-        reader.get_mut().flush().unwrap();
-    });
+    use support::managed_http::{IntentApiFixture, IntentReply};
+    let server = IntentApiFixture::new(vec![IntentReply::json(
+        404,
+        serde_json::json!({"error":"not found"}),
+    )]);
 
     let output = cli()
         .arg("mutate")
         .arg("--server")
-        .arg(format!("http://{address}"))
+        .arg(&server.origin)
         .arg("--graph")
         .arg("legacy")
         .arg("-e")
@@ -2285,12 +2265,19 @@ fn remote_if_commit_fails_closed_against_an_older_server() {
         .output()
         .unwrap();
     assert!(!output.status.success(), "an old server must fail closed");
-    server.join().unwrap();
+    let error = parse_stdout_json(&output);
+    assert_eq!(error["code"], "api_contract_mismatch");
+    assert_eq!(error["http_status"], 404);
+    assert_eq!(error["request_dispatched"], false);
+    let requests = server.requests();
     assert_eq!(
-        line_rx.recv().unwrap().trim_end(),
-        "POST /graphs/legacy/mutate/if-graph-commit HTTP/1.1",
-        "the CLI must not send a conditional write to an older server's ordinary mutation route"
+        requests.len(),
+        1,
+        "the CLI must not send any data request to an older server"
     );
+    assert_eq!(requests[0].method, "HEAD");
+    assert_eq!(requests[0].path, "/healthz");
+    server.assert_complete();
 }
 
 #[test]
@@ -2341,7 +2328,7 @@ fn remote_json_errors_preserve_server_codes_and_details() {
             &[&["--json"]]
         };
         for format in formats {
-            let server = IntentApiFixture::new(vec![IntentReply::json(status, body.clone())]);
+            let server = IntentApiFixture::graph(vec![IntentReply::json(status, body.clone())]);
             let output = cli()
                 .env_remove("OMNIGRAPH_BEARER_TOKEN")
                 .args(["--server", &server.origin, "--graph", "knowledge"])
@@ -2371,6 +2358,86 @@ fn remote_json_errors_preserve_server_codes_and_details() {
 }
 
 #[test]
+fn remote_response_contract_errors_preserve_status_and_hide_untrusted_bodies() {
+    use omnigraph_api_types::HTTP_API_CONTRACT_HEADER as HEADER;
+    use support::managed_http::{IntentApiFixture, IntentReply};
+
+    for (status, headers) in [
+        (200, vec![]),
+        (403, vec![(HEADER.into(), "0.11".into())]),
+        (503, vec![(HEADER.into(), "0.12, 0.12".into())]),
+        (
+            200,
+            vec![
+                (HEADER.into(), "0.12".into()),
+                (HEADER.into(), "0.12".into()),
+            ],
+        ),
+    ] {
+        for arguments in [
+            vec!["mutate", "write"],
+            vec!["mutate", "write", "--json"],
+            vec!["query", "read", "--format", "json"],
+            vec!["query", "read", "--format", "jsonl"],
+        ] {
+            let server = IntentApiFixture::new(vec![
+                IntentReply {
+                    status: 200, headers: vec![(HEADER.into(), "0.12".into())], body: vec![],
+                },
+                IntentReply {
+                    status, headers: headers.clone(),
+                    body: br#"{"error":"untrusted-secret-body","code":"forbidden","rows":[{"success":true}]}"#.to_vec(),
+                },
+            ]);
+            let mut command = cli();
+            command
+                .env_remove("OMNIGRAPH_BEARER_TOKEN")
+                .args(["--server", &server.origin, "--graph", "knowledge"])
+                .args(&arguments);
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            if arguments.len() > 2 {
+                let error = parse_stdout_json(&output);
+                assert_eq!(error["code"], "api_contract_mismatch");
+                assert_eq!(error["http_status"], status);
+                assert_eq!(error["request_dispatched"], true);
+                assert!(
+                    error["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("effects are unknown")
+                );
+                assert!(output.stderr.is_empty());
+                if arguments.last() == Some(&"jsonl") {
+                    assert_eq!(
+                        stdout_string(&output).lines().count(),
+                        1,
+                        "JSONL contract errors must occupy one line"
+                    );
+                }
+            } else {
+                assert!(output.stdout.is_empty());
+                let error = String::from_utf8_lossy(&output.stderr);
+                assert!(error.contains("effects are unknown"), "{error}");
+                assert!(error.contains(&format!("HTTP {status}")), "{error}");
+            }
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("untrusted-secret-body"));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("untrusted-secret-body"));
+            let requests = server.requests();
+            assert_eq!(
+                requests.len(),
+                2,
+                "no retry or fallback after response mismatch"
+            );
+            assert_eq!(requests[0].method, "HEAD");
+            assert_eq!(requests[0].path, "/healthz");
+            assert_eq!(requests[1].headers[HEADER], "0.12");
+            server.assert_complete();
+        }
+    }
+}
+
+#[test]
 fn remote_human_and_invalid_json_errors_remain_diagnostics() {
     use support::managed_http::{IntentApiFixture, IntentReply};
 
@@ -2386,7 +2453,7 @@ fn remote_human_and_invalid_json_errors_remain_diagnostics() {
             "server returned 403",
         ),
     ] {
-        let server = IntentApiFixture::new(vec![IntentReply {
+        let server = IntentApiFixture::graph(vec![IntentReply {
             status: 403,
             headers: Vec::new(),
             body: body.as_bytes().to_vec(),
@@ -2535,26 +2602,35 @@ fn positional_http_uri_on_a_data_verb_is_rejected() {
 
 #[test]
 fn as_on_a_served_write_is_rejected() {
-    // RFC-011: a served write resolves the actor from the bearer token, so --as
-    // cannot set identity. It errors while building the remote client — before
-    // any HTTP call, so no server is needed.
-    let output = output_failure(
-        cli()
+    use support::managed_http::IntentApiFixture;
+
+    // A served write resolves the actor from the bearer token. Refuse --as
+    // before both discovery and the optional no-graph registry probe.
+    let server = IntentApiFixture::new(vec![]);
+    for graph in [None, Some("knowledge")] {
+        let mut command = cli();
+        command
             .arg("mutate")
             .arg("--server")
-            .arg("http://127.0.0.1:1")
+            .arg(&server.origin)
             .arg("--as")
             .arg("act-nope")
             .arg("-e")
             .arg("query add($name: String) { insert Person { name: $name } }")
             .arg("--params")
-            .arg(r#"{"name":"X"}"#),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("`--as` is not allowed on a served write"),
-        "expected --as-served rejection; got: {stderr}"
-    );
+            .arg(r#"{"name":"X"}"#);
+        if let Some(graph) = graph {
+            command.args(["--graph", graph]);
+        }
+        let output = output_failure(&mut command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("`--as` is not allowed on a served write"),
+            "expected --as-served rejection; got: {stderr}"
+        );
+    }
+    assert!(server.requests().is_empty());
+    server.assert_complete();
 }
 
 #[test]

@@ -1,6 +1,7 @@
 //! Server settings loading and mode inference (single vs multi).
 //! Moved verbatim from tests/server.rs in the modularization.
 
+use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::fs;
 
 use axum::Router;
@@ -416,6 +417,7 @@ mod multi_graph_startup {
                 .clone()
                 .oneshot(
                     Request::builder()
+                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                         .method(Method::GET)
                         .uri(format!("/graphs/{id}/snapshot?branch=main"))
                         .body(Body::empty())
@@ -439,6 +441,7 @@ mod multi_graph_startup {
         let resp = app
             .oneshot(
                 Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                     .method(Method::GET)
                     .uri("/graphs/nonexistent/snapshot?branch=main")
                     .body(Body::empty())
@@ -509,6 +512,7 @@ mod multi_graph_startup {
                 .map(|s| Body::from(s.to_string()))
                 .unwrap_or_else(Body::empty);
             let req = Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .method(method.clone())
                 .uri(*path)
                 .header("content-type", "application/json")
@@ -570,6 +574,7 @@ mod multi_graph_startup {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                     .method(Method::POST)
                     .uri("/graphs/alpha/branches")
                     .header("content-type", "application/json")
@@ -592,6 +597,7 @@ mod multi_graph_startup {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                     .method(Method::DELETE)
                     .uri("/graphs/alpha/branches/feature")
                     .body(Body::empty())
@@ -618,6 +624,7 @@ mod multi_graph_startup {
         let commit_resp = app
             .oneshot(
                 Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                     .method(Method::GET)
                     .uri("/graphs/alpha/commits/0000000000000000")
                     .body(Body::empty())
@@ -647,6 +654,7 @@ mod multi_graph_startup {
         let resp = app
             .oneshot(
                 Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                     .method(Method::GET)
                     .uri("/snapshot?branch=main")
                     .body(Body::empty())
@@ -737,6 +745,7 @@ mod multi_graph_startup {
         let resp = app
             .oneshot(
                 Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                     .method(Method::GET)
                     .uri("/graphs")
                     .body(Body::empty())
@@ -782,6 +791,7 @@ mod multi_graph_startup {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                     .method(Method::GET)
                     .uri("/graphs")
                     .body(Body::empty())
@@ -796,6 +806,7 @@ mod multi_graph_startup {
         let resp_authed = app
             .oneshot(
                 Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                     .method(Method::GET)
                     .uri("/graphs")
                     .header("authorization", "Bearer secret-token")
@@ -875,6 +886,7 @@ rules:
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                     .method(Method::GET)
                     .uri("/graphs")
                     .header("authorization", "Bearer andrew-token")
@@ -903,6 +915,7 @@ rules:
         let resp_viewer = app
             .oneshot(
                 Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                     .method(Method::GET)
                     .uri("/graphs")
                     .header("authorization", "Bearer bruno-token")

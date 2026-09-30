@@ -2,8 +2,6 @@ mod support;
 
 use std::fs;
 
-use omnigraph::db::Omnigraph;
-use reqwest::blocking::Client;
 use serde_json::json;
 
 use support::*;
@@ -79,7 +77,7 @@ query insert_person($name: String, $age: I32) {
 "#,
     )
     .unwrap();
-    let client = Client::new();
+    let client = graph_http_client();
 
     let health = client
         .get(format!("{}/healthz", server.base_url))
@@ -263,15 +261,62 @@ query insert_person($name: String, $age: I32) {
     );
 }
 
+/// Compare the served schema and every branch snapshot around a refused apply.
+/// This observes the existing server handle without opening another writer.
+fn assert_cluster_schema_apply_refused(server: &TestServer, schema: &std::path::Path) {
+    let read = |arguments: &[&str]| {
+        parse_stdout_json(&output_success(
+            cli()
+                .args(["--server", &server.base_url, "--graph", GRAPH_ID])
+                .args(arguments)
+                .arg("--json"),
+        ))
+    };
+    let state = || {
+        let schema = read(&["schema", "show"]);
+        let inventory = read(&["branch", "list"]);
+        let mut branches: Vec<_> = inventory["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|branch| branch.as_str().unwrap().to_string())
+            .collect();
+        branches.sort();
+        let snapshots: Vec<_> = branches
+            .iter()
+            .map(|branch| read(&["snapshot", "--branch", branch]))
+            .collect();
+        (schema, branches, snapshots)
+    };
+    let before = state();
+    let output = output_failure(
+        cli()
+            .args(["--server", &server.base_url, "--graph", GRAPH_ID])
+            .args(["schema", "apply", "--schema"])
+            .arg(schema)
+            .arg("--json"),
+    );
+    let refusal = parse_stdout_json(&output);
+    assert_eq!(refusal["code"], "conflict", "{refusal}");
+    assert!(
+        refusal["error"]
+            .as_str()
+            .unwrap()
+            .contains("server-side schema apply is disabled for cluster-backed serving"),
+        "{refusal}"
+    );
+    assert_eq!(
+        state(),
+        before,
+        "refusal must preserve schema and graph state"
+    );
+}
+
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
-fn remote_schema_apply_via_cli_updates_graph() {
+fn remote_schema_apply_refuses_additive_change_for_cluster_backed_graph() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
-    let served_root = cluster
-        .path()
-        .join("graphs")
-        .join(format!("{GRAPH_ID}.omni"));
     let temp = tempfile::tempdir().unwrap();
     let next_schema = temp.path().join("next.pg");
     fs::write(
@@ -283,34 +328,12 @@ fn remote_schema_apply_via_cli_updates_graph() {
     )
     .unwrap();
 
-    let payload = parse_stdout_json(&output_success(
-        cli()
-            .arg("schema")
-            .arg("apply")
-            .arg("--server")
-            .arg(&server.base_url)
-            .arg("--graph")
-            .arg(GRAPH_ID)
-            .arg("--schema")
-            .arg(&next_schema)
-            .arg("--json"),
-    ));
-    assert_eq!(payload["applied"], true);
-
-    let db = tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(Omnigraph::open(served_root.to_string_lossy().as_ref()))
-        .unwrap();
-    assert!(
-        db.catalog().node_types["Person"]
-            .properties
-            .contains_key("nickname")
-    );
+    assert_cluster_schema_apply_refused(&server, &next_schema);
 }
 
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
-fn remote_schema_apply_rejects_unsupported_plan() {
+fn remote_schema_apply_refuses_incompatible_change_for_cluster_backed_graph() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
     let temp = tempfile::tempdir().unwrap();
@@ -323,32 +346,16 @@ fn remote_schema_apply_rejects_unsupported_plan() {
     )
     .unwrap();
 
-    let output = output_failure(
-        cli()
-            .arg("schema")
-            .arg("apply")
-            .arg("--server")
-            .arg(&server.base_url)
-            .arg("--graph")
-            .arg(GRAPH_ID)
-            .arg("--schema")
-            .arg(&breaking_schema),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("changing property type"),
-        "expected unsupported-plan error, got: {stderr}"
-    );
+    assert_cluster_schema_apply_refused(&server, &breaking_schema);
 }
 
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
-fn remote_schema_apply_rejects_when_non_main_branch_exists() {
+fn remote_schema_apply_refuses_branched_cluster_backed_graph() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
 
-    // Create a non-main branch over the served path so the schema-apply
-    // single-branch precondition fails.
+    // The cluster-backed refusal applies before schema-plan or branch checks.
     output_success(
         cli()
             .arg("branch")
@@ -373,22 +380,7 @@ fn remote_schema_apply_rejects_when_non_main_branch_exists() {
     )
     .unwrap();
 
-    let output = output_failure(
-        cli()
-            .arg("schema")
-            .arg("apply")
-            .arg("--server")
-            .arg(&server.base_url)
-            .arg("--graph")
-            .arg(GRAPH_ID)
-            .arg("--schema")
-            .arg(&next_schema),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("schema apply requires a graph with only main"),
-        "expected single-branch precondition error, got: {stderr}"
-    );
+    assert_cluster_schema_apply_refused(&server, &next_schema);
 }
 
 #[test]
@@ -1041,12 +1033,14 @@ query insert_person($name: String, $age: I32) {
             .arg(r#"{"name":"PolicyRemote","age":41}"#)
             .arg("--json"),
     );
-    let denied_main_stderr = String::from_utf8(denied_main_change.stderr).unwrap();
+    let denied_main = parse_stdout_json(&denied_main_change);
+    assert_eq!(denied_main["code"], "forbidden");
+    let denied_main_message = denied_main["error"].as_str().unwrap();
     assert!(
-        denied_main_stderr.contains("denied")
-            && denied_main_stderr.contains("change")
-            && denied_main_stderr.contains("main"),
-        "expected change-on-main denial, got: {denied_main_stderr}"
+        denied_main_message.contains("denied")
+            && denied_main_message.contains("change")
+            && denied_main_message.contains("main"),
+        "expected change-on-main denial, got: {denied_main}"
     );
 
     // bruno can create an unprotected branch.
@@ -1102,10 +1096,12 @@ query insert_person($name: String, $age: I32) {
             .arg("main")
             .arg("--json"),
     );
-    let denied_merge_stderr = String::from_utf8(denied_merge.stderr).unwrap();
+    let denied_merge = parse_stdout_json(&denied_merge);
+    assert_eq!(denied_merge["code"], "forbidden");
+    let denied_merge_message = denied_merge["error"].as_str().unwrap();
     assert!(
-        denied_merge_stderr.contains("denied") && denied_merge_stderr.contains("branch_merge"),
-        "expected branch_merge denial, got: {denied_merge_stderr}"
+        denied_merge_message.contains("denied") && denied_merge_message.contains("branch_merge"),
+        "expected branch_merge denial, got: {denied_merge}"
     );
 
     // ragnor (admins) can promote into protected main.
