@@ -37,7 +37,7 @@ pub mod registry;
 pub mod route;
 pub mod source;
 
-pub use bound::{BoundPlan, ValueTable};
+pub use bound::{BOUND_PLAN_VERSION, BoundPlan, ValueTable};
 pub use cost::{
     AccessPath, CSR_BUILD_FACTOR, ExpandCostInputs, ExpandMode, ExpandPolicy,
     HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, IndexCoverage, choose_access_path, choose_expand_mode,
@@ -51,7 +51,9 @@ pub use logical::{
     Census, ColumnRef, JoinKind, KeyJoinKind, LogicalId, LogicalKind, LogicalNode, LogicalPlan,
     Predicate, RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, SearchArm,
 };
-pub use lower::{ContainsJoinFields, ExpandFields, HashJoinFields, Lower, SortMergeJoinFields};
+pub use lower::{
+    ContainsJoinFields, ExpandFields, HashJoinFields, Lower, RankFuseFields, SortMergeJoinFields,
+};
 pub use operation::{Operation, PageBudgetSpec, ScopeSpec, Side, TableRef};
 pub use optimizer::{Bounds, physical_plan, rewrite};
 pub use physical::{

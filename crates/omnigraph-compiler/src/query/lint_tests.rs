@@ -400,28 +400,33 @@ match {
 }
 return { $p.name }
 }
+
+
 "#,
         "/tmp/queries.gq",
         QueryLintSchemaSource::file("/tmp/schema.pg"),
     );
 
-    assert_eq!(
-        output.results[0].operation.as_ref().unwrap().reads,
-        vec![
-            QueryGraphFact {
-                kind: QueryGraphFactKind::Node,
-                type_name: "Company".to_string(),
-            },
-            QueryGraphFact {
-                kind: QueryGraphFactKind::Node,
-                type_name: "Person".to_string(),
-            },
-            QueryGraphFact {
-                kind: QueryGraphFactKind::Edge,
-                type_name: "WorksAt".to_string(),
-            },
-        ]
-    );
+    assert_eq!(output.results.len(), 1);
+    for result in &output.results {
+        assert_eq!(
+            result.operation.as_ref().unwrap().reads,
+            vec![
+                QueryGraphFact {
+                    kind: QueryGraphFactKind::Node,
+                    type_name: "Company".to_string(),
+                },
+                QueryGraphFact {
+                    kind: QueryGraphFactKind::Node,
+                    type_name: "Person".to_string(),
+                },
+                QueryGraphFact {
+                    kind: QueryGraphFactKind::Edge,
+                    type_name: "WorksAt".to_string(),
+                },
+            ]
+        );
+    }
 }
 
 #[test]
@@ -578,4 +583,42 @@ return {
             "nullable": false
         })
     );
+}
+
+#[test]
+fn selected_scopes_contribute_every_read_fact_issue_659() {
+    let schema = catalog(
+        "node Person { name: String } node Company { name: String } edge WorksAt: Person -> Company edge Employs: Company -> Person",
+    );
+    for selector in ["(worksAt | employs)", "*"] {
+        let output = lint_query_file(
+            &schema,
+            &format!(
+                "query q() {{ match {{ $p: Person not {{ $p {selector} $c $c: Company }} }} return {{ $p.name }} }}"
+            ),
+            "/tmp/queries.gq",
+            QueryLintSchemaSource::file("/tmp/schema.pg"),
+        );
+        assert_eq!(
+            output.results[0].operation.as_ref().unwrap().reads,
+            vec![
+                QueryGraphFact {
+                    kind: QueryGraphFactKind::Node,
+                    type_name: "Company".into()
+                },
+                QueryGraphFact {
+                    kind: QueryGraphFactKind::Node,
+                    type_name: "Person".into()
+                },
+                QueryGraphFact {
+                    kind: QueryGraphFactKind::Edge,
+                    type_name: "Employs".into()
+                },
+                QueryGraphFact {
+                    kind: QueryGraphFactKind::Edge,
+                    type_name: "WorksAt".into()
+                },
+            ]
+        );
+    }
 }

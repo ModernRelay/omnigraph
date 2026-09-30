@@ -12,6 +12,41 @@ use serial_test::serial;
 mod support;
 use support::*;
 
+#[tokio::test(flavor = "multi_thread")]
+async fn stored_wildcard_keeps_both_authorization_gates_issue_659() {
+    let source = r#"query neighbors() {
+        match { $p: Person { name: "Alice" } $f: Person $p * $f }
+        return { $f.name }
+    }"#;
+    let (_temp, app) = app_with_stored_queries(
+        &[("neighbors", source, false)],
+        &[
+            ("act-invoke", "t-invoke"),
+            ("act-noinvoke", "t-noinvoke"),
+            ("act-invokeonly", "t-invokeonly"),
+        ],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let (missing_status, missing_body) = json_response(
+        &app,
+        invoke_request("does_not_exist", "t-invoke", json!({})),
+    )
+    .await;
+    let (hidden_status, hidden_body) =
+        json_response(&app, invoke_request("neighbors", "t-noinvoke", json!({}))).await;
+    assert_eq!(missing_status, StatusCode::NOT_FOUND);
+    assert_eq!(hidden_status, StatusCode::NOT_FOUND);
+    assert_eq!(hidden_body, missing_body);
+    let (status, body) =
+        json_response(&app, invoke_request("neighbors", "t-invokeonly", json!({}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) =
+        json_response(&app, invoke_request("neighbors", "t-invoke", json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["row_count"], 2);
+}
+
 #[tokio::test]
 async fn signed_stored_invocation_requires_both_outer_and_inner_grants() {
     let tokens = data_tokens::DataTokens::new();

@@ -1,0 +1,581 @@
+# issue: 659
+# red_on: 7f1233bb
+# notes: Bound rows preserve concrete edge identity and order equal IDs by type; unbound rows use distinct endpoints.
+# notes: Recursive members share shortest distances; incoming-only paths distinguish undirected traversal.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+node Doc {
+    slug: String @key
+}
+edge Knows: Person -> Person {
+    weight: I64
+    since: I32?
+}
+edge Likes: Person -> Person {
+    weight: I64?
+}
+edge Owns: Person -> Doc
+
+--- seed
+{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"c"}}
+{"type":"Person","data":{"name":"d"}}
+{"type":"Person","data":{"name":"e"}}
+{"type":"Doc","data":{"slug":"doc"}}
+{"edge":"Knows","id":"shared","from":"a","to":"b","data":{"weight":1}}
+{"edge":"Knows","id":"ab2","from":"a","to":"b","data":{"weight":2}}
+{"edge":"Knows","id":"ac","from":"a","to":"c","data":{"weight":3}}
+{"edge":"Knows","id":"loop","from":"a","to":"a","data":{"weight":4}}
+{"edge":"Knows","id":"de","from":"d","to":"e","data":{"weight":5}}
+{"edge":"Likes","id":"shared","from":"a","to":"b"}
+{"edge":"Likes","id":"bc","from":"b","to":"c","data":{"weight":6}}
+{"edge":"Likes","id":"bd","from":"b","to":"d","data":{"weight":7}}
+{"edge":"Likes","id":"ca","from":"c","to":"a","data":{"weight":8}}
+{"edge":"Owns","id":"document","from":"a","to":"doc"}
+
+
+--- query
+query same_id_edges_have_a_total_order() {
+    match {
+        $from: Person { name: "a" }
+        $from $edge:(knows | likes) $to
+        $edge.@id = "shared"
+    }
+    return { $edge.@type as edge_type, $edge.@id as edge_id }
+    order { $from.name }
+    limit 2
+}
+
+--- expect ordered
+{"edge_type":"Knows","edge_id":"shared"}
+{"edge_type":"Likes","edge_id":"shared"}
+
+--- expect shape
+edge_type: String
+edge_id: String
+
+--- expect plan
+expand $from $to: selection alternation [Knows out, Likes out]
+sort tiebreak [$edge.@type, $edge.@id, $from.@id, $to.@id]
+
+--- query
+query same_id_order_keeps_type_tiebreak() {
+    match {
+        $from: Person { name: "a" }
+        $from $edge:(knows | likes) $to
+        $edge.@id = "shared"
+    }
+    return { $edge.@type as edge_type, $edge.@id as edge_id }
+    order { $edge.@id }
+    limit 1
+}
+
+--- expect ordered
+{"edge_type":"Knows","edge_id":"shared"}
+
+--- expect shape
+edge_type: String
+edge_id: String
+
+--- expect plan
+sort tiebreak [$edge.@type, $from.@id, $to.@id]
+
+--- query
+query same_id_alias_order_keeps_wildcard_type_tiebreak() {
+    match {
+        $from: Person { name: "a" }
+        $to: Person
+        $from $edge:* $to
+        $edge.@id = "shared"
+    }
+    return { $edge.@type as edge_type, $edge.@id as edge_id }
+    order { edge_id }
+    limit 1
+}
+
+--- expect ordered
+{"edge_type":"Knows","edge_id":"shared"}
+
+--- expect shape
+edge_type: String
+edge_id: String
+
+--- expect plan
+expand $from $to: selection wildcard [Knows out, Likes out]
+sort tiebreak [$edge.@type, $from.@id, $to.@id]
+
+--- query
+query union_explicit_one() {
+    match {
+        $from: Person { name: "a" }
+        $from (knows | likes){1,1} $to
+    }
+    return { $to.name as destination }
+}
+
+--- expect unordered
+{"destination":"a"}
+{"destination":"b"}
+{"destination":"c"}
+
+--- expect shape
+destination: String
+
+--- query
+query wildcard_default() {
+    match {
+        $from: Person { name: "a" }
+        $to: Person
+        $from * $to
+    }
+    return { $to.name as destination }
+}
+
+--- expect unordered
+{"destination":"a"}
+{"destination":"b"}
+{"destination":"c"}
+
+--- expect shape
+destination: String
+
+--- query
+query wildcard_explicit_one() {
+    match {
+        $from: Person { name: "a" }
+        $to: Person
+        $from *{1,1} $to
+    }
+    return { $to.name as destination }
+}
+
+--- expect unordered
+{"destination":"a"}
+{"destination":"b"}
+{"destination":"c"}
+
+--- expect shape
+destination: String
+
+--- query
+query undirected_union_default() {
+    match {
+        $from: Person { name: "e" }
+        $from <knows | likes> $to
+    }
+    return { $to.name as destination }
+}
+
+--- expect unordered
+{"destination":"d"}
+
+--- expect shape
+destination: String
+
+--- query
+query undirected_union_explicit_one() {
+    match {
+        $from: Person { name: "e" }
+        $from <knows | likes>{1,1} $to
+    }
+    return { $to.name as destination }
+}
+
+--- expect unordered
+{"destination":"d"}
+
+--- expect shape
+destination: String
+
+--- query
+query undirected_wildcard_default() {
+    match {
+        $from: Person { name: "e" }
+        $to: Person
+        $from <*> $to
+    }
+    return { $to.name as destination }
+}
+
+--- expect unordered
+{"destination":"d"}
+
+--- expect shape
+destination: String
+
+--- query
+query undirected_wildcard_explicit_one() {
+    match {
+        $from: Person { name: "e" }
+        $to: Person
+        $from <*>{1,1} $to
+    }
+    return { $to.name as destination }
+}
+
+--- expect unordered
+{"destination":"d"}
+
+--- expect shape
+destination: String
+
+--- query
+query duplicate_members() {
+    match {
+        $from: Person { name: "a" }
+        $from (knows | kNOWS | likes | likes) $to
+    }
+    return { $to.name as destination }
+}
+
+--- expect unordered
+{"destination":"a"}
+{"destination":"b"}
+{"destination":"c"}
+
+--- expect shape
+destination: String
+
+--- query
+query wildcard_mixed_path() {
+    match {
+        $from: Person { name: "a" }
+        $to: Person
+        $from *{3,3} $to
+    }
+    return { $to.name as destination }
+}
+
+--- expect unordered
+{"destination":"e"}
+
+--- expect shape
+destination: String
+
+--- query
+query bound_union_explicit_one() {
+    match {
+        $from: Person { name: "a" }
+        $from $edge:(knows | likes){1,1} $to
+    }
+    return { $edge.@type as edge_type, $edge.@id as edge_id }
+}
+
+--- expect unordered
+{"edge_type":"Knows","edge_id":"shared"}
+{"edge_type":"Knows","edge_id":"ab2"}
+{"edge_type":"Knows","edge_id":"ac"}
+{"edge_type":"Knows","edge_id":"loop"}
+{"edge_type":"Likes","edge_id":"shared"}
+
+--- expect shape
+edge_type: String
+edge_id: String
+
+--- query
+query bound_wildcard_explicit_one() {
+    match {
+        $from: Person { name: "a" }
+        $to: Person
+        $from $edge:*{1,1} $to
+    }
+    return { $edge.@type as edge_type, $edge.@id as edge_id }
+}
+
+--- expect unordered
+{"edge_type":"Knows","edge_id":"shared"}
+{"edge_type":"Knows","edge_id":"ab2"}
+{"edge_type":"Knows","edge_id":"ac"}
+{"edge_type":"Knows","edge_id":"loop"}
+{"edge_type":"Likes","edge_id":"shared"}
+
+--- expect shape
+edge_type: String
+edge_id: String
+
+--- query
+query bound_undirected_union() {
+    match {
+        $from: Person { name: "a" }
+        $from $edge:<knows | likes> $to
+    }
+    return { $edge.@type as edge_type, $edge.@id as edge_id }
+}
+
+--- expect unordered
+{"edge_type":"Knows","edge_id":"shared"}
+{"edge_type":"Knows","edge_id":"ab2"}
+{"edge_type":"Knows","edge_id":"ac"}
+{"edge_type":"Knows","edge_id":"loop"}
+{"edge_type":"Likes","edge_id":"shared"}
+{"edge_type":"Likes","edge_id":"ca"}
+
+--- expect shape
+edge_type: String
+edge_id: String
+
+--- query
+query bound_undirected_wildcard() {
+    match {
+        $from: Person { name: "a" }
+        $to: Person
+        $from $edge:<*> $to
+    }
+    return { $edge.@type as edge_type, $edge.@id as edge_id }
+}
+
+--- expect unordered
+{"edge_type":"Knows","edge_id":"shared"}
+{"edge_type":"Knows","edge_id":"ab2"}
+{"edge_type":"Knows","edge_id":"ac"}
+{"edge_type":"Knows","edge_id":"loop"}
+{"edge_type":"Likes","edge_id":"shared"}
+{"edge_type":"Likes","edge_id":"ca"}
+
+--- expect shape
+edge_type: String
+edge_id: String
+
+--- query
+query count_distinct_neighbors() {
+    match {
+        $from: Person { name: "a" }
+        count { $from (knows | likes) $to } = 3
+    }
+    return { $from.name as name }
+}
+
+--- expect unordered
+{"name":"a"}
+
+--- expect shape
+name: String
+
+--- query
+query count_physical_edges() {
+    match {
+        $from: Person { name: "a" }
+        count { $from $edge:(knows | likes) $to } = 5
+    }
+    return { $from.name as name }
+}
+
+--- expect unordered
+{"name":"a"}
+
+--- expect shape
+name: String
+
+--- query
+query exists_mixed_path() {
+    match {
+        $from: Person { name: "a" }
+        exists { $from (knows | likes){3,3} $to }
+    }
+    return { $from.name as name }
+}
+
+--- expect unordered
+{"name":"a"}
+
+--- expect shape
+name: String
+
+--- query
+query not_mixed_path() {
+    match {
+        $from: Person { name: "a" }
+        not { $from (knows | likes){4,4} $to }
+    }
+    return { $from.name as name }
+}
+
+--- expect unordered
+{"name":"a"}
+
+--- expect shape
+name: String
+
+--- query
+query huge_finite_bound_before_selection() {
+    match {
+        $a: Person { name: "a" }
+        $b: Person { name: "b" }
+        $a knows{1,4294967295} $b
+        $b (knows | likes) $c
+    }
+    return { $c.name as destination }
+}
+
+--- expect unordered
+{"destination":"c"}
+{"destination":"d"}
+
+--- expect shape
+destination: String
+
+--- query
+query named_type_count_preserves_parallel_edges() {
+    match { $a: Person { name: "a" } $a $e:knows $b }
+    return { count($e.@type) as total }
+}
+--- expect unordered
+{"total":4}
+--- expect shape
+total: I64
+
+--- query
+query type_filter_selects_one_member() {
+    match { $a: Person { name: "a" } $a $e:(knows | likes) $b $e.@type = "Likes" }
+    return { $b.name as destination, $e.@id as edge_id }
+}
+--- expect unordered
+{"destination":"b","edge_id":"shared"}
+--- expect shape
+destination: String
+edge_id: String
+
+--- query
+query group_by_concrete_type() {
+    match { $a: Person { name: "a" } $a $e:(knows | likes) $b }
+    return { $e.@type as kind, count($e.@id) as total }
+}
+--- expect unordered
+{"kind":"Knows","total":4}
+{"kind":"Likes","total":1}
+--- expect shape
+kind: String
+total: I64
+
+--- query
+query type_metadata_inside_count_block() {
+    match { $a: Person { name: "a" } count($e.@type) { $a $e:(knows | likes) $b $e.@type = "Likes" } = 1 }
+    return { $a.name as name }
+}
+--- expect unordered
+{"name":"a"}
+--- expect shape
+name: String
+
+--- query
+query undirected_recursive_alternation() {
+    match { $a: Person { name: "e" } $b: Person $a <knows | likes>{1,3} $b }
+    return { $b.name as destination }
+}
+--- expect unordered
+{"destination":"d"}
+{"destination":"b"}
+{"destination":"a"}
+{"destination":"c"}
+--- expect shape
+destination: String
+--- expect plan
+expand $a $b: selection alternation [Knows both, Likes both]
+
+--- query
+query undirected_recursive_wildcard() {
+    match { $a: Person { name: "e" } $b: Person $a <*>{2,3} $b }
+    return { $b.name as destination }
+}
+--- expect unordered
+{"destination":"b"}
+{"destination":"a"}
+{"destination":"c"}
+--- expect shape
+destination: String
+--- expect plan
+expand $a $b: selection wildcard [Knows both, Likes both]
+
+--- query
+query source_cycle_without_self_loop() {
+    match { $a: Person { name: "b" } $a (knows | likes){1,3} $b }
+    return { $b.name as destination }
+}
+--- expect unordered
+{"destination":"a"}
+{"destination":"c"}
+{"destination":"d"}
+{"destination":"e"}
+--- expect shape
+destination: String
+
+--- query
+query named_unprojected_type_order() {
+    match { $a: Person { name: "a" } $a $e:knows $b }
+    return { $b.name as destination }
+    order { $e.@type }
+    limit 1
+}
+--- expect ordered
+{"destination":"a"}
+--- expect shape
+destination: String
+--- expect plan
+sort tiebreak [$a.@id, $b.@id, $e.@id]
+
+--- query
+query singleton_selection_type_order() {
+    match { $a: Person { name: "a" } $a $e:(knows | knows) $b }
+    return { $b.name as destination }
+    order { $e.@type }
+    limit 1
+}
+--- expect ordered
+{"destination":"a"}
+--- expect shape
+destination: String
+--- expect plan
+sort tiebreak [$a.@id, $b.@id, $e.@type, $e.@id]
+
+--- query
+query named_aliased_type_order() {
+    match { $a: Person { name: "a" } $a $e:knows $b }
+    return { $e.@type as kind, $b.name as destination }
+    order { kind }
+    limit 1
+}
+--- expect ordered
+{"kind":"Knows","destination":"a"}
+--- expect shape
+kind: String
+destination: String
+--- expect plan
+sort tiebreak [$a.@id, $b.@id, $e.@id]
+
+--- query
+query named_constant_only_order() {
+    match { $a: Person { name: "a" } $a $e:knows $b }
+    return { $e.@type as kind }
+    order { $e.@type }
+    limit 1
+}
+--- expect ordered
+{"kind":"Knows"}
+--- expect shape
+kind: String
+--- expect plan
+sort no tiebreak
+
+--- query
+query named_type_aggregate_order() {
+    match { $a: Person { name: "a" } $a $e:knows $b }
+    return { count($e.@type) as total }
+    order { count($e.@type) }
+    limit 1
+}
+--- expect unordered
+{"total":4}
+--- expect shape
+total: I64
+--- expect plan
+sort no tiebreak

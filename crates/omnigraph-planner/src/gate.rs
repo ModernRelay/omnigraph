@@ -33,10 +33,14 @@ struct Recorded<'s> {
 }
 
 impl<'s> Recorded<'s> {
-    fn new(source: &'s dyn PlanSource) -> Self {
+    fn new(source: &'s dyn PlanSource, has_wildcard_traversal: bool) -> Self {
+        let read = Assumptions {
+            has_wildcard_traversal,
+            ..Assumptions::default()
+        };
         Self {
             source,
-            read: RefCell::new(Assumptions::default()),
+            read: RefCell::new(read),
         }
     }
 
@@ -134,6 +138,12 @@ impl PlanSource for Recorded<'_> {
             .settings
             .insert("traversal".to_string(), traversal.as_str().to_string());
         traversal
+    }
+
+    fn traversal_work_limit(&self) -> Option<u64> {
+        let limit = self.source.traversal_work_limit();
+        self.read.borrow_mut().traversal_work_limit = limit;
+        limit
     }
 
     /// Recorded as the setting spells it: `0` is no cap.
@@ -305,7 +315,7 @@ pub fn plan_query(
     bounds: &Bounds,
 ) -> Result<PhysicalPlan, Unrouted> {
     let operation = Operation::Query(Box::new(query.clone()));
-    let recorded = Recorded::new(source);
+    let recorded = Recorded::new(source, query.has_wildcard_traversal());
     let mut logical = resolve(&operation, &recorded).map_err(Unrouted::of)?;
     crate::optimizer::optimize(&mut logical, &recorded, bounds)
         .map(|mut optimized| {
@@ -329,7 +339,8 @@ pub fn route(
     bounds: &Bounds,
 ) -> Decision {
     let operation = OperationSummary::of(op);
-    let recorded = Recorded::new(source);
+    let wildcard = matches!(op, Operation::Query(query) if query.has_wildcard_traversal());
+    let recorded = Recorded::new(source, wildcard);
     let source = &recorded;
     let mut plan = match resolve(op, source) {
         Ok(plan) => plan,

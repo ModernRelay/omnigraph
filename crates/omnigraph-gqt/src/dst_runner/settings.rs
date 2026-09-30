@@ -158,6 +158,7 @@ mod tests {
                 "OMNIGRAPH_MERGE_LINEAGE",
                 "OMNIGRAPH_ANN_NPROBES",
                 "OMNIGRAPH_LOAD_CONCURRENCY",
+                "OMNIGRAPH_TRAVERSAL_WORK_LIMIT",
             ] {
                 assert!(
                     settings

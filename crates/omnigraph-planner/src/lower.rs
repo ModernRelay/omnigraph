@@ -8,24 +8,33 @@ use std::collections::HashSet;
 
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
 use omnigraph_compiler::query::ast::CompOp;
-use omnigraph_compiler::types::Direction;
+use omnigraph_compiler::traversal::EdgeSelection;
 
 use crate::cost::{AccessPath, ExpandMode, ExpandPolicy};
 use crate::error::PlanError;
-use crate::logical::{KeyJoinKind, ScanSpec};
+use crate::logical::{ColumnRef, KeyJoinKind, ScanSpec};
 use crate::physical::{NodeId, PhysicalNode, PhysicalPlan, RankArm, RankedAccess, ScanInput};
 
 #[cfg(doc)]
 use crate::physical::RankKind;
 use crate::source::SideId;
 
+/// The configuration of a [`PhysicalNode::RankFuse`] beside its two inputs.
+#[derive(Debug, Clone, Copy)]
+pub struct RankFuseFields<'p> {
+    pub arms: &'p [RankArm; 2],
+    pub k: Option<&'p IRExpr>,
+    pub limit: Option<usize>,
+    pub row_tiebreak: &'p [ColumnRef],
+}
+
 /// The fields of [`PhysicalNode::Expand`] beside its input.
 #[derive(Debug, Clone, Copy)]
 pub struct ExpandFields<'p> {
     pub src: &'p str,
     pub dst: &'p str,
-    pub edge_type: &'p str,
-    pub direction: Direction,
+    pub edges: &'p EdgeSelection,
+    pub src_type: &'p str,
     pub dst_type: &'p str,
     pub min_hops: u32,
     pub max_hops: Option<u32>,
@@ -197,9 +206,7 @@ pub trait Lower {
     fn rank_fuse(
         &mut self,
         id: NodeId,
-        arms: &[RankArm; 2],
-        k: Option<&IRExpr>,
-        limit: Option<usize>,
+        fields: RankFuseFields<'_>,
         primary: Self::Op,
         secondary: Self::Op,
     ) -> Result<Self::Op, Self::Error>;
@@ -218,14 +225,15 @@ pub trait Lower {
         input: Self::Op,
     ) -> Result<Self::Op, Self::Error>;
 
-    /// `tiebreak` names the bindings whose ids the sort appends after
-    /// `order_by`, name-sorted; the scans project those ids.
+    /// `tiebreak` names the metadata columns the sort appends after
+    /// `order_by`, in binding order with selected-edge type before identity;
+    /// projections retain each declared key until the sort consumes it.
     fn sort(
         &mut self,
         id: NodeId,
         order_by: &[IROrdering],
         fetch: Option<usize>,
-        tiebreak: &[String],
+        tiebreak: &[ColumnRef],
         input: Self::Op,
     ) -> Result<Self::Op, Self::Error>;
 
@@ -417,8 +425,8 @@ impl PhysicalPlan {
                 input,
                 src,
                 dst,
-                edge_type,
-                direction,
+                edges,
+                src_type,
                 dst_type,
                 min_hops,
                 max_hops,
@@ -426,14 +434,14 @@ impl PhysicalPlan {
                 mode,
                 frontier_estimate,
                 policy,
-                version: _,
+                versions: _,
             } => {
                 let input = self.lower_node(*input, l)?;
                 let fields = ExpandFields {
                     src,
                     dst,
-                    edge_type,
-                    direction: *direction,
+                    edges,
+                    src_type,
                     dst_type,
                     min_hops: *min_hops,
                     max_hops: *max_hops,
@@ -456,10 +464,26 @@ impl PhysicalPlan {
                 l.anti_join(id, outer_var, outer, inner)
             }
             PhysicalNode::OuterReference { outer_var } => l.outer_reference(id, outer_var),
-            PhysicalNode::RankFuse { arms, k, limit, .. } => {
+            PhysicalNode::RankFuse {
+                arms,
+                k,
+                limit,
+                row_tiebreak,
+                ..
+            } => {
                 let primary = self.lower_node(arms[0].input, l)?;
                 let secondary = self.lower_node(arms[1].input, l)?;
-                l.rank_fuse(id, arms, k.as_ref(), *limit, primary, secondary)
+                l.rank_fuse(
+                    id,
+                    RankFuseFields {
+                        arms,
+                        k: k.as_ref(),
+                        limit: *limit,
+                        row_tiebreak,
+                    },
+                    primary,
+                    secondary,
+                )
             }
             PhysicalNode::Projection {
                 input,

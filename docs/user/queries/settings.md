@@ -76,6 +76,29 @@ refuses startup; no default is substituted.
 | `merge_lineage` | enum `off`, `on`, `verify` | `on` (a debug build defaults to `verify`) | request | `OMNIGRAPH_MERGE_LINEAGE` | how a merge finds the entities it classifies: the full-scan walk, the lineage path, or both compared |
 | `ann_nprobes` | integer, at least `0` | `20` | request | `OMNIGRAPH_ANN_NPROBES` | the partition cap per index delta of a `nearest` scan; `0` is no cap |
 | `stage_write_concurrency` | integer `1..=64` | `8` | process | `OMNIGRAPH_LOAD_CONCURRENCY` | the width of the staged-write fan-out for `load` and `mutate` |
+| `traversal_work_limit` | integer `1..=9223372036854775807` | `1000000` | request | `OMNIGRAPH_TRAVERSAL_WORK_LIMIT` | shared traversal row-work cap for statements containing alternatives or wildcard |
+
+For these statements the cap covers all traversals, including named and nested
+ones, and remains shared across retries. It charges consumed source rows,
+conservative physical edge rows before each scan, examined adjacency entries
+and bound-edge source replication. Exceeding the cap fails with
+`traversal_work_limit`; a result limit cannot bypass admission. This is a row-work
+bound, not a byte, elapsed-time or total-query CPU/I/O bound. Memory and scratch
+retain their existing limits. The budgeted route uses pinned Lance scans with
+indexed filtering where available.
+
+Sources are admitted in fixed windows of at most 8,192 rows, independent of
+upstream batch boundaries. Each nonempty frontier probe charges the selected
+table's full physical row count before opening the scan. Multiple windows,
+members, directions and hops can therefore charge a table repeatedly. A directed
+one-hop query over selected tables totaling 1,000,000 physical rows exceeds the
+default cap even when its start node has only one neighbor. Index selectivity
+does not reduce this conservative admission charge. The cap does not bound
+index decoding, bytes read, or storage latency.
+
+Internal traversal pins used by the GQT harness can force indexed execution. A
+forced CSR pin is refused for statements with selections; there is no public
+`set traversal` setting.
 
 A name outside the table, a value of the wrong type, and a value outside the
 declared values or range are each refused with the table's row. A `process`
@@ -88,7 +111,7 @@ settings line's refusal as `ERROR line <n>, column <c>: <message>`.
 set merge_lineage = fast;
 error: unknown value `fast` for setting `merge_lineage`; expected one of off, on, verify
 set traversal = csr;                      (likewise reset traversal; and show traversal;)
-error: unknown setting `traversal`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency
+error: unknown setting `traversal`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit
 set ann_nprobes = "many";
 error: setting `ann_nprobes` takes an integer of at least 0, got a string
 set stage_write_concurrency = 0;
