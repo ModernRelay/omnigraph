@@ -3,11 +3,11 @@ rfc: "0047"
 title: "Search plan truth: loud search failures and one total order"
 track: public
 status: draft
-implementation: not-started
+implementation: in-progress
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-01
-updated: 2026-09-29
+updated: 2026-09-30
 discussion: "https://github.com/ModernRelay/omnigraph/pull/791"
 supersedes: []
 superseded_by: []
@@ -122,7 +122,10 @@ catalogue by the change that adds each refusal.
 
 - **HTTP.** A refused query is a `400` whose error body carries an additive
   `diagnostic` object (`code`, `position` or `stage` and `expression`,
-  `expected`, `fix`). A refusal by design is never a `500`; a planner defect
+  `expected`, `fix`, and an optional `suggestion`: byte-range edits of the
+  original source with an `applicability` of `machine_applicable` or
+  `needs_review`, so an agent can apply a repair without parsing prose). A
+  refusal by design is never a `500`; a planner defect
   still is.
 - **CLI.** The human formats print the form above on stderr with no colour
   codes and no backtrace. `--json`, `--format json` and `--format jsonl`
@@ -402,7 +405,7 @@ and closes its issues.
 
 | Step | Delivers | Closes |
 |---|---|---|
-| 1 | Diagnostics contract for parse and type refusals (PR #759) | — |
+| 1 | Diagnostics contract for parse and type refusals (PR #759, merged 2026-09-30) | — |
 | 2 | Planner refusals carry diagnostics; a refusal by design is a bad request | #786 |
 | 3 | `T27` and `FullTextIndexRequired` | #747 |
 | 4 | The ranked binding roots its component; the `rrf()` arms type error | #789 |
@@ -441,3 +444,7 @@ None.
   unresolved question, which asked the engine owner to agree to those
   refusals. The planner-refusal rule of step 2 stays. Every defect this RFC
   names was checked again in code at `baf10c94`.
+- 2026-09-30 — step 1 shipped in PR #759, and `implementation` moved to
+  `in-progress`. The maintainer's review added the optional `suggestion` to
+  the diagnostic: source edits a caller can apply mechanically, marked
+  machine-applicable only after the edited text parses.
