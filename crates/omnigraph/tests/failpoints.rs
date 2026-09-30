@@ -2175,6 +2175,94 @@ async fn same_source_merges_both_land_issue_643() {
     }
 }
 
+/// Issue 643, failure boundary: merge A fails after its table effects,
+/// before its manifest commit, while merge B into an independent target is
+/// parked mid-merge holding its gates and the shared schema permit. A's
+/// target does not move, B still publishes, and A's gates are released: the
+/// same handle retries A to completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn failed_merge_beside_an_independent_merge_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s1", "t1").await;
+    diverged_merge_pair(&db, "s2", "t2").await;
+    let db = std::sync::Arc::new(db);
+    let t1_head = branch_head_commit_id(dir.path(), "t1").await.unwrap();
+    let t1_person = helpers::snapshot_branch(&db, "t1")
+        .await
+        .unwrap()
+        .dataset("node:Person")
+        .unwrap()
+        .published_dataset_version;
+
+    let parked =
+        helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+    let merge_b_db = std::sync::Arc::clone(&db);
+    let merge_b = tokio::spawn(async move { merge_b_db.branch_merge("s2", "t2").await });
+    parked.wait_until_reached().await;
+
+    {
+        let _failpoint = catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            db.branch_merge("s1", "t1"),
+        )
+        .await
+        .expect("A must not wait on B's gates")
+        .expect_err("A must fail at its injected fault");
+        assert!(
+            error.to_string().contains(
+                "injected failpoint triggered: branch_merge.post_phase_b_pre_manifest_commit"
+            ),
+            "A must fail at the injected fault, not earlier: {error}"
+        );
+    }
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "t1").await.unwrap(),
+        t1_head,
+        "the failed merge must not move its target's graph head"
+    );
+    assert_eq!(
+        helpers::snapshot_branch(&db, "t1")
+            .await
+            .unwrap()
+            .dataset("node:Person")
+            .unwrap()
+            .published_dataset_version,
+        t1_person,
+        "the failed merge's table effects must stay unpublished"
+    );
+    assert!(
+        !merge_b.is_finished(),
+        "B must still be parked after A failed"
+    );
+
+    parked.release();
+    assert_eq!(
+        merge_b.await.unwrap().expect("B must merge after release"),
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            db.branch_merge("s1", "t1"),
+        )
+        .await
+        .expect("the failed merge must have released its gates")
+        .expect("the same handle must retry A once the fault stops"),
+        omnigraph::db::MergeOutcome::Merged
+    );
+    for target in ["t1", "t2"] {
+        assert_eq!(
+            helpers::count_rows_branch(&db, target, "node:Person").await,
+            6,
+            "{target} holds the seed rows, its own insert and its source's"
+        );
+    }
+}
+
 /// Branch create takes the schema gate's EXCLUSIVE side: no CAS covers its
 /// namespace inventory, so a sibling create with disjoint branch gates must
 /// wait at the gate, then refuse on the collision the first leaves behind.
