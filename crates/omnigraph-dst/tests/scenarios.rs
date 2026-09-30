@@ -5259,6 +5259,41 @@ fn dst_concurrent_fleet() {
     }
 }
 
+/// Issue 816: two writers on separate handles that load the same `__manifest`
+/// version must not wait on each other outside the arbiter. With a
+/// process-wide control session, Lance's load coalescing parked the second
+/// loader on the first, which was itself queued at the gate, and these seeds
+/// escaped under the seam scheduler. The pin runs each of them once.
+#[test]
+#[serial]
+fn dst_seam_scheduler_seeds_do_not_escape_issue_816() {
+    use omnigraph_dst::concurrent::{ConcurrentScenario, run_concurrent_universe};
+    for seed in [32_004, 32_007, 32_010, 32_015, 32_016, 32_020] {
+        let sc = ConcurrentScenario {
+            seed,
+            writers: 2,
+            ops_per_writer: 8,
+            maintenance_ops: 0,
+            schema_ops: 0,
+            kill_writer: None,
+            branch_cycles: 0,
+            readers: 0,
+            writer_fault_pct: 0,
+            seam_schedule: true,
+            park_deleter_hold: false,
+        };
+        let report = run_concurrent_universe(&format!("shared-memory://dst-816-{seed}"), &sc);
+        assert!(
+            report.sched_turns > 0,
+            "seed {seed}: the gate never granted a turn"
+        );
+        assert_eq!(
+            report.sched_escapes, 0,
+            "seed {seed}: an actor stalled outside the arbiter"
+        );
+    }
+}
+
 /// the seam-granularity deterministic scheduler (the
 /// storage-call arbiter): with `seam_schedule` on, every mutating actor's
 /// adapter call waits at ONE seeded serialization point, so the

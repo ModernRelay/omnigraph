@@ -16,18 +16,27 @@ static STORE_REGISTRY: LazyLock<Arc<ObjectStoreRegistry>> = LazyLock::new(|| {
     Arc::new(registry)
 });
 
-/// Control-plane session for `__manifest` and other mutable-tip metadata.
+/// Control-plane session for `__manifest` and other mutable-tip metadata on
+/// paths that have no graph handle (initialization, upgrade, one-shot reads).
 ///
 /// Its caches are deliberately disabled. Control paths still share the
 /// process-wide object-store clients, but they cannot retain mutable-tip
-/// metadata across branch-recreation boundaries.
-static CONTROL_SESSION: LazyLock<Arc<Session>> =
-    LazyLock::new(|| Arc::new(Session::new(0, 0, Arc::clone(&STORE_REGISTRY))));
+/// metadata across branch-recreation boundaries. A graph handle uses its own
+/// session of the same shape (`LanceAccessContext::new`).
+static CONTROL_SESSION: LazyLock<Arc<Session>> = LazyLock::new(zero_cache_control_session);
+
+fn zero_cache_control_session() -> Arc<Session> {
+    Arc::new(Session::new(0, 0, Arc::clone(&STORE_REGISTRY)))
+}
 
 /// The split Lance access context for one graph handle.
 ///
 /// Data tables use a graph-scoped cached session. Control-plane metadata uses a
-/// zero-cache session. Both share the same object-store registry/client pool.
+/// zero-cache session of its own. Both share the same object-store
+/// registry/client pool. The control session is per handle, not the
+/// process-wide one: its caches hold nothing, but Lance still coalesces
+/// concurrent loads of one key, so a shared session made one handle's
+/// `__manifest` load wait on another handle's.
 #[derive(Clone)]
 pub struct LanceAccessContext {
     data_session: Arc<Session>,
@@ -48,7 +57,7 @@ impl LanceAccessContext {
                 DEFAULT_METADATA_CACHE_SIZE,
                 Arc::clone(&STORE_REGISTRY),
             )),
-            control_session: Arc::clone(&CONTROL_SESSION),
+            control_session: zero_cache_control_session(),
         }
     }
 
@@ -272,17 +281,27 @@ pub mod object_store_seam {
 mod tests {
     use super::*;
 
+    /// Each context owns its sessions and shares only the store registry. The
+    /// control session is per context too: a process-wide one let Lance's
+    /// load coalescing make one handle's `__manifest` load wait on another's
+    /// (issue 816).
     #[test]
-    fn data_and_control_sessions_share_only_the_store_registry() {
+    fn data_and_control_sessions_share_only_the_store_registry_issue_816() {
         let first = LanceAccessContext::new();
         let second = LanceAccessContext::new();
 
         let first_data = first.data_session();
         let second_data = second.data_session();
         let control = first.control_session();
+        let second_control = second.control_session();
 
         assert!(!Arc::ptr_eq(&first_data, &control));
         assert!(!Arc::ptr_eq(&first_data, &second_data));
+        assert!(!Arc::ptr_eq(&control, &second_control));
+        assert!(Arc::ptr_eq(
+            &control.store_registry(),
+            &second_control.store_registry()
+        ));
         assert!(Arc::ptr_eq(
             &first_data.store_registry(),
             &control.store_registry()
