@@ -455,6 +455,73 @@ async fn parked_writer_blocks_schema_apply() {
     assert_eq!(count_rows(&db, "node:Person").await, 5);
 }
 
+/// Issue 643, schema-apply boundary, and the merge's tripwire (the writer's
+/// is `parked_writer_blocks_schema_apply`): a merge parked before its
+/// manifest commit holds its SHARED schema permit, so a schema apply waits at
+/// the exclusive side. Past the gate the apply refuses at once, because the
+/// merge's source branch exists, so an apply that returns while the merge is
+/// parked means the merge let its permit go early. After the merge publishes,
+/// the apply refuses and the merge's result is intact.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn parked_merge_blocks_schema_apply_issue_643() {
+    use omnigraph::seams::catalog;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("s").await.unwrap();
+    for (branch, name, age) in [("s", "On-s", 61), ("main", "On-main", 62)] {
+        db.mutate(
+            branch,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", name)], &[("$age", age)]),
+        )
+        .await
+        .unwrap();
+    }
+    let db = Arc::new(db);
+    let desired = TEST_SCHEMA.replace("    age: I32?\n}", "    age: I32?\n    motto: String?\n}");
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let merge_db = Arc::clone(&db);
+    let merge = tokio::spawn(async move { merge_db.branch_merge("s", "main").await });
+    parked.wait_until_reached().await;
+
+    let schema_db = Arc::clone(&db);
+    let mut schema_task = tokio::spawn(async move { schema_db.apply_schema(&desired).await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut schema_task)
+            .await
+            .is_err(),
+        "schema apply must wait behind a merge's held shared schema permit; it \
+         answered while the merge was parked",
+    );
+
+    parked.release();
+    assert_eq!(
+        merge
+            .await
+            .unwrap()
+            .expect("the merge must publish after release"),
+        omnigraph::db::MergeOutcome::Merged
+    );
+    let refusal = schema_task
+        .await
+        .unwrap()
+        .expect_err("schema apply refuses while the merge's source branch exists");
+    assert!(
+        refusal
+            .to_string()
+            .contains("schema apply requires a graph with only main"),
+        "{refusal}"
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, 6);
+}
+
 /// ReadOnly opens participate in the process-local schema publication gate even
 /// though they perform no recovery writes. Park an open immediately before its
 /// source/IR/state read: schema apply must not reach staging until that coherent
