@@ -729,6 +729,30 @@ pub fn s3_test_graph_uri(suite: &str) -> Option<String> {
 /// `Document { title: String @key, content: Blob? }`. Returns the table URI.
 #[cfg(feature = "failpoints")]
 pub async fn seed_ranged_external_blob_row(db: &Omnigraph, uri: &str) -> String {
+    write_ranged_external_blob_row(db, uri, 4, 8).await
+}
+
+/// Replace the `ranged` row written by [`seed_ranged_external_blob_row`] with
+/// one naming the same object through another byte range, in one graph
+/// commit. Call it before any engine write to `Document`: it writes the
+/// table's linear head, which is the published version only until then.
+#[cfg(feature = "failpoints")]
+pub async fn replace_ranged_external_blob_range(
+    db: &Omnigraph,
+    uri: &str,
+    offset: u64,
+    size: u64,
+) -> String {
+    write_ranged_external_blob_row(db, uri, offset, size).await
+}
+
+#[cfg(feature = "failpoints")]
+async fn write_ranged_external_blob_row(
+    db: &Omnigraph,
+    uri: &str,
+    offset: u64,
+    size: u64,
+) -> String {
     use arrow_array::ArrayRef;
     use lance::blob::{BlobDescriptorArrayBuilder, BlobRange};
 
@@ -741,10 +765,16 @@ pub async fn seed_ranged_external_blob_row(db: &Omnigraph, uri: &str) -> String 
         .clone();
     let table_uri = format!("{uri}/{}", entry.dataset_path);
     let mut raw = lance::Dataset::open(&table_uri).await.unwrap();
+    assert_eq!(
+        raw.version().version,
+        entry.published_dataset_version,
+        "the ranged-descriptor fixture writes the linear head, which must be the published version"
+    );
+    raw.delete("__id = 'ranged'").await.unwrap();
     let logical_schema = arrow_schema::Schema::from(raw.schema());
     let mut descriptor_builder = BlobDescriptorArrayBuilder::new("content");
     descriptor_builder
-        .push_external("s3://bucket/object", Some(BlobRange { offset: 4, size: 8 }))
+        .push_external("s3://bucket/object", Some(BlobRange { offset, size }))
         .unwrap();
     let (descriptor_field, descriptor) = descriptor_builder.finish().unwrap().into_parts();
     let schema = Arc::new(arrow_schema::Schema::new_with_metadata(

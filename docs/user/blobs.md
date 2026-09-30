@@ -52,9 +52,10 @@ range of an object. Export writes an external reference as a bare URI, which
 reloads as the whole object, so export refuses a ranged reference instead of
 widening it. The change-feed baseline is an export and refuses it too.
 Change-feed images and entity reads by id are not reloaded, so they describe
-it exactly, as `{"uri": …, "offset": …, "length": …}` (`length` is null when
-the range runs to the end of the object), without reading the object; the feed
-passes the commit that holds it like any other.
+it exactly, as `{"uri": …, "offset": …, "length": …}` with a positive
+`length`, without reading the object; the feed passes the commit that holds it
+like any other. A stored descriptor with an offset but no length is refused as
+a Blob integrity error.
 
 OmniGraph never deletes the object named by an external reference.
 

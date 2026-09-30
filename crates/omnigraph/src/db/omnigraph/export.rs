@@ -699,12 +699,18 @@ pub(crate) async fn logical_row_image(
         image.entry(name).or_insert(serde_json::Value::Null);
     }
     for (name, reference) in ranged {
+        // The descriptor decoder gives every ranged reference a positive
+        // length: it refuses an offset with size 0, and offset 0 with size 0
+        // is the whole object, never ranged.
+        let length = reference.length.ok_or_else(|| {
+            OmniError::manifest_internal("a ranged external Blob reference carries no length")
+        })?;
         image.insert(
             name,
             serde_json::json!({
                 "uri": reference.uri,
                 "offset": reference.offset,
-                "length": reference.length,
+                "length": length,
             }),
         );
     }

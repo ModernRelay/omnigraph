@@ -1,7 +1,8 @@
 # issue: none
 # notes: A constant whose result is null (`$age > 30` with `$age` null) writes a null to a nullable property and
 # notes: selects no row as an inline match; assigned to a non-nullable property it is the typed error naming the property, raised before the batch.
-# notes: A null parameter assigned to a non-nullable Blob is the same typed error, raised before the table is scanned.
+# notes: A null parameter assigned to a non-nullable Blob is the same typed error, raised before the table is scanned:
+# notes: a predicate that matches no row still refuses, where resolving after the scan would report zero affected rows.
 
 --- runner
 timeout_ms: 10000
@@ -38,6 +39,16 @@ query null_on_non_nullable_blob($slug: String, $body: Blob?) {
 
 --- params
 {"slug": "a", "body": null}
+
+--- expect error: cannot assign null to non-nullable property 'body' of Person
+
+--- mutate
+query null_on_non_nullable_blob_matching_no_row($slug: String, $body: Blob?) {
+    update Person set { body: $body } where slug = $slug
+}
+
+--- params
+{"slug": "nobody", "body": null}
 
 --- expect error: cannot assign null to non-nullable property 'body' of Person
 

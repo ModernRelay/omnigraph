@@ -1163,7 +1163,9 @@ async fn change_feed_detects_same_length_blob_only_update() {
 /// feed must still cross the commit that introduced it: its image describes
 /// the exact reference as `{uri, offset, length}` without contacting the
 /// object (`s3://bucket/object` does not exist), and the cursor advances past
-/// it to the next commit.
+/// it to the next commit. The same holds for a range-only update of the same
+/// URI, whose before and after images carry the two exact ranges, and for its
+/// delete, whose before image carries the last range.
 #[tokio::test]
 #[cfg(feature = "failpoints")]
 async fn change_feed_describes_ranged_external_blob_and_advances_past_it() {
@@ -1187,7 +1189,16 @@ async fn change_feed_describes_ranged_external_blob_and_advances_past_it() {
     let (cursor, _) = boundary_cursor(&now);
 
     helpers::seed_ranged_external_blob_row(&db, uri).await;
+    helpers::replace_ranged_external_blob_range(&db, uri, 16, 3).await;
     let db = helpers::session(db);
+    db.mutate(
+        "main",
+        "query drop_document($title: String) {\n    delete Document where title = $title\n}\n",
+        "drop_document",
+        &helpers::params(&[("$title", "ranged")]),
+    )
+    .await
+    .unwrap();
     db.load(
         "main",
         r#"{"type":"Document","data":{"title":"later","content":"base64:QQ=="}}"#,
@@ -1216,6 +1227,45 @@ async fn change_feed_describes_ranged_external_blob_and_advances_past_it() {
     );
     let (cursor, caught_up) = boundary_cursor(&ranged_page);
     assert!(!caught_up, "the later commit is still unread");
+
+    let first_range = serde_json::json!({"uri": "s3://bucket/object", "offset": 4, "length": 8});
+    let second_range = serde_json::json!({"uri": "s3://bucket/object", "offset": 16, "length": 3});
+    let update_page = db
+        .poll_change_feed(one_commit(cursor))
+        .await
+        .expect("a range-only update must not wedge the feed");
+    assert_eq!(update_page.blocks.len(), 1);
+    let changes = &update_page.blocks[0].changes;
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(changes[0].id, "ranged");
+    assert_eq!(changes[0].op, ChangeOpKind::Update);
+    assert_eq!(
+        changes[0].before.as_ref().unwrap().properties["content"],
+        first_range
+    );
+    assert_eq!(
+        changes[0].after.as_ref().unwrap().properties["content"],
+        second_range
+    );
+    let (cursor, caught_up) = boundary_cursor(&update_page);
+    assert!(!caught_up);
+
+    let delete_page = db
+        .poll_change_feed(one_commit(cursor))
+        .await
+        .expect("deleting a ranged row must not wedge the feed");
+    assert_eq!(delete_page.blocks.len(), 1);
+    let changes = &delete_page.blocks[0].changes;
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(changes[0].id, "ranged");
+    assert_eq!(changes[0].op, ChangeOpKind::Delete);
+    assert_eq!(
+        changes[0].before.as_ref().unwrap().properties["content"],
+        second_range
+    );
+    assert!(changes[0].after.is_none());
+    let (cursor, caught_up) = boundary_cursor(&delete_page);
+    assert!(!caught_up);
 
     let later_page = db.poll_change_feed(one_commit(cursor)).await.unwrap();
     assert_eq!(later_page.blocks.len(), 1);
