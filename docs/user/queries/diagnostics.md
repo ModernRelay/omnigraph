@@ -13,6 +13,7 @@ fix names the decision instead.
 | `stage` and `expression` | For a refusal after parsing: the compiler stage (`typecheck`) and, when the site can render it, the expression it refused. |
 | `expected` | What was expected or violated, one line, without a position. |
 | `fix` | One concrete fix, absent when `expected` names the decision. |
+| `suggestion` | Optional source edits with `applicability`, plus `start`, `end` and `replacement` for each edit. |
 
 The one-line `error` text is the code and the expectation in the legacy form
 (`parse error: …`, `type error: T33: …`); the other fields travel beside it.
@@ -34,6 +35,39 @@ error[Q002]: parse error: expected `(`: a query declares its parameters even whe
 Earlier releases reported this at the file's first position as `expected
 query_file`.
 
+## Typed suggestions
+
+The `fix` remains human-readable guidance. When the compiler can propose a
+specific edit, `suggestion` carries it as data. For example, this source:
+
+```text
+query name { match { $p: Person } return { $p.name } }
+```
+
+receives this suggestion alongside Q002:
+
+```json
+{
+  "applicability": "machine_applicable",
+  "edits": [{ "start": 10, "end": 10, "replacement": "()" }]
+}
+```
+
+Ranges use zero-based UTF-8 byte offsets in the exact original request source,
+with an exclusive `end`. Equal offsets insert text. Ranges do not overlap;
+apply multiple edits from the highest offset to the lowest. Do not apply an
+edit to a source that has changed since the request.
+
+`machine_applicable` means the compiler has enough evidence for this local
+correction. `needs_review` means the caller must review the proposed change.
+Neither value guarantees that the corrected query will pass every check;
+validate it again. The compiler does not apply suggestions automatically.
+
+Q002 offers the `()` insertion only when the edited file matches the grammar
+without another missing-parameter recovery. Incomplete or ambiguous input can
+still receive textual guidance while omitting `suggestion`. Missing suggestions
+do not mean there is no possible fix.
+
 ## Where the fields appear
 
 - **CLI, human formats** (`table`, `kv`, `csv`): the form above on stderr,
@@ -49,9 +83,11 @@ query_file`.
   `line <n>, column <c>`; type errors report their `T…` code. See
   [Linting](index.md#linting).
 - **`queries validate --json` and `cluster plan --json`**: each breakage or
-  `query_typecheck_error` diagnostic carries the same object as `diagnostic`
-  or `detail`, so a stored query the next release would refuse is a
-  pre-upgrade finding.
+  query parse/typecheck failure carries the same diagnostic information as
+  `diagnostic` or `detail`, so a stored query the next release would refuse
+  is a pre-upgrade finding. Cluster `detail` uses the compiler shape: `message`
+  and a nested `stage` object. API and validation output use `expected` and
+  separate `stage`/`expression` fields.
 
 ```json
 {
@@ -73,7 +109,7 @@ query_file`.
 | `Q001` | The source does not match the grammar at the reported position; `expected` names the grammar rules the parser could accept there. |
 | `Q002` | A query declaration is missing its parameter list. |
 | `Q003` | A settings statement is refused: unknown setting, value outside its row, or a process setting in a request. |
-| `Q004` | A branch or show statement is misplaced or malformed. |
+| `Q004` | A branch, show or explain statement is misplaced or malformed. |
 | `Q005` | A declaration body is refused; `expected` names the construct. |
 
 Type codes are listed where the construct they guard is described, in

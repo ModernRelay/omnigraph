@@ -942,6 +942,9 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "FullTextIndexRebuildRequiredOutput",
     "DiagnosticOutput",
     "PositionOutput",
+    "SuggestionOutput",
+    "ApplicabilityOutput",
+    "TextEditOutput",
     "EntityKindOutput",
     "ChangeFeedGapOutput",
     "ChangeOpOutput",
@@ -1357,9 +1360,25 @@ fn error_output_schema_has_expected_fields() {
         .map(|field| field.as_str().unwrap())
         .collect();
     assert_eq!(required, HashSet::from(["code", "expected"]));
-    for field in ["position", "stage", "expression", "fix"] {
+    for field in ["position", "stage", "expression", "fix", "suggestion"] {
         assert!(details["properties"].get(field).is_some(), "{field}");
     }
+    for (name, fields) in [
+        ("SuggestionOutput", vec!["applicability", "edits"]),
+        ("TextEditOutput", vec!["start", "end", "replacement"]),
+    ] {
+        let required: HashSet<&str> = doc["components"]["schemas"][name]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field.as_str().unwrap())
+            .collect();
+        assert_eq!(required, fields.into_iter().collect(), "{name}");
+    }
+    assert_eq!(
+        doc["components"]["schemas"]["ApplicabilityOutput"]["enum"],
+        serde_json::json!(["machine_applicable", "needs_review"])
+    );
     for path in [
         "/graphs/{graph_id}/query",
         "/graphs/{graph_id}/read",

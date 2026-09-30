@@ -5357,7 +5357,11 @@ fn query_discovery_rejects_duplicates_and_parse_errors() {
         out.diagnostics
     );
 
-    fs::write(dir.path().join("broken.gq"), "query {{{ nope").unwrap();
+    fs::write(
+        dir.path().join("broken.gq"),
+        "query broken { match { $p: Person } return { $p.name } }",
+    )
+    .unwrap();
     fs::write(
         dir.path().join("cluster.yaml"),
         "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries: ./broken.gq\n",
@@ -5365,12 +5369,18 @@ fn query_discovery_rejects_duplicates_and_parse_errors() {
     .unwrap();
     let out = validate_config_dir(dir.path());
     assert!(!out.ok);
-    assert!(
-        out.diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "query_parse_error"),
-        "{:?}",
-        out.diagnostics
+    let diagnostic = out
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "query_parse_error")
+        .unwrap();
+    let detail = diagnostic.detail.as_ref().unwrap();
+    assert_eq!(detail.code.as_str(), "Q002");
+    assert_eq!(detail.position.unwrap().byte, 12);
+    let json = serde_json::to_value(diagnostic).unwrap();
+    assert_eq!(
+        json["detail"]["suggestion"]["edits"][0]["replacement"],
+        "()"
     );
 }
 

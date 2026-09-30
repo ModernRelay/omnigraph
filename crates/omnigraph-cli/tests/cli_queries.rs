@@ -1257,7 +1257,11 @@ fn queries_validate_graph_filter_selects_one_graph() {
 #[test]
 fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
     let (_temp, graph) = loaded_graph();
-    let refused = "query name {";
+    let refused = "query name { match { $p: Person } return { $p.name } }";
+    let suggestion = serde_json::json!({
+        "applicability": "machine_applicable",
+        "edits": [{"start": 10, "end": 10, "replacement": "()"}]
+    });
 
     let json = parse_stdout_json(&output_failure(
         embedded("query", &graph)
@@ -1273,6 +1277,7 @@ fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
     assert_eq!(json["diagnostic"]["fix"], "query name()");
     assert_eq!(json["diagnostic"]["position"]["line"], 1);
     assert_eq!(json["diagnostic"]["position"]["column"], 11);
+    assert_eq!(json["diagnostic"]["suggestion"], suggestion);
     assert!(
         json.get("code").is_none(),
         "an embedded refusal has no HTTP code: {json}"
@@ -1294,6 +1299,7 @@ fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
     );
     let line: Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(line["diagnostic"]["code"], "Q002");
+    assert_eq!(line["diagnostic"]["suggestion"], suggestion);
 
     let human = output_failure(embedded("query", &graph).arg("-e").arg(refused));
     let stderr = stderr_string(&human);
@@ -1322,6 +1328,7 @@ fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
     ));
     assert_eq!(json["code"], "bad_request");
     assert_eq!(json["diagnostic"]["code"], "Q002");
+    assert_eq!(json["diagnostic"]["suggestion"], suggestion);
     assert_eq!(json["diagnostic"]["fix"], "query name()");
     let served_human = output_failure(served("query", &server).arg("-e").arg(refused));
     let stderr = stderr_string(&served_human);

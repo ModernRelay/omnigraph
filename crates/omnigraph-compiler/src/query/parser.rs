@@ -7,7 +7,7 @@ use crate::settings::{SessionSettings, SessionSettingsError, SettingId, SettingV
 
 use super::ast::*;
 use super::codes::{Q001, Q002, Q003, Q004, Q005};
-use super::diagnostic::{Position, QueryDiagnostic};
+use super::diagnostic::{Applicability, Position, QueryDiagnostic, Suggestion, TextEdit};
 
 #[derive(Parser)]
 #[grammar = "query/query.pest"]
@@ -32,16 +32,22 @@ impl NameScope<'_> {
     }
 }
 
-fn reserved_property_error(word: &str) -> CompilerError {
-    CompilerError::Parse(format!(
-        "`{word}` is a reserved word; a property of that name is written `$p.{word}` in a read and cannot be named bare in a mutation `where`"
-    ))
+fn reserved_property_error(at: &pest::iterators::Pair<Rule>) -> CompilerError {
+    let word = at.as_str();
+    query_error_at(
+        format!(
+            "`{word}` is a reserved word; a property of that name is written `$p.{word}` in a read and cannot be named bare in a mutation `where`"
+        ),
+        at,
+    )
 }
 
-fn reserved_alias_error(word: &str) -> CompilerError {
-    CompilerError::Parse(format!(
-        "`{word}` is a reserved word and cannot be a return alias"
-    ))
+fn reserved_alias_error(at: &pest::iterators::Pair<Rule>) -> CompilerError {
+    let word = at.as_str();
+    query_error_at(
+        format!("`{word}` is a reserved word and cannot be a return alias"),
+        at,
+    )
 }
 
 pub fn parse_query(input: &str) -> Result<QueryFile> {
@@ -117,16 +123,37 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Que
                             .into_inner()
                             .find(|part| part.as_rule() == Rule::ident)
                             .expect("grammar: missing_param_list holds an ident");
-                        return Err(QueryDiagnostic::parse(
+                        let byte = name.as_span().end();
+                        let mut diagnostic = QueryDiagnostic::parse(
                             Q002,
                             "expected `(`: a query declares its parameters even when it has none",
-                            Some(Position::at(input, name.as_span().end())),
+                            Some(Position::at(input, byte)),
                         )
-                        .with_fix(format!("query {}()", name.as_str())));
+                        .with_fix(format!("query {}()", name.as_str()));
+                        let mut repaired = input.to_string();
+                        repaired.insert_str(byte, "()");
+                        if QueryParser::parse(Rule::query_file, &repaired).is_ok_and(|pairs| {
+                            !pairs
+                                .flatten()
+                                .any(|p| p.as_rule() == Rule::missing_param_list)
+                        }) {
+                            diagnostic = diagnostic.with_suggestion(Suggestion {
+                                applicability: Applicability::MachineApplicable,
+                                edits: vec![TextEdit {
+                                    start: byte,
+                                    end: byte,
+                                    replacement: "()".to_string(),
+                                }],
+                            });
+                        }
+                        return Err(diagnostic);
                     }
                     Rule::query_decl => {
-                        queries
-                            .push(parse_query_decl(inner).map_err(compiler_error_to_diagnostic)?);
+                        let position = position_of(&inner);
+                        queries.push(
+                            parse_query_decl(inner)
+                                .map_err(|error| compiler_error_to_diagnostic(error, position))?,
+                        );
                     }
                     _ => {}
                 }
@@ -146,7 +173,8 @@ fn parse_explain_stmt(
         .into_inner()
         .find(|inner| inner.as_rule() == Rule::query_decl)
         .expect("grammar: explain_stmt holds one query_decl after kw_explain");
-    parse_query_decl(decl).map_err(compiler_error_to_diagnostic)
+    let position = position_of(&decl);
+    parse_query_decl(decl).map_err(|error| compiler_error_to_diagnostic(error, position))
 }
 
 /// The position of `pair`'s start in the source it was parsed from.
@@ -161,6 +189,10 @@ fn diagnostic_at(
     at: &pest::iterators::Pair<Rule>,
 ) -> QueryDiagnostic {
     QueryDiagnostic::parse(code, message, Some(position_of(at)))
+}
+
+fn query_error_at(message: impl Into<String>, at: &pest::iterators::Pair<Rule>) -> CompilerError {
+    CompilerError::query(diagnostic_at(Q005, message, at))
 }
 
 fn parse_setting_stmt(
@@ -240,9 +272,9 @@ fn parse_setting_value(
                 )
             }),
         Rule::ident => Ok(SettingValue::Ident(token.as_str().to_string())),
-        Rule::string_lit => parse_string_lit(token.as_str())
+        Rule::string_lit => decode_string_literal(token.as_str())
             .map(SettingValue::Str)
-            .map_err(compiler_error_to_diagnostic),
+            .map_err(|error| diagnostic_at(Q003, parse_error_message(error), &token)),
         other => unreachable!("grammar: setting_value admits no {other:?}"),
     }
 }
@@ -294,9 +326,8 @@ fn parse_branch_name(
         .next()
         .expect("grammar: branch_name wraps an ident or a string_lit");
     let name = match token.as_rule() {
-        Rule::string_lit => {
-            parse_string_lit(token.as_str()).map_err(compiler_error_to_diagnostic)?
-        }
+        Rule::string_lit => decode_string_literal(token.as_str())
+            .map_err(|error| diagnostic_at(Q004, parse_error_message(error), &token))?,
         Rule::ident => token.as_str().to_string(),
         other => unreachable!("grammar: branch_name admits no {other:?}"),
     };
@@ -358,11 +389,17 @@ fn pest_error_to_diagnostic(input: &str, err: pest::error::Error<Rule>) -> Query
 /// A declaration body the hand-written parser refused: its bare message
 /// names the construct and `Display` adds the one `parse error:` prefix; a
 /// diagnostic it already carries passes through.
-fn compiler_error_to_diagnostic(err: CompilerError) -> QueryDiagnostic {
+fn compiler_error_to_diagnostic(err: CompilerError, position: Position) -> QueryDiagnostic {
     match err {
         CompilerError::Query(diagnostic) => *diagnostic,
-        CompilerError::Parse(message) => QueryDiagnostic::parse(Q005, message, None),
-        other => QueryDiagnostic::parse(Q005, other.to_string(), None),
+        other => QueryDiagnostic::parse(Q005, parse_error_message(other), Some(position)),
+    }
+}
+
+fn parse_error_message(error: CompilerError) -> String {
+    match error {
+        CompilerError::Parse(message) => message,
+        other => other.to_string(),
     }
 }
 
@@ -389,22 +426,29 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
                 }
             }
             Rule::query_annotation => {
+                let at = item.clone();
                 let (annotation_name, value) = parse_query_annotation(item)?;
                 match annotation_name {
                     "description" => {
                         if description.replace(value).is_some() {
-                            return Err(CompilerError::Parse(format!(
-                                "query `{}` cannot include duplicate @description annotations",
-                                name
-                            )));
+                            return Err(query_error_at(
+                                format!(
+                                    "query `{}` cannot include duplicate @description annotations",
+                                    name
+                                ),
+                                &at,
+                            ));
                         }
                     }
                     "instruction" => {
                         if instruction.replace(value).is_some() {
-                            return Err(CompilerError::Parse(format!(
-                                "query `{}` cannot include duplicate @instruction annotations",
-                                name
-                            )));
+                            return Err(query_error_at(
+                                format!(
+                                    "query `{}` cannot include duplicate @instruction annotations",
+                                    name
+                                ),
+                                &at,
+                            ));
                         }
                     }
                     other => {
@@ -448,7 +492,10 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
                                     let int_pair = section.into_inner().next().unwrap();
                                     limit =
                                         Some(int_pair.as_str().parse::<u64>().map_err(|e| {
-                                            CompilerError::Parse(format!("invalid limit: {}", e))
+                                            query_error_at(
+                                                format!("invalid limit: {}", e),
+                                                &int_pair,
+                                            )
                                         })?);
                                 }
                                 _ => {}
@@ -500,7 +547,7 @@ fn parse_query_annotation(pair: pest::iterators::Pair<Rule>) -> Result<(&'static
                 .ok_or_else(|| {
                     CompilerError::Parse("@description requires a string literal".to_string())
                 })
-                .map(|value| parse_string_lit(value.as_str()))??;
+                .map(|value| parse_string_lit(&value))??;
             Ok(("description", value))
         }
         Rule::instruction_annotation => {
@@ -510,7 +557,7 @@ fn parse_query_annotation(pair: pest::iterators::Pair<Rule>) -> Result<(&'static
                 .ok_or_else(|| {
                     CompilerError::Parse("@instruction requires a string literal".to_string())
                 })
-                .map(|value| parse_string_lit(value.as_str()))??;
+                .map(|value| parse_string_lit(&value))??;
             Ok(("instruction", value))
         }
         other => Err(CompilerError::Parse(format!(
@@ -827,7 +874,7 @@ fn parse_edge_name(pair: pest::iterators::Pair<Rule>) -> Result<String> {
     if pair.as_rule() != Rule::string_lit {
         return Ok(pair.as_str().to_string());
     }
-    let name = parse_string_lit(pair.as_str())?;
+    let name = parse_string_lit(&pair)?;
     let mut chars = name.chars();
     let starts = chars
         .next()
@@ -835,27 +882,31 @@ fn parse_edge_name(pair: pest::iterators::Pair<Rule>) -> Result<String> {
     if starts && chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
         Ok(name)
     } else {
-        Err(CompilerError::Parse(format!(
-            "`{}` is not an edge name; a quoted edge is its bare name in quotes, as in `$a \"in\" $b`",
-            pair.as_str()
-        )))
+        Err(query_error_at(
+            format!(
+                "`{}` is not an edge name; a quoted edge is its bare name in quotes, as in `$a \"in\" $b`",
+                pair.as_str()
+            ),
+            &pair,
+        ))
     }
 }
 
 fn parse_traversal_bounds(pair: pest::iterators::Pair<Rule>) -> Result<(u32, Option<u32>)> {
     let mut inner = pair.into_inner();
-    let min = inner
+    let min_pair = inner
         .next()
-        .ok_or_else(|| CompilerError::Parse("traversal bound missing min hop".to_string()))?
+        .ok_or_else(|| CompilerError::Parse("traversal bound missing min hop".to_string()))?;
+    let min = min_pair
         .as_str()
         .parse::<u32>()
-        .map_err(|e| CompilerError::Parse(format!("invalid traversal min bound: {}", e)))?;
+        .map_err(|e| query_error_at(format!("invalid traversal min bound: {}", e), &min_pair))?;
     let max = inner
         .next()
         .map(|p| {
             p.as_str()
                 .parse::<u32>()
-                .map_err(|e| CompilerError::Parse(format!("invalid traversal max bound: {}", e)))
+                .map_err(|e| query_error_at(format!("invalid traversal max bound: {}", e), &p))
         })
         .transpose()?;
     Ok((min, max))
@@ -978,7 +1029,7 @@ fn parse_operand(pair: pest::iterators::Pair<Rule>, scope: NameScope<'_>) -> Res
         Rule::bm25_call => parse_bm25_call(inner, scope),
         Rule::rrf_call => parse_rrf_call(inner, scope),
         Rule::meta_field | Rule::expr_ident => Ok(scope.bare_name(inner.as_str())),
-        Rule::reserved_property => Err(reserved_property_error(inner.as_str())),
+        Rule::reserved_property => Err(reserved_property_error(&inner)),
         _ => Err(CompilerError::Parse(format!(
             "unexpected operand rule: {:?}",
             inner.as_rule()
@@ -1134,19 +1185,19 @@ fn parse_filter_op(pair: pest::iterators::Pair<Rule>) -> Result<CompOp> {
 fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
     let inner = pair.into_inner().next().unwrap();
     match inner.as_rule() {
-        Rule::string_lit => Ok(Literal::String(parse_string_lit(inner.as_str())?)),
+        Rule::string_lit => Ok(Literal::String(parse_string_lit(&inner)?)),
         Rule::integer => {
             let n: i64 = inner
                 .as_str()
                 .parse()
-                .map_err(|e| CompilerError::Parse(format!("invalid integer: {}", e)))?;
+                .map_err(|e| query_error_at(format!("invalid integer: {}", e), &inner))?;
             Ok(Literal::Integer(n))
         }
         Rule::float_lit => {
             let f: f64 = inner
                 .as_str()
                 .parse()
-                .map_err(|e| CompilerError::Parse(format!("invalid float: {}", e)))?;
+                .map_err(|e| query_error_at(format!("invalid float: {}", e), &inner))?;
             Ok(Literal::Float(f))
         }
         Rule::bool_lit => {
@@ -1166,7 +1217,7 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
             let date_str = inner
                 .into_inner()
                 .next()
-                .map(|s| parse_string_lit(s.as_str()))
+                .map(|s| parse_string_lit(&s))
                 .ok_or_else(|| {
                     CompilerError::Parse("date literal requires a string".to_string())
                 })?;
@@ -1176,7 +1227,7 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
             let dt_str = inner
                 .into_inner()
                 .next()
-                .map(|s| parse_string_lit(s.as_str()))
+                .map(|s| parse_string_lit(&s))
                 .ok_or_else(|| {
                     CompilerError::Parse("datetime literal requires a string".to_string())
                 })?;
@@ -1198,8 +1249,9 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
     }
 }
 
-fn parse_string_lit(raw: &str) -> Result<String> {
-    decode_string_literal(raw)
+fn parse_string_lit(at: &pest::iterators::Pair<Rule>) -> Result<String> {
+    decode_string_literal(at.as_str())
+        .map_err(|error| query_error_at(parse_error_message(error), at))
 }
 
 fn parse_projection(pair: pest::iterators::Pair<Rule>) -> Result<Projection> {
@@ -1208,7 +1260,7 @@ fn parse_projection(pair: pest::iterators::Pair<Rule>) -> Result<Projection> {
     let alias = match inner.next() {
         None => None,
         Some(alias) if alias.as_rule() == Rule::reserved_alias => {
-            return Err(reserved_alias_error(alias.as_str()));
+            return Err(reserved_alias_error(&alias));
         }
         Some(alias) => Some(alias.as_str().to_string()),
     };
@@ -1225,13 +1277,16 @@ fn parse_ordering(pair: pest::iterators::Pair<Rule>) -> Result<Ordering> {
         Rule::nearest_ordering => (parse_nearest_ordering(first, NameScope::Alias)?, false),
         Rule::expr => {
             let expr = parse_expr(first, NameScope::Alias)?;
-            let direction = inner.next().map(|p| p.as_str().to_string());
-            if matches!(expr, Expr::Nearest { .. }) && direction.is_some() {
-                return Err(CompilerError::Parse(
-                    "nearest() ordering does not accept asc/desc modifiers".to_string(),
+            let direction = inner.next();
+            if matches!(expr, Expr::Nearest { .. })
+                && let Some(direction) = &direction
+            {
+                return Err(query_error_at(
+                    "nearest() ordering does not accept asc/desc modifiers",
+                    direction,
                 ));
             }
-            let descending = matches!(direction.as_deref(), Some("desc"));
+            let descending = direction.is_some_and(|p| p.as_str() == "desc");
             (expr, descending)
         }
         other => {

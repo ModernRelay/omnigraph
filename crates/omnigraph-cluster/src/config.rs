@@ -160,11 +160,14 @@ pub(crate) fn resolve_query_decls(
                 }
             },
             Err(err) => {
-                diagnostics.push(Diagnostic::error(
-                    "query_parse_error",
-                    format!("graphs.{graph_id}.queries"),
-                    format!("'{}' does not parse: {err}", resolved.display()),
-                ));
+                diagnostics.push(
+                    Diagnostic::error(
+                        "query_parse_error",
+                        format!("graphs.{graph_id}.queries"),
+                        format!("'{}' does not parse: {err}", resolved.display()),
+                    )
+                    .with_detail(err.diagnostic().cloned()),
+                );
                 continue;
             }
         };

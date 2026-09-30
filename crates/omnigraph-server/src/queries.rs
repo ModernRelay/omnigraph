@@ -85,6 +85,7 @@ pub struct LoadError {
     /// The offending query name, when the failure is entry-scoped.
     pub query: Option<String>,
     pub message: String,
+    pub diagnostic: Option<Box<omnigraph_compiler::QueryDiagnostic>>,
 }
 
 impl std::fmt::Display for LoadError {
@@ -107,13 +108,22 @@ impl QueryRegistry {
 
         for spec in specs {
             let declarations = parse_query(&spec.source)
-                .map_err(|err| err.to_string())
+                .map_err(|err| LoadError {
+                    query: Some(spec.name.clone()),
+                    message: err.to_string(),
+                    diagnostic: err.diagnostic().cloned().map(Box::new),
+                })
                 .and_then(|file| {
                     if file.settings.is_empty() {
                         file.into_declarations()
                     } else {
                         Err(STORED_QUERY_CARRIES_NO_SETTINGS.to_string())
                     }
+                    .map_err(|message| LoadError {
+                        query: Some(spec.name.clone()),
+                        message,
+                        diagnostic: None,
+                    })
                 });
             match declarations {
                 Ok(queries) => match queries.into_iter().find(|q| q.name == spec.name) {
@@ -136,12 +146,10 @@ impl QueryRegistry {
                                  (the registry key must match the query symbol)",
                             spec.name
                         ),
+                        diagnostic: None,
                     }),
                 },
-                Err(message) => errors.push(LoadError {
-                    query: Some(spec.name),
-                    message,
-                }),
+                Err(error) => errors.push(error),
             }
         }
 
@@ -163,6 +171,7 @@ impl QueryRegistry {
                         message: format!(
                             "MCP tool name '{tool}' already claimed by exposed query '{winner}'"
                         ),
+                        diagnostic: None,
                     });
                 }
             }
@@ -435,13 +444,22 @@ mod tests {
 
     #[test]
     fn parse_error_surfaces_per_entry() {
-        let errors =
-            QueryRegistry::from_specs(vec![spec("broken", "query broken( {{ not valid", false)])
-                .unwrap_err();
+        let source = "query broken { match { $u: User } return { $u.name } }";
+        let errors = QueryRegistry::from_specs(vec![spec("broken", source, false)]).unwrap_err();
         assert_eq!(errors[0].query.as_deref(), Some("broken"));
         let message = &errors[0].message;
         assert!(message.starts_with("parse error: "), "{message}");
         assert_eq!(message.matches("parse error:").count(), 1, "{message}");
+        let diagnostic = errors[0].diagnostic.as_deref().unwrap();
+        assert_eq!(
+            diagnostic,
+            parse_query(source).unwrap_err().diagnostic().unwrap()
+        );
+        assert_eq!(diagnostic.code.as_str(), "Q002");
+        assert_eq!(
+            diagnostic.suggestion.as_ref().unwrap().edits[0].replacement,
+            "()"
+        );
     }
 
     #[test]

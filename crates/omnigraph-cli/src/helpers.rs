@@ -1019,7 +1019,7 @@ pub(crate) async fn execute_query_lint(
 fn registry_from_serving_queries(
     queries: &[omnigraph_cluster::ServingQuery],
     graph: Option<&str>,
-) -> Result<QueryRegistry> {
+) -> std::result::Result<QueryRegistry, Vec<omnigraph_server::queries::LoadError>> {
     let specs: Vec<omnigraph_server::queries::RegistrySpec> = queries
         .iter()
         .filter(|q| graph.is_none_or(|g| q.graph_id == g))
@@ -1030,16 +1030,21 @@ fn registry_from_serving_queries(
             tool_name: None,
         })
         .collect();
-    QueryRegistry::from_specs(specs).map_err(|errors| {
-        color_eyre::eyre::eyre!(
-            "stored-query registry failed to load:\n  {}",
-            errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("\n  ")
-        )
-    })
+    QueryRegistry::from_specs(specs)
+}
+
+fn registry_load_issues(errors: Vec<omnigraph_server::queries::LoadError>) -> Vec<QueriesIssue> {
+    errors
+        .into_iter()
+        .map(|error| QueriesIssue {
+            query: error.query.unwrap_or_else(|| "<registry>".to_string()),
+            message: error.message,
+            diagnostic: error
+                .diagnostic
+                .as_deref()
+                .map(omnigraph_api_types::DiagnosticOutput::from),
+        })
+        .collect()
 }
 
 /// `queries validate --cluster <dir>` (RFC-011): type-check every stored query
@@ -1066,7 +1071,13 @@ pub(crate) async fn execute_queries_validate(
         }
         matched_any = true;
         let registry =
-            registry_from_serving_queries(&snapshot.queries, Some(&serving_graph.graph_id))?;
+            match registry_from_serving_queries(&snapshot.queries, Some(&serving_graph.graph_id)) {
+                Ok(registry) => registry,
+                Err(errors) => {
+                    breakages.extend(registry_load_issues(errors));
+                    continue;
+                }
+            };
         let db = Omnigraph::open(&serving_graph.root.to_string_lossy()).await?;
         let report = check(&registry, &db.catalog());
         total += registry.len();
@@ -1158,7 +1169,16 @@ pub(crate) async fn execute_queries_list(
     json: bool,
 ) -> Result<()> {
     let snapshot = read_serving_snapshot_or_report(cluster).await?;
-    let registry = registry_from_serving_queries(&snapshot.queries, graph)?;
+    let registry = registry_from_serving_queries(&snapshot.queries, graph).map_err(|errors| {
+        color_eyre::eyre::eyre!(
+            "stored-query registry failed to load:\n  {}",
+            errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        )
+    })?;
 
     let output = QueriesListOutput {
         queries: registry
@@ -1287,6 +1307,35 @@ pub(crate) fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_query_parse_failures_keep_diagnostics_in_validation_output() {
+        let queries = vec![omnigraph_cluster::ServingQuery {
+            graph_id: "g".to_string(),
+            name: "broken".to_string(),
+            source: "query broken { match { $p: Person } return { $p.name } }".to_string(),
+        }];
+        let failures = registry_from_serving_queries(&queries, Some("g")).unwrap_err();
+        let output = QueriesValidateOutput {
+            ok: false,
+            breakages: registry_load_issues(failures),
+            warnings: Vec::new(),
+        };
+        let json = serde_json::to_value(output).unwrap();
+        let error = &json["breakages"][0];
+        assert_eq!(error["query"], "broken");
+        assert_eq!(error["diagnostic"]["code"], "Q002");
+        assert_eq!(error["diagnostic"]["position"]["byte"], 12);
+        assert_eq!(
+            error["diagnostic"]["suggestion"]["edits"][0]["replacement"],
+            "()"
+        );
+        assert!(
+            registry_from_serving_queries(&queries, Some("other"))
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn graph_resource_id_for_selection_uses_name_or_anonymous_uri() {

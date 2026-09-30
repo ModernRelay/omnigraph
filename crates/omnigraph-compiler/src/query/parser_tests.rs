@@ -1982,6 +1982,97 @@ fn query_without_parameter_list_reports_q002_at_the_name_end_with_fix() {
 }
 
 #[test]
+fn query_diagnostic_suggestion_edits_preserve_source_and_reparse() {
+    for source in [
+        "query name { match { $p: Person } return { $p.name } }",
+        "/* café */\nquery name /* keep */ { match { $p: Person } return { $p.name } }",
+        "query name // keep\n{ match { $p: Person } return { $p.name } }",
+        "query first() { match { $p: Person } return { $p.name } }\nquery name { match { $p: Person } return { $p.name } }",
+        "query name @description(\"hello\") { match { $p: Person } return { $p.name } }",
+    ] {
+        let diagnostic = parse_query_diagnostic(source).unwrap_err();
+        assert_eq!(diagnostic.code, Q002, "{source}");
+        let json = serde_json::to_value(&diagnostic).unwrap();
+        let suggestion = &json["suggestion"];
+        assert_eq!(
+            suggestion["applicability"], "machine_applicable",
+            "{source}"
+        );
+        let edits = suggestion["edits"].as_array().unwrap();
+        assert_eq!(edits.len(), 1);
+        let edit = &edits[0];
+        let byte = source.find("query name").unwrap() + "query name".len();
+        assert_eq!(edit["start"], byte);
+        assert_eq!(edit["end"], byte);
+        assert_eq!(edit["replacement"], "()");
+        let mut repaired = source.to_string();
+        repaired.replace_range(byte..byte, edit["replacement"].as_str().unwrap());
+        parse_query_diagnostic(&repaired).unwrap();
+    }
+
+    for source in [
+        "query name garbage",
+        "query café {",
+        "query name {",
+        "query name { match { $p: Person } return { $p.name } } query second { match { $p: Person } return { $p.name } }",
+    ] {
+        let json = serde_json::to_value(parse_query_diagnostic(source).unwrap_err()).unwrap();
+        assert!(json.get("suggestion").is_none(), "{source}: {json}");
+    }
+    let source = "queryname { match { $p: Person } return { $p.name } }";
+    assert_eq!(parse_query_diagnostic(source).unwrap_err().code, Q001);
+    parse_query_diagnostic("query name /* keep */ () { match { $p: Person } return { $p.name } }")
+        .unwrap();
+}
+
+#[test]
+fn handwritten_query_diagnostics_locate_the_refused_token() {
+    for (source, token, code) in [
+        (
+            "/* café */\nquery q() { delete Person where in = 1 }",
+            "in =",
+            Q005,
+        ),
+        (
+            "query q() { match { $p: Person } return { $p.name as in } }",
+            "in }",
+            Q005,
+        ),
+        (
+            "query q() { match { $p: Person } return { 99999999999999999999999 as n } }",
+            "99999999999999999999999",
+            Q005,
+        ),
+        (
+            "query q() { match { $p: Person } return { $p.name } limit 99999999999999999999999 }",
+            "99999999999999999999999",
+            Q005,
+        ),
+        (
+            r#"query q() { match { $p: Person } return { "bad\x" as n } }"#,
+            r#""bad\x""#,
+            Q005,
+        ),
+        (r#"set engine = "bad\x";"#, r#""bad\x""#, Q003),
+        (r#"branch create "bad\x""#, r#""bad\x""#, Q004),
+        (
+            "query q() { match { $p: Person } return { $p.name } order { (nearest($p.embedding, [1.0])) desc } }",
+            "desc",
+            Q005,
+        ),
+    ] {
+        let diagnostic = parse_query_diagnostic(source).unwrap_err();
+        assert_eq!(diagnostic.code, code, "{source}: {diagnostic}");
+        assert_eq!(
+            diagnostic.position,
+            Some(Position::at(source, source.find(token).unwrap())),
+            "{source}"
+        );
+        assert!(diagnostic.stage.is_none());
+    }
+}
+
+#[test]
 fn grammar_mismatch_reports_q001_at_the_deepest_failure() {
     let err = parse_query_diagnostic("mutation { insert Person { name: \"a\" } }").unwrap_err();
     assert_eq!(err.code.as_str(), "Q001");

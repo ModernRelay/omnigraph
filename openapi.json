@@ -3661,6 +3661,14 @@
   },
   "components": {
     "schemas": {
+      "ApplicabilityOutput": {
+        "type": "string",
+        "description": "Whether a suggested source edit can be applied mechanically.",
+        "enum": [
+          "machine_applicable",
+          "needs_review"
+        ]
+      },
       "BlobEntityKind": {
         "type": "string",
         "description": "Logical graph entity selected by the Blob delivery surface.\n\nThis is intentionally graph vocabulary: callers select a node or edge.",
@@ -4492,6 +4500,16 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "suggestion": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SuggestionOutput"
+              }
             ]
           }
         }
@@ -5817,6 +5835,25 @@
           }
         }
       },
+      "SuggestionOutput": {
+        "type": "object",
+        "description": "Non-overlapping edits against the original request source.",
+        "required": [
+          "applicability",
+          "edits"
+        ],
+        "properties": {
+          "applicability": {
+            "$ref": "#/components/schemas/ApplicabilityOutput"
+          },
+          "edits": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TextEditOutput"
+            }
+          }
+        }
+      },
       "SystemColumnsOutput": {
         "type": "object",
         "description": "A graph's system column spellings (see `SchemaOutput::system_columns`).",
@@ -5834,6 +5871,28 @@
           },
           "src": {
             "type": "string"
+          }
+        }
+      },
+      "TextEditOutput": {
+        "type": "object",
+        "description": "A UTF-8 byte range in the original source, with an exclusive end.",
+        "required": [
+          "start",
+          "end",
+          "replacement"
+        ],
+        "properties": {
+          "end": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "replacement": {
+            "type": "string"
+          },
+          "start": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       }

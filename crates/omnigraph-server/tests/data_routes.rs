@@ -1859,7 +1859,7 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
         } else {
             "query"
         };
-        let missing = json!({field: "query name {", "branch": "main"});
+        let missing = json!({field: "query name { match { $p: Person } return { $p.name } }", "branch": "main"});
         let (status, out) = json_response(&app, send(path, token, missing, expected_head)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {out}");
         let error: ErrorOutput = serde_json::from_value(out).unwrap();
@@ -1868,6 +1868,20 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
             .expect("a refused query carries its diagnostic");
         assert_eq!(diagnostic.code, "Q002", "{path}");
         assert_eq!(diagnostic.fix.as_deref(), Some("query name()"), "{path}");
+        let suggestion = diagnostic.suggestion.unwrap();
+        assert_eq!(
+            suggestion.applicability,
+            omnigraph_api_types::ApplicabilityOutput::MachineApplicable
+        );
+        assert_eq!(
+            suggestion.edits,
+            vec![omnigraph_api_types::TextEditOutput {
+                start: 10,
+                end: 10,
+                replacement: "()".to_string(),
+            }],
+            "{path}"
+        );
         assert_eq!(
             diagnostic.position.map(|at| (at.line, at.column)),
             Some((1, 11)),

@@ -96,6 +96,30 @@ pub struct Stage {
     pub expression: Option<String>,
 }
 
+/// Whether the compiler has enough evidence to apply the edits mechanically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Applicability {
+    MachineApplicable,
+    NeedsReview,
+}
+
+/// Replace `start..end` in the original UTF-8 source; an empty range inserts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TextEdit {
+    pub start: usize,
+    pub end: usize,
+    pub replacement: String,
+}
+
+/// Edits use non-overlapping byte ranges in the same original source.
+/// Applying a suggestion may reveal further errors; it is not query validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Suggestion {
+    pub applicability: Applicability,
+    pub edits: Vec<TextEdit>,
+}
+
 /// One query compile diagnostic. See the module documentation for the
 /// contract each field carries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -107,10 +131,13 @@ pub struct QueryDiagnostic {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<Position>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stage: Option<Stage>,
+    pub stage: Option<Box<Stage>>,
     /// One concrete fix, naming the construct to use.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<String>,
+    /// Optional edits for the original source, separate from human guidance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<Box<Suggestion>>,
 }
 
 impl QueryDiagnostic {
@@ -124,6 +151,7 @@ impl QueryDiagnostic {
             position,
             stage: None,
             fix: None,
+            suggestion: None,
         }
     }
 
@@ -135,11 +163,12 @@ impl QueryDiagnostic {
             code,
             message: message.into(),
             position: None,
-            stage: Some(Stage {
+            stage: Some(Box::new(Stage {
                 name: "typecheck",
                 expression: None,
-            }),
+            })),
             fix: None,
+            suggestion: None,
         }
     }
 
@@ -148,15 +177,20 @@ impl QueryDiagnostic {
         self
     }
 
+    pub fn with_suggestion(mut self, suggestion: Suggestion) -> Self {
+        self.suggestion = Some(Box::new(suggestion));
+        self
+    }
+
     pub fn with_expression(mut self, expression: impl Into<String>) -> Self {
         let expression = expression.into();
         match &mut self.stage {
             Some(stage) => stage.expression = Some(expression),
             None => {
-                self.stage = Some(Stage {
+                self.stage = Some(Box::new(Stage {
                     name: "typecheck",
                     expression: Some(expression),
-                })
+                }))
             }
         }
         self
@@ -202,7 +236,7 @@ mod tests {
     fn a_diagnostic_fits_a_result_without_boxing() {
         // Clippy's `result_large_err` threshold; the parser returns this type
         // from every helper.
-        assert!(std::mem::size_of::<QueryDiagnostic>() <= 128);
+        assert!(std::mem::size_of::<QueryDiagnostic>() < 128);
     }
 
     #[test]
@@ -212,5 +246,6 @@ mod tests {
         assert_eq!(value["stage"]["name"], "typecheck");
         assert!(value.get("position").is_none());
         assert!(value.get("fix").is_none());
+        assert!(value.get("suggestion").is_none());
     }
 }

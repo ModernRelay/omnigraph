@@ -1498,6 +1498,29 @@ pub struct PositionOutput {
     pub byte: u32,
 }
 
+/// Whether a suggested source edit can be applied mechanically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicabilityOutput {
+    MachineApplicable,
+    NeedsReview,
+}
+
+/// A UTF-8 byte range in the original source, with an exclusive end.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TextEditOutput {
+    pub start: usize,
+    pub end: usize,
+    pub replacement: String,
+}
+
+/// Non-overlapping edits against the original request source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SuggestionOutput {
+    pub applicability: ApplicabilityOutput,
+    pub edits: Vec<TextEditOutput>,
+}
+
 /// The diagnostics contract for a refused query (RFC 0047): a stable code
 /// (`Q…` parse, `T…` typecheck); where the failure is, as a source position
 /// or as the stage and expression when it is post-parse; what was expected or
@@ -1516,6 +1539,8 @@ pub struct DiagnosticOutput {
     pub expected: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<SuggestionOutput>,
 }
 
 impl From<&omnigraph_compiler::QueryDiagnostic> for DiagnosticOutput {
@@ -1537,6 +1562,28 @@ impl From<&omnigraph_compiler::QueryDiagnostic> for DiagnosticOutput {
                 .and_then(|stage| stage.expression.clone()),
             expected: diagnostic.message.clone(),
             fix: diagnostic.fix.clone(),
+            suggestion: diagnostic
+                .suggestion
+                .as_ref()
+                .map(|suggestion| SuggestionOutput {
+                    applicability: match suggestion.applicability {
+                        omnigraph_compiler::Applicability::MachineApplicable => {
+                            ApplicabilityOutput::MachineApplicable
+                        }
+                        omnigraph_compiler::Applicability::NeedsReview => {
+                            ApplicabilityOutput::NeedsReview
+                        }
+                    },
+                    edits: suggestion
+                        .edits
+                        .iter()
+                        .map(|edit| TextEditOutput {
+                            start: edit.start,
+                            end: edit.end,
+                            replacement: edit.replacement.clone(),
+                        })
+                        .collect(),
+                }),
         }
     }
 }
@@ -2062,6 +2109,37 @@ mod tests {
     use super::*;
     use omnigraph_compiler::settings::SettingScope;
     use serde_json::json;
+
+    #[test]
+    fn diagnostic_suggestions_round_trip_and_old_payloads_remain_valid() {
+        let old = json!({"code": "Q002", "expected": "missing parameters", "fix": "query q()"});
+        let decoded: DiagnosticOutput = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), old);
+
+        let source = "query q { match { $p: Person } return { $p.name } }";
+        let error = omnigraph_compiler::query::parser::parse_query(source).unwrap_err();
+        let output = DiagnosticOutput::from(error.diagnostic().unwrap());
+        let json = serde_json::to_value(&output).unwrap();
+        assert_eq!(
+            json["suggestion"],
+            json!({
+                "applicability": "machine_applicable",
+                "edits": [{"start": 7, "end": 7, "replacement": "()"}]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<DiagnosticOutput>(json).unwrap(),
+            output
+        );
+        let mut reviewed = output;
+        reviewed.suggestion.as_mut().unwrap().applicability = ApplicabilityOutput::NeedsReview;
+        let json = serde_json::to_value(&reviewed).unwrap();
+        assert_eq!(json["suggestion"]["applicability"], "needs_review");
+        assert_eq!(
+            serde_json::from_value::<DiagnosticOutput>(json).unwrap(),
+            reviewed
+        );
+    }
 
     /// `SettingsRequest` has one field per `request` row of the definition,
     /// in definition order, spelled as the row's name; a `process` row has

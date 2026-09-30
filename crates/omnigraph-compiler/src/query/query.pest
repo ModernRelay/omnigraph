@@ -11,7 +11,8 @@ query_file = { SOI ~ setting_stmt* ~ (show_stmt ~ statement_trailer? | branch_st
 // one fix (`query name()`) instead of reporting the file's first position;
 // pest tracks attempts per rule, never per token, so the missing `(` is
 // otherwise not an attempt it can name.
-missing_param_list = { "query" ~ ident ~ !"(" ~ ANY* }
+missing_param_list = { missing_query_keyword ~ ident ~ !"(" ~ ANY* }
+missing_query_keyword = @{ "query" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 // Settings statements stand at the head of a file, before its one statement
 // or its declarations; `show` is itself the one statement. Names are looked
