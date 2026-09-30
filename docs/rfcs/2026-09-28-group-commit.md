@@ -12,7 +12,7 @@ discussion: "https://github.com/ModernRelay/omnigraph/pull/785"
 supersedes: []
 superseded_by: []
 blocked_on:
-  - "Surface guard: the raw, unassigned fragments of several strict inserts and pure-insert upserts, each staged against one pin, commit as one detached transaction from a later pin of the same table: the rows are the union, fragment and row ids come fresh from the later pin's counters, Lance derives the row-version metadata at commit, and the change feed's one-transaction proof and merge's insert-absence proof accept the result."
+  - "Engine half of the composition guard: a composed commit carries the markers its components carry, and the change feed's one-transaction proof and merge's insert-absence certificate accept it. The Lance half is pinned by `lance_surface_guards.rs::group_commit_composes_inserts_staged_against_older_pins_onto_a_later_pin`."
   - "Correctness: the admission matrix under Evidence and tests, failpoints around the composed detached commits and the compare-and-swap including the in-doubt read-back, and the DST concurrent universe with the publisher on (every acknowledged write visible exactly once, one actor per commit)."
   - "Instrument: `concurrent-writes` with eight writers on one branch, local and on RustFS at +30 ms per round trip, above one writer's rate on the same build (31.7 and 0.87 commits/s on `b14c22c5` with PR #783), with one writer within noise of today and per-writer commit counts within a factor of two of each other (#784)."
 ---
@@ -391,16 +391,24 @@ append-only entries; the admission rule excludes a mix.
   - row-version metadata: "leave them as `None`. Lance derives both while
     building the manifest" (distributed write).
 
-  The union must be taken from each staged write's raw transaction, whose
-  fragments are still unassigned. `StagedWrite::new_fragments()` is not
-  usable here. It is the read-your-writes copy, with fragment and row ids
-  already provisionally assigned from the entry's own base, and Lance keeps
-  nonzero fragment ids and complete row-id metadata as given.
+  The union must be taken from each staged write's raw transaction. There,
+  every new fragment has fragment id 0, and its row-id sequence is empty for
+  an insert: merge-insert records only the ids of the rows it rewrote,
+  chunked per fragment and allowed to be incomplete. Lance then assigns both
+  at commit from Hc; `assign_row_ids` fills an incomplete sequence from the
+  commit's counter.
+
+  `StagedWrite::new_fragments()` is not usable here. It is the
+  read-your-writes copy, with fragment and row ids already provisionally
+  assigned from the entry's own base, and Lance keeps nonzero fragment ids
+  and complete row-id sequences as given.
 
   The composed transaction keeps the insertion-only shape the components
   have, a merge-insert `Update` in `RewriteRows` mode with new fragments
   only, and its markers:
-  - the key-existence filter is rebuilt from the union of the ids;
+  - the key-existence filter is the bitwise OR of the components' Bloom
+    filters, which share one configuration and one key column, so the OR is
+    exactly their union and no key is re-encoded;
   - the field lists stay those of the components, which are identical for
     one table under one schema;
   - a marker is kept only when every component carries it.
@@ -559,17 +567,27 @@ reclaims them.
 
 ## Evidence and tests
 
-- **`lance_surface_guards.rs`: the composition guard.**
-  - Setup: strict inserts and pure-insert upserts staged against pin P0,
-    with a further append landing in between, committed as one detached
-    transaction from the later pin.
-  - The composed transaction is built from the raw transactions' unassigned
-    fragments. A second cell shows that composing the read-your-writes
-    copies instead reuses ids allocated from P0.
-  - Pinned: rows, row ids, fragment ids, row-version metadata, and the
-    markers.
-  - `changes.rs` and the merge owners assert that the feed's fast path and
-    the merge chain's insert-absence proof accept the composed commit.
+- **`lance_surface_guards.rs`: the composition guard, Lance half.**
+  - Test: `group_commit_composes_inserts_staged_against_older_pins_onto_a_later_pin`,
+    passing on Lance 11.0.0 since 2026-09-30.
+  - Setup: two keyed upserts of new keys staged against P0 and one staged
+    against P1, where P1 is a third insert that landed detached from P0.
+    The three are committed as one detached transaction from P1.
+  - Pinned:
+    - the raw staged fragments carry fragment id 0 and an empty row-id
+      sequence;
+    - the components' key filters share one Bloom configuration, and
+      their OR covers each;
+    - the result is exactly the union of rows, and P1's rows keep their
+      row ids and stamps;
+    - new row ids and fragment ids are unique and above P1's;
+    - the composed rows share one version stamp, distinct from the
+      insert that landed first;
+    - the composed version reopens by id.
+- **The composition guard, engine half.** Owned by `changes.rs` and the
+  merge owners. They assert that a composed commit carries its components'
+  markers, and that the feed's fast path and the merge chain's
+  insert-absence certificate accept it.
 - **The admission matrix.** Each cell asserts the commit count, the rows,
   and which entry re-prepared or failed.
 
@@ -735,3 +753,15 @@ Each step leaves `main` shippable.
     a recommendation.
   - #813's reuse of captured authority is noted where revalidation and the
     next lever are described.
+
+- 2026-09-30 — The Lance half of the composition guard is checked in and
+  passes.
+  - Its first run corrected a fact the review had stated and this RFC
+    repeated: that the raw staged fragments carry no row-id metadata. They
+    do carry a row-id sequence, the captured ids of rows the merge-insert
+    rewrote, and for an insert it is empty. Lance's `assign_row_ids` fills
+    an incomplete sequence at commit, so composition holds; the guard now
+    decodes the sequence and pins that it is empty.
+  - The key-existence filter's union is the bitwise OR of the components'
+    Bloom filters, pinned by the same guard, in place of rebuilding the
+    filter from the ids.
