@@ -1898,6 +1898,7 @@ mod tests {
                         (HEADER.into(), "0.12".into()),
                     ],
                 ),
+                (401, vec![(HEADER.into(), "0.12".into())]),
                 (503, vec![(HEADER.into(), "0.12".into())]),
                 (
                     302,
@@ -1912,10 +1913,13 @@ mod tests {
                     headers,
                     body: b"secret untrusted body".to_vec(),
                 }]);
+                let mut endpoint = url::Url::parse(&server.origin).unwrap();
+                endpoint.set_username("secret-user").unwrap();
+                endpoint.set_password(Some("secret-password")).unwrap();
                 let http = if managed {
-                    GraphHttpClient::managed(&server.origin)
+                    GraphHttpClient::managed(endpoint.as_str())
                 } else {
-                    GraphHttpClient::new(&server.origin)
+                    GraphHttpClient::new(endpoint.as_str())
                 }
                 .unwrap();
                 let error = remote_json::<Value>(
@@ -2013,7 +2017,45 @@ mod tests {
         let contract = error.downcast_ref::<ApiContractError>().unwrap();
         assert!(!contract.request_dispatched);
         assert_eq!(contract.http_status, None);
+        assert!(contract.error.contains("timed out"), "{error:?}");
         server.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn graph_http_discovery_preserves_connection_failure_without_credentials() {
+        let server = IntentApiFixture::new(vec![]);
+        let mut endpoint = url::Url::parse(&server.origin).unwrap();
+        endpoint.set_username("secret-user").unwrap();
+        endpoint.set_password(Some("secret-password")).unwrap();
+        endpoint.set_query(Some("api_key=secret-query"));
+        drop(server);
+
+        let http = GraphHttpClient::new(endpoint.as_str()).unwrap();
+        let error = remote_json::<Value>(
+            &http,
+            Method::POST,
+            remote_url(endpoint.as_str(), &["graphs", "knowledge", "change"], &[]).unwrap(),
+            Some(json!({})),
+            Some("secret-bearer"),
+        )
+        .await
+        .unwrap_err();
+        let contract = error.downcast_ref::<ApiContractError>().unwrap();
+        assert!(!contract.request_dispatched);
+        assert_eq!(contract.http_status, None);
+        assert!(contract.error.contains("connection failed"), "{error:?}");
+        assert!(
+            contract
+                .error
+                .contains(omnigraph_api_types::HTTP_API_CONTRACT_HEADER)
+        );
+        assert!(
+            contract
+                .error
+                .contains(omnigraph_api_types::HTTP_API_CONTRACT)
+        );
+        assert!(!format!("{error:?}").contains("secret"));
+        assert!(!serde_json::to_string(contract).unwrap().contains("secret"));
     }
 
     #[tokio::test]
@@ -2104,7 +2146,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graph_http_does_not_follow_or_retry_data_responses() {
+    async fn graph_http_preserves_data_errors_without_following_redirects() {
+        // These statuses exercise response forwarding and redirect refusal.
+        // They are not reqwest's retryable HTTP/2 or HTTP/3 transport faults.
         let target = IntentApiFixture::new(vec![]);
         for status in [302, 429, 503] {
             let mut reply = contract_reply(status, json!({"error":"stop"}));

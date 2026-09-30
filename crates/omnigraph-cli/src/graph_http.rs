@@ -13,7 +13,7 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// compound command may already have effects; this marker says nothing about them.
 #[derive(Debug, Serialize)]
 pub(crate) struct ApiContractError {
-    pub(crate) error: &'static str,
+    pub(crate) error: String,
     pub(crate) code: ErrorCode,
     pub(crate) http_status: Option<u16>,
     pub(crate) request_dispatched: bool,
@@ -22,16 +22,40 @@ pub(crate) struct ApiContractError {
 impl ApiContractError {
     fn discovery(status: Option<StatusCode>) -> Self {
         Self {
-            error: "could not establish Omnigraph-Http-Api: 0.12 through successful server discovery; this data request was not sent; configure the server root and select the graph separately",
+            error: format!(
+                "could not establish {HTTP_API_CONTRACT_HEADER}: {HTTP_API_CONTRACT} through successful server discovery; this data request was not sent; configure the server root and select the graph separately"
+            ),
             code: ErrorCode::ApiContractMismatch,
             http_status: status.map(|status| status.as_u16()),
             request_dispatched: false,
         }
     }
 
+    fn discovery_transport(error: reqwest::Error) -> Self {
+        // Classify the typed cause instead of rendering its source chain:
+        // connector errors can contain URLs or reflected credentials.
+        let cause = if error.is_timeout() {
+            "server discovery timed out"
+        } else if error.is_connect() {
+            "server discovery connection failed (DNS, TCP, proxy, or TLS)"
+        } else {
+            "server discovery transport failed"
+        };
+        Self {
+            error: format!(
+                "{cause}; could not establish {HTTP_API_CONTRACT_HEADER}: {HTTP_API_CONTRACT}; this data request was not sent"
+            ),
+            code: ErrorCode::ApiContractMismatch,
+            http_status: error.status().map(|status| status.as_u16()),
+            request_dispatched: false,
+        }
+    }
+
     fn response(status: StatusCode) -> Self {
         Self {
-            error: "server response did not carry exactly one Omnigraph-Http-Api: 0.12 header; this request's effects are unknown; do not retry automatically",
+            error: format!(
+                "server response did not carry exactly one {HTTP_API_CONTRACT_HEADER}: {HTTP_API_CONTRACT} header; this request's effects are unknown; do not retry automatically"
+            ),
             code: ErrorCode::ApiContractMismatch,
             http_status: Some(status.as_u16()),
             request_dispatched: true,
@@ -41,7 +65,7 @@ impl ApiContractError {
 
 impl std::fmt::Display for ApiContractError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.error)?;
+        f.write_str(&self.error)?;
         if let Some(status) = self.http_status {
             write!(f, " (HTTP {status})")?;
         }
@@ -115,7 +139,7 @@ impl GraphHttpClient {
             .timeout(DISCOVERY_TIMEOUT)
             .send()
             .await
-            .map_err(|error| ApiContractError::discovery(error.status()))?;
+            .map_err(ApiContractError::discovery_transport)?;
         if !discovery.status().is_success() || !has_contract(&discovery) {
             return Err(ApiContractError::discovery(Some(discovery.status())).into());
         }

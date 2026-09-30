@@ -28,7 +28,11 @@ Protected OmniGraph graph and registry HTTP routes authenticate, then validate t
 
 Every ordinary HTTP response carries the contract header, including refusals, streamed results and public `GET`/`HEAD /healthz`, `/readyz` and `/openapi.json` responses. These public routes do not require the header. `/healthz` responses use `Cache-Control: no-store` for discovery; no additional endpoint or compatibility registry is introduced. MCP and OAuth metadata retain their separately negotiated standard protocols and are outside this header contract.
 
-Before each graph or registry request, the CLI probes the configured server's public `HEAD /healthz` without bearer credentials, preserving any reverse-proxy path prefix. Discovery has a five-second bound, does not consume the response body, and requires a successful response with the exact single contract header. Failure prevents data dispatch. The request then carries the header, and the CLI checks the response header before decoding or emitting any JSON, Arrow, export, feed or Blob body. This adds one discovery round trip per data request and no persistent capability cache.
+Before each graph or registry request, the CLI probes the configured server's public `HEAD /healthz` without bearer credentials or URL Basic-auth userinfo, preserving any
+reverse-proxy path prefix. A proxy must allow anonymous `HEAD /healthz` even when
+its data routes use Basic authentication. Discovery has a five-second bound, does not consume the response body, and requires a successful response with the exact single contract header. Failure prevents data dispatch. Transport failures preserve a bounded cause
+category (timeout, connection failure or request failure) without printing the
+URL, credentials or raw source chain; HTTP discovery refusals retain their status. The request then carries the header, and the CLI checks the response header before decoding or emitting any JSON, Arrow, export, feed or Blob body. This adds one discovery round trip per data request and no persistent capability cache.
 
 Graph HTTP clients disable redirects and automatic retries. This includes raw streaming and NDJSON paths; managed control-plane and OAuth clients retain their independent protocols. Data-request deadlines and response limits remain unchanged; the discovery bound is additional. The server admission check is still necessary: discovery is not a fence against a changed backend or a proxy dropping a header.
 
@@ -55,3 +59,8 @@ Qualification passed in the server/API/CLI owners, all 14 loopback system cases,
 ## Decision log
 
 - 2026-09-30: Accepted the narrowly scoped A1 implementation on the maintainer's instruction to build the first slice. Fixed the header, refusal, discovery and transport rules; the broader server runtime RFC remains draft. Chose explicit refusal over package-version inference or old-client fallback.
+
+- 2026-09-30: Clarified anonymous discovery and credential-safe transport causes
+  while hardening the reviewed stack. Existing scope validation already precedes
+  discovery; it remains unchanged. HTTP status/redirect assertions do not claim
+  protocol-level retry-fault qualification.

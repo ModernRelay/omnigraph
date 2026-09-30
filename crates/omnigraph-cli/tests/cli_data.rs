@@ -2582,14 +2582,17 @@ fn read_supports_inline_query_string() {
 }
 
 #[test]
-fn positional_http_uri_on_a_data_verb_is_rejected() {
+fn ambiguous_or_positional_http_scopes_are_rejected_without_network_io() {
+    use support::managed_http::IntentApiFixture;
+
     // RFC-011: a `--store` http(s):// URL no longer dispatches to a remote
     // server — that requires `--server <url>`.
+    let server = IntentApiFixture::new(vec![]);
     let output = output_failure(
         cli()
             .arg("query")
             .arg("--store")
-            .arg("http://127.0.0.1:1")
+            .arg(&server.origin)
             .arg("-e")
             .arg("query q() { match { $p: Person { } } return { $p } }"),
     );
@@ -2598,6 +2601,25 @@ fn positional_http_uri_on_a_data_verb_is_rejected() {
         stderr.contains("must be addressed with `--server <url>`"),
         "expected store-remote rejection; got: {stderr}"
     );
+    // Both read and write resolvers reject conflicting addressing before the
+    // optional no-graph registry discovery can make a network request.
+    for arguments in [
+        vec!["snapshot", "graph.omni"],
+        vec!["export", "graph.omni"],
+        vec!["schema", "show", "graph.omni"],
+        vec!["branch", "list", "--uri", "graph.omni"],
+        vec!["branch", "merge", "feature", "--uri", "graph.omni"],
+        vec!["query", "--store", "graph.omni", "-e", "branch list"],
+    ] {
+        let output = output_failure(cli().args(["--server", &server.origin]).args(&arguments));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("mutually exclusive"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+    assert!(server.requests().is_empty());
+    server.assert_complete();
 }
 
 #[test]
