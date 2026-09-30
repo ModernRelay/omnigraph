@@ -2575,53 +2575,121 @@ fn merge_history_cost_rows(replay: &str) -> String {
         }
     }
 
-    omnigraph_dst::lance_faults::install();
     let mut rows = String::new();
     for (target_commits, merge_back, label) in [
         (2, false, "MergeTargetHistory2"),
         (32, false, "MergeTargetHistory32"),
         (2, true, "MergeBackAfterThreeWay"),
     ] {
-        let environment = omnigraph_dst::memory::MemoryEnvironment::new(
+        rows.push_str(&labeled_cost_rows(
             format!("shared-memory://dst-merge-cost-{replay}-{label}"),
-            24_901,
-            omnigraph_dst::UniverseProcess::Shared,
-        );
-        let ledger = omnigraph_dst::cost::arm();
-        let run = omnigraph_dst::run_universe(
-            &environment,
             &MergeHistoryCost {
                 target_commits,
                 merge_back,
                 label,
             },
-        );
-        let table = ledger.render_calls();
-        omnigraph_dst::cost::disarm();
-        run.cleanup.unwrap().unwrap();
-        run.result.unwrap().unwrap();
-        let mut physical_reads = 0;
-        for line in table.lines() {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            if fields[0] != label {
-                continue;
-            }
-            if fields[1] == "l.get" {
-                physical_reads = fields[2]
-                    .strip_prefix("calls=")
-                    .unwrap()
-                    .parse::<u64>()
-                    .unwrap();
-            }
-            rows.push_str(line);
-            rows.push('\n');
-        }
-        assert!(
-            physical_reads > 0,
-            "{label} must reach the physical read meter: {table}"
-        );
+            label,
+        ));
     }
     rows
+}
+
+fn labeled_cost_rows<S>(root: String, scenario: &S, label: &str) -> String
+where
+    S: omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage, Output = ()>,
+{
+    omnigraph_dst::lance_faults::install();
+    let environment = omnigraph_dst::memory::MemoryEnvironment::new(
+        root,
+        24_901,
+        omnigraph_dst::UniverseProcess::Shared,
+    );
+    let ledger = omnigraph_dst::cost::arm();
+    let run = omnigraph_dst::run_universe(&environment, scenario);
+    let table = ledger.render_calls();
+    omnigraph_dst::cost::disarm();
+    run.cleanup.unwrap().unwrap();
+    run.result.unwrap().unwrap();
+    let mut rows = String::new();
+    let mut physical_reads = 0;
+    for line in table.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields[0] != label {
+            continue;
+        }
+        if fields[1] == "l.get" {
+            physical_reads = fields[2]
+                .strip_prefix("calls=")
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+        }
+        rows.push_str(line);
+        rows.push('\n');
+    }
+    assert!(
+        physical_reads > 0,
+        "{label} must reach the physical read meter: {table}"
+    );
+    rows
+}
+
+fn branch_write_cost_rows(replay: &str) -> String {
+    struct BranchWriteCost;
+
+    impl BranchWriteCost {
+        async fn set_age(db: &Session, age: i64) {
+            db.mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "set_age",
+                &mixed_params(&[("$name", "Alice")], &[("$age", age)]),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for BranchWriteCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_branch_write_setup");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            db.branch_create("feature").await.unwrap();
+            Self::set_age(&db, 31).await;
+            Self::set_age(&db, 32).await;
+            omnigraph_dst::cost::set_label("BranchWrite");
+            Self::set_age(&db, 33).await;
+            omnigraph_dst::cost::set_label("_branch_write_verify");
+            let alice = person_rows_on(&db, "feature")
+                .await
+                .into_iter()
+                .find(|(name, _, _)| name == "Alice")
+                .unwrap();
+            assert_eq!(alice.1, 33);
+        }
+    }
+
+    labeled_cost_rows(
+        format!("shared-memory://dst-branch-write-cost-{replay}"),
+        &BranchWriteCost,
+        "BranchWrite",
+    )
 }
 
 /// Storage calls per op kind plus reopened merge-history scenarios, replayed
@@ -2641,11 +2709,13 @@ fn dst_bench_cost_count_golden() {
     let full = ledger.render();
     omnigraph_dst::cost::disarm();
     table.push_str(&merge_history_cost_rows("a"));
+    table.push_str(&branch_write_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
     let mut table2 = ledger2.render_calls();
     omnigraph_dst::cost::disarm();
     table2.push_str(&merge_history_cost_rows("b"));
+    table2.push_str(&branch_write_cost_rows("b"));
     assert_eq!(
         table, table2,
         "the counting pass must replay identically before any golden claim"

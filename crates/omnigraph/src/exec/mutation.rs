@@ -977,7 +977,7 @@ impl Omnigraph {
                     // `commit_all`. It still needs a linearization point for
                     // the caller's CAS promise: under the same schema -> branch
                     // ordering as effectful writes (shared permit — this pass
-                    // only reads the accepted view), re-read the complete
+                    // only reads the accepted view), revalidate the complete
                     // authority and map a moved caller head to terminal 412.
                     let _schema_permit = self.write_queue().acquire_schema_shared().await;
                     let _branch_guard = self

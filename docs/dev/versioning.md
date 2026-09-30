@@ -10,7 +10,7 @@ version axes. Never derive one axis from another.
 |---|---|---|
 | Release | Published workspace artifacts move in lockstep. | Workspace manifests, lockfile, generated metadata, release automation. |
 | CLI ↔ server wire | Prefer additive changes; documented breaking release boundaries require coordinated upgrades. No global version handshake. | Shared DTOs, OpenAPI drift tests, and release-specific migration guidance. |
-| Graph storage | Closed stamp range `[MIN_SUPPORTED, CURRENT]`, one value per system column vintage; explicit registered upgrades into the floor, otherwise rebuild; no open-time migration. | Main-manifest stamp guard on both bounds. |
+| Graph storage | Closed stamp range `[MIN_SUPPORTED, CURRENT]`, independent of system column vintage; explicit registered upgrades into the floor, otherwise rebuild; no open-time migration. | Main-manifest stamp guard on both bounds. |
 | Lance dependency and file format | One deliberately pinned Lance family and explicit stable file version. | Lockfile, write parameters, and Lance surface guards. |
 
 ## Current storage contract
@@ -25,11 +25,12 @@ stamp: a table registration may name a detached Lance version whose linear
 target is published before it exists, which an older binary would open as
 reclaimed history, so the stamp refuses it before any open. Both system
 column vintages of [RFC 0040](../rfcs/0040-system-column-namespace.md),
-`id`/`src`/`dst` and `__id`/`__src`/`__dst`, live under v11: the vintage is
-read from the schema IR's feature set, never from the stamp, and
-`omnigraph schema upgrade-system-columns` converts it on a served graph
-without a stamp change. A v8, v9 or v10 graph needs one explicit
-`omnigraph upgrade`, a route that keeps its branches and its spellings,
+`id`/`src`/`dst` and `__id`/`__src`/`__dst`, are supported within this range:
+the vintage is read from the schema IR's feature set, never from the stamp, and
+`omnigraph schema upgrade-system-columns` converts it on a supported standalone
+graph without a separate vintage-specific stamp. Its publication follows the
+ordinary format conversion rule, so a v11 main becomes v12. A v8, v9 or v10 graph
+needs one explicit `omnigraph upgrade`, a route that keeps its branches and its spellings,
 before this binary serves it.
 
 - v4 was the last released pre-identity format, used by OmniGraph 0.8.x.
@@ -56,8 +57,9 @@ before this binary serves it.
   edge table. Until v10 a v8 graph retained its stamp until
   `omnigraph schema upgrade-system-columns` converted it in place (RFC 0040
   Rollout step 3: stamp advance first, one rename-only commit per table,
-  schema promotion last). Since v10 that upgrade moves no stamp and stages
-  detached renames like schema apply (RFC 0067).
+  schema promotion last). Since v10 the vintage has no separate stamp and the
+  upgrade stages detached renames like schema apply (RFC 0067); its publication
+  follows the ordinary format conversion rule above.
 - v10 preserves v9's layout and lets a table registration carry
   `omnigraph.staged_version` and `omnigraph.transaction_uuid` (RFC 0067): the
   detached Lance version a pin was staged as and the transaction promotion

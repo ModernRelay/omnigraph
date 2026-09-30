@@ -152,7 +152,10 @@ resource validation before staging. `stage_all` opens each touched table at
 its pin through the read-handle cache (the registration's `staged_version`
 when it carries one) and produces one exact transaction per table without
 moving HEAD. `commit_all` enters the gates, revalidates the complete
-authority, and commits every participant as a detached version of its pinned
+authority (for a branch other than the handle's bound one, the captured
+manifest probe first: an unchanged version and branch identifier keep the
+captured authority, a mismatch is a fresh coherent capture), and commits
+every participant as a detached version of its pinned
 base: no recovery sidecar is armed, a table's linear HEAD never moves, and
 nothing can rebase. Every detached commit records the authority it was staged
 against in its transaction properties,
@@ -163,7 +166,11 @@ removed under `omnigraph.deleted_ids` (inline up to 64 KiB) or
 discovery read them. The manifest then publishes every pin as
 `(base + 1, staged_version, transaction_uuid)` in one CAS; a publish that
 loses the CAS returns the plain `ReadSetChanged`, and the staging it leaves
-is unpublished until the collector reclaims it. The published pin is final:
+is unpublished until the collector reclaims it. The probe reads only the
+held native ref, so a second live incarnation of the branch name (two
+processes creating it at once) is refused by the publisher's own branch
+resolution after the detached commits, not before them; the graph is
+unchanged and the staging is reclaimed the same way. The published pin is final:
 readers open `staged_version` directly, and `published_dataset_version`
 keeps its number, `base + 1`, as the table's logical version inside its
 `__manifest` lineage without naming a Lance version. Every registration
