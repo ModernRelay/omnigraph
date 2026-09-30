@@ -1,6 +1,6 @@
 ---
 rfc: "0047"
-title: "Search plan truth: loud search failures and one total order"
+title: "Search plan validation and result guarantees"
 track: public
 status: draft
 implementation: in-progress
@@ -14,7 +14,7 @@ superseded_by: []
 blocked_on: []
 ---
 
-# RFC 0047: Search plan truth: loud search failures and one total order
+# RFC 0047: Search plan validation and result guarantees
 
 Existing-behavior code references are at `main` `baf10c94`. Behaviour marked
 as observed was reproduced at `b14c22c5` with a logic-test probe on engine v2
@@ -328,6 +328,55 @@ Lance or execution-engine dependency. The validation behavior below is
 proposed; it does not describe shipped checks. A term in bold italics is
 defined where it first appears.
 
+#### Query and explain share acceptance
+
+Ordinary execution, plain `EXPLAIN` and inspected execution call the same
+planning and validation path for the underlying query. Explain is a rendering
+of an accepted plan, not an alternate planner or a stronger validation mode.
+For identical checked-query inputs, resolved parameter values, schema and
+snapshot facts, planning statistics, settings, rule/semantics versions and
+validation limits, they produce the same accepted plan and validation scope,
+or the same deterministic planning/validation failure. Failure preserves its diagnostic
+class, code and reason; source positions still refer to the submitted source.
+Wall-clock timeout, cancellation and failure to obtain planning inputs are
+separate attempt outcomes, outside this deterministic equality.
+Bind volatile inputs such as `now()` once for this comparison. Two separate
+requests may capture different inputs and are not covered by that equality.
+
+Validation failure returns an error before execution or a successful explain
+document. After acceptance, plain explain returns the plan without executing
+its operators. It validates adaptive-policy definitions and prerequisites
+known at planning, but does not run their data-dependent guards or claim a
+runtime branch was taken. Execution still evaluates those guards and can fail
+on I/O, memory, cancellation or other execution conditions that plain explain
+does not exercise. Successful explain therefore establishes planning
+acceptance, not successful execution.
+
+Successful explain carries a compact summary derived from the accepted-plan
+wrapper, for example `"validation": { "scope": "exact_subset" }`. The scope
+is `exact_subset` when the closed fragment and its derivation were checked,
+or `invariants_only` for the explicitly narrower checks. No optimizer or
+renderer may manufacture or upgrade this scope. Acceptance is implicit in a
+successful document; a second `accepted` flag adds no guarantee. The full
+derivation remains internal evidence for validation, replay and diagnostics,
+not a required field of ordinary read responses.
+
+Inspected execution renders this summary from the same accepted plan that
+produced its rows, without a second planning run. GQT asserts the scope
+through the following new `expect plan` form, alongside existing row and
+shape expectations:
+
+```text
+--- expect plan
+validation scope exact_subset
+```
+
+`validation scope invariants_only` selects the other scope. Missing evidence
+or a different scope fails the assertion. Failed planning uses the existing
+`expect error:` mechanism instead; it produces no successful plan summary.
+These assertions inspect the validator's result and do not implement another
+validator in GQT.
+
 #### Requirements come from the checked query
 
 Before lowering, derive immutable requirements from the checked declaration,
@@ -558,6 +607,32 @@ must introduce no search, order or cut choice outside them. Any later
 execution-plan rewrite needs its own checked rule before extending the
 guarantee to that boundary.
 
+#### Which checks a query performs
+
+| Work | Fresh query planning and plain explain | Other owner or stage |
+|---|---|---|
+| Compiler legality, parameter/type resolution and query-derived requirements | Required through the shared compiler and validation path | Do not repeat compiler rules in another checker |
+| Lowering checks, physical requirements, recorded index/snapshot prerequisites and adaptive-policy definitions | Required before accepting a new plan | Runtime evaluates the declared data-dependent guards when reached |
+| Exact-subset derivation checking | Required for that subset under this RFC, including ordinary production planning | Nonmember queries receive invariant checks only |
+| Saved-evidence decoding, format/version compatibility and reconstruction of saved inputs | Not needed for a fresh in-memory plan | Required when accepting a serialized plan for replay |
+| Rendering the scope, full trace or other explain diagnostics | Not needed to execute an ordinary query | Explain, inspection and replay export render from accepted evidence |
+| Expected-row comparisons, malformed-plan injections, reference comparisons and overhead measurements | Not part of serving a query | GQT and the existing Rust test owners |
+
+The derivation checker is additional protection against compiler/optimizer
+defects; it is not needed merely to evaluate the operators. Requiring it in
+production for the supported fragment is a deliberate assurance and cost
+choice in this RFC. Moving it to tests or a debug mode would weaken that
+production guarantee and require an explicit change to the acceptance
+contract, shared by query and explain. Explain cannot silently enable checks
+that ordinary planning skips.
+
+Validate a newly built plan once before using its accepted wrapper. Execution
+does not recheck the entire derivation for each row, batch or policy rung;
+it checks the declared runtime guards and resource limits where required.
+A fresh plan needs no serialization-and-replay round trip to establish
+acceptance. Mutation of the plan or acceptance of a saved plan still requires
+validation as specified above.
+
 ### Diagnostics
 
 `QueryDiagnostic { kind, code, message, position, stage, fix }` lives in the
@@ -678,6 +753,9 @@ either arm is.
 
 - **Wire:** `diagnostic`, `retrievals`, `metrics` and `usage` are additive and
   omitted when absent. `POST /read` is untouched. OpenAPI regenerates.
+- **Explain:** the additive validation-scope summary comes from the same
+  acceptance path as execution. It does not add a validation field to an
+  ordinary read response or expose the complete derivation by default.
 - **Language:** `T27` and the `rrf()` arms type error refuse queries the
   compiler accepts today; both previously produced wrong or failing results.
 - **Order:** results change only where an order was not total: ties inside a
@@ -757,6 +835,20 @@ typed comparator field. Adaptive-policy tests alter a guard, prefilter source,
 rung, cap or fallback and require rejection; exercise each permitted branch
 and its recorded evidence through replay.
 
+Add parity tests for ordinary planning, plain explain and inspected execution
+using one captured set of query inputs, including resolved `now()`, snapshot
+facts, statistics, settings and validation limits. Require the same accepted
+plan/scope on success and the same diagnostic class/code/reason on a
+deterministic planning or validation failure, including validation-budget
+exhaustion. Timeout and cancellation do not require equal outcomes across
+attempts. Assert that plain explain runs no query operators;
+an execution-only failure may occur after successful explain. GQT cases
+assert `validation scope exact_subset` or `validation scope invariants_only`
+on the explain document from their own run. Parser/runner tests reject a
+missing or mismatched scope; error cases retain ordinary error expectations.
+Ordinary execution must pass the acceptance gate even when no explain output
+is requested. Keep malformed evidence and bypass tests in the Rust owners.
+
 Use the A/B/C nearest boundary-tie example to assert the order within the
 retrieved window without demanding A from a B,C window. Separately assert
 BM25's uncapped matching population and RRF arm caps versus its final row
@@ -793,7 +885,7 @@ and regressions. Step 7 can ship independently.
 |---|---|---|
 | 1 | Diagnostics contract for parse and type refusals (PR #759, merged 2026-09-30) | None |
 | 2 | Planner refusals carry diagnostics; a refusal by design is a bad request | #786 |
-| 2a | Shared validation requirements and acceptance path; finite exact-subset rules, adaptive-policy checks, bounded and versioned replay evidence | supports steps 3-6 |
+| 2a | Shared query/explain validation and acceptance; exact-subset rules, adaptive-policy checks, bounded/versioned replay evidence, GQT scope assertions | supports steps 3-6 |
 | 3 | `T27` and `FullTextIndexRequired` | #747 |
 | 4 | The ranked binding roots its component; the `rrf()` arms type error | #789 |
 | 5 | One total order: fused score column, `Sort` over fusion and search-ordered aggregates, `T37` retired | #787, #788 |
@@ -837,3 +929,5 @@ None.
   `in-progress`. The maintainer's review added the optional `suggestion` to
   the diagnostic: source edits a caller can apply mechanically, marked
   machine-applicable only after the edited text parses.
+- 2026-09-30: retitled to "Search plan validation and result guarantees" to
+  reflect shared validation and the explicit scope of search result guarantees.
