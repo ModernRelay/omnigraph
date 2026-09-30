@@ -51,13 +51,13 @@ use lance_io::utils::tracking_store::IOTracker;
 use omnigraph::Session;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::instrumentation::{
-    CountingStorageAdapter, ProbedStores, QueryIoProbes, StorageReadCounts,
-    enabled_engine_cargo_features, with_query_io_probes,
+    CountingStorageAdapter, ProbedStores, QueryIoProbes, StorageReadCounts, with_query_io_probes,
 };
 use omnigraph::loader::LoadMode;
 use omnigraph::settings::SessionSettings;
 use omnigraph::storage::storage_for_uri;
 
+use super::run_target::{RunTarget, attestation, spawn_watchdog, validate_target_uri};
 use super::{Args, current_process_peak_rss_bytes, helpers, rfc023_limits, rfc023_scenarios};
 
 /// Phase flag values shared between the timeline task and the writers.
@@ -95,13 +95,7 @@ pub(super) fn validate_args(args: &Args) -> Result<(), String> {
     if args.phase.is_some() || args.fixture_root.is_some() {
         return Err("--phase/--fixture-root are internal to phased adopt children".into());
     }
-    if let Some(uri) = &args.target_uri
-        && !uri.starts_with("s3://")
-    {
-        return Err(format!(
-            "--target-uri must be an s3:// URI (or unset for a local tempdir), got '{uri}'"
-        ));
-    }
+    validate_target_uri(args)?;
     // Seed feasibility under the same chunked-load plan the fixtures use.
     rfc023_limits::derive_chunk_plan(args.dims, "base", args.rows)?;
     Ok(())
@@ -124,15 +118,6 @@ fn nearest_rank(sorted: &[u64], quantile: f64) -> u64 {
     }
     let rank = (quantile * sorted.len() as f64).ceil() as usize;
     sorted[rank.clamp(1, sorted.len()) - 1]
-}
-
-/// `cfg!(tokio_unstable)` in one place: the workspace injects the cfg via
-/// `.cargo/config.toml` rustflags unless `RUSTFLAGS=` replaces it, and the
-/// record must say which build it measured. The cfg is not declared in this
-/// crate's lint table, hence the local allow.
-#[allow(unexpected_cfgs)]
-fn tokio_unstable_cfg() -> bool {
-    cfg!(tokio_unstable)
 }
 
 #[derive(Default)]
@@ -291,59 +276,13 @@ struct MeasuredRun {
 }
 
 pub(super) async fn run(args: &Args) -> serde_json::Value {
-    // ---- Target root -----------------------------------------------------
-    // Local: a tempdir owned for the child's lifetime. S3: a unique prefix
-    // under --target-uri, probed for reachability BEFORE any fixture work so
-    // a bad endpoint or credential set is a refusal (78), not a mid-run
-    // panic.
-    let mut local_dir: Option<tempfile::TempDir> = None;
-    let (root_uri, target_backend) = match &args.target_uri {
-        None => {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let uri = dir.path().to_str().expect("utf8 tempdir").to_string();
-            local_dir = Some(dir);
-            (uri, "local-fs")
-        }
-        Some(base) => {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let run_root = format!("{}/cw-{nanos}", base.trim_end_matches('/'));
-            let probe_uri = format!("{run_root}/__cw_probe");
-            let reachable = async {
-                let storage = storage_for_uri(&run_root).map_err(|e| e.to_string())?;
-                storage
-                    .write_text(&probe_uri, "concurrent-writes probe")
-                    .await
-                    .map_err(|e| e.to_string())?;
-                storage.delete(&probe_uri).await.map_err(|e| e.to_string())
-            }
-            .await;
-            if let Err(error) = reachable {
-                eprintln!(
-                    "refusing --target-uri '{base}': the store is not usable from this \
-                     environment ({error}); set the AWS_* variables the deployment guide \
-                     documents (endpoint, credentials, path style)"
-                );
-                std::process::exit(78);
-            }
-            (run_root, "s3")
-        }
-    };
-
-    // ---- Watchdog --------------------------------------------------------
+    // ---- Target root and watchdog ---------------------------------------
+    let target = RunTarget::prepare(args, "cw").await;
+    let root_uri = target.root_uri.clone();
     let watchdog_budget = Duration::from_secs(args.warmup_secs + args.duration_secs)
         .saturating_add(WATCHDOG_SLACK)
         .saturating_mul(2);
-    let watchdog = tokio::spawn(async move {
-        tokio::time::sleep(watchdog_budget).await;
-        eprintln!(
-            "concurrent-writes watchdog: run exceeded {}s; terminating",
-            watchdog_budget.as_secs()
-        );
-        std::process::exit(75);
-    });
+    let watchdog = spawn_watchdog("concurrent-writes", watchdog_budget);
 
     // ---- Fixture (outside every timer) ----------------------------------
     let setup_started = Instant::now();
@@ -424,21 +363,11 @@ pub(super) async fn run(args: &Args) -> serde_json::Value {
     .await;
 
     // ---- Judge + summarize (no probes, counters already read) ------------
-    let record = judge_and_summarize(args, target_backend, &measured).await;
+    let record = judge_and_summarize(args, target.backend, &measured).await;
 
     // ---- Teardown --------------------------------------------------------
     watchdog.abort();
-    if target_backend == "s3" && !args.keep_fixture {
-        if let Ok(storage) = storage_for_uri(&measured.root_uri) {
-            if let Err(error) = storage.delete_prefix(&measured.root_uri).await {
-                eprintln!(
-                    "concurrent-writes teardown: could not delete '{}': {error}",
-                    measured.root_uri
-                );
-            }
-        }
-    }
-    drop(local_dir);
+    target.teardown(args, "concurrent-writes").await;
     record
 }
 
@@ -862,13 +791,7 @@ async fn judge_and_summarize(
                                at the window flip and include the tails of warmup-started ops",
         })},
         "probes_installed": !args.no_probes,
-        "attestation": {
-            "enabled_engine_cargo_features": enabled_engine_cargo_features(),
-            "lance_mem_pool_size_env": std::env::var("LANCE_MEM_POOL_SIZE").ok(),
-            "rustflags_env": std::env::var("RUSTFLAGS").ok(),
-            "tokio_unstable_cfg": tokio_unstable_cfg(),
-            "tokio_worker_threads": tokio::runtime::Handle::current().metrics().num_workers(),
-        },
+        "attestation": attestation(),
         "operation_pre_peak_rss_bytes": measured.pre_measure_peak_rss,
         "operation_post_peak_rss_bytes": current_process_peak_rss_bytes(),
         "rss_boundary": "single child; the parent's wait4 peak includes fixture seeding",

@@ -231,6 +231,47 @@ the measured child, so exporting those variables is sufficient.
 
 These records are diagnostic evidence and do not enter the durable archive.
 
+## Concurrent-merges overlap diagnostics
+
+The `concurrent-merges` scenario asks whether merges into independent
+targets overlap or queue: `--writers N` merges run at once, each from its
+own source into its own target, against a single merge alone on the same
+graph.
+
+```bash
+RUSTFLAGS= cargo bench --locked -p omnigraph-engine --bench scenarios -- \
+  --scenario concurrent-merges --writers 8 --rows 256 --dims 8 \
+  --delta-rows 50 --runs 3 --out /tmp/concurrent-merges.jsonl
+```
+
+One repetition builds a `Chunk` fixture of `--rows` rows on `main` and
+N + 2 merge pairs, each a source and a target forked from `main` that
+insert `--delta-rows` rows under their own keys, so every merge is a
+three-way merge without conflicts and never a fast-forward. Two pairs
+are controls, merged alone before and after the batch, so every merge
+sees the same branch count and the pair of controls shows drift. Each
+measured phase opens a fresh handle outside its clock; the batch runs N
+tasks over clones of one `Session`, released together by a barrier, and
+its clock starts before the release.
+
+`batch.last_over_single` is the batch's last completion over the
+controls' mean: 1.0 is perfect overlap and N is full serialization.
+`batch.per_merge` holds each merge's start, completion and service time
+from the batch clock. The peak-RSS pair brackets the batch; the process
+high-water mark already covers fixture seeding and the first control, so
+an unchanged post value means the batch did not raise it. A fresh
+handle then requires exact row counts on every branch and reads each
+target's first and last merged source key back; a merge error, an
+outcome other than `Merged`, or a mismatch fails the run.
+
+The record is `claim_grade: false`: one batch on the host's clock is
+overlap evidence, not a throughput or latency claim. `--target-uri`,
+`--keep-fixture` and `--tokio-workers` behave as they do for
+`concurrent-writes`; the unique segment is `cm-{nanos}`. On a local
+target a small merge takes tens of milliseconds, so contention on the
+storage path hides; the queueing a slow store exposes shows best on an
+S3-compatible target with injected latency.
+
 ## Layout
 
 - `cases/*.case-v1.yaml` assigns the fixture, workload, environment, and
