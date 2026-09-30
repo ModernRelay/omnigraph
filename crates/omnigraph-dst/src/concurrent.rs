@@ -52,7 +52,7 @@ use omnigraph::storage::{ObjectStorageAdapter, StorageAdapter};
 
 use crate::fixtures::{
     MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, mixed_params, mutate_on, person_rows_target,
-    query_main,
+    query_main, schema_with_extras,
 };
 use crate::rand::SplitMix64;
 
@@ -133,6 +133,17 @@ pub struct ConcurrentScenario {
     /// op's Lance-realm writes may land (declared, not a hole: that IS a
     /// torn state for recovery to judge).
     pub kill_writer: Option<(usize, usize)>,
+    /// ARM — schema apply as the EXCLUSIVE gate's writer role (RFC
+    /// 2026-09-18-shared-schema-gate): a dedicated schema actor (scheduler
+    /// id = `writers + 2`) performs this many monotone additive applies
+    /// (`schema_with_extras(1..=n)`) against main while the data writers
+    /// race under their SHARED permits. Seed triple drawn only when
+    /// nonzero, after every existing draw, so all existing scenarios keep
+    /// their exact draw sequences. Refused together with `branch_cycles`
+    /// (apply's mono-branch refusal would make every cycle a vacuous
+    /// conflict). This is the deterministic coverage of the
+    /// shared/exclusive boundary: writers-racing-apply had none before.
+    pub schema_ops: usize,
     /// ARM 3 — branch verbs under concurrency: a dedicated BRANCH ACTOR
     /// (writer id = `writers`, one past the data writers) runs this many
     /// fork→write→merge→delete cycles against main while the writers race —
@@ -192,6 +203,11 @@ pub struct ConcurrentReport {
     /// maintenance actor, a dying/faulted writer's recovery pass, or a
     /// branch actor (none of these writes a writer-encoded person value).
     pub maintenance_commits: usize,
+    /// Empty person-diff commits (maintenance, schema applies) that landed
+    /// with a writer's data commit both before and after them in main's
+    /// lineage: evidence that such a commit interleaved with the writers
+    /// rather than running entirely before or after them.
+    pub era_commits_between_data: usize,
     /// Era commits legally unreadable at final audit because a concurrent
     /// Cleanup retired their versions (the retention horizon, live). The
     /// prefix-membership judge covers the claims that landed there.
@@ -201,6 +217,9 @@ pub struct ConcurrentReport {
     pub branch_committed: usize,
     pub branch_merges: usize,
     pub branch_retries: usize,
+    /// Schema actor totals: applies committed / legal-conflict retries.
+    pub schema_committed: usize,
+    pub schema_retries: usize,
     /// Reader-actor rounds completed (their oracles red by panic en route).
     pub reader_rounds: usize,
     /// Marked storage faults actually delivered to writers (bite evidence
@@ -1515,6 +1534,96 @@ fn writer_life(
     }))
 }
 
+/// The schema actor (RFC 2026-09-18-shared-schema-gate): monotone
+/// additive applies racing the data writers. Each apply takes the schema
+/// gate's EXCLUSIVE side inside the engine, so it drains every writer's
+/// shared permit and blocks new ones — the boundary this actor exists to
+/// exercise deterministically. Legal outcomes en route: success, or a
+/// typed `kind: Conflict` retry (a moved graph head between capture and
+/// publish). Anything else reds naming the apply.
+fn schema_life(
+    root: &str,
+    storage: Arc<dyn StorageAdapter>,
+    ops: usize,
+    seeds3: (u64, u64, u64),
+    start: Arc<std::sync::Barrier>,
+    sched_ctx: Option<(Arc<SeamScheduler>, usize)>,
+) -> (usize, usize) {
+    let (runtime_seed, ulid_seed, workload_seed) = seeds3;
+    let _ = rand::rng().reseed();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .rng_seed(tokio::runtime::RngSeed::from_bytes(
+            &runtime_seed.to_le_bytes(),
+        ))
+        .build_local(Default::default())
+        .expect("schema runtime");
+    runtime.block_on(Box::pin(async move {
+        let _ids = omnigraph::dst_ids::IDS
+            .install(Arc::new(omnigraph::dst_ids::SeededUlids::new(ulid_seed)));
+        let _clock = omnigraph::dst_clock::CLOCK
+            .install(Arc::new(omnigraph::dst_clock::LogicalClock::default()));
+        let _gate = sched_ctx.as_ref().map(|(s, actor)| {
+            let (hook_sched, hook_actor) = (s.clone(), *actor);
+            omnigraph::dst_gate::GATE.install(Arc::new(omnigraph::dst_gate::TurnFn(move || {
+                hook_sched
+                    .enter(hook_actor)
+                    .map(|g| Box::new(g) as Box<dyn std::any::Any + Send>)
+            })))
+        });
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::open_with_storage(root, storage)
+                    .await
+                    .expect("schema-actor handle on shared root"),
+            ),
+            SessionSettings::default(),
+        );
+        let _finish = sched_ctx
+            .as_ref()
+            .map(|(s, actor)| s.finish_on_drop(*actor));
+        start.wait();
+        if let Some((s, _)) = &sched_ctx {
+            s.arm();
+        }
+        let mut committed = 0usize;
+        let mut retries = 0usize;
+        // Seeded pauses spread the applies across the writers' lifetime. A
+        // back-to-back burst queues the exclusive side the moment the barrier
+        // opens and, the lock being write-preferring, runs every apply before
+        // the first writer commit — no contention at all. REAL time, like the
+        // writers' think time: this universe holds no virtual clock.
+        let mut stream = SplitMix64(workload_seed);
+        for count in 1..=ops {
+            let pause_ms = 2 + stream.next_u64() % 30;
+            tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
+            let desired = schema_with_extras(count);
+            let mut occ_retries = 0usize;
+            loop {
+                match Box::pin(db.apply_schema(&desired)).await {
+                    Ok(_) => break,
+                    Err(err) => {
+                        let rendered = format!("{err:?}");
+                        assert!(
+                            rendered.contains("kind: Conflict"),
+                            "schema apply {count}: illegal rejection while racing \
+                             live writers: {rendered}"
+                        );
+                        occ_retries += 1;
+                        assert!(
+                            occ_retries < 256,
+                            "schema apply {count}: livelocked on legal conflicts"
+                        );
+                        retries += 1;
+                    }
+                }
+            }
+            committed += 1;
+        }
+        (committed, retries)
+    }))
+}
+
 /// ARM 1 — the maintenance actor's life: races Optimize / Cleanup(keep=1) /
 /// ensure_indices against the data writers from its own thread + handle.
 /// Returns (committed, legal retries, cleanups run). STRICT first-contact
@@ -1843,12 +1952,13 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
     // Birth certificate. NOTE the envelope: this line does NOT promise replay.
     println!(
         "dst concurrent universe [root={root} seed={} writers={} ops_per_writer={} \
-         maintenance_ops={} kill_writer={:?} branch_cycles={}] \
+         maintenance_ops={} schema_ops={} kill_writer={:?} branch_cycles={}] \
          envelope=bite+oracles-hold (no replay claim)",
         sc.seed,
         sc.writers,
         sc.ops_per_writer,
         sc.maintenance_ops,
+        sc.schema_ops,
         sc.kill_writer,
         sc.branch_cycles
     );
@@ -1871,6 +1981,14 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
     } else {
         Vec::new()
     };
+    assert!(
+        !(sc.schema_ops > 0 && sc.branch_cycles > 0),
+        "schema_ops races the mono-branch refusal: a branch actor makes every \
+         apply a vacuous legal conflict — arm one or the other"
+    );
+    // Drawn last so every existing scenario keeps its exact draw sequence.
+    let schema_seeds =
+        (sc.schema_ops > 0).then(|| (seeds.next_u64(), seeds.next_u64(), seeds.next_u64()));
 
     crate::harness::clear_process_slots();
     crate::env_knobs::require_pool_env();
@@ -1929,9 +2047,13 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                 }));
 
                 // ---- the race: one OS thread per participant ----
+                // Every actor that calls `start.wait()` must be counted: the
+                // barrier is cyclic, so an undercount lets the first N pass and
+                // parks the last arrival forever.
                 let participants = sc.writers
                     + usize::from(maintenance_seeds.is_some())
                     + usize::from(branch_seeds.is_some())
+                    + usize::from(schema_seeds.is_some())
                     + sc.readers;
                 let start = Arc::new(std::sync::Barrier::new(participants));
                 // ARM 2: the dying writer gets its own kill wrapper over the
@@ -1959,14 +2081,18 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                     })
                     .collect();
                 // the universe's arbiter. Scheduler ids: writers 0..N,
-                // branch actor N (its claim id), maintenance N+1. Readers
-                // stay ungated (read-only; initial scope).
+                // branch actor N (its claim id), maintenance N+1, schema
+                // actor N+2. Readers stay ungated (read-only; initial
+                // scope).
                 let scheduler: Option<Arc<SeamScheduler>> = sc
                     .seam_schedule
                     .then(|| SeamScheduler::new(sc.seed ^ SEAM_SCHED_SALT));
                 if let Some(s) = &scheduler {
                     for w in 0..sc.writers {
                         s.register(w);
+                    }
+                    if schema_seeds.is_some() {
+                        s.register(sc.writers + 2);
                     }
                     if branch_seeds.is_some() {
                         s.register(sc.writers);
@@ -1989,11 +2115,12 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                 crate::lance_faults::set_seam_scheduler(scheduler.clone().map(|s| (s, sc.writers)));
                 type BranchStats = (Vec<ClaimedWrite>, usize, usize);
                 #[allow(clippy::type_complexity)] // scoped result tuple of the race
-                let (results, maintenance_stats, branch_stats, reader_rounds): (
+                let (results, maintenance_stats, branch_stats, reader_rounds, schema_stats): (
                     Vec<(Vec<ClaimedWrite>, usize, usize)>,
                     (usize, usize, usize),
                     BranchStats,
                     usize,
+                    (usize, usize),
                 ) = std::thread::scope(|writers| {
                     let handles: Vec<_> = writer_seeds
                         .iter()
@@ -2064,6 +2191,26 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                             })
                             .expect("spawn maintenance thread")
                     });
+                    let schema_handle = schema_seeds.map(|seeds3| {
+                        let schema_actor = sc.writers + 2;
+                        let storage: Arc<dyn StorageAdapter> = match &scheduler {
+                            Some(s) => Arc::new(ScheduledStorage::new(
+                                storage.clone(),
+                                s.clone(),
+                                schema_actor,
+                            )),
+                            None => storage.clone(),
+                        };
+                        let sched_ctx = scheduler.clone().map(|s| (s, schema_actor));
+                        let start = start.clone();
+                        std::thread::Builder::new()
+                            .name("dst-schema-actor".into())
+                            .stack_size(crate::harness::UNIVERSE_STACK_BYTES)
+                            .spawn_scoped(writers, move || {
+                                schema_life(root, storage, sc.schema_ops, seeds3, start, sched_ctx)
+                            })
+                            .expect("spawn schema actor thread")
+                    });
                     let branch_handle = branch_seeds.map(|seeds3| {
                         let storage: Arc<dyn StorageAdapter> = match &scheduler {
                             Some(s) => Arc::new(ScheduledStorage::new(
@@ -2114,6 +2261,13 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                             Err(panic) => std::panic::resume_unwind(panic),
                         }
                     }
+                    let schema_stats = match schema_handle {
+                        None => (0usize, 0usize),
+                        Some(h) => match h.join() {
+                            Ok(s) => s,
+                            Err(panic) => std::panic::resume_unwind(panic),
+                        },
+                    };
                     let m = match maintenance_handle {
                         None => (0, 0, 0),
                         Some(h) => match h.join() {
@@ -2135,7 +2289,7 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                             Err(panic) => std::panic::resume_unwind(panic),
                         }
                     }
-                    (all, m, b, r_total)
+                    (all, m, b, r_total, schema_stats)
                 });
                 // The race is over: clear the Lance-realm arbiter slot so
                 // the final audit's reads run ungated (and never count as
@@ -2143,6 +2297,7 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                 crate::lance_faults::set_seam_scheduler(None);
                 let (maintenance_committed, maintenance_retries, maintenance_cleanups) =
                     maintenance_stats;
+                let (schema_committed, schema_retries) = schema_stats;
                 let (branch_claims, branch_merges, branch_retries) = branch_stats;
                 let branch_committed = branch_claims.len();
                 let recovery_reopens: usize = results.iter().map(|(_, r, _)| *r).sum();
@@ -2204,9 +2359,13 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                     // always red.
                     let maintenance_active = sc.maintenance_ops > 0;
                     let branch_active = sc.branch_cycles > 0;
+                    let schema_active = sc.schema_ops > 0;
                     let mut below_horizon = 0usize;
                     let mut islands = 0usize;
                     let mut maintenance_commit_count = 0usize;
+                    // `true` for a data commit, `false` for an empty-diff
+                    // commit, in lineage order.
+                    let mut era_sequence: Vec<bool> = Vec::new();
                     let mut attributed: Vec<AttributedCommit> = Vec::new();
                     let mut prev: Option<BTreeMap<String, i64>> = None;
                     let mut s0: Option<BTreeMap<String, i64>> = None;
@@ -2276,14 +2435,17 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                                             assert!(
                                                 maintenance_active
                                                     || recovery_legal
-                                                    || branch_active,
+                                                    || branch_active
+                                                    || schema_active,
                                                 "commit {id}: empty person-diff with \
                                                  no maintenance actor, no dying \
-                                                 writer, and no branch actor — \
-                                                 unattributable commit"
+                                                 writer, no branch actor, and no \
+                                                 schema actor — unattributable commit"
                                             );
                                             maintenance_commit_count += 1;
+                                            era_sequence.push(false);
                                         } else {
+                                            era_sequence.push(true);
                                             // Decode every change; ARM 3: a commit
                                             // whose changes ALL belong to the branch
                                             // actor is a MERGE commit folding a whole
@@ -2441,6 +2603,17 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                         maintenance_retries,
                         maintenance_cleanups,
                         maintenance_commits: maintenance_commit_count,
+                        era_commits_between_data: era_sequence
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, data)| {
+                                !**data
+                                    && era_sequence[..*i].iter().any(|d| *d)
+                                    && era_sequence[i + 1..].iter().any(|d| *d)
+                            })
+                            .count(),
+                        schema_committed,
+                        schema_retries,
                         below_horizon,
                         branch_committed,
                         branch_merges,

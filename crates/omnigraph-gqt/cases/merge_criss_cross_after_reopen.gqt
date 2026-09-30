@@ -1,0 +1,153 @@
+# issue: none
+# notes: Two incomparable common ancestors preserve disjoint later updates in On and Verify modes.
+# notes: Both merged targets and the unchanged source are read after reopen.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"a","age":0}}
+{"type":"Person","data":{"name":"b","age":0}}
+{"type":"Person","data":{"name":"c","age":0}}
+{"type":"Person","data":{"name":"d","age":0}}
+
+--- mutate
+branch create left;
+
+--- expect ok
+
+--- mutate
+branch create right;
+
+--- expect ok
+
+--- mutate branch: left
+query left_first() {
+    update Person set { age: 1 } where name = "a"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: right
+query right_first() {
+    update Person set { age: 1 } where name = "b"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create left_old from left;
+
+--- expect ok
+
+--- mutate
+branch create right_old from right;
+
+--- expect ok
+
+--- mutate
+set merge_lineage = verify;
+branch merge right_old into left;
+
+--- expect outcome: merged
+
+--- mutate
+set merge_lineage = verify;
+branch merge left_old into right;
+
+--- expect outcome: merged
+
+--- mutate branch: left
+query left_later() {
+    update Person set { age: 2 } where name = "c"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: right
+query right_later() {
+    update Person set { age: 3 } where name = "d"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create on_target from right;
+
+--- expect ok
+
+--- restart
+
+--- mutate
+set merge_lineage = verify;
+branch merge left into right;
+
+--- expect outcome: merged
+
+--- mutate
+set merge_lineage = on;
+branch merge left into on_target;
+
+--- expect outcome: merged
+
+--- restart
+
+--- query branch: right
+query verify_target() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"a","p.age":1}
+{"p.name":"b","p.age":1}
+{"p.name":"c","p.age":2}
+{"p.name":"d","p.age":3}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- query branch: on_target
+query on_target_rows() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"a","p.age":1}
+{"p.name":"b","p.age":1}
+{"p.name":"c","p.age":2}
+{"p.name":"d","p.age":3}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- query branch: left
+query source_stays_isolated() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"a","p.age":1}
+{"p.name":"b","p.age":1}
+{"p.name":"c","p.age":2}
+{"p.name":"d","p.age":0}
+
+--- expect shape
+p.name: String
+p.age: I32

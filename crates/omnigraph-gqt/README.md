@@ -6,8 +6,9 @@ Every `.gqt` file under `cases/`, including subdirectories, is one test
 in the complete corpus. Test names retain the path relative to `cases/`.
 Shared cases live directly under `cases/`; v2-specific cases live under
 `cases/v2/`, with plan assertions under `cases/v2/planner/`.
-These directories organize the corpus. Cases that require v2 still select it
-explicitly with `set engine = v2;`; discovery never changes the engine.
+These directories organize the corpus. Every case runs on engine v2, the one
+engine; a case's `set engine = v2;` line changes nothing, and discovery never
+selects an engine.
 The format contract and future extensions live in
 [RFC 0045](../../docs/rfcs/0045-gq-logic-tests.md).
 
@@ -133,16 +134,80 @@ table; a place-and-action pair outside it, or listed but not implemented, is
 refused at admission naming the table row. An old `--- fault` block
 converts by renaming the section and its `return_error` action to
 `action: fail`; `at`, `occurrence` and `scope` keep their names. Process crashes,
-concurrent steps, server/CLI sessions and network simulation are future
-extensions.
+server/CLI sessions and network simulation are future extensions.
+
+## Concurrent block
+
+A `--- concurrent` section runs two to four labeled GQ statements at the
+same time on the case's one handle, in the order its `order:` line names;
+it is one step of the case and runs under the DST runner only.
+
+```text
+--- concurrent
+w1: query add_bob() { insert Person { name: "bob" } }
+r1: query all() { match { $p: Person } return { $p.name } }
+order: w1 park put __manifest/_versions/, r1 start, r1, w1 put __manifest/_versions/
+--- expect
+w1: ok
+r1: ok
+```
+
+A session is `<label>[ on <branch>]: <statement>` at column 0, continued on
+the lines that follow: one query or mutation declaration with no parameters,
+on `main` unless `on <branch>` says otherwise. Every session is a `Session`
+over the case handle, so the sessions share its in-process locks the way a
+server's requests do. `order:` closes the block: comma-separated entries,
+each `<label> start` (the session's statement begins; the runner holds it
+before that), `<label>` (the session's completion, reported as `done`),
+`<label> <verb> <key-suffix>` (the session's next store request of that
+verb whose key contains the suffix, run in turn; the cursor moves past the
+entry when the request completes: a multipart write when its upload
+completes or aborts, a listing when its first item or end arrives, a `copy`
+is named by its destination key) or `<label> park <verb> <key-suffix>` (the
+session arrives at that request and is held there, inside whatever the
+engine holds at that point, until its next entry is due; arrival moves the
+cursor; the entry after a park for its label is that request without
+`park`, or the label's completion). Verbs are `get`, `head`, `put`, `list`,
+`delete` and `copy`. Labels are `[a-z][a-z0-9]*`; `setup`, `runner`, `step`
+and `order` are reserved. A request no entry names runs at once, and a
+request made outside any session's future (a Lance pool thread, a task the
+engine spawned) can never be named. The `--- expect` after the block is
+bare, one `<label>: ok` or `<label>: error: <needle>` line per session;
+rows are not compared inside a block.
+
+While a session waits on the script the block drives the paused clock
+itself (RFC 0045 §Concurrent block says why) up to ten virtual seconds past
+the last cursor move or request; past that the clock stands still and the
+block fails as starved when neither an entry nor a request arrives for half
+the case's `timeout_ms` of wall time, at most ten seconds, or when a
+session finishes without a request entry of its own. A session blocked in
+the engine while no session waits on the script ends as the case's
+timeout. The example above is the read-during-publish case: on an engine
+whose publish holds the schema gate and the handle's coordinator lock
+across the manifest commit, `r1` waits behind `w1` (at the schema gate,
+before it reaches the coordinator lock) and the block starves at entry 3;
+on an engine that installs the published state after the commit, it
+passes. An entry naming a request the engine makes while holding a lock
+another session needs starves the block too: the writer's manifest `put` is
+safe to park at, a read's `__manifest` listing is under the coordinator read
+lock and is not, which is what `start` is for. The evidence row
+`concurrent_block` carries each session's outcome, the entry the cursor
+stopped at and the block's failure, replay-compared; the grant sequence
+with its wall times and the count of requests made outside any session are
+in the report's measurements, not the cost table. Under `--measure` each
+session is its own row, labeled by its session label, and the block's own
+row holds the requests made outside any session, so a read's virtual time
+beside a write is a number. Once a block is starved its sessions drain, and
+the requests they make from then on are in phase `after_abort`: a starved
+block's rows are the drain, not the interleaving the script named. Store
+requests are the only points an entry can name in this version; seams and
+in-process gates as entries, control statements as sessions and sessions on
+separate handles are later extensions.
 
 ## Plan expectations
 
 A query step may carry an `--- expect plan` section directly after its
-`--- expect shape`. The query's effective engine must be `v2`, selected by
-the runner baseline, a case settings step, or the query's `set engine = v2;`
-prefix. Under `v1` the harness fails before executing or explaining the
-query: v1 produces no plan. Each line asserts one fact of the selected v2
+`--- expect shape`. Each line asserts one fact of the query's v2
 plan, obtained from the engine's explain document before row
 comparison, without executing the query a second time:
 
@@ -199,6 +264,31 @@ the probe cap the plan carries (`0` spells no cap, as the `ann_nprobes`
 setting does). Nothing is compared as rendered text, so a planner that
 reaches the same facts by another route keeps the case green.
 
+## Reference comparison
+
+A query step may end with `--- expect same as v1`, directly after its
+`--- expect shape` or `--- expect plan`; the section has no body. The runner
+runs the step's query again on a copy of the case session carrying the frozen
+engine v1 (`omnigraph_reference_engine::ReferenceEngine`, the crate
+`omnigraph-reference-engine`, installed through `Session::with_read_executor`)
+and compares its rows with v2's, ordered or unordered as the step's
+`--- expect` says. The step's own rows expect still applies; the comparison is
+added to it.
+
+```text
+--- expect unordered
+--- expect shape
+p.name: String
+--- expect same as v1
+```
+
+A v1 error, a v1 gate refusal included, or a row difference fails the step.
+The section is refused on a mutate step, an error expect, `show` and
+`branch list`. The DST runner skips the comparison. The reference answers
+`not { ... }` blocks only among the correlated blocks, and refuses count
+predicates and a string `nearest` argument, so a step using those carries no
+`expect same as v1`.
+
 ## Run and reproduce
 
 Run the complete package (the workspace Cargo configuration enables seeded
@@ -213,7 +303,118 @@ cargo test -p omnigraph-gqt --test gq_logic_tests -- --test-threads=2
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --target omnigraph-engine-dst --storage in-memory-object-store --seed 42
 cargo run --bin omnigraph-gqt -- --replay ../../target/gqt-artifacts/invocation-EXAMPLE.json
+cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --measure
 ```
+
+`--measure` records, for every step of each DST environment, the object-store
+requests the engine made while the step ran. The measuring store is a
+decorator on the engine's `object_store_seam`, the seam the DST fault
+decorator uses, so every store the registry builds is wrapped: `__manifest`
+and table traffic alike, and the engine is not edited. The ledger keeps every
+request of the run, tagged with the label current when it was made: `setup`
+before the first step, `step` N while step N runs, `runner` N from its end to
+the next step (the runner's own checks); the runner only moves the label, and
+the report is the ledger grouped by it, so the rows add up to every request
+the store saw (`slot` column). Per group it reports:
+
+- `requests`, the work, and `repeat_reads`, the `get`s and `head`s of an
+  object and byte range the group had already read (the same bytes paid for
+  twice; objects are told apart by their real names, uuids included);
+- `after_publish`, the requests after the group's last `__manifest` version
+  put, the publish CAS: the crash window, where a crash leaves a published
+  operation unfinished; absent when the group published nothing;
+- a count per `<realm>_<kind>.<verb>` class (`manifest_meta.put`,
+  `table_data.get`, …) where the realm is the dataset (`__manifest`, the
+  table, the recovery root) and the kind its Lance directory; a request the
+  store refused counts under `<verb>_failed`, for every verb (`get`, `head`,
+  `put`, `put_part`, `put_multipart`, `put_complete`, `put_abort`, `copy`,
+  `delete`, `list`); a `list` counts one request per 1,000 keys, a multipart
+  upload the create, one request per part and the complete or abort, the
+  shapes S3 bills;
+- the schedule in the work-span model: the measuring store sleeps the
+  request's cost on the paused DST clock, so requests the engine issues
+  together overlap and a group's `makespan` (ticks of one millisecond, from
+  its first request's start to its last request's end) is the time its
+  schedule took under the model; the in-memory store alone answers
+  synchronously and would make every request its own tick;
+- its phases, from the engine's own decision seams: measure mode installs a
+  pass-through observer on every empty seam of the engine catalog, and a
+  request's phase is the last seam the engine crossed in the step (`start`
+  before the first crossing), so the report names `mutation.post_stage_pre_effect_gate`,
+  `fork.before_classify`, `mutation.post_finalize_pre_publisher`,
+  `publish.load_state`, `publish.pre_merge`, … in the order they were crossed;
+  nothing is inferred from the log's shape. A `--- seam` directive takes its
+  seam back for its step and the observer returns after it. Each phase has
+  its makespan, its `span` (the critical path with the phase's tables side by
+  side: the phase's non-table requests in series plus the longest single
+  table's time; a table request is one in a table's realm, so a branch's own
+  `__manifest` lineage under `__manifest/tree/` is never a table), its
+  requests and tables; the step's `span` is the sum of the phases' spans,
+  the critical path under "phases in sequence, tables independent within a
+  phase", so `waiting` (makespan minus span) is the time tables spent in
+  series that the model says they need not; every schedule column is the
+  model's time in ticks, a request spanning its start to its end, so they
+  share one unit under every model, and the printout shows the parallelism
+  achieved (requests per makespan tick) beside the parallelism available
+  (requests per span tick);
+- `sim ms`, the group's virtual time under the latency model, and `u$`, its
+  requests at S3 list prices in microdollars (PUT, COPY and LIST 5.0, GET and
+  HEAD 0.4, DELETE free).
+
+Every label the runner set is a row, so a step that made no request (a
+settings step, a no-op mutation before its first table) reports zero, and
+zero stays distinct from missing.
+
+`--model <name>` picks the latency model, what one request costs on the
+virtual clock: `unit` (the default: one tick per request, the model every
+count is stated under), `s3-like` (17 ms per request, the slope measured on
+the branch-age chart, plus the bytes at 50 MiB/s, Durner et al., until a
+calibration run on the real store replaces both) or `local` (0.1 ms plus the
+bytes at 1 GiB/s). The bytes are charged when they are known: a write's and
+a bounded read's before the call, a whole-object or offset read's after it,
+once the result says how much came back. Requests still overlap under every
+model; there is no per-device queue, since a serialized queue would make the
+makespan equal the request count and hide the overlap the schedule columns
+exist to show.
+
+The request counts (`requests`, `repeat_reads`, `after_publish`, the class
+counts) are an `io` evidence row per group, so the two runs of one seed must
+agree on them; the schedule-derived numbers (`makespan`, `span`, the phases,
+`sim ms`, `u$`) are measurement-only, since a detached commit's overlap moved
+by one tick between two runs of one seed (in the seed load and in a step), a
+determinism gap of the write path under DST, not of the counting; bytes and
+the uuid-redacted request log (each request with its start tick, so requests
+sharing a tick ran together) go to a `measurements` field the replay
+comparison skips. The invocation prints one ASCII table per environment, a
+row per step and per gap and a row per phase, and writes the long-form TSV
+under `target/gqt-artifacts/cost/` (phase rows as `phase.<name>.<field>`).
+Direct-engine environments record nothing: on a `file` root Lance bypasses
+the wrapped store for data files, so only the DST in-memory object store
+sees every request. Every case measures the same way; nothing in a case
+declares it, and the invocation takes several case paths or directories,
+anywhere on disk. `--artifacts <dir>` puts the report and the TSV in that
+directory instead of the build tree's `target/gqt-artifacts/`, so a suite
+kept outside this repository keeps its outputs beside its cases.
+
+**Baseline.** `--baseline <path>` names a TSV, anywhere on disk, with one
+row per case, environment, seed, slot and step and the three counts
+`requests`, `repeat_reads` and `after_publish`; the repository commits no
+such file, and without the flag a measured run prints its table and
+writes its TSV without a delta. A case is named by its path under the
+corpus whichever spelling the invocation used (a case outside the corpus
+by its absolute path). `--write-baseline` (with `--baseline`) replaces,
+for each measured case, the rows of the environments and seeds the run
+measured and keeps every other row, so a `--target` or `--seed` selection
+rewrites only what it ran; a run that failed writes nothing and says so;
+rows of a case the run did not measure stay, so after a case is renamed or
+removed, delete the file first and let a run over the directory rebuild
+it. With `--baseline` alone the run prints each case's delta against the
+file: a mutate, control, settings or restart row at any change, a query,
+show or list row past two requests or five percent, whichever is more, or
+at a changed crash window, plus the rows the baseline lacks and, within
+the measured environments and seeds, the rows the run lacks. The delta is
+a report, never a failure. A baseline that cannot be read or parsed fails
+the invocation, and its saved report says so.
 
 `--target`, `--storage` and `--seed` only narrow declared executions; all supplied
 filters must match. There are no environment IDs or runner format versions.
@@ -253,22 +454,18 @@ unset, empty, or `0` leaves it disabled. Other values, including non-UTF-8
 values, produce an `invalid_case` report before execution or rewriting.
 Replay ignores this variable and refuses saved blessing invocations.
 
-`OMNIGRAPH_GQ_ENGINE` selects the initial `engine` setting for direct and
-DST case sessions, and the baseline `reset engine` restores. Unset, empty,
-or `v1` selects the executor; `v2` selects the plan route. CI runs the corpus
-under both routes. A case's `set engine = …;` overrides this baseline like
-any other setting. `--- expect plan` requires the query's effective engine
-to be `v2`; a query prefix or case setting can override the runner baseline.
-Plan-specific corpus cases explicitly select v2, while shared row cases
-inherit the baseline and run on both routes.
+`OMNIGRAPH_GQ_ENGINE` names the initial `engine` setting for direct and
+DST case sessions, the baseline `reset engine` restores. It accepts only `v2`,
+empty or unset, all three meaning engine v2, the setting's one value; engine
+v1 is reached only through `--- expect same as v1`, never through this
+variable.
 
-Invocation reports freeze the selected engine in the worker input before
-clearing the worker environment. Replay uses that recorded engine even if
-`OMNIGRAPH_GQ_ENGINE` now selects the other route. Reports whose input has no
-engine field mean `v1`; v1 reports continue to omit the field. Engine input
-is covered by the report's input digest, and the executable and source
-identity checks still apply. Any other value, including non-UTF-8 values,
-produces an `invalid_case` report before workers start, including on replay.
+Invocation reports freeze the engine in the worker input before clearing the
+worker environment, and replay uses the recorded value. An input without the
+field means `v2`. Engine input is covered by the report's input digest, and
+the executable and source identity checks still apply. Any other value, `v1`
+and non-UTF-8 values included, produces an `invalid_case` report before
+workers start, including on replay.
 
 `OMNIGRAPH_GQ_BLESS=1` is supported only for a case declaring one direct-engine
 environment. A subset selection cannot bless a multi-environment case. It rewrites a failing row or shape expectation and still returns

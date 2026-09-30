@@ -107,9 +107,9 @@ context rather than restating metadata.
 ## Lifecycle
 
 ```text
-draft ──maintainer decision──▶ accepted ──later replacement──▶ superseded
-  │                                  │
-  └──maintainer decision──▶ rejected └──implementation progresses separately
+draft ──maintainer decision──▶ accepted ──accepted replacement──▶ superseded
+  ├──maintainer decision──▶ rejected
+  └──maintainer-approved draft replacement────────────────────▶ superseded
 ```
 
 - **Draft**: under design and review. A draft may live on the main branch so
@@ -120,8 +120,17 @@ draft ──maintainer decision──▶ accepted ──later replacement──�
 - **Rejected**: the decision was not adopted. Keep the record and concise
   rationale; use `removed` if an experiment shipped and was later deleted,
   otherwise `n/a` or `not-started` as appropriate.
-- **Superseded**: another RFC owns the current decision. Link both directions
+- **Superseded**: another RFC owns the current decision or proposal. Link both directions
   and keep the old rationale intact.
+
+A maintainer may consolidate or replace an unaccepted draft with another draft
+and mark the previous draft `superseded`. This transfers the proposal's ownership,
+not acceptance or implementation authority; the disposition must say that the
+replacement is still a draft. Reserve `rejected` for a decision not to adopt the
+proposal, rather than merely moving its continuing design into a replacement.
+An accepted RFC remains authoritative until its replacement is accepted: a draft
+cannot retire an accepted contract. Record reciprocal supersession metadata only
+when that disposition takes effect.
 
 Acceptance requires all invariants, compatibility consequences, operational
 boundaries, and owned evidence gates to be explicit. A blocker owned by another
@@ -185,9 +194,9 @@ then dated RFCs by date.
 | [0031](0031-comparative-cost-harness.md) | Comparative cost harness | maintainer | draft | not-started |
 | [0032](0032-adversarial-correctness-harness.md) | Adversarial correctness harness | maintainer | draft | not-started |
 | [0033](0033-blob-management.md) | Blob management | maintainer | accepted | partial |
-| [0034](0034-durable-recovery-authority.md) | Durable recovery authority and outcomes | maintainer | draft | not-started |
-| [0035](0035-served-operation-ownership.md) | Served operation ownership | maintainer | draft | not-started |
-| [0036](0036-atomic-runtime-activation.md) | Atomic runtime activation and graph availability supervision | maintainer | draft | not-started |
+| [0034](0034-durable-recovery-authority.md) | Durable recovery authority and outcomes | maintainer | superseded | not-started |
+| [0035](0035-served-operation-ownership.md) | Served operation ownership | maintainer | superseded | not-started |
+| [0036](0036-atomic-runtime-activation.md) | Atomic runtime activation and graph availability supervision | maintainer | superseded | not-started |
 | [0037](0037-deterministic-simulation-harness.md) | Deterministic simulation harness | public | accepted | in-progress |
 | [0038](0038-typed-storage-failures.md) | Typed storage failures | public | accepted | complete |
 | [0039](0039-end-to-end-benchmark.md) | The end-to-end benchmark | public | accepted | in-progress |
@@ -210,16 +219,17 @@ then dated RFCs by date.
 | [0062](0062-manifest-version-clock.md) | Manifest version as the table registration clock | maintainer | draft | in-progress |
 | [0063](0063-self-contained-branch-lineage.md) | Self-contained branch lineage | maintainer | draft | in-progress |
 | [0064](0064-explicit-storage-upgrades.md) | Explicit storage upgrades | maintainer | accepted | in-progress |
-| [0065](0065-isolated-branch-merge-publication.md) | Isolated branch merge publication | maintainer | draft | not-started |
+| [0065](0065-isolated-branch-merge-publication.md) | Isolated branch merge publication | maintainer | superseded | not-started |
 | [0066](0066-one-seam-type.md) | One seam type for test-time behavior substitution | maintainer | draft | in-progress |
 | [0067](0067-detached-table-commits.md) | Detached table commits | maintainer | accepted | complete |
 | [0068](0068-graph-commit-record.md) | Graph commit record | maintainer | draft | not-started |
 | [2026-09-09](2026-09-09-identity-credentials-and-applied-policy.md) | Identity credentials and applied policy authorization | maintainer | accepted | complete |
-| [2026-09-10](2026-09-10-server-lifecycle-and-online-deployment.md) | Server lifecycle and online deployment | maintainer | draft | not-started |
+| [2026-09-10](2026-09-10-server-lifecycle-and-online-deployment.md) | Server lifecycle and online deployment | maintainer | superseded | not-started |
 | [2026-09-14](2026-09-14-compatibility-surfaces.md) | Compatibility surfaces | maintainer | draft | not-started |
 | [2026-09-16](2026-09-16-session-settings.md) | Session settings | maintainer | draft | in-progress |
-| [2026-09-18](2026-09-18-shared-schema-gate.md) | Shared schema gate and the write critical section | maintainer | draft | not-started |
+| [2026-09-18](2026-09-18-shared-schema-gate.md) | Shared schema gate and the write critical section | maintainer | accepted | complete |
 | [2026-09-21](2026-09-21-detached-only-tables.md) | Detached-only tables | maintainer | accepted | in-progress |
 | [2026-09-24](2026-09-24-shared-expression-model.md) | Shared expression model | maintainer | draft | in-progress |
 | [2026-09-26](2026-09-26-self-contained-server-testing.md) | Self-contained server testing with GQT and DST | maintainer | draft | not-started |
 | [2026-09-28](2026-09-28-group-commit.md) | Group commit | maintainer | draft | not-started |
+| [2026-09-29](2026-09-29-server-runtime-and-online-deployment.md) | Server runtime and online deployment | maintainer | draft | not-started |

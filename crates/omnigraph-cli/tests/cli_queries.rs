@@ -1016,34 +1016,53 @@ fn queries_validate_exits_zero_on_clean_registry() {
 }
 
 #[test]
-fn cluster_import_rejects_a_type_broken_query() {
-    // In the cluster model a stored query is type-checked at the cluster
-    // boundary (import/apply), so a broken query can never reach the applied
-    // state `queries validate` reads — the gate is upstream. `Widget` is not in
-    // the fixture schema, so import must reject it, naming the query.
-    let temp = tempdir().unwrap();
-    let dir = temp.path();
-    std::fs::copy(fixture("test.pg"), dir.join("graph.pg")).unwrap();
-    write_query_file(
-        &dir.join("ghost.gq"),
-        "query ghost() { match { $w: Widget } return { $w.name } }",
-    );
-    std::fs::write(
-        dir.join("cluster.yaml"),
-        "version: 1\nmetadata:\n  name: sys\nstate:\n  backend: cluster\n  lock: true\n\
-         graphs:\n  knowledge:\n    schema: ./graph.pg\n    queries:\n      ghost:\n        file: ./ghost.gq\n",
-    )
-    .unwrap();
-    let output = output_failure(cli().arg("cluster").arg("import").arg("--config").arg(dir));
-    let combined = format!(
-        "{}{}",
-        stdout_string(&output),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        combined.contains("ghost"),
-        "cluster import must reject the broken query, naming it; got:\n{combined}"
-    );
+fn cluster_import_rejects_a_broken_query_naming_it_and_where() {
+    // In the cluster model a stored query is checked at the cluster boundary
+    // (import/apply), so a broken query can never reach the applied state
+    // `queries validate` reads — the gate is upstream. `Widget` is not in the
+    // fixture schema, so import must reject `ghost`, naming it; `broken` does
+    // not parse, and the human report also says where, from the diagnostic.
+    let cases: [(&str, &str, &[&str]); 2] = [
+        (
+            "ghost",
+            "query ghost() { match { $w: Widget } return { $w.name } }",
+            &["ghost"],
+        ),
+        (
+            "broken",
+            "query broken() { match { $p: Person $p.age > } return { $p.name } }",
+            &[
+                "broken: parse error: expected operand",
+                "  --> line 1, column 46",
+            ],
+        ),
+    ];
+    for (name, source, expected) in cases {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        std::fs::copy(fixture("test.pg"), dir.join("graph.pg")).unwrap();
+        write_query_file(&dir.join(format!("{name}.gq")), source);
+        std::fs::write(
+            dir.join("cluster.yaml"),
+            format!(
+                "version: 1\nmetadata:\n  name: sys\nstate:\n  backend: cluster\n  lock: true\n\
+                 graphs:\n  knowledge:\n    schema: ./graph.pg\n    queries:\n      {name}:\n        file: ./{name}.gq\n"
+            ),
+        )
+        .unwrap();
+        let output = output_failure(cli().arg("cluster").arg("import").arg("--config").arg(dir));
+        let combined = format!(
+            "{}{}",
+            stdout_string(&output),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for needle in expected {
+            assert!(
+                combined.contains(needle),
+                "cluster import must reject `{name}` with {needle:?}; got:\n{combined}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1230,4 +1249,89 @@ fn queries_validate_graph_filter_selects_one_graph() {
             .arg("knowledge"),
     );
     assert!(stdout_string(&output).contains("OK"));
+}
+
+/// RFC 0047's diagnostics contract at the CLI: a refused query reports its
+/// code, position, expectation and one fix in every output format, with no
+/// colour and no backtrace, on both transports.
+#[test]
+fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
+    let (_temp, graph) = loaded_graph();
+    let refused = "query name { match { $p: Person } return { $p.name } }";
+    let suggestion = serde_json::json!({
+        "applicability": "machine_applicable",
+        "edits": [{"start": 10, "end": 10, "replacement": "()"}]
+    });
+
+    let json = parse_stdout_json(&output_failure(
+        embedded("query", &graph)
+            .arg("-e")
+            .arg(refused)
+            .arg("--json"),
+    ));
+    assert_eq!(
+        json["error"],
+        "parse error: expected `(`: a query declares its parameters even when it has none"
+    );
+    assert_eq!(json["diagnostic"]["code"], "Q002");
+    assert_eq!(json["diagnostic"]["fix"], "query name()");
+    assert_eq!(json["diagnostic"]["position"]["line"], 1);
+    assert_eq!(json["diagnostic"]["position"]["column"], 11);
+    assert_eq!(json["diagnostic"]["suggestion"], suggestion);
+    assert!(
+        json.get("code").is_none(),
+        "an embedded refusal has no HTTP code: {json}"
+    );
+
+    let jsonl = output_failure(
+        embedded("query", &graph)
+            .arg("-e")
+            .arg(refused)
+            .arg("--format")
+            .arg("jsonl"),
+    );
+    let stdout = stdout_string(&jsonl);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "jsonl carries the error as one line: {stdout:?}"
+    );
+    let line: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(line["diagnostic"]["code"], "Q002");
+    assert_eq!(line["diagnostic"]["suggestion"], suggestion);
+
+    let human = output_failure(embedded("query", &graph).arg("-e").arg(refused));
+    let stderr = stderr_string(&human);
+    assert!(
+        stderr.contains("error[Q002]: parse error: expected `(`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--> line 1, column 11"), "{stderr}");
+    assert!(stderr.contains("fix: query name()"), "{stderr}");
+    assert!(!stderr.contains("\u{1b}["), "no colour codes: {stderr:?}");
+    assert!(
+        !stderr.contains("Backtrace") && !stderr.contains("Location:"),
+        "no backtrace footer: {stderr}"
+    );
+    assert!(
+        stdout_string(&human).is_empty(),
+        "the human lane writes nothing to stdout"
+    );
+
+    let (_cluster, server) = served_graph();
+    let json = parse_stdout_json(&output_failure(
+        served("query", &server)
+            .arg("-e")
+            .arg(refused)
+            .arg("--json"),
+    ));
+    assert_eq!(json["code"], "bad_request");
+    assert_eq!(json["diagnostic"]["code"], "Q002");
+    assert_eq!(json["diagnostic"]["suggestion"], suggestion);
+    assert_eq!(json["diagnostic"]["fix"], "query name()");
+    let served_human = output_failure(served("query", &server).arg("-e").arg(refused));
+    let stderr = stderr_string(&served_human);
+    assert!(stderr.contains("error[Q002]:"), "{stderr}");
+    assert!(stderr.contains("fix: query name()"), "{stderr}");
 }

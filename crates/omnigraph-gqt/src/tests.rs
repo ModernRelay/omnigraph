@@ -33,6 +33,69 @@ fn a_fault_section_is_refused() {
     assert!(refusal("x", &text).contains("there is no `--- fault` section"));
 }
 
+const DST_RUNNER: &str = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n--- schema\nnode Person {\n    name: String @key\n}\n";
+const BLOCK: &str = "--- concurrent\nw1: query add() { insert Person { name: \"bob\" } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1 put __manifest/, r1, w1\n";
+const BLOCK_EXPECT: &str = "--- expect\nw1: ok\nr1: ok\n";
+
+#[test]
+fn a_concurrent_block_parses_with_its_bare_expect() {
+    let text = format!("{HDR}{DST_RUNNER}{SEED}{BLOCK}{BLOCK_EXPECT}");
+    let case = parse_case("block", &text).unwrap();
+    assert_eq!(case.items.len(), 1);
+    assert!(case.needs_dst());
+    let Item::Step(Step::Concurrent(step)) = &case.items[0] else {
+        panic!("expected a concurrent step");
+    };
+    assert_eq!(step.ordinal, 1);
+    assert_eq!(step.sessions.len(), 2);
+    assert_eq!(step.sessions[0].kind, SessionKind::Mutation);
+    assert_eq!(step.sessions[1].kind, SessionKind::Query);
+    assert_eq!(step.sessions[0].name, "add");
+    assert_eq!(step.order.len(), 3);
+    assert_eq!(case.source_lines.get(&1), Some(&15));
+}
+
+#[test]
+fn a_concurrent_block_refuses_what_it_cannot_run() {
+    let refused = |block: &str, expect: &str| {
+        refusal("block", &format!("{HDR}{DST_RUNNER}{SEED}{block}{expect}"))
+    };
+    assert!(refused(BLOCK, "--- expect ok\n").contains("`--- expect` is bare"));
+    assert!(
+        refused(BLOCK, "--- expect\n# note\nw1: ok\nr1: ok\n")
+            .contains("`#` lines are refused inside the expect section")
+    );
+    assert!(
+        refused(BLOCK, "--- params\n{}\n--- expect\nw1: ok\nr1: ok\n").contains("takes no params")
+    );
+    assert!(
+        refused(
+            "--- concurrent\nw1: query add($n: String) { insert Person { name: $n } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1, r1\n",
+            BLOCK_EXPECT
+        )
+        .contains("declares parameters")
+    );
+    assert!(
+        refused(
+            "--- concurrent\nw1: branch create feature\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1, r1\n",
+            BLOCK_EXPECT
+        )
+        .contains("must be a query or mutation declaration")
+    );
+    let in_loop = refused(
+        &format!("--- loop $x 1 2\n{BLOCK}"),
+        &format!("{BLOCK_EXPECT}--- endloop\n"),
+    );
+    assert!(in_loop.contains("inside a loop"), "{in_loop}");
+    assert!(
+        refused(
+            "--- concurrent extra\nw1: query a() {}\norder: w1\n",
+            BLOCK_EXPECT
+        )
+        .contains("takes no arguments")
+    );
+}
+
 #[test]
 fn header_notes_repeat_and_continuation_lines_are_refused() {
     let text = format!(
@@ -511,6 +574,112 @@ fn refuses_row_expect_on_a_mutate_step() {
 fn refuses_ok_expect_on_a_query_step() {
     let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT_OK}");
     assert!(refusal("x", &text).contains("a query step takes"));
+}
+
+const SAME: &str = "--- expect same as v1\n";
+
+#[test]
+fn same_as_v1_follows_a_query_steps_shape_or_plan() {
+    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}{QUERY}{EXPECT}");
+    let case = parse_case("x", &text).unwrap();
+    let flags: Vec<bool> = case
+        .items
+        .iter()
+        .map(|item| match item {
+            Item::Step(Step::Query(step)) => step.same_as_v1,
+            other => panic!("expected query steps, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(flags, [true, false]);
+    let after_plan = format!(
+        "{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- expect plan\npass projection_pushdown\n{SAME}"
+    );
+    let case = parse_case("x", &after_plan).unwrap();
+    let Some(Item::Step(Step::Query(step))) = case.items.first() else {
+        panic!("first item is the query step");
+    };
+    assert!(step.same_as_v1 && step.plan.is_some());
+}
+
+#[test]
+fn same_as_v1_is_refused_off_a_query_rows_expect() {
+    for text in [
+        format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{SAME}"),
+        format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{EXPECT_OK}{SAME}"),
+    ] {
+        let refused = refusal("x", &text);
+        assert!(
+            refused.starts_with("invalid_case: ") && refused.contains("refused on a mutate step"),
+            "{refused}"
+        );
+    }
+    let rows = "--- expect unordered\n{\"p.name\": \"alice\"}\n";
+    for (text, needle) in [
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{SAME}{SHAPE}"),
+            "must directly follow",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{rows}{SAME}{SHAPE}"),
+            "needs an `--- expect shape`",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect error: boom\n{SAME}"),
+            "must directly follow",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}{SAME}"),
+            "must directly follow",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}{{\"p.name\": \"alice\"}}\n"),
+            "carries no body",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{CREATE}{LIST}{SAME}"),
+            "only on a query declaration step",
+        ),
+    ] {
+        let refused = refusal("x", &text);
+        assert!(refused.contains(needle), "{needle}: {refused}");
+    }
+}
+
+#[tokio::test]
+async fn same_as_v1_fails_on_a_v1_error_or_a_row_difference() {
+    let equal = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}");
+    let case = parse_case("x", &equal).unwrap();
+    execute_case(&case, Path::new("unused.gqt"), false)
+        .await
+        .unwrap();
+
+    let compound = "--- query\nquery either() {\n    match { $p: Person  $p.name = \"alice\" or $p.name = \"bob\" }\n    return { $p.name }\n}\n";
+    let refused = format!("{HDR}{SCHEMA}{SEED}{compound}{EXPECT}{SAME}");
+    let case = parse_case("x", &refused).unwrap();
+    let err = execute_case(&case, Path::new("unused.gqt"), false)
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("expect same as v1: v2 returned rows, v1 failed")
+            && err.contains("compound predicates")
+            && err.contains("drop `--- expect same as v1` from this step"),
+        "{err}"
+    );
+
+    let differing = "# issue: none\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n\
+         --- schema\nnode P {\n    k: String @key\n    age: I64\n    score: F64\n}\n\
+         --- seed\n{\"type\":\"P\",\"data\":{\"k\":\"k\",\"age\":7,\"score\":7.5}}\n\
+         --- query\nquery kept() {\n    match { $p: P  not { $p.age < $p.score } }\n    return { $p.k }\n}\n\
+         --- expect unordered\n--- expect shape\np.k: String\n--- expect same as v1\n";
+    let case = parse_case("x", differing).unwrap();
+    let err = execute_case(&case, Path::new("unused.gqt"), false)
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("the engines disagree (expected = v1, actual = v2)")
+            && err.contains("{\"p.k\":\"k\"}"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -1480,7 +1649,7 @@ async fn pinned_step_runs_only_its_pinned_path() {
             .await
             .unwrap_or_else(|e| panic!("{mode}: {e}"));
 
-        let (session, _uri, _dir) = open_case_store(&case, Engine::V1).await.unwrap();
+        let (session, _uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
         assert_eq!(session.settings().traversal().as_str(), mode);
         let Some(Item::Step(Step::Query(step))) = case.items.first() else {
             panic!("first item is the query step");
@@ -1528,7 +1697,7 @@ async fn traversal_pin_survives_settings_steps_and_rebind() {
          --- restart\n"
     );
     let case = parse_case("pinned", &text).unwrap();
-    let (mut session, uri, _dir) = open_case_store(&case, Engine::V1).await.unwrap();
+    let (mut session, uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
     let Some(Item::Step(Step::Query(query))) = case.items.first() else {
         panic!("first item is the query step");
     };

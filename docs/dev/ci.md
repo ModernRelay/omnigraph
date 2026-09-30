@@ -73,30 +73,30 @@ Branch protection currently requires these reporting contexts:
 - `Dependency Guard (cargo deny)`
 
 `GQ Logic Tests` (`gq-logic-tests.yml`) owns the complete `.gqt` corpus as a
-required context aggregating four qualification jobs. `GQT (ordinary)` checks
+required context aggregating three qualification jobs. `GQT (ordinary)` checks
 unit tests and unavailable-DST refusal under an empty `RUSTFLAGS`, then runs
 the seam guard (`crates/omnigraph-seams/tests/failpoint_names_guard.rs`) in
 the same flagless shape; the guard is a source walk whose crate declares no
 workspace crate (its dev-dependencies are `serde_yaml`, `syn`, `tempfile` and
 `toml`), so
 it adds no second engine build.
-`GQT (dst)` runs the whole package. `GQT (engine-v2)` runs the same package
-with `OMNIGRAPH_GQ_ENGINE=v2` as the case default; explicit case settings
-still apply. `GQT (dst-clippy)` checks all package targets with Clippy. All
-four run from the repository root under
+`GQT (dst)` runs the whole package, on engine v2, the one engine; a step's
+`--- expect same as v1` comparison runs inside it, so no job selects an
+engine. `GQT (dst-clippy)` checks all package targets with Clippy. All
+three run from the repository root under
 the workspace Cargo configuration, which enables the seeded Tokio runtime.
 Each job has its own 60-minute budget and cache key. The budget is at least
 twice the observed 27-minute cold `ordinary` build. The roughly 30 minutes
 recorded for `dst.yml` cover a different package selection and workload;
-they do not establish a bound for GQT `dst`, `engine-v2` or `dst-clippy`. Exact cold
+they do not establish a bound for GQT `dst` or `dst-clippy`. Exact cold
 timings for those jobs remain unverified. See the cache rule under
 [Full correctness graphs](#full-correctness-graphs) for the budget policy.
 Matrix fail-fast cancels the remaining jobs when one fails; Cargo retains
 its default fail-fast between test targets.
 The required context fails if classification or any qualification fails,
-is cancelled, or is skipped. A successful run still requires all four jobs
+is cancelled, or is skipped. A successful run still requires all three jobs
 to pass; fail-fast never turns incomplete qualification into success.
-Test jobs upload invocation reports, and all four jobs upload available
+Test jobs upload invocation reports, and all three jobs upload available
 Cargo build timings separately, including on failure.
 Every corpus case is enrolled, including cases whose required graph
 behavior currently fails. `Test Workspace` excludes this separately tested

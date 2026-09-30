@@ -84,9 +84,7 @@ fn compare(op: CompOp, left: &Literal, right: &Literal) -> Option<Literal> {
         return Some(Literal::Null);
     }
     let holds = match (op, left, right) {
-        (CompOp::Contains, Literal::List(items), needle) => items
-            .iter()
-            .any(|item| compare(CompOp::Eq, item, needle) == Some(Literal::Bool(true))),
+        (CompOp::Contains, Literal::List(items), needle) => return member(items, needle),
         (
             CompOp::Contains | CompOp::StringContains,
             Literal::String(text),
@@ -106,6 +104,20 @@ fn compare(op: CompOp, left: &Literal, right: &Literal) -> Option<Literal> {
         _ => return None,
     };
     Some(Literal::Bool(holds))
+}
+
+/// Whether `needle` equals an element of `items`; `None` when no element is
+/// known to match and one comparison is the engine's to decide (a Date).
+fn member(items: &[Literal], needle: &Literal) -> Option<Literal> {
+    let mut decided = true;
+    for item in items {
+        match compare(CompOp::Eq, item, needle) {
+            Some(Literal::Bool(true)) => return Some(Literal::Bool(true)),
+            Some(_) => {}
+            None => decided = false,
+        }
+    }
+    decided.then_some(Literal::Bool(false))
 }
 
 /// The order of two scalar literals; `None` where the engine's parsers decide
@@ -246,6 +258,12 @@ mod tests {
     fn what_the_rules_do_not_decide_stays_as_written() {
         let date = |value: &str| Literal::Date(value.to_string());
         let kept = compared(date("2026-01-01"), CompOp::Lt, date("2026-02-01"));
+        assert!(matches!(kept, IRExpr::Binary { .. }));
+        let kept = compared(
+            Literal::List(vec![date("2026-01-01")]),
+            CompOp::Contains,
+            date("2026-01-01"),
+        );
         assert!(matches!(kept, IRExpr::Binary { .. }));
         let kept = compared(Literal::Integer(1), CompOp::Eq, text("1"));
         assert!(matches!(kept, IRExpr::Binary { .. }));

@@ -134,7 +134,7 @@ cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked 
 cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 
 # Focused examples
-cargo test -p omnigraph-engine --test traversal
+cargo test -p omnigraph-engine --test traversal_indexed
 cargo test -p omnigraph-engine --features failpoints --test failpoints
 cargo test -p omnigraph-server --features aws
 
@@ -191,12 +191,13 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   (`instrument:`, `hunt:`, `heavy-repro:`, or the environment it needs);
   expensive regression repros use `heavy-repro:` and thereby enroll in the
   nightly job.
-- Engine v1 is frozen: `crates/omnigraph/src/exec/query.rs`,
-  `exec/projection.rs`, `tests/traversal.rs` and `tests/search.rs` are
-  upstream's bytes, pinned by `crates/omnigraph/tests/v1_frozen.rs`. A defect
-  seen on v1 is fixed on v2 (`crates/omnigraph/src/engine/`), which the
-  session setting `engine = v2` selects; a v1 edit needs the pin updated in
-  the same PR and a reviewer's eyes.
+- Engine v1 is frozen: every file under
+  `crates/omnigraph-reference-engine/src/` is pinned by
+  `crates/omnigraph-reference-engine/tests/frozen.rs`. v1 is reachable only
+  through GQT's `--- expect same as v1`, which compares a query step's v2
+  rows with v1's. A defect seen on v1 is fixed on v2
+  (`crates/omnigraph/src/engine/`); a v1 edit needs the pin updated in the
+  same PR and a reviewer's eyes.
 - Update user-visible docs in the same change as a flag, endpoint, format,
   schema construct, behavior, or limit.
 - Update current developer guides when architecture or support boundaries

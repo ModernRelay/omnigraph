@@ -21,7 +21,7 @@ prepare logical change and validate it
         ↓
 stage exact Lance transactions (no HEAD movement)
         ↓
-acquire schema → branch → sorted-table gates, recheck the complete authority
+acquire shared schema permit → branch → sorted-table gates, recheck the complete authority
         ↓
 commit each participant as a detached version of its pin
         ↓
@@ -97,16 +97,29 @@ handoff use the existing complete fold. This is disposable process memory;
 `__manifest` remains the only durable graph authority. Publication still scans
 history for collision, expected-version, and lineage validation.
 
+The capture itself (`open_write_txn`) takes no permit on the common path:
+when a schema-apply sentinel stands and an apply in this process holds the
+exclusive permit, it parks on the shared side until the apply releases, then
+recaptures under the promoted contract. A sentinel under a free gate is
+another process's apply and gets the typed refusal at once. Only `mutate`
+and `load` reach the park: merge, index maintenance, optimize, cleanup and
+repair call `ensure_schema_apply_idle` before their capture, so a standing
+sentinel refuses them one call earlier.
+
 Finalization acquires the root-shared gate order:
 
-1. schema;
+1. the schema gate — a shared permit for ordinary writers (only a
+   contract-lifecycle pass such as schema apply or the system-column
+   upgrade, and branch create, whose namespace inventory no CAS covers,
+   take it exclusively, so cross-branch writers do not serialize on it; see
+   [RFC 2026-09-18-shared-schema-gate](../rfcs/2026-09-18-shared-schema-gate.md));
 2. target branch;
 3. touched `(table identity, physical branch)` entries in deterministic order;
 4. coordinator publication.
 
-These gates order work inside one process. Correctness still depends on the
-persisted manifest precondition and the exact Lance transaction identity each
-pin records. A retryable pre-effect attempt discards all staged work, captures a new
+These gates order work inside one process. Correctness still depends on the persisted manifest
+precondition and the exact Lance transaction identity each pin records. A
+retryable pre-effect attempt discards all staged work, captures a new
 `WriteTxn`, and repeats boundedly; it never reuses batches against a new base.
 
 ## Writer adapters
@@ -139,7 +152,10 @@ resource validation before staging. `stage_all` opens each touched table at
 its pin through the read-handle cache (the registration's `staged_version`
 when it carries one) and produces one exact transaction per table without
 moving HEAD. `commit_all` enters the gates, revalidates the complete
-authority, and commits every participant as a detached version of its pinned
+authority (for a branch other than the handle's bound one, the captured
+manifest probe first: an unchanged version and branch identifier keep the
+captured authority, a mismatch is a fresh coherent capture), and commits
+every participant as a detached version of its pinned
 base: no recovery sidecar is armed, a table's linear HEAD never moves, and
 nothing can rebase. Every detached commit records the authority it was staged
 against in its transaction properties,
@@ -150,7 +166,11 @@ removed under `omnigraph.deleted_ids` (inline up to 64 KiB) or
 discovery read them. The manifest then publishes every pin as
 `(base + 1, staged_version, transaction_uuid)` in one CAS; a publish that
 loses the CAS returns the plain `ReadSetChanged`, and the staging it leaves
-is unpublished until the collector reclaims it. The published pin is final:
+is unpublished until the collector reclaims it. The probe reads only the
+held native ref, so a second live incarnation of the branch name (two
+processes creating it at once) is refused by the publisher's own branch
+resolution after the detached commits, not before them; the graph is
+unchanged and the staging is reclaimed the same way. The published pin is final:
 readers open `staged_version` directly, and `published_dataset_version`
 keeps its number, `base + 1`, as the table's logical version inside its
 `__manifest` lineage without naming a Lance version. Every registration
@@ -220,14 +240,14 @@ chunk of the proven insertion chain or the bounded ordered diff commits as a
 detached version of the previous chunk (one link per chunk, within the
 merge's transaction ceiling); the target publishes once, with each chained
 table's pin naming `base + 1` as its `published_dataset_version` and the
-chain's tip as its `staged_version`, whatever the chain's length. The merge
-proofs walk the branch's commit chain by `read_version` links from the
-source pin back to the base pin (`try_proven_pure_insert_history`,
-`proven_chain_fragments`, `chain_reaches`, `plan_lineage_merge` in
-`exec/merge.rs`). A failure anywhere before publication leaves the target
-untouched and the chain as unpublished staging; a target that advanced
-meanwhile makes the merge lose its manifest CAS and return the ordinary
-conflict.
+chain's tip as its `staged_version`, whatever the chain's length. The
+pure-insert proof walks the branch's commit chain by `read_version` links
+from the source pin back to the base pin (`try_proven_pure_insert_history`,
+`proven_chain_fragments` in `exec/merge.rs`); lineage candidate discovery
+(`plan_lineage_merge`) compares the base and side manifests and walks no
+chain. A failure anywhere before publication leaves the target untouched
+and the chain as unpublished staging; a target that advanced meanwhile
+makes the merge lose its manifest CAS and return the ordinary conflict.
 
 Existing-table constructive transactions stage independently with bounded
 concurrency. The `stage_write_concurrency` session setting (`process` scope,

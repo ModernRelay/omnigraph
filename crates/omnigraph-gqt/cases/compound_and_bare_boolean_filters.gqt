@@ -1,0 +1,123 @@
+# issue: none
+# notes: A compound predicate, a bare Bool property or parameter and a comparison of comparisons each filter rows; one comparison with
+# notes: a leading `nearest` order gives the reference engine's rows; a type fault inside a compound is the plain type error, and a compound update `where` runs.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    name: String
+    age: I64?
+    enabled: Bool
+    embedding: Vector(2) @index
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a","name":"alice","age":40,"enabled":true,"embedding":[1.0,0.0]}}
+{"type":"Person","data":{"slug":"b","name":"bob","age":20,"enabled":false,"embedding":[0.0,1.0]}}
+{"type":"Person","data":{"slug":"c","name":"carol","enabled":true,"embedding":[1.0,1.0]}}
+
+--- query
+set engine = v2;
+query disjunction() {
+    match { $p: Person  $p.age > 30 or $p.name = "bob" }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "a"}
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String
+
+--- query
+query leading_nearest_runs($q: Vector(2)) {
+    match { $p: Person  $p.enabled = true }
+    return { $p.slug }
+    order { nearest($p.embedding, $q) }
+    limit 1
+}
+
+--- params
+{"q": [1.0, 0.0]}
+
+--- expect ordered
+{"p.slug": "a"}
+
+--- expect shape
+p.slug: String
+--- expect same as v1
+
+--- query
+set engine = v2;
+query bare_boolean_property() {
+    match { $p: Person  $p.enabled }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "a"}
+{"p.slug": "c"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query bare_boolean_parameter($flag: Bool) {
+    match { $p: Person  $flag }
+    return { $p.slug }
+}
+
+--- params
+{"flag": true}
+
+--- expect unordered
+{"p.slug": "a"}
+{"p.slug": "b"}
+{"p.slug": "c"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query comparison_of_comparisons() {
+    match {
+        $p: Person
+        $q: Person { slug: "b" }
+        ($p.age > 30) = ($q.age > 30)
+    }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query type_fault_inside_compound() {
+    match { $p: Person  $p.enabled and $p.name }
+    return { $p.slug }
+}
+
+--- expect error: T41: `and` needs Bool operands, got Bool and String
+
+--- mutate
+query compound_where_runs($cut: I64) {
+    update Person set { enabled: false } where age < $cut or name = "carol"
+}
+
+--- params
+{"cut": 30}
+
+--- expect affected: nodes=2 edges=0

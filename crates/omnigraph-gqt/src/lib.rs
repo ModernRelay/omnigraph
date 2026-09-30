@@ -52,10 +52,14 @@ use omnigraph_compiler::{
 };
 use serde_json::Value;
 
+mod concurrent;
 mod dst_runner;
+mod measure;
 mod runner_config;
+use concurrent::{ConcurrentStep, SessionExpect, SessionKind, SessionOp};
 pub use dst_runner::{
-    replay_report, report_cli_refusal, run_corpus_case, run_selected, run_worker_if_requested,
+    MeasureOptions, replay_report, report_cli_refusal, run_corpus_case, run_selected,
+    run_worker_if_requested,
 };
 use omnigraph::storage::StorageAdapter;
 use runner_config::{Execution, RunnerConfig, SeamDirective, parse_runner, parse_seam};
@@ -75,10 +79,8 @@ use shape::{
 pub const CASE_TIMEOUT_ENV: &str = "OMNIGRAPH_GQ_CASE_TIMEOUT_SECS";
 pub const DEFAULT_CASE_TIMEOUT_SECS: u64 = 10;
 pub const BLESS_ENV: &str = "OMNIGRAPH_GQ_BLESS";
-/// `OMNIGRAPH_GQ_ENGINE=v2` runs every query step of an embedded-engine case
-/// on the plan route; unset, empty, or `v1` runs the route production runs.
-/// A server target keeps the server's route; this runner setting selects
-/// embedded sessions only.
+/// The runner's `engine` baseline for embedded-engine sessions: `v2`, empty
+/// or unset, all meaning engine v2, the setting's one value.
 pub const ENGINE_ENV: &str = "OMNIGRAPH_GQ_ENGINE";
 
 #[derive(Debug)]
@@ -99,6 +101,35 @@ struct Case {
 impl Case {
     fn has_loops(&self) -> bool {
         self.items.iter().any(|i| matches!(i, Item::Loop { .. }))
+    }
+
+    /// Whether the case needs the DST runner: a seam directive or a
+    /// concurrent block, neither of which the direct engine can host.
+    fn needs_dst(&self) -> bool {
+        !self.seams.is_empty()
+            || self
+                .items
+                .iter()
+                .any(|i| matches!(i, Item::Step(Step::Concurrent(_))))
+    }
+}
+
+/// The latency models `--measure --model` accepts, by name.
+pub fn measure_model_names() -> Vec<&'static str> {
+    measure::MODELS.iter().map(|model| model.name).collect()
+}
+
+/// The step's kind as the measure report names it.
+fn step_kind(step: &Step) -> &'static str {
+    match step {
+        Step::Query(_) => "query",
+        Step::Mutate(_) => "mutate",
+        Step::Control(_) => "control",
+        Step::List(_) => "list",
+        Step::Settings(_) => "settings",
+        Step::Show(_) => "show",
+        Step::Restart { .. } => "restart",
+        Step::Concurrent(_) => "concurrent",
     }
 }
 
@@ -121,6 +152,7 @@ enum Step {
     Settings(SettingsStep),
     Show(ShowStep),
     Restart { ordinal: usize },
+    Concurrent(ConcurrentStep),
 }
 
 impl Step {
@@ -133,6 +165,7 @@ impl Step {
             Self::Settings(s) => s.ordinal,
             Self::Show(s) => s.ordinal,
             Self::Restart { ordinal } => *ordinal,
+            Self::Concurrent(s) => s.ordinal,
         }
     }
 
@@ -143,7 +176,11 @@ impl Step {
             Step::Query(step) => Some(&step.expect),
             Step::List(step) => Some(&step.expect),
             Step::Show(step) => Some(&step.expect),
-            Step::Mutate(_) | Step::Control(_) | Step::Settings(_) | Step::Restart { .. } => None,
+            Step::Mutate(_)
+            | Step::Control(_)
+            | Step::Settings(_)
+            | Step::Restart { .. }
+            | Step::Concurrent(_) => None,
         }
     }
 
@@ -152,7 +189,11 @@ impl Step {
             Step::Query(step) => Some(&mut step.expect),
             Step::List(step) => Some(&mut step.expect),
             Step::Show(step) => Some(&mut step.expect),
-            Step::Mutate(_) | Step::Control(_) | Step::Settings(_) | Step::Restart { .. } => None,
+            Step::Mutate(_)
+            | Step::Control(_)
+            | Step::Settings(_)
+            | Step::Restart { .. }
+            | Step::Concurrent(_) => None,
         }
     }
 }
@@ -173,6 +214,9 @@ struct QueryStep {
     /// The `--- expect plan` section, checked against the engine's explain
     /// document before the rows.
     plan: Option<PlanExpect>,
+    /// `--- expect same as v1`: the rows must also equal the reference
+    /// engine's rows for the same query, compared as `expect` compares.
+    same_as_v1: bool,
 }
 
 #[derive(Debug)]
@@ -745,7 +789,11 @@ fn walk_expr(expr: &Expr, params: &[Param], needs_indices: &mut bool) -> Result<
         | Expr::Literal(_)
         | Expr::AliasRef(_) => {}
         Expr::Aggregate { func: _, arg } => walk_expr(arg, params, needs_indices)?,
-        Expr::Binary { left, op: _, right } => {
+        Expr::Binary { left, op: _, right }
+        | Expr::In {
+            needle: left,
+            list: right,
+        } => {
             walk_expr(left, params, needs_indices)?;
             walk_expr(right, params, needs_indices)?;
         }
@@ -929,6 +977,9 @@ enum Pending {
         id: Option<SettingId>,
         prefix: Vec<SettingStmt>,
     },
+    /// A `--- concurrent` block awaiting the bare `--- expect` that names
+    /// each session's outcome.
+    Concurrent(ConcurrentStep),
 }
 
 /// Whether `text` holds the statement `<statement> <name>` at any position:
@@ -1214,6 +1265,37 @@ fn complete_control_step(
     })
 }
 
+/// The expect word that adds the reference-engine comparison to a query
+/// step's rows expect.
+const SAME_AS_V1: &str = "same as v1";
+
+/// Why a `--- expect same as v1` section has no step to attach to; a mutate
+/// step, pending or just completed, gets its own refusal.
+fn same_as_v1_misplaced(
+    line: usize,
+    pending: Option<&Pending>,
+    items: &[Item],
+    open_loop: Option<&(String, Vec<String>, Vec<Step>)>,
+) -> String {
+    let last = match open_loop {
+        Some((_, _, steps)) => steps.last(),
+        None => match items.last() {
+            Some(Item::Step(step)) => Some(step),
+            Some(Item::Loop { .. }) | None => None,
+        },
+    };
+    let on_mutate = matches!(pending, Some(Pending::Decl(step)) if step.is_mutation)
+        || (pending.is_none() && matches!(last, Some(Step::Mutate(_))));
+    if on_mutate {
+        return format!(
+            "invalid_case: line {line}: `--- expect same as v1` is refused on a mutate step; the reference engine only reads, and a mutation returns no rows to compare"
+        );
+    }
+    format!(
+        "line {line}: `--- expect same as v1` must directly follow a query step's `--- expect shape` or `--- expect plan`; it adds the reference-engine comparison to the step's own rows expect"
+    )
+}
+
 /// The step a declaration section becomes under `mode`, or why the mode is
 /// refused for it.
 fn complete_decl_step(
@@ -1248,6 +1330,7 @@ fn complete_decl_step(
                 expects_expand: step.expects_expand,
                 expect: rows_expect(ordered, section, loop_var)?,
                 plan: None,
+                same_as_v1: false,
             }))
         }
         (ExpectHeader::Error(needle), is_mutation) => {
@@ -1274,6 +1357,7 @@ fn complete_decl_step(
                     expects_expand: step.expects_expand,
                     expect: QueryExpect::Error { needle },
                     plan: None,
+                    same_as_v1: false,
                 })
             })
         }
@@ -1360,6 +1444,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
     let mut pending: Option<Pending> = None;
     let mut awaiting_shape: Option<Step> = None;
     let mut awaiting_plan: Option<Step> = None;
+    let mut awaiting_same_as_v1: Option<Step> = None;
     let mut ordinal = 0usize;
     let mut seams = BTreeMap::new();
     let mut source_lines = BTreeMap::new();
@@ -1413,11 +1498,14 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
             Some((k, rest)) => (k, rest),
             None => (section.name.as_str(), ""),
         };
-        if !(kind == "expect" && rest.trim().starts_with("shape")) {
+        let expect_word = if kind == "expect" { rest.trim() } else { "" };
+        if !expect_word.starts_with("shape") {
             settle_shape(&mut items, &mut open_loop, awaiting_shape.take())?;
         }
-        if let Some(step) = awaiting_plan.take_if(|_| !(kind == "expect" && rest.trim() == "plan"))
-        {
+        if let Some(step) = awaiting_plan.take_if(|_| !matches!(expect_word, "plan" | SAME_AS_V1)) {
+            push_step(&mut items, &mut open_loop, step);
+        }
+        if let Some(step) = awaiting_same_as_v1.take_if(|_| expect_word != SAME_AS_V1) {
             push_step(&mut items, &mut open_loop, step);
         }
         if awaiting_seam_step && !matches!(kind, "mutate" | "seam") {
@@ -1425,7 +1513,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                 "invalid_case: a seam must directly precede its mutate step (a GQ mutation or a branch statement); no seam is crossed by a query step yet".into(),
             );
         }
-        if matches!(kind, "query" | "mutate" | "restart") {
+        if matches!(kind, "query" | "mutate" | "restart" | "concurrent") {
             source_lines.insert(ordinal + 1, section.header_line + 1);
             awaiting_seam_step = false;
         }
@@ -1607,6 +1695,85 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     params_raw: None,
                 }));
             }
+            "concurrent" => {
+                let line = section.header_line + 1;
+                if !rest.is_empty() {
+                    return Err(format!("line {line}: `--- concurrent` takes no arguments"));
+                }
+                if open_loop.is_some() {
+                    return Err(format!(
+                        "line {line}: invalid_case: a concurrent block inside a loop is not supported"
+                    ));
+                }
+                if pending.is_some() {
+                    return Err(format!(
+                        "line {line}: the previous step is missing its `--- expect`"
+                    ));
+                }
+                let (lines, order) = concurrent::parse_block(&section.body).map_err(|e| {
+                    if e.starts_with("line ") {
+                        e
+                    } else {
+                        format!("line {line}: {e}")
+                    }
+                })?;
+                let mut sessions = Vec::with_capacity(lines.len());
+                for session in lines {
+                    let file = parse_query(&session.text).map_err(|e| {
+                        format!(
+                            "line {}: session `{}` does not parse: {e}",
+                            session.line, session.label
+                        )
+                    })?;
+                    if !file.settings.is_empty() {
+                        return Err(format!(
+                            "line {}: session `{}` carries `set` or `reset` lines; a block session is one statement",
+                            session.line, session.label
+                        ));
+                    }
+                    let FileBody::Queries(decls) = file.body else {
+                        return Err(format!(
+                            "line {}: session `{}` must be a query or mutation declaration; show, branch and explain statements are not admitted in a block",
+                            session.line, session.label
+                        ));
+                    };
+                    let [decl] = decls.as_slice() else {
+                        return Err(format!(
+                            "line {}: session `{}` holds exactly one declaration, got {}",
+                            session.line,
+                            session.label,
+                            decls.len()
+                        ));
+                    };
+                    if !decl.params.is_empty() {
+                        return Err(format!(
+                            "line {}: session `{}` declares parameters; a block session takes none",
+                            session.line, session.label
+                        ));
+                    }
+                    inspect_decl(decl, &mut needs_indices)?;
+                    let kind = if decl.mutations.is_empty() {
+                        SessionKind::Query
+                    } else {
+                        SessionKind::Mutation
+                    };
+                    sessions.push(SessionOp {
+                        label: session.label,
+                        branch: session.branch,
+                        source: session.text,
+                        name: decl.name.clone(),
+                        kind,
+                        expect: SessionExpect::Ok,
+                    });
+                }
+                ordinal += 1;
+                qm_steps += 1;
+                pending = Some(Pending::Concurrent(ConcurrentStep {
+                    ordinal,
+                    sessions,
+                    order,
+                }));
+            }
             "params" => {
                 if !rest.is_empty() {
                     return Err(format!("unknown section `--- {}`", section.name));
@@ -1618,6 +1785,9 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     }
                     Some(Pending::Settings { .. } | Pending::Show { .. }) => {
                         return Err("a settings statement takes no params".into());
+                    }
+                    Some(Pending::Concurrent(_)) => {
+                        return Err("a concurrent block takes no params; its sessions are literal statements".into());
                     }
                     None => {
                         return Err(format!(
@@ -1643,6 +1813,32 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                 step.params_raw = Some(body);
             }
             "expect" => {
+                if let Some(Pending::Concurrent(mut step)) =
+                    pending.take_if(|p| matches!(p, Pending::Concurrent(_)))
+                {
+                    let line = section.header_line + 1;
+                    if !rest.trim().is_empty() {
+                        return Err(format!(
+                            "line {line}: after a concurrent block, `--- expect` is bare and its body names each session: `<label>: ok` or `<label>: error: <needle>`"
+                        ));
+                    }
+                    refuse_comment_lines(&section.body, "expect")?;
+                    let labels: Vec<&str> =
+                        step.sessions.iter().map(|s| s.label.as_str()).collect();
+                    let expects =
+                        concurrent::parse_expect_body(&section.body, &labels).map_err(|e| {
+                            if e.starts_with("line ") {
+                                e
+                            } else {
+                                format!("line {line}: {e}")
+                            }
+                        })?;
+                    for (op, expect) in step.sessions.iter_mut().zip(expects) {
+                        op.expect = expect;
+                    }
+                    push_step(&mut items, &mut open_loop, Step::Concurrent(step));
+                    continue;
+                }
                 if rest.trim() == "shape" {
                     let Some(mut step) = awaiting_shape.take() else {
                         return Err(format!(
@@ -1688,6 +1884,28 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         ));
                     };
                     query.plan = Some(PlanExpect { lines });
+                    awaiting_same_as_v1 = Some(step);
+                    continue;
+                }
+                if rest.trim() == SAME_AS_V1 {
+                    let line = section.header_line + 1;
+                    refuse_nonempty_body(&section.body, "an `expect same as v1` section")?;
+                    let Some(mut step) =
+                        awaiting_plan.take().or_else(|| awaiting_same_as_v1.take())
+                    else {
+                        return Err(same_as_v1_misplaced(
+                            line,
+                            pending.as_ref(),
+                            &items,
+                            open_loop.as_ref(),
+                        ));
+                    };
+                    let Step::Query(query) = &mut step else {
+                        return Err(format!(
+                            "line {line}: `--- expect same as v1` is supported only on a query declaration step"
+                        ));
+                    };
+                    query.same_as_v1 = true;
                     push_step(&mut items, &mut open_loop, step);
                     continue;
                 }
@@ -1720,6 +1938,9 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     }) => Step::Show(complete_show_step(
                         ordinal, id, prefix, &mode, section, loop_var,
                     )?),
+                    Some(Pending::Concurrent(_)) => {
+                        unreachable!("a pending concurrent block is completed above")
+                    }
                     None => {
                         return Err(format!(
                             "line {}: `--- expect` has no query or mutate step to bind to",
@@ -1795,7 +2016,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         return Err("the final step is missing its `--- expect`".into());
     }
     settle_shape(&mut items, &mut open_loop, awaiting_shape.take())?;
-    if let Some(step) = awaiting_plan.take() {
+    if let Some(step) = awaiting_plan.take().or_else(|| awaiting_same_as_v1.take()) {
         push_step(&mut items, &mut open_loop, step);
     }
     if open_loop.is_some() {
@@ -2145,22 +2366,13 @@ async fn run_query_step(
         message,
         bless_lines: None,
     };
-    let settings = match session.effective(&step.source) {
-        Ok(settings) => Some(settings),
+    let inspected = match session.effective(&step.source) {
+        Ok(_) => true,
         Err(error) if step.plan.is_some() => {
             return Err(fail(format!("query settings failed: {error}")));
         }
-        Err(_) => None,
+        Err(_) => false,
     };
-    let inspected = settings
-        .as_ref()
-        .is_some_and(|settings| settings.engine() == Engine::V2);
-    if step.plan.is_some() && !inspected {
-        return Err(fail(
-            "expect plan requires engine = v2; effective engine is v1, which produces no plan"
-                .into(),
-        ));
-    }
     // A params refusal is one of the ways "the query must fail": route it
     // into an `error:` expectation instead of always failing the step.
     let params = match build_params(step.params_raw.as_ref(), &step.decl.params, binding) {
@@ -2252,12 +2464,54 @@ async fn run_query_step(
             if let Some(drift) = drift {
                 return Err(fail(drift));
             }
-            check_rows(&label, &result, *ordered, body_raw, *span, binding)
+            check_rows(&label, &result, *ordered, body_raw, *span, binding)?;
+            if step.same_as_v1 && !dst_runner::active() {
+                check_same_as_v1(session, step, &params, &result, *ordered)
+                    .await
+                    .map_err(&fail)?;
+            }
+            Ok(())
         }
         QueryExpect::Error { needle } => {
             check_error_expect(needle, outcome, "the query succeeded").map_err(fail)
         }
     }
+}
+
+/// `--- expect same as v1`: the step's query again on a copy of the case
+/// session whose reads run on the reference engine; any v1 error, a gate
+/// refusal included, or a row difference fails the step.
+async fn check_same_as_v1(
+    session: &Session,
+    step: &QueryStep,
+    params: &omnigraph_compiler::ParamMap,
+    v2: &QueryResult,
+    ordered: bool,
+) -> Result<(), String> {
+    let reference = session
+        .clone()
+        .with_read_executor(Arc::new(omnigraph_reference_engine::ReferenceEngine));
+    let v1 = reference
+        .query(
+            ReadTarget::branch(&step.branch),
+            &step.source,
+            &step.name,
+            params,
+        )
+        .await
+        .map_err(|e| format!("expect same as v1: v2 returned rows, v1 failed: {e}"))?;
+    let rows = |result: &QueryResult, engine: &str| match result.to_rust_json() {
+        Ok(Value::Array(rows)) => Ok(rows),
+        Ok(_) => Err(format!(
+            "expect same as v1: {engine} returned a non-array row set"
+        )),
+        Err(e) => Err(format!(
+            "expect same as v1: {engine} rows failed to render as JSON: {e}"
+        )),
+    };
+    compare_rows(&rows(&v1, "v1")?, &rows(v2, "v2")?, ordered).map_err(|(message, _)| {
+        format!("expect same as v1: the engines disagree (expected = v1, actual = v2): {message}")
+    })
 }
 
 /// Compares the executed rows with the expect body; a mismatch carries the
@@ -2623,6 +2877,157 @@ async fn run_mutate_step(
     }
 }
 
+/// A `--- concurrent` step: the sessions' statements as futures over the case
+/// session, joined on the worker's one runtime under the block's script; fails
+/// on a starved script, then on the first session missing its expect.
+async fn run_concurrent_step(
+    session: &Session,
+    case: &Case,
+    step: &ConcurrentStep,
+) -> Result<(), StepFail> {
+    let label = step_label(step.ordinal, "concurrent", None);
+    let fail = |message: String| StepFail {
+        label: label.clone(),
+        message,
+        bless_lines: None,
+    };
+    if !dst_runner::active() {
+        return Err(fail(
+            "a concurrent block runs under the DST runner only; its environment is omnigraph-engine-dst".into(),
+        ));
+    }
+    let line = case.source_lines.get(&step.ordinal).map(|l| *l as u64);
+    let run = concurrent::Run::begin(step, concurrent::starve_budget(case.runner.timeout_ms));
+    let sessions = step.sessions.iter().enumerate().map(|(index, op)| {
+        let ctx = measure::SessionCtx::new(
+            index,
+            measure::session_label(&op.label, step.ordinal as u64, line, op.kind.name()),
+            run.draining_flag(),
+        );
+        let run = Arc::clone(&run);
+        measure::SESSION.scope(ctx, async move {
+            let outcome = match run.start_session(index).await {
+                Ok(()) => run_session(session, op).await,
+                Err(aborted) => Err(aborted),
+            };
+            let script = run.finish_session(index).await;
+            (outcome, script)
+        })
+    });
+    let results = tokio::select! {
+        biased;
+        results = futures::future::join_all(sessions) => results,
+        () = run.drive_clock() => unreachable!("the clock driver never returns"),
+    };
+    let block = run.end();
+    let sessions_evidence: Vec<Value> = step
+        .sessions
+        .iter()
+        .zip(&results)
+        .map(|(op, (outcome, script))| {
+            serde_json::json!({
+                "label": op.label,
+                "outcome": if outcome.is_ok() { "ok" } else { "failed" },
+                "message": outcome.as_ref().err(),
+                "script": script.as_ref().err(),
+            })
+        })
+        .collect();
+    dst_runner::record(
+        "concurrent_block",
+        serde_json::json!({
+            "sessions": sessions_evidence,
+            "stuck_at": block.stuck_at.map(|at| at + 1),
+            "failure": block.failure,
+        }),
+    );
+    measure::push_detail(serde_json::json!({
+        "slot": "concurrent",
+        "step": step.ordinal,
+        "value": {"grants": block.log, "wall_ms": block.wall_ms, "unattributed": block.unattributed},
+    }));
+    dst_runner::observe(|| {
+        format!(
+            "concurrent block: stuck_at={:?} failure={:?} unattributed={}",
+            block.stuck_at, block.failure, block.unattributed
+        )
+    });
+    if let Some(failure) = block.failure {
+        return Err(fail(failure));
+    }
+    for (op, (outcome, _)) in step.sessions.iter().zip(&results) {
+        if let Err(message) = outcome {
+            return Err(fail(format!("session `{}`: {message}", op.label)));
+        }
+    }
+    Ok(())
+}
+
+/// One session of a block: the statement on its branch through the case
+/// session under the case's traversal pin, compared with the session's expect.
+async fn run_session(session: &Session, op: &SessionOp) -> Result<(), String> {
+    let params = build_params(None, &[], None)?;
+    let mode = pinned_mode(session);
+    match op.kind {
+        SessionKind::Mutation => {
+            let (outcome, counts) = under_traversal(
+                mode,
+                session.mutate(&op.branch, &op.source, &op.name, &params),
+            )
+            .await;
+            let outcome = outcome.inspect_err(dst_runner::observe_fault);
+            dst_runner::record(
+                "mutation_result",
+                match &outcome {
+                    Ok(result) => {
+                        serde_json::json!({"nodes": result.affected_nodes, "edges": result.affected_edges})
+                    }
+                    Err(error) => serde_json::json!({"error": error.to_string()}),
+                },
+            );
+            dst_runner::observe(|| match &outcome {
+                Ok(result) => format!(
+                    "session `{}` actual affected: nodes={} edges={}",
+                    op.label, result.affected_nodes, result.affected_edges
+                ),
+                Err(error) => format!("session `{}` actual mutation error: {error}", op.label),
+            });
+            if let Some(violation) = check_pin(mode, &counts, false) {
+                return Err(violation);
+            }
+            match &op.expect {
+                SessionExpect::Ok => outcome
+                    .map(|_| ())
+                    .map_err(|e| format!("mutation failed: {e}")),
+                SessionExpect::Error { needle } => {
+                    check_error_expect(needle, outcome, "the mutation succeeded")
+                }
+            }
+        }
+        SessionKind::Query => {
+            let query = session.query(
+                ReadTarget::branch(&op.branch),
+                &op.source,
+                &op.name,
+                &params,
+            );
+            let (outcome, counts) = under_traversal(mode, query).await;
+            dst_runner::observe_query(&outcome, false);
+            if let Some(violation) = check_pin(mode, &counts, false) {
+                return Err(violation);
+            }
+            match &op.expect {
+                SessionExpect::Ok => outcome
+                    .map(|_| ())
+                    .map_err(|e| format!("query failed: {e}")),
+                SessionExpect::Error { needle } => {
+                    check_error_expect(needle, outcome, "the query succeeded")
+                }
+            }
+        }
+    }
+}
+
 /// A fresh store for one case: init from the schema, the case session over
 /// it, seed, and build indices when the case needs them. The tempdir rides
 /// along so the store outlives the call.
@@ -2799,11 +3204,21 @@ async fn execute_steps_inner(
                         Step::Restart { .. } => {
                             serde_json::json!({"kind": "restart", "storage": "preserved"})
                         }
+                        Step::Concurrent(c) => serde_json::json!({
+                            "kind": "concurrent",
+                            "sessions": c.sessions.iter().map(|s| serde_json::json!({"label": s.label, "branch": s.branch, "kind": s.kind.name(), "expect": format!("{:?}", s.expect)})).collect::<Vec<_>>(),
+                            "order": c.order.iter().map(|e| format!("{} {}", c.sessions[e.session].label, e.event)).collect::<Vec<_>>(),
+                        }),
                     },
                 );
                 let seams = case.seams.get(&ordinal).map_or(&[][..], Vec::as_slice);
                 let armed = dst_runner::arm_seams(seams, step)?;
                 let lifetime_before = dst_runner::lifetime_counts();
+                dst_runner::measure_step_begin(
+                    ordinal as u64,
+                    case.source_lines.get(&ordinal).map(|line| *line as u64),
+                    step_kind(step),
+                );
                 let outcome = match step {
                     Step::Query(q) => {
                         run_query_step(&session, pinned_mode(&session), q, binding).await
@@ -2815,6 +3230,7 @@ async fn execute_steps_inner(
                     Step::List(l) => run_list_step(&session, l, binding).await,
                     Step::Settings(s) => run_settings_step(&mut session, s, binding),
                     Step::Show(s) => run_show_step(&session, s, binding),
+                    Step::Concurrent(c) => run_concurrent_step(&session, case, c).await,
                     Step::Restart { ordinal } => {
                         generation += 1;
                         dst_runner::observe(|| format!("lifetime: reopen generation {generation}"));
@@ -2865,6 +3281,7 @@ async fn execute_steps_inner(
                     }
                 };
                 let seam_result = dst_runner::finish_seams(armed);
+                dst_runner::measure_step_end(ordinal as u64);
                 let lifetime_after = dst_runner::lifetime_counts();
                 dst_runner::record(
                     "engine_lifetime",
@@ -2995,7 +3412,7 @@ pub async fn run_case(path: PathBuf, bless: bool) -> Result<(), String> {
     {
         return Err("DST cases require the file dispatcher; the async normal runner cannot execute mode: dst".into());
     }
-    case.runner.environments[0].admit(!case.seams.is_empty())?;
+    case.runner.environments[0].admit(case.needs_dst())?;
     execute_case(&case, &path, bless).await
 }
 
@@ -3026,20 +3443,20 @@ pub fn bless_from_env() -> Result<bool, String> {
 }
 
 /// The `engine` baseline of every case session, as `OMNIGRAPH_GQ_ENGINE`
-/// names it; `V1`, the definition's default, when unset.
+/// names it; `V2`, the definition's default, when unset.
 ///
 /// # Errors
 ///
-/// Refuses any value other than `v1`, `v2`, or empty.
+/// Refuses any value other than `v2` or empty.
 pub fn engine_from_env() -> Result<Engine, String> {
     match std::env::var(ENGINE_ENV) {
-        Err(std::env::VarError::NotPresent) => Ok(Engine::V1),
+        Err(std::env::VarError::NotPresent) => Ok(Engine::V2),
         Err(std::env::VarError::NotUnicode(v)) => Err(format!(
             "invalid_case: {ENGINE_ENV} requires UTF-8, got {v:?}"
         )),
-        Ok(v) if v.is_empty() => Ok(Engine::V1),
+        Ok(v) if v.is_empty() => Ok(Engine::V2),
         Ok(v) => Engine::from_spelling(&v).ok_or_else(|| {
-            format!("invalid_case: {ENGINE_ENV} takes v1 or v2 (or empty/unset), got `{v}`")
+            format!("invalid_case: {ENGINE_ENV} takes v2 (or empty/unset), got `{v}`")
         }),
     }
 }

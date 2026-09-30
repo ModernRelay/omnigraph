@@ -1846,6 +1846,47 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {out}");
         let error: ErrorOutput = serde_json::from_value(out).unwrap();
         assert_ne!(error.code, Some(ErrorCode::Forbidden), "{path}");
+        let diagnostic = error
+            .diagnostic
+            .expect("a refused query carries its diagnostic");
+        assert_eq!(diagnostic.code, "Q001", "{path}");
+        assert!(diagnostic.position.is_some(), "{path}");
+
+        // The measured shape, a declaration without its parameter list, is
+        // refused at the name's end with the one fix at every door.
+        let field = if path == "/read" {
+            "query_source"
+        } else {
+            "query"
+        };
+        let missing = json!({field: "query name { match { $p: Person } return { $p.name } }", "branch": "main"});
+        let (status, out) = json_response(&app, send(path, token, missing, expected_head)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {out}");
+        let error: ErrorOutput = serde_json::from_value(out).unwrap();
+        let diagnostic = error
+            .diagnostic
+            .expect("a refused query carries its diagnostic");
+        assert_eq!(diagnostic.code, "Q002", "{path}");
+        assert_eq!(diagnostic.fix.as_deref(), Some("query name()"), "{path}");
+        let suggestion = diagnostic.suggestion.unwrap();
+        assert_eq!(
+            suggestion.applicability,
+            omnigraph_api_types::ApplicabilityOutput::MachineApplicable
+        );
+        assert_eq!(
+            suggestion.edits,
+            vec![omnigraph_api_types::TextEditOutput {
+                start: 10,
+                end: 10,
+                replacement: "()".to_string(),
+            }],
+            "{path}"
+        );
+        assert_eq!(
+            diagnostic.position.map(|at| (at.line, at.column)),
+            Some((1, 11)),
+            "{path}"
+        );
     }
 }
 
@@ -2201,7 +2242,7 @@ async fn settings_show_all_lists_the_definition_in_order() {
     assert_eq!(
         body,
         show_output(&[
-            show_row("engine", "v1", "v1", "default", "request"),
+            show_row("engine", "v2", "v2", "default", "request"),
             show_row("rrf_plan", "auto", "auto", "default", "process"),
             show_row(
                 "merge_lineage",
@@ -2423,7 +2464,7 @@ async fn settings_reset_all_at_the_http_door_returns_to_the_process_defaults() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["rows"][0],
-        show_row("engine", "v1", "v1", "default", "request"),
+        show_row("engine", "v2", "v2", "default", "request"),
         "{body}"
     );
     assert_eq!(

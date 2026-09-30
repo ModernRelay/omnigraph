@@ -1,6 +1,4 @@
-//! Engine v2 behaviour that differs from v1 by design, run under
-//! `engine = v2`; v1's own tests (`search.rs`, `traversal.rs`) are upstream's
-//! bytes and never name a v2 operator.
+//! Engine v2 behaviour that differs from the frozen engine v1 by design.
 
 mod helpers;
 

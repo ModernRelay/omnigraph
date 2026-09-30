@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-09-16
-updated: 2026-09-17
+updated: 2026-09-27
 discussion: null
 supersedes: []
 superseded_by: []
@@ -39,8 +39,10 @@ same file; `reset` restores a setting's process default; `show` reads the
 current value back, and `show all;` reads every setting with its value, its
 default, where the value came from, and its scope.
 
-The first setting is `engine`, values `v1` and `v2`, default `v1`. Under
-`v1` every operation runs the existing code. Under `v2` the operations that
+The first setting is `engine`, with the one value `v2`, its default; `v1` is
+refused as an unknown value (amended 2026-09-27, Decision log: the draft had
+values `v1` and `v2`, default `v1`, and every `v1` below records that
+draft). Under `v2` the operations that
 ***engine version 2*** (the engine version 2 planner RFC, PR #711, which
 names the planner, the execution engine and memory management as engine
 version 2's components; the planner and `omnigraph-exec` are the two with
@@ -1115,10 +1117,17 @@ tree. None is depended on.
    field and the read path's route (`Session::query` and `run_query_at`
    run the plan route under `engine = v2`) landed with engine version 2's
    read-path PR (RFC 0068 milestone 3); the two gate calls and the registry
-   entries follow with the change-feed and merge planner.
+   entries follow with the change-feed and merge planner. Amended
+   2026-09-27: in v0.12.0, before the setting ever shipped, the `engine` row
+   narrowed to the one value `v2`, its default; `set engine = v1;`,
+   `OMNIGRAPH_ENGINE=v1` and the `settings` value `v1` are refused as
+   unknown values, and every read runs the plan route. Engine v1 left
+   production for the frozen crate `omnigraph-reference-engine`, which only
+   a GQT step's `--- expect same as v1` reaches.
 
-Each step is independently safe: step 1 changes no default, and step 2
-changes no behavior for a caller that never sets `engine`. If that PR merges
+Each step is independently safe: step 1 changes no default, and step 2 as
+drafted changed no behavior for a caller that never set `engine`; its
+2026-09-27 narrowing moves every read to `v2`. If that PR merges
 first, the two steps are one PR with the same content. The runner RFC
 (several settings assignments per case; evidence that a routed operation
 routed) follows step 2.
@@ -1181,3 +1190,13 @@ routed) follows step 2.
   under v1 whose message shows both fixes. The narrowing comes from the
   shared expression model RFC
   ([2026-09-24-shared-expression-model.md](2026-09-24-shared-expression-model.md)).
+- 2026-09-27, amendment from the PR that made engine v2 the only engine
+  (v0.12.0): `engine` has the one value `v2`, default `v2`; `v1` is refused
+  as an unknown value at every door. The row stays so that a later engine
+  version is a new value, not a new setting. Superseded sentences: in the
+  Summary, "The first setting is `engine`, values `v1` and `v2`, default
+  `v1`. Under `v1` every operation runs the existing code."; rollout step
+  2 gains its narrowing, and the safety sentence under the rollout list is
+  reworded. The rest of the body's `v1` text records the draft. Engine v1
+  is the frozen test reference `omnigraph-reference-engine`, reached only
+  through a GQT step's `--- expect same as v1`.

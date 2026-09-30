@@ -36,6 +36,7 @@ use serial_test::serial;
 
 use omnigraph::Session;
 use omnigraph::db::Omnigraph;
+use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::instrumentation::{
     QueryIoProbes, RrfGateFallback, RrfGatePlan, RrfGateVerdict, with_query_io_probes,
 };
@@ -558,12 +559,9 @@ async fn antijoin_only_shape_falls_back() {
     );
 }
 
-/// The Shape fence's remaining admission-failure rows (the AntiJoin row has
-/// its own test above): arms targeting different variables, the ranked
-/// variable introduced as an Expand dst (the answer-relevant row — its
-/// NodeScan never installs the search), and a traversal-free rrf scan.
-/// Each takes a distinct early return in the gate; all must record the
-/// Shape reason even under force_prefilter.
+/// The Shape fence's remaining rows: arms on different variables and a
+/// traversal-free rrf scan record the Shape reason under force_prefilter; a
+/// ranked Expand dst is a user-error refusal of v2's planner.
 #[tokio::test]
 #[serial]
 async fn shape_fence_covers_all_fallback_rows() {
@@ -571,11 +569,25 @@ async fn shape_fence_covers_all_fallback_rows() {
     let db = init_gate_db(&dir).await;
     let text_params = params(&[("$q1", "needle"), ("$q2", "sharp")]);
 
-    for query_name in [
-        "different_var_arms",
+    let prefilter_db = with_setting(&db, "rrf_plan", "force_prefilter");
+    let refused = query_main(
+        &prefilter_db,
+        GATE_QUERIES,
         "ranked_var_is_expand_dst",
-        "no_traversal",
-    ] {
+        &text_params,
+    )
+    .await
+    .expect_err("engine v2 refuses a ranked order on a traversal destination");
+    assert!(
+        matches!(&refused, OmniError::Manifest(error) if error.kind == ManifestErrorKind::BadRequest),
+        "ranked_var_is_expand_dst: the refusal is a user error: {refused:?}"
+    );
+    assert!(
+        refused.to_string().contains("a traversal destination"),
+        "{refused}"
+    );
+
+    for query_name in ["different_var_arms", "no_traversal"] {
         let (_, verdicts, _) = run_forced(&db, "force_prefilter", query_name, &text_params).await;
         assert_eq!(verdicts.len(), 1, "{query_name}: one verdict per rrf run");
         assert_eq!(

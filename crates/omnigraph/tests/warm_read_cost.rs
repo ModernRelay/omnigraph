@@ -1199,14 +1199,14 @@ async fn repeat_warm_read_reuses_table_handles() {
         let (cold_out, cold) = measure(db.query(
             ReadTarget::branch("main"),
             TEST_QUERIES,
-            "total_people",
+            "adults",
             &params(&[]),
         ))
         .await;
         cold_out.unwrap();
         assert!(
             cold.data_reads > 0,
-            "the cold first read must open the table"
+            "the cold first read must open the table (`adults` reads rows; a count is answered from `__manifest` metadata)"
         );
 
         // Warm repeat: the held handle is reused, so no open happens through this
@@ -1214,7 +1214,7 @@ async fn repeat_warm_read_reuses_table_handles() {
         let (warm_out, warm) = measure(db.query(
             ReadTarget::branch("main"),
             TEST_QUERIES,
-            "total_people",
+            "adults",
             &params(&[]),
         ))
         .await;
@@ -1247,7 +1247,7 @@ async fn write_invalidates_table_cache_for_changed_table() {
     db.query(
         ReadTarget::branch("main"),
         TEST_QUERIES,
-        "total_people",
+        "adults",
         &params(&[]),
     )
     .await
@@ -1267,14 +1267,14 @@ async fn write_invalidates_table_cache_for_changed_table() {
     let (out, io) = measure(db.query(
         ReadTarget::branch("main"),
         TEST_QUERIES,
-        "total_people",
+        "adults",
         &params(&[]),
     ))
     .await;
     out.unwrap();
     assert_eq!(
-        io.data_reads, 2,
-        "a read after a write re-opens the landed detached pin: the version-keyed cache misses"
+        io.data_reads, 4,
+        "a row read after a write re-opens the landed detached pin and scans it: the version-keyed cache misses"
     );
 
     let after = count_rows(&db, "node:Person").await;

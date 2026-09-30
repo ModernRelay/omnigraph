@@ -107,9 +107,11 @@ GQ has no `null` literal, so `$p.x = null` is a parse error.
 not. A parameter bound to `null` makes every comparison on it null. `is null`
 refuses a `Blob`.
 
-`and`, `or`, `not`, `is` and `null` are reserved words: none is a bare operand
+`and`, `or`, `not`, `is`, `null` and `in` are reserved words: none is a bare operand
 or a return alias. `$p.and` after a dot and `and: 1` in an assignment or
 binding match stay legal; `nothing` and `android` are ordinary identifiers.
+A traversal names its edge bare or as a string, the one spelling for an edge
+a reserved word names: `$i "in" $b` follows the edge `In`; `$i in $b` tests membership.
 
 A mutation `where` takes the same expressions over the target type's
 properties, `@id`, `@src`, `@dst`, literals, parameters and `now()`, never a
@@ -118,12 +120,6 @@ binding variable, aggregate or search call:
 matches take constants evaluated once per invocation, such as
 `adult: true or $flag`; a property or system field there is `T45`. See
 [Mutations](../mutations/index.md).
-
-A read with a compound filter (`and`, `or`, `not`, a null test, a bare `Bool`
-operand), or a comparison in `return` or `order`, runs on engine v2: add
-`set engine = v2;` before it, or start the server with `OMNIGRAPH_ENGINE=v2`,
-the one fix for a stored query. Under the default `v1` it is refused with a
-`plan error` that shows both fixes. Mutations run under either engine.
 
 ### Correlated blocks
 
@@ -144,7 +140,7 @@ The block narrows the rows before `order` and `limit`, so a paged listing
 filtered by a relationship count is exact. A binding the block's traversal
 connects to the outer row is reached through that traversal, never scanned as
 a whole table, however many rows the outer pattern has; a binding correlated
-only through a filter, or read by a text search, is scanned. On engine v2 a
+only through a filter, or read by a text search, is scanned. A
 single-hop, filter-free `count { ... }` over a directed, unbound edge is
 answered from the graph index's degree. A bare aggregate in `match`,
 `count($d) > 2` without a block, is refused: it names no row to group by.
@@ -167,6 +163,11 @@ query prolific($least: I64) {
 ### Strings and lists
 
 - `$x.tags contains "rust"` tests membership when `tags` is a list.
+- `$x.number in $numbers` tests membership in a list parameter or literal
+  (`$x.number in ["A-1", "A-2"]`): `$numbers contains $x.number` with the
+  list, of the value's type (`T7`), on the right. On a matched binding's
+  property it filters that binding's scan. An empty list has no member: `in`
+  keeps no row, `not (... in [])` keeps the rows whose value is not null.
 - `$x.title contains "graph"` tests exact, case-sensitive substring containment
   when `title` is a String.
 - `$x.title starts_with "Omni"` tests an exact, case-sensitive prefix.
@@ -221,10 +222,9 @@ nullable (`is null` and `is not null` are always `Bool`), and refused in an aggr
 Search expressions are documented in [Search](../search/index.md).
 
 An explicit order is total and deterministic: OmniGraph adds entity ids as a
-final tie-breaker when user keys are equal, and on the `v2` engine only where
-the ids can change the visible order (when every returned expression is an
-order key, equal rows are indistinguishable and no id is read); `v1` appends
-every `<var>.id`, and the rows are the same either way. Ascending order places nulls first;
+final tie-breaker when user keys are equal, only where the ids can change the
+visible order (when every returned expression is an order key, equal rows are
+indistinguishable and no id is read). Ascending order places nulls first;
 descending order places them last. `nearest(...)` ordering requires a `limit`.
 
 An order key that is a property access or a system field sorts as before,
@@ -233,8 +233,6 @@ a comparison, a call) must be a return alias or an expression written in
 `return`, as in `return { count($d) as deals } order { count($d) desc }`;
 otherwise it is ``T42: order key `max($d.amount)` does not appear in return;
 add it to return or order by its alias``, with the key as written.
-Engine v1 accepts only a property, a system field, an alias or the leading
-search key.
 
 Search orderings share that contract: `nearest(...)` ranks by ascending vector
 distance and `bm25(...)` by descending relevance score, so the score (never
@@ -314,20 +312,20 @@ Use `set`, `reset`, and `show` to configure query execution. See
 
 ## Linting
 
-Validate queries without running them:
+Validate queries without running them; a refusal reports a stable code, its
+position or stage, the expectation and one fix ([Diagnostics](diagnostics.md)):
 
 ```bash
 omnigraph lint --query queries.gq --schema schema.pg --json
 ```
 
-`Q000` identifies parse errors. A file that holds a [branch
-statement](../branching/index.md) where query declarations were expected also
-reports `Q000`. A [settings line](#session-settings) that names an unknown
-setting or a value outside its row reports `ERROR line <n>, column <c>:
-<message>`. `L201` warns when a nullable
-property is never set by any update query in the inspected set. Type errors
-report the affected query and source location. The command exits nonzero when
-the overall status is an error.
+`Q000` identifies a file the parser refused, at `line <n>, column <c>`; a
+[branch statement](../branching/index.md) where declarations were expected
+and a [settings line](#session-settings) naming an unknown setting or a value
+outside its row report the same way. `L201` warns when a nullable property is
+never set by any update query in the inspected set. Type errors report the
+affected query and their `T…` code. The command exits nonzero when the overall
+status is an error.
 
 For every query that compiles successfully, JSON output includes an
 `operation` descriptor:

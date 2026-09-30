@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-09-03
-updated: 2026-09-06
+updated: 2026-09-30
 discussion: null
 supersedes: []
 superseded_by: []
@@ -37,11 +37,14 @@ crate already does, and without bypassing it:
    process non-zero instead of waiting forever.
 
 Nothing here changes a storage format, the ledger's schema, the lock, the
-recovery protocol, or any existing route's success shape. The wider designs of
-RFC 0034 (recovery authority) and RFC 0035 (served-operation ownership) stay
-independent; this RFC takes none of their decisions and its seams remain valid
-under them. Restoring a ledger is deliberately not here: its real use arrives
-with coherent restore points, where the ledger and the graphs come back
+recovery protocol, or any existing route's success shape. The wider
+[Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md)
+proposal stays independent. Its proposed v0.12 wire contract may replace the
+readiness and inventory shapes while retaining observe-only authority and the
+absolute shutdown deadline. This RFC's accepted wire shapes remain current until
+a replacement is accepted and implemented with its coordinated consumer
+transition. Restoring a ledger is deliberately not here:
+its real use arrives with coherent restore points, where the ledger and the graphs come back
 together, and it will be designed once, against those.
 
 ## Motivation
@@ -67,10 +70,9 @@ one. On the way down, axum's graceful shutdown has no bound, so a stalled
 connection keeps a replica alive past any orchestration grace period, and the
 orchestrator's kill is indistinguishable from a crash.
 
-Both gaps are small and local. Neither needs RFC 0034's recovery modes or RFC
-0035's admission cells to close; both of those remain the right larger
-designs for the engine and the server, and this RFC is careful not to
-preempt them.
+Both gaps are small and local. Neither requires the wider server proposal's
+operation ownership or completion supervision to close; this RFC does not
+preempt those contracts.
 
 ## User and operational behavior
 
@@ -179,11 +181,12 @@ renders the same difference as `quarantined`.
 as flag, then environment, then default. `serve` spawns the signal listener
 first; on the signal it sets `draining`, starts a `std::thread` that sleeps
 for the grace and calls `std::process::exit(2)`, and releases the graceful
-shutdown. The clean path is unchanged. This is the deadline half of RFC 0035
-§8 without its participants: one absolute deadline created at signal receipt,
-no participant-local timeouts, a hard non-zero exit that never claims
-success and never depends on the runtime. RFC 0035 may later replace the
-thread with its coordinator; the flag and the readiness change stay.
+shutdown. The clean path is unchanged. This supplies the proposed server
+[operation-ownership contract's](2026-09-29-server-runtime-and-online-deployment.md#operation-ownership)
+deadline boundary without its participants: one absolute deadline created at
+signal receipt, no participant-local timeouts, a hard non-zero exit that never
+claims success and never depends on the runtime. The server runtime proposal may
+replace the thread with its coordinator; the flag and the readiness change stay.
 
 ## Invariants
 
@@ -222,10 +225,10 @@ fields.
 - **Use `state.lock: false` for observation.** It is a bundle setting that
   changes every command and warns on each, and it cannot label a result as
   observed. Rejected.
-- **Implement RFC 0034's `ReadOnlyProbe` first.** The engine's read-only open
-  already skips recovery; what an observer lacks is the cluster crate not
-  taking its lock and not writing. RFC 0034 remains the right design for
-  recovery authority and is not needed for this.
+- **Implement RFC 0034's `ReadOnlyProbe` first.** This was an alternative when
+  this RFC was drafted; RFC 0034 is now superseded. The engine's read-only open
+  already skipped recovery; what observation needed was the cluster crate not
+  taking its lock and not writing. The wider completion design was not required.
 - **Restore a ledger from a file.** Drafted, then deferred: its real use is a
   coherent restore point where the ledger and the graphs come back together,
   and until those exist, `import` and `observe` rebuild a lost ledger with
@@ -236,8 +239,9 @@ fields.
 - **Report the boot digest on `/healthz`.** Liveness and readiness have
   different consumers and different failure semantics; a draining replica is
   alive and not ready. Rejected.
-- **Wait for RFC 0035's shutdown coordinator.** Its deadline half is
-  separable and needed now; its admission cells are not.
+- **Wait for RFC 0035's shutdown coordinator.** This was an alternative when
+  this RFC was drafted; RFC 0035 is now superseded. The deadline boundary was
+  independently shippable without the full admission design.
 - **A Tokio task as the watchdog.** A task cannot fire while the executor is
   blocked or the runtime is tearing down, which are exactly the cases a
   deadline exists for. A thread can.
@@ -268,8 +272,8 @@ fields.
 
 ## Unresolved questions
 
-None that block acceptance. The default grace of 25 seconds matches RFC
-0035 §8; it is a default, not a contract.
+None that block acceptance. The default grace of 25 seconds matched the earlier
+RFC 0035 proposal; it is a default, not a contract.
 
 ## Decision log
 
@@ -284,3 +288,11 @@ None that block acceptance. The default grace of 25 seconds matches RFC
   bounded shutdown); `implementation` advances with each.
 - 2026-09-06: accepted the zero-graph readiness amendment from RFC 0005;
   implementation and process HTTP evidence follow without a wire-format change.
+- 2026-09-29: The server runtime proposal replaces the active references to
+  RFCs 0034 and 0035 in Summary, Motivation, and Shutdown. Alternatives retain
+  those identifiers as historical context. Observe, readiness, and bounded
+  shutdown remain this RFC's accepted decisions.
+- 2026-09-30: Clarified that the proposed v0.12 server contract may replace
+  readiness and inventory wire shapes; observe-only authority and the absolute
+  shutdown deadline remain its foundations. This clarification changes none of
+  this RFC's accepted behavior or current wire shapes.

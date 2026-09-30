@@ -27,7 +27,7 @@ delete Person where email = $email
 A `where` on `update` or `delete` takes the same expressions as a read filter
 (see [Boolean expressions and nulls](../queries/index.md#boolean-expressions-and-nulls)):
 `and`, `or`, `not`, parentheses, the six comparisons, `starts_with`,
-`contains`, `is null` and `is not null`. Its operands are the target type's
+`contains`, `in`, `is null` and `is not null`. Its operands are the target type's
 properties, named bare, the system fields `@id`, `@src` and `@dst`, literals,
 parameters, and `now()`; `from` and `to` stay accepted for `@src` and `@dst`.
 It keeps only the rows whose expression is true. On four `Knows` edges, `ab1`

@@ -5,45 +5,48 @@ use std::sync::Arc;
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
-    Int32Array, Int64Array, ListArray, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
     builder::{
         BooleanBuilder, Date32Builder, Date64Builder, FixedSizeListBuilder, Float32Builder,
         Float64Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder, UInt32Builder,
         UInt64Builder,
     },
 };
-use arrow_cast::display::array_value_to_string;
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Schema, SchemaRef};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::ir::{
-    IRAssignment, IRExpr, IROp, IROrdering, IRProjection, MutationOpIR, ParamMap, QueryIR,
-};
+use omnigraph_compiler::ir::{IRAssignment, IRExpr, MutationOpIR, ParamMap};
 use omnigraph_compiler::lower_mutation_query;
-use omnigraph_compiler::lower_query;
-use omnigraph_compiler::query::ast::{AggFunc, CompOp, Literal, NOW_PARAM_NAME};
-use omnigraph_compiler::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
-use omnigraph_compiler::result::{MutationResult, QueryResult};
-use omnigraph_compiler::types::Direction;
-use omnigraph_compiler::types::ScalarType;
+use omnigraph_compiler::query::ast::{Literal, NOW_PARAM_NAME};
+use omnigraph_compiler::query::typecheck::{CheckedQuery, typecheck_query_decl};
+use omnigraph_compiler::result::MutationResult;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use crate::db::Snapshot;
 use crate::db::manifest::ManifestCoordinator;
 use crate::db::{MergeOutcome, Omnigraph, WriteTxn, is_internal_system_branch};
-use crate::db::{ReadTarget, Snapshot};
-use crate::embedding::EmbeddingClient;
 use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};
-use crate::graph_index::GraphIndex;
 use crate::storage_layer::SnapshotHandle;
 use tempfile::{Builder as TempDirBuilder, TempDir};
 
 pub(crate) mod merge;
 pub(crate) mod mutation;
-mod projection;
-mod query;
+mod query_doors;
 pub(crate) mod staging;
+
+/// A failure to find a named statement in query text, as an engine error: a
+/// compile refusal keeps its diagnostic (code, position, fix) on the read and
+/// the mutation door alike, and any other lookup failure is a bad request.
+pub(crate) fn query_lookup_error(error: omnigraph_compiler::RunInputError) -> OmniError {
+    match error {
+        omnigraph_compiler::RunInputError::Core(
+            query @ omnigraph_compiler::error::CompilerError::Query(_),
+        ) => OmniError::Compiler(query),
+        other => OmniError::manifest(other.to_string()),
+    }
+}

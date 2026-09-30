@@ -114,7 +114,7 @@ pub(super) fn session_with_prefix(
 /// statement. Runs before target resolution, authorization, and admission at
 /// every door, so the door's Cedar action is known before it is checked.
 pub(super) fn classify(query: &str) -> std::result::Result<QueryFile, ApiError> {
-    parse_query(query).map_err(|err| ApiError::bad_request(err.to_string()))
+    parse_query(query).map_err(|err| ApiError::from_compiler(&err))
 }
 
 pub(super) fn control_write_at_read_door(write: &BranchWrite) -> ApiError {

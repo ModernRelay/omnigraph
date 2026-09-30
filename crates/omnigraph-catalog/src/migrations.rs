@@ -43,7 +43,22 @@ use lance::dataset::transaction::{Operation, Transaction, UpdateMap};
 use omnigraph_compiler::{SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_V3, SystemColumns};
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(test, feature = "test-util"))]
+use std::sync::Arc;
+
+#[cfg(any(test, feature = "test-util"))]
+use arrow_array::RecordBatch;
+#[cfg(any(test, feature = "test-util"))]
+use arrow_schema::Schema;
+
+#[cfg(any(test, feature = "test-util"))]
+use crate::commit::commit_overwrite;
 use crate::error::{OmniError, Result};
+use crate::record::RECORD_COLUMN;
+#[cfg(any(test, feature = "test-util"))]
+use crate::record::{expand_from_storage, flat_manifest_schema, flat_to_storage};
+#[cfg(any(test, feature = "test-util"))]
+use crate::state::read_publish_scan;
 
 /// The internal schema version this binary writes for a new-vintage graph and
 /// the ceiling it serves.
@@ -93,7 +108,12 @@ use crate::error::{OmniError, Result};
 ///
 /// v1–v10 graphs are not served by this binary (see `MIN_SUPPORTED`); the
 /// history is kept for provenance and to document what each stamp value meant.
-pub const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 11;
+pub const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 12;
+
+/// The first stamp whose `__manifest` rows are stored as `object_id`,
+/// `object_type` and one packed `record` struct (`record.rs`). A stamp-11
+/// manifest keeps its flat columns until its next publish rewrites it.
+pub const PACKED_RECORD_STAMP: u32 = 12;
 
 /// The oldest main-manifest stamp accepted by normal open: v11, the target of
 /// every registered upgrade route. Explicit conversion and retained-snapshot
@@ -283,8 +303,16 @@ pub fn guard_stamp(dataset: &Dataset) -> Result<u32> {
 /// or metadata damage) from a genuine pre-stamp v1 store — free, since the
 /// schema is already in memory when the stamp is read.
 fn manifest_layout_is_modern(dataset: &Dataset) -> bool {
-    dataset.schema().field("stable_table_id").is_some()
-        && dataset.schema().field("table_incarnation_id").is_some()
+    (dataset.schema().field("stable_table_id").is_some()
+        && dataset.schema().field("table_incarnation_id").is_some())
+        || dataset.schema().field(RECORD_COLUMN).is_some()
+}
+
+/// Whether this binary serves a `__manifest` stamped `stamp`: the served range
+/// is one predicate, so the upgrade and respelling preflights cannot drift from
+/// the open guard.
+pub fn is_served_stamp(stamp: u32) -> bool {
+    (MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION..=INTERNAL_MANIFEST_SCHEMA_VERSION).contains(&stamp)
 }
 
 /// Refuse to open a manifest whose stamp this binary cannot serve — in either
@@ -551,9 +579,47 @@ pub async fn set_stamp(dataset: &mut Dataset, version: u32) -> Result<()> {
 /// seam used to synthesize a sub-CURRENT graph and assert the open path refuses
 /// it. Its callers are the refusal tests here and in the engine, so it compiles
 /// only under `test` or the `test-util` feature.
+/// It changes the metadata only, so packed rows stay under the new stamp: below
+/// the served floor the guard refuses the manifest, at v11 the flat projection
+/// fails; a fixture that must READ uses [`restamp_flat_for_test`].
 #[cfg(any(test, feature = "test-util"))]
 pub async fn set_stamp_for_test(dataset: &mut Dataset, version: u32) -> Result<()> {
     set_stamp(dataset, version).await
+}
+
+/// Test-only: a stored batch of either shape laid out flat (the stamps 5 to 11
+/// shape) under `metadata`.
+#[cfg(any(test, feature = "test-util"))]
+pub fn flat_batch_for_test(
+    batch: &RecordBatch,
+    metadata: HashMap<String, String>,
+) -> Result<RecordBatch> {
+    let logical = if batch.column_by_name(RECORD_COLUMN).is_some() {
+        expand_from_storage(batch)?
+    } else {
+        batch.clone()
+    };
+    let schema = Arc::new(Schema::new_with_metadata(
+        flat_manifest_schema().fields().clone(),
+        metadata,
+    ));
+    flat_to_storage(&logical, &schema)
+}
+
+/// Test-only: rewrite the live rows flat and stamp `version` in the same commit,
+/// the `__manifest` a pre-stamp-12 binary left behind; a restamp alone leaves
+/// packed rows no flat reader can project.
+#[cfg(any(test, feature = "test-util"))]
+pub async fn restamp_flat_for_test(dataset: &mut Dataset, version: u32) -> Result<()> {
+    let live_rows = read_publish_scan(dataset).await?.live_rows;
+    let mut metadata = dataset.schema().metadata.clone();
+    metadata.insert(INTERNAL_SCHEMA_VERSION_KEY.to_string(), version.to_string());
+    let batches = live_rows
+        .iter()
+        .map(|batch| flat_batch_for_test(batch, metadata.clone()))
+        .collect::<Result<Vec<_>>>()?;
+    *dataset = commit_overwrite(dataset.clone(), batches).await?;
+    Ok(())
 }
 
 /// Test-only: overwrite the internal-schema stamp with a raw (possibly
@@ -596,15 +662,15 @@ mod tests {
     /// the floor or above the ceiling.
     #[test]
     fn unsupported_guard_accepts_exactly_the_supported_range() {
-        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_LEGACY).unwrap(), 11);
-        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_V3).unwrap(), 11);
+        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_LEGACY).unwrap(), 12);
+        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_V3).unwrap(), 12);
         assert!(stamp_for_system_columns(omnigraph_compiler::SYSTEM_COLUMNS_META).is_err());
         assert_eq!(
             (
                 MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
                 INTERNAL_MANIFEST_SCHEMA_VERSION
             ),
-            (11, 11)
+            (11, 12)
         );
         for stamp in MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION..=INTERNAL_MANIFEST_SCHEMA_VERSION {
             assert!(
@@ -615,7 +681,7 @@ mod tests {
         let below = refuse_if_stamp_unsupported(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION - 1)
             .expect_err("a sub-floor stamp must be refused")
             .to_string();
-        assert!(below.contains("reads only v11 to v11"), "got: {below}");
+        assert!(below.contains("reads only v11 to v12"), "got: {below}");
         assert!(
             below.contains("0.11.x (detached table commits)"),
             "got: {below}"
@@ -633,8 +699,8 @@ mod tests {
         let future = refuse_if_stamp_unsupported(future_stamp)
             .expect_err("the first unsupported future stamp must be refused")
             .to_string();
-        assert!(future.contains("internal schema v12"), "got: {future}");
-        assert!(future.contains("reads only v11 to v11"), "got: {future}");
+        assert!(future.contains("internal schema v13"), "got: {future}");
+        assert!(future.contains("reads only v11 to v12"), "got: {future}");
         assert!(future.contains("upgrade omnigraph"), "got: {future}");
     }
 

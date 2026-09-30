@@ -8,6 +8,7 @@ members = [
     "crates/omnigraph-catalog",
     "crates/omnigraph-planner",
     "crates/omnigraph",
+    "crates/omnigraph-reference-engine",
     "crates/omnigraph-cli",
     "crates/omnigraph-api-types",
     "crates/omnigraph-cluster",

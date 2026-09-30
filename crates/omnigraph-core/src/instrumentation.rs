@@ -200,13 +200,9 @@ pub struct QueryIoProbes {
     /// reach a `WrappingObjectStore`; read it for backend-complete counts.
     pub manifest_stores: ProbedStores,
     pub table_stores: ProbedStores,
-    /// Uncapped retries taken after a capped BM25 scan under-filled. Only a
-    /// standalone `bm25()` ordering carries a cap (`rrf()` arms are never
-    /// capped — see `execute_rrf_fusion`); its capped and uncapped runs are
-    /// result-identical up to score ties at the cap boundary (the capped
-    /// scan is the uncapped scan's score prefix), so result assertions
-    /// cannot see the cap; this counter and `bm25_scan_rows` below are how
-    /// tests assert it actually engaged.
+    /// Uncapped retries taken after a capped BM25 scan under-filled. Engine
+    /// v2's BM25 scans carry no cap, so no engine path records one and the
+    /// count stays 0.
     pub bm25_uncapped_retries: Arc<AtomicU64>,
     /// Rows returned by BM25-ranked scans, summed over scans (capped and
     /// uncapped passes alike). Lets a test pin the cap's MAGNITUDE — a factor
@@ -685,7 +681,7 @@ tokio::task_local! {
 
 /// RED CONTROL ONLY: drop `id` from the rrf prefilter gate's materialized
 /// eligible-id set for the scope of `fut` — a deliberate violation of the
-/// gate's superset rule (single owner: `exec::query::rrf_prefilter_gate`'s
+/// gate's superset rule (single owner: `engine::search::rrf_prefilter_gate`'s
 /// invariant doc; a subset changes answers). The differential oracle uses
 /// this to prove its equivalence relation can turn red: dropping one
 /// surviving id MUST make the forced-prefilter and forced-postfilter

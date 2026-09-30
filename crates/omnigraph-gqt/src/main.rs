@@ -1,14 +1,18 @@
 #![recursion_limit = "512"]
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use omnigraph_gqt::MeasureOptions;
+
 struct Selection {
-    path: PathBuf,
+    paths: Vec<PathBuf>,
     target: Option<String>,
     storage: Option<String>,
     seed: Option<u64>,
+    measure: Option<MeasureOptions>,
+    artifacts: Option<PathBuf>,
 }
 
 enum Invocation {
@@ -16,9 +20,11 @@ enum Invocation {
     Case(Selection),
 }
 
+const USAGE: &str = "usage: omnigraph-gqt <case.gqt|dir>... [--target <target>] [--storage <storage>] [--seed <u64>] [--artifacts <dir>] [--measure [--model <name>] [--baseline <path>] [--write-baseline]] | --replay <report.json>";
+
 fn parse(args: &[OsString]) -> Result<Invocation, String> {
-    let mut args = args.iter();
-    let first = args.next().ok_or("usage: omnigraph-gqt <case.gqt> [--target <target>] [--storage <storage>] [--seed <u64>] | --replay <report.json>")?;
+    let mut args = args.iter().peekable();
+    let first = args.next().ok_or(USAGE)?;
     if first == "--replay" {
         let path = args
             .next()
@@ -32,14 +38,57 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
     if first.to_string_lossy().starts_with("--") {
         return Err("expected a case path or --replay".into());
     }
+    let mut paths = vec![PathBuf::from(first)];
+    while let Some(arg) = args.peek() {
+        if arg.to_string_lossy().starts_with("--") {
+            break;
+        }
+        paths.push(PathBuf::from(args.next().expect("peeked")));
+    }
     let mut selection = Selection {
-        path: first.into(),
+        paths,
         target: None,
         storage: None,
         seed: None,
+        measure: None,
+        artifacts: None,
     };
+    let mut measure = false;
+    let mut model: Option<String> = None;
+    let mut baseline: Option<PathBuf> = None;
+    let mut write_baseline = false;
     while let Some(arg) = args.next() {
         match arg.to_str() {
+            Some("--measure") if !measure => measure = true,
+            Some("--artifacts") if selection.artifacts.is_none() => {
+                selection.artifacts = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .ok_or("--artifacts requires a directory")?,
+                );
+            }
+            Some("--model") if model.is_none() => {
+                let name = args
+                    .next()
+                    .and_then(|v| v.to_str())
+                    .ok_or("--model requires a model name")?;
+                let names = omnigraph_gqt::measure_model_names();
+                if !names.contains(&name) {
+                    return Err(format!(
+                        "--model takes one of {}, got `{name}`",
+                        names.join(", ")
+                    ));
+                }
+                model = Some(name.into());
+            }
+            Some("--baseline") if baseline.is_none() => {
+                baseline = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .ok_or("--baseline requires a path")?,
+                );
+            }
+            Some("--write-baseline") if !write_baseline => write_baseline = true,
             Some("--target") if selection.target.is_none() => {
                 selection.target = Some(
                     args.next()
@@ -72,7 +121,55 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
             }
         }
     }
+    if !measure && (model.is_some() || baseline.is_some() || write_baseline) {
+        return Err("--model, --baseline and --write-baseline need --measure".into());
+    }
+    if write_baseline && baseline.is_none() {
+        return Err("--write-baseline needs --baseline <path>, the file to write".into());
+    }
+    if measure {
+        selection.measure = Some(MeasureOptions {
+            model: model.unwrap_or_else(|| "unit".into()),
+            baseline,
+            write_baseline,
+        });
+    }
     Ok(Invocation::Case(selection))
+}
+
+/// The case files the paths name: a file as itself, a directory as every
+/// `.gqt` under it, sorted, so a corpus run reads in one order.
+fn case_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+        let entries = std::fs::read_dir(dir)
+            .map_err(|e| format!("cannot read directory {}: {e}", dir.display()))?;
+        for entry in entries {
+            let path = entry
+                .map_err(|e| format!("cannot read directory {}: {e}", dir.display()))?
+                .path();
+            if path.is_dir() {
+                walk(&path, out)?;
+            } else if path.extension().is_some_and(|ext| ext == "gqt") {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            let mut found = Vec::new();
+            walk(path, &mut found)?;
+            if found.is_empty() {
+                return Err(format!("no .gqt case under {}", path.display()));
+            }
+            found.sort();
+            files.extend(found);
+        } else {
+            files.push(path.clone());
+        }
+    }
+    Ok(files)
 }
 
 fn run() -> Result<(), String> {
@@ -104,32 +201,49 @@ fn run() -> Result<(), String> {
         Invocation::Replay(path) => omnigraph_gqt::replay_report(&path, &executable),
         Invocation::Case(selection) => {
             let bless = omnigraph_gqt::bless_from_env().map_err(refusal)?;
-            let outcome = omnigraph_gqt::run_selected(
-                &selection.path,
-                &executable,
-                bless,
-                selection.target.as_deref(),
-                selection.storage.as_deref(),
-                selection.seed,
-            );
-            println!(
-                "{} {} {:.2}s",
-                if outcome.result.is_ok() {
-                    if selection.target.is_some()
-                        || selection.storage.is_some()
-                        || selection.seed.is_some()
-                    {
-                        "ok (selected execution)"
-                    } else {
-                        "ok"
-                    }
-                } else {
-                    "FAIL"
-                },
-                outcome.stem,
-                outcome.elapsed.as_secs_f64()
-            );
-            outcome.result
+            let files = case_files(&selection.paths)
+                .map_err(|error| refusal(format!("invalid_case: {error}")))?;
+            let selected = selection.target.is_some()
+                || selection.storage.is_some()
+                || selection.seed.is_some();
+            let mut failures = Vec::new();
+            for path in &files {
+                let outcome = omnigraph_gqt::run_selected(
+                    path,
+                    &executable,
+                    bless,
+                    selection.target.as_deref(),
+                    selection.storage.as_deref(),
+                    selection.seed,
+                    selection.measure.clone(),
+                    selection.artifacts.clone(),
+                );
+                println!(
+                    "{} {} {:.2}s",
+                    match (&outcome.result, selected) {
+                        (Ok(()), true) => "ok (selected execution)",
+                        (Ok(()), false) => "ok",
+                        (Err(_), _) => "FAIL",
+                    },
+                    outcome.stem,
+                    outcome.elapsed.as_secs_f64()
+                );
+                if let Err(error) = outcome.result {
+                    failures.push(error);
+                }
+            }
+            if files.len() > 1 {
+                println!(
+                    "{} of {} cases passed",
+                    files.len() - failures.len(),
+                    files.len()
+                );
+            }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(failures.join("\n"))
+            }
         }
     }
 }

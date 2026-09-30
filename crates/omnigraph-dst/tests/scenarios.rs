@@ -2480,9 +2480,220 @@ fn dst_branch_recreation_reads_ignore_same_name_retired_history() {
     );
 }
 
-/// The counting-pass golden: one universe's storage actions per op kind and
-/// realm-verb, replayed identically, then compared with `cost_table.txt`
-/// (regen with DST_REGEN_COSTS=1); every changed line is a named cost change.
+fn merge_history_cost_rows(replay: &str) -> String {
+    struct MergeHistoryCost {
+        target_commits: u64,
+        merge_back: bool,
+        label: &'static str,
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for MergeHistoryCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_merge_setup");
+            let settings = SessionSettings::default()
+                .with("merge_lineage", "on")
+                .unwrap();
+            let db = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::init_with_storage(
+                        &resources.root,
+                        TEST_SCHEMA,
+                        resources.adapter.clone(),
+                        InitOptions::default(),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+                settings,
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            db.branch_create("feature").await.unwrap();
+            db.mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "set_age",
+                &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
+            )
+            .await
+            .unwrap();
+            for revision in 0..self.target_commits {
+                db.mutate(
+                    "main",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(
+                        &[("$name", "Bob")],
+                        &[("$age", 26 + i64::try_from(revision % 2).unwrap())],
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+            if self.merge_back {
+                assert_eq!(
+                    db.branch_merge("feature", "main").await.unwrap(),
+                    omnigraph::db::MergeOutcome::Merged
+                );
+                db.mutate(
+                    "feature",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", "Alice")], &[("$age", 32)]),
+                )
+                .await
+                .unwrap();
+            }
+            let detached = db.detach();
+            let db = detached.attach(Arc::new(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            ));
+            let (source, target) = if self.merge_back {
+                ("main", "feature")
+            } else {
+                ("feature", "main")
+            };
+            let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+            omnigraph_dst::cost::set_label(self.label);
+            let outcome = omnigraph::instrumentation::with_merge_write_probes(
+                probes.clone(),
+                db.branch_merge(source, target),
+            )
+            .await;
+            omnigraph_dst::cost::set_label("_merge_verify");
+            assert_eq!(outcome.unwrap(), omnigraph::db::MergeOutcome::Merged);
+            assert_eq!(probes.completed_full_walk_classification_calls(), 0);
+            assert_eq!(probes.completed_lineage_classification_calls(), 1);
+            assert_eq!(person_rows_on(&db, target).await.len(), 4);
+        }
+    }
+
+    let mut rows = String::new();
+    for (target_commits, merge_back, label) in [
+        (2, false, "MergeTargetHistory2"),
+        (32, false, "MergeTargetHistory32"),
+        (2, true, "MergeBackAfterThreeWay"),
+    ] {
+        rows.push_str(&labeled_cost_rows(
+            format!("shared-memory://dst-merge-cost-{replay}-{label}"),
+            &MergeHistoryCost {
+                target_commits,
+                merge_back,
+                label,
+            },
+            label,
+        ));
+    }
+    rows
+}
+
+fn labeled_cost_rows<S>(root: String, scenario: &S, label: &str) -> String
+where
+    S: omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage, Output = ()>,
+{
+    omnigraph_dst::lance_faults::install();
+    let environment = omnigraph_dst::memory::MemoryEnvironment::new(
+        root,
+        24_901,
+        omnigraph_dst::UniverseProcess::Shared,
+    );
+    let ledger = omnigraph_dst::cost::arm();
+    let run = omnigraph_dst::run_universe(&environment, scenario);
+    let table = ledger.render_calls();
+    omnigraph_dst::cost::disarm();
+    run.cleanup.unwrap().unwrap();
+    run.result.unwrap().unwrap();
+    let mut rows = String::new();
+    let mut physical_reads = 0;
+    for line in table.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields[0] != label {
+            continue;
+        }
+        if fields[1] == "l.get" {
+            physical_reads = fields[2]
+                .strip_prefix("calls=")
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+        }
+        rows.push_str(line);
+        rows.push('\n');
+    }
+    assert!(
+        physical_reads > 0,
+        "{label} must reach the physical read meter: {table}"
+    );
+    rows
+}
+
+fn branch_write_cost_rows(replay: &str) -> String {
+    struct BranchWriteCost;
+
+    impl BranchWriteCost {
+        async fn set_age(db: &Session, age: i64) {
+            db.mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "set_age",
+                &mixed_params(&[("$name", "Alice")], &[("$age", age)]),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for BranchWriteCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_branch_write_setup");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            db.branch_create("feature").await.unwrap();
+            Self::set_age(&db, 31).await;
+            Self::set_age(&db, 32).await;
+            omnigraph_dst::cost::set_label("BranchWrite");
+            Self::set_age(&db, 33).await;
+            omnigraph_dst::cost::set_label("_branch_write_verify");
+            let alice = person_rows_on(&db, "feature")
+                .await
+                .into_iter()
+                .find(|(name, _, _)| name == "Alice")
+                .unwrap();
+            assert_eq!(alice.1, 33);
+        }
+    }
+
+    labeled_cost_rows(
+        format!("shared-memory://dst-branch-write-cost-{replay}"),
+        &BranchWriteCost,
+        "BranchWrite",
+    )
+}
+
+/// Storage calls per op kind plus reopened merge-history scenarios, replayed
+/// identically and compared with `cost_table.txt` (DST_REGEN_COSTS=1 to regen).
 #[test]
 #[serial]
 fn dst_bench_cost_count_golden() {
@@ -2494,13 +2705,17 @@ fn dst_bench_cost_count_golden() {
     };
     let ledger = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-a", &sc);
-    let table = ledger.render_calls();
+    let mut table = ledger.render_calls();
     let full = ledger.render();
     omnigraph_dst::cost::disarm();
+    table.push_str(&merge_history_cost_rows("a"));
+    table.push_str(&branch_write_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
-    let table2 = ledger2.render_calls();
+    let mut table2 = ledger2.render_calls();
     omnigraph_dst::cost::disarm();
+    table2.push_str(&merge_history_cost_rows("b"));
+    table2.push_str(&branch_write_cost_rows("b"));
     assert_eq!(
         table, table2,
         "the counting pass must replay identically before any golden claim"
@@ -4581,6 +4796,7 @@ fn dst_concurrent_two_writers_first_contact() {
             writers: 2,
             ops_per_writer: 12,
             maintenance_ops: 0,
+            schema_ops: 0,
             kill_writer: None,
             branch_cycles: 0,
             readers: 0,
@@ -4630,6 +4846,7 @@ fn dst_concurrent_contention_hunt() {
             writers: 4,
             ops_per_writer: 20,
             maintenance_ops: 0,
+            schema_ops: 0,
             kill_writer: None,
             branch_cycles: 0,
             readers: 0,
@@ -4669,6 +4886,7 @@ fn dst_maintenance_actor_first_contact() {
             writers: 2,
             ops_per_writer: 12,
             maintenance_ops: 8,
+            schema_ops: 0,
             kill_writer: None,
             branch_cycles: 0,
             readers: 0,
@@ -4698,6 +4916,128 @@ fn dst_maintenance_actor_first_contact() {
     }
 }
 
+/// Schema apply racing live writers — the deterministic coverage the
+/// shared/exclusive schema gate ships with (RFC 2026-09-18-shared-schema-gate;
+/// before it, writers-racing-apply had NO DST coverage). A dedicated schema
+/// actor performs monotone additive applies (each takes the gate's EXCLUSIVE
+/// side, draining every writer's shared permit) while two data writers race
+/// under shared permits. Oracles: every writer claim commits (no wedge under
+/// schema contention), every apply commits (writers cannot starve the
+/// exclusive side), each apply lands exactly one empty-person-diff era
+/// commit, and — in every seed — the writers genuinely interleaved
+/// (`alternations` ≥ 1) and at least one apply landed between two writer
+/// commits (`era_commits_between_data` ≥ 1); otherwise the green is
+/// vacuous. Plain mode only:
+/// an apply's table rewrite runs on the single `lance-cpu` pool thread,
+/// which the seam arbiter deliberately cannot see, so under the seam
+/// scheduler its stall budget trips on a loaded machine (measured: 0, 4,
+/// 12, 18 or 27 escapes across runs of one seed). The strict-replay claim
+/// for this arm (`sched_escapes == 0`) is therefore the hunt's, run
+/// explicitly on an idle machine; the permits' turn/epoch protocol itself
+/// is pinned by `dst_seam_scheduler_bite_and_replay`.
+#[test]
+#[serial]
+fn dst_schema_apply_racing_writers_first_contact() {
+    use omnigraph_dst::concurrent::{ConcurrentScenario, run_concurrent_universe};
+    for seed in dst_seeds(&[24_301, 24_302, 24_303]) {
+        let root = format!("shared-memory://dst-s24-schema-{seed}");
+        let sc = ConcurrentScenario {
+            seed,
+            writers: 2,
+            ops_per_writer: 12,
+            maintenance_ops: 0,
+            schema_ops: 3,
+            kill_writer: None,
+            branch_cycles: 0,
+            readers: 1,
+            writer_fault_pct: 0,
+            seam_schedule: false,
+            park_deleter_hold: false,
+        };
+        let report = run_concurrent_universe(&root, &sc);
+        assert_eq!(
+            report.committed, 24,
+            "every data write must commit despite schema contention"
+        );
+        assert_eq!(
+            report.schema_committed, 3,
+            "every schema apply must commit; writers cannot starve the exclusive side"
+        );
+        assert_eq!(
+            report.maintenance_commits, 3,
+            "each apply lands exactly one empty-person-diff era commit"
+        );
+        assert!(
+            report.alternations >= 1,
+            "seed {seed}: the writers never interleaved — a vacuous green for the \
+             concurrency claim"
+        );
+        assert!(
+            report.era_commits_between_data >= 1,
+            "seed {seed}: no schema apply landed between two writer commits — the \
+             applies never contended with the writers"
+        );
+        println!(
+            "dst s24 schema [seed={seed}]: committed={} occ_retries={} \
+             schema(committed={} retries={}) alternations={} applies_between_writes={}",
+            report.committed,
+            report.occ_retries,
+            report.schema_committed,
+            report.schema_retries,
+            report.alternations,
+            report.era_commits_between_data
+        );
+    }
+}
+
+/// The schema-arm hunt instrument: wider seeds, scheduler on, faults on —
+/// run explicitly when hunting interleavings around the shared/exclusive
+/// boundary (`OMNIGRAPH_DST_SEEDS` widens the search). No readers: a reader
+/// opens read-only handles, which take the schema gate's exclusive side with
+/// no arbiter hook, so their gate transitions would fall outside the turns
+/// that `sched_escapes == 0` certifies.
+#[test]
+#[serial]
+#[ignore = "hunt: schema-apply-vs-writers interleaving search — run explicitly"]
+fn dst_schema_apply_racing_writers_hunt() {
+    use omnigraph_dst::concurrent::{ConcurrentScenario, run_concurrent_universe};
+    // 24_304 is the first-contact scenario's own shape under the scheduler
+    // (see the pin for why strict replay is a hunt claim for this arm).
+    for seed in dst_seeds(&[
+        24_304, 24_310, 24_311, 24_312, 24_313, 24_314, 24_315, 24_316, 24_317,
+    ]) {
+        let root = format!("shared-memory://dst-s24-schema-hunt-{seed}");
+        let sc = ConcurrentScenario {
+            seed,
+            writers: 3,
+            ops_per_writer: 10,
+            maintenance_ops: 0,
+            schema_ops: 4,
+            kill_writer: None,
+            branch_cycles: 0,
+            readers: 0,
+            writer_fault_pct: 10,
+            seam_schedule: true,
+            park_deleter_hold: false,
+        };
+        let report = run_concurrent_universe(&root, &sc);
+        assert_eq!(report.committed, 30);
+        assert_eq!(report.schema_committed, 4);
+        assert_eq!(report.sched_escapes, 0, "strict replay must hold");
+        println!(
+            "dst s24 schema-hunt [seed={seed}]: committed={} schema(committed={} \
+             retries={}) faults={} alternations={} sched(turns={} escapes={})",
+            report.committed,
+            report.schema_committed,
+            report.schema_retries,
+            report.writer_faults_injected,
+            report.alternations,
+            report.sched_turns,
+            report.sched_escapes
+        );
+    }
+}
+
 /// ARM 2 — crash one writer mid-op while the other keeps racing:
 /// writer 0's adapter-realm storage dies at its k-th write-class call
 /// (post-mortem refusal, no revive — the one-participant process-death
@@ -4719,6 +5059,7 @@ fn dst_crash_one_writer_first_contact() {
             writers: 2,
             ops_per_writer: 12,
             maintenance_ops: 0,
+            schema_ops: 0,
             kill_writer: Some((0, kill_at)),
             branch_cycles: 0,
             readers: 0,
@@ -4772,6 +5113,7 @@ fn dst_branch_actor_first_contact() {
             writers: 2,
             ops_per_writer: 12,
             maintenance_ops: 0,
+            schema_ops: 0,
             kill_writer: None,
             branch_cycles: 4,
             readers: 0,
@@ -4821,6 +5163,7 @@ fn dst_concurrent_fleet() {
             writers: 3,
             ops_per_writer: 10,
             maintenance_ops: 0,
+            schema_ops: 0,
             kill_writer: None,
             branch_cycles: 0,
             // Readers in EVERY fleet arm — live differential reads during
@@ -4830,8 +5173,26 @@ fn dst_concurrent_fleet() {
             seam_schedule: seam,
             park_deleter_hold: false,
         };
-        let arms: [(&str, ConcurrentScenario); 6] = [
+        let arms: [(&str, ConcurrentScenario); 8] = [
             ("race", base.clone()),
+            // Schema arms: plain mode only (the first-contact pin says why).
+            (
+                "schema",
+                ConcurrentScenario {
+                    schema_ops: 3,
+                    seam_schedule: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "schema+maint",
+                ConcurrentScenario {
+                    schema_ops: 3,
+                    maintenance_ops: 4,
+                    seam_schedule: false,
+                    ..base.clone()
+                },
+            ),
             (
                 "maint",
                 ConcurrentScenario {
@@ -4842,6 +5203,7 @@ fn dst_concurrent_fleet() {
             (
                 "crash",
                 ConcurrentScenario {
+                    schema_ops: 0,
                     kill_writer: Some((0, 7 + (seed as usize % 17))),
                     ..base.clone()
                 },
@@ -4915,6 +5277,7 @@ fn dst_seam_scheduler_bite_and_replay() {
         writers: 2,
         ops_per_writer: 8,
         maintenance_ops: 0,
+        schema_ops: 0,
         kill_writer: None,
         branch_cycles: 0,
         readers: 0,
@@ -5016,6 +5379,7 @@ fn dst_optimize_races_branch_delete() {
             writers: 3,
             ops_per_writer: 10,
             maintenance_ops: 4,
+            schema_ops: 0,
             kill_writer: None,
             branch_cycles: 3,
             readers: 0,
@@ -5084,6 +5448,7 @@ fn dst_optimize_races_branch_delete_seed_search() {
             writers: 2,
             ops_per_writer: 6,
             maintenance_ops: 0,
+            schema_ops: 0,
             kill_writer: None,
             branch_cycles: 3,
             readers: 0,
@@ -5180,6 +5545,7 @@ fn dst_optimize_races_branch_delete_directed_hold() {
             writers: 2,
             ops_per_writer: 6,
             maintenance_ops: 0,
+            schema_ops: 0,
             kill_writer: None,
             branch_cycles: 3,
             readers: 0,

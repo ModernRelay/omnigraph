@@ -1,0 +1,40 @@
+# issue: none
+# notes: Distinct BM25 scores (one, two and three "tensor" terms) rank descending. The id
+# notes: tie-break order n1, n2, n3 is the reverse of score order, so a broken score sort cannot
+# notes: pass. Replaces the Rust test bm25_distinct_scores_rank_descending (search.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Note {
+    slug: String @key
+    body: String @index
+}
+
+--- seed
+{"type":"Note","data":{"slug":"n1","body":"tensor"}}
+{"type":"Note","data":{"slug":"n2","body":"tensor tensor"}}
+{"type":"Note","data":{"slug":"n3","body":"tensor tensor tensor"}}
+
+--- query
+query bm25_ranked($q: String) {
+    match { $n: Note }
+    return { $n.slug }
+    order { bm25($n.body, $q) }
+    limit 3
+}
+
+--- params
+{"q": "tensor"}
+
+--- expect ordered
+{"n.slug": "n3"}
+{"n.slug": "n2"}
+{"n.slug": "n1"}
+
+--- expect shape
+n.slug: String

@@ -71,13 +71,12 @@ use context::QueryContext;
 pub(crate) use explain::{explain_document, explain_rows};
 pub(crate) use graph::{EmbeddingResolver, GraphIndexHandle};
 use lower::Lowering;
-pub(crate) use operators::{SubqueryAggregate, absorb_inner_batches};
 use plan_source::{ExplainedQuery, QuerySource, explain_query, plan_query};
 pub(crate) use report::{Executed, PlanRun};
 use report::{ExecutionReport, ReportRow};
 use run::{pass_rows, run_plan};
 pub(crate) use scan::{id_in_list_expr, ir_expr_to_df_expr};
-pub(crate) use search::referenced_edge_types;
+pub(crate) use search::{check_param_date_literals, referenced_edge_types};
 
 /// What `execute` takes beside the bound plan, each member data and not a
 /// decision: the read-consistency unit, the type metadata the lowered

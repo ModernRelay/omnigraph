@@ -161,6 +161,36 @@ async fn failed_mutation_leaves_target_unchanged() {
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
 }
 
+/// Mutation text the parser refuses keeps its diagnostic through the engine
+/// door, as read text does: the code and the position survive, and nothing
+/// is published.
+#[tokio::test]
+async fn refused_mutation_text_keeps_its_parse_diagnostic() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let head = head_commit_id(uri).await;
+
+    let err = db
+        .mutate(
+            "main",
+            "query add() { insert Person { name \"Zed\" } }",
+            "add",
+            &params(&[]),
+        )
+        .await
+        .unwrap_err();
+    let diagnostic = err
+        .diagnostic()
+        .unwrap_or_else(|| panic!("a parse refusal carries its diagnostic: {err}"));
+    assert_eq!(diagnostic.code.as_str(), "Q001");
+    // The refused assignment starts at `name`, where the parser reports it.
+    let position = diagnostic.position.expect("a parse refusal has a position");
+    assert_eq!((position.line, position.column), (1, 31));
+
+    assert_eq!(head_commit_id(uri).await, head);
+}
+
 /// Multi-statement mutations are atomic at the query boundary. The
 /// `insert_person_and_friend` query inserts a person and an edge that
 /// references it; both must land together (read-your-writes within the

@@ -62,11 +62,12 @@ use super::commit_graph::GraphCommit;
 use super::manifest::{GenesisManifestAttempt, ManifestChange, TableRegistration, TableTombstone};
 use super::schema_state::{
     SCHEMA_SOURCE_FILENAME, SchemaContractText, SchemaStagingPolicy, SchemaStateRecovery,
-    load_validated_schema_contract, load_validated_schema_contract_for_source,
-    read_accepted_schema_ir, read_schema_contract_text, read_schema_contract_text_for_source,
-    read_schema_state_identity, recover_schema_state_files, render_schema_contract, schema_ir_uri,
-    schema_source_staging_uri, schema_source_uri, schema_state_uri, validate_schema_contract,
-    validate_schema_contract_text, validate_schema_ir_against_snapshot, write_schema_contract,
+    StagedContract, inspect_staged_contract, load_validated_schema_contract,
+    load_validated_schema_contract_for_source, read_accepted_schema_ir, read_schema_contract_text,
+    read_schema_contract_text_for_source, read_schema_state_identity, recover_schema_state_files,
+    render_schema_contract, schema_ir_uri, schema_source_staging_uri, schema_source_uri,
+    schema_state_uri, validate_schema_contract, validate_schema_contract_text,
+    validate_schema_ir_against_snapshot, write_schema_contract,
 };
 use super::snapshot::Snapshot;
 use super::{
@@ -160,11 +161,9 @@ pub(crate) struct WriteTxn {
     /// forked named branch whose materialized `graph_head:<branch>` row is
     /// intentionally absent.
     pub(crate) effective_graph_head: Option<String>,
-    /// Optional caller compare-and-swap token for this mutation attempt.
-    /// Unlike the internal authority token, a mismatch is terminal and must
-    /// surface as `PreconditionFailed`; it is re-evaluated from fresh authority
-    /// under the pre-effect gates so update/delete behavior cannot depend on
-    /// the engine's internal reprepare policy.
+    /// Optional caller compare-and-swap token for this mutation attempt. Unlike
+    /// the internal authority token, a mismatch is terminal (`PreconditionFailed`),
+    /// judged against the revalidated authority under the pre-effect gates.
     pub(crate) caller_expected_graph_head: Option<String>,
     /// Catalog built from the exact accepted IR whose identity is recorded in
     /// `authority`. Mutation/load planning and validation must use this snapshot,
@@ -172,10 +171,10 @@ pub(crate) struct WriteTxn {
     /// another long-lived handle.
     pub(crate) catalog: Arc<Catalog>,
     /// Cheap freshness probe retained from the exact manifest handle that
-    /// supplied `base` and `authority`. It is not publish authority: merge uses
-    /// it only to prove the captured view is still current and falls back to a
-    /// full coherent capture on mismatch. The publisher still performs its own
-    /// fresh CAS read.
+    /// supplied `base` and `authority`. It is not publish authority: merge and
+    /// write revalidation use it only to prove the captured view is still
+    /// current and fall back to a full coherent capture on mismatch. The
+    /// publisher still performs its own fresh CAS read.
     pub(crate) manifest_probe: crate::db::manifest::CapturedManifestProbe,
 }
 
@@ -731,9 +730,7 @@ impl Omnigraph {
         let storage = storage_for_uri(&root)?;
         let identity = write_queue_root_identity(&root)?;
         let queues = crate::db::write_queue::WriteQueueManager::for_root(&identity);
-        let _schema_gate = queues
-            .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
-            .await;
+        let _schema_gate = queues.acquire_schema_shared().await;
         crate::db::upgrade::legacy_sidecars::refuse_pending_recovery(&root, storage.as_ref()).await
     }
 
@@ -787,9 +784,7 @@ impl Omnigraph {
         // Hold the same schema gate through format preflight and contract
         // capture. A v3 live or staged IR must refuse before the local write
         // probe, coordinator open, or the staged-contract pass can change files.
-        let schema_contract_guard = write_queue
-            .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
-            .await;
+        let schema_contract_guard = write_queue.acquire_schema_exclusive().await;
         crate::db::schema_state::refuse_unsupported_schema_versions(&root, storage.as_ref())
             .await?;
         // Read-write opens write before the first user mutation (the
@@ -835,7 +830,7 @@ impl Omnigraph {
             .await?;
             // A staged schema contract names the graph commit that publishes
             // it: install it when that commit is in lineage, discard it
-            // otherwise. The caller holds the shared schema gate.
+            // otherwise. The caller holds the exclusive schema permit.
             recover_schema_state_files(
                 &root,
                 Arc::clone(&storage),
@@ -1068,15 +1063,11 @@ impl Omnigraph {
             .map_err(|err| OmniError::Policy(err.to_string()))
     }
 
+    /// Validates on every call, so a long-lived handle sees external drift of
+    /// the schema source, IR or state (`lifecycle::long_lived_handle_rejects_schema_*`).
     pub(crate) async fn ensure_schema_state_valid(
         &self,
     ) -> Result<crate::db::schema_state::SchemaState> {
-        // Full per-call validation is intentional: a long-lived handle must
-        // detect external drift of the schema source, IR, OR state on its next
-        // operation (see lifecycle::long_lived_handle_rejects_schema_* tests). A
-        // source-only fast path would miss IR/state drift when _schema.pg is
-        // unchanged, so the only safe latency win is not calling this twice per
-        // query (finding A removes the redundant caller in exec/query.rs).
         validate_schema_contract(self.uri(), Arc::clone(&self.storage)).await
     }
 
@@ -1087,8 +1078,8 @@ impl Omnigraph {
     /// validating the files does not make `self.catalog()` current after another
     /// handle applies a schema. Control/legacy-adapter bridges use this capture
     /// for planning and conservative table-gate enumeration. The caller MUST
-    /// already hold `schema_apply_serial_queue_key`; this helper does not acquire
-    /// it because the gate is a non-reentrant mutex.
+    /// already hold a schema permit (either side); this helper does not acquire
+    /// one because the gate is non-reentrant on one task.
     pub(crate) async fn load_accepted_catalog_with_schema_gate_held(&self) -> Result<Arc<Catalog>> {
         let catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
         let snapshot = self.coordinator.read().await.snapshot();
@@ -1224,6 +1215,10 @@ impl Omnigraph {
         schema_apply::ensure_schema_apply_not_locked(self, operation).await
     }
 
+    pub(crate) async fn schema_apply_sentinel_present(&self) -> Result<bool> {
+        schema_apply::schema_apply_sentinel_present(self).await
+    }
+
     /// Engine-facing trait surface around `TableStore`.
     ///
     /// This is the **only** accessor for engine code reaching into the
@@ -1345,8 +1340,9 @@ impl Omnigraph {
     /// contract ONCE and pin the base snapshot. The per-table opens take
     /// `Option<&WriteTxn>` and, on the bound branch for the non-strict (Insert/Merge)
     /// path, source the pinned base entry — instead of re-resolving (re-validating the
-    /// schema) per table. Strict ops, the fork path, and the commit-time OCC re-read
-    /// keep their fresh reads (those are correctness machinery — see the handoff doc).
+    /// schema) per table. Strict ops, the fork path, and the commit-time revalidation
+    /// keep their own reads: `revalidate_write_txn` probes the manifest and reopens the
+    /// branch only on a mismatch (correctness machinery — see the handoff doc).
     ///
     /// "Once" covers the table-touch hot path captured here (the cost gate permits
     /// one marker read plus one validation at pre-effect revalidation); it does
@@ -1363,7 +1359,29 @@ impl Omnigraph {
         const MAX_CAPTURE_RETRIES: usize = 8;
         let branch = normalize_branch_name(branch.unwrap_or("main"))?;
 
-        for _ in 0..MAX_CAPTURE_RETRIES {
+        let mut captures = 0;
+        loop {
+            // A standing sentinel under a busy gate is an apply in this
+            // process: park on the shared side, then recapture under the
+            // promoted contract. Under a free gate it is another process's
+            // apply, or a dead one: the typed refusal, once a second listing
+            // confirms it (RFC 2026-09-18-shared-schema-gate).
+            if self.schema_apply_sentinel_present().await? {
+                match self.write_queue().try_acquire_schema_shared() {
+                    Some(free) => {
+                        drop(free);
+                        self.ensure_schema_apply_not_locked("write preparation")
+                            .await?;
+                    }
+                    None => drop(self.write_queue().acquire_schema_shared().await),
+                }
+                tokio::task::yield_now().await;
+                continue;
+            }
+            captures += 1;
+            if captures > MAX_CAPTURE_RETRIES {
+                break;
+            }
             // A schema apply publishes graph_head before promoting its staged
             // contract. Read one fully validated IR/catalog, capture coherent
             // manifest authority, then re-read the durable schema marker (the
@@ -1371,8 +1389,6 @@ impl Omnigraph {
             // only (old head, old schema) or (new head, new schema), never the
             // intermediate (new head, old schema) state, without paying for a
             // second full schema parse during capture.
-            self.ensure_schema_apply_not_locked("write preparation")
-                .await?;
             let (schema_ir, schema_state) =
                 load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
             let (branch_identifier, graph_head, effective_graph_head, snapshot, manifest_probe) =
@@ -1828,9 +1844,26 @@ impl Omnigraph {
         // Recheck the durable sentinel inside that critical section so a schema
         // apply observed after preparation cannot be followed by a table effect.
         self.ensure_schema_apply_not_locked("write commit").await?;
-        let (branch_identifier, graph_head, effective_graph_head, snapshot, _) = self
-            .write_authority_for_known_branch(txn.branch.as_deref(), true)
-            .await?;
+        let bound = txn.branch.as_deref() == self.coordinator.read().await.current_branch();
+        let (branch_identifier, graph_head, effective_graph_head, snapshot) =
+            if !bound && txn.manifest_probe.is_current().await? {
+                (
+                    txn.authority.branch_identifier.clone(),
+                    txn.authority.graph_head.clone(),
+                    txn.effective_graph_head.clone(),
+                    txn.base.clone(),
+                )
+            } else {
+                let (branch_identifier, graph_head, effective_graph_head, snapshot, _) = self
+                    .write_authority_for_known_branch(txn.branch.as_deref(), true)
+                    .await?;
+                (
+                    branch_identifier,
+                    graph_head,
+                    effective_graph_head,
+                    snapshot,
+                )
+            };
         let (schema_ir, schema_state) =
             load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
         self.ensure_schema_apply_not_locked("write commit").await?;
@@ -1991,10 +2024,7 @@ impl Omnigraph {
         // authority window. This also
         // captures the schema contract and target coordinator coherently across
         // a concurrent schema apply. Lock order remains schema -> coordinator.
-        let _schema_guard = self
-            .write_queue()
-            .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
-            .await;
+        let _schema_permit = self.write_queue().acquire_schema_exclusive().await;
         let (schema_ir, _) =
             load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
         let branch = normalize_branch_name(branch)?;
@@ -2040,10 +2070,7 @@ impl Omnigraph {
             // `reload_schema_if_source_changed` takes the coordinator read
             // lock, and Tokio's RwLock is not reentrant. Pinned by
             // `composite_flow_schema_apply_then_branch_ops_no_deadlock_in_refresh`.
-            let _serial = self
-                .write_queue
-                .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
-                .await;
+            let _serial = self.write_queue.acquire_schema_exclusive().await;
             let mut coord = self.coordinator.write().await;
             coord.refresh().await?;
             let outcome = recover_schema_state_files(
@@ -2111,10 +2138,7 @@ impl Omnigraph {
             return Ok(());
         }
         let result = {
-            let _serial = self
-                .write_queue
-                .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
-                .await;
+            let _serial = self.write_queue.acquire_schema_exclusive().await;
             let snapshot = self.coordinator.read().await.snapshot();
             recover_schema_state_files(
                 &self.root_uri,
@@ -2145,10 +2169,7 @@ impl Omnigraph {
         // across the complete source/IR/state read and ArcSwap publication so a
         // concurrent apply cannot interleave its sequential file promotions
         // with this reload.
-        let _schema_guard = self
-            .write_queue
-            .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
-            .await;
+        let _schema_permit = self.write_queue.acquire_schema_exclusive().await;
         fail(&SCHEMA_RELOAD_BEFORE_CONTRACT_READ)?;
         let schema_path = schema_source_uri(&self.root_uri);
         let schema_source = self.storage.read_text(&schema_path).await?;
@@ -2191,6 +2212,28 @@ impl Omnigraph {
     pub(crate) async fn refresh_coordinator_only(&self) -> Result<()> {
         self.coordinator.write().await.refresh().await?;
         self.invalidate_read_caches().await;
+        Ok(())
+    }
+
+    /// The reprepare refresh: a write whose authority moved recaptures from
+    /// the coordinator alone, and takes the contract-lifecycle pass of
+    /// [`refresh`](Self::refresh) only when a published staging is waiting
+    /// to be installed. `open_write_txn` reads the accepted contract from
+    /// the store on every capture, so the schema view and the `PromoteOnly`
+    /// pass add nothing to an ordinary reprepare; taking their exclusive
+    /// permit there made every same-branch reprepare a process-wide barrier
+    /// (RFC 2026-09-18-shared-schema-gate, 2026-09-29 entry).
+    pub(crate) async fn refresh_for_reprepare(&self) -> Result<()> {
+        self.refresh_coordinator_only().await?;
+        if matches!(
+            inspect_staged_contract(&self.root_uri, self.storage.as_ref(), false).await?,
+            StagedContract::Marked {
+                published: true,
+                ..
+            }
+        ) {
+            self.refresh().await?;
+        }
         Ok(())
     }
 
@@ -2256,10 +2299,7 @@ impl Omnigraph {
         let target = target.into();
         let validate_live_snapshot = matches!(&target, ReadTarget::Branch(_));
         let bind_historical_aliases = matches!(&target, ReadTarget::Snapshot(_));
-        let _schema_guard = self
-            .write_queue()
-            .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
-            .await;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await;
         let catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
         let mut resolved = self.resolve_target_after_schema_validation(target).await?;
         if validate_live_snapshot {
@@ -2277,10 +2317,7 @@ impl Omnigraph {
     }
 
     pub(crate) async fn capture_current_read_view(&self) -> Result<(ResolvedTarget, Arc<Catalog>)> {
-        let _schema_guard = self
-            .write_queue()
-            .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
-            .await;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await;
         let current_branch = self
             .coordinator
             .read()
@@ -2300,10 +2337,7 @@ impl Omnigraph {
         &self,
         version: u64,
     ) -> Result<(Snapshot, Arc<Catalog>)> {
-        let _schema_guard = self
-            .write_queue()
-            .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
-            .await;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await;
         let catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
         let branch = self
             .coordinator
@@ -3030,10 +3064,7 @@ impl Omnigraph {
         let source = self.active_branch().await;
         self.settle_pending_schema_install().await?;
         fail(&BRANCH_CONTROL_PRE_GATES)?;
-        let _schema_guard = self
-            .write_queue()
-            .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
-            .await;
+        let _schema_permit = self.write_queue().acquire_schema_exclusive().await;
         let _branch_guards = self
             .write_queue()
             .acquire_branches(&[source.clone(), Some(target.clone())])
@@ -3116,10 +3147,7 @@ impl Omnigraph {
         self.ensure_schema_state_valid().await?;
         self.settle_pending_schema_install().await?;
         fail(&BRANCH_CONTROL_PRE_GATES)?;
-        let _schema_guard = self
-            .write_queue()
-            .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
-            .await;
+        let _schema_permit = self.write_queue().acquire_schema_exclusive().await;
         let _branch_guards = self
             .write_queue()
             .acquire_branches(&[branch.clone(), Some(target_branch.clone())])
@@ -3179,10 +3207,7 @@ impl Omnigraph {
         self.ensure_schema_state_valid().await?;
         self.settle_pending_schema_install().await?;
         fail(&BRANCH_CONTROL_PRE_GATES)?;
-        let _schema_guard = self
-            .write_queue()
-            .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
-            .await;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await;
         let _branch_guard = self.write_queue().acquire_branch(Some(&branch)).await;
         // Purge only after taking the branch gate. Merge capture takes the
         // same branch-gate -> cache-lock order, so no later insert for this

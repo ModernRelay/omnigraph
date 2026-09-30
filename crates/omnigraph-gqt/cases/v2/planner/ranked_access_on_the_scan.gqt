@@ -60,6 +60,24 @@ scan Doc as $d: ranked nearest fetch 2
 
 --- query
 set engine = v2;
+query by_vector_among_members($q: Vector(4), $members: [String]) {
+    match { $d: Doc $d.slug in $members }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 1
+}
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0], "members": ["d002", "d003"]}
+--- expect ordered
+{"d.slug":"d002"}
+--- expect shape
+d.slug: String
+--- expect plan
+scan Doc as $d: ranked nearest fetch 1
+scan Doc as $d: filter reads [d.slug]
+
+--- query
+set engine = v2;
 query fused($q: Vector(4), $t: String) {
     match { $d: Doc }
     return { $d.slug }
