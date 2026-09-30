@@ -8,7 +8,7 @@ authors:
   - OmniGraph maintainers
 created: 2026-09-30
 updated: 2026-09-30
-discussion: null
+discussion: https://github.com/ModernRelay/omnigraph/pull/814
 supersedes: []
 superseded_by: []
 blocked_on: []
