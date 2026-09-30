@@ -1965,6 +1965,125 @@ async fn cross_branch_writers_overlap_inside_schema_gate() {
     );
 }
 
+/// Create `source` and `target` from main and give each its own insert, so a
+/// merge between them is three-way and reaches its manifest commit.
+async fn diverged_merge_pair(db: &helpers::Session, source: &str, target: &str) {
+    db.branch_create(source).await.unwrap();
+    db.branch_create(target).await.unwrap();
+    for (branch, age) in [(source, 51), (target, 52)] {
+        db.mutate(
+            branch,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", &format!("On-{branch}"))], &[("$age", age)]),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+/// Issue 643: merges into independent targets overlap. Merge A parks after
+/// its table effects, before its manifest commit, holding the shared schema
+/// permit and its own source and target branch gates; merge B between two
+/// other branches must run to completion meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn independent_target_merges_overlap_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s1", "t1").await;
+    diverged_merge_pair(&db, "s2", "t2").await;
+    let db = std::sync::Arc::new(db);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let merge_a_db = std::sync::Arc::clone(&db);
+    let merge_a = tokio::spawn(async move { merge_a_db.branch_merge("s1", "t1").await });
+    parked.wait_until_reached().await;
+
+    let merge_b_db = std::sync::Arc::clone(&db);
+    let merge_b = tokio::spawn(async move { merge_b_db.branch_merge("s2", "t2").await });
+    let merged_b = tokio::time::timeout(std::time::Duration::from_secs(10), merge_b)
+        .await
+        .expect("a merge into another target must complete while A is parked")
+        .unwrap()
+        .expect("B must merge");
+    assert_eq!(merged_b, omnigraph::db::MergeOutcome::Merged);
+    assert!(
+        !merge_a.is_finished(),
+        "A must still be parked before its manifest commit while B published"
+    );
+
+    parked.release();
+    assert_eq!(
+        merge_a.await.unwrap().expect("A must merge after release"),
+        omnigraph::db::MergeOutcome::Merged
+    );
+    for target in ["t1", "t2"] {
+        assert_eq!(
+            helpers::count_rows_branch(&db, target, "node:Person").await,
+            6,
+            "{target} holds the seed rows, its own insert and its source's"
+        );
+    }
+}
+
+/// Issue 643: merges into the same target stay serialized. With merge A
+/// parked before its manifest commit, holding the target's branch gate, a
+/// second merge into that target must wait; once A publishes, B merges on
+/// top of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn same_target_merges_serialize_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s1", "t").await;
+    db.branch_create("s2").await.unwrap();
+    db.mutate(
+        "s2",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "On-s2")], &[("$age", 53)]),
+    )
+    .await
+    .unwrap();
+    let db = std::sync::Arc::new(db);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let merge_a_db = std::sync::Arc::clone(&db);
+    let merge_a = tokio::spawn(async move { merge_a_db.branch_merge("s1", "t").await });
+    parked.wait_until_reached().await;
+
+    let merge_b_db = std::sync::Arc::clone(&db);
+    let mut merge_b = tokio::spawn(async move { merge_b_db.branch_merge("s2", "t").await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), &mut merge_b)
+            .await
+            .is_err(),
+        "a merge into the same target must wait while A holds that target's gate"
+    );
+
+    parked.release();
+    assert_eq!(
+        merge_a.await.unwrap().expect("A must merge after release"),
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert_eq!(
+        merge_b.await.unwrap().expect("B must merge after A"),
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&db, "t", "node:Person").await,
+        7,
+        "t holds the seed rows, its own insert and both sources' inserts"
+    );
+}
+
 /// Branch create takes the schema gate's EXCLUSIVE side: no CAS covers its
 /// namespace inventory, so a sibling create with disjoint branch gates must
 /// wait at the gate, then refuse on the collision the first leaves behind.
