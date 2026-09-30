@@ -1054,7 +1054,7 @@ impl Omnigraph {
         query_name: &str,
     ) -> Result<omnigraph_compiler::ir::MutationIR> {
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
-            .map_err(|e| OmniError::manifest(e.to_string()))?;
+            .map_err(query_lookup_error)?;
 
         let checked = typecheck_query_decl(catalog, &query_decl)?;
         match checked {

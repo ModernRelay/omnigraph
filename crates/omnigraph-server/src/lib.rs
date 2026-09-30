@@ -459,6 +459,7 @@ enum ApiErrorDetails {
     ChangeFeedGap(api::ChangeFeedGapOutput),
     ChangeDiffRefusal(api::ChangeDiffRefusalOutput),
     FullTextIndexRebuildRequired(api::FullTextIndexRebuildRequiredOutput),
+    Diagnostic(api::DiagnosticOutput),
 }
 
 impl AppState {
@@ -1195,9 +1196,21 @@ impl ApiError {
         }
     }
 
+    /// A refused query: HTTP 400 with the one-line message, plus the
+    /// compiler's structured diagnostic when the refusal carries one.
+    fn from_compiler(err: &omnigraph_compiler::error::CompilerError) -> Self {
+        let mut response = Self::bad_request(err.to_string());
+        if let Some(diagnostic) = err.diagnostic() {
+            response.details = Some(Box::new(ApiErrorDetails::Diagnostic(
+                api::DiagnosticOutput::from(diagnostic),
+            )));
+        }
+        response
+    }
+
     fn from_omni(err: OmniError) -> Self {
         match err {
-            OmniError::Compiler(err) => Self::bad_request(err.to_string()),
+            OmniError::Compiler(err) => Self::from_compiler(&err),
             OmniError::DataFusion(message) => Self::bad_request(format!("query: {message}")),
             OmniError::Manifest(err) => match err.kind {
                 ManifestErrorKind::BadRequest => Self::bad_request(err.message),
@@ -1452,22 +1465,8 @@ impl IntoResponse for ApiError {
                 axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
             );
         }
-        let mut output = ErrorOutput {
-            error: self.message.into(),
-            code: self.code,
-            merge_conflicts: Vec::new(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: None,
-            change_feed_gap: None,
-            change_diff_refusal: None,
-            full_text_index_rebuild_required: None,
-        };
+        let mut output = ErrorOutput::message(self.message);
+        output.code = self.code;
         if let Some(details) = self.details {
             match *details {
                 ApiErrorDetails::MergeConflicts(value) => output.merge_conflicts = value,
@@ -1492,6 +1491,7 @@ impl IntoResponse for ApiError {
                 ApiErrorDetails::FullTextIndexRebuildRequired(value) => {
                     output.full_text_index_rebuild_required = Some(value)
                 }
+                ApiErrorDetails::Diagnostic(value) => output.diagnostic = Some(value),
             }
         }
         (self.status, headers, Json(output)).into_response()
@@ -1540,6 +1540,38 @@ mod api_error_tests {
         let ordinary: ErrorOutput = serde_json::from_slice(&body).unwrap();
         assert_eq!(ordinary.code, Some(ErrorCode::Conflict));
         assert!(ordinary.full_text_index_rebuild_required.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_refused_query_returns_bad_request_with_its_diagnostic() {
+        let err = omnigraph_compiler::query::parser::parse_query("query name {").unwrap_err();
+        let response = ApiError::from_omni(OmniError::Compiler(err)).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, Some(ErrorCode::BadRequest));
+        assert_eq!(
+            error.error,
+            "parse error: expected `(`: a query declares its parameters even when it has none"
+        );
+        let diagnostic = error
+            .diagnostic
+            .expect("a refused query carries its diagnostic");
+        assert_eq!(diagnostic.code, "Q002");
+        assert_eq!(diagnostic.fix.as_deref(), Some("query name()"));
+        let at = diagnostic.position.unwrap();
+        assert_eq!((at.line, at.column), (1, 11));
+        assert!(diagnostic.stage.is_none());
+
+        // An ordinary bad request carries no diagnostic key at all.
+        let response = ApiError::bad_request("no").into_response();
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("diagnostic").is_none());
     }
 
     #[test]

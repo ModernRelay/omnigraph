@@ -1489,6 +1489,105 @@ pub struct FullTextIndexRebuildRequiredOutput {
     pub reason: String,
 }
 
+/// A source position: 1-based line and column (in characters) and the byte
+/// offset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PositionOutput {
+    pub line: u32,
+    pub column: u32,
+    pub byte: u32,
+}
+
+/// Whether a suggested source edit can be applied mechanically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicabilityOutput {
+    MachineApplicable,
+    NeedsReview,
+}
+
+/// A UTF-8 byte range in the original source, with an exclusive end.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TextEditOutput {
+    pub start: usize,
+    pub end: usize,
+    pub replacement: String,
+}
+
+/// Non-overlapping edits against the original request source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SuggestionOutput {
+    pub applicability: ApplicabilityOutput,
+    pub edits: Vec<TextEditOutput>,
+}
+
+/// The diagnostics contract for a refused query (RFC 0047): a stable code
+/// (`Q…` parse, `T…` typecheck); where the failure is, as a source position
+/// or as the stage and expression when it is post-parse; what was expected or
+/// violated; and one concrete fix, absent when `expected` names the decision.
+/// Rides `ErrorOutput.diagnostic` as an additive detail because
+/// [`ErrorCode`] is a closed compatibility contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DiagnosticOutput {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<PositionOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression: Option<String>,
+    pub expected: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<SuggestionOutput>,
+}
+
+impl From<&omnigraph_compiler::QueryDiagnostic> for DiagnosticOutput {
+    fn from(diagnostic: &omnigraph_compiler::QueryDiagnostic) -> Self {
+        Self {
+            code: diagnostic.code.as_str().to_string(),
+            position: diagnostic.position.map(|at| PositionOutput {
+                line: at.line,
+                column: at.column,
+                byte: at.byte,
+            }),
+            stage: diagnostic
+                .stage
+                .as_ref()
+                .map(|stage| stage.name.to_string()),
+            expression: diagnostic
+                .stage
+                .as_ref()
+                .and_then(|stage| stage.expression.clone()),
+            expected: diagnostic.message.clone(),
+            fix: diagnostic.fix.clone(),
+            suggestion: diagnostic
+                .suggestion
+                .as_ref()
+                .map(|suggestion| SuggestionOutput {
+                    applicability: match suggestion.applicability {
+                        omnigraph_compiler::Applicability::MachineApplicable => {
+                            ApplicabilityOutput::MachineApplicable
+                        }
+                        omnigraph_compiler::Applicability::NeedsReview => {
+                            ApplicabilityOutput::NeedsReview
+                        }
+                    },
+                    edits: suggestion
+                        .edits
+                        .iter()
+                        .map(|edit| TextEditOutput {
+                            start: edit.start,
+                            end: edit.end,
+                            replacement: edit.replacement.clone(),
+                        })
+                        .collect(),
+                }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorOutput {
     pub error: String,
@@ -1546,6 +1645,34 @@ pub struct ErrorOutput {
     /// preserves the closed [`ErrorCode`] contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_text_index_rebuild_required: Option<FullTextIndexRebuildRequiredOutput>,
+    /// Set for a refused query: the diagnostics contract's code, position or
+    /// stage, expectation and fix. `error` keeps the one-line rendering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<DiagnosticOutput>,
+}
+
+impl ErrorOutput {
+    /// An error body carrying `error` and nothing else; every typed detail is
+    /// absent.
+    pub fn message(error: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+            code: None,
+            merge_conflicts: Vec::new(),
+            published_dataset_version_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
+            full_text_index_rebuild_required: None,
+            diagnostic: None,
+        }
+    }
 }
 
 pub fn snapshot_payload(
@@ -1982,6 +2109,37 @@ mod tests {
     use super::*;
     use omnigraph_compiler::settings::SettingScope;
     use serde_json::json;
+
+    #[test]
+    fn diagnostic_suggestions_round_trip_and_old_payloads_remain_valid() {
+        let old = json!({"code": "Q002", "expected": "missing parameters", "fix": "query q()"});
+        let decoded: DiagnosticOutput = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), old);
+
+        let source = "query q { match { $p: Person } return { $p.name } }";
+        let error = omnigraph_compiler::query::parser::parse_query(source).unwrap_err();
+        let output = DiagnosticOutput::from(error.diagnostic().unwrap());
+        let json = serde_json::to_value(&output).unwrap();
+        assert_eq!(
+            json["suggestion"],
+            json!({
+                "applicability": "machine_applicable",
+                "edits": [{"start": 7, "end": 7, "replacement": "()"}]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<DiagnosticOutput>(json).unwrap(),
+            output
+        );
+        let mut reviewed = output;
+        reviewed.suggestion.as_mut().unwrap().applicability = ApplicabilityOutput::NeedsReview;
+        let json = serde_json::to_value(&reviewed).unwrap();
+        assert_eq!(json["suggestion"]["applicability"], "needs_review");
+        assert_eq!(
+            serde_json::from_value::<DiagnosticOutput>(json).unwrap(),
+            reviewed
+        );
+    }
 
     /// `SettingsRequest` has one field per `request` row of the definition,
     /// in definition order, spelled as the row's name; a `process` row has

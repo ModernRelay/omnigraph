@@ -399,6 +399,27 @@ pub(crate) fn cluster_lock_summary(state: &omnigraph_cluster::StateObservations)
     format!(" ({})", parts.join(", "))
 }
 
+/// Where a refused query fails and its one fix, one indented line each, to
+/// print under the line that names the refusal: `--> line, column` for a
+/// parse refusal, `--> stage: expression` for a later one, then `fix:`.
+pub(crate) fn diagnostic_detail_lines(
+    diagnostic: &omnigraph_api_types::DiagnosticOutput,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(at) = &diagnostic.position {
+        lines.push(format!("  --> line {}, column {}", at.line, at.column));
+    } else if let Some(stage) = &diagnostic.stage {
+        match &diagnostic.expression {
+            Some(expression) => lines.push(format!("  --> {stage}: {expression}")),
+            None => lines.push(format!("  --> {stage}")),
+        }
+    }
+    if let Some(fix) = &diagnostic.fix {
+        lines.push(format!("  fix: {fix}"));
+    }
+    lines
+}
+
 pub(crate) fn print_cluster_diagnostics(diagnostics: &[omnigraph_cluster::Diagnostic]) {
     for diagnostic in diagnostics {
         let label = match diagnostic.severity {
@@ -409,6 +430,12 @@ pub(crate) fn print_cluster_diagnostics(diagnostics: &[omnigraph_cluster::Diagno
             "{label} {} {}: {}",
             diagnostic.code, diagnostic.path, diagnostic.message
         );
+        if let Some(detail) = &diagnostic.detail {
+            let detail = omnigraph_api_types::DiagnosticOutput::from(detail.as_ref());
+            for line in diagnostic_detail_lines(&detail) {
+                println!("{line}");
+            }
+        }
     }
 }
 
@@ -940,6 +967,8 @@ pub(crate) fn print_policy_explain(
 pub(crate) struct QueriesIssue {
     pub(crate) query: String,
     pub(crate) message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) diagnostic: Option<omnigraph_api_types::DiagnosticOutput>,
 }
 
 #[derive(serde::Serialize)]

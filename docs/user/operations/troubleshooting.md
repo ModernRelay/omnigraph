@@ -31,6 +31,12 @@ A graph-head `412` includes `precondition_failure` with `expected` and, when
 available, `actual`. A change-feed `410` includes `change_feed_gap`; retrying
 the same cursor cannot recover its missing history.
 
+A `400` that refuses a query includes `diagnostic`: the stable code (`Q…`
+parse, `T…` typecheck), `position` (`line`, `column`, `byte`) for a parse
+refusal or `stage` (and `expression` when known) for a later one, `expected`,
+and `fix` when one exists. Act on the fix; a retry of the same source fails
+the same way. See [Diagnostics](../queries/diagnostics.md).
+
 ## Conflicts
 
 A `409` is not one universal retry signal:

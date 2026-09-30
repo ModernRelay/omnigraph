@@ -2253,3 +2253,29 @@ fn test_assignments_and_binding_matches_take_constants() {
         "type error: T3: match variable `$missing` must be a declared query parameter"
     );
 }
+
+#[test]
+fn a_type_error_exposes_its_diagnostic_with_code_and_stage() {
+    let catalog = setup();
+    let file = parse_query("query q() { match { $x: Nowhere } return { $x.name } }").unwrap();
+    let decl = &file.into_declarations().unwrap()[0];
+    let err = typecheck_query_decl(&catalog, decl).unwrap_err();
+    let diagnostic = err
+        .diagnostic()
+        .expect("a typecheck refusal carries its diagnostic");
+    assert_eq!(diagnostic.code.as_str(), "T1");
+    assert_eq!(
+        diagnostic.stage.as_ref().map(|stage| stage.name),
+        Some("typecheck")
+    );
+    assert!(diagnostic.position.is_none());
+    assert_eq!(
+        err.to_string(),
+        format!("type error: T1: {}", diagnostic.message)
+    );
+    assert!(
+        crate::query::codes::ALL
+            .iter()
+            .any(|code| code.as_str() == "T1")
+    );
+}
