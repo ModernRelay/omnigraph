@@ -116,7 +116,7 @@ async fn graph_lineage_lives_only_in_manifest() {
         .unwrap();
     // A genuine three-way merge (both sides advanced past the base).
     assert_eq!(
-        outcome,
+        outcome.outcome,
         omnigraph::db::MergeOutcome::Merged,
         "expected a real merge, not fast-forward/up-to-date"
     );

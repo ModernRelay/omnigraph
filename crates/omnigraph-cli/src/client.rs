@@ -68,6 +68,68 @@ const MANAGED_LOAD_REQUEST_LIMIT: usize = 32 * 1024 * 1024;
 // Managed queries and mutations share a thirty-second total request deadline.
 const MANAGED_LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// A success response must describe the merge that was submitted. A receipt
+/// cannot be recovered by reading a mutable HEAD after receiving bad evidence.
+fn validate_merge_receipt(
+    outcome: BranchMergeOutcome,
+    commit: Option<&CommitOutput>,
+    target: &str,
+    actor: Option<&str>,
+) -> Result<()> {
+    match (outcome, commit) {
+        (BranchMergeOutcome::AlreadyUpToDate, None) => Ok(()),
+        (BranchMergeOutcome::FastForward | BranchMergeOutcome::Merged, Some(commit))
+            if !commit.graph_commit_id.is_empty()
+                && commit.graph_manifest_version > 0
+                && commit.graph_branch.as_deref().unwrap_or("main") == target
+                && commit
+                    .parent_commit_id
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty())
+                && commit
+                    .merged_parent_commit_id
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty())
+                && commit.actor_id.as_deref() == actor =>
+        {
+            Ok(())
+        }
+        _ => bail!(
+            "invalid merge response: outcome and commit disagree; effects are unknown; reconcile before retrying"
+        ),
+    }
+}
+
+fn validate_merge_output(
+    output: &BranchMergeOutput,
+    source: &str,
+    target: &str,
+    delete_branch: bool,
+) -> Result<()> {
+    if output.source != source || output.target != target {
+        bail!(
+            "invalid merge response: source or target differs from the request; effects are unknown; reconcile before retrying"
+        );
+    }
+    validate_merge_receipt(
+        output.outcome,
+        output.commit.as_ref(),
+        target,
+        output.actor_id.as_deref(),
+    )?;
+    match (
+        delete_branch,
+        output.branch_deleted,
+        &output.branch_delete_error_details,
+    ) {
+        (false, None, None) | (true, Some(true), None) => Ok(()),
+        (true, Some(false), Some(error)) if !error.error.is_empty() => Ok(()),
+        _ => bail!(
+            "invalid merge response: optional deletion result is incomplete or inconsistent; effects are unknown; reconcile before retrying"
+        ),
+    }
+}
+
 /// The engine owns parsed-table limits. This bound covers only the exact
 /// UTF-8 NDJSON body sent to the existing server route, before any request.
 fn read_managed_load_data(path: &str) -> Result<String> {
@@ -1064,7 +1126,7 @@ impl GraphClient {
     /// merge`) from `-e`/`--query`: `POST /mutate` with the source alone, or
     /// the engine call the matching `branch` verb makes, answered as the
     /// server answers it (`branch` received the effect, both counts `0`,
-    /// `commit` the target's head after a publishing merge). The `--set`
+    /// `commit` the merge's own publication). The `--set`
     /// values and the source's `set` lines reach the merge, the one control
     /// write that consults a setting.
     pub(crate) async fn branch_write_statement(
@@ -1082,7 +1144,7 @@ impl GraphClient {
             } => {
                 let mut request = branch_statement_change_request(query_source);
                 request.settings = Self::remote_settings(settings)?;
-                remote_json_bounded(
+                let output: ChangeOutput = remote_json_bounded(
                     http,
                     Method::POST,
                     remote_url(base_url, &["mutate"], &[])?,
@@ -1091,7 +1153,33 @@ impl GraphClient {
                     None,
                     *response_limit,
                 )
-                .await
+                .await?;
+                if let BranchWrite::Merge { source, into } = &write {
+                    let target = into.as_deref().unwrap_or("main");
+                    let Some(BranchOutcomeOutput::Merged {
+                        source: actual_source,
+                        target: actual_target,
+                        merge,
+                    }) = &output.outcome
+                    else {
+                        bail!(
+                            "invalid merge response: missing merge outcome; effects are unknown; reconcile before retrying"
+                        );
+                    };
+                    if actual_source != source || actual_target != target || output.branch != target
+                    {
+                        bail!(
+                            "invalid merge response: source or target differs from the request; effects are unknown; reconcile before retrying"
+                        );
+                    }
+                    validate_merge_receipt(
+                        *merge,
+                        output.commit.as_ref(),
+                        target,
+                        output.actor_id.as_deref(),
+                    )?;
+                }
+                Ok(output)
             }
             GraphClient::Embedded { uri, actor } => {
                 let query_name = write.statement_name().to_string();
@@ -1113,25 +1201,17 @@ impl GraphClient {
                         let target = into.unwrap_or_else(|| "main".to_string());
                         let mut session = Self::open_session(uri, settings).await?;
                         Self::apply_prefix(&mut session, query_source)?;
-                        let merge: BranchMergeOutcome = session
+                        let result = session
                             .branch_merge_as(&source, &target, actor.as_deref())
-                            .await?
-                            .into();
-                        let commit = match merge {
-                            BranchMergeOutcome::AlreadyUpToDate => None,
-                            BranchMergeOutcome::FastForward | BranchMergeOutcome::Merged => session
-                                .list_commits(Some(&target))
-                                .await
-                                .ok()
-                                .and_then(|commits| commits.first().map(commit_output)),
-                        };
+                            .await?;
+                        let commit = result.commit.as_ref().map(commit_output);
                         (
                             target.clone(),
                             commit,
                             BranchOutcomeOutput::Merged {
                                 source,
                                 target,
-                                merge,
+                                merge: result.outcome.into(),
                             },
                         )
                     }
@@ -1410,7 +1490,14 @@ impl GraphClient {
         delete_branch: bool,
         settings: &[(SettingId, SettingValue)],
     ) -> Result<BranchMergeOutput> {
-        match self {
+        // Use the engine's canonical spelling for dispatch, receipt validation,
+        // and optional deletion. Padding must not cause a post-publication error.
+        let source = source.trim();
+        let into = into.trim();
+        if source.is_empty() || into.is_empty() {
+            bail!("branch merge source and target must not be empty");
+        }
+        let output = match self {
             GraphClient::Remote {
                 http,
                 base_url,
@@ -1429,34 +1516,40 @@ impl GraphClient {
                     })?),
                     token.as_deref(),
                 )
-                .await
+                .await?
             }
             GraphClient::Embedded { uri, actor } => {
                 let session = Self::open_session(uri, settings).await?;
                 let actor = actor.as_deref();
-                let outcome = session.branch_merge_as(source, into, actor).await?;
+                let result = session.branch_merge_as(source, into, actor).await?;
                 // Composed exactly like the server handler: the merge is
                 // durable, so a deletion refusal/failure is reported in the
                 // payload, never as an error (parity_matrix pins the two
                 // composition sites against drift).
-                let (branch_deleted, branch_delete_error) = if delete_branch {
+                let (branch_deleted, branch_delete_error_details) = if delete_branch {
                     match session.branch_delete_as(source, actor).await {
                         Ok(()) => (Some(true), None),
-                        Err(err) => (Some(false), Some(err.to_string())),
+                        Err(err) => (
+                            Some(false),
+                            Some(omnigraph_server::engine_error_output(err)),
+                        ),
                     }
                 } else {
                     (None, None)
                 };
-                Ok(BranchMergeOutput {
+                BranchMergeOutput {
                     source: source.to_string(),
                     target: into.to_string(),
-                    outcome: outcome.into(),
+                    outcome: result.outcome.into(),
+                    commit: result.commit.as_ref().map(commit_output),
                     actor_id: actor.map(String::from),
                     branch_deleted,
-                    branch_delete_error,
-                })
+                    branch_delete_error_details,
+                }
             }
-        }
+        };
+        validate_merge_output(&output, source, into, delete_branch)?;
+        Ok(output)
     }
 
     /// `apply_schema` — apply `schema_source`. The embedded arm runs the
@@ -2515,7 +2608,12 @@ mod tests {
         });
         let merged = json!({
             "source": "review", "target": "main", "outcome": "merged",
-            "actor_id": "principal:alice"
+            "actor_id": "principal:alice", "commit": {
+                "graph_commit_id": "merge", "graph_branch": null,
+                "graph_manifest_version": 8, "parent_commit_id": "target",
+                "merged_parent_commit_id": "source",
+                "actor_id": "principal:alice", "created_at": 12345
+            }
         });
         let server = IntentApiFixture::graph(vec![
             IntentReply::json(200, read),

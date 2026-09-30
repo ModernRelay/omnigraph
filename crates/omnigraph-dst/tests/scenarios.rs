@@ -2537,7 +2537,7 @@ fn merge_history_cost_rows(replay: &str) -> String {
             }
             if self.merge_back {
                 assert_eq!(
-                    db.branch_merge("feature", "main").await.unwrap(),
+                    db.branch_merge("feature", "main").await.unwrap().outcome,
                     omnigraph::db::MergeOutcome::Merged
                 );
                 db.mutate(
@@ -2568,7 +2568,10 @@ fn merge_history_cost_rows(replay: &str) -> String {
             )
             .await;
             omnigraph_dst::cost::set_label("_merge_verify");
-            assert_eq!(outcome.unwrap(), omnigraph::db::MergeOutcome::Merged);
+            assert_eq!(
+                outcome.unwrap().outcome,
+                omnigraph::db::MergeOutcome::Merged
+            );
             assert_eq!(probes.completed_full_walk_classification_calls(), 0);
             assert_eq!(probes.completed_lineage_classification_calls(), 1);
             assert_eq!(person_rows_on(&db, target).await.len(), 4);

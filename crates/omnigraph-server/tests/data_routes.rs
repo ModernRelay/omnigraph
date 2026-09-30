@@ -1429,6 +1429,165 @@ fn json_post(path: &str, body: &Value) -> Request<Body> {
         .unwrap()
 }
 
+/// Hold only this request thread at the existing engine seam. Other server
+/// tests may merge concurrently without consuming or waiting on this hold.
+struct MergeReturnHold {
+    thread: std::thread::ThreadId,
+    hold: Arc<omnigraph::seams::Hold>,
+}
+
+impl omnigraph::seams::Behavior for MergeReturnHold {
+    fn uninstalling(&self) {
+        self.hold.release();
+    }
+}
+
+impl omnigraph::seams::Decide for MergeReturnHold {
+    fn decide(&self, name: &'static str) -> omnigraph::seams::Decision {
+        if std::thread::current().id() == self.thread {
+            omnigraph::seams::Decide::decide(self.hold.as_ref(), name)
+        } else {
+            omnigraph::seams::Decision::Pass
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn branch_merge_receipts_keep_own_publication_when_a_later_writer_finishes_first() {
+    use omnigraph::seams::catalog::BRANCH_MERGE_PRE_RETURN;
+
+    for door in ["/mutate", "/branches/merge"] {
+        for outcome in ["fast_forward", "merged", "already_up_to_date"] {
+            let (_temp, app) = app_for_loaded_graph().await;
+            let (status, body) = json_response(
+                &app,
+                json_post("/mutate", &json!({"query": "branch create feature"})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            for (branch, name, write) in [
+                ("feature", "Source", outcome != "already_up_to_date"),
+                ("main", "Target", outcome == "merged"),
+            ] {
+                if write {
+                    let (status, body) = json_response(
+                        &app,
+                        json_post(
+                            "/mutate",
+                            &json!({
+                                "query": MUTATION_QUERIES,
+                                "name": "insert_person",
+                                "params": {"name": name, "age": 31},
+                                "branch": branch
+                            }),
+                        ),
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::OK, "{body}");
+                }
+            }
+            let commits_request = |branch| {
+                Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                    .uri(g(&format!("/commits?branch={branch}")))
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            let (_, before) = json_response(&app, commits_request("main")).await;
+            let (_, source) = json_response(&app, commits_request("feature")).await;
+            let before_count = before["commits"].as_array().unwrap().len();
+            let merge_body = if door == "/mutate" {
+                json!({"query": "branch merge feature into main"})
+            } else {
+                json!({"source": "feature", "target": "main"})
+            };
+            let request = json_post(door, &merge_body);
+            let request_app = app.clone();
+            let (start, started) = std::sync::mpsc::channel();
+            let request_thread = std::thread::spawn(move || {
+                started.recv().unwrap();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(json_response(&request_app, request))
+            });
+            let hold = Arc::new(omnigraph::seams::Hold::default());
+            let guard = BRANCH_MERGE_PRE_RETURN.install(Arc::new(MergeReturnHold {
+                thread: request_thread.thread().id(),
+                hold: hold.clone(),
+            }));
+            start.send(()).unwrap();
+            hold.wait_until_reached();
+            // A has returned from the merge implementation and released its
+            // write gates, but has not returned to the HTTP response builder.
+            let (_, published) = json_response(&app, commits_request("main")).await;
+            assert_eq!(
+                published["commits"].as_array().unwrap().len(),
+                before_count + usize::from(outcome != "already_up_to_date"),
+                "{door} {outcome}"
+            );
+            let (status, later) = json_response(
+                &app,
+                json_post(
+                    "/mutate",
+                    &json!({
+                        "query": MUTATION_QUERIES,
+                        "name": "insert_person",
+                        "params": {"name": "Later", "age": 32},
+                        "branch": "main"
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{later}");
+            assert_eq!(
+                later["commit"]["parent_commit_id"],
+                published["commits"][0]["graph_commit_id"]
+            );
+            hold.release();
+            let (status, receipt) = request_thread.join().unwrap();
+            assert!(!hold.timed_out(), "the test must release the reached hold");
+            drop(guard);
+            assert_eq!(status, StatusCode::OK, "{receipt}");
+            let returned_outcome = if door == "/mutate" {
+                &receipt["outcome"]["merge"]
+            } else {
+                &receipt["outcome"]
+            };
+            assert_eq!(returned_outcome, outcome, "{door}: {receipt}");
+            assert!(receipt.get("commit").is_some(), "{door}: {receipt}");
+            if outcome == "already_up_to_date" {
+                assert_eq!(receipt["commit"], Value::Null);
+                assert_eq!(published["commits"][0], before["commits"][0]);
+            } else {
+                assert_eq!(
+                    receipt["commit"], published["commits"][0],
+                    "{door}: A must return its own publication even after B has finished"
+                );
+                assert_ne!(receipt["commit"], later["commit"]);
+                assert_eq!(receipt["commit"]["graph_branch"], Value::Null);
+                assert_eq!(
+                    receipt["commit"]["parent_commit_id"],
+                    before["commits"][0]["graph_commit_id"]
+                );
+                assert_eq!(
+                    receipt["commit"]["merged_parent_commit_id"],
+                    source["commits"][0]["graph_commit_id"]
+                );
+                assert_receipt_commit_matches_get(&app, &receipt).await;
+            }
+            let (_, after) = json_response(&app, commits_request("main")).await;
+            assert_eq!(after["commits"][0], later["commit"]);
+            assert_eq!(
+                after["commits"].as_array().unwrap().len(),
+                before_count + 1 + usize::from(outcome != "already_up_to_date"),
+                "neither result construction nor delivery may replay the merge"
+            );
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn branch_statements_dispatch_to_their_route_bodies() {
     let (_temp, app) = app_for_loaded_graph().await;
@@ -1547,7 +1706,7 @@ async fn branch_statements_dispatch_to_their_route_bodies() {
     );
     assert!(
         body["commit"]["graph_commit_id"].is_string(),
-        "a fast-forward moves main to the commit authored on feature: {body}"
+        "a fast-forward publishes its own target commit: {body}"
     );
     assert_receipt_commit_matches_get(&app, &body).await;
     let (_, commits) = json_response(
@@ -3773,8 +3932,10 @@ async fn branch_merge_delete_branch_retires_parent_with_live_child() {
     .await;
     assert_eq!(merge_status, StatusCode::OK);
     assert_eq!(merge_body["outcome"], "fast_forward");
+    assert_receipt_commit_matches_get(&app, &merge_body).await;
     assert_eq!(merge_body["branch_deleted"], true);
-    assert!(merge_body["branch_delete_error"].is_null());
+    assert!(merge_body.get("branch_delete_error_details").is_none());
+    assert!(merge_body.get("branch_delete_error").is_none());
 
     let (list_status, list_body) = json_response(
         &app,
@@ -3831,8 +3992,14 @@ async fn branch_merge_delete_branch_refusal_is_non_fatal() {
     assert_eq!(merge_status, StatusCode::OK);
     assert_eq!(merge_body["outcome"], "already_up_to_date");
     assert_eq!(merge_body["branch_deleted"], false);
+    assert!(merge_body.get("branch_delete_error").is_none());
+    assert_eq!(merge_body["commit"], Value::Null);
+    assert_eq!(
+        merge_body["branch_delete_error_details"]["code"],
+        "bad_request"
+    );
     assert!(
-        merge_body["branch_delete_error"]
+        merge_body["branch_delete_error_details"]["error"]
             .as_str()
             .unwrap()
             .contains("cannot delete branch 'main'")

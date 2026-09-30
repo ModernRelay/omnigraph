@@ -638,27 +638,13 @@ async fn run(cli: Cli) -> Result<()> {
                 let payload = client
                     .branch_merge(&source, &into, delete_branch, &settings)
                     .await?;
-                // Warnings go to stderr so `--json` consumers reading stdout
-                // are unaffected. `branch_deleted: None` after requesting
-                // deletion means an older server ignored the unknown request
-                // field — surface that instead of silently leaving the branch.
-                if delete_branch {
-                    match payload.branch_deleted {
-                        Some(true) => {}
-                        Some(false) => eprintln!(
-                            "warning: merged, but could not delete branch '{}': {}",
-                            payload.source,
-                            payload
-                                .branch_delete_error
-                                .as_deref()
-                                .unwrap_or("unknown error")
-                        ),
-                        None => eprintln!(
-                            "warning: merged, but the server does not support --delete-branch; \
-                             branch '{}' was not deleted",
-                            payload.source
-                        ),
-                    }
+                // Keep the successful merge receipt on stdout; optional
+                // deletion has its own structured result and human warning.
+                if let Some(error) = &payload.branch_delete_error_details {
+                    eprintln!(
+                        "warning: merged, but could not delete branch '{}': {}",
+                        payload.source, error.error
+                    );
                 }
                 if json {
                     print_json(&payload)?;

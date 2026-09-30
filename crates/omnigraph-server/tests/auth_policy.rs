@@ -512,8 +512,11 @@ async fn signed_merge_cannot_smuggle_source_deletion_through_merge_grant() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["outcome"], "already_up_to_date");
     assert_eq!(body["branch_deleted"], false);
+    assert_eq!(body["commit"], Value::Null);
+    assert!(body.get("branch_delete_error").is_none());
+    assert_eq!(body["branch_delete_error_details"]["code"], "forbidden");
     assert!(
-        body["branch_delete_error"]
+        body["branch_delete_error_details"]["error"]
             .as_str()
             .unwrap()
             .contains("credential does not permit")
@@ -1868,6 +1871,7 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
         .first()
         .expect("head commit should exist");
     assert_eq!(head["actor_id"], "act-ragnor");
+    assert_eq!(&merge_body["commit"], head);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1885,10 +1889,19 @@ async fn branch_merge_delete_branch_policy_denial_is_non_fatal() {
     .await;
     let graph = graph_path(temp.path());
 
-    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
     db.branch_create_from(ReadTarget::branch("main"), "feature")
         .await
         .unwrap();
+    db.mutate(
+        "feature",
+        r#"query add() { insert Person { name: "Zoe", age: 33 } }"#,
+        "add",
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+    let source_head = db.list_commits(Some("feature")).await.unwrap().remove(0);
     drop(db);
 
     let merge = BranchMergeRequest {
@@ -1910,10 +1923,20 @@ async fn branch_merge_delete_branch_policy_denial_is_non_fatal() {
     )
     .await;
     assert_eq!(merge_status, StatusCode::OK);
-    assert_eq!(merge_body["outcome"], "already_up_to_date");
+    assert_eq!(merge_body["outcome"], "fast_forward");
+    assert_eq!(merge_body["commit"]["actor_id"], "act-ragnor");
+    assert_eq!(
+        merge_body["commit"]["merged_parent_commit_id"],
+        source_head.graph_commit_id
+    );
     assert_eq!(merge_body["branch_deleted"], false);
+    assert!(merge_body.get("branch_delete_error").is_none());
+    assert_eq!(
+        merge_body["branch_delete_error_details"]["code"],
+        "forbidden"
+    );
     assert!(
-        merge_body["branch_delete_error"]
+        merge_body["branch_delete_error_details"]["error"]
             .as_str()
             .unwrap()
             .contains("policy denied action 'branch_delete'")
@@ -1922,6 +1945,12 @@ async fn branch_merge_delete_branch_policy_denial_is_non_fatal() {
     let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     let branches = db.branch_list().await.unwrap();
     assert!(branches.iter().any(|branch| branch == "feature"));
+    let head = db.list_commits(Some("main")).await.unwrap().remove(0);
+    assert_eq!(
+        merge_body["commit"],
+        serde_json::to_value(omnigraph_server::api::commit_output(&head)).unwrap(),
+        "deletion denial must retain the already-published merge receipt"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

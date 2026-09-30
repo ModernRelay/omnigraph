@@ -585,7 +585,7 @@ async fn diff_after_merge_reports_actual_changes() {
     .unwrap();
 
     let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(outcome.outcome, MergeOutcome::Merged);
 
     // Diff from pre-branch to post-merge on main
     let cs = diff_since_branch(&main, "main", v_before_branch, &ChangeFilter::default())
@@ -2732,7 +2732,7 @@ async fn change_feed_merge_commit_is_first_parent_relative_with_merged_parent_on
     .await
     .unwrap();
     let outcome = main.branch_merge("side", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(outcome.outcome, MergeOutcome::Merged);
 
     let feed = main
         .poll_change_feed(feed_request(

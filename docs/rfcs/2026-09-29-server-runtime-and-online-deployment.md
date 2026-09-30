@@ -16,7 +16,7 @@ supersedes:
   - "2026-09-10-server-lifecycle-and-online-deployment"
 superseded_by: []
 blocked_on:
-  - "A2/A3: exact merge receipts and whole-command outcome qualification"
+  - "A3: whole-command outcome contract and qualification"
   - "B: qualified admission bounds, completion reserve and retained-I/O settlement proof"
   - "E1: versioned single-outstanding-deployment ledger, achieved-result and active-witness encoding"
   - "E1: authorization, writer admission/handoff, finalization ordering and crash reconciliation"
@@ -244,7 +244,8 @@ blindly reapplies the bundle.
 | Settled with an exact committed/no-op/compound result | Return that result and any completion obligation |
 | Settled with unknown effects | Reconcile evidence; settlement alone never authorizes replay |
 
-A returns a merge's own `CommitOutput` on the branch merge route, GQ merge through
+A2's accepted [Exact merge receipts](2026-09-30-exact-merge-receipts.md) decision
+returns a merge's own `CommitOutput` on the branch merge route, GQ merge through
 `/mutate`, and CLI JSON: `graph_commit_id`, `graph_manifest_version`, optional
 `graph_branch`, `parent_commit_id`, `merged_parent_commit_id`, `actor_id` and
 `created_at` in Unix microseconds. Optional fields come from that publication.
@@ -425,7 +426,7 @@ cases and unreached faults do not pass qualification.
 
 | Increment | Deliverable | Shipping gate |
 |---|---|---|
-| A | A1 v0.12 HTTP admission; A2 own-publication merge receipts; A3 CLI outcomes | A1 follows [its accepted decision](2026-09-30-v012-http-admission.md); A2/A3 require T1–T3 outcome qualification |
+| A | A1 v0.12 HTTP admission; A2 own-publication merge receipts; A3 CLI outcomes | A1 follows [its accepted decision](2026-09-30-v012-http-admission.md); A2 is qualified under [Exact merge receipts](2026-09-30-exact-merge-receipts.md), including T1/T2; A3 remains proposed and requires T3 qualification |
 | B | Owned writes, read/stream accounting, drain and shared shutdown | T5–T7 plus minimum T10 bounds/reserve |
 | C | Schema/control completion, owned maintenance and bounded transient startup retry | T4/T6/T7/T11; same-process progress and protected reclamation |
 | D | Aggregate budgets, feed progress and embedding diagnostics | T10–T11 and workload qualification |
@@ -440,8 +441,9 @@ Merging this draft supplies no product qualification.
 
 Before accepting each affected increment, its owners must specify:
 
-1. CLI/server: A2/A3 exact receipt and whole-command outcome qualification; A1
-   admission and discovery encoding are fixed by the accepted decision above.
+1. CLI/server: A3 whole-command outcome contract and qualification. A1 admission
+   and A2 exact receipt contracts are fixed by their accepted decisions; A2's
+   implementation evidence remains with its owner.
 2. Cluster/server: versioned pending slot, immutable input/achieved base, exact
    effect/finalization/result binding, active witness, observation interval,
    result retention, migration and stopped-writer handoff.
@@ -488,3 +490,8 @@ Before accepting each affected increment, its owners must specify:
   admission decision fixes A1's wire encoding and validation; Compatibility,
   Rollout and Unresolved questions now link to that owner. This umbrella remains
   draft: the instruction to build A1 does not accept the remaining increments.
+- 2026-09-30: Moved A2's exact receipt contract and T1/T2 gates to the accepted
+  Exact merge receipts decision. Exact outcomes and Rollout now identify that
+  owner; Unresolved questions no longer calls A2's contract undecided. A2 is
+  implemented and its T1/T2 qualification is recorded there. A3 and the remaining
+  lifecycle/deployment increments stay proposals in this draft.

@@ -861,7 +861,7 @@ async fn run_direction(
     apply(&db, "main", right_op).await;
 
     let merge_result = db.branch_merge("feature", "main").await;
-    let outcome = match merge_result {
+    let outcome = match merge_result.map(|result| result.outcome) {
         Ok(MergeOutcome::AlreadyUpToDate) => ActualOutcome::AlreadyUpToDate,
         Ok(MergeOutcome::FastForward) => ActualOutcome::FastForward,
         Ok(MergeOutcome::Merged) => ActualOutcome::Merged,

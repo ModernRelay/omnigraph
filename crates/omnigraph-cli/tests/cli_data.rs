@@ -3070,13 +3070,32 @@ fn branch_merge_defaults_target_to_main() {
             .arg("merge")
             .arg("--uri")
             .arg(&graph)
-            .arg("feature")
+            .arg(" feature ")
             .arg("--json"),
     );
     let merge_payload: Value = serde_json::from_slice(&merge_output.stdout).unwrap();
     assert_eq!(merge_payload["source"], "feature");
     assert_eq!(merge_payload["target"], "main");
     assert_eq!(merge_payload["outcome"], "fast_forward");
+    let receipt = &merge_payload["commit"];
+    assert!(receipt["graph_commit_id"].is_string(), "{merge_payload}");
+    assert!(receipt["parent_commit_id"].is_string(), "{merge_payload}");
+    assert!(
+        receipt["merged_parent_commit_id"].is_string(),
+        "{merge_payload}"
+    );
+    let persisted = parse_stdout_json(&output_success(
+        cli()
+            .args([
+                "commit",
+                "show",
+                receipt["graph_commit_id"].as_str().unwrap(),
+                "--uri",
+            ])
+            .arg(&graph)
+            .arg("--json"),
+    ));
+    assert_eq!(*receipt, persisted);
 
     let snapshot_output = output_success(
         cli()
@@ -3096,6 +3115,172 @@ fn branch_merge_defaults_target_to_main() {
         .as_u64()
         .unwrap();
     assert_eq!(person_entity_count, 5);
+}
+
+#[test]
+fn remote_merge_requires_consistent_receipts_without_replay() {
+    use serde_json::json;
+    use support::managed_http::{IntentApiFixture, IntentReply};
+
+    for (source, target) in [(" ", "main"), ("review", "\t")] {
+        let server = IntentApiFixture::graph(vec![]);
+        let output = output_failure(cli().args([
+            "--server",
+            &server.origin,
+            "--graph",
+            "knowledge",
+            "branch",
+            "merge",
+            source,
+            "--into",
+            target,
+        ]));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("branch merge source and target must not be empty"),
+            "{output:?}"
+        );
+        assert!(server.requests().is_empty());
+        server.assert_complete();
+    }
+
+    let commit = json!({
+        "graph_commit_id": "merge-a", "graph_manifest_version": 9,
+        "graph_branch": null, "parent_commit_id": "target-before",
+        "merged_parent_commit_id": "source-before", "actor_id": "alice",
+        "created_at": 1234567
+    });
+    for (statement, padded) in [(false, false), (false, true), (true, false)] {
+        let mut cases = vec![
+            ("fast_forward", Some(commit.clone()), true),
+            ("merged", Some(commit.clone()), true),
+            ("already_up_to_date", Some(Value::Null), true),
+            ("fast_forward", None, false),
+            ("merged", Some(Value::Null), false),
+            ("already_up_to_date", None, false),
+            ("already_up_to_date", Some(commit.clone()), false),
+        ];
+        for (field, value) in [
+            ("graph_branch", json!("other")),
+            ("graph_commit_id", json!("")),
+            ("graph_manifest_version", json!(0)),
+            ("parent_commit_id", Value::Null),
+            ("merged_parent_commit_id", Value::Null),
+            ("actor_id", json!("somebody-else")),
+        ] {
+            let mut bad_commit = commit.clone();
+            bad_commit[field] = value;
+            cases.push(("merged", Some(bad_commit), false));
+        }
+        for (outcome, receipt, valid) in cases {
+            let mut body = if statement {
+                json!({"branch":"main", "query_name":"branch merge",
+                    "affected_nodes":0, "affected_edges":0, "actor_id":"alice",
+                    "outcome":{"kind":"merged", "source":"review", "target":"main", "merge":outcome}})
+            } else {
+                json!({"source":"review", "target":"main", "outcome":outcome, "actor_id":"alice"})
+            };
+            if let Some(receipt) = receipt {
+                body["commit"] = receipt;
+            }
+            let server = IntentApiFixture::graph(vec![IntentReply::json(200, body.clone())]);
+            let mut command = cli();
+            command.args(["--server", &server.origin, "--graph", "knowledge"]);
+            if statement {
+                command.args(["mutate", "-e", "branch merge review into main", "--json"]);
+            } else if padded {
+                command.args(["branch", "merge", " review ", "--into", " main ", "--json"]);
+            } else {
+                command.args(["branch", "merge", "review", "--json"]);
+            }
+            let output = command.output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(if valid { 0 } else { 1 }),
+                "{body}: {output:?}"
+            );
+            if valid {
+                assert_eq!(parse_stdout_json(&output), body);
+            } else {
+                assert!(
+                    !stdout_string(&output).contains("graph_commit_id"),
+                    "invalid receipt reported as success: {output:?}"
+                );
+            }
+            server.assert_complete();
+            let requests = server.workflow_requests();
+            assert_eq!(
+                requests.len(),
+                1,
+                "a protocol failure must not replay the merge"
+            );
+            assert_eq!(requests[0].method, "POST");
+            if !statement {
+                assert_eq!(requests[0].body["source"], "review");
+                assert_eq!(requests[0].body["target"], "main");
+            }
+        }
+    }
+
+    // Optional deletion has its own required result. An old alias or missing
+    // structured failure cannot turn an incomplete response into success.
+    for (deleted, details, legacy, valid) in [
+        (Some(true), None, None, true),
+        (
+            Some(false),
+            Some(json!({"error":"deletion denied", "code":"forbidden"})),
+            None,
+            true,
+        ),
+        (None, None, None, false),
+        (Some(false), None, None, false),
+        (Some(false), None, Some("deletion denied"), false),
+        (
+            Some(true),
+            Some(json!({"error":"deletion denied"})),
+            None,
+            false,
+        ),
+    ] {
+        let mut body = json!({"source":"review", "target":"main", "outcome":"merged",
+            "actor_id":"alice", "commit":commit});
+        if let Some(deleted) = deleted {
+            body["branch_deleted"] = json!(deleted);
+        }
+        if let Some(details) = details {
+            body["branch_delete_error_details"] = details;
+        }
+        if let Some(legacy) = legacy {
+            body["branch_delete_error"] = json!(legacy);
+        }
+        let server = IntentApiFixture::graph(vec![IntentReply::json(200, body.clone())]);
+        let output = cli()
+            .args([
+                "--server",
+                &server.origin,
+                "--graph",
+                "knowledge",
+                "branch",
+                "merge",
+                " review ",
+                "--into",
+                " main ",
+                "--delete-branch",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if valid { 0 } else { 1 }),
+            "{body}: {output:?}"
+        );
+        if valid {
+            assert_eq!(parse_stdout_json(&output), body);
+        }
+        server.assert_complete();
+        assert_eq!(server.workflow_requests().len(), 1);
+    }
 }
 
 #[test]
@@ -3217,7 +3402,9 @@ fn branch_merge_delete_branch_retires_parent_with_live_child() {
     let merge_payload: Value = serde_json::from_slice(&merge_output.stdout).unwrap();
     assert_eq!(merge_payload["outcome"], "fast_forward");
     assert_eq!(merge_payload["branch_deleted"], true);
-    assert!(merge_payload["branch_delete_error"].is_null());
+    assert!(merge_payload.get("branch_delete_error").is_none());
+    assert!(merge_payload.get("branch_delete_error_details").is_none());
+    assert!(merge_payload["commit"]["graph_commit_id"].is_string());
 
     let list_output = output_success(
         cli()
@@ -3267,8 +3454,11 @@ fn branch_merge_delete_branch_refusal_warns_and_exits_zero() {
     let merge_payload: Value = serde_json::from_slice(&merge_output.stdout).unwrap();
     assert_eq!(merge_payload["outcome"], "already_up_to_date");
     assert_eq!(merge_payload["branch_deleted"], false);
+    assert!(merge_payload.get("branch_delete_error").is_none());
+    assert!(merge_payload["branch_delete_error_details"]["code"].is_string());
+    assert_eq!(merge_payload.get("commit"), Some(&Value::Null));
     assert!(
-        merge_payload["branch_delete_error"]
+        merge_payload["branch_delete_error_details"]["error"]
             .as_str()
             .unwrap()
             .contains("cannot delete branch 'main'")
