@@ -2275,6 +2275,84 @@ async fn blob_update_null_round_trip() {
     );
 }
 
+/// A null assigned to a non-nullable Blob is refused while the update's
+/// assignments resolve, before the statement opens its table, so the table is
+/// never scanned and nothing is published. The control, the same update with a
+/// value, opens the table, so the zero count is the refusal's.
+#[tokio::test]
+async fn blob_null_on_non_nullable_refuses_before_table_open_or_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = "node Document {\n    title: String @key\n    content: Blob\n}\n";
+    let db = helpers::session(Omnigraph::init(uri, schema).await.unwrap());
+    db.load_jsonl(
+        r#"{"type": "Document", "data": {"title": "kid-a", "content": "base64:AQID"}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let head = || async {
+        omnigraph::db::commit_graph::CommitGraph::open(uri)
+            .await
+            .unwrap()
+            .head_commit()
+            .await
+            .unwrap()
+            .expect("loaded graph has a commit")
+            .graph_commit_id
+    };
+    let manifest_before = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let pin_before = pinned_version(&db, "main", "node:Document").await;
+    let head_before = head().await;
+
+    let probes = MergeWriteProbes::default();
+    let refused = with_merge_write_probes(
+        probes.clone(),
+        mutate_main(
+            &db,
+            BLOB_MUTATIONS,
+            "clear_doc_content",
+            &null_blob_params("kid-a", &["content"]),
+        ),
+    )
+    .await;
+    let error = refused.unwrap_err().to_string();
+    assert!(
+        error.contains("cannot assign null to non-nullable property 'content' of Document"),
+        "{error}"
+    );
+    assert_eq!(
+        probes.mutation_table_open_calls(),
+        0,
+        "the refusal must precede the table open and its scan"
+    );
+    assert_eq!(probes.blob_payload_read_calls(), 0);
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        manifest_before
+    );
+    assert_eq!(
+        pinned_version(&db, "main", "node:Document").await,
+        pin_before
+    );
+    assert_eq!(head().await, head_before);
+
+    // Control: a value where the null was opens the table to scan it.
+    let probes = MergeWriteProbes::default();
+    let matched = with_merge_write_probes(
+        probes.clone(),
+        mutate_main(
+            &db,
+            BLOB_MUTATIONS,
+            "update_doc_content",
+            &params(&[("$title", "nobody"), ("$content", "base64:BAUG")]),
+        ),
+    )
+    .await;
+    assert_eq!(matched.unwrap().affected_nodes, 0);
+    assert_eq!(probes.mutation_table_open_calls(), 1);
+}
+
 // ─── External Blob bases stay outside the graph's own storage ────────────────
 
 /// A base over the graph root would let any authorized writer copy manifest

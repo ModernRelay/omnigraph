@@ -540,6 +540,7 @@ async fn open_table_for_mutation(
     op_kind: crate::db::MutationOpKind,
     txn: Option<&crate::db::WriteTxn>,
 ) -> Result<(Option<SnapshotHandle>, String, Option<String>)> {
+    crate::instrumentation::record_mutation_table_open();
     // `open_for_mutation_on_branch` returns the expected version even when it
     // skips the open (collapse #1, the non-strict insert/merge path): the version
     // is the pinned base's, identical to the opened handle's `.version()`. Use it

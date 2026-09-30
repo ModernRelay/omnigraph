@@ -3,6 +3,7 @@
 # notes: selects no row as an inline match; assigned to a non-nullable property it is the typed error naming the property, raised before the batch.
 # notes: A null parameter assigned to a non-nullable Blob is the same typed error, raised before the table is scanned:
 # notes: a predicate that matches no row still refuses, where resolving after the scan would report zero affected rows.
+# notes: The engine test blob_null_on_non_nullable_refuses_before_table_open_or_scan in end_to_end.rs proves the table is never opened.
 
 --- runner
 timeout_ms: 10000

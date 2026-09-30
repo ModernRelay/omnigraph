@@ -1210,6 +1210,10 @@ pub struct MergeWriteProbes {
     /// Legacy whole-delta materializations. RFC-023's bounded keyed path must
     /// keep this at zero; retaining the probe makes regressions observable.
     pub scan_staged_combined_calls: Arc<AtomicU64>,
+    /// Tables a mutation statement opened for its read or staging (one per
+    /// statement that reaches `open_table_for_mutation`). A statement refused
+    /// while its assignments resolve must leave this at zero.
+    pub mutation_table_open_calls: Arc<AtomicU64>,
     /// Blob payload reads performed while rebuilding descriptor rows into a
     /// logical keyed-write source. Resource-limit tests use this to prove an
     /// oversized descriptor is rejected from `BlobFile::size()` before the
@@ -1305,6 +1309,9 @@ impl MergeWriteProbes {
     }
     pub fn scan_staged_combined_calls(&self) -> u64 {
         self.scan_staged_combined_calls.load(Ordering::Relaxed)
+    }
+    pub fn mutation_table_open_calls(&self) -> u64 {
+        self.mutation_table_open_calls.load(Ordering::Relaxed)
     }
     pub fn blob_payload_read_calls(&self) -> u64 {
         self.blob_payload_read_calls.load(Ordering::Relaxed)
@@ -1529,6 +1536,13 @@ pub fn record_strict_insert_preflight() {
 pub fn record_stage_vector_index() {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
         p.stage_vector_index_calls.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one table a mutation statement opens. No-op in production.
+pub fn record_mutation_table_open() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.mutation_table_open_calls.fetch_add(1, Ordering::Relaxed);
     });
 }
 
