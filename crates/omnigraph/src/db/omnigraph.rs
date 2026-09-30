@@ -161,11 +161,9 @@ pub(crate) struct WriteTxn {
     /// forked named branch whose materialized `graph_head:<branch>` row is
     /// intentionally absent.
     pub(crate) effective_graph_head: Option<String>,
-    /// Optional caller compare-and-swap token for this mutation attempt.
-    /// Unlike the internal authority token, a mismatch is terminal and must
-    /// surface as `PreconditionFailed`; it is re-evaluated from fresh authority
-    /// under the pre-effect gates so update/delete behavior cannot depend on
-    /// the engine's internal reprepare policy.
+    /// Optional caller compare-and-swap token for this mutation attempt. Unlike
+    /// the internal authority token, a mismatch is terminal (`PreconditionFailed`),
+    /// judged against the revalidated authority under the pre-effect gates.
     pub(crate) caller_expected_graph_head: Option<String>,
     /// Catalog built from the exact accepted IR whose identity is recorded in
     /// `authority`. Mutation/load planning and validation must use this snapshot,
@@ -173,10 +171,10 @@ pub(crate) struct WriteTxn {
     /// another long-lived handle.
     pub(crate) catalog: Arc<Catalog>,
     /// Cheap freshness probe retained from the exact manifest handle that
-    /// supplied `base` and `authority`. It is not publish authority: merge uses
-    /// it only to prove the captured view is still current and falls back to a
-    /// full coherent capture on mismatch. The publisher still performs its own
-    /// fresh CAS read.
+    /// supplied `base` and `authority`. It is not publish authority: merge and
+    /// write revalidation use it only to prove the captured view is still
+    /// current and fall back to a full coherent capture on mismatch. The
+    /// publisher still performs its own fresh CAS read.
     pub(crate) manifest_probe: crate::db::manifest::CapturedManifestProbe,
 }
 
@@ -1342,8 +1340,9 @@ impl Omnigraph {
     /// contract ONCE and pin the base snapshot. The per-table opens take
     /// `Option<&WriteTxn>` and, on the bound branch for the non-strict (Insert/Merge)
     /// path, source the pinned base entry — instead of re-resolving (re-validating the
-    /// schema) per table. Strict ops, the fork path, and the commit-time OCC re-read
-    /// keep their fresh reads (those are correctness machinery — see the handoff doc).
+    /// schema) per table. Strict ops, the fork path, and the commit-time revalidation
+    /// keep their own reads: `revalidate_write_txn` probes the manifest and reopens the
+    /// branch only on a mismatch (correctness machinery — see the handoff doc).
     ///
     /// "Once" covers the table-touch hot path captured here (the cost gate permits
     /// one marker read plus one validation at pre-effect revalidation); it does
@@ -1845,9 +1844,26 @@ impl Omnigraph {
         // Recheck the durable sentinel inside that critical section so a schema
         // apply observed after preparation cannot be followed by a table effect.
         self.ensure_schema_apply_not_locked("write commit").await?;
-        let (branch_identifier, graph_head, effective_graph_head, snapshot, _) = self
-            .write_authority_for_known_branch(txn.branch.as_deref(), true)
-            .await?;
+        let bound = txn.branch.as_deref() == self.coordinator.read().await.current_branch();
+        let (branch_identifier, graph_head, effective_graph_head, snapshot) =
+            if !bound && txn.manifest_probe.is_current().await? {
+                (
+                    txn.authority.branch_identifier.clone(),
+                    txn.authority.graph_head.clone(),
+                    txn.effective_graph_head.clone(),
+                    txn.base.clone(),
+                )
+            } else {
+                let (branch_identifier, graph_head, effective_graph_head, snapshot, _) = self
+                    .write_authority_for_known_branch(txn.branch.as_deref(), true)
+                    .await?;
+                (
+                    branch_identifier,
+                    graph_head,
+                    effective_graph_head,
+                    snapshot,
+                )
+            };
         let (schema_ir, schema_state) =
             load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
         self.ensure_schema_apply_not_locked("write commit").await?;
