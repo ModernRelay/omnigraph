@@ -9,6 +9,14 @@ plain responses, including 404, 405, 415, or 422.
 
 Do not parse human-readable error text when a structured field is present.
 
+## Server discovery
+
+Remote graph commands first make an anonymous `HEAD /healthz` request to the
+configured service root. Discovery sends neither the data bearer token nor URL
+Basic-auth credentials; reverse proxies must allow that public probe. A timeout
+or connection failure is reported with a credential-safe cause category and
+means the data request was not sent. HTTP discovery refusals retain their status.
+
 ## HTTP errors
 
 | Status | Meaning | Usual action |

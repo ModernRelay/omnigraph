@@ -23,6 +23,7 @@
 //! - `same-key`: all actors write to the same node type (hot-key contention)
 //! - `mixed`: each actor writes to a different table per op (round-robin)
 
+use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -133,8 +134,9 @@ async fn drive_actor(
         };
         let body = serde_json::to_vec(&request_body).unwrap();
         let req = Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
-            .uri("/change")
+            .uri("/graphs/default/change")
             .header("content-type", "application/json")
             .body(Body::from(body))
             .unwrap();

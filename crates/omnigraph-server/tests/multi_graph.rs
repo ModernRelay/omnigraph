@@ -1,6 +1,7 @@
 //! Cluster-mode boot and the concurrent branch-ops matrix.
 //! Moved verbatim from tests/server.rs in the modularization.
 
+use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::fs;
 
 use axum::body::{Body, to_bytes};
@@ -247,6 +248,7 @@ async fn concurrent_branch_ops_morphological_matrix() {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                     .uri(g("/branches"))
                     .method(Method::GET)
                     .body(Body::empty())
@@ -368,6 +370,7 @@ async fn concurrent_branch_ops_morphological_matrix() {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                     .uri(g("/snapshot?branch=main"))
                     .method(Method::GET)
                     .body(Body::empty())
@@ -422,6 +425,7 @@ async fn cluster_boot_serves_applied_state() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri("/graphs")
             .body(Body::empty())
             .unwrap(),
@@ -432,6 +436,7 @@ async fn cluster_boot_serves_applied_state() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri("/graphs/knowledge/queries")
             .body(Body::empty())
             .unwrap(),
@@ -450,6 +455,7 @@ async fn cluster_boot_serves_applied_state() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
             .uri("/graphs/knowledge/queries/find_person")
             .header("content-type", "application/json")
@@ -493,6 +499,7 @@ async fn served_export_process_queue_budget_refuses_then_releases() {
     let app = build_app(state);
     let request = |graph_id: &str| {
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
             .uri(format!("/graphs/{graph_id}/export"))
             .header("content-type", "application/json")
@@ -639,6 +646,7 @@ rules:
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri("/graphs")
             .header("authorization", "Bearer admin-token")
             .body(Body::empty())
@@ -659,6 +667,7 @@ rules:
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri("/graphs/broken/queries")
             .header("authorization", "Bearer admin-token")
             .body(Body::empty())
@@ -775,6 +784,7 @@ graphs:
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri("/graphs/knowledge/read")
             .method(Method::POST)
             .header("content-type", "application/json")

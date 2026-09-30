@@ -1,6 +1,7 @@
 //! Object-store-backed serving, gated independently for S3 and Azure.
 //! Moved verbatim from tests/server.rs in the modularization.
 
+use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::fs;
 
 use axum::body::Body;
@@ -84,6 +85,7 @@ async fn server_opens_object_store_graph_directly_and_serves_snapshot_and_read(u
     let (snapshot_status, snapshot_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/snapshot"))
             .method(Method::GET)
             .header("authorization", "Bearer object-store-token")
@@ -105,6 +107,7 @@ async fn server_opens_object_store_graph_directly_and_serves_snapshot_and_read(u
     let (read_status, read_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/read"))
             .method(Method::POST)
             .header("authorization", "Bearer object-store-token")
@@ -228,6 +231,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
     let (load_status, load_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
             .uri("/graphs/knowledge/load")
             .header("content-type", "application/json")
@@ -265,6 +269,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
     let (missing_status, missing_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
             .uri("/graphs/knowledge/load")
             .header("content-type", "application/json")
@@ -295,6 +300,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
     let response = tower::ServiceExt::oneshot(
         app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
             .uri("/graphs/knowledge/queries/find_person")
             .header("content-type", "application/json")
@@ -388,6 +394,7 @@ async fn server_boots_azure_cluster_from_bare_storage_uri_and_serves_query() {
     let response = tower::ServiceExt::oneshot(
         build_app(state),
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
             .uri("/graphs/knowledge/queries/find_person")
             .header("content-type", "application/json")

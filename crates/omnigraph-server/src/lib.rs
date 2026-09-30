@@ -5,6 +5,7 @@ pub mod api;
 mod blob_transport;
 mod export_transport;
 mod handlers;
+mod http_contract;
 mod mcp;
 mod settings;
 use handlers::*;
@@ -154,6 +155,7 @@ pub struct ApiDoc;
 pub fn served_openapi() -> utoipa::openapi::OpenApi {
     let mut doc = ApiDoc::openapi();
     handlers::nest_paths_under_cluster_prefix(&mut doc);
+    http_contract::describe_contract(&mut doc);
     doc
 }
 
@@ -1050,9 +1052,9 @@ impl ApiError {
     }
 
     /// HTTP 424 Failed Dependency for an external Blob source that passed the
-    /// graph's admission policy but could not be probed or read. `ErrorCode`
-    /// remains a closed rolling contract; the optional structured detail is
-    /// the additive machine-readable discriminator.
+    /// graph's admission policy but could not be probed or read. The admitted
+    /// HTTP contract identifies this condition through the optional structured
+    /// detail; the top-level `code` remains unset.
     fn external_blob_source(uri: String, reason: String) -> Self {
         let message = format!("external blob source '{uri}' is unavailable: {reason}");
         Self {
@@ -1142,9 +1144,8 @@ impl ApiError {
     fn recovery_required(message: String, operation_id: String) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
-            // `ErrorCode` is a closed rolling wire contract. The additive
-            // `recovery_required` field carries the new meaning while older
-            // clients continue to deserialize the otherwise familiar body.
+            // The admitted HTTP contract identifies this condition through
+            // `recovery_required`; the top-level `code` remains unset.
             code: None,
             message: message.into_boxed_str(),
             details: Some(Box::new(ApiErrorDetails::RecoveryRequired(
@@ -1155,8 +1156,8 @@ impl ApiError {
 
     /// HTTP 412 Precondition Failed — an
     /// `Omnigraph-If-Graph-Commit` graph-head precondition no longer holds.
-    /// `code` is omitted for the same closed-wire-contract reason as
-    /// [`Self::recovery_required`].
+    /// The admitted HTTP contract identifies this condition through
+    /// `precondition_failure`; the top-level `code` remains unset.
     fn precondition_failed(message: String, details: api::PreconditionFailureOutput) -> Self {
         Self {
             status: StatusCode::PRECONDITION_FAILED,
@@ -2105,10 +2106,12 @@ fn validate_and_attach(
 
 pub fn build_app(state: AppState) -> Router {
     // The per-graph protected routes, identical in single + multi mode.
-    // Two middleware layers wrap them (outer first, inner last):
+    // Middleware wraps them in this order (outer first, inner last):
     //   1. `require_bearer_auth` — extracts the bearer token and injects
     //      `AuthenticatedActor` (or rejects 401).
-    //   2. `resolve_graph_handle` — injects `Arc<GraphHandle>` based on
+    //   2. `require_contract` — refuses unsupported HTTP contracts before
+    //      graph resolution or request-body work.
+    //   3. `resolve_graph_handle` — injects `Arc<GraphHandle>` based on
     //      the active mode (single: the only handle; multi: lookup by
     //      `{graph_id}` in the URI path).
     let per_graph_protected = Router::new()
@@ -2182,6 +2185,7 @@ pub fn build_app(state: AppState) -> Router {
             state.clone(),
             resolve_graph_handle,
         ))
+        .route_layer(middleware::from_fn(http_contract::require_contract))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_auth,
@@ -2196,6 +2200,7 @@ pub fn build_app(state: AppState) -> Router {
     let management = Router::new()
         .route("/graphs", get(server_graphs_list))
         .route("/graphs/discovery", get(server_graphs_discovery))
+        .route_layer(middleware::from_fn(http_contract::require_contract))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_auth,
@@ -2215,7 +2220,8 @@ pub fn build_app(state: AppState) -> Router {
     if state.oidc_identity_trust.is_some() {
         app = app.merge(mcp::router(state.clone()));
     }
-    app.layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
+    app.layer(middleware::from_fn(http_contract::identify_response))
+        .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

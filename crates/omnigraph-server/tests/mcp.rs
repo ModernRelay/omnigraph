@@ -7,6 +7,7 @@ use axum::http::{Request, StatusCode};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use omnigraph_server::AppState;
+use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use omnigraph_server::oidc_identity::OidcIdentityTrust;
 use rsa::{RsaPrivateKey, pkcs8::DecodePrivateKey as _, traits::PublicKeyParts as _};
 use serde_json::{Value, json};
@@ -118,6 +119,7 @@ async fn call(app: &Router, token: &str, tool: &str, arguments: Value) -> Value 
         .unwrap();
     let status = response.status();
     assert!(!response.headers().contains_key("mcp-session-id"));
+    assert!(!response.headers().contains_key(HTTP_API_CONTRACT_HEADER));
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -132,6 +134,7 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
     let response=app.clone().oneshot(rpc(Some(&alice),"initialize",json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}))).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert!(!response.headers().contains_key("mcp-session-id"));
+    assert!(!response.headers().contains_key(HTTP_API_CONTRACT_HEADER));
     let (status, list) = json_response(&app, rpc(Some(&alice), "tools/list", json!({}))).await;
     assert_eq!(status, StatusCode::OK, "{list}");
     let names: Vec<_> = list["result"]["tools"]
@@ -228,20 +231,37 @@ async fn mcp_authenticates_every_request_and_enforces_resource_and_http_bounds()
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(!response.headers().contains_key(HTTP_API_CONTRACT_HEADER));
     assert_eq!(
         response.headers()["www-authenticate"],
         "Bearer resource_metadata=\"https://data.example/.well-known/oauth-protected-resource/clusters/A/incarnations/one\""
     );
-    let (status, metadata) = json_response(
-        &app,
-        Request::get("/.well-known/oauth-protected-resource")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/.well-known/oauth-protected-resource")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!response.headers().contains_key(HTTP_API_CONTRACT_HEADER));
+    let metadata: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(metadata["resource"], RESOURCE);
     assert!(!metadata.to_string().contains("stable_alice"));
+    let response = app
+        .clone()
+        .oneshot(Request::get("/no-such-route").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response.headers()[HTTP_API_CONTRACT_HEADER],
+        HTTP_API_CONTRACT
+    );
+
     let alice = token("alice", RESOURCE);
     for wrong in [
         token("alice", "https://data.example/clusters/B/incarnations/one"),

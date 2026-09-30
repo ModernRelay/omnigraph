@@ -6,10 +6,8 @@ the current `cluster.yaml` to resolve storage and validate the source location;
 graph, query, and policy resources come from applied state. URI boot is
 config-free.
 
-The checked-in [OpenAPI document](../../../openapi.json) is the canonical schema
-for the documented graph API in this source tree. A running server also returns
-it from `GET /openapi.json`; that discovery route is not self-listed in the
-document.
+The [OpenAPI document](../../../openapi.json) defines the graph API. A running
+server returns it from `GET /openapi.json`, which is not self-listed.
 
 ## Start a server
 
@@ -20,57 +18,66 @@ OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-alice":"secret"}' \
   omnigraph-server --cluster ./company-brain --bind 0.0.0.0:8080
 ```
 
-From an object-storage cluster root:
-
-```bash
-OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-alice":"secret"}' \
-  omnigraph-server \
-    --cluster s3://company-data/omnigraph/company-brain \
-    --bind 0.0.0.0:8080
-```
+For object storage, replace `./company-brain` with the cluster root, for example
+`s3://company-data/omnigraph/company-brain`.
 
 The default bind address is `127.0.0.1:8080`. `--require-all-graphs` makes any
 graph startup failure fatal. Without it, an unhealthy graph is quarantined and
 healthy graphs continue to serve.
 
-An applied empty cluster can serve too: `/readyz` reports its actual applied
-digest, ledger revision and CAS with zero served and quarantined graphs.
-Authorized `GET /graphs` returns an empty inventory; graph requests still
-require an existing graph. No default graph is created. Missing or unapplied
-state refuses startup, as does a nonempty cluster whose graphs all fail.
-Authentication, policy and managed data-token root checks still apply.
+An applied empty cluster serves an empty authorized inventory; no default graph
+is created. `/readyz` reports its applied digest, ledger revision/CAS and zero
+served/quarantined counts. Missing or unapplied state, or a nonempty cluster whose
+graphs all fail, refuses startup. Authentication, policy and data-token root
+checks still apply.
 
 Applied changes become active after restart. Add or remove graphs with
 `cluster.yaml` and `cluster apply`; there are no runtime graph-create/delete
 routes. An unapplied resource edit does not activate it, although changing or
 breaking the directory's config can change where boot looks for applied state.
 
+## HTTP contract
+
+Upgrade the v0.12 CLI, server and HTTP integrations together. Every protected
+request requires exactly one `Omnigraph-Http-Api: 0.12`: graph/registry calls,
+including `/graphs/discovery`, JSON, streams and Blob GET/HEAD. Missing,
+duplicate, combined or unsupported values return `400 api_contract_mismatch`
+after authentication but before graph lookup, body decoding or execution. This
+HTTP identifier is separate from package/storage versions and grants no permission.
+
+Ordinary responses, including errors and streams, carry the same header. Check
+it before decoding or emitting the body. A missing/incompatible response header
+means unknown effects, never permission to replay. Proxies must preserve it both ways.
+
+Server URLs name the service root, including its proxy prefix. Select a graph
+with `--graph`, `default_graph` or `alias.graph`. Migrate graph-qualified server
+URLs to that root plus graph selection; the CLI never guesses a root from a path.
+
+Public `/healthz`, `/readyz` and `/openapi.json` need no header and identify the
+contract in their responses. Before every graph/registry request, the CLI sends
+`HEAD /healthz` to that base with a five-second bound, no bearer, body consumption
+or cache. Failure prevents data dispatch. Each request adds one discovery round
+trip; its existing deadline stays separate. Neither request follows redirects
+or retries automatically. Older clients/servers without this contract are unsupported.
+
+MCP/OAuth metadata neither require nor return this header; managed control-plane
+APIs keep their separate protocol. The accepted [HTTP admission decision](../../rfcs/2026-09-30-v012-http-admission.md)
+defines exact request/response and refusal rules.
+
 ## Authentication
 
 Choose one static token source:
 
-```bash
-# One token, actor name "default"
-export OMNIGRAPH_SERVER_BEARER_TOKEN='secret'
+| Environment variable | Value |
+|---|---|
+| `OMNIGRAPH_SERVER_BEARER_TOKEN` | One bearer token; actor is `default` |
+| `OMNIGRAPH_SERVER_BEARER_TOKENS_JSON` | Actor-to-token object, e.g. `{"act-alice":"secret-a"}` |
+| `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` | Path to that JSON object |
+| `OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET` | Secrets Manager mapping; requires the AWS-enabled build |
 
-# Actor-to-token mapping
-export OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-alice":"secret-a","act-bob":"secret-b"}'
-
-# File containing the same JSON object
-export OMNIGRAPH_SERVER_BEARER_TOKENS_FILE=/run/secrets/omnigraph-tokens.json
-```
-
-The AWS-enabled build can also read the mapping from Secrets Manager through
-`OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET`.
-
-Send the token as:
-
-```http
-Authorization: Bearer secret-a
-```
-
-The token selects the actor used by authorization and commit attribution.
-Clients cannot claim another actor. See [Authorization and actors](policy.md).
+Send `Authorization: Bearer secret-a`. The token selects the actor for
+authorization and commit attribution; clients cannot claim another actor.
+See [Authorization and actors](policy.md).
 
 A server with neither static tokens, signed-token trust, nor policy refuses to start unless you explicitly
 pass `--unauthenticated` (or set `OMNIGRAPH_UNAUTHENTICATED=1`). Use that only
@@ -108,15 +115,12 @@ two explicit profiles:
   allow the request. These credentials cannot grant `schema_apply`,
   `config_manage`, or `admin`.
 
-Every valid identity credential can call `GET /graphs/discovery` for graph IDs
-and display names from the server's applied inventory, including quarantined
-graphs. Display names currently equal graph IDs. This route returns no storage
-locations, availability, schema, query definitions, or graph data, and does not
-require policy membership. It accepts neither static nor restricted
-credentials. `GET /graphs` remains a separate metadata catalog requiring
-`graph_list` policy permission; restricted credentials also filter it to
-graphs with a signed `graph_list` grant. Discovery does not make an unavailable
-server reachable or grant access to a listed graph.
+Every valid identity credential can call `GET /graphs/discovery` for applied
+graph IDs and names (currently identical), including quarantined graphs. It
+requires no policy membership and returns no locations, availability, schema,
+queries or data. Static/restricted credentials cannot use it. `GET /graphs`
+requires `graph_list` permission and, for restricted credentials, a signed
+`graph_list` grant. Discovery grants no graph access or reachability.
 
 See [managed data access](../cli/managed-data.md) for issuance and CLI discovery.
 
@@ -203,6 +207,7 @@ keep their existing routes and do not expose MCP.
 | Route family | Purpose |
 |---|---|
 | `GET /healthz` | Process health |
+| `GET /readyz` | Replica readiness and booted applied revision |
 | `GET /openapi.json` | Runtime copy of the OpenAPI document |
 | `GET /graphs` | Graph metadata catalog; requires `graph_list` policy |
 | `GET /graphs/discovery` | Graph IDs and display names only; requires an identity credential |
@@ -237,6 +242,7 @@ schema through `cluster apply`.
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/query \
+  -H 'Omnigraph-Http-Api: 0.12' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -d '{
@@ -256,10 +262,9 @@ The deprecated `/read` compatibility response does not include
 
 ## Invoke a stored query
 
-Stored queries are part of the applied cluster revision:
-
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/queries/find_person \
+  -H 'Omnigraph-Http-Api: 0.12' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -d '{"params":{"name":"Ada"}}'
@@ -276,18 +281,17 @@ acting on:
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/mutate/if-graph-commit \
+  -H 'Omnigraph-Http-Api: 0.12' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -H 'Omnigraph-If-Graph-Commit: <graph_commit_id>' \
   -d '{"query":"query rename($name: String) { update Person set { name: $name } where email = \"ada@example.com\" }","name":"rename","params":{"name":"Ada"}}'
 ```
 
-For stored mutations, use
-`POST /graphs/{id}/queries/{name}/if-graph-commit` with the same header.
-Ordinary `/mutate`, deprecated `/change`, and `/queries/{name}` routes
-reject the header, so a client cannot accidentally send a condition that is
-ignored. An older server does not have the dedicated routes and therefore
-returns `404`; clients must not fall back to an unconditional route.
+Stored mutations use `POST /graphs/{id}/queries/{name}/if-graph-commit` with
+that header. Ordinary `/mutate`, deprecated `/change`, and `/queries/{name}`
+reject it rather than ignore the condition. Never fall back to an unconditional
+route after a conditional request fails.
 
 The header must contain one raw commit id; wildcard, quoted, weak-ETag, and
 comma-list forms are invalid. The condition covers the whole target branch.
@@ -316,23 +320,18 @@ modes.
 
 ## Deliver Blob values
 
-`GET` and `HEAD /graphs/{id}/blob` select a cell with `entity`, `type`, `id`,
-and `property` query parameters. The route supports single byte ranges and
-ETag preconditions for managed values. It reports external references without
-fetching their target.
-
-See [Blob values](../blobs.md) for examples and limits.
+`GET`/`HEAD /graphs/{id}/blob` select a cell by `entity`, `type`, `id` and
+`property`. They support managed ranges/ETag conditions and report external
+references without fetching them. See [Blob values](../blobs.md) for details.
 
 ## Changes and baselines
 
-`GET /graphs/{id}/commits/{commit_id}/changes` reports one commit relative to
-its first parent. `GET /graphs/{id}/changes` polls complete commits on one
-branch; its terminal response supplies the durable cursor. If cleanup makes a
-cursor unreadable, the route returns `410 change_feed_gap`.
-
-`POST /graphs/{id}/changes/baseline` streams an entity snapshot followed by a
-terminal snapshot commit and resume cursor. For pagination, checkpointing and
-recovery see [Changes and Change Feeds](../branching/changes.md).
+`GET /graphs/{id}/commits/{commit_id}/changes` compares a commit with its first
+parent. `GET /graphs/{id}/changes` polls complete branch commits; the terminal
+response supplies its durable cursor. Unreadable history returns `410 change_feed_gap`.
+`POST /graphs/{id}/changes/baseline` streams entities, then a snapshot commit and
+resume cursor. See [Changes and Change Feeds](../branching/changes.md) for
+pagination, checkpointing and recovery.
 
 ## Errors and retries
 
