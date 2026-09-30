@@ -229,6 +229,11 @@ fn rfc023_external_writer_process() {
                     .await
                     .unwrap();
                 }
+                "merge_target_recreated" => {
+                    db.branch_delete("t").await.unwrap();
+                    db.branch_create("t").await.unwrap();
+                    db.load("t", &payload, mode).await.unwrap();
+                }
                 other => panic!("unknown external writer action '{other}'"),
             }
         });
@@ -2261,6 +2266,73 @@ async fn failed_merge_beside_an_independent_merge_issue_643() {
             "{target} holds the seed rows, its own insert and its source's"
         );
     }
+}
+
+/// Issue 643, branch recreation: another process deletes a merge's target
+/// and creates a branch of the same name while the merge is parked after its
+/// table effects, before its manifest commit. The name now denotes a new
+/// branch lifetime, so the merge must refuse rather than publish into it,
+/// and the recreated target keeps exactly what its own writer put there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn merge_refuses_a_target_recreated_by_another_process_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s", "t").await;
+    let db = std::sync::Arc::new(db);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let merge_db = std::sync::Arc::clone(&db);
+    let merge = tokio::spawn(async move { merge_db.branch_merge("s", "t").await });
+    parked.wait_until_reached().await;
+
+    let child_uri = uri.clone();
+    tokio::task::spawn_blocking(move || {
+        run_rfc023_external_writer_action(
+            child_uri,
+            LoadMode::Append,
+            r#"{"type":"Person","data":{"name":"On-t-recreated","age":55}}"#.to_string(),
+            "merge_target_recreated",
+        )
+    })
+    .await
+    .unwrap()
+    .expect("the other process recreates the target");
+    let recreated_head = branch_head_commit_id(dir.path(), "t").await.unwrap();
+
+    parked.release();
+    let error = merge
+        .await
+        .unwrap()
+        .expect_err("the merge must refuse a target recreated under its name");
+    assert!(
+        matches!(
+            &error,
+            OmniError::Manifest(manifest)
+                if !manifest.publication_in_doubt
+                    && matches!(
+                        &manifest.details,
+                        Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged { member, .. })
+                            if member == "branch_identifier:t"
+                    )
+        ),
+        "the refusal must name the target's changed branch identity: {error:?}"
+    );
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "t").await.unwrap(),
+        recreated_head,
+        "the refused merge must not move the recreated target"
+    );
+    let reader = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    assert_eq!(
+        helpers::count_rows_branch(&reader, "t", "node:Person").await,
+        5,
+        "the recreated target holds the seed rows and its own writer's row only"
+    );
 }
 
 /// Branch create takes the schema gate's EXCLUSIVE side: no CAS covers its
