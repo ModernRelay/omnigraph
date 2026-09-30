@@ -349,14 +349,15 @@ pub(crate) fn resolve_server_flag(
 /// Param precedence: --params > positional args > the alias's fixed
 /// params. The keyed token applies via the ordinary URL match.
 pub(crate) async fn execute_operator_alias(
-    client: &reqwest::Client,
     alias_name: &str,
     alias: &crate::operator::OperatorAlias,
     alias_args: &[String],
     explicit_params: Option<Value>,
 ) -> Result<ReadOutput> {
-    let uri = resolve_server_flag(Some(&alias.server), alias.graph.as_deref())?
-        .expect("server name is present");
+    let root = resolve_server_flag(Some(&alias.server), None)?.expect("server name is present");
+    let uri =
+        resolve_server_flag(Some(&root), alias.graph.as_deref())?.expect("server name is present");
+    let client = crate::graph_http::GraphHttpClient::new(&root)?;
     let bearer_token = resolve_remote_bearer_token(Some(&uri))?;
 
     let mut params = serde_json::Map::new();
@@ -389,7 +390,7 @@ pub(crate) async fn execute_operator_alias(
         body.insert("params".to_string(), Value::Object(params));
     }
     remote_json(
-        client,
+        &client,
         Method::POST,
         remote_url(&uri, &["queries", &alias.query], &[])?,
         Some(Value::Object(body)),
@@ -414,19 +415,6 @@ pub(crate) fn apply_server_flag(
         );
     }
     resolve_server_flag(server, graph)
-}
-
-pub(crate) fn build_http_client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::new())
-}
-
-/// Blob delivery never follows the server's external-descriptor redirect.
-/// Keeping this client separate prevents a graph-level read from silently
-/// turning into an unbounded request against caller-owned object storage.
-pub(crate) fn build_blob_http_client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?)
 }
 
 pub(crate) fn apply_bearer_token(
@@ -489,7 +477,7 @@ pub(crate) fn precondition_failed_cli(
 }
 
 pub(crate) async fn remote_json<T: DeserializeOwned>(
-    client: &reqwest::Client,
+    client: &crate::graph_http::GraphHttpClient,
     method: Method,
     url: String,
     body: Option<Value>,
@@ -502,7 +490,7 @@ pub(crate) async fn remote_json<T: DeserializeOwned>(
 /// precondition (mutation routes only). A 412 whose body carries
 /// `precondition_failure` surfaces as the typed [`PreconditionFailedCli`].
 pub(crate) async fn remote_json_with_graph_commit_precondition<T: DeserializeOwned>(
-    client: &reqwest::Client,
+    client: &crate::graph_http::GraphHttpClient,
     method: Method,
     url: String,
     body: Option<Value>,
@@ -523,7 +511,7 @@ pub(crate) async fn remote_json_with_graph_commit_precondition<T: DeserializeOwn
 
 /// Same typed graph protocol with an optional response limit for managed data access.
 pub(crate) async fn remote_json_bounded<T: DeserializeOwned>(
-    client: &reqwest::Client,
+    client: &crate::graph_http::GraphHttpClient,
     method: Method,
     url: String,
     body: Option<Value>,
@@ -545,7 +533,7 @@ pub(crate) async fn remote_json_bounded<T: DeserializeOwned>(
     } else {
         request
     };
-    remote_response_json_bounded(request.send().await?, bearer_token, response_limit).await
+    remote_response_json_bounded(client.send(request).await?, bearer_token, response_limit).await
 }
 
 /// Decode either JSON requests or raw NDJSON loads through the same bounded,

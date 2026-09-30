@@ -1,6 +1,7 @@
 //! Data-plane routes: read/query/change/ingest/branches/snapshot/export.
 //! Moved verbatim from tests/server.rs in the modularization.
 
+use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::convert::Infallible;
 use std::fs;
 use std::sync::Arc;
@@ -84,6 +85,7 @@ async fn assert_receipt_commit_matches_get(app: &axum::Router, output: &Value) {
     let (status, shown) = json_response(
         app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g(&format!("/commits/{commit_id}")))
             .method(Method::GET)
             .body(Body::empty())
@@ -106,6 +108,7 @@ async fn blob_get_head_ranges_and_conditionals_follow_http_contract() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(&uri)
                 .method(Method::GET)
                 .body(Body::empty())
@@ -114,6 +117,10 @@ async fn blob_get_head_ranges_and_conditionals_follow_http_contract() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[HTTP_API_CONTRACT_HEADER],
+        HTTP_API_CONTRACT
+    );
     assert_eq!(
         response.headers().get("content-type").unwrap(),
         "application/octet-stream"
@@ -145,6 +152,7 @@ async fn blob_get_head_ranges_and_conditionals_follow_http_contract() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(&uri)
                 .method(Method::GET)
                 .header("if-match", "\"stale\"")
@@ -174,6 +182,7 @@ async fn blob_get_head_ranges_and_conditionals_follow_http_contract() {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                     .uri(&uri)
                     .method(Method::GET)
                     .header("range", range)
@@ -205,6 +214,7 @@ async fn blob_get_head_ranges_and_conditionals_follow_http_contract() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(&uri)
                 .method(Method::GET)
                 .header("range", "bytes=0-1,6-10")
@@ -224,6 +234,7 @@ async fn blob_get_head_ranges_and_conditionals_follow_http_contract() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(&uri)
                 .method(Method::GET)
                 .header("if-none-match", format!("\"other\", W/{etag}"))
@@ -257,6 +268,7 @@ async fn blob_get_head_ranges_and_conditionals_follow_http_contract() {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                     .uri(&uri)
                     .method(Method::GET)
                     .header("range", "bytes=0-4")
@@ -281,6 +293,7 @@ async fn blob_get_head_ranges_and_conditionals_follow_http_contract() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(&uri)
                 .method(Method::HEAD)
                 .header("range", "bytes=99-")
@@ -309,6 +322,7 @@ async fn blob_get_head_ranges_and_conditionals_follow_http_contract() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(&uri)
                 .method(Method::HEAD)
                 .header("if-none-match", "*")
@@ -334,6 +348,7 @@ async fn blob_get_head_ranges_and_conditionals_follow_http_contract() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(&uri)
                 .method(Method::HEAD)
                 .header("if-match", "W/\"stale\"")
@@ -372,6 +387,7 @@ async fn blob_get_preserves_empty_null_edge_and_target_semantics() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(&empty_uri)
                 .method(Method::GET)
                 .body(Body::empty())
@@ -396,6 +412,7 @@ async fn blob_get_preserves_empty_null_edge_and_target_semantics() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(&empty_uri)
                 .method(Method::GET)
                 .header("range", "bytes=0-0")
@@ -431,6 +448,7 @@ async fn blob_get_preserves_empty_null_edge_and_target_semantics() {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                     .uri(blob_uri("node", "Document", id, "content", ""))
                     .method(Method::GET)
                     .body(Body::empty())
@@ -445,6 +463,7 @@ async fn blob_get_preserves_empty_null_edge_and_target_semantics() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(blob_uri("node", "Document", "readme", "title", ""))
                 .method(Method::GET)
                 .body(Body::empty())
@@ -458,6 +477,7 @@ async fn blob_get_preserves_empty_null_edge_and_target_semantics() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(blob_uri(
                     "edge",
                     "Attachment",
@@ -481,6 +501,7 @@ async fn blob_get_preserves_empty_null_edge_and_target_semantics() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(blob_uri(
                     "node",
                     "Document",
@@ -504,6 +525,7 @@ async fn blob_get_preserves_empty_null_edge_and_target_semantics() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(blob_uri(
                     "node",
                     "Document",
@@ -528,6 +550,7 @@ async fn blob_get_preserves_empty_null_edge_and_target_semantics() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(blob_uri(
                     "node",
                     "Document",
@@ -559,6 +582,7 @@ async fn blob_get_preserves_empty_null_edge_and_target_semantics() {
                 .clone()
                 .oneshot(
                     Request::builder()
+                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                         .uri(uri)
                         .method(method.clone())
                         .body(Body::empty())
@@ -644,6 +668,7 @@ async fn blob_external_get_and_head_redirect_without_target_io() {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                     .uri(&uri)
                     .method(method.clone())
                     .header("range", "bytes=1-2")
@@ -692,6 +717,7 @@ async fn blob_get_streams_large_managed_values_in_bounded_chunks() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(&uri)
                 .method(Method::HEAD)
                 .header("range", "bytes=0-0")
@@ -715,6 +741,7 @@ async fn blob_get_streams_large_managed_values_in_bounded_chunks() {
     let response = app
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(uri)
                 .method(Method::GET)
                 .body(Body::empty())
@@ -789,6 +816,7 @@ async fn export_route_returns_jsonl_for_branch_snapshot() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/export"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -817,6 +845,7 @@ async fn export_route_returns_jsonl_for_branch_snapshot() {
 
 fn export_request(type_names: Vec<String>) -> Request<Body> {
     Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .uri(g("/export"))
         .method(Method::POST)
         .header("content-type", "application/json")
@@ -855,6 +884,7 @@ async fn export_json_rejections_preserve_typed_statuses_before_streaming() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/export"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -886,6 +916,7 @@ async fn export_json_rejections_preserve_typed_statuses_before_streaming() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/export"))
                 .method(Method::POST)
                 .header("content-type", "text/plain")
@@ -913,6 +944,7 @@ async fn export_json_rejections_preserve_typed_statuses_before_streaming() {
     let oversized = app
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/export"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -991,6 +1023,7 @@ async fn snapshot_route_returns_graph_and_published_dataset_versions() {
     let (snapshot_status, snapshot_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .body(Body::empty())
@@ -1053,6 +1086,7 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/ingest"))
             .method(Method::POST)
             .header("authorization", "Bearer token-one")
@@ -1124,6 +1158,7 @@ async fn ingest_existing_branch_skips_branch_create_policy_check() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/ingest"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
@@ -1152,6 +1187,7 @@ async fn ingest_without_from_returns_404_for_missing_branch_and_creates_nothing(
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/ingest"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -1193,6 +1229,7 @@ async fn ingest_without_from_loads_into_existing_branch() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/ingest"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -1223,6 +1260,7 @@ async fn ingest_denies_missing_branch_without_branch_create_permission() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/ingest"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
@@ -1256,6 +1294,7 @@ async fn ingest_denies_when_actor_lacks_change_permission() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/ingest"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
@@ -1286,6 +1325,7 @@ async fn ingest_rejects_payloads_over_32_mib() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/ingest"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -1358,6 +1398,7 @@ async fn branch_merge_conflict_response_includes_structured_conflicts() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches/merge"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -1380,6 +1421,7 @@ async fn branch_merge_conflict_response_includes_structured_conflicts() {
 
 fn json_post(path: &str, body: &Value) -> Request<Body> {
     Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .uri(g(path))
         .method(Method::POST)
         .header("content-type", "application/json")
@@ -1511,6 +1553,7 @@ async fn branch_statements_dispatch_to_their_route_bodies() {
     let (_, commits) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/commits?branch=main"))
             .method(Method::GET)
             .body(Body::empty())
@@ -1734,6 +1777,7 @@ async fn branch_statement_refusals_name_the_door_and_the_envelope() {
         let (status, body) = json_response(
             &app,
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/mutate/if-graph-commit"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -1749,6 +1793,7 @@ async fn branch_statement_refusals_name_the_door_and_the_envelope() {
     let (route_status, route_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches/nope"))
             .method(Method::DELETE)
             .body(Body::empty())
@@ -1779,6 +1824,7 @@ async fn branch_statement_refusals_name_the_door_and_the_envelope() {
     };
     let post_create = || {
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -1807,6 +1853,7 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
     .await;
     let send = |path: &str, token: &str, body: Value, expected_head: bool| {
         let mut builder = Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g(path))
             .method(Method::POST)
             .header("authorization", format!("Bearer {token}"))
@@ -1908,6 +1955,7 @@ async fn branch_merge_statement_conflict_matches_the_route_409() {
     let (route_status, route_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches/merge"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -2104,6 +2152,7 @@ async fn settings_field_with_a_process_name_is_an_unknown_field() {
     assert_unknown_settings_field(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/mutate/if-graph-commit"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -2264,6 +2313,7 @@ async fn settings_show_all_lists_the_definition_in_order() {
 async fn settings_field_is_accepted_at_the_conditional_mutation_route() {
     fn conditional(body: &Value, expected_commit: &str) -> Request<Body> {
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/mutate/if-graph-commit"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -2540,6 +2590,7 @@ async fn repeated_read_after_change_sees_updated_state_from_same_app() {
     let (change_status, change_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/change"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -2561,6 +2612,7 @@ async fn repeated_read_after_change_sees_updated_state_from_same_app() {
     let (read_status, read_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/read"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -2588,6 +2640,7 @@ async fn query_endpoint_runs_inline_read() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/query"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -2806,6 +2859,7 @@ async fn query_endpoint_rejects_mutation_with_400() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/query"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -2832,6 +2886,7 @@ async fn empty_source_is_refused_as_no_query_on_both_doors() {
         let (status, body) = json_response(
             &app,
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g(path))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -2863,6 +2918,7 @@ async fn mutate_endpoint_runs_inline_mutation() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/mutate"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -2888,6 +2944,7 @@ async fn mutate_endpoint_runs_inline_mutation() {
     let (status, no_op) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/mutate"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -2926,6 +2983,7 @@ async fn change_endpoint_emits_deprecation_headers() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/change"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -2966,6 +3024,7 @@ async fn load_endpoint_loads_into_existing_branch() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/load"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -3014,6 +3073,7 @@ async fn raw_graph_batch_load_publishes_mixed_declarations_in_one_commit() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/load/ndjson?branch=main&mode=append"))
                 .method(Method::POST)
                 .header("content-type", "application/x-ndjson")
@@ -3119,6 +3179,7 @@ async fn invalid_raw_graph_batch_has_no_effect() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/load/ndjson?branch=main&mode=append"))
                 .method(Method::POST)
                 .header("content-type", "application/x-ndjson")
@@ -3158,6 +3219,7 @@ async fn raw_graph_batch_requires_ndjson_and_enforces_body_cap() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/load/ndjson?branch=main"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -3172,6 +3234,7 @@ async fn raw_graph_batch_requires_ndjson_and_enforces_body_cap() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/load/ndjson?branch=main"))
                 .method(Method::POST)
                 .header("content-type", "application/x-ndjson")
@@ -3204,6 +3267,7 @@ async fn raw_graph_batch_policy_refusal_does_not_poll_body() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/load/ndjson?branch=main"))
                 .method(Method::POST)
                 .header("authorization", "Bearer team-token")
@@ -3237,6 +3301,7 @@ async fn ingest_endpoint_emits_deprecation_headers() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/ingest"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -3278,6 +3343,7 @@ async fn read_endpoint_emits_deprecation_headers() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/read"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -3333,6 +3399,7 @@ async fn query_endpoint_does_not_emit_deprecation_headers() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/query"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -3372,6 +3439,7 @@ async fn query_rows_omit_null_cells() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/query"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -3409,6 +3477,7 @@ async fn change_endpoint_accepts_legacy_field_names() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/change"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -3428,6 +3497,7 @@ async fn change_endpoint_accepts_legacy_field_names() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/change"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -3446,6 +3516,7 @@ async fn remote_branch_list_create_merge_flow_works() {
     let (list_status, list_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches"))
             .method(Method::GET)
             .body(Body::empty())
@@ -3462,6 +3533,7 @@ async fn remote_branch_list_create_merge_flow_works() {
     let (create_status, create_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -3476,6 +3548,7 @@ async fn remote_branch_list_create_merge_flow_works() {
     let (list_status, list_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches"))
             .method(Method::GET)
             .body(Body::empty())
@@ -3495,6 +3568,7 @@ async fn remote_branch_list_create_merge_flow_works() {
     let (change_status, change_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/change"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -3517,6 +3591,7 @@ async fn remote_branch_list_create_merge_flow_works() {
     let (read_status, read_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/read"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -3536,6 +3611,7 @@ async fn remote_branch_list_create_merge_flow_works() {
     let (merge_status, merge_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches/merge"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -3559,6 +3635,7 @@ async fn remote_branch_list_create_merge_flow_works() {
     let (read_status, read_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/read"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -3582,6 +3659,7 @@ async fn remote_branch_delete_flow_works() {
     let (create_status, _) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -3594,6 +3672,7 @@ async fn remote_branch_delete_flow_works() {
     let (delete_status, delete_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches/feature"))
             .method(Method::DELETE)
             .body(Body::empty())
@@ -3606,6 +3685,7 @@ async fn remote_branch_delete_flow_works() {
     let (list_status, list_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches"))
             .method(Method::GET)
             .body(Body::empty())
@@ -3627,6 +3707,7 @@ async fn branch_merge_delete_branch_retires_parent_with_live_child() {
     let (create_status, _) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -3646,6 +3727,7 @@ async fn branch_merge_delete_branch_retires_parent_with_live_child() {
     let (change_status, _) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/change"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -3662,6 +3744,7 @@ async fn branch_merge_delete_branch_retires_parent_with_live_child() {
     let (create_child_status, _) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -3680,6 +3763,7 @@ async fn branch_merge_delete_branch_retires_parent_with_live_child() {
     let (merge_status, merge_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches/merge"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -3695,6 +3779,7 @@ async fn branch_merge_delete_branch_retires_parent_with_live_child() {
     let (list_status, list_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches"))
             .method(Method::GET)
             .body(Body::empty())
@@ -3716,6 +3801,7 @@ async fn branch_merge_delete_branch_refusal_is_non_fatal() {
     let (create_status, _) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -3734,6 +3820,7 @@ async fn branch_merge_delete_branch_refusal_is_non_fatal() {
     let (merge_status, merge_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches/merge"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -3754,6 +3841,7 @@ async fn branch_merge_delete_branch_refusal_is_non_fatal() {
     let (list_status, list_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches"))
             .method(Method::GET)
             .body(Body::empty())
@@ -3782,6 +3870,7 @@ async fn branch_delete_denies_without_policy_permission() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches/feature"))
             .method(Method::DELETE)
             .header("authorization", "Bearer token-team")
@@ -3855,6 +3944,7 @@ query vector_search_string($q: String) {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/read"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -3905,6 +3995,7 @@ async fn change_long_lived_handle_refreshes_before_preparing_write() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/change"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -3962,6 +4053,7 @@ async fn change_concurrent_inserts_same_key_serialize_without_409() {
             })
             .unwrap();
             let req = Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/change"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -3994,6 +4086,7 @@ async fn change_concurrent_inserts_same_key_serialize_without_409() {
     let (snapshot_status, snapshot_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .body(Body::empty())
@@ -4051,6 +4144,7 @@ async fn change_concurrent_updates_same_key_return_typed_pre_effect_conflicts() 
             })
             .unwrap();
             let req = Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/change"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -4179,6 +4273,7 @@ query insert_c($name: String) {
             })
             .unwrap();
             let req = Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/change"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -4197,6 +4292,7 @@ query insert_c($name: String) {
             })
             .unwrap();
             let req = Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/change"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -4226,6 +4322,7 @@ query insert_c($name: String) {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .body(Body::empty())
@@ -4335,6 +4432,7 @@ async fn ingest_per_actor_admission_cap_returns_429() {
             })
             .unwrap();
             let req = Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/ingest"))
                 .method(Method::POST)
                 .header("authorization", "Bearer flooder-token")
@@ -4415,6 +4513,7 @@ async fn mutate_graph_commit_precondition_issue_365() {
             "/mutate"
         };
         let mut builder = Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g(path))
             .method(Method::POST)
             .header("content-type", "application/json");
@@ -4429,6 +4528,7 @@ async fn mutate_graph_commit_precondition_issue_365() {
         let (status, out) = json_response(
             app,
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/query"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -4450,6 +4550,7 @@ async fn mutate_graph_commit_precondition_issue_365() {
         let (status, out) = json_response(
             app,
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/commits?branch=main"))
                 .method(Method::GET)
                 .body(Body::empty())
@@ -4480,6 +4581,7 @@ async fn mutate_graph_commit_precondition_issue_365() {
     let (status, _) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/mutate/if-graph-commit"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -4496,6 +4598,7 @@ async fn mutate_graph_commit_precondition_issue_365() {
         let (status, _) = json_response(
             &app,
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/mutate/if-graph-commit"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -4511,6 +4614,7 @@ async fn mutate_graph_commit_precondition_issue_365() {
         );
     }
     let mut duplicate = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .uri(g("/mutate/if-graph-commit"))
         .method(Method::POST)
         .header("content-type", "application/json")
@@ -4533,6 +4637,7 @@ async fn mutate_graph_commit_precondition_issue_365() {
     let (status, _) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/mutate"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -4604,6 +4709,7 @@ async fn mutate_graph_commit_precondition_issue_365() {
     let (status, read_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/query"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -4662,6 +4768,7 @@ async fn mutate_graph_commit_precondition_issue_365() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -4674,6 +4781,7 @@ async fn mutate_graph_commit_precondition_issue_365() {
     let (status, fresh_read) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/query"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -4727,6 +4835,7 @@ async fn load_commit(app: &axum::Router, ndjson: &str) -> String {
     let (status, body) = json_response(
         app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/load"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -4745,6 +4854,7 @@ async fn get_json(app: &axum::Router, uri: String) -> (StatusCode, Value) {
     json_response(
         app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(uri)
             .method(Method::GET)
             .body(Body::empty())
@@ -4944,6 +5054,7 @@ async fn change_routes_report_a_missing_branch_without_storage_detail() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/changes/baseline"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -5068,6 +5179,7 @@ async fn change_baseline_streams_snapshot_then_terminal_cursor() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/changes/baseline"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
@@ -5199,6 +5311,7 @@ async fn change_responses_carry_no_storage_vocabulary() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/changes/baseline"))
                 .method(Method::POST)
                 .header("content-type", "application/json")

@@ -3,6 +3,7 @@
 
 use axum::body::Body;
 use axum::http::StatusCode;
+use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use omnigraph_server::queries::{QueryRegistry, RegistrySpec};
 use omnigraph_server::{AppState, ProcessDefaults};
 use serde_json::{Value, json};
@@ -183,6 +184,7 @@ async fn invoke_stored_read_returns_rows() {
     // The graph-head precondition is mutation-only. A stored read must reject
     // it instead of silently ignoring a caller's concurrency requirement.
     let request = axum::http::Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .uri(g("/queries/find_person"))
         .method(axum::http::Method::POST)
         .header("content-type", "application/json")
@@ -630,6 +632,7 @@ async fn invoke_stored_mutation_graph_commit_precondition_issue_365() {
         expected_commit: &str,
     ) -> axum::http::Request<Body> {
         axum::http::Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g(&format!("/queries/{name}/if-graph-commit")))
             .method(axum::http::Method::POST)
             .header("content-type", "application/json")
@@ -650,6 +653,7 @@ async fn invoke_stored_mutation_graph_commit_precondition_issue_365() {
 
     let conditional_body = json!({ "params": { "name": "Refused" } });
     let request = axum::http::Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .uri(g("/queries/add_person/if-graph-commit"))
         .method(axum::http::Method::POST)
         .header("content-type", "application/json")
@@ -663,6 +667,7 @@ async fn invoke_stored_mutation_graph_commit_precondition_issue_365() {
         "the stored conditional capability route requires its header"
     );
     let request = axum::http::Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .uri(g("/queries/add_person"))
         .method(axum::http::Method::POST)
         .header("content-type", "application/json")
@@ -793,6 +798,7 @@ fn spec(name: &str, source: &str) -> RegistrySpec {
 
 fn cluster_invoke(graph_id: &str, name: &str, body: Value) -> axum::http::Request<Body> {
     axum::http::Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .uri(format!("/graphs/{graph_id}/queries/{name}"))
         .method(axum::http::Method::POST)
         .header("content-type", "application/json")

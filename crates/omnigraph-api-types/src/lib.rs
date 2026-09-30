@@ -24,6 +24,12 @@ use utoipa::{IntoParams, ToSchema};
 /// re-exported so a wire consumer needs no second dependency for it.
 pub use omnigraph_compiler::settings;
 
+/// The single request/response discriminator for the v0.12 HTTP contract.
+/// This is independent of the package version and graph-storage stamp.
+pub const HTTP_API_CONTRACT_HEADER: &str = "omnigraph-http-api";
+/// Exact header value; consumers must reject missing or repeated values.
+pub const HTTP_API_CONTRACT: &str = "0.12";
+
 /// Lowercase wire name for the raw graph-head conditional-write token.
 /// Documentation presents the canonical spelling
 /// `Omnigraph-If-Graph-Commit`; HTTP header names are case-insensitive.
@@ -1348,6 +1354,9 @@ pub enum ErrorCode {
     Unauthorized,
     Forbidden,
     BadRequest,
+    /// 400: the request lacks the exact supported HTTP contract header.
+    /// Authentication and contract admission precede graph access and effects.
+    ApiContractMismatch,
     NotFound,
     /// 405 Method Not Allowed — the route exists but the active server
     /// mode doesn't serve this method (e.g. `GET /graphs` in single-graph
@@ -1444,9 +1453,8 @@ pub struct PreconditionFailureOutput {
 
 /// A change continuation can no longer be reconstructed from retained history
 /// (HTTP 410). Recovery is the baseline handshake; retrying the same cursor
-/// cannot succeed. `code` stays unset: [`ErrorCode`] is closed and this
-/// additive detail is the machine-readable discriminator (the same rolling
-/// contract as `external_blob_source`).
+/// cannot succeed. `code` stays unset: this structured detail is the
+/// machine-readable discriminator, as with `external_blob_source`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeFeedGapOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1618,8 +1626,7 @@ pub struct ErrorOutput {
     pub blob_range: Option<BlobRangeOutput>,
     /// Set with HTTP 424 when an external Blob URI passed admission policy but
     /// its source could not be probed or read. This optional detail is the
-    /// rolling-safe machine-readable discriminator; `code` is omitted because
-    /// [`ErrorCode`] is a closed compatibility contract.
+    /// machine-readable discriminator; `code` is omitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_blob_source: Option<ExternalBlobSourceOutput>,
     /// Set when an overlapping durable recovery intent must be resolved before
@@ -1627,8 +1634,8 @@ pub struct ErrorOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_required: Option<RecoveryRequiredOutput>,
     /// Set when a mutation's graph-commit precondition failed
-    /// (HTTP 412). Like `recovery_required`, the meaning rides this additive
-    /// field — `ErrorCode` is a closed rolling wire contract.
+    /// (HTTP 412). Like `recovery_required`, this structured field carries
+    /// the machine-readable meaning and `code` is omitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub precondition_failure: Option<PreconditionFailureOutput>,
     /// Set with HTTP 410 when retained history can no longer reconstruct a

@@ -1,3 +1,4 @@
+use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -110,6 +111,7 @@ fn assert_optional_commit_field(doc: &Value, schema_name: &str) {
 async fn openapi_endpoint_returns_200_with_valid_json() {
     let (_temp, app) = app_for_loaded_graph().await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -123,6 +125,7 @@ async fn openapi_endpoint_returns_200_with_valid_json() {
 async fn openapi_endpoint_returns_openapi_31_version() {
     let (_temp, app) = app_for_loaded_graph().await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -148,6 +151,7 @@ async fn openapi_endpoint_does_not_require_auth() {
     let app = build_app(state);
 
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -1589,14 +1593,15 @@ fn error_code_schema_has_expected_variants() {
             "unauthorized",
             "forbidden",
             "bad_request",
+            "api_contract_mismatch",
             "not_found",
             "method_not_allowed",
             "conflict",
             "too_many_requests",
             "internal",
         ]),
-        "ErrorCode is a rolling wire contract: new meanings belong in optional \
-         structured fields, not new closed-enum values",
+        "ErrorCode must match the closed v0.12 HTTP contract, including its \
+         explicit API admission refusal",
     );
 }
 
@@ -2051,6 +2056,7 @@ fn openapi_spec_round_trips_through_json() {
 async fn open_mode_spec_has_no_security_schemes() {
     let (_temp, app) = app_for_loaded_graph().await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2067,6 +2073,7 @@ async fn open_mode_spec_has_no_security_schemes() {
 async fn open_mode_spec_has_no_operation_security() {
     let (_temp, app) = app_for_loaded_graph().await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2088,6 +2095,7 @@ async fn open_mode_spec_has_no_operation_security() {
 async fn auth_mode_spec_includes_bearer_token_security_scheme() {
     let (_temp, app) = app_for_loaded_graph_with_auth("secret").await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2102,6 +2110,7 @@ async fn auth_mode_spec_includes_bearer_token_security_scheme() {
 async fn auth_mode_spec_has_security_on_protected_operations() {
     let (_temp, app) = app_for_loaded_graph_with_auth("secret").await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2137,6 +2146,7 @@ async fn auth_mode_spec_has_security_on_protected_operations() {
 async fn auth_mode_healthz_still_has_no_security() {
     let (_temp, app) = app_for_loaded_graph_with_auth("secret").await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2245,6 +2255,7 @@ async fn app_for_multi_mode(graph_ids: &[&str]) -> (Vec<tempfile::TempDir>, Rout
 async fn multi_mode_openapi_lists_cluster_paths() {
     let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2266,6 +2277,7 @@ async fn multi_mode_openapi_lists_cluster_paths() {
 async fn multi_mode_openapi_drops_flat_protected_paths() {
     let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2303,6 +2315,7 @@ async fn multi_mode_openapi_drops_flat_protected_paths() {
 async fn multi_mode_openapi_keeps_management_paths_flat() {
     let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2331,6 +2344,7 @@ async fn multi_mode_openapi_keeps_management_paths_flat() {
 async fn multi_mode_openapi_prefixes_operation_ids_with_cluster() {
     let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2375,6 +2389,7 @@ async fn multi_mode_openapi_prefixes_operation_ids_with_cluster() {
 async fn multi_mode_openapi_declares_graph_id_path_parameter() {
     let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2446,6 +2461,7 @@ async fn multi_mode_operation_ids_are_unique() {
     // spec is unique.
     let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2473,6 +2489,7 @@ async fn served_spec_always_nests_under_cluster_prefix() {
     // nested cluster surface and never the flat protected routes.
     let (_temp, app) = app_for_loaded_graph().await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2517,4 +2534,95 @@ async fn served_spec_always_nests_under_cluster_prefix() {
             "served spec must NOT emit flat protected path: {flat}"
         );
     }
+}
+
+#[test]
+fn openapi_describes_api_contract_admission_and_response_identity() {
+    let doc = openapi_json();
+    assert!(
+        doc["components"]["schemas"]["ErrorCode"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|code| code == "api_contract_mismatch")
+    );
+    for (path, item) in doc["paths"].as_object().unwrap() {
+        for (method, operation) in item.as_object().unwrap() {
+            if ![
+                "get", "post", "put", "delete", "options", "head", "patch", "trace",
+            ]
+            .contains(&method.as_str())
+            {
+                continue;
+            }
+            let parameters = operation["parameters"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let contract_parameters: Vec<_> = parameters
+                .iter()
+                .filter(|parameter| parameter["name"] == HTTP_API_CONTRACT_HEADER)
+                .collect();
+            let oauth = path == "/.well-known/oauth-protected-resource";
+            let protected = path == "/graphs" || path.starts_with("/graphs/");
+            if protected {
+                assert_eq!(contract_parameters.len(), 1, "{method} {path}");
+                let parameter = contract_parameters[0];
+                assert_eq!(parameter["in"], "header");
+                assert_eq!(parameter["required"], true);
+                assert_eq!(
+                    parameter["schema"]["enum"],
+                    serde_json::json!([HTTP_API_CONTRACT])
+                );
+                assert!(
+                    operation["responses"]["400"]["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains("api_contract_mismatch"),
+                    "{method} {path}"
+                );
+                if method == "head" {
+                    assert!(operation["responses"]["400"]["content"].is_null());
+                } else {
+                    // The admission envelope is {error, code}, also valid under
+                    // the change feed's narrower graph-vocabulary projection.
+                    let error_schema = if path.contains("/changes") {
+                        "#/components/schemas/ChangeErrorOutput"
+                    } else {
+                        "#/components/schemas/ErrorOutput"
+                    };
+                    assert_eq!(
+                        operation["responses"]["400"]["content"]["application/json"]["schema"]["$ref"],
+                        error_schema,
+                        "{method} {path}"
+                    );
+                }
+            } else {
+                assert!(contract_parameters.is_empty(), "{method} {path}");
+            }
+            for (status, response) in operation["responses"].as_object().unwrap() {
+                let contract = &response["headers"][HTTP_API_CONTRACT_HEADER];
+                if oauth {
+                    assert!(contract.is_null(), "{method} {path} {status}");
+                } else {
+                    assert_eq!(
+                        contract["schema"]["enum"],
+                        serde_json::json!([HTTP_API_CONTRACT]),
+                        "{method} {path} {status}"
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(
+        doc["paths"]["/healthz"]["get"]["responses"]["200"]["headers"]["Cache-Control"]["schema"]["enum"],
+        serde_json::json!(["no-store"])
+    );
+    let head = &doc["paths"]["/healthz"]["head"];
+    assert_eq!(head["operationId"], "health_head");
+    assert!(head["responses"]["200"]["content"].is_null());
+    assert_eq!(
+        head["responses"]["200"]["headers"],
+        doc["paths"]["/healthz"]["get"]["responses"]["200"]["headers"]
+    );
 }

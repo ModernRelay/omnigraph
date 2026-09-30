@@ -7,13 +7,41 @@ rules and decision authority behind it live in [GOVERNANCE.md](GOVERNANCE.md).
 
 | I want to… | Go to | Notes |
 |---|---|---|
-| **Report a bug** or wrong behavior | **[Open an Issue](../../issues/new/choose)** — bug form | Concrete and reproducible. A maintainer triages it; once labelled **`accepted`** it's open for a PR. |
-| **Propose a feature / share an idea** | **[Open an Issue](../../issues/new/choose)** — feature form | A maintainer triages it. **`accepted`** means a PR may follow; a larger design gets **`needs-rfc`** and goes through an RFC first. |
-| **Propose a design / RFC** | **An Issue first**, then an RFC pull request | Get the issue `accepted` before investing in the RFC. Merge may publish a draft for review; only `status: accepted` authorizes implementation — see [docs/rfcs/README.md](docs/rfcs/README.md). |
+| **Report broken existing functionality**, incorrect results, or a regression | **[Bug report](../../issues/new?template=bug_report.yml)** | Include a concrete reproduction. Maintainers review classification and decide acceptance. |
+| **Request a new capability or change to intended behavior or architecture** | **[Feature or design proposal](../../issues/new?template=feature_request.yml)** | Includes RFC ideas and amendments. Maintainers decide whether the same issue needs an RFC. |
 | **Fix something / implement a change** | **A pull request** | Must link an `accepted` issue or accepted RFC — unless it's trivial (below). |
 | **Report a security vulnerability** | **[SECURITY.md](SECURITY.md)** | Do **not** open a public Issue. |
 
 GitHub Discussions are not used — Issues are the only inbound channel.
+
+Choose one form for the underlying problem; a suggested fix does not turn a bug
+report into a feature proposal. If an issue already covers the problem or idea,
+add details there. If unsure which form applies, describe the behavior and
+expectation once; maintainers review its classification during triage.
+
+Both forms automatically apply `needs-triage`. The bug form also applies `bug`,
+and the feature or design proposal form applies `feature`. These initial labels
+do not imply acceptance; maintainers can correct them during triage.
+
+An RFC is a later design step, not a separate intake form. Wait for maintainer
+agreement before writing one. Maintainers apply `needs-rfc` to the existing issue,
+which then tracks the RFC and implementation. Do not open a second issue for it.
+Implementation requires the RFC's explicit `status: accepted`; merging a draft
+does not accept it. See the [RFC process](docs/rfcs/README.md).
+
+### Bug reports
+
+Include the actual and expected results, exact version (and commit for source
+builds), execution path, and environment. Provide a minimal, complete
+[GQT reproduction](crates/omnigraph-gqt/README.md) with setup and assertions.
+Before filing, use `# issue: none` in the case header and a filename such as
+`repro.gqt`.
+If GQT cannot express the issue, explain why and provide exact alternative
+steps and commands. Maintainers decide whether an exception is appropriate.
+Running GQT before filing is optional because the runner requires a source
+checkout. If you ran it, include the command and failure output.
+
+A reproduction does not automatically accept a report; maintainers decide acceptance.
 
 ### When can I just open a PR?
 The **trivial fast-lane** — open directly, no prior issue/RFC needed, when the

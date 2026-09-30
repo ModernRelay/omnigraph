@@ -1,0 +1,83 @@
+name: Issue triage
+run-name: "Issue triage: ${{ github.event.issue.number || inputs.issue_number }}"
+
+on:
+  issues:
+    types: [opened]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Open issue to check for a missing intake status
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: issue-triage-${{ github.repository }}-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  label:
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.issue.labels.*.name, 'needs-triage') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Add missing intake label
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Issue number must be a positive integer."
+            exit 1
+          fi
+
+          for attempt in 1 2 3; do
+            if decision=$(gh api "repos/$GH_REPO/issues/$NUMBER" --jq '
+              if has("pull_request") then "pull-request"
+              elif .state != "open" then "closed"
+              elif [.labels[].name] | any(
+                . == "needs-triage" or . == "accepted" or . == "needs-rfc" or
+                . == "blocked" or . == "declined"
+              ) then "has-status"
+              else "add-triage"
+              end
+            '); then
+              case "$decision" in
+                pull-request)
+                  echo "::error::This workflow accepts issues, not pull requests."
+                  exit 1
+                  ;;
+                closed|has-status)
+                  echo "Issue $NUMBER: $decision; no label change."
+                  exit 0
+                  ;;
+                add-triage)
+                  if gh api --method POST "repos/$GH_REPO/issues/$NUMBER/labels" \
+                    --input - <<< '{"labels":["needs-triage"]}' > /dev/null; then
+                    echo "Issue $NUMBER: added needs-triage."
+                    exit 0
+                  fi
+                  ;;
+                *)
+                  echo "::error::Unexpected response while checking issue status."
+                  exit 1
+                  ;;
+              esac
+            fi
+
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::Attempt $attempt failed; retrying after rechecking current issue status."
+              sleep "$((attempt * 2))"
+            fi
+          done
+
+          echo "::error::Unable to label issue after three attempts."
+          exit 1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number || inputs.issue_number }}

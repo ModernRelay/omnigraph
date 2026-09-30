@@ -1,55 +1,96 @@
 name: Bug report
-description: Report a reproducible problem or wrong behavior in OmniGraph.
+description: Report existing functionality that fails, gives incorrect results, or regresses.
 title: "bug: <short summary>"
 labels: ["bug", "needs-triage"]
 body:
   - type: markdown
     attributes:
       value: |
-        This form is for **reporting problems** — concrete, reproducible bugs.
-        For an idea or feature request, use the
-        [feature proposal form](https://github.com/ModernRelay/omnigraph/issues/new/choose) instead.
-        For a security vulnerability, follow [SECURITY.md](https://github.com/ModernRelay/omnigraph/blob/main/SECURITY.md) — do **not** file it here.
+        Use this form when **existing functionality is broken**, gives incorrect results,
+        contradicts documented behavior, or regresses. Include a concrete reproduction.
+        For new capabilities or changes to intended behavior, use the
+        [feature or design proposal form](https://github.com/ModernRelay/omnigraph/issues/new?template=feature_request.yml).
+        For a security vulnerability, follow [SECURITY.md](https://github.com/ModernRelay/omnigraph/blob/main/SECURITY.md). Do **not** file it here.
 
-        A maintainer will triage this; once labelled **`accepted`** it's open for a pull request
+        New reports start with **`bug`** and **`needs-triage`**. Maintainers review the
+        classification and decide GQT exceptions and acceptance.
+        A reproduction does not automatically accept a report.
+        Once labelled **`accepted`**, it's open for a pull request
         (see [GOVERNANCE.md](https://github.com/ModernRelay/omnigraph/blob/main/GOVERNANCE.md)).
   - type: textarea
     id: what-happened
     attributes:
-      label: What happened
-      description: What went wrong, and what you expected instead.
+      label: Actual result
+      description: What happened? Include the incorrect result or exact error message.
+    validations:
+      required: true
+  - type: textarea
+    id: expected-result
+    attributes:
+      label: Expected result
+      description: What should have happened instead? Include the expected value or behavior.
     validations:
       required: true
   - type: textarea
     id: repro
     attributes:
-      label: Steps to reproduce
-      description: Minimal steps, commands, schema/query, or a failing snippet.
+      label: GQT reproduction or limitation
+      description: |
+        Paste a minimal, complete .gqt case with setup and assertions. See the
+        [GQT guide](https://github.com/ModernRelay/omnigraph/blob/main/crates/omnigraph-gqt/README.md).
+        Before filing, use `# issue: none` in the case header; if saving it locally, name it `repro.gqt`.
+        If GQT cannot express the issue (for example, an installation, CLI, or HTTP problem),
+        explain the limitation and give exact alternative steps and commands.
+        Maintainers decide whether an exception is appropriate.
       placeholder: |
-        1. omnigraph init ...
-        2. omnigraph ...
-        3. observed: ...  / expected: ...
+        Paste the complete .gqt case here.
+
+        If GQT cannot express the issue:
+        - Explain what GQT cannot reproduce.
+        - Include the minimal setup, input data, and exact commands or code needed to reproduce it.
+      render: text
     validations:
       required: true
   - type: input
     id: version
     attributes:
       label: Version
-      description: Output of `omnigraph --version` (or the engine/crate version) and how you installed it.
+      description: Output of `omnigraph --version` (or the engine/crate version), installation method, and exact commit SHA for source builds. For a failed installation, give the version or commit you tried to install.
+    validations:
+      required: true
+  - type: dropdown
+    id: execution-path
+    attributes:
+      label: Execution path
+      description: How did you encounter the problem? Describe other paths in the reproduction above.
+      options:
+        - CLI
+        - HTTP API / server
+        - Embedded Rust API
+        - Build / installation
+        - Other (describe in reproduction)
     validations:
       required: true
   - type: input
     id: environment
     attributes:
       label: Environment
-      description: OS, architecture, and storage backend (local FS / S3 / RustFS / MinIO / Azure Blob (Azurite)).
+      description: OS and architecture; storage backend (local FS / S3 / RustFS / MinIO / Azure Blob / Azurite) and service version where relevant. Write N/A for storage if the problem occurs before storage is used.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction-output
+    attributes:
+      label: Reproduction command and output
+      description: If you ran the reproduction, paste the exact command and its output, including assertion failures. Running GQT is optional for filing a report; its runner requires a source checkout.
+      render: shell
     validations:
       required: false
   - type: textarea
     id: logs
     attributes:
-      label: Logs / output
-      description: Relevant error text or logs. Will be rendered as code.
+      label: Additional logs
+      description: Other relevant logs or stack traces. Remove credentials and private data before posting.
       render: shell
     validations:
       required: false

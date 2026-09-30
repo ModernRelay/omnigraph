@@ -50,6 +50,7 @@ use read_format::{ReadOutputFormat, ReadRenderOptions, render_read};
 mod blob_cli;
 mod cli;
 mod client;
+mod graph_http;
 mod helpers;
 mod managed;
 #[cfg(test)]
@@ -196,6 +197,15 @@ async fn main() -> Result<()> {
                 std::io::stdout().flush()?;
                 std::process::exit(1);
             }
+            if let Some(contract) = error.downcast_ref::<graph_http::ApiContractError>() {
+                match machine {
+                    Some(MachineErrors::Json) => print_json(contract)?,
+                    Some(MachineErrors::Jsonl) => println!("{}", serde_json::to_string(contract)?),
+                    None => return Err(error),
+                }
+                std::io::stdout().flush()?;
+                std::process::exit(1);
+            }
             Err(error)
         }
         result => result,
@@ -257,7 +267,6 @@ async fn run(cli: Cli) -> Result<()> {
             std::process::exit(code);
         }
     };
-    let http_client = build_http_client()?;
     // RFC-010 Slice 1: reject scope-addressing flags a verb can't consume,
     // from one declared flag × capability matrix — before any per-command
     // dispatch.
@@ -1503,14 +1512,9 @@ async fn run(cli: Cli) -> Result<()> {
                     defined.join(", ")
                 );
             };
-            let output = execute_operator_alias(
-                &http_client,
-                &name,
-                operator_alias,
-                &args,
-                load_params_json(&params)?,
-            )
-            .await?;
+            let output =
+                execute_operator_alias(&name, operator_alias, &args, load_params_json(&params)?)
+                    .await?;
             let format = resolve_read_format(format, json, operator_alias.format);
             print_read_output(&output, format)?;
         }

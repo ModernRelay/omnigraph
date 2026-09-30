@@ -13,6 +13,7 @@ pub struct IntentApiFixture {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     reply_count: usize,
+    graph: bool,
     session: Option<std::sync::Arc<std::sync::Mutex<Value>>>,
 }
 
@@ -44,33 +45,50 @@ impl IntentReply {
 
 impl IntentApiFixture {
     pub fn new(replies: Vec<IntentReply>) -> Self {
-        Self::start(replies, None, Duration::ZERO)
+        Self::start(replies, None, Duration::ZERO, false)
     }
 
     /// Exercise request deadlines without introducing another HTTP fixture.
     /// Delays stay bounded even when a caller times out before the response.
     pub fn with_response_delay(replies: Vec<IntentReply>, delay: Duration) -> Self {
         assert!(delay <= Duration::from_secs(32), "fixture delay bound");
-        Self::start(replies, None, delay)
+        Self::start(replies, None, delay, false)
     }
 
     pub fn with_session(replies: Vec<IntentReply>, session: Value) -> Self {
-        Self::start(replies, Some(session), Duration::ZERO)
+        Self::start(replies, Some(session), Duration::ZERO, false)
     }
 
-    fn start(replies: Vec<IntentReply>, session: Option<Value>, delay: Duration) -> Self {
-        Self::start_with_origin(|_| replies, session, delay)
+    /// Graph data fixtures answer public discovery without consuming a scripted
+    /// reply. Control-plane and OAuth fixtures retain their separate protocol.
+    pub fn graph(replies: Vec<IntentReply>) -> Self {
+        Self::start(replies, None, Duration::ZERO, true)
+    }
+
+    pub fn graph_with_response_delay(replies: Vec<IntentReply>, delay: Duration) -> Self {
+        assert!(delay <= Duration::from_secs(32), "fixture delay bound");
+        Self::start(replies, None, delay, true)
+    }
+
+    fn start(
+        replies: Vec<IntentReply>,
+        session: Option<Value>,
+        delay: Duration,
+        graph: bool,
+    ) -> Self {
+        Self::start_with_origin(|_| replies, session, delay, graph)
     }
 
     /// Build replies after binding the exact origin, for origin-bound signed claims.
     pub fn with_origin(replies: impl FnOnce(&str) -> Vec<IntentReply>) -> Self {
-        Self::start_with_origin(replies, None, Duration::ZERO)
+        Self::start_with_origin(replies, None, Duration::ZERO, false)
     }
 
     fn start_with_origin(
         replies: impl FnOnce(&str) -> Vec<IntentReply>,
         session: Option<Value>,
         delay: Duration,
+        graph: bool,
     ) -> Self {
         use std::io::Write;
         use std::sync::atomic::Ordering;
@@ -143,8 +161,13 @@ impl IntentApiFixture {
                     },
                     raw_body: body,
                 });
-                sleep(delay);
-                let reply = if request_line[0] == "GET"
+                let discovery = graph && request_line[0] == "HEAD" && request_line[1] == "/healthz";
+                if !discovery {
+                    sleep(delay);
+                }
+                let mut reply = if discovery {
+                    IntentReply::json(200, serde_json::json!({"status":"ok"}))
+                } else if request_line[0] == "GET"
                     && request_line[1] == "/v1/auth/session"
                     && let Some(session) = &session_response
                 {
@@ -154,6 +177,16 @@ impl IntentApiFixture {
                         IntentReply::json(500, serde_json::json!({"type":"unexpected_request"}))
                     })
                 };
+                if graph
+                    && !reply.headers.iter().any(|(name, _)| {
+                        name.eq_ignore_ascii_case(omnigraph_api_types::HTTP_API_CONTRACT_HEADER)
+                    })
+                {
+                    reply.headers.push((
+                        omnigraph_api_types::HTTP_API_CONTRACT_HEADER.into(),
+                        omnigraph_api_types::HTTP_API_CONTRACT.into(),
+                    ));
+                }
                 let mut response = format!(
                     "HTTP/1.1 {} Fixture\r\nConnection: close\r\nContent-Type: application/json\r\n",
                     reply.status
@@ -179,6 +212,7 @@ impl IntentApiFixture {
             stop,
             thread: Some(thread),
             reply_count,
+            graph,
             session,
         }
     }
@@ -191,9 +225,10 @@ impl IntentApiFixture {
         self.requests()
             .into_iter()
             .filter(|request| {
-                self.session.is_none()
-                    || request.method != "GET"
-                    || request.path != "/v1/auth/session"
+                !(self.session.is_some()
+                    && request.method == "GET"
+                    && request.path == "/v1/auth/session"
+                    || self.graph && request.method == "HEAD" && request.path == "/healthz")
             })
             .collect()
     }

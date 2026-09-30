@@ -1468,10 +1468,8 @@ pub(crate) async fn server_change(
 /// mutations may still acquire locks briefly. Returns 409 when the prepared
 /// write authority changes before effects.
 ///
-/// Conditional callers use `POST /mutate/if-graph-commit`. Keeping that
-/// capability on a distinct path makes rolling upgrades fail closed: an older
-/// server returns 404 instead of ignoring an unknown optional header and
-/// mutating unconditionally.
+/// Conditional callers use `POST /mutate/if-graph-commit`, which requires and
+/// validates `Omnigraph-If-Graph-Commit`. This endpoint rejects that header.
 ///
 /// Pairs with `POST /query` (read-only). The legacy `POST /change` route
 /// has identical semantics and is kept as a deprecated alias.
@@ -1536,9 +1534,9 @@ pub(crate) async fn server_mutate(
 )]
 /// Apply a mutation only while the branch still has the required graph head.
 ///
-/// The dedicated path is the rolling-safe capability signal. Clients must not
-/// send this header to `/mutate`: an older server could ignore an unknown
-/// optional header after executing the write.
+/// This explicit conditional route requires `Omnigraph-If-Graph-Commit` and
+/// validates its precondition before mutation effects. `/mutate` rejects the
+/// precondition header; conditional callers must use this route.
 pub(crate) async fn server_mutate_if_graph_commit(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,

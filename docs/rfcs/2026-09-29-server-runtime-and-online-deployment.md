@@ -3,7 +3,7 @@ rfc: "2026-09-29-server-runtime-and-online-deployment"
 title: "Server runtime and online deployment"
 track: maintainer
 status: draft
-implementation: not-started
+implementation: in-progress
 authors:
   - OmniGraph maintainers
 created: 2026-09-29
@@ -16,7 +16,7 @@ supersedes:
   - "2026-09-10-server-lifecycle-and-online-deployment"
 superseded_by: []
 blocked_on:
-  - "A: one v0.12 wire contract with pre-effect admission/refusal and exact outcome qualification"
+  - "A2/A3: exact merge receipts and whole-command outcome qualification"
   - "B: qualified admission bounds, completion reserve and retained-I/O settlement proof"
   - "E1: versioned single-outstanding-deployment ledger, achieved-result and active-witness encoding"
   - "E1: authorization, writer admission/handoff, finalization ordering and crash reconciliation"
@@ -352,14 +352,13 @@ engine. Tests must prove the boundary whose behavior is promised.
 **One v0.12 release-line contract.** CLI, server and cluster tools are upgraded
 together to a qualified build. Earlier/later release lines, missing required
 contract evidence and incompatible protocol shapes are refused, without warning-
-and-continue, alternate response aliases or automatic downgrade. This policy is
-new: today's CLI has no general server-version admission handshake. Specify and
-qualify one explicit request/response contract discriminator before A ships;
-it is checked server-side before graph admission/effects, and the CLI verifies
-support before dispatch. Keep health/readiness and contract discovery available.
-A response incompatibility after dispatch reports unknown effects, not a proven
-no-effect refusal. Package version alone does not prove an increment implemented.
-No general surface-hash or mixed-version negotiation framework is required.
+and-continue, alternate response aliases or automatic downgrade. The accepted
+[v0.12 HTTP admission](2026-09-30-v012-http-admission.md) decision owns A1's exact
+header, public discovery, pre-effect refusal and CLI response validation. Package
+version alone does not establish that contract or prove another increment
+implemented. A response incompatibility after dispatch reports unknown effects,
+not a proven no-effect refusal. No general surface-hash or mixed-version
+negotiation framework is required.
 
 v0.12 is a software release, not internal manifest stamp 12. Existing formats,
 schema vintages and explicit offline upgrades follow the
@@ -426,7 +425,7 @@ cases and unreached faults do not pass qualification.
 
 | Increment | Deliverable | Shipping gate |
 |---|---|---|
-| A | v0.12 wire admission, own-publication merge receipts and CLI outcomes | T1–T3; exact wire encoding and pre-effect refusal |
+| A | A1 v0.12 HTTP admission; A2 own-publication merge receipts; A3 CLI outcomes | A1 follows [its accepted decision](2026-09-30-v012-http-admission.md); A2/A3 require T1–T3 outcome qualification |
 | B | Owned writes, read/stream accounting, drain and shared shutdown | T5–T7 plus minimum T10 bounds/reserve |
 | C | Schema/control completion, owned maintenance and bounded transient startup retry | T4/T6/T7/T11; same-process progress and protected reclamation |
 | D | Aggregate budgets, feed progress and embedding diagnostics | T10–T11 and workload qualification |
@@ -441,8 +440,8 @@ Merging this draft supplies no product qualification.
 
 Before accepting each affected increment, its owners must specify:
 
-1. CLI/server: the single v0.12 contract discriminator, admission and discovery
-   encoding, including streams and refusal before graph effects.
+1. CLI/server: A2/A3 exact receipt and whole-command outcome qualification; A1
+   admission and discovery encoding are fixed by the accepted decision above.
 2. Cluster/server: versioned pending slot, immutable input/achieved base, exact
    effect/finalization/result binding, active witness, observation interval,
    result retention, migration and stopped-writer handoff.
@@ -484,3 +483,8 @@ Before accepting each affected increment, its owners must specify:
   Detailed test/benchmark recipes stay with their existing owners. No storage
   compatibility fence, data-preserving migration rule or implemented behavior
   changes; software v0.12 and internal manifest versions remain separate.
+
+- 2026-09-30: Split A into independently scoped steps. The accepted v0.12 HTTP
+  admission decision fixes A1's wire encoding and validation; Compatibility,
+  Rollout and Unresolved questions now link to that owner. This umbrella remains
+  draft: the instruction to build A1 does not accept the remaining increments.
