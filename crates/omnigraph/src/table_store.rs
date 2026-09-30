@@ -5676,7 +5676,8 @@ fn ensure_proven_insert_blobs_are_materialized(batch: &RecordBatch, table_key: &
 
 /// Managed Blob bytes one compaction scanner batch may materialize: Lance 11
 /// rewrites a Blob table through a scanner that reads every managed payload of
-/// a batch, so `stage_compaction` sizes each task's batches against this.
+/// a batch, so `stage_compaction` sizes each task's batches against this, per
+/// row (a row sums its Blob columns; one over the budget is a one-row batch).
 const COMPACTION_BLOB_BATCH_BYTES: u64 = KEYED_WRITE_MAX_BYTES;
 /// Most rows a Blob table's compaction batch may hold: Lance's own fallback
 /// default. `stage_compaction` always sets the derived size on a Blob table,

@@ -167,8 +167,8 @@ data.
 Values larger than these limits stay readable. The CLI and the HTTP server
 read managed values in 4 MiB ranges, so a large value streams without a
 whole-value buffer, and one HTTP response holds at most two ranges at a time.
-`omnigraph optimize` bounds its own Blob memory separately; see
-[Optimize](operations/maintenance.md#optimize).
+`omnigraph optimize` bounds the Blob payload of each compaction batch
+separately; see [Optimize](operations/maintenance.md#optimize).
 
 ## Lifecycle
 

@@ -3097,6 +3097,188 @@ mod change_route_error_tests {
 #[cfg(test)]
 mod blob_error_tests {
     use super::*;
+    use std::fmt;
+
+    use futures::stream::BoxStream;
+    use object_store::path::Path as ObjectPath;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
+
+    /// Wraps every graph-catalog store a probed task opens so that each read
+    /// fails as an object store would, with a physical URI in its message.
+    /// Resolving a snapshot target reopens the graph catalog at the
+    /// snapshot's version, so this is a storage failure inside target
+    /// resolution.
+    #[derive(Debug)]
+    struct CatalogReadFault;
+
+    impl lance::io::WrappingObjectStore for CatalogReadFault {
+        fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+            Arc::new(CatalogReadFaultStore { target })
+        }
+    }
+
+    #[derive(Debug)]
+    struct CatalogReadFaultStore {
+        target: Arc<dyn ObjectStore>,
+    }
+
+    impl fmt::Display for CatalogReadFaultStore {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "CatalogReadFaultStore({})", self.target)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CatalogReadFaultStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.target.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.target.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            _options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            Err(object_store::Error::PermissionDenied {
+                path: format!("s3://private-bucket/{location}"),
+                source: "GET denied".into(),
+            })
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.target.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.target.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&ObjectPath>,
+            offset: &ObjectPath,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.target.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<ListResult> {
+            self.target.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.target.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A storage failure while the Blob route resolves a snapshot target for
+    /// a policy-gated actor reaches the log with its class through the
+    /// delivery path itself, and the client sees only the redacted 500.
+    #[tokio::test]
+    async fn blob_delivery_logs_the_class_of_a_target_resolution_storage_failure() {
+        let capture = crate::test_log_capture::Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("info"));
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        Omnigraph::init(
+            uri,
+            "node Document {\n    title: String @key\n    content: Blob?\n}\n",
+        )
+        .await
+        .unwrap();
+        let engine = Omnigraph::open(uri).await.unwrap();
+        let snapshot = engine.resolve_snapshot("main").await.unwrap();
+        let policy: PolicyConfig = serde_yaml::from_str(
+            "version: 1\n\
+             groups:\n  team: [act-alice]\n\
+             rules:\n  - id: team-read\n    allow:\n      actors: { group: team }\n      actions: [read]\n      branch_scope: any\n",
+        )
+        .unwrap();
+        let handle = GraphHandle {
+            key: GraphKey::cluster(GraphId::try_from("graph").unwrap()),
+            uri: uri.to_string(),
+            engine: Arc::new(engine),
+            policy: Some(Arc::new(PolicyCompiler::compile(&policy, "graph").unwrap())),
+            queries: None,
+        };
+        let actor = AuthenticatedActor::cluster_static(Arc::from("act-alice"));
+        let query = || api::BlobReadQuery {
+            entity: api::BlobEntityKind::Node,
+            r#type: "Document".to_string(),
+            id: "missing".to_string(),
+            property: "content".to_string(),
+            branch: None,
+            snapshot: Some(snapshot.as_str().to_string()),
+        };
+
+        // Unarmed, the same request resolves its target and reaches the cell.
+        let unarmed = read_blob_for_delivery(&handle, Some(&actor), query())
+            .await
+            .unwrap_err();
+        assert_ne!(unarmed.status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        // With the fault installed on this task, reopening the graph catalog
+        // at the snapshot's version fails in the object store.
+        let probes = omnigraph::instrumentation::QueryIoProbes {
+            manifest_wrapper: Some(Arc::new(CatalogReadFault)),
+            ..Default::default()
+        };
+        let response = omnigraph::instrumentation::with_query_io_probes(
+            probes,
+            read_blob_for_delivery(&handle, Some(&actor), query()),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let output: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(output.error, "Blob delivery failed before response headers");
+        assert!(!String::from_utf8_lossy(&body).contains("private-bucket"));
+
+        let logs = capture.output();
+        for expected in [
+            r#"error_kind="blob_pre_header_internal""#,
+            r#"stage="target" error_variant="Storage""#,
+            "storage_kind=Some(",
+        ] {
+            assert!(logs.contains(expected), "missing {expected}: {logs}");
+        }
+        for absent in ["unclassified", "private-bucket", "denied"] {
+            assert!(!logs.contains(absent), "log carries {absent}: {logs}");
+        }
+    }
 
     #[tokio::test]
     async fn pre_header_internal_errors_do_not_expose_physical_storage_or_identity() {
@@ -3133,15 +3315,6 @@ mod blob_error_tests {
             None,
         )
         .into_response();
-        // A target-resolution engine failure keeps its class: the classified
-        // resolver maps the error and its cause together.
-        let (mapped, cause) =
-            classified_engine_error(OmniError::Storage(omnigraph::error::StorageFailure::new(
-                omnigraph::error::StorageFailureKind::Permanent,
-                "storage: GET s3://private-bucket/graph/__manifest/_versions/9.manifest",
-            )));
-        let target_storage = redact_blob_api_error(mapped, "target", cause).into_response();
-        assert_eq!(target_storage.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -3159,8 +3332,6 @@ mod blob_error_tests {
             r#"error_variant="BlobIntegrity""#,
             r#"stage="target""#,
             r#"error_variant="unclassified""#,
-            r#"stage="target" error_variant="Storage""#,
-            "storage_kind=Some(Permanent)",
         ] {
             assert!(logs.contains(expected), "missing {expected}: {logs}");
         }
