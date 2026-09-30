@@ -38,3 +38,15 @@ pub(crate) mod merge;
 pub(crate) mod mutation;
 mod query_doors;
 pub(crate) mod staging;
+
+/// A failure to find a named statement in query text, as an engine error: a
+/// compile refusal keeps its diagnostic (code, position, fix) on the read and
+/// the mutation door alike, and any other lookup failure is a bad request.
+pub(crate) fn query_lookup_error(error: omnigraph_compiler::RunInputError) -> OmniError {
+    match error {
+        omnigraph_compiler::RunInputError::Core(
+            query @ omnigraph_compiler::error::CompilerError::Query(_),
+        ) => OmniError::Compiler(query),
+        other => OmniError::manifest(other.to_string()),
+    }
+}

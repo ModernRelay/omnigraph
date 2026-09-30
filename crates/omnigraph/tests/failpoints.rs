@@ -1256,15 +1256,43 @@ async fn mutation_revalidates_unique_after_pre_effect_authority_change() {
 async fn strict_mutation_rejects_disjoint_head_change_before_effects() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
-    let db = std::sync::Arc::new(helpers::init_and_load(&dir).await);
+    let db = Arc::new(helpers::init_and_load(&dir).await);
+    assert_strict_update_refuses_head_change(db, "main").await;
+}
 
+/// The same refusal on a branch other than the handle's bound one, where
+/// revalidation trusts the captured manifest probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn named_branch_strict_mutation_rejects_head_change_before_effects() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(helpers::init_and_load(&dir).await);
+    db.branch_create("feature").await.unwrap();
+    db.mutate(
+        "feature",
+        OCC_DISJOINT_MUTATIONS,
+        "insert_company",
+        &params(&[("$name", "OldFeatureCo")]),
+    )
+    .await
+    .unwrap();
+    assert_strict_update_refuses_head_change(db, "feature").await;
+}
+
+/// Parks a strict Person update on `branch`, commits a disjoint Company insert
+/// on the same branch, and requires the refusal before any table effect.
+async fn assert_strict_update_refuses_head_change(
+    db: Arc<omnigraph::Session>,
+    branch: &'static str,
+) {
     let rendezvous =
         helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
-    let writer_a_db = std::sync::Arc::clone(&db);
-    let writer_a = tokio::spawn(async move {
-        writer_a_db
+    let writer_db = Arc::clone(&db);
+    let writer = tokio::spawn(async move {
+        writer_db
             .mutate(
-                "main",
+                branch,
                 OCC_DISJOINT_MUTATIONS,
                 "set_age",
                 &helpers::mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
@@ -1274,61 +1302,103 @@ async fn strict_mutation_rejects_disjoint_head_change_before_effects() {
 
     rendezvous.wait_until_reached().await;
     db.mutate(
-        "main",
+        branch,
         OCC_DISJOINT_MUTATIONS,
         "insert_company",
         &params(&[("$name", "ConcurrentCo")]),
     )
     .await
     .expect("the disjoint Company insert commits while Person update is parked");
-
-    let winner_person_pin = helpers::snapshot_main(&db)
-        .await
-        .unwrap()
-        .dataset("node:Person")
-        .unwrap()
-        .published_dataset_version;
-    let person_uri = node_table_uri(&db, "Person").await;
-    let winner_person_head = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .latest_version_id()
-        .await
-        .unwrap();
+    let _no_table_effect = catalog::MUTATION_POST_TABLE_COMMIT.fire_always();
     rendezvous.release();
 
-    let err = writer_a
+    let err = writer
         .await
         .unwrap()
         .expect_err("strict stale read set must fail rather than auto-reprepare");
-    let OmniError::Manifest(manifest_err) = err else {
-        panic!("expected a typed manifest conflict");
-    };
-    assert!(matches!(
-        manifest_err.details,
-        Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged {
-            ref member,
-            ..
-        }) if member == "graph_head:main"
-    ));
+    assert_refused_before_effects(err, &format!("graph_head:{branch}"));
+}
 
-    let final_person_pin = helpers::snapshot_main(&db)
-        .await
-        .unwrap()
-        .dataset("node:Person")
-        .unwrap()
-        .published_dataset_version;
-    let final_person_head = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .latest_version_id()
-        .await
-        .unwrap();
-    assert_eq!(
-        (final_person_pin, final_person_head),
-        (winner_person_pin, winner_person_head),
-        "strict rejection must happen before any Person table effect"
+/// With `MUTATION_POST_TABLE_COMMIT` armed, a write that reached a table effect
+/// carries the injected error, which has no conflict details.
+fn assert_refused_before_effects(err: OmniError, member: &str) {
+    let refusal = err.to_string();
+    let OmniError::Manifest(manifest_err) = err else {
+        panic!("expected a typed manifest conflict, got {refusal}");
+    };
+    assert!(
+        matches!(
+            manifest_err.details,
+            Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged {
+                member: ref changed,
+                ..
+            }) if changed == member
+        ),
+        "the write must be refused with {member} before a table effect, got {refusal}"
     );
+}
+
+/// A write on a branch other than the handle's bound one keeps its captured
+/// authority only while the branch's version and identifier are unchanged. A
+/// delete and recreate of that name while the write is parked must refuse it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn named_branch_write_refuses_delete_recreate_before_effects() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = std::sync::Arc::new(helpers::init_and_load(&dir).await);
+    db.branch_create("feature").await.unwrap();
+    db.mutate(
+        "feature",
+        OCC_DISJOINT_MUTATIONS,
+        "insert_company",
+        &params(&[("$name", "OldFeatureCo")]),
+    )
+    .await
+    .unwrap();
+    let old_ref = helpers::graph_native_ref(&uri, "feature").await;
+
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let _no_table_effect = catalog::MUTATION_POST_TABLE_COMMIT.fire_always();
+    let writer_db = std::sync::Arc::clone(&db);
+    let writer = tokio::spawn(async move {
+        writer_db
+            .mutate(
+                "feature",
+                OCC_DISJOINT_MUTATIONS,
+                "set_age",
+                &helpers::mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+            )
+            .await
+    });
+
+    rendezvous.wait_until_reached().await;
+    let recreated = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        db.branch_delete("feature").await?;
+        db.branch_create("feature").await
+    })
+    .await;
+    rendezvous.release();
+    recreated
+        .expect("delete and recreate must not wait for the parked write")
+        .unwrap();
+    let new_ref = helpers::graph_native_ref(&uri, "feature").await;
+    assert_ne!(new_ref, old_ref, "recreate must mint a new incarnation");
+
+    let err = writer
+        .await
+        .unwrap()
+        .expect_err("a write captured on the deleted incarnation must be refused");
+    assert_refused_before_effects(err, "branch_identifier:feature");
+
+    assert_eq!(
+        helpers::count_rows_branch(&db, "feature", "node:Company").await,
+        helpers::count_rows_branch(&db, "main", "node:Company").await,
+        "the recreated branch must hold main's rows only"
+    );
+    assert_eq!(helpers::graph_native_ref(&uri, "feature").await, new_ref);
 }
 
 /// A caller graph-head precondition is terminal even when the race occurs

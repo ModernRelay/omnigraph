@@ -298,7 +298,7 @@ impl Omnigraph {
             return Ok(compiled);
         }
         let statement = omnigraph_compiler::find_read_statement(query_source, query_name)
-            .map_err(|e| OmniError::manifest(e.to_string()))?;
+            .map_err(super::query_lookup_error)?;
         let type_ctx = typecheck_query(catalog, statement.decl())?;
         let ir = Arc::new(lower_query(catalog, statement.decl(), &type_ctx)?);
         let compiled = if statement.is_explain() {

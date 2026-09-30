@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+pub use crate::query::diagnostic::{QueryCode, QueryDiagnostic};
+
 #[derive(Debug, Error)]
 pub enum SchemaIdentityError {
     #[error("invalid schema identity domain: {0}")]
@@ -94,14 +96,19 @@ pub fn decode_string_literal(raw: &str) -> Result<String> {
 
 #[derive(Debug, Error)]
 pub enum CompilerError {
+    /// A schema (`.pg`) parse refusal, or a string helper's; query parse
+    /// refusals are `Query` diagnostics.
     #[error("parse error: {0}")]
     Parse(String),
 
     #[error("catalog error: {0}")]
     Catalog(String),
 
-    #[error("type error: {0}")]
-    Type(String),
+    /// Every query compile diagnostic, parse (`Q…`) or typecheck (`T…`),
+    /// with its code, position or stage, message and fix; `Display` is the
+    /// diagnostic's legacy one-line form.
+    #[error("{0}")]
+    Query(Box<QueryDiagnostic>),
 
     #[error("storage error: {0}")]
     Storage(String),
@@ -137,6 +144,28 @@ pub enum CompilerError {
 
     #[error(transparent)]
     SchemaIdentity(#[from] SchemaIdentityError),
+}
+
+impl CompilerError {
+    /// A typecheck diagnostic under `code`; `message` states what was
+    /// expected or violated without the code prefix, which `Display` adds.
+    pub fn typed(code: QueryCode, message: impl Into<String>) -> Self {
+        Self::Query(Box::new(QueryDiagnostic::typecheck(code, message)))
+    }
+
+    /// A query compile error carrying `diagnostic`.
+    pub fn query(diagnostic: QueryDiagnostic) -> Self {
+        Self::Query(Box::new(diagnostic))
+    }
+
+    /// The structured diagnostic behind a query compile error, when this is
+    /// one.
+    pub fn diagnostic(&self) -> Option<&QueryDiagnostic> {
+        match self {
+            Self::Query(diagnostic) => Some(diagnostic),
+            _ => None,
+        }
+    }
 }
 
 #[deprecated(note = "use CompilerError")]

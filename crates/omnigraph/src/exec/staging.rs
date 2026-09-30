@@ -902,11 +902,6 @@ impl StagedMutation {
         // the complete attempt before effects. Mutation inserts and load
         // append/merge may then reprepare at their outer bounded retry loop;
         // strict read-modify-write operations return the typed conflict.
-        //
-        // Revalidate the complete coarse authority under the branch/table
-        // gates. The helper probe-reuses a current warm coordinator and opens
-        // the target branch fresh on any mismatch, returning the snapshot from
-        // that same authority view. No prepared table pin is patched forward.
         let snapshot = db.revalidate_write_txn(txn).await?;
         for entry in &staged {
             let current = snapshot
