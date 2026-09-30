@@ -955,12 +955,10 @@ async fn read_blob_for_delivery(
     actor: Option<&AuthenticatedActor>,
     query: BlobReadQuery,
 ) -> std::result::Result<omnigraph::BlobRead, ApiError> {
-    // The target stage already holds an `ApiError`, so its cause is logged as
-    // "unclassified": a known gap until target resolution returns the engine
-    // error it mapped.
-    let target = resolve_authorized_read_target(handle, actor, query.branch, query.snapshot)
-        .await
-        .map_err(|mapped| redact_blob_api_error(mapped, "target", None))?;
+    let target =
+        resolve_authorized_read_target_classified(handle, actor, query.branch, query.snapshot)
+            .await
+            .map_err(|(mapped, cause)| redact_blob_api_error(mapped, "target", cause))?;
     let entity = match query.entity {
         api::BlobEntityKind::Node => omnigraph::EntityKind::Node,
         api::BlobEntityKind::Edge => omnigraph::EntityKind::Edge,
@@ -1397,9 +1395,25 @@ pub(crate) async fn resolve_authorized_read_target(
     branch: Option<String>,
     snapshot: Option<String>,
 ) -> std::result::Result<ReadTarget, ApiError> {
+    resolve_authorized_read_target_classified(handle, actor, branch, snapshot)
+        .await
+        .map_err(|(mapped, _)| mapped)
+}
+
+/// [`resolve_authorized_read_target`], also returning the log-safe class of
+/// an engine failure beside the mapped error, so a redacting caller can log
+/// the class the mapping discards. Refusals that are not engine failures
+/// carry no class.
+async fn resolve_authorized_read_target_classified(
+    handle: &GraphHandle,
+    actor: Option<&AuthenticatedActor>,
+    branch: Option<String>,
+    snapshot: Option<String>,
+) -> std::result::Result<ReadTarget, (ApiError, Option<blob_transport::RedactedCause>)> {
     if branch.is_some() && snapshot.is_some() {
-        return Err(ApiError::bad_request(
-            "request may specify branch or snapshot, not both",
+        return Err((
+            ApiError::bad_request("request may specify branch or snapshot, not both"),
+            None,
         ));
     }
 
@@ -1411,7 +1425,7 @@ pub(crate) async fn resolve_authorized_read_target(
             .resolved_branch_of(target.clone())
             .await
             .map(|branch| branch.or_else(|| Some("main".to_string())))
-            .map_err(ApiError::from_omni)?,
+            .map_err(classified_engine_error)?,
         ReadTarget::Snapshot(_) => None,
     };
     authorize_request(
@@ -1422,8 +1436,14 @@ pub(crate) async fn resolve_authorized_read_target(
             branch: policy_branch,
             target_branch: None,
         },
-    )?;
+    )
+    .map_err(|refused| (refused, None))?;
     Ok(target)
+}
+
+fn classified_engine_error(error: OmniError) -> (ApiError, Option<blob_transport::RedactedCause>) {
+    let cause = blob_transport::RedactedCause::of(&error);
+    (ApiError::from_omni(error), Some(cause))
 }
 
 #[utoipa::path(
@@ -3113,6 +3133,15 @@ mod blob_error_tests {
             None,
         )
         .into_response();
+        // A target-resolution engine failure keeps its class: the classified
+        // resolver maps the error and its cause together.
+        let (mapped, cause) =
+            classified_engine_error(OmniError::Storage(omnigraph::error::StorageFailure::new(
+                omnigraph::error::StorageFailureKind::Permanent,
+                "storage: GET s3://private-bucket/graph/__manifest/_versions/9.manifest",
+            )));
+        let target_storage = redact_blob_api_error(mapped, "target", cause).into_response();
+        assert_eq!(target_storage.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -3130,6 +3159,8 @@ mod blob_error_tests {
             r#"error_variant="BlobIntegrity""#,
             r#"stage="target""#,
             r#"error_variant="unclassified""#,
+            r#"stage="target" error_variant="Storage""#,
+            "storage_kind=Some(Permanent)",
         ] {
             assert!(logs.contains(expected), "missing {expected}: {logs}");
         }

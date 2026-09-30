@@ -2463,8 +2463,10 @@ async fn filtered_scan_projects_blob_descriptors_on_indexed_multi_fragment_table
     }
 
     /// The exact `read_blob_at` scan. Returns the one selected row's stable
-    /// row id and descriptor children, or `None` when no row matched.
-    async fn read_blob_at_scan(ds: &Dataset, id: &str) -> Option<(u64, u8, u64, String)> {
+    /// row id, the descriptor's own validity (the null signal the engine's
+    /// descriptor decoder reads) and its children, or `None` when no row
+    /// matched.
+    async fn read_blob_at_scan(ds: &Dataset, id: &str) -> Option<(u64, bool, u8, u64, String)> {
         let mut scanner = ds.scan();
         scanner.project(&["content"]).unwrap();
         scanner.filter_expr(col("id").eq(lit(id.to_string())));
@@ -2507,6 +2509,7 @@ async fn filtered_scan_projects_blob_descriptors_on_indexed_multi_fragment_table
             "a filtered descriptor scan must keep all five Blob-v2 descriptor children"
         );
         let row_id = batch.column(1).as_primitive::<UInt64Type>().value(0);
+        let valid = descriptor.is_valid(0);
         let kind = descriptor
             .column_by_name("kind")
             .unwrap()
@@ -2528,7 +2531,7 @@ async fn filtered_scan_projects_blob_descriptors_on_indexed_multi_fragment_table
             .as_string::<i32>()
             .value(0)
             .to_string();
-        Some((row_id, kind, size, uri))
+        Some((row_id, valid, kind, size, uri))
     }
 
     async fn assert_contract(
@@ -2540,9 +2543,16 @@ async fn filtered_scan_projects_blob_descriptors_on_indexed_multi_fragment_table
     ) {
         let shared = Arc::new(ds.clone());
         for (id, value) in live {
-            let (row_id, kind, size, uri) = read_blob_at_scan(ds, id)
+            let (row_id, valid, kind, size, uri) = read_blob_at_scan(ds, id)
                 .await
                 .unwrap_or_else(|| panic!("{case}: id '{id}' must match exactly one row"));
+            // The scanned descriptor itself distinguishes null from a valid
+            // empty value; the separate take_blobs below cross-checks it.
+            assert_eq!(
+                valid,
+                !matches!(value, BlobValue::Null),
+                "{case}: '{id}' descriptor validity in the filtered scan"
+            );
             let file = shared
                 .take_blobs(&[row_id], "content")
                 .await
@@ -2557,6 +2567,7 @@ async fn filtered_scan_projects_blob_descriptors_on_indexed_multi_fragment_table
                 BlobValue::Bytes(bytes) => {
                     let file = file.unwrap_or_else(|| panic!("{case}: '{id}' is not null"));
                     assert_ne!(kind, BlobKind::External as u8, "{case}: '{id}' is managed");
+                    // A valid empty value is a valid descriptor of size 0.
                     assert_eq!(size, bytes.len() as u64, "{case}: '{id}' descriptor size");
                     assert_eq!(file.size(), bytes.len() as u64, "{case}: '{id}' file size");
                     assert_eq!(
