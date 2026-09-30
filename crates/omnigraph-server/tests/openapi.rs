@@ -650,10 +650,10 @@ fn openapi_blob_documents_binary_redirect_conditional_and_range_contracts() {
     }
     assert!(head["responses"].get("206").is_none());
     assert!(head["responses"].get("416").is_none());
-    for status in ["400", "401", "403", "404", "412", "500"] {
+    for (status, response) in head["responses"].as_object().unwrap() {
         assert!(
-            head["responses"][status].get("content").is_none(),
-            "HEAD /blob {status} must not promise a JSON body that Axum strips"
+            response.get("content").is_none(),
+            "HEAD /blob {status} must not promise a body that Axum strips"
         );
     }
 
@@ -1624,6 +1624,7 @@ fn error_code_schema_has_expected_variants() {
             "method_not_allowed",
             "conflict",
             "too_many_requests",
+            "service_unavailable",
             "internal",
         ]),
         "ErrorCode must match the closed v0.12 HTTP contract, including its \
@@ -2627,6 +2628,12 @@ fn openapi_describes_api_contract_admission_and_response_identity() {
                 assert!(contract_parameters.is_empty(), "{method} {path}");
             }
             for (status, response) in operation["responses"].as_object().unwrap() {
+                if method == "head" {
+                    assert!(
+                        response.get("content").is_none(),
+                        "HEAD {path} {status} must not promise a response body"
+                    );
+                }
                 let contract = &response["headers"][HTTP_API_CONTRACT_HEADER];
                 if oauth {
                     assert!(contract.is_null(), "{method} {path} {status}");

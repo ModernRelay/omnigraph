@@ -1028,3 +1028,326 @@ rules:
         );
     }
 }
+
+/// Exercise the production listener and shutdown driver in a contained process.
+/// A no-op schema pass holds the engine's schema gate so the HTTP write
+/// parks at an async acquire; a blocking HTTP seam would keep the connection
+/// alive by itself and could hide missing request ownership.
+#[cfg(unix)]
+mod owned_shutdown {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{Shutdown, TcpStream};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const ROOT: &str = "OMNIGRAPH_OWNED_SHUTDOWN_TEST_ROOT";
+    const MODE: &str = "OMNIGRAPH_OWNED_SHUTDOWN_TEST_MODE";
+
+    struct ContainedChild(Child);
+    impl Drop for ContainedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn wait_marker(path: &Path, child: &mut Child) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !path.exists() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "child exited before {}",
+                path.display()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "never reached {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn send_mutation(address: &str, name: &str) -> TcpStream {
+        let mut socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let body = serde_json::json!({
+            "query": MUTATION_QUERIES, "name":"insert_person", "params":{"name":name,"age":17}
+        })
+        .to_string();
+        write!(socket,
+            "POST /graphs/owned/mutate HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Type: application/json\r\n{HTTP_API_CONTRACT_HEADER}: {HTTP_API_CONTRACT}\r\nContent-Length: {}\r\n\r\n{body}", body.len()
+        ).unwrap();
+        socket.flush().unwrap();
+        socket
+    }
+
+    fn server_config(root: &Path, grace: Duration) -> omnigraph_server::ServerConfig {
+        let graph = graph_path(root);
+        omnigraph_server::ServerConfig {
+            mode: omnigraph_server::ServerConfigMode::Multi {
+                graphs: vec![omnigraph_server::GraphStartupConfig {
+                    graph_id: "owned".into(),
+                    uri: graph.to_string_lossy().into_owned(),
+                    policy: None,
+                    embedding: None,
+                    external_blob_policy: Default::default(),
+                    queries: Default::default(),
+                }],
+                config_path: root.join("cluster.yaml"),
+                server_policy: None,
+            },
+            bind: "127.0.0.1:0".into(),
+            allow_unauthenticated: true,
+            require_all_graphs: true,
+            witness: Default::default(),
+            shutdown_grace: grace,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "instrument: subprocess helper for disconnected_write_and_shutdown_share_ownership"]
+    async fn owned_server_child() {
+        let Some(root) = std::env::var_os(ROOT).map(PathBuf::from) else {
+            return;
+        };
+        let mode = std::env::var(MODE).unwrap();
+        let cutoff = mode == "cutoff";
+        if mode.starts_with("panic-") {
+            use omnigraph::seams::catalog::{
+                GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT, GRAPH_PUBLISH_BEFORE_COMMIT_APPEND,
+            };
+            let seam = if mode == "panic-before" {
+                &GRAPH_PUBLISH_BEFORE_COMMIT_APPEND
+            } else {
+                &GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT
+            };
+            let fault_root = root.clone();
+            let _guard = seam.observe(move || {
+                fs::write(fault_root.join("fault-reached"), b"reached").unwrap();
+                panic!("contained owned-server engine panic");
+            });
+            let _ = omnigraph_server::serve(server_config(&root, Duration::from_secs(10))).await;
+            fs::write(root.join("serve-returned"), b"returned").unwrap();
+            std::process::exit(91);
+        }
+        let graph = graph_path(&root);
+        let direct = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+        use omnigraph::seams::catalog::{
+            MUTATION_POST_STAGE_PRE_EFFECT_GATE, SCHEMA_APPLY_POST_SENTINEL,
+        };
+        let (hold_guard, hold) = SCHEMA_APPLY_POST_SENTINEL.hold();
+        let observed_root = root.clone();
+        let staged_hold = hold.clone();
+        let stage_guard = MUTATION_POST_STAGE_PRE_EFFECT_GATE.observe(move || {
+            // Stage against the accepted snapshot first, then interleave a
+            // no-op schema pass. It takes the exclusive gate without changing
+            // HEAD, so the HTTP write parks asynchronously on that gate after
+            // this callback returns. Blocking the HTTP worker itself would
+            // hide cancellation behind a connection that never gets polled.
+            fs::write(observed_root.join("start-holder"), b"start").unwrap();
+            staged_hold.wait_until_reached();
+            fs::write(observed_root.join("http-staged"), b"reached").unwrap();
+        });
+        let control_root = root.clone();
+        let observed_hold = hold.clone();
+        std::thread::spawn(move || {
+            observed_hold.wait_until_reached();
+            fs::write(control_root.join("holder-reached"), b"reached").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !control_root.join("release").exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            observed_hold.release();
+        });
+        let direct_root = root.clone();
+        let direct_task = tokio::spawn(async move {
+            while !direct_root.join("start-holder").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let result = direct
+                .apply_schema(&fs::read_to_string(fixture("test.pg")).unwrap())
+                .await
+                .unwrap();
+            assert!(!result.applied, "the gate holder must not move graph HEAD");
+        });
+        let signal_root = root.clone();
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        tokio::spawn(async move {
+            terminate.recv().await.unwrap();
+            fs::write(signal_root.join("signal-observed"), b"observed").unwrap();
+        });
+        let result = omnigraph_server::serve(server_config(
+            &root,
+            Duration::from_secs(if cutoff { 2 } else { 10 }),
+        ))
+        .await;
+        // Immediate exit makes a premature serve return observable even if a
+        // blocked runtime worker would otherwise delay Tokio's destructor.
+        fs::write(root.join("serve-returned"), b"returned").unwrap();
+        if result.is_err() || !root.join("release").exists() || cutoff {
+            std::process::exit(91);
+        }
+        direct_task.await.unwrap();
+        assert!(!hold.timed_out());
+        drop(stage_guard);
+        drop(hold_guard);
+        std::process::exit(0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_write_and_shutdown_share_ownership() {
+        for mode in ["finish", "cutoff", "panic-before", "panic-after"] {
+            let cutoff = mode == "cutoff";
+            let panic = mode.starts_with("panic-");
+            let temp = init_loaded_graph().await;
+            let root = temp.path();
+            let graph = graph_path(root);
+            let before = Omnigraph::open_read_only(graph.to_str().unwrap())
+                .await
+                .unwrap()
+                .list_commits(None)
+                .await
+                .unwrap()
+                .len();
+            let mut child = ContainedChild(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "owned_shutdown::owned_server_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env(ROOT, root)
+                    .env(MODE, mode)
+                    .env("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", "{}")
+                    .env_remove("OMNIGRAPH_SERVER_BEARER_TOKEN")
+                    .env_remove("OMNIGRAPH_SERVER_BEARER_TOKENS_FILE")
+                    .env_remove("OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET")
+                    .env("OMNIGRAPH_PER_ACTOR_INFLIGHT_MAX", "1")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .unwrap(),
+            );
+            let stdout = child.0.stdout.take().unwrap();
+            let (listen_tx, listen_rx) = std::sync::mpsc::channel();
+            let output_thread = std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if let Some(address) = line.strip_prefix(omnigraph_server::LISTEN_ADDR_PREFIX) {
+                        let _ = listen_tx.send(address.to_string());
+                    }
+                }
+            });
+            let address = listen_rx
+                .recv_timeout(Duration::from_secs(15))
+                .expect("production listener did not start");
+            let fault_started = Instant::now();
+            if panic {
+                let mut response = String::new();
+                // The response may be lost as fatal shutdown begins; the
+                // fault marker and process exit are the independent oracle.
+                let _ = send_mutation(&address, "Uncertain").read_to_string(&mut response);
+                wait_marker(&root.join("fault-reached"), &mut child.0);
+            } else {
+                let socket = send_mutation(&address, "Disconnected");
+                wait_marker(&root.join("http-staged"), &mut child.0);
+                socket.shutdown(Shutdown::Both).unwrap();
+                drop(socket);
+                // Give the real connection closure a turn; the next request must
+                // still find the disconnected write's actor reservation occupied.
+                std::thread::sleep(Duration::from_millis(100));
+                let mut refused = String::new();
+                send_mutation(&address, "MustNotRun")
+                    .read_to_string(&mut refused)
+                    .unwrap();
+                assert!(refused.starts_with("HTTP/1.1 429"), "{refused}");
+                assert!(refused.contains("too_many_requests"), "{refused}");
+                assert_eq!(
+                    unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) },
+                    0
+                );
+                wait_marker(&root.join("signal-observed"), &mut child.0);
+                std::thread::sleep(Duration::from_millis(100));
+                assert!(
+                    !root.join("serve-returned").exists(),
+                    "serve returned while its disconnected write was pending"
+                );
+                assert!(child.0.try_wait().unwrap().is_none());
+                if !cutoff {
+                    fs::write(root.join("release"), b"release").unwrap();
+                }
+            }
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let status = loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "shutdown did not finish within its process bound"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert_eq!(
+                status.code(),
+                Some(if mode == "finish" { 0 } else { 2 }),
+                "mode={mode}"
+            );
+            if panic {
+                assert!(
+                    fault_started.elapsed() < Duration::from_secs(5),
+                    "fatal completion should exit after known owners drain, before the ten-second watchdog"
+                );
+                assert!(
+                    !root.join("signal-observed").exists(),
+                    "fatal exit must not need SIGTERM"
+                );
+                assert!(
+                    !root.join("serve-returned").exists(),
+                    "uncertain owner must never be a clean serve return"
+                );
+            }
+            output_thread.join().unwrap();
+            if panic {
+                let db = Omnigraph::open_read_only(graph.to_str().unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    db.list_commits(None).await.unwrap().len(),
+                    before + usize::from(mode == "panic-after"),
+                    "mode={mode}"
+                );
+                continue;
+            }
+            let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
+            assert_eq!(
+                db.list_commits(None).await.unwrap().len(),
+                before + if cutoff { 0 } else { 1 }
+            );
+            let rows = db
+                .query(
+                    omnigraph::db::ReadTarget::branch("main"),
+                    "query q() { match { $p: Person } return { $p.name } }",
+                    "q",
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            let names = rows.to_rust_json().unwrap().to_string();
+            assert_eq!(names.contains("Disconnected"), !cutoff, "{names}");
+            assert!(
+                !names.contains("MustNotRun"),
+                "refused work published: {names}"
+            );
+        }
+    }
+}

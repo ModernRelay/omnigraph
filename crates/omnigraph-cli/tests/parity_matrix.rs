@@ -610,6 +610,42 @@ fn parity_load() {
         "bulk Overwrite remote arm failed: {r:?}"
     );
     assert_write_parity("load --mode overwrite above keyed limit", &l, &r);
+
+    // The engine creates --from's branch before parsing the load payload. A
+    // later refusal must describe the whole invocation, never imply that the
+    // branch was not created or that the load can be blindly replayed.
+    std::fs::write(&data, "not valid graph NDJSON\n").unwrap();
+    let (l, r) = p.run(&[
+        "load",
+        "--mode",
+        "append",
+        "--data",
+        data.to_str().unwrap(),
+        "--branch",
+        "partial-load",
+        "--from",
+        "main",
+        "--json",
+    ]);
+    for (arm, output) in [("local", &l), ("remote", &r)] {
+        assert_eq!(output.status.code(), Some(1), "{arm}: {output:?}");
+        let output = parse_stdout_json(output);
+        assert_eq!(output["command_outcome"]["execution"], "unknown", "{arm}");
+        assert_eq!(output["command_outcome"]["effects"], "unknown", "{arm}");
+        assert_ne!(output["command_outcome"]["action"], "retry", "{arm}");
+    }
+    let (l, r) = p.run(&["branch", "list", "--json"]);
+    assert_parity("compound load retained the created branch", &l, &r);
+    for output in [&l, &r] {
+        let payload = parse_stdout_json(output);
+        assert!(
+            payload["branches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name == "partial-load")
+        );
+    }
 }
 
 #[test]

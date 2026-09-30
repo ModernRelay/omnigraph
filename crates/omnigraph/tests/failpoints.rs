@@ -10,7 +10,7 @@ use arrow_array::{Int32Array, RecordBatch, StringArray};
 use arrow_schema::Schema;
 use lance::Dataset;
 use omnigraph::db::{Omnigraph, ReadTarget, StagingVerdict};
-use omnigraph::error::{ManifestErrorKind, OmniError};
+use omnigraph::error::{CompletionEvidence, ManifestErrorKind, OmniError};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
 use omnigraph::seams::FailScenario;
@@ -2890,8 +2890,52 @@ async fn metadata_only_schema_apply_post_publish_failure_heals_on_next_write() {
     assert!(dir.path().join("__schema_state.json.staging").exists());
     assert_no_recovery_sidecars(dir.path());
 
-    // The next write's entry heal finds the recorded commit in lineage,
-    // installs the contract and releases the dead apply's sentinel.
+    // A validation-shaped error while completing this already-published
+    // contract is not a fresh mutation's ordinary pre-effect refusal.
+    let staging_path = dir.path().join("_schema.pg.staging");
+    let staged_source = std::fs::read(&staging_path).unwrap();
+    std::fs::write(&staging_path, "node {").unwrap();
+    let blocked = mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "blocked")], &[("$age", 12)]),
+    )
+    .await
+    .unwrap_err();
+    std::fs::write(&staging_path, staged_source).unwrap();
+    assert_eq!(
+        blocked.completion_evidence(),
+        Some(CompletionEvidence::Uncertain),
+        "published schema completion dominates a validation-shaped cause: {blocked}"
+    );
+
+    // Completion succeeds before native branch-name validation. The whole
+    // command cannot claim no effects, but its validation cause stays nonfatal.
+    let invalid_branch = db.branch_create_from("main", "bad?name").await.unwrap_err();
+    assert_eq!(invalid_branch.completion_evidence(), None);
+    assert!(
+        matches!(invalid_branch, OmniError::Manifest(ref error)
+            if error.kind == omnigraph::error::ManifestErrorKind::BadRequest),
+        "completed pending work must leave an ordinary name refusal: {invalid_branch}"
+    );
+
+    // Completion succeeds before the next mutation's ordinary validation
+    // refusal. Prior successful work is neither an effect-free command nor
+    // evidence of uncertain completion.
+    let invalid = mutate_main(&db, MUTATION_QUERIES, "missing_mutation", &params(&[]))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        invalid.completion_evidence(),
+        None,
+        "successful completion does not poison later validation: {invalid}"
+    );
+    assert_no_staging_files(dir.path());
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 0);
+
+    // The same handle now admits the ordinary write against the installed
+    // contract, with the dead apply's sentinel released.
     db.load_jsonl(
         "{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n",
         LoadMode::Append,
@@ -2907,6 +2951,37 @@ async fn metadata_only_schema_apply_post_publish_failure_heals_on_next_write() {
     db.apply_schema(&indexed_schema)
         .await
         .expect("the released sentinel admits the next apply, a no-op here");
+
+    let before_refusal = db.list_commits(None).await.unwrap();
+    let refused = {
+        let _release_failure = catalog::BRANCH_DELETE_POST_ARCHIVE.fire_always();
+        db.apply_schema("node {").await.unwrap_err()
+    };
+    assert_eq!(
+        refused.completion_evidence(),
+        Some(CompletionEvidence::Uncertain),
+        "failed sentinel completion must dominate the primary validation refusal: {refused}"
+    );
+    assert_eq!(db.list_commits(None).await.unwrap(), before_refusal);
+    db.apply_schema(&indexed_schema)
+        .await
+        .expect("the next apply completes the failed sentinel release on the same handle");
+
+    db.branch_create("blocks-schema").await.unwrap();
+    let refused = {
+        let _release_failure = catalog::BRANCH_DELETE_POST_ARCHIVE.fire_always();
+        db.apply_schema(&indexed_schema).await.unwrap_err()
+    };
+    assert_eq!(
+        refused.completion_evidence(),
+        Some(CompletionEvidence::Uncertain),
+        "failed sentinel completion must dominate the mono-branch refusal: {refused}"
+    );
+    assert_eq!(db.list_commits(None).await.unwrap(), before_refusal);
+    db.branch_delete("blocks-schema").await.unwrap();
+    db.apply_schema(&indexed_schema)
+        .await
+        .expect("the mono-branch refusal's pending release also heals on the same handle");
 }
 
 #[tokio::test]
@@ -5569,6 +5644,25 @@ async fn branch_merge_fences_target_delete_recreate_aba() {
         (&old_entry.dataset_path, old_entry.published_dataset_version),
         "the regression fixture must exercise same-path/same-version ABA"
     );
+
+    // A fault at the same return boundary can lose an already-published
+    // result. It must not masquerade as an ordinary pre-effect refusal.
+    drop(return_rv);
+    let before_lost_receipt = branch_head_commit_id(dir.path(), "target").await.unwrap();
+    let lost = {
+        let _failure = catalog::BRANCH_MERGE_PRE_RETURN.fail_once_at(1);
+        reopened.branch_merge("source", "target").await.unwrap_err()
+    };
+    assert_eq!(
+        lost.completion_evidence(),
+        Some(CompletionEvidence::Uncertain),
+        "post-publication receipt failure must retain uncertainty: {lost}"
+    );
+    assert_ne!(
+        branch_head_commit_id(dir.path(), "target").await.unwrap(),
+        before_lost_receipt,
+        "the injected receipt failure must follow a real publication"
+    );
 }
 
 /// `sync_branch` replaces a handle's active coordinator. It must join the same
@@ -7614,9 +7708,9 @@ async fn live_handle_keeps_writing_after_persistent_ack_loss_stops() {
 /// family the failure-window matrix does not already cover with its
 /// same-handle actor, fail the family's driver once at the seam on a live
 /// handle, then prove the SAME handle's next ordinary write succeeds —
-/// without reopening. The driver's own outcome is recorded, not asserted
-/// (some seams absorb, some drivers may not reach an armed seam); the
-/// liveness insert is the contract.
+/// without reopening. Most driver outcomes are recorded (some seams absorb,
+/// some drivers may not reach an armed seam); the post-archive deletion row
+/// also owns its completion evidence. The liveness insert is the common contract.
 #[tokio::test]
 #[serial]
 async fn live_handle_writes_after_every_write_family_seam_failure() {
@@ -7763,9 +7857,19 @@ async fn live_handle_writes_after_every_write_family_seam_failure() {
             Driver::BranchDelete => {
                 let name = format!("lv_d{index}");
                 db.branch_create(&name).await.expect("delete-row setup");
-                db.branch_delete(&name)
-                    .await
-                    .map_err(|error| error.to_string())
+                let commits_before = db.list_commits(Some("main")).await.unwrap();
+                let result = db.branch_delete(&name).await;
+                if *seam == "branch_delete.post_archive" {
+                    let error = result.as_ref().expect_err("post-archive fault is reached");
+                    assert_eq!(
+                        error.completion_evidence(),
+                        Some(CompletionEvidence::Uncertain),
+                        "retirement published before completion failed: {error}"
+                    );
+                    assert!(!db.branch_list().await.unwrap().contains(&name));
+                    assert_eq!(db.list_commits(Some("main")).await.unwrap(), commits_before);
+                }
+                result.map_err(|error| error.to_string())
             }
             Driver::BranchMutate => {
                 let name = format!("lv_m{index}");

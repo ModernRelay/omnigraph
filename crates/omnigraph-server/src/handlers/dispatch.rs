@@ -201,6 +201,7 @@ pub(super) async fn run_branch_statement(
     handle: &GraphHandle,
     session: &Session,
     actor: Option<&AuthenticatedActor>,
+    ingress: IngressLease,
     write: BranchWrite,
 ) -> std::result::Result<ChangeOutput, ApiError> {
     let query_name = write.statement_name().to_string();
@@ -208,7 +209,7 @@ pub(super) async fn run_branch_statement(
     let (branch, commit, outcome) = match write {
         BranchWrite::Create { name, from } => {
             let from = from.unwrap_or_else(|| "main".to_string());
-            branch_create_body(state, handle, actor, &from, &name).await?;
+            branch_create_body(state, handle, actor, ingress, &from, &name).await?;
             (
                 name.clone(),
                 None,
@@ -216,7 +217,7 @@ pub(super) async fn run_branch_statement(
             )
         }
         BranchWrite::Delete { name } => {
-            branch_delete_body(state, handle, actor, &name).await?;
+            branch_delete_body(state, handle, actor, ingress, &name).await?;
             (
                 name.clone(),
                 None,
@@ -225,7 +226,8 @@ pub(super) async fn run_branch_statement(
         }
         BranchWrite::Merge { source, into } => {
             let target = into.unwrap_or_else(|| "main".to_string());
-            let result = branch_merge_body(state, handle, session, actor, &source, &target).await?;
+            let result =
+                branch_merge_body(state, handle, session, actor, ingress, &source, &target).await?;
             let merge = result.outcome.into();
             let commit = result.commit.as_ref().map(api::commit_output);
             (

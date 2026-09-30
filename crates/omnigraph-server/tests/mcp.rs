@@ -1,10 +1,13 @@
 //! MCP is another authenticated read transport over the native policy handlers.
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::Poll;
 
 use axum::Router;
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Request, StatusCode};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use futures::StreamExt as _;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use omnigraph_server::AppState;
 use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
@@ -57,7 +60,7 @@ fn trust(root: &std::path::Path) -> Arc<OidcIdentityTrust> {
     OidcIdentityTrust::read(&path, &canonical_root).unwrap()
 }
 
-async fn fixture_app() -> (tempfile::TempDir, Router) {
+async fn fixture_app() -> (tempfile::TempDir, Router, AppState) {
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
     let policy = temp.path().join("policy.yaml");
@@ -88,7 +91,7 @@ async fn fixture_app() -> (tempfile::TempDir, Router) {
     .await
     .unwrap()
     .with_oidc_identity_trust(trust(temp.path()));
-    (temp, omnigraph_server::build_app(state))
+    (temp, omnigraph_server::build_app(state.clone()), state)
 }
 
 fn rpc(token: Option<&str>, method: &str, params: Value) -> Request<Body> {
@@ -128,7 +131,7 @@ async fn call(app: &Router, token: &str, tool: &str, arguments: Value) -> Value 
 
 #[tokio::test]
 async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutations() {
-    let (temp, app) = fixture_app().await;
+    let (temp, app, _state) = fixture_app().await;
     let alice = token("alice", RESOURCE);
     let bob = token("bob", RESOURCE);
     let response=app.clone().oneshot(rpc(Some(&alice),"initialize",json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}))).await.unwrap();
@@ -224,13 +227,25 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
 
 #[tokio::test]
 async fn mcp_authenticates_every_request_and_enforces_resource_and_http_bounds() {
-    let (_temp, app) = fixture_app().await;
+    let (_temp, app, _state) = fixture_app().await;
+    let polls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&polls);
+    let (parts, _) = rpc(None, "tools/list", json!({})).into_parts();
+    let untrusted_body = Body::from_stream(futures::stream::poll_fn(move |_| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        Poll::Ready(None::<Result<Bytes, std::io::Error>>)
+    }));
     let response = app
         .clone()
-        .oneshot(rpc(None, "tools/list", json!({})))
+        .oneshot(Request::from_parts(parts, untrusted_body))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        0,
+        "authentication must precede collection"
+    );
     assert!(!response.headers().contains_key(HTTP_API_CONTRACT_HEADER));
     assert_eq!(
         response.headers()["www-authenticate"],
@@ -327,6 +342,74 @@ async fn mcp_authenticates_every_request_and_enforces_resource_and_http_bounds()
             .unwrap()
             .status(),
         StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn mcp_shares_response_lifetimes_closed_admission_and_the_status_lane() {
+    let (_temp, app, state) = fixture_app().await;
+    let alice = token("alice", RESOURCE);
+    let runtime = state.operation_runtime();
+    let response = app
+        .clone()
+        .oneshot(rpc(Some(&alice), "tools/list", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(runtime.snapshot().active_reads, 1);
+    // Even after the HTTP body is gone, its yielded bytes retain the observer.
+    let mut body = response.into_body().into_data_stream();
+    let bytes = body.next().await.unwrap().unwrap();
+    assert!(!bytes.is_empty());
+    drop(body);
+    assert_eq!(runtime.snapshot().active_reads, 1);
+    let held = (1..omnigraph_server::operations::DEFAULT_READ_OBSERVERS)
+        .map(|_| runtime.try_observe().unwrap())
+        .collect::<Vec<_>>();
+    let refused = app
+        .clone()
+        .oneshot(rpc(Some(&alice), "tools/list", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(!refused.headers().contains_key(HTTP_API_CONTRACT_HEADER));
+    let (status, ready) =
+        json_response(&app, Request::get("/readyz").body(Body::empty()).unwrap()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "saturated data admission must leave status available"
+    );
+    assert_eq!(ready["ready"], true);
+    drop(held);
+    drop(bytes);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            runtime.wait_logical_owners()
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(runtime.snapshot().active_reads, 0);
+    runtime.close();
+    let response = app
+        .clone()
+        .oneshot(rpc(Some(&alice), "tools/list", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(runtime.snapshot().active_reads, 0);
+    let (status, ready) =
+        json_response(&app, Request::get("/readyz").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(ready["ready"], false);
+    assert_eq!(
+        app.oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
     );
 }
 
