@@ -411,7 +411,7 @@ pub(super) async fn operation(args: &Args) -> serde_json::Value {
         post_ack_reclaim_wait_us, operation_complete_wall_us, operation_completion_peak_rss_bytes)
     }).await;
     if is_pointer_adoption(args) {
-        assert_eq!(merge_outcome, Some(MergeOutcome::FastForward));
+        assert_eq!(merge_outcome.as_ref().map(|result| result.outcome), Some(MergeOutcome::FastForward));
         assert_eq!(io.data_writes, 0, "pointer adoption must not write table objects");
         assert_eq!(probes.stage_fenced_insert_calls(), 0);
         assert_eq!(probes.stage_merge_insert_calls(), 0);
@@ -784,7 +784,8 @@ async fn prepare_cleanup(args: &Args, db: &Session, fixture: &mut Fixture) {
     assert_eq!(
         db.branch_merge("control-retained-parent", "main")
             .await
-            .unwrap(),
+            .unwrap()
+            .outcome,
         MergeOutcome::FastForward
     );
     db.load("main", &one_row(args, "main-only"), LoadMode::Append)
@@ -793,7 +794,8 @@ async fn prepare_cleanup(args: &Args, db: &Session, fixture: &mut Fixture) {
     assert_eq!(
         db.branch_merge("main", "control-retained-parent")
             .await
-            .unwrap(),
+            .unwrap()
+            .outcome,
         MergeOutcome::FastForward
     );
     let parent = fixture.required_parent.as_ref().unwrap();

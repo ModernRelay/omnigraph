@@ -1137,7 +1137,7 @@ pub(super) async fn fenced_adopt_operation(args: &Args) -> serde_json::Value {
         .checked_sub(operation_pre_peak_rss_bytes)
         .filter(|increase| *increase > 0);
     assert_eq!(
-        outcome,
+        outcome.outcome,
         MergeOutcome::FastForward,
         "all-new unchanged-target workload must take the adopt path"
     );
@@ -1965,7 +1965,7 @@ pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
     // The target always advanced after the fork, so this can never be a
     // fast-forward regardless of source shape.
     assert_eq!(
-        outcome,
+        outcome.outcome,
         MergeOutcome::Merged,
         "a diverged target must produce a three-way merge, not a fast-forward"
     );

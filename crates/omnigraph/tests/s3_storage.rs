@@ -122,7 +122,7 @@ async fn s3_branch_change_merge_flow_works() {
     assert_eq!(before_merge.num_rows(), 0);
 
     let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
 
     let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
     let after_merge = query_main(

@@ -12,6 +12,39 @@ use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
 
 use helpers::*;
 
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn warmed_wildcard_rechecks_members_after_schema_apply_issue_659() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let source = r#"query neighbor_since() {
+        match { $p: Person { name: "Alice" } $f: Person $p $e:* $f }
+        return { $f.name, $e.since }
+    }"#;
+    assert_eq!(
+        query_main(&db, source, "neighbor_since", &params(&[]))
+            .await
+            .unwrap()
+            .num_rows(),
+        2
+    );
+    let owner = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+    owner
+        .apply_schema(&format!("{TEST_SCHEMA}\nedge Likes: Person -> Person\n"))
+        .await
+        .unwrap();
+    let error = query_main(&db, source, "neighbor_since", &params(&[]))
+        .await
+        .expect_err("new member lacks the property");
+    let message = error.to_string();
+    assert!(
+        message.contains("since")
+            && message.contains("every selected edge")
+            && message.contains("Likes"),
+        "{message}"
+    );
+}
+
 async fn assert_exact_id_primary_key(db: &Omnigraph, table_key: &str) {
     let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let dataset = snapshot.open_dataset(table_key).await.unwrap();
@@ -262,7 +295,8 @@ query insert_project($name: String) {
         stale_handle
             .branch_merge("source", "target")
             .await
-            .expect("merge planning must use the schema-gated post-apply catalog"),
+            .expect("merge planning must use the schema-gated post-apply catalog")
+            .outcome,
         MergeOutcome::FastForward
     );
     assert_eq!(

@@ -1804,7 +1804,7 @@ graphs:
     assert!(output.status.success(), "graph load failed");
 
     let server = spawn_server_with_cluster(temp.path());
-    let client = reqwest::blocking::Client::new();
+    let client = graph_http_client();
     let queries: serde_json::Value = client
         .get(format!("{}/graphs/knowledge/queries", server.base_url))
         .send()
@@ -1872,7 +1872,7 @@ fn local_applied_empty_cluster_serves_exact_witness_and_empty_inventory() {
                 ("OMNIGRAPH_REQUIRE_ALL_GRAPHS", "true"),
             ],
         );
-        let client = Client::new();
+        let client = graph_http_client();
         let ready: Value = client
             .get(format!("{}/readyz", server.base_url))
             .send()
@@ -2081,7 +2081,7 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
     );
 
     // Phase 5: serve the applied revision.
-    let client = Client::new();
+    let client = graph_http_client();
     {
         let server = spawn_server_with_cluster(dir);
         let (status, body) = invoke_query(
@@ -2342,7 +2342,7 @@ policies:
             r#"{"act-admin":"admin-token","act-reader":"reader-token"}"#,
         )],
     );
-    let client = Client::new();
+    let client = graph_http_client();
     let get_graphs = |token: Option<&str>| {
         let mut request = client.get(format!("{}/graphs", server.base_url));
         if let Some(token) = token {
