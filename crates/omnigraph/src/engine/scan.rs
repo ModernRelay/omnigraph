@@ -235,11 +235,20 @@ pub(super) async fn execute_node_scan(
         ),
         _ => None,
     };
-    let mut use_index = match (nearest_target.as_ref(), known_matches) {
-        (Some(_), _) if search_mode.nearest_exact => false,
-        (Some((_, _, k)), Some(matches)) => matches > *k,
+    let policy = match nearest_target {
+        Some(_) => Some(search_mode.nearest_policy.ok_or_else(|| {
+            OmniError::manifest_internal("a nearest scan carries no declared policy")
+        })?),
+        None => None,
+    };
+    let mut use_index = match (nearest_target.as_ref(), known_matches, policy) {
+        (Some(_), _, _) if search_mode.nearest_exact => false,
+        (Some((_, _, k)), Some(matches), Some(policy)) => {
+            !(policy.flat_when_eligible_within_fetch && matches <= *k)
+        }
         _ => true,
     };
+    scan_report.probes.clear();
     let mut last_rung: Option<(usize, u64)> = None;
     let mut final_summary: Option<(Option<u64>, Option<u64>)> = None;
     let (batches, attempt_memory) = loop {
@@ -319,10 +328,19 @@ pub(super) async fn execute_node_scan(
             exhausted: !use_index || known_matches.is_some_and(|matches| rows >= matches),
             dataset_rows: type_rows,
         });
+        scan_report.probes.push(ProbeAttempt {
+            maximum_nprobes: probe_budget,
+            flat: !use_index,
+            rows,
+        });
         if !use_index {
             break (batches, attempt_memory);
         }
+        let Some(policy) = policy else {
+            break (batches, attempt_memory);
+        };
         match ladder_step(
+            policy,
             rows,
             *k,
             known_matches,

@@ -161,6 +161,7 @@ impl<'a> Lowering<'a> {
                     None => ranked.nprobes,
                 };
                 mode.nearest_exact = rung.is_some_and(|rung| rung.exact);
+                mode.nearest_policy = ranked.policy;
             }
             RankKind::Bm25 => {
                 let text = resolve_to_string(&ranked.query, self.params()).ok_or_else(|| {

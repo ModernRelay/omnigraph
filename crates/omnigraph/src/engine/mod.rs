@@ -178,10 +178,11 @@ async fn run_once(
     let lowered = lowering.lower_query(pass)?;
     lowered.record_in_memory_filters();
     let batch = run_plan(&lowered, lowering.plan, ctx).await?;
-    let report = *lowered
+    let report = lowered
         .report
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     let rows = pass_rows(&lowered, lowering.plan, rung)?;
     Ok((batch, report, rows))
 }
@@ -194,10 +195,10 @@ struct NearestScan<'p> {
     overfetch: &'p [OverfetchRung],
 }
 
-/// The two arms of an `rrf()` in arm order, and the pre-pass their
-/// `RankFuse` declares.
+/// An `rrf()` with both its arms: the `RankFuse` node and the pre-pass it
+/// declares.
 struct Fusion<'p> {
-    arms: [ArmTarget<'p>; 2],
+    id: NodeId,
     prefilter: &'p Prefilter,
 }
 
@@ -209,11 +210,11 @@ struct RankedScans<'p> {
 
 fn ranked_scans(plan: &PhysicalPlan) -> RankedScans<'_> {
     let mut nearest = None;
-    let mut arms: [Option<ArmTarget<'_>>; 2] = [None, None];
+    let mut arms = [false, false];
     let mut fuse = None;
     for (id, node) in plan.live() {
         if let PhysicalNode::RankFuse { prefilter, .. } = node {
-            fuse = Some(prefilter);
+            fuse = Some((id, prefilter));
             continue;
         }
         let PhysicalNode::Scan {
@@ -222,10 +223,6 @@ fn ranked_scans(plan: &PhysicalPlan) -> RankedScans<'_> {
         } = node
         else {
             continue;
-        };
-        let target = ArmTarget {
-            kind: ranked.kind,
-            property: &ranked.property,
         };
         match ranked.scope {
             RankScope::Order => {
@@ -237,17 +234,14 @@ fn ranked_scans(plan: &PhysicalPlan) -> RankedScans<'_> {
                     });
                 }
             }
-            RankScope::Primary => arms[0] = Some(target),
-            RankScope::Secondary => arms[1] = Some(target),
+            RankScope::Primary => arms[0] = true,
+            RankScope::Secondary => arms[1] = true,
         }
     }
     RankedScans {
         nearest,
         fusion: match (arms, fuse) {
-            ([Some(primary), Some(secondary)], Some(prefilter)) => Some(Fusion {
-                arms: [primary, secondary],
-                prefilter,
-            }),
+            ([true, true], Some((id, prefilter))) => Some(Fusion { id, prefilter }),
             _ => None,
         },
     }
@@ -427,8 +421,14 @@ pub(crate) async fn execute(
     let policy = bound.plan.assumptions().gate_policy;
     let lowering = Lowering::new(&bound, context);
     let RankedScans { nearest, fusion } = ranked_scans(&bound.plan);
-    if let Some(Fusion { arms, prefilter }) = fusion {
-        let eligible = Box::pin(rrf_prefilter_gate(context, arms, prefilter, policy)).await;
+    if let Some(Fusion { id, prefilter }) = fusion {
+        let (eligible, verdict) = Box::pin(rrf_prefilter_gate(context, prefilter, policy)).await;
+        let plan = if eligible.is_some() {
+            "prefilter"
+        } else {
+            "postfilter"
+        };
+        executed.decide(id, 0, report::Taken::gate(plan, &verdict));
         let mut pass = Pass::default();
         if let Some(ids) = eligible {
             for id in &prefilter.feeds {
@@ -454,15 +454,29 @@ pub(crate) async fn execute(
         ..
     }) = &nearest
     {
-        pass = match Box::pin(nearest_prefilter_gate(context, prefilter, policy)).await {
-            NearestGatePlan::Prefilter(ids) => pass.prefiltered(*id, ids),
-            NearestGatePlan::Postfilter => pass,
-            NearestGatePlan::ProvenEmpty => pass.proven_empty(*id),
+        let (plan, verdict) = Box::pin(nearest_prefilter_gate(context, prefilter, policy)).await;
+        let (taken, next) = match plan {
+            NearestGatePlan::Prefilter(ids) => ("prefilter", pass.prefiltered(*id, ids)),
+            NearestGatePlan::Postfilter => ("postfilter", pass),
+            NearestGatePlan::ProvenEmpty => ("proven_empty", pass.proven_empty(*id)),
         };
+        executed.decide(*id, 0, report::Taken::gate(taken, &verdict));
+        pass = next;
     }
 
     let (result_batch, report, rows) = Box::pin(run_once(&lowering, &ctx, &pass, 0)).await?;
     executed.record(rows);
+    if let Some(NearestScan { id, .. }) = &nearest
+        && !report.probes.is_empty()
+    {
+        executed.decide(
+            *id,
+            0,
+            report::Taken::Probes {
+                attempts: report.probes.clone(),
+            },
+        );
+    }
     let mut result_batch = result_batch;
     let mut report = report;
     let aggregate = bound
@@ -528,6 +542,15 @@ pub(crate) async fn execute(
                 let (retried, retried_report, rows) =
                     Box::pin(run_once(&lowering, &ctx, &wider, rung)).await?;
                 executed.record(rows);
+                if !retried_report.probes.is_empty() {
+                    executed.decide(
+                        id,
+                        rung,
+                        report::Taken::Probes {
+                            attempts: retried_report.probes.clone(),
+                        },
+                    );
+                }
                 result_batch = retried;
                 report = retried_report;
                 if let PassStep::Exact { k } = step {
@@ -712,6 +735,8 @@ mod traversal_admission_tests {
                 direction: Direction::Out,
             }],
             feeds,
+            on_empty: omnigraph_planner::EmptyEligible::ProvenEmpty,
+            coverage_admits: true,
         };
         let mut plan = selected_plan();
         let input = 0;
@@ -748,6 +773,7 @@ mod traversal_admission_tests {
                 overfetch: vec![],
                 prefilter: None,
                 eligibility: omnigraph_planner::Eligibility::BeforeScoring,
+                policy: Some(omnigraph_planner::NearestPolicy::DEFAULT),
             }),
         };
         validate_traversal_admission(&plan).unwrap();

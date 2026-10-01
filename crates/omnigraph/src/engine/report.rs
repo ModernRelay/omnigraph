@@ -89,9 +89,67 @@ impl ReportRow {
     }
 }
 
+/// One adaptive search decision the run took inside the policy its plan
+/// declares: a pre-pass gate's verdict with the facts it read, or the probe
+/// attempts of a `nearest` scan, in the overfetch pass `rung`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SearchDecision {
+    /// The ranked scan or fusion the decision belongs to.
+    pub(crate) id: NodeId,
+    pub(crate) rung: usize,
+    #[serde(flatten)]
+    pub(crate) taken: Taken,
+}
+
+/// What a [`SearchDecision`] took.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub(crate) enum Taken {
+    /// The gate's plan (`prefilter`, `postfilter` or `proven_empty`), the
+    /// fallback that decided a postfilter, and the counts it read.
+    Gate {
+        plan: &'static str,
+        fallback: Option<&'static str>,
+        forced: bool,
+        eligible: Option<u64>,
+        corpus: Option<u64>,
+    },
+    /// Every attempt of the scan's probe ladder, in order.
+    Probes {
+        attempts: Vec<super::search::ProbeAttempt>,
+    },
+}
+
+impl Taken {
+    /// The report form of a gate verdict under the plan the gate chose.
+    pub(super) fn gate(
+        plan: &'static str,
+        verdict: &crate::instrumentation::RrfGateVerdict,
+    ) -> Self {
+        use crate::instrumentation::RrfGateFallback;
+        Self::Gate {
+            plan,
+            fallback: verdict.fallback.map(|fallback| match fallback {
+                RrfGateFallback::Threshold => "threshold",
+                RrfGateFallback::Shape => "shape",
+                RrfGateFallback::Coverage => "coverage",
+                RrfGateFallback::BuildErr => "build_error",
+                RrfGateFallback::EmptyEligible => "empty_eligible",
+                RrfGateFallback::Forced => "forced",
+            }),
+            forced: verdict.forced,
+            eligible: verdict.eligible,
+            corpus: verdict.corpus,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 pub struct ExecutionReport {
     rows: Vec<ReportRow>,
+    /// The adaptive search decisions of the run, in the order taken.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    search: Vec<SearchDecision>,
 }
 
 impl ExecutionReport {
@@ -103,6 +161,11 @@ impl ExecutionReport {
     #[cfg(test)]
     pub(crate) fn row(&self, id: NodeId) -> Option<&ReportRow> {
         self.rows.iter().find(|row| row.id == id)
+    }
+
+    /// Record one adaptive search decision.
+    pub(super) fn decide(&mut self, id: NodeId, rung: usize, taken: Taken) {
+        self.search.push(SearchDecision { id, rung, taken });
     }
 
     /// Fold one pass in: a node met before gains the pass's attempt, and is

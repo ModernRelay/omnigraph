@@ -645,6 +645,15 @@ fn report_rows(report: &impl serde::Serialize) -> Vec<Value> {
         .clone()
 }
 
+/// The adaptive search decisions a run recorded: each gate's verdict with
+/// the counts it read, and each nearest scan's probe attempts per rung.
+fn search_decisions(report: &impl serde::Serialize) -> Vec<Value> {
+    serde_json::to_value(report).unwrap()["search"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// The rule a replay's trace is held to: `id`, `operator`, `status`, `rung`
 /// and `ran` repeat always; `actual_rows` repeats where both attempts were
 /// drained; `drained` itself is a scheduling fact and is not compared.
@@ -681,16 +690,19 @@ fn sides(rows: &[Value]) -> Vec<String> {
 }
 
 /// The first run and its replays: the result rows and the bound plan of the
-/// inspected run, and the report rows of the run and of the second replay.
+/// inspected run, its report rows and the search decisions it recorded.
 struct Replayed {
     result: Vec<Value>,
     plan: omnigraph_planner::BoundPlan,
     rows: Vec<Value>,
+    search: Vec<Value>,
 }
 
 /// One inspected run and two replays of its plan through the door (the plan
-/// read back through its mirrors); each returns the run's rows and trace, the
-/// second one proving the door's caches carry no state into a row.
+/// read back through its mirrors); each returns the run's rows, trace and
+/// search decisions (a gate re-establishes its verdict from the pins, and
+/// the ladder takes the same probe rungs), the second one proving the
+/// door's caches carry no state into a row.
 async fn replayed(db: &Session, source: &str, name: &str, params: &ParamMap) -> Replayed {
     let run = db
         .query_inspected(ReadTarget::branch("main"), source, name, params)
@@ -701,6 +713,7 @@ async fn replayed(db: &Session, source: &str, name: &str, params: &ParamMap) -> 
     assert_eq!(read_back.plan, run.plan, "the bound plan reads back equal");
     let result = rows_of(&run.result);
     let rows = report_rows(&run.report);
+    let search = search_decisions(&run.report);
     for _ in 0..2 {
         let replay = db
             .replay_bound_plan(ReadTarget::branch("main"), &envelope)
@@ -708,11 +721,13 @@ async fn replayed(db: &Session, source: &str, name: &str, params: &ParamMap) -> 
             .unwrap();
         assert_eq!(rows_of(&replay.result), result);
         assert_same_trace(&rows, &report_rows(&replay.report));
+        assert_eq!(search_decisions(&replay.report), search);
     }
     Replayed {
         result,
         plan: run.plan,
         rows,
+        search,
     }
 }
 
@@ -744,8 +759,9 @@ async fn a_hash_join_traversal_replays_with_its_switches() {
 async fn a_contains_join_with_a_residual_replays_through_its_marked_scan() {
     let dir = tempfile::tempdir().unwrap();
     let db = citations(&dir).await;
-    let Replayed { result, plan, rows } =
-        replayed(&db, CITATION_QUERIES, "cited", &ParamMap::new()).await;
+    let Replayed {
+        result, plan, rows, ..
+    } = replayed(&db, CITATION_QUERIES, "cited", &ParamMap::new()).await;
     assert_eq!(
         result,
         [
@@ -899,9 +915,31 @@ async fn a_nearest_ladder_replays_the_same_rungs() {
     let dir = tempfile::tempdir().unwrap();
     let db = docs(&dir).await;
     let params = ParamMap::from([("q".to_string(), Literal::List(vec![Literal::Float(0.0); 4]))]);
-    let Replayed { result, plan, rows } =
-        replayed(&db, DOC_QUERIES, "nearest_with_edge", &params).await;
+    let Replayed {
+        result,
+        plan,
+        rows,
+        search,
+    } = replayed(&db, DOC_QUERIES, "nearest_with_edge", &params).await;
     assert_eq!(result.len(), 3);
+    let decided: Vec<(&str, u64)> = search
+        .iter()
+        .map(|decision| {
+            (
+                decision["decision"].as_str().unwrap(),
+                decision["rung"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        decided.first(),
+        Some(&("gate", 0)),
+        "the edge's pre-pass gate decides first: {search:#?}"
+    );
+    assert!(
+        decided.iter().filter(|(kind, _)| *kind == "probes").count() == 2,
+        "every rung records its probe attempts: {search:#?}"
+    );
     let rungs: Vec<usize> = rows[0]["attempts"]
         .as_array()
         .unwrap()
@@ -925,8 +963,16 @@ async fn a_fusion_replays() {
     let db = docs(&dir).await;
     let mut params = ParamMap::from([("t".to_string(), Literal::String("needle".to_string()))]);
     params.insert("q".to_string(), Literal::List(vec![Literal::Float(0.0); 4]));
-    let Replayed { result, .. } = replayed(&db, DOC_QUERIES, "fused", &params).await;
+    let Replayed { result, search, .. } = replayed(&db, DOC_QUERIES, "fused", &params).await;
     assert_eq!(result.len(), 3);
+    assert_eq!(
+        search
+            .iter()
+            .filter(|decision| decision["decision"] == "gate")
+            .count(),
+        1,
+        "the fusion's gate records one verdict: {search:#?}"
+    );
 }
 
 #[tokio::test]

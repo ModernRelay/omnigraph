@@ -192,12 +192,59 @@ pub struct Hop {
 /// ids of `ranked_type` that have every hop in `hops` and ANDs them into the
 /// scans `feeds` names as `id IN (...)`, when the gate policy admits the set.
 /// Empty `hops` admits nothing: the run records the shape fallback and the
-/// scans run as planned.
+/// scans run as planned. Every hop is a required first hop of the query, so
+/// the eligible set holds every row that can survive the traversal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prefilter {
     pub ranked_type: String,
     pub hops: Vec<Hop>,
     pub feeds: Vec<NodeId>,
+    /// What an empty eligible set decides: the empty answer for a
+    /// standalone `nearest`, the unfiltered plan for a fusion.
+    pub on_empty: EmptyEligible,
+    /// Whether the recorded full-text coverage of every `bm25` scan in
+    /// `feeds` is full, the guard under which prefiltering keeps BM25
+    /// scores; true when it feeds no `bm25` scan.
+    pub coverage_admits: bool,
+}
+
+/// What a pre-pass's empty eligible set decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmptyEligible {
+    /// No row survives the traversal: the answer is empty and no scan runs.
+    ProvenEmpty,
+    /// The scans run unfiltered.
+    Postfilter,
+}
+
+/// The adaptive policy of a `nearest` scan, declared before it runs: what
+/// the scan may do after an attempt leaves it short of `fetch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NearestPolicy {
+    /// A short scan under a probe cap rescans under the cap times this,
+    /// and uncapped once that reaches the ranked partitions.
+    pub probe_factor: usize,
+    /// Rows the prefilter admitted at `_distance = +inf` (the partition
+    /// search did not reach them) are rescanned flat and exact.
+    pub flat_rescan_on_unreached: bool,
+    /// A short capped scan without Lance's partition counters rescans
+    /// uncapped (fail closed).
+    pub uncapped_on_missing_counters: bool,
+    /// A scan whose eligible set is no larger than `fetch` scores flat from
+    /// its first attempt.
+    pub flat_when_eligible_within_fetch: bool,
+}
+
+impl NearestPolicy {
+    /// The policy the planner declares: probe caps grow fourfold (20 → 80 →
+    /// 320 → none), and every fallback is on.
+    pub const DEFAULT: Self = Self {
+        probe_factor: 4,
+        flat_rescan_on_unreached: true,
+        uncapped_on_missing_counters: true,
+        flat_when_eligible_within_fetch: true,
+    };
 }
 
 impl Prefilter {
@@ -282,6 +329,8 @@ pub struct RankedAccess {
     /// `nearest` scan, whose candidate window is drawn from eligible rows;
     /// on a `bm25` scan before scoring only under recorded full coverage.
     pub eligibility: Eligibility,
+    /// The adaptive policy of a `nearest` scan; `None` on a `bm25` scan.
+    pub policy: Option<NearestPolicy>,
 }
 
 impl RankedAccess {
@@ -306,7 +355,10 @@ impl RankedAccess {
             "scope": self.scope,
         });
         match self.kind {
-            RankKind::Nearest => value["nprobes"] = json!(self.nprobes),
+            RankKind::Nearest => {
+                value["nprobes"] = json!(self.nprobes);
+                value["policy"] = json!(self.policy);
+            }
             RankKind::Bm25 => value["eligibility"] = json!(self.eligibility),
         }
         value

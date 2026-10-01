@@ -23,9 +23,9 @@ use crate::error::PlanError;
 use crate::logical::{ColumnRef, GqFilter, KeyJoinKind, Predicate, RuntimeFilterSpec, ScanSpec};
 use crate::operation::TableRef;
 use crate::physical::{
-    Assumptions, Eligibility, Estimate, Hop, NodeId, OrderKey, OverfetchRung, PhysicalNode,
-    PhysicalPlan, Prefilter, Properties, RankArm, RankKind, RankScope, RankedAccess, ScanInput,
-    StatisticSource,
+    Assumptions, Eligibility, EmptyEligible, Estimate, Hop, NearestPolicy, NodeId, OrderKey,
+    OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, Properties, RankArm, RankKind, RankScope,
+    RankedAccess, ScanInput, StatisticSource,
 };
 use crate::source::SideId;
 
@@ -740,6 +740,7 @@ pub struct RankedMirror {
     pub overfetch: Vec<OverfetchRung>,
     pub prefilter: Option<PrefilterMirror>,
     pub eligibility: Eligibility,
+    pub policy: Option<NearestPolicy>,
 }
 
 impl From<&RankedAccess> for RankedMirror {
@@ -754,6 +755,7 @@ impl From<&RankedAccess> for RankedMirror {
             overfetch: ranked.overfetch.clone(),
             prefilter: ranked.prefilter.as_ref().map(PrefilterMirror::from),
             eligibility: ranked.eligibility,
+            policy: ranked.policy,
         }
     }
 }
@@ -770,6 +772,7 @@ impl From<RankedMirror> for RankedAccess {
             overfetch: mirror.overfetch,
             prefilter: mirror.prefilter.map(Prefilter::from),
             eligibility: mirror.eligibility,
+            policy: mirror.policy,
         }
     }
 }
@@ -785,6 +788,8 @@ pub struct PrefilterMirror {
     pub ranked_type: String,
     pub hops: Vec<HopMirror>,
     pub feeds: Vec<NodeId>,
+    pub on_empty: EmptyEligible,
+    pub coverage_admits: bool,
 }
 
 impl From<&Prefilter> for PrefilterMirror {
@@ -800,6 +805,8 @@ impl From<&Prefilter> for PrefilterMirror {
                 })
                 .collect(),
             feeds: prefilter.feeds.clone(),
+            on_empty: prefilter.on_empty,
+            coverage_admits: prefilter.coverage_admits,
         }
     }
 }
@@ -817,6 +824,8 @@ impl From<PrefilterMirror> for Prefilter {
                 })
                 .collect(),
             feeds: mirror.feeds,
+            on_empty: mirror.on_empty,
+            coverage_admits: mirror.coverage_admits,
         }
     }
 }

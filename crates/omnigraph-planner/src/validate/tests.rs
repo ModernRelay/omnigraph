@@ -24,7 +24,9 @@ node Doc {
     title: String
     year: I64
     open: Bool
+    embedding: Vector(2)
 }
+edge Cites: Doc -> Doc
 "#;
 
 /// The bound-literal evaluator: literals and bound parameters through the
@@ -67,7 +69,7 @@ impl Fixture {
         let checked = CheckedQuery::check(&catalog, &decl).unwrap();
         let ir =
             omnigraph_compiler::lower_query(&catalog, checked.decl(), checked.types()).unwrap();
-        let mut source = MemorySource::default();
+        let mut source = MemorySource::default().with_edge_version("Cites", 1);
         for (name, node_type) in &catalog.node_types {
             source = source.with_node_type(
                 name,
@@ -476,4 +478,95 @@ fn an_exhausted_budget_is_a_resource_outcome() {
             value: 3
         }
     );
+}
+
+const NEAREST: &str = r#"query q($v: Vector(2)) {
+    match { $d: Doc $d cites $e }
+    return { $d.slug }
+    order { nearest($d.embedding, $v) }
+    limit 3
+}"#;
+
+fn nearest() -> Fixture {
+    Fixture::new(
+        NEAREST,
+        &[(
+            "v",
+            Literal::List(vec![Literal::Float(0.0), Literal::Float(1.0)]),
+        )],
+    )
+}
+
+/// The ranked scan of `plan` and its access, mutably.
+fn ranked_access(plan: &mut PhysicalPlan) -> &mut crate::physical::RankedAccess {
+    let id = node_ids(plan, |node| node.ranked().is_some())[0];
+    match plan.node_mut(id) {
+        Some(PhysicalNode::Scan {
+            ranked: Some(ranked),
+            ..
+        }) => ranked,
+        _ => unreachable!("the id names a ranked scan"),
+    }
+}
+
+#[test]
+fn a_nearest_plan_declares_its_policy_and_prepass() {
+    let fixture = nearest();
+    let mut plan = fixture.plan();
+    let access = ranked_access(&mut plan).clone();
+    assert_eq!(access.policy, Some(crate::physical::NearestPolicy::DEFAULT));
+    let prefilter = access
+        .prefilter
+        .expect("the edge from `$d` declares a pre-pass");
+    assert_eq!(
+        prefilter.on_empty,
+        crate::physical::EmptyEligible::ProvenEmpty
+    );
+    assert!(prefilter.coverage_admits);
+    assert_eq!(prefilter.hops.len(), 1);
+    fixture
+        .accept(plan)
+        .expect("the declared policy is accepted");
+}
+
+#[test]
+fn a_stalling_or_unguarded_ladder_fails_the_declared_policy() {
+    let fixture = nearest();
+    let breaks: [fn(&mut crate::physical::RankedAccess); 4] = [
+        |access| access.policy.as_mut().unwrap().probe_factor = 1,
+        |access| access.policy.as_mut().unwrap().flat_rescan_on_unreached = false,
+        |access| access.policy.as_mut().unwrap().uncapped_on_missing_counters = false,
+        |access| access.policy = None,
+    ];
+    for edit in breaks {
+        let mut plan = fixture.plan();
+        edit(ranked_access(&mut plan));
+        let (check, detail) = fixture.refused(plan);
+        assert_eq!(check, "declared policy", "{detail}");
+    }
+}
+
+#[test]
+fn a_prepass_off_the_required_hops_fails_the_declared_policy() {
+    let fixture = nearest();
+    let breaks: [fn(&mut crate::physical::Prefilter); 3] = [
+        |prefilter| prefilter.hops[0].edge_type = "Other".to_string(),
+        |prefilter| prefilter.on_empty = crate::physical::EmptyEligible::Postfilter,
+        |prefilter| prefilter.feeds.push(usize::MAX),
+    ];
+    for edit in breaks {
+        let mut plan = fixture.plan();
+        edit(ranked_access(&mut plan).prefilter.as_mut().unwrap());
+        let (check, detail) = fixture.refused(plan);
+        assert_eq!(check, "declared policy", "{detail}");
+    }
+}
+
+#[test]
+fn a_bm25_scan_with_a_nearest_policy_fails_the_declared_policy() {
+    let fixture = ranked();
+    let mut plan = fixture.plan();
+    ranked_access(&mut plan).policy = Some(crate::physical::NearestPolicy::DEFAULT);
+    let (check, detail) = fixture.refused(plan);
+    assert_eq!(check, "declared policy", "{detail}");
 }

@@ -25,8 +25,8 @@ use crate::logical::{ColumnRef, EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
 use crate::lower::ContainsJoinFields;
 use crate::optimizer::{RRF_NEAREST_ARM_K, derived_order};
 use crate::physical::{
-    Assumptions, Eligibility, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan, RankKind,
-    RankScope, RankedAccess,
+    Assumptions, Eligibility, EmptyEligible, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan,
+    RankKind, RankScope, RankedAccess,
 };
 use crate::source::FullTextCoverage;
 
@@ -140,6 +140,7 @@ impl Requirements {
         self.check_search(plan, &matcher, budget)?;
         self.check_returns(plan, &top, &matcher, budget)?;
         self.check_order_and_cut(plan, &top, &matcher, budget)?;
+        check_policies(plan, budget)?;
         Ok(())
     }
 
@@ -869,6 +870,173 @@ impl Requirements {
 }
 
 const SYSTEM_ID: &str = "@id";
+
+/// The adaptive search policies the plan declares (RFC 0047, "Execution and
+/// replay use the same acceptance path"): every `nearest` scan's probe
+/// ladder terminates and keeps its correctness fallbacks, and every
+/// pre-pass draws its eligible set from required first hops, feeds only the
+/// scans its kind may prefilter, decides an empty set as its kind must, and
+/// guards BM25 scans by their recorded coverage. The gate policy's
+/// thresholds are finite.
+fn check_policies(plan: &PhysicalPlan, budget: &mut Budget) -> Result<(), ValidationError> {
+    let policy = plan.assumptions().gate_policy;
+    if !policy.ratio.is_finite() || policy.ratio < 0.0 {
+        return Err(ValidationError::violated(
+            "declared policy",
+            format!(
+                "the gate admits by ratio {}, which is no finite share",
+                policy.ratio
+            ),
+        ));
+    }
+    for (id, node) in plan.live() {
+        budget.visit(1)?;
+        match node {
+            PhysicalNode::Scan {
+                ranked: Some(access),
+                spec,
+                ..
+            } => {
+                match (access.kind, access.policy) {
+                    (RankKind::Nearest, Some(policy)) => {
+                        if policy.probe_factor < 2
+                            || !policy.flat_rescan_on_unreached
+                            || !policy.uncapped_on_missing_counters
+                        {
+                            return Err(ValidationError::violated(
+                                "declared policy",
+                                format!(
+                                    "the nearest scan's policy {policy:?} lets its probe ladder stall or drops a fallback that keeps its rows in order"
+                                ),
+                            ));
+                        }
+                    }
+                    (RankKind::Bm25, None) => {}
+                    (kind, policy) => {
+                        return Err(ValidationError::violated(
+                            "declared policy",
+                            format!("a {kind:?} scan declares the nearest policy {policy:?}"),
+                        ));
+                    }
+                }
+                if let Some(prefilter) = &access.prefilter {
+                    if access.kind != RankKind::Nearest
+                        || access.scope != RankScope::Order
+                        || prefilter.feeds != [id]
+                        || prefilter.on_empty != EmptyEligible::ProvenEmpty
+                    {
+                        return Err(ValidationError::violated(
+                            "declared policy",
+                            "only a standalone nearest scan carries its own pre-pass, feeding itself and proving an empty eligible set empty",
+                        ));
+                    }
+                    let binding = spec.binding.as_deref().unwrap_or_default();
+                    check_prefilter(plan, plan.root(), binding, prefilter, budget)?;
+                }
+            }
+            PhysicalNode::RankFuse {
+                arms, prefilter, ..
+            } => {
+                if prefilter.on_empty != EmptyEligible::Postfilter {
+                    return Err(ValidationError::violated(
+                        "declared policy",
+                        "a fusion's empty eligible set proves nothing; its arms run unfiltered",
+                    ));
+                }
+                let mut admits = true;
+                for feed in &prefilter.feeds {
+                    match plan.node(*feed) {
+                        Some(PhysicalNode::Scan {
+                            spec,
+                            ranked: Some(ranked),
+                            ..
+                        }) if ranked.kind == RankKind::Bm25 => {
+                            admits &=
+                                plan.assumptions()
+                                    .full_text
+                                    .get(&Assumptions::full_text_key(
+                                        &spec.table.type_key,
+                                        &ranked.property,
+                                    ))
+                                    == Some(&FullTextCoverage::Full);
+                        }
+                        _ => {
+                            return Err(ValidationError::violated(
+                                "declared policy",
+                                "a fusion's pre-pass feeds only its bm25 arms",
+                            ));
+                        }
+                    }
+                }
+                if admits != prefilter.coverage_admits {
+                    return Err(ValidationError::violated(
+                        "prerequisite",
+                        format!(
+                            "the fusion's pre-pass claims coverage admits {}; the recorded coverage of its bm25 arms admits {admits}",
+                            prefilter.coverage_admits
+                        ),
+                    ));
+                }
+                check_prefilter(plan, arms[0].input, &arms[0].binding, prefilter, budget)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Every hop of a pre-pass is a required first hop of `binding` in the
+/// pipeline under `root`: a top-level traversal leaving the scanned binding
+/// over that one edge type in that direction, at least one hop long. Such
+/// an eligible set holds every row that can survive the traversal.
+fn check_prefilter(
+    plan: &PhysicalPlan,
+    root: NodeId,
+    binding: &str,
+    prefilter: &crate::physical::Prefilter,
+    budget: &mut Budget,
+) -> Result<(), ValidationError> {
+    if prefilter.hops.is_empty() {
+        return Ok(());
+    }
+    let nodes = pipeline(plan, root, budget)?;
+    let scanned = nodes.iter().any(|id| {
+        matches!(plan.node(*id), Some(PhysicalNode::Scan { spec, .. })
+            if spec.binding.as_deref() == Some(binding)
+                && spec.table.node_type_name() == Some(prefilter.ranked_type.as_str()))
+    });
+    let introduced = nodes.iter().any(
+        |id| matches!(plan.node(*id), Some(PhysicalNode::Expand { dst, .. }) if dst == binding),
+    );
+    if !scanned || introduced {
+        return Err(ValidationError::violated(
+            "declared policy",
+            format!(
+                "the pre-pass of `${binding}` filters a binding no scan of its type introduces"
+            ),
+        ));
+    }
+    for hop in &prefilter.hops {
+        let required = nodes.iter().any(|id| {
+            matches!(plan.node(*id), Some(PhysicalNode::Expand { src, edges, min_hops, .. })
+            if src == binding
+                && *min_hops > 0
+                && edges.named().is_some_and(|member| {
+                    member.edge_type == hop.edge_type && member.direction == hop.direction
+                }))
+        });
+        if !required {
+            return Err(ValidationError::violated(
+                "declared policy",
+                format!(
+                    "the pre-pass of `${binding}` requires a {} {:?} hop no traversal of the query requires",
+                    hop.edge_type, hop.direction
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Every node of `top` that projects the query's `return`.
 fn projections_of<'p>(plan: &'p PhysicalPlan, top: &[NodeId]) -> Vec<&'p Vec<IRProjection>> {

@@ -27,9 +27,9 @@ use crate::logical::{
 use crate::lower::ContainsJoinFields;
 use crate::operation::{Operation, Side};
 use crate::physical::{
-    Assumptions, Eligibility, Estimate, Hop, NodeId, OrderKey, OverfetchRung, PhysicalNode,
-    PhysicalPlan, Prefilter, Properties, RankArm, RankKind, RankScope, RankedAccess, ScanInput,
-    StatisticSource, TextContains,
+    Assumptions, Eligibility, EmptyEligible, Estimate, Hop, NearestPolicy, NodeId, OrderKey,
+    OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, Properties, RankArm, RankKind, RankScope,
+    RankedAccess, ScanInput, StatisticSource, TextContains,
 };
 use crate::source::{FullTextCoverage, NodeTypeSpec, PlanSource, SideId};
 use crate::validate::subset::{Role, Rule, Tracer};
@@ -2182,7 +2182,20 @@ impl Lowering<'_> {
         binding: &str,
         scan: NodeId,
         feeds: Vec<NodeId>,
+        on_empty: EmptyEligible,
     ) -> Result<Prefilter, PlanError> {
+        let coverage_admits = feeds.iter().all(|feed| match self.physical.node(*feed) {
+            Some(PhysicalNode::Scan {
+                spec,
+                ranked: Some(ranked),
+                ..
+            }) if ranked.kind == RankKind::Bm25 => {
+                self.source
+                    .full_text_coverage(&spec.table.type_key, &ranked.property)
+                    == FullTextCoverage::Full
+            }
+            _ => true,
+        });
         let ranked_type = match self.physical.node(scan) {
             Some(PhysicalNode::Scan { spec, .. }) => spec.table.node_type_name(),
             _ => None,
@@ -2198,6 +2211,8 @@ impl Lowering<'_> {
                 ranked_type,
                 hops: Vec::new(),
                 feeds,
+                on_empty,
+                coverage_admits,
             });
         }
         let mut introduced_by_scan = false;
@@ -2240,6 +2255,8 @@ impl Lowering<'_> {
             ranked_type,
             hops,
             feeds,
+            on_empty,
+            coverage_admits,
         })
     }
 
@@ -2562,6 +2579,7 @@ impl Lowering<'_> {
                     overfetch: fetch.map(OverfetchRung::ladder).unwrap_or_default(),
                     prefilter: None,
                     eligibility: Eligibility::BeforeScoring,
+                    policy: Some(NearestPolicy::DEFAULT),
                 };
                 let (score, scan) = self.rank(lowered, binding, access)?;
                 let top = top_level(&self.physical, lowered);
@@ -2569,7 +2587,13 @@ impl Lowering<'_> {
                     matches!(self.physical.node(*id), Some(PhysicalNode::Expand { src, .. }) if src == binding)
                 });
                 if expanded_from {
-                    let prefilter = self.prefilter(&top, binding, scan, vec![scan])?;
+                    let prefilter = self.prefilter(
+                        &top,
+                        binding,
+                        scan,
+                        vec![scan],
+                        EmptyEligible::ProvenEmpty,
+                    )?;
                     if let Some(PhysicalNode::Scan {
                         ranked: Some(ranked),
                         ..
@@ -2599,6 +2623,7 @@ impl Lowering<'_> {
                     overfetch: Vec::new(),
                     prefilter: None,
                     eligibility: Eligibility::BeforeScoring,
+                    policy: None,
                 };
                 let (score, scan) = self.rank(lowered, binding, access)?;
                 if let Some(PhysicalNode::Scan {
@@ -2653,6 +2678,10 @@ impl Lowering<'_> {
                         overfetch: Vec::new(),
                         prefilter: None,
                         eligibility: Eligibility::BeforeScoring,
+                        policy: match arm.kind {
+                            RankKind::Nearest => Some(NearestPolicy::DEFAULT),
+                            RankKind::Bm25 => None,
+                        },
                     };
                     let (_, scan) = self.rank(root, &arm.binding, access)?;
                     if arm.kind == RankKind::Bm25 {
@@ -2677,6 +2706,7 @@ impl Lowering<'_> {
                     &primary_arm.binding,
                     primary_scan,
                     feeds,
+                    EmptyEligible::Postfilter,
                 )?;
                 let [primary_arm, secondary_arm] = <[RankArm; 2]>::try_from(lowered_arms)
                     .map_err(|_| PlanError::Internal("an rrf has two arms".to_string()))?;

@@ -295,6 +295,12 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
             "fetch": 10,
             "nprobes": null,
             "scope": "order",
+            "policy": {
+                "probe_factor": 4,
+                "flat_rescan_on_unreached": true,
+                "uncapped_on_missing_counters": true,
+                "flat_when_eligible_within_fetch": true,
+            },
         })
     );
     assert_eq!(

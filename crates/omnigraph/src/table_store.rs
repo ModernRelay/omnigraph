@@ -4733,29 +4733,22 @@ impl TableStore {
         has_fts_index_on(ds, column).await
     }
 
-    /// Metadata-only check (no data IO) of whether the FTS (inverted) index
-    /// entries on `column` together cover EVERY current fragment of `ds`.
-    /// The FTS twin of `dataset_index::key_column_index_coverage`, consumed as a
-    /// correctness fence by the rrf prefilter gate: rows in fragments no
-    /// entry covers are scored by a filter-dependent batch-derived scorer
-    /// instead of the index-global BM25 statistics (lance
-    /// `inverted/index.rs`), so a prefilter mask would change their scores
-    /// and the gate's two plans would stop being answer-identical.
-    /// Coverage is the UNION across same-column entries: index optimization
-    /// creates delta entries each covering a disjoint fragment subset, and
-    /// demanding one all-covering entry would permanently disable the
-    /// prefilter plan on exactly the append + optimize maintenance schedule
-    /// production tables follow. `false` is always safe — the gate then
-    /// runs the postfilter plan — so every unprovable case (no FTS index,
-    /// an entry without a fragment bitmap) contributes nothing.
-    pub(crate) async fn fts_covers_all_fragments(ds: &Dataset, column: &str) -> Result<bool> {
-        Ok(Self::fts_coverage(ds, column).await? == omnigraph_planner::FullTextCoverage::Full)
-    }
-
-    /// How far `column`'s full-text index covers `ds`'s fragments: every
-    /// fragment (the union of the entries' fragment bitmaps holds them all),
-    /// some (an entry exists, but the bitmaps do not prove every fragment),
-    /// or no full-text entry at all.
+    /// Metadata-only read (no data IO) of how far the FTS (inverted) index
+    /// entries on `column` together cover `ds`'s current fragments: every
+    /// fragment, some (an entry exists, but the bitmaps do not prove every
+    /// fragment), or no full-text entry at all. The FTS twin of
+    /// `dataset_index::key_column_index_coverage`, read while planning: rows
+    /// in fragments no entry covers are scored by a filter-dependent
+    /// batch-derived scorer instead of the index-global BM25 statistics
+    /// (lance `inverted/index.rs`), so a filter applied before scoring would
+    /// change their scores. Coverage is the UNION across same-column
+    /// entries: index optimization creates delta entries each covering a
+    /// disjoint fragment subset, and demanding one all-covering entry would
+    /// permanently rule out filtering before scoring on exactly the append +
+    /// optimize maintenance schedule production tables follow. Anything
+    /// short of full is always safe — eligibility then applies after
+    /// scoring and the gates run their postfilter plans — so every
+    /// unprovable case (an entry without a fragment bitmap) is partial.
     pub(crate) async fn fts_coverage(
         ds: &Dataset,
         column: &str,

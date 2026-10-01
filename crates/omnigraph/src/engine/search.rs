@@ -3,9 +3,7 @@
 //! values; the per-pass `Pass` the overfetch ladder and the prefilter gates
 //! write; the gates and probe ladders themselves.
 
-use omnigraph_planner::{
-    GatePolicy, Hop, NodeId, OverfetchRung, Prefilter, PrefilterMode, RankKind,
-};
+use omnigraph_planner::{GatePolicy, Hop, NodeId, OverfetchRung, Prefilter, PrefilterMode};
 
 use super::*;
 
@@ -22,6 +20,8 @@ pub(super) struct SearchMode {
     /// The nearest scan runs flat (`use_index(false)`, every row scored): the
     /// overfetch loop's exact pass.
     pub(super) nearest_exact: bool,
+    /// The adaptive policy the plan declares for the nearest scan.
+    pub(super) nearest_policy: Option<omnigraph_planner::NearestPolicy>,
     /// The nearest prefilter gate proved the answer empty: no node of the
     /// ranked type satisfies an Expand's first hop. Read off the `Pass` by
     /// `Lowering::search_mode`; an RRF arm's pass never carries it.
@@ -133,14 +133,6 @@ impl Pass {
     }
 }
 
-/// What the `rrf` gate reads of one arm of an `rrf()`: the index it ranks
-/// with and the ranked property, whose FTS coverage the gate checks.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct ArmTarget<'a> {
-    pub(super) kind: RankKind,
-    pub(super) property: &'a str,
-}
-
 /// Shared eligible-id set, `Debug`-opaque so a logged `SearchMode` prints the
 /// cardinality instead of up to `GatePolicy::max_ids` id strings.
 #[derive(Clone)]
@@ -155,9 +147,23 @@ impl std::fmt::Debug for EligibleIds {
 /// What the nearest scan reported back to the query level: the LAST scan of
 /// the ranked variable in a pass. `rows == k` means the scan was full, so a
 /// shortfall above it can only be recovered by asking for more candidates.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub(super) struct ScanReport {
     pub(super) nearest_scan: Option<NearestScanReport>,
+    /// Every Lance attempt of that nearest scan in this pass, in order: the
+    /// probe cap it ran under and whether it scored flat.
+    pub(super) probes: Vec<ProbeAttempt>,
+}
+
+/// One attempt of a nearest scan's probe ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ProbeAttempt {
+    /// The probe cap; `None` is uncapped.
+    pub(crate) maximum_nprobes: Option<usize>,
+    /// The attempt scored every admitted row (`use_index(false)`).
+    pub(crate) flat: bool,
+    /// Rows the attempt returned.
+    pub(crate) rows: usize,
 }
 
 /// One nearest scan as `execute_node_scan`'s ladder left it.
@@ -401,7 +407,8 @@ pub(crate) fn check_param_date_literals(
 /// - the eligible set MUST over-approximate the traversal's survivors (a
 ///   superset only costs speedup; a subset changes answers) — every
 ///   shape the planner's `prefilter` admits is an instance;
-/// - full FTS fragment coverage (uncovered fragments are scored
+/// - full FTS fragment coverage, the plan's recorded fact
+///   (`Prefilter::coverage_admits`; uncovered fragments are scored
 ///   filter-dependently, so a mask would change their scores);
 /// - `nearest` arms are never prefiltered (their constitutive `k` makes a
 ///   prefiltered run answer-different) — the caller's threading rule;
@@ -415,10 +422,9 @@ pub(crate) fn check_param_date_literals(
 /// `rrf_gate_verdicts` probe entry.
 pub(super) async fn rrf_prefilter_gate(
     context: &EngineContext<'_>,
-    arms: [ArmTarget<'_>; 2],
     prefilter: &Prefilter,
     policy: GatePolicy,
-) -> Option<EligibleIds> {
+) -> (Option<EligibleIds>, RrfGateVerdict) {
     let fall_back =
         |fallback: RrfGateFallback, forced: bool, eligible: Option<u64>, corpus: Option<u64>| {
             tracing::debug!(
@@ -426,53 +432,33 @@ pub(super) async fn rrf_prefilter_gate(
                 forced,
                 "rrf prefilter gate fell back to the postfilter plan"
             );
-            record_rrf_gate_verdict(RrfGateVerdict {
+            let verdict = RrfGateVerdict {
                 plan: RrfGatePlan::Postfilter,
                 fallback: Some(fallback),
                 forced,
                 eligible,
                 corpus,
-            });
+            };
+            record_rrf_gate_verdict(verdict.clone());
+            (None, verdict)
         };
 
     if policy.mode == PrefilterMode::ForcePostfilter {
-        fall_back(RrfGateFallback::Forced, true, None, None);
-        return None;
+        return fall_back(RrfGateFallback::Forced, true, None, None);
     }
     let forced = policy.mode == PrefilterMode::ForcePrefilter;
     if !prefilter.admits() {
-        fall_back(RrfGateFallback::Shape, forced, None, None);
-        return None;
+        return fall_back(RrfGateFallback::Shape, forced, None, None);
     }
-    let bm25_props: Vec<&str> = arms
-        .iter()
-        .filter(|arm| arm.kind == RankKind::Bm25)
-        .map(|arm| arm.property)
-        .collect();
     let ranked_type = prefilter.ranked_type.as_str();
     let node_key = format!("node:{ranked_type}");
     let snapshot = context.snapshot;
     let Some(node_entry) = snapshot.dataset(&node_key) else {
-        fall_back(RrfGateFallback::Shape, forced, None, None);
-        return None;
+        return fall_back(RrfGateFallback::Shape, forced, None, None);
     };
     let corpus = node_entry.entity_count;
-    match snapshot.open_lance_dataset(&node_key).await {
-        Ok(ds) => {
-            for prop in &bm25_props {
-                match crate::table_store::TableStore::fts_covers_all_fragments(&ds, prop).await {
-                    Ok(true) => {}
-                    Ok(false) | Err(_) => {
-                        fall_back(RrfGateFallback::Coverage, forced, None, Some(corpus));
-                        return None;
-                    }
-                }
-            }
-        }
-        Err(_) => {
-            fall_back(RrfGateFallback::Coverage, forced, None, Some(corpus));
-            return None;
-        }
+    if !prefilter.coverage_admits {
+        return fall_back(RrfGateFallback::Coverage, forced, None, Some(corpus));
     }
 
     #[cfg_attr(not(debug_assertions), allow(unused_mut))]
@@ -489,22 +475,22 @@ pub(super) async fn rrf_prefilter_gate(
     {
         EligibleOutcome::Ids { ids, eligible } => (ids, eligible),
         EligibleOutcome::FallBack { fallback, eligible } => {
-            fall_back(fallback, forced, eligible, Some(corpus));
-            return None;
+            return fall_back(fallback, forced, eligible, Some(corpus));
         }
     };
     #[cfg(debug_assertions)]
     if let Some(dropped) = crate::instrumentation::rrf_gate_subset_drop() {
         ids.retain(|id| *id != dropped);
     }
-    record_rrf_gate_verdict(RrfGateVerdict {
+    let verdict = RrfGateVerdict {
         plan: RrfGatePlan::Prefilter,
         fallback: None,
         forced,
         eligible: Some(eligible_count),
         corpus: Some(corpus),
-    });
-    Some(EligibleIds(Arc::new(ids)))
+    };
+    record_rrf_gate_verdict(verdict.clone());
+    (Some(EligibleIds(Arc::new(ids))), verdict)
 }
 
 /// Outcome of the adjacency eligible-id computation shared by the rrf and
@@ -622,7 +608,7 @@ pub(super) async fn nearest_prefilter_gate(
     context: &EngineContext<'_>,
     prefilter: &Prefilter,
     policy: GatePolicy,
-) -> NearestGatePlan {
+) -> (NearestGatePlan, RrfGateVerdict) {
     let forced = policy.mode != PrefilterMode::Auto;
     let fall_back = |fallback: RrfGateFallback, eligible: Option<u64>, corpus: Option<u64>| {
         tracing::debug!(
@@ -630,27 +616,29 @@ pub(super) async fn nearest_prefilter_gate(
             forced,
             "nearest prefilter gate fell back to the unfiltered scan"
         );
-        record_ann_prefilter_verdict(RrfGateVerdict {
+        let verdict = RrfGateVerdict {
             plan: RrfGatePlan::Postfilter,
             fallback: Some(fallback),
             forced,
             eligible,
             corpus,
-        });
+        };
+        record_ann_prefilter_verdict(verdict.clone());
+        verdict
     };
     if policy.mode == PrefilterMode::ForcePostfilter {
-        fall_back(RrfGateFallback::Forced, None, None);
-        return NearestGatePlan::Postfilter;
+        let verdict = fall_back(RrfGateFallback::Forced, None, None);
+        return (NearestGatePlan::Postfilter, verdict);
     }
     if !prefilter.admits() {
-        fall_back(RrfGateFallback::Shape, None, None);
-        return NearestGatePlan::Postfilter;
+        let verdict = fall_back(RrfGateFallback::Shape, None, None);
+        return (NearestGatePlan::Postfilter, verdict);
     }
     let ranked_type = prefilter.ranked_type.as_str();
     let node_key = format!("node:{ranked_type}");
     let Some(node_entry) = context.snapshot.dataset(&node_key) else {
-        fall_back(RrfGateFallback::Shape, None, None);
-        return NearestGatePlan::Postfilter;
+        let verdict = fall_back(RrfGateFallback::Shape, None, None);
+        return (NearestGatePlan::Postfilter, verdict);
     };
     let corpus = node_entry.entity_count;
     match adjacency_eligible_ids(
@@ -665,22 +653,28 @@ pub(super) async fn nearest_prefilter_gate(
     .await
     {
         EligibleOutcome::Ids { ids, eligible } => {
-            record_ann_prefilter_verdict(RrfGateVerdict {
+            let verdict = RrfGateVerdict {
                 plan: RrfGatePlan::Prefilter,
                 fallback: None,
                 forced,
                 eligible: Some(eligible),
                 corpus: Some(corpus),
-            });
-            NearestGatePlan::Prefilter(EligibleIds(Arc::new(ids)))
+            };
+            record_ann_prefilter_verdict(verdict.clone());
+            (
+                NearestGatePlan::Prefilter(EligibleIds(Arc::new(ids))),
+                verdict,
+            )
         }
         EligibleOutcome::FallBack { fallback, eligible } => {
-            fall_back(fallback, eligible, Some(corpus));
-            if fallback == RrfGateFallback::EmptyEligible {
-                NearestGatePlan::ProvenEmpty
-            } else {
-                NearestGatePlan::Postfilter
-            }
+            let verdict = fall_back(fallback, eligible, Some(corpus));
+            let plan = match (fallback, prefilter.on_empty) {
+                (RrfGateFallback::EmptyEligible, omnigraph_planner::EmptyEligible::ProvenEmpty) => {
+                    NearestGatePlan::ProvenEmpty
+                }
+                _ => NearestGatePlan::Postfilter,
+            };
+            (plan, verdict)
         }
     }
 }
@@ -793,13 +787,15 @@ pub(super) fn collect_referenced_edge_names(
     }
 }
 
-/// Per-rung multiplier of the probe ladder (20 → 80 → 320 → none).
-pub(super) const ANN_PROBE_ESCALATION_FACTOR: usize = 4;
-
-/// The next rung of the probe ladder after `current` starved a scan: ×4, or
-/// no cap once the next rung would cover the ranked partitions anyway.
-pub(super) fn next_probe_budget(current: usize, partitions_ranked: usize) -> Option<usize> {
-    let next = current.saturating_mul(ANN_PROBE_ESCALATION_FACTOR);
+/// The next rung of the probe ladder after `current` starved a scan: times
+/// the plan's declared `factor`, or no cap once the next rung would cover
+/// the ranked partitions anyway.
+pub(super) fn next_probe_budget(
+    current: usize,
+    partitions_ranked: usize,
+    factor: usize,
+) -> Option<usize> {
+    let next = current.saturating_mul(factor);
     (next < partitions_ranked).then_some(next)
 }
 
@@ -823,10 +819,12 @@ pub(super) enum LadderStep {
 }
 
 /// The ladder's decision after one nearest scan under `maximum` (`None` =
-/// uncapped) returned `rows` of the `k` asked for. `summary` is Lance's
-/// `(partitions_searched, partitions_ranked)`, each absent on a flat plan.
+/// uncapped) returned `rows` of the `k` asked for, within the plan's
+/// declared `policy`. `summary` is Lance's `(partitions_searched,
+/// partitions_ranked)`, each absent on a flat plan.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn ladder_step(
+    policy: omnigraph_planner::NearestPolicy,
     rows: usize,
     k: usize,
     known_matches: Option<usize>,
@@ -836,7 +834,7 @@ pub(super) fn ladder_step(
     maximum: Option<usize>,
     last_rung: Option<(usize, u64)>,
 ) -> LadderStep {
-    if has_infinite_distance {
+    if has_infinite_distance && policy.flat_rescan_on_unreached {
         return LadderStep::FlatRescan;
     }
     let Some(maximum) = maximum else {
@@ -855,8 +853,12 @@ pub(super) fn ladder_step(
         Some((None, None)) => return LadderStep::Stop,
         Some((Some(searched), Some(ranked))) => (searched, ranked),
         Some((Some(_), None)) | Some((None, Some(_))) | None => {
-            return LadderStep::RescanUncapped {
-                summary_missing: true,
+            return if policy.uncapped_on_missing_counters {
+                LadderStep::RescanUncapped {
+                    summary_missing: true,
+                }
+            } else {
+                LadderStep::Stop
             };
         }
     };
@@ -866,7 +868,11 @@ pub(super) fn ladder_step(
     if last_rung == Some((rows, searched)) {
         return LadderStep::Stop;
     }
-    match next_probe_budget(maximum, usize::try_from(ranked).unwrap_or(usize::MAX)) {
+    match next_probe_budget(
+        maximum,
+        usize::try_from(ranked).unwrap_or(usize::MAX),
+        policy.probe_factor,
+    ) {
         Some(next) => LadderStep::Rescan(next),
         None => LadderStep::RescanUncapped {
             summary_missing: false,
@@ -894,6 +900,34 @@ mod ann_probe_budget_tests {
     };
 
     const IVF_SHORT: Option<(Option<u64>, Option<u64>)> = Some((Some(1), Some(1_000)));
+    const POLICY: omnigraph_planner::NearestPolicy = omnigraph_planner::NearestPolicy::DEFAULT;
+
+    /// The ladder takes its factor and its fallbacks from the plan's
+    /// declared policy, not from a constant of its own.
+    #[test]
+    fn the_ladder_runs_the_declared_policy() {
+        let wider = omnigraph_planner::NearestPolicy {
+            probe_factor: 2,
+            ..POLICY
+        };
+        assert_eq!(
+            ladder_step(wider, 3, 10, None, None, false, IVF_SHORT, Some(20), None),
+            LadderStep::Rescan(40)
+        );
+        let no_rescan = omnigraph_planner::NearestPolicy {
+            flat_rescan_on_unreached: false,
+            uncapped_on_missing_counters: false,
+            ..POLICY
+        };
+        assert_eq!(
+            ladder_step(no_rescan, 3, 10, None, None, true, IVF_SHORT, None, None),
+            LadderStep::Stop
+        );
+        assert_eq!(
+            ladder_step(no_rescan, 3, 10, None, None, false, None, Some(20), None),
+            LadderStep::Stop
+        );
+    }
 
     /// Rust test: no `.gqt` fixture trains an IVF index, so no case carries a probe cap.
     #[test]
@@ -997,22 +1031,42 @@ mod ann_probe_budget_tests {
     /// Rust test: no `.gqt` fixture trains an IVF index, so no case ranks partitions.
     #[test]
     fn probe_ladder_multiplies_then_uncaps() {
-        assert_eq!(next_probe_budget(20, 1_000), Some(80));
-        assert_eq!(next_probe_budget(80, 1_000), Some(320));
-        assert_eq!(next_probe_budget(320, 1_000), None);
-        assert_eq!(next_probe_budget(20, 60), None);
-        assert_eq!(next_probe_budget(1, 100), Some(4));
+        assert_eq!(next_probe_budget(20, 1_000, 4), Some(80));
+        assert_eq!(next_probe_budget(80, 1_000, 4), Some(320));
+        assert_eq!(next_probe_budget(320, 1_000, 4), None);
+        assert_eq!(next_probe_budget(20, 60, 4), None);
+        assert_eq!(next_probe_budget(1, 100, 4), Some(4));
     }
 
     /// Rust test: an infinite `_distance` needs a trained IVF index; no `.gqt` fixture has one.
     #[test]
     fn ladder_rescans_flat_on_an_infinite_distance_before_every_other_stop() {
         assert_eq!(
-            ladder_step(10, 10, Some(10), Some(10), true, IVF_SHORT, None, None),
+            ladder_step(
+                POLICY,
+                10,
+                10,
+                Some(10),
+                Some(10),
+                true,
+                IVF_SHORT,
+                None,
+                None
+            ),
             LadderStep::FlatRescan
         );
         assert_eq!(
-            ladder_step(3, 10, None, None, true, Some((None, None)), Some(20), None),
+            ladder_step(
+                POLICY,
+                3,
+                10,
+                None,
+                None,
+                true,
+                Some((None, None)),
+                Some(20),
+                None
+            ),
             LadderStep::FlatRescan
         );
     }
@@ -1021,7 +1075,7 @@ mod ann_probe_budget_tests {
     #[test]
     fn ladder_stops_without_a_cap() {
         assert_eq!(
-            ladder_step(3, 10, None, None, false, IVF_SHORT, None, None),
+            ladder_step(POLICY, 3, 10, None, None, false, IVF_SHORT, None, None),
             LadderStep::Stop
         );
     }
@@ -1030,7 +1084,7 @@ mod ann_probe_budget_tests {
     #[test]
     fn ladder_stops_when_the_scan_is_full() {
         assert_eq!(
-            ladder_step(10, 10, None, None, false, IVF_SHORT, Some(20), None),
+            ladder_step(POLICY, 10, 10, None, None, false, IVF_SHORT, Some(20), None),
             LadderStep::Stop
         );
     }
@@ -1039,11 +1093,31 @@ mod ann_probe_budget_tests {
     #[test]
     fn ladder_stops_when_every_known_match_is_here() {
         assert_eq!(
-            ladder_step(5, 10, Some(5), None, false, IVF_SHORT, Some(20), None),
+            ladder_step(
+                POLICY,
+                5,
+                10,
+                Some(5),
+                None,
+                false,
+                IVF_SHORT,
+                Some(20),
+                None
+            ),
             LadderStep::Stop
         );
         assert_eq!(
-            ladder_step(4, 10, Some(5), None, false, IVF_SHORT, Some(20), None),
+            ladder_step(
+                POLICY,
+                4,
+                10,
+                Some(5),
+                None,
+                false,
+                IVF_SHORT,
+                Some(20),
+                None
+            ),
             LadderStep::Rescan(80)
         );
     }
@@ -1052,11 +1126,31 @@ mod ann_probe_budget_tests {
     #[test]
     fn ladder_stops_when_the_scan_holds_the_whole_dataset() {
         assert_eq!(
-            ladder_step(7, 10, None, Some(7), false, IVF_SHORT, Some(20), None),
+            ladder_step(
+                POLICY,
+                7,
+                10,
+                None,
+                Some(7),
+                false,
+                IVF_SHORT,
+                Some(20),
+                None
+            ),
             LadderStep::Stop
         );
         assert_eq!(
-            ladder_step(7, 10, None, Some(8), false, IVF_SHORT, Some(20), None),
+            ladder_step(
+                POLICY,
+                7,
+                10,
+                None,
+                Some(8),
+                false,
+                IVF_SHORT,
+                Some(20),
+                None
+            ),
             LadderStep::Rescan(80)
         );
     }
@@ -1065,7 +1159,17 @@ mod ann_probe_budget_tests {
     #[test]
     fn ladder_treats_a_summary_with_neither_counter_as_a_flat_scan() {
         assert_eq!(
-            ladder_step(3, 10, None, None, false, Some((None, None)), Some(20), None),
+            ladder_step(
+                POLICY,
+                3,
+                10,
+                None,
+                None,
+                false,
+                Some((None, None)),
+                Some(20),
+                None
+            ),
             LadderStep::Stop
         );
     }
@@ -1075,7 +1179,7 @@ mod ann_probe_budget_tests {
     fn ladder_fails_closed_without_both_counters() {
         for summary in [None, Some((Some(1), None)), Some((None, Some(8)))] {
             assert_eq!(
-                ladder_step(3, 10, None, None, false, summary, Some(20), None),
+                ladder_step(POLICY, 3, 10, None, None, false, summary, Some(20), None),
                 LadderStep::RescanUncapped {
                     summary_missing: true
                 },
@@ -1089,7 +1193,7 @@ mod ann_probe_budget_tests {
     fn ladder_stops_when_every_ranked_partition_was_searched() {
         for summary in [Some((Some(8), Some(8))), Some((Some(9), Some(8)))] {
             assert_eq!(
-                ladder_step(3, 10, None, None, false, summary, Some(20), None),
+                ladder_step(POLICY, 3, 10, None, None, false, summary, Some(20), None),
                 LadderStep::Stop,
                 "summary {summary:?}"
             );
@@ -1100,15 +1204,45 @@ mod ann_probe_budget_tests {
     #[test]
     fn ladder_stops_when_widening_changed_nothing() {
         assert_eq!(
-            ladder_step(3, 10, None, None, false, IVF_SHORT, Some(80), Some((3, 1))),
+            ladder_step(
+                POLICY,
+                3,
+                10,
+                None,
+                None,
+                false,
+                IVF_SHORT,
+                Some(80),
+                Some((3, 1))
+            ),
             LadderStep::Stop
         );
         assert_eq!(
-            ladder_step(3, 10, None, None, false, IVF_SHORT, Some(80), Some((3, 0))),
+            ladder_step(
+                POLICY,
+                3,
+                10,
+                None,
+                None,
+                false,
+                IVF_SHORT,
+                Some(80),
+                Some((3, 0))
+            ),
             LadderStep::Rescan(320)
         );
         assert_eq!(
-            ladder_step(3, 10, None, None, false, IVF_SHORT, Some(80), Some((2, 1))),
+            ladder_step(
+                POLICY,
+                3,
+                10,
+                None,
+                None,
+                false,
+                IVF_SHORT,
+                Some(80),
+                Some((2, 1))
+            ),
             LadderStep::Rescan(320)
         );
     }
@@ -1117,18 +1251,28 @@ mod ann_probe_budget_tests {
     #[test]
     fn ladder_climbs_then_uncaps() {
         assert_eq!(
-            ladder_step(3, 10, None, None, false, IVF_SHORT, Some(20), None),
+            ladder_step(POLICY, 3, 10, None, None, false, IVF_SHORT, Some(20), None),
             LadderStep::Rescan(80)
         );
         assert_eq!(
-            ladder_step(3, 10, None, None, false, IVF_SHORT, Some(320), None),
+            ladder_step(POLICY, 3, 10, None, None, false, IVF_SHORT, Some(320), None),
             LadderStep::RescanUncapped {
                 summary_missing: false
             }
         );
         let narrow_index = Some((Some(1), Some(60)));
         assert_eq!(
-            ladder_step(3, 10, None, None, false, narrow_index, Some(20), None),
+            ladder_step(
+                POLICY,
+                3,
+                10,
+                None,
+                None,
+                false,
+                narrow_index,
+                Some(20),
+                None
+            ),
             LadderStep::RescanUncapped {
                 summary_missing: false
             }
