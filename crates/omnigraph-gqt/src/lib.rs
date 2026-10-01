@@ -2975,25 +2975,7 @@ async fn run_concurrent_step(
             })
         })
         .collect();
-    dst_runner::record(
-        "concurrent_block",
-        serde_json::json!({
-            "sessions": sessions_evidence,
-            "stuck_at": block.stuck_at.map(|at| at + 1),
-            "failure": block.failure,
-        }),
-    );
-    measure::push_detail(serde_json::json!({
-        "slot": "concurrent",
-        "step": step.ordinal,
-        "value": {"grants": block.log, "wall_ms": block.wall_ms, "unattributed": block.unattributed},
-    }));
-    dst_runner::observe(|| {
-        format!(
-            "concurrent block: stuck_at={:?} failure={:?} unattributed={}",
-            block.stuck_at, block.failure, block.unattributed
-        )
-    });
+    record_concurrent_outcome(step.ordinal, &sessions_evidence, &block);
     if let Some(failure) = block.failure {
         return Err(fail(failure));
     }
@@ -3003,6 +2985,22 @@ async fn run_concurrent_step(
         }
     }
     Ok(())
+}
+
+fn record_concurrent_outcome(ordinal: usize, sessions: &[Value], block: &concurrent::Outcome) {
+    dst_runner::record(
+        "concurrent_block",
+        serde_json::json!({
+            "sessions": sessions,
+            "stuck_at": block.stuck_at.map(|at| at + 1),
+            "failure": block.failure,
+        }),
+    );
+    measure::push_detail(serde_json::json!({
+        "slot": "concurrent",
+        "step": ordinal,
+        "value": {"grants": block.log, "wall_ms": block.wall_ms, "unattributed": block.unattributed},
+    }));
 }
 
 /// One session of a block: the statement on its branch through the case

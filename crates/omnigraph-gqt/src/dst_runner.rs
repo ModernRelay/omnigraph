@@ -2097,6 +2097,60 @@ mod action_tests {
         );
     }
 
+    #[tokio::test]
+    async fn concurrent_replay_compares_outcomes_without_background_measurements() {
+        async fn report(
+            sessions: &[serde_json::Value],
+            block: &crate::concurrent::Outcome,
+        ) -> super::WorkerReport {
+            super::capture("same-input".into(), async {
+                crate::record_concurrent_outcome(3, sessions, block);
+                Ok(())
+            })
+            .await
+            .unwrap()
+        }
+
+        let mut sessions = vec![serde_json::json!({
+            "label": "r1", "outcome": "ok", "message": null, "script": null,
+        })];
+        let mut block = crate::concurrent::Outcome {
+            stuck_at: None,
+            failure: None,
+            unattributed: 2,
+            log: Vec::new(),
+            wall_ms: 5,
+        };
+        let expected = super::comparable(&report(&sessions, &block).await).unwrap();
+        block.unattributed = 3;
+        block.wall_ms = 9;
+        block.log.push(serde_json::json!({"wall_ms": 7}));
+        let measured = super::comparable(&report(&sessions, &block).await).unwrap();
+        assert!(
+            expected == measured,
+            "background I/O and timing measurements must not change replay equality"
+        );
+
+        block.stuck_at = Some(0);
+        assert_ne!(
+            expected,
+            super::comparable(&report(&sessions, &block).await).unwrap()
+        );
+        block.stuck_at = None;
+        block.failure = Some("session starved".into());
+        assert_ne!(
+            expected,
+            super::comparable(&report(&sessions, &block).await).unwrap()
+        );
+        block.failure = None;
+        sessions[0]["outcome"] = "failed".into();
+        sessions[0]["message"] = "query failed".into();
+        assert_ne!(
+            expected,
+            super::comparable(&report(&sessions, &block).await).unwrap()
+        );
+    }
+
     fn measured(environment: &str, seed: &str, step: u64, requests: u64) -> super::MeasureRow {
         super::MeasureRow {
             environment: environment.into(),

@@ -543,29 +543,11 @@ fn measure_counts_schema_contract_requests_issue_817() {
         files.sort();
         files
     };
-    let mut setup = contract_files("setup", 0);
-    setup.dedup();
-    assert_eq!(
-        setup,
-        ["__schema_state.json", "_schema.ir.json", "_schema.pg"]
-    );
-    for step in [1, 2] {
-        assert_eq!(
-            contract_files("step", step),
-            [
-                "__schema_state.json",
-                "__schema_state.json",
-                "__schema_state.json",
-                "__schema_state.json",
-                "__schema_state.json",
-                "_schema.ir.json",
-                "_schema.ir.json",
-                "_schema.ir.json",
-                "_schema.ir.json",
-                "_schema.pg",
-                "_schema.pg",
-            ],
-            "insert {step}: capture loads the contract and re-reads the state, revalidation loads it again"
+    assert!(contract_files("setup", 0).is_empty());
+    for step in [1, 2, 3] {
+        assert!(
+            contract_files("step", step).is_empty(),
+            "step {step}: the schema contract is inline in the catalog"
         );
     }
     let io_counts = |slot: &str, step: u64| -> serde_json::Value {
@@ -588,27 +570,27 @@ fn measure_counts_schema_contract_requests_issue_817() {
             .map(|(class, count)| (class.clone(), count.as_u64().unwrap()))
             .collect()
     };
-    for step in [1, 2] {
+    assert_eq!(
+        control_classes(&io_counts("setup", 0)),
+        [
+            ("control_claim.delete".to_string(), 1),
+            ("control_claim.put".to_string(), 1),
+            ("control_manifest.head_failed".to_string(), 2),
+            ("control_manifest.list".to_string(), 2),
+            ("control_probe.delete".to_string(), 1),
+            ("control_probe.put".to_string(), 1),
+        ],
+        "setup measures the init claim, capability probe and two manifest preflights"
+    );
+    for step in [1, 2, 3] {
         let counts = io_counts("step", step);
-        assert_eq!(
-            control_classes(&counts),
-            [
-                ("control_schema.get".to_string(), 7),
-                ("control_schema.head".to_string(), 4),
-            ],
-            "insert {step}: the engine's pin is 7 read_text + 4 exists (tests/write_cost.rs)"
+        assert!(
+            control_classes(&counts).is_empty(),
+            "step {step}: the inline contract needs no control-adapter requests"
         );
         assert_eq!(
-            counts["repeat_reads"], 8,
-            "insert {step}: 11 contract reads on three files; no Lance object is read twice"
+            counts["repeat_reads"], 0,
+            "step {step}: neither the inline contract nor table data needs repeated reads"
         );
     }
-    assert_eq!(
-        control_classes(&io_counts("step", 3)),
-        [
-            ("control_schema.get".to_string(), 3),
-            ("control_schema.head".to_string(), 2),
-        ],
-        "a warm query reads the contract once (tests/warm_read_cost.rs)"
-    );
 }

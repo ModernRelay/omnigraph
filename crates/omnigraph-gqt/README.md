@@ -321,10 +321,12 @@ the fault wrapper's own), in both of the engine's realms. The Lance
 realm: the measuring store is a decorator on the engine's
 `object_store_seam`, the seam the DST fault decorator uses, so every store the
 registry builds is wrapped, `__manifest` and table traffic alike. The control
-realm: the schema contract (`_schema.pg`, `_schema.ir.json`,
-`__schema_state.json` and their `.staging` twins), the init claim and probe,
-the legacy `__recovery/` listing and the graph-index artifact go through the
-engine's `StorageAdapter`, whose DST store is a second in-memory object store
+realm: the init claim and probe, manifest-root preflight and graph-index
+artifacts go through the engine's `StorageAdapter`. The classifier also
+recognizes legacy schema files (`_schema.pg`, `_schema.ir.json`,
+`__schema_state.json` and their `.staging` twins) and `__recovery/` paths.
+Format 13 stores the live schema contract inline in `__manifest`, so its I/O
+belongs to the Lance realm. The adapter's DST store is a second in-memory object store
 the registry never builds; the worker wraps the adapter it hands the engine
 and logs each call as the requests the in-memory adapter makes for it: a text
 read one `get`, a bounded read one `get` of `0-(max+1)`, a write one `put`,
@@ -344,9 +346,8 @@ control realm's limits below are the exceptions). Per group it reports:
   twice; objects are told apart by their real names, uuids included, and a
   control object never meets a Lance object of the same name);
 - `after_publish`, the requests of either realm after the group's last
-  `__manifest` version put, the publish CAS: the crash window, where a crash
-  leaves a published operation unfinished (a schema apply's contract write
-  after its publish is in it); absent when the group published nothing;
+  `__manifest` version put, the publish CAS; absent when the group published
+  nothing. A schema apply includes its contract in that same publication;
 - a count per `<realm>_<kind>.<verb>` class (`manifest_meta.put`,
   `table_data.get`, `control_schema.head`, …) where the realm is the dataset
   (`__manifest`, the table, the recovery root) and the kind its Lance
@@ -419,17 +420,15 @@ Direct-engine environments record nothing: on a `file` root Lance bypasses
 the wrapped store for data files, so only the DST in-memory object store
 sees every request. The control realm's counts are the in-memory adapter's:
 under DST its store never holds a Lance object, so the engine's probes of a
-dataset root through the adapter (init's `__manifest` preflight, schema
-apply's leftover-dataset probe) always miss, `head_failed` then `list`, and
-the `delete_prefix` reclaim behind the second is never reached (it is logged
-as its listing alone, the deletes that follow being as many as it found); an
+dataset root through the adapter (such as init's `__manifest` preflight)
+always miss, `head_failed` then `list`. `delete_prefix` logs only its listing;
+deletes performed inside the adapter are not counted. An
 `exists` the store refused is `head_failed` whether the head or the list
 after it failed. An adapter the engine builds for itself instead of using
-the handle's (`ensure_no_pending_recovery`, the storage upgrade, the
-graph-index load of a historical read) is outside the wrapped one; no gqt
-step reaches one today. A contract file probed then read in one step is a repeat
-read, `head` and whole-object `get` sharing a key, and so is every load of
-the contract after a step's first (a write's revalidation after its capture).
+the handle's (the storage upgrade or the graph-index load of a historical
+read) is outside the wrapped one; no gqt step reaches one today. An adapter
+object probed then read in one step is a repeat read: `head` and whole-object
+`get` share a key. Repeated loads in that step also count as repeat reads.
 Every case measures the same way; nothing in a case
 declares it, and the invocation takes several case paths or directories,
 anywhere on disk. `--artifacts <dir>` puts the report and the TSV in that
