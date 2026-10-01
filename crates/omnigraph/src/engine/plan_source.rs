@@ -18,8 +18,9 @@ use omnigraph_compiler::types::Direction;
 use omnigraph_planner::{
     AcceptInput, AcceptedBoundPlan, AcceptedPlan, AdjacencyProof, Bounds, ConstantEvaluator,
     DatasetPin, EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics,
-    Explain, FragmentStat, GatePolicy, NodeTypeSpec, Operation, PlanError, PlanSource,
-    PrefilterMode, ReplayEnvelope, ReplayRefusal, SideId, TableRef, Unrouted, ValidationLimits,
+    Explain, FragmentStat, FullTextCoverage, GatePolicy, NodeTypeSpec, Operation, PlanError,
+    PlanSource, PrefilterMode, ReplayEnvelope, ReplayRefusal, SideId, TableRef, Unrouted,
+    ValidationLimits,
 };
 
 use super::ResolvedParams;
@@ -105,6 +106,9 @@ pub(crate) struct QuerySource<'a> {
     gate_policy: GatePolicy,
     expand_caps: ExpandCaps,
     table_stats: HashMap<String, TableStatistics>,
+    /// The full-text coverage of every property a `bm25()` order key ranks,
+    /// by `(table key, property)`, read at the pinned dataset version.
+    full_text: HashMap<(String, String), FullTextCoverage>,
 }
 
 struct TableStatistics {
@@ -126,6 +130,7 @@ impl<'a> QuerySource<'a> {
         let params = resolve_params(&query.ir, params)?;
         let ir = super::constant::fold_query_constants(&query.ir, params.shared())?;
         let table_stats = destination_table_statistics(&ir, snapshot).await?;
+        let full_text = ranked_full_text_coverage(&ir, snapshot).await?;
         let mut source = QuerySource {
             ir,
             checked: query.checked.clone(),
@@ -137,6 +142,7 @@ impl<'a> QuerySource<'a> {
             gate_policy: gate_policy(settings),
             expand_caps: ExpandCaps::from_env(),
             table_stats,
+            full_text,
         };
         source
             .load_column_statistics(&Operation::Query(Box::new(source.ir.clone())))
@@ -196,6 +202,13 @@ impl<'a> QuerySource<'a> {
 }
 
 impl PlanSource for QuerySource<'_> {
+    fn full_text_coverage(&self, type_key: &str, property: &str) -> FullTextCoverage {
+        self.full_text
+            .get(&(type_key.to_string(), property.to_string()))
+            .copied()
+            .unwrap_or(FullTextCoverage::Absent)
+    }
+
     fn traversal_work_limit(&self) -> Option<u64> {
         self.ir
             .has_edge_selections()
@@ -503,6 +516,68 @@ pub(crate) fn explain_query(source: &QuerySource<'_>) -> Result<ExplainedQuery> 
     )
     .map_err(unaccepted)?;
     Ok(ExplainedQuery { explain, accepted })
+}
+
+/// The full-text coverage of every property the leading `order` key ranks
+/// by `bm25()` (alone or as an `rrf()` arm), at the snapshot's pinned
+/// version: the fact that decides where the ranked scan applies its
+/// eligibility.
+async fn ranked_full_text_coverage(
+    ir: &QueryIR,
+    snapshot: &Snapshot,
+) -> Result<HashMap<(String, String), FullTextCoverage>> {
+    fn bm25_targets(expr: &IRExpr, out: &mut Vec<(String, String)>) {
+        match expr {
+            IRExpr::Bm25 { field, .. } => {
+                if let IRExpr::PropAccess { variable, property } = field.as_ref() {
+                    out.push((variable.clone(), property.clone()));
+                }
+            }
+            IRExpr::Rrf {
+                primary, secondary, ..
+            } => {
+                bm25_targets(primary, out);
+                bm25_targets(secondary, out);
+            }
+            _ => {}
+        }
+    }
+    fn binding_type(ops: &[IROp], binding: &str) -> Option<String> {
+        ops.iter().find_map(|op| match op {
+            IROp::NodeScan {
+                variable,
+                type_name,
+                ..
+            } if variable == binding => Some(type_name.clone()),
+            IROp::Expand {
+                dst_var, dst_type, ..
+            } if dst_var == binding => Some(dst_type.clone()),
+            _ => None,
+        })
+    }
+    let mut targets = Vec::new();
+    if let Some(leading) = ir.order_by.first() {
+        bm25_targets(&leading.expr, &mut targets);
+    }
+    let mut coverage = HashMap::new();
+    for (binding, property) in targets {
+        let Some(type_name) = binding_type(&ir.pipeline, &binding) else {
+            continue;
+        };
+        let type_key = format!("node:{type_name}");
+        if coverage.contains_key(&(type_key.clone(), property.clone())) {
+            continue;
+        }
+        let known = match snapshot.dataset(&type_key) {
+            Some(_) => {
+                let dataset = snapshot.open_lance_dataset(&type_key).await?;
+                crate::table_store::TableStore::fts_coverage(&dataset, &property).await?
+            }
+            None => FullTextCoverage::Absent,
+        };
+        coverage.insert((type_key, property), known);
+    }
+    Ok(coverage)
 }
 
 async fn destination_table_statistics(

@@ -27,11 +27,11 @@ use crate::logical::{
 use crate::lower::ContainsJoinFields;
 use crate::operation::{Operation, Side};
 use crate::physical::{
-    Assumptions, Estimate, Hop, NodeId, OrderKey, OverfetchRung, PhysicalNode, PhysicalPlan,
-    Prefilter, Properties, RankArm, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
-    TextContains,
+    Assumptions, Eligibility, Estimate, Hop, NodeId, OrderKey, OverfetchRung, PhysicalNode,
+    PhysicalPlan, Prefilter, Properties, RankArm, RankKind, RankScope, RankedAccess, ScanInput,
+    StatisticSource, TextContains,
 };
-use crate::source::{NodeTypeSpec, PlanSource, SideId};
+use crate::source::{FullTextCoverage, NodeTypeSpec, PlanSource, SideId};
 
 pub const ROW_ID: &str = "_rowid";
 pub const ROW_ADDR: &str = "_rowaddr";
@@ -2036,6 +2036,22 @@ impl Lowering<'_> {
             )));
         }
         self.unmark(scan);
+        let mut access = access;
+        access.eligibility = match access.kind {
+            RankKind::Nearest => Eligibility::BeforeScoring,
+            RankKind::Bm25 => {
+                let type_key = match self.physical.node(scan) {
+                    Some(PhysicalNode::Scan { spec, .. }) => spec.table.type_key.clone(),
+                    _ => String::new(),
+                };
+                match self.source.full_text_coverage(&type_key, &access.property) {
+                    FullTextCoverage::Full => Eligibility::BeforeScoring,
+                    FullTextCoverage::Partial | FullTextCoverage::Absent => {
+                        Eligibility::AfterScoring
+                    }
+                }
+            }
+        };
         match self.physical.node_mut(scan) {
             Some(PhysicalNode::Scan { ranked, .. }) if ranked.is_none() => {
                 *ranked = Some(access);
@@ -2497,6 +2513,7 @@ impl Lowering<'_> {
                     scope: RankScope::Order,
                     overfetch: fetch.map(OverfetchRung::ladder).unwrap_or_default(),
                     prefilter: None,
+                    eligibility: Eligibility::BeforeScoring,
                 };
                 let (score, scan) = self.rank(lowered, binding, access)?;
                 let top = top_level(&self.physical, lowered);
@@ -2533,6 +2550,7 @@ impl Lowering<'_> {
                     scope: RankScope::Order,
                     overfetch: Vec::new(),
                     prefilter: None,
+                    eligibility: Eligibility::BeforeScoring,
                 };
                 let (score, _) = self.rank(lowered, binding, access)?;
                 self.ranking = Some(Ranking::Scores(vec![score]));
@@ -2574,6 +2592,7 @@ impl Lowering<'_> {
                         scope,
                         overfetch: Vec::new(),
                         prefilter: None,
+                        eligibility: Eligibility::BeforeScoring,
                     };
                     let (_, scan) = self.rank(root, &arm.binding, access)?;
                     if arm.kind == RankKind::Bm25 {

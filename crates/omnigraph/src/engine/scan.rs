@@ -45,6 +45,9 @@ pub(super) struct NodeRead<'n> {
     /// The gate proved the answer empty, or a BM25 filter matched no row: no
     /// Lance read runs.
     pub(super) proven_empty: bool,
+    /// The pushed filter runs after the full-text search scores rows
+    /// (Lance's postfilter) instead of before it.
+    filter_after_scoring: bool,
 }
 
 impl<'n> NodeRead<'n> {
@@ -142,12 +145,15 @@ impl<'n> NodeRead<'n> {
             fts_query,
             columns,
             proven_empty,
+            filter_after_scoring: search_mode.eligibility_after_scoring,
         })
     }
 
     /// The Lance plan of this read: the projection, the pushed filter as a
-    /// prefilter, the `(rows, bytes)` batch override and bounded readahead of
-    /// a pipelined read, the full-text query, then `configure` (nearest).
+    /// prefilter (as a postfilter on the scored rows where the plan places a
+    /// BM25 scan's eligibility after scoring), the `(rows, bytes)` batch
+    /// override and bounded readahead of a pipelined read, the full-text
+    /// query, then `configure` (nearest).
     pub(super) fn plan(
         &self,
         pipelined_batch: Option<(usize, usize)>,
@@ -157,10 +163,11 @@ impl<'n> NodeRead<'n> {
         Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
     > {
         let projection = self.columns.read_projection();
+        let filter_after_scoring = self.filter_after_scoring && self.fts_query.is_some();
         TableStore::scan_plan_with(&self.ds, projection.as_deref(), None, false, |scanner| {
             if let Some(expr) = &self.filter_expr {
                 scanner.filter_expr(expr.clone());
-                scanner.prefilter(true);
+                scanner.prefilter(!filter_after_scoring);
             }
             if let Some((rows, bytes)) = pipelined_batch {
                 scanner.batch_size(rows);

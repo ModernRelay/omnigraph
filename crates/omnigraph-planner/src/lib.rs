@@ -58,15 +58,15 @@ pub use lower::{
 pub use operation::{Operation, PageBudgetSpec, ScopeSpec, Side, TableRef};
 pub use optimizer::{Bounds, physical_plan, rewrite};
 pub use physical::{
-    Assumptions, DatasetPin, Estimate, GatePolicy, Hop, NodeId, OrderKey, OverfetchRung,
-    PhysicalNode, PhysicalPlan, Prefilter, PrefilterMode, Properties, RankArm, RankKind, RankScope,
-    RankedAccess, ScanInput, StatisticSource,
+    Assumptions, DatasetPin, Eligibility, Estimate, GatePolicy, Hop, NodeId, OrderKey,
+    OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, PrefilterMode, Properties, RankArm,
+    RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
 };
 pub use registry::{Coverage, Entry, Route, Shape};
 pub use route::RouteOverride;
 pub use source::{
     AdjacencyProof, EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics,
-    FragmentStat, MemorySource, NodeTypeSpec, PlanSource, SideId,
+    FragmentStat, FullTextCoverage, MemorySource, NodeTypeSpec, PlanSource, SideId,
 };
 pub use validate::{
     AcceptInput, AcceptedBoundPlan, AcceptedPlan, ConstantEvaluator, Evidence, ReplayEnvelope,

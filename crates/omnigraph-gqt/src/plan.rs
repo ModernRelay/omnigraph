@@ -14,6 +14,7 @@
 //! scan Doc as $d: ranked bm25
 //! scan Doc as $d: ranked nearest fetch 10
 //! scan Doc as $d: ranked nearest fetch 10 nprobes 20
+//! scan Doc as $d: ranked bm25 eligibility after_scoring
 //! expand $d Knows $e: mode indexed_scan
 //! expand $d Knows $e: mode indexed_scan ran csr
 //! contains join $p.text contains $m.number
@@ -42,7 +43,7 @@ use serde_json::Value;
 
 use crate::report::Row;
 
-const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `hash join $var[ ran <hash_join|id_lookup>]`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `rank fuse row tiebreak [$e.@type, $e.@id]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `pass <name>`, `not pass <name>`, `validation scope <exact_subset|invariants_only>`";
+const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `hash join $var[ ran <hash_join|id_lookup>]`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>][ eligibility <before_scoring|after_scoring>]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `rank fuse row tiebreak [$e.@type, $e.@id]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `pass <name>`, `not pass <name>`, `validation scope <exact_subset|invariants_only>`";
 
 const ID_LOOKUP: &str = "id_lookup";
 const JOIN_SIDES: [&str; 2] = ["hash_join", "id_lookup"];
@@ -92,6 +93,8 @@ pub(crate) enum PlanLine {
         index: String,
         fetch: Option<u64>,
         nprobes: Option<u64>,
+        /// Where the scan applies its eligibility, when claimed.
+        eligibility: Option<String>,
     },
     /// Every selected physical scan is marked with a runtime filter on
     /// `column`, or with none when `column` is `None`.
@@ -404,18 +407,28 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
                 .ok_or_else(|| refused("claims `ranked nearest` or `ranked bm25`"))?;
             let mut fetch = None;
             let mut nprobes = None;
+            let mut eligibility = None;
             while let Some(key) = words.next() {
-                let count = words.next().and_then(|count| count.parse::<u64>().ok());
-                match (key, count) {
-                    ("fetch", Some(count)) if fetch.is_none() && nprobes.is_none() => {
+                let value = words.next();
+                let count = value.and_then(|count| count.parse::<u64>().ok());
+                match (key, count, value) {
+                    ("fetch", Some(count), _)
+                        if fetch.is_none() && nprobes.is_none() && eligibility.is_none() =>
+                    {
                         fetch = Some(count);
                     }
-                    ("nprobes", Some(count)) if nprobes.is_none() => {
+                    ("nprobes", Some(count), _) if nprobes.is_none() && eligibility.is_none() => {
                         nprobes = Some(count);
+                    }
+                    ("eligibility", _, Some(placement))
+                        if eligibility.is_none()
+                            && ["before_scoring", "after_scoring"].contains(&placement) =>
+                    {
+                        eligibility = Some(placement.to_string());
                     }
                     _ => {
                         return Err(refused(
-                            "claims `ranked <kind>[ fetch <n>][ nprobes <n>]`: each key optional, at most once, in that order, followed by a whole number",
+                            "claims `ranked <kind>[ fetch <n>][ nprobes <n>][ eligibility <before_scoring|after_scoring>]`: each key optional, at most once, in that order",
                         ));
                     }
                 }
@@ -426,6 +439,7 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
                 index: kind.to_string(),
                 fetch,
                 nprobes,
+                eligibility,
             });
             continue;
         } else if let Some(access) = claim.strip_prefix("access ") {
@@ -614,6 +628,7 @@ struct PlannedRanking {
     kind: String,
     fetch: Option<u64>,
     nprobes: Option<u64>,
+    eligibility: Option<String>,
 }
 
 /// `<choice>[ ran <choice>]` over the words `allowed`: the planned choice
@@ -723,6 +738,10 @@ fn planned_physical(node: &Value, out: &mut PlannedNodes) {
                     nprobes: ranked
                         .get("nprobes")
                         .map(|nprobes| nprobes.as_u64().unwrap_or(0)),
+                    eligibility: ranked
+                        .get("eligibility")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                 }),
             runtime_filter: node
                 .get("runtime_filter")
@@ -1011,6 +1030,7 @@ pub(crate) fn plan_mismatch(
                 index: kind,
                 fetch,
                 nprobes,
+                eligibility,
             } => {
                 let selected = match physical_scans(&nodes, type_name, binding.as_deref()) {
                     Ok(selected) => selected,
@@ -1049,6 +1069,15 @@ pub(crate) fn plan_mismatch(
                                 "expect plan: the `{kind}` scans of `{type_name}` fetch {fetches:?}, expected {fetch}"
                             ),
                         });
+                    }
+                }
+                if let Some(eligibility) = eligibility {
+                    let placements: Vec<Option<&str>> =
+                        of_kind.iter().map(|r| r.eligibility.as_deref()).collect();
+                    if !placements.contains(&Some(eligibility.as_str())) {
+                        return Some(format!(
+                            "expect plan: the `{kind}` scans of `{type_name}` apply eligibility {placements:?}, expected {eligibility}"
+                        ));
                     }
                 }
                 if let Some(nprobes) = nprobes {
@@ -1467,6 +1496,27 @@ mod tests {
         let mismatch = check(&lines, &explain()).unwrap();
         assert!(mismatch.contains("reports no validation"), "{mismatch}");
         assert!(parse_plan_body(&[(0, "validation scope everything")]).is_err());
+    }
+
+    /// The eligibility claim reads the ranked scan's declared placement.
+    #[test]
+    fn eligibility_claims_read_the_ranked_scans_placement() {
+        let explain = json!({"physical_plan": {"node": "Scan", "table": "node:Doc", "binding": "d",
+            "ranked": {"kind": "bm25", "fetch": null, "eligibility": "after_scoring"}}});
+        let lines =
+            parse_plan_body(&[(0, "scan Doc as $d: ranked bm25 eligibility after_scoring")])
+                .unwrap();
+        assert_eq!(check(&lines, &explain), None);
+        let lines =
+            parse_plan_body(&[(0, "scan Doc as $d: ranked bm25 eligibility before_scoring")])
+                .unwrap();
+        let mismatch = check(&lines, &explain).unwrap();
+        assert!(mismatch.contains("expected before_scoring"), "{mismatch}");
+        assert!(parse_plan_body(&[(0, "scan Doc: ranked bm25 eligibility sometimes")]).is_err());
+        assert!(
+            parse_plan_body(&[(0, "scan Doc: ranked bm25 eligibility after_scoring fetch 1")])
+                .is_err()
+        );
     }
 
     #[test]
@@ -1899,6 +1949,7 @@ mod tests {
                 index: "nearest".to_string(),
                 fetch: Some(10),
                 nprobes: None,
+                eligibility: None,
             }
         );
         assert_eq!(lines[2].clone(), {
@@ -1972,6 +2023,7 @@ mod tests {
                 index: "nearest".to_string(),
                 fetch: None,
                 nprobes: Some(20),
+                eligibility: None,
             }
         );
         assert_eq!(

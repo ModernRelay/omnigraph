@@ -747,6 +747,7 @@ mod traversal_admission_tests {
                 scope: RankScope::Order,
                 overfetch: vec![],
                 prefilter: None,
+                eligibility: omnigraph_planner::Eligibility::BeforeScoring,
             }),
         };
         validate_traversal_admission(&plan).unwrap();

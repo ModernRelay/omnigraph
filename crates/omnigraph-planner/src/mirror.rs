@@ -23,8 +23,9 @@ use crate::error::PlanError;
 use crate::logical::{ColumnRef, GqFilter, KeyJoinKind, Predicate, RuntimeFilterSpec, ScanSpec};
 use crate::operation::TableRef;
 use crate::physical::{
-    Assumptions, Estimate, Hop, NodeId, OrderKey, OverfetchRung, PhysicalNode, PhysicalPlan,
-    Prefilter, Properties, RankArm, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
+    Assumptions, Eligibility, Estimate, Hop, NodeId, OrderKey, OverfetchRung, PhysicalNode,
+    PhysicalPlan, Prefilter, Properties, RankArm, RankKind, RankScope, RankedAccess, ScanInput,
+    StatisticSource,
 };
 use crate::source::SideId;
 
@@ -738,6 +739,7 @@ pub struct RankedMirror {
     pub scope: RankScope,
     pub overfetch: Vec<OverfetchRung>,
     pub prefilter: Option<PrefilterMirror>,
+    pub eligibility: Eligibility,
 }
 
 impl From<&RankedAccess> for RankedMirror {
@@ -751,6 +753,7 @@ impl From<&RankedAccess> for RankedMirror {
             scope: ranked.scope,
             overfetch: ranked.overfetch.clone(),
             prefilter: ranked.prefilter.as_ref().map(PrefilterMirror::from),
+            eligibility: ranked.eligibility,
         }
     }
 }
@@ -766,6 +769,7 @@ impl From<RankedMirror> for RankedAccess {
             scope: mirror.scope,
             overfetch: mirror.overfetch,
             prefilter: mirror.prefilter.map(Prefilter::from),
+            eligibility: mirror.eligibility,
         }
     }
 }

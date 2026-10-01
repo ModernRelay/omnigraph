@@ -4749,8 +4749,20 @@ impl TableStore {
     /// runs the postfilter plan — so every unprovable case (no FTS index,
     /// an entry without a fragment bitmap) contributes nothing.
     pub(crate) async fn fts_covers_all_fragments(ds: &Dataset, column: &str) -> Result<bool> {
+        Ok(Self::fts_coverage(ds, column).await? == omnigraph_planner::FullTextCoverage::Full)
+    }
+
+    /// How far `column`'s full-text index covers `ds`'s fragments: every
+    /// fragment (the union of the entries' fragment bitmaps holds them all),
+    /// some (an entry exists, but the bitmaps do not prove every fragment),
+    /// or no full-text entry at all.
+    pub(crate) async fn fts_coverage(
+        ds: &Dataset,
+        column: &str,
+    ) -> Result<omnigraph_planner::FullTextCoverage> {
+        use omnigraph_planner::FullTextCoverage;
         let indices = user_indices_for_column(ds, column).await?;
-        let fts_bitmaps: Vec<_> = indices
+        let fts_entries: Vec<_> = indices
             .iter()
             .filter(|index| {
                 index
@@ -4759,16 +4771,27 @@ impl TableStore {
                     .map(|details| IndexDetails(details.clone()).supports_fts())
                     .unwrap_or(false)
             })
+            .collect();
+        if fts_entries.is_empty() {
+            return Ok(FullTextCoverage::Absent);
+        }
+        let fts_bitmaps: Vec<_> = fts_entries
+            .iter()
             .filter_map(|index| index.fragment_bitmap.as_ref())
             .collect();
         if fts_bitmaps.is_empty() {
-            return Ok(false);
+            return Ok(FullTextCoverage::Partial);
         }
-        Ok(ds.fragments().iter().all(|f| {
+        let covered = ds.fragments().iter().all(|f| {
             fts_bitmaps
                 .iter()
                 .any(|bitmap| bitmap.contains(f.id as u32))
-        }))
+        });
+        Ok(if covered {
+            FullTextCoverage::Full
+        } else {
+            FullTextCoverage::Partial
+        })
     }
 
     pub async fn has_vector_index(&self, ds: &Dataset, column: &str) -> Result<bool> {

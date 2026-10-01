@@ -25,8 +25,10 @@ use crate::logical::{ColumnRef, EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
 use crate::lower::ContainsJoinFields;
 use crate::optimizer::{RRF_NEAREST_ARM_K, derived_order};
 use crate::physical::{
-    NodeId, OverfetchRung, PhysicalNode, PhysicalPlan, RankKind, RankScope, RankedAccess,
+    Assumptions, Eligibility, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan, RankKind,
+    RankScope, RankedAccess,
 };
+use crate::source::FullTextCoverage;
 
 /// The nodes of one pipeline: every node reachable from `root` without
 /// entering a correlated block's inner tree.
@@ -132,9 +134,9 @@ impl Requirements {
         for nodes in &pipelines {
             self.check_bindings(plan, nodes)?;
             self.check_eligibility(plan, nodes, &matcher, budget)?;
+            self.check_blocks(plan, nodes, &matcher, budget)?;
         }
         let top = pipeline(plan, plan.root(), budget)?;
-        self.check_blocks(plan, &top, &matcher, budget)?;
         self.check_search(plan, &matcher, budget)?;
         self.check_returns(plan, &top, &matcher, budget)?;
         self.check_order_and_cut(plan, &top, &matcher, budget)?;
@@ -238,8 +240,9 @@ impl Requirements {
         Ok(())
     }
 
-    /// One correlated block of the top level per written block, each with
-    /// the aggregate and comparison the query wrote.
+    /// One correlated block per written block in each pipeline the query's
+    /// rows come from, each with the aggregate and comparison the query
+    /// wrote.
     fn check_blocks(
         &self,
         plan: &PhysicalPlan,
@@ -364,7 +367,15 @@ impl Requirements {
                     ),
                 ));
             }
-            self.check_access(plan, access)?;
+            let type_key = ranked
+                .iter()
+                .find(|(_, _, other)| std::ptr::eq(*other, *access))
+                .and_then(|(id, _, _)| match plan.node(*id) {
+                    Some(PhysicalNode::Scan { spec, .. }) => Some(spec.table.type_key.as_str()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            self.check_access(plan, type_key, access)?;
         }
         match (&self.search, fuse) {
             (Some(Search::Fuse { arms, k }), Some((planned, planned_k))) => {
@@ -416,8 +427,33 @@ impl Requirements {
     fn check_access(
         &self,
         plan: &PhysicalPlan,
+        type_key: &str,
         access: &RankedAccess,
     ) -> Result<(), ValidationError> {
+        match (access.kind, access.eligibility) {
+            (RankKind::Nearest, Eligibility::AfterScoring) => {
+                return Err(ValidationError::violated(
+                    "declared policy",
+                    "a nearest scan draws its candidates from eligible rows; it filters before scoring",
+                ));
+            }
+            (RankKind::Bm25, Eligibility::BeforeScoring) => {
+                let recorded = plan
+                    .assumptions()
+                    .full_text
+                    .get(&Assumptions::full_text_key(type_key, &access.property));
+                if recorded != Some(&FullTextCoverage::Full) {
+                    return Err(ValidationError::violated(
+                        "prerequisite",
+                        format!(
+                            "the bm25 scan of `{type_key}.{}` filters before scoring under recorded coverage {recorded:?}; only full coverage keeps its scores independent of the filter",
+                            access.property
+                        ),
+                    ));
+                }
+            }
+            _ => {}
+        }
         let limit = self.limit.and_then(|limit| usize::try_from(limit).ok());
         let (fetch, overfetch) = match (access.kind, access.scope) {
             (RankKind::Bm25, _) => (None, Vec::new()),

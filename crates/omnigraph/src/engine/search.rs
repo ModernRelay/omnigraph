@@ -28,6 +28,9 @@ pub(super) struct SearchMode {
     pub(super) answer_proven_empty: bool,
     /// BM25 full-text search on the scan's binding.
     pub(super) bm25: Option<Bm25Target>,
+    /// The plan places the scan's eligibility after scoring: its filter
+    /// runs as Lance's postfilter, so BM25 statistics read every row.
+    pub(super) eligibility_after_scoring: bool,
     /// The set a gate ANDs into the ranked scan as `id IN (...)`, read off the
     /// `Pass` by `Lowering::search_mode`; the arms an `rrf()` prefilter feeds
     /// are the plan's `Prefilter.feeds`.

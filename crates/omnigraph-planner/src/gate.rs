@@ -21,7 +21,7 @@ use crate::registry::{Coverage, Entry, Route, coverage, lookup};
 use crate::route::RouteOverride;
 use crate::source::{
     AdjacencyProof, EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics,
-    FragmentStat, NodeTypeSpec, PlanSource, SideId,
+    FragmentStat, FullTextCoverage, NodeTypeSpec, PlanSource, SideId,
 };
 use crate::validate::{self, AcceptInput, AcceptedPlan, ValidationError};
 
@@ -159,6 +159,15 @@ impl PlanSource for Recorded<'_> {
 
     fn gate_policy(&self) -> GatePolicy {
         self.source.gate_policy()
+    }
+
+    fn full_text_coverage(&self, type_key: &str, property: &str) -> FullTextCoverage {
+        let coverage = self.source.full_text_coverage(type_key, property);
+        self.read
+            .borrow_mut()
+            .full_text
+            .insert(Assumptions::full_text_key(type_key, property), coverage);
+        coverage
     }
 }
 

@@ -16,7 +16,7 @@ use crate::logical::{
     tiebreak_text,
 };
 use crate::mirror::EdgeSelectionMirror;
-use crate::source::SideId;
+use crate::source::{FullTextCoverage, SideId};
 use omnigraph_compiler::query::codes::{P002, P003};
 
 /// The index of a node in a [`PhysicalPlan`].
@@ -130,6 +130,18 @@ pub struct Assumptions {
     /// Retained even when rewrites remove an expansion, for historical replay admission.
     #[serde(default, skip_serializing_if = "is_false")]
     pub has_wildcard_traversal: bool,
+    /// The full-text coverage of every property a ranked scan's eligibility
+    /// placement read, keyed `<table key>.<property>`. A pinned dataset
+    /// version fixes it, so the dataset pins re-establish it on replay.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub full_text: BTreeMap<String, FullTextCoverage>,
+}
+
+impl Assumptions {
+    /// The key a property's full-text coverage is recorded under.
+    pub fn full_text_key(type_key: &str, property: &str) -> String {
+        format!("{type_key}.{property}")
+    }
 }
 
 impl Assumptions {
@@ -195,6 +207,19 @@ impl Prefilter {
     }
 }
 
+/// Where a ranked scan applies its eligibility (its pushed filter, a gate's
+/// eligible set and the members of its search predicates): before the index
+/// scores rows, as Lance's prefilter, or after, on the scored rows. A BM25
+/// score is independent of a filter applied before scoring only when the
+/// property's full-text index covers every fragment; elsewhere eligibility
+/// applies after scoring, so the filter never changes a score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Eligibility {
+    BeforeScoring,
+    AfterScoring,
+}
+
 /// One rerun of a `nearest` scan's overfetch ladder, taken in order after a
 /// full scan left the answer short of the limit. Report rung `r >= 1` names
 /// `overfetch[r - 1]`; rung 0 is the scan as planned.
@@ -253,6 +278,10 @@ pub struct RankedAccess {
     /// the ranked binding, and on every arm of `rrf()`, whose pre-pass the
     /// `RankFuse` declares.
     pub prefilter: Option<Prefilter>,
+    /// Where the scan applies its eligibility: always before scoring on a
+    /// `nearest` scan, whose candidate window is drawn from eligible rows;
+    /// on a `bm25` scan before scoring only under recorded full coverage.
+    pub eligibility: Eligibility,
 }
 
 impl RankedAccess {
@@ -276,8 +305,9 @@ impl RankedAccess {
             "fetch": self.fetch,
             "scope": self.scope,
         });
-        if self.kind == RankKind::Nearest {
-            value["nprobes"] = json!(self.nprobes);
+        match self.kind {
+            RankKind::Nearest => value["nprobes"] = json!(self.nprobes),
+            RankKind::Bm25 => value["eligibility"] = json!(self.eligibility),
         }
         value
     }
