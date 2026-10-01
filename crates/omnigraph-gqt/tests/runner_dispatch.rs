@@ -507,7 +507,7 @@ fn selecting_engine_does_not_allow_blessing_a_shared_case() {
 #[cfg(tokio_unstable)]
 #[test]
 fn measure_counts_schema_contract_requests_issue_817() {
-    const CASE: &str = "# issue: none\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n--- schema\nnode Person { name: String @key }\n--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}\n--- mutate\nquery add_bob() { insert Person { name: \"bob\" } }\n--- expect affected: nodes=1 edges=0\n--- mutate\nquery add_carol() { insert Person { name: \"carol\" } }\n--- expect affected: nodes=1 edges=0\n";
+    const CASE: &str = "# issue: none\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n--- schema\nnode Person { name: String @key }\n--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}\n--- mutate\nquery add_bob() { insert Person { name: \"bob\" } }\n--- expect affected: nodes=1 edges=0\n--- mutate\nquery add_carol() { insert Person { name: \"carol\" } }\n--- expect affected: nodes=1 edges=0\n--- query\nquery all() { match { $p: Person } return { $p.name } }\n--- expect unordered\n{\"p.name\":\"alice\"}\n{\"p.name\":\"bob\"}\n{\"p.name\":\"carol\"}\n--- expect shape\np.name: String\n";
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("two_inserts_on_main.gqt");
     std::fs::write(&path, CASE).unwrap();
@@ -604,9 +604,8 @@ fn measure_counts_schema_contract_requests_issue_817() {
             "insert {step}: the engine's pin is 7 read_text + 4 exists (tests/write_cost.rs)"
         );
         assert_eq!(
-            counts["repeat_reads"],
-            8,
-            "insert {step}: the capture's re-reads and the revalidation's second load"
+            counts["repeat_reads"], 8,
+            "insert {step}: 11 contract reads on three files; no Lance object is read twice"
         );
     }
     assert_eq!(

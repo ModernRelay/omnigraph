@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use omnigraph::error::{OmniError, Result as OmniResult};
 use omnigraph::storage::{ListDirBounds, StorageAdapter};
 
-use super::{MEASURE, Measure, Object, Started, failed, verb_of, LIST_PAGE};
+use super::{LIST_PAGE, MEASURE, Measure, Object, Started, failed, verb_of};
 
 /// The measured adapter around `base`, for the worker to hand the engine,
 /// calling `progress` per request; `base` itself when the process is not
@@ -271,13 +271,12 @@ impl StorageAdapter for MeasuredAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::measuring;
     use super::super::Model;
+    use super::super::tests::measuring;
 
-    /// The mapping, pinned against the in-memory adapter the DST worker
-    /// wraps: each call, the requests it is logged as, their bytes and range,
-    /// one tick apart under the unit model since the adapter awaits each. The
-    /// ledger is report output a case cannot assert.
+    /// The mapping, pinned as the wrapper's output over the in-memory adapter:
+    /// each call's requests, bytes and range, one tick apart under the unit
+    /// model. The ledger is report output a case cannot assert.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn adapter_calls_are_logged_as_the_in_memory_adapters_requests() {
         use omnigraph::storage::{ListDirBounds, ObjectStorageAdapter, StorageAdapter};

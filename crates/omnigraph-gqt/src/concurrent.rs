@@ -828,7 +828,8 @@ impl Drop for Permit {
 }
 
 /// A request outside the gate (the control realm's, through the engine's
-/// `StorageAdapter`) is progress for a live block's budgets like a gated one.
+/// `StorageAdapter`, which a measured run wraps) is progress for a live
+/// block's budgets like a gated one.
 pub(crate) fn touch() {
     if let Some(run) = active() {
         run.touch();
