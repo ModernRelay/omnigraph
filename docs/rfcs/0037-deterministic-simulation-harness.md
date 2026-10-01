@@ -274,7 +274,7 @@ exactly:
 
 | # | Name | Imitated reality | Who sees the fault | What must survive | Positions indexed by | Mechanism |
 |---|---|---|---|---|---|---|
-| 1 | injected storage faults | the store misbehaves on a call | the operation (an error or wrong bytes) | its retry and error paths | the call | call-level |
+| 1 | injected operation failures | the store misbehaves on a call, or the engine fails before publication | the operation (an error or wrong bytes) | its retry and error paths | the storage call or pre-publication seam | call-level or named decision seam |
 | 2 | crash windows | the process dies at a phase boundary | nobody; the process is gone | recovery, from a marked place | code location (the 71 cataloged windows) | line-level |
 | 3 | crash-state enumeration | the process dies between durable writes | nobody; the process is gone | recovery, from every write cut | write ordinal (W writes = W states) | call-level (a write counter) |
 
@@ -284,7 +284,9 @@ Per model, what is built and measured:
    inputs") injects clean errors and latency, corruption on the read
    path (value-aware bit rot, truncated reads, persistent latent
    sector errors), lost and misdirected writes, ack-loss (the effect
-   durable, the confirmation lost), and bounded staleness.
+   durable, the confirmation lost), and bounded staleness. The separate
+   `engine_effect_error_pct` stream returns failures at existing
+   pre-publication seams while the process stays alive; it is not a crash.
 2. The judged contract is two-sided: a failed operation is invisible
    XOR fully applied, and committed writes never roll back.
 3. Since memory dies with the process, storage is the only surviving
@@ -693,6 +695,17 @@ to the legal catalog). Injected damage is judged detected-or-harmless
 by attribution: a damage ledger records what was injected, so
 engine-born detection errors are legalized by overlap instead of
 guessed at.
+
+Coverage follows the methods the workload actually calls. Current-format
+schema contracts are Lance rows. Adapter text-read corruption and staleness
+are qualified against offline legacy upgrade admission; rejected attempts
+must preserve the adapter and Lance objects, followed by a successful clean
+conversion. Binary graph-index writes support loss and misdirection but not
+the adapter's text-only corruption. Lance-call weather supports errors,
+latency and lost acknowledgements and remains outside strict report replay.
+The separate engine-effect stream preserves strict replay, requires counted
+seam delivery, and is scoped to workload operations under serialized scenario
+ownership; the live-handle owner also requires subsequent successful writes.
 
 ### Provenance
 

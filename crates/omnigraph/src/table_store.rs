@@ -1439,6 +1439,42 @@ impl TableStore {
         }
     }
 
+    /// Validate an original empty create for a non-destructive schema-apply retry.
+    /// Returns whether its complete Arrow schema already matches the desired one.
+    pub async fn validate_initial_empty_table(
+        &self,
+        ds: &Dataset,
+        desired: &SchemaRef,
+    ) -> Result<bool> {
+        if ds.version().version != 1
+            || !ds.manifest().uses_stable_row_ids()
+            || ds.manifest().data_storage_format.lance_file_format()
+                != LanceFileVersion::V2_2.resolve()
+            || ds
+                .manifest()
+                .fragments
+                .iter()
+                .any(|fragment| fragment.physical_rows != Some(0))
+        {
+            return Err(OmniError::manifest_conflict(format!(
+                "schema apply cannot reuse '{}': expected an original empty version-one table",
+                ds.uri()
+            )));
+        }
+        let transaction = ds.read_transaction().await.map_err(OmniError::storage)?;
+        if !transaction.is_some_and(|transaction| {
+            transaction.read_version == 0
+                && matches!(transaction.operation, Operation::Overwrite { .. })
+        }) {
+            return Err(OmniError::manifest_conflict(format!(
+                "schema apply cannot reuse '{}': version one is not an original create",
+                ds.uri()
+            )));
+        }
+        let actual = arrow_schema::Schema::from(ds.schema());
+        Ok(&actual == desired.as_ref())
+    }
+
     /// List the named Lance branches present on the dataset at `dataset_uri`.
     /// The `cleanup` orphan reconciler diffs this against the manifest branch
     /// set to find orphaned per-table forks. `main`/default is not a named
@@ -6337,6 +6373,62 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
         let col = Arc::new(StringArray::from(ids.to_vec())) as ArrayRef;
         RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn schema_retry_refuses_noninitial_or_nonempty_tables_without_mutation() {
+        for case in ["nonempty", "advanced", "unstable", "wrong-format"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().to_str().unwrap();
+            let uri = format!("{root}/candidate");
+            let store = TableStore::new(root, Arc::new(lance::session::Session::default()));
+            let batch = batch_with_ids(if case == "nonempty" {
+                &["retained"]
+            } else {
+                &[]
+            });
+            let desired = batch.schema();
+            let params = WriteParams {
+                enable_stable_row_ids: case != "unstable",
+                data_storage_version: Some(if case == "wrong-format" {
+                    LanceFileVersion::V2_1
+                } else {
+                    LanceFileVersion::V2_2
+                }),
+                auto_cleanup: None,
+                skip_auto_cleanup: true,
+                ..Default::default()
+            };
+            let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], desired.clone());
+            let mut dataset = Dataset::write(reader, &uri, Some(params)).await.unwrap();
+            if case == "advanced" {
+                dataset
+                    .update_config([("retry-probe", Some("1"))])
+                    .await
+                    .unwrap();
+            }
+            let manifest_path = format!("/{}", dataset.manifest_location().path);
+            let bytes = std::fs::read(&manifest_path).unwrap();
+            let version = dataset.version().version;
+            let error = store
+                .validate_initial_empty_table(&dataset, &desired)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("original empty version-one table"),
+                "{case}: {error}"
+            );
+            assert_eq!(std::fs::read(&manifest_path).unwrap(), bytes, "{case}");
+            let reopened = Dataset::open(&uri).await.unwrap();
+            assert_eq!(reopened.version().version, version, "{case}");
+            assert_eq!(
+                reopened.count_rows(None).await.unwrap(),
+                usize::from(case == "nonempty"),
+                "{case}"
+            );
+        }
     }
 
     #[test]

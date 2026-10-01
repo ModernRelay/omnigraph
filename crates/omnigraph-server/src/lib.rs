@@ -2042,12 +2042,13 @@ mod external_blob_startup_tests {
         Omnigraph::init(graph.to_string_lossy().as_ref(), schema)
             .await
             .unwrap();
-        // A read-write open normally removes this matching no-op staging
-        // residue. The invalid policy must be rejected before graph open, so
-        // startup cannot perform even that safe recovery mutation first.
-        let staging = graph.join("_schema.pg.staging");
-        std::fs::write(&staging, schema).unwrap();
-        assert!(staging.exists());
+        let recovery = graph.join("__recovery");
+        std::fs::create_dir_all(&recovery).unwrap();
+        std::fs::write(recovery.join("unresolved.json"), "malformed sidecar").unwrap();
+        assert!(matches!(
+            Omnigraph::open(graph.to_str().unwrap()).await,
+            Err(OmniError::RecoveryRequired { .. })
+        ));
         let policy: omnigraph::ExternalBlobPolicy = serde_json::from_value(serde_json::json!({
             "mode": "allow",
             "bases": [{
@@ -2076,11 +2077,10 @@ mod external_blob_startup_tests {
                 .contains("server-safe external Blob base may not use file://"),
             "unexpected refusal: {error:?}"
         );
-        assert!(
-            staging.exists(),
-            "invalid server policy must be refused before read-write open recovery moves graph state"
+        assert_eq!(
+            std::fs::read_to_string(recovery.join("unresolved.json")).unwrap(),
+            "malformed sidecar"
         );
-        assert_eq!(std::fs::read_to_string(staging).unwrap(), schema);
     }
 }
 

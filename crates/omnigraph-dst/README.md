@@ -97,12 +97,12 @@ The five GROUPS below are the reader's map; the enforced census counts
 
 Three distinct instruments, complementary — none subsumes another:
 
-1. **Fault plans** (weather): seeded per-call fault rates in BOTH storage
-   realms (the `StorageAdapter` seam and Lance's interposed provider) —
-   clean errors and latency, read-path corruption (bit rot, truncation,
-   latent sector errors), write-side weather (corrupted, lost, misdirected
-   writes), ack-loss, and bounded staleness. Unaimed — discovers handling
-   bugs statistically across the whole run.
+1. **Fault plans** (weather): seeded errors, latency and lost acknowledgements
+   in the adapter realm and, when enabled, Lance's provider. The adapter also
+   models text corruption, lost or misdirected writes, and bounded staleness;
+   each verb needs a workload that reaches its supported methods. Seeded
+   engine-effect failures use existing pre-publication decision seams.
+   Lance-call weather retains the semantic oracles but is outside strict replay.
 2. **Crash-window hunt**: a named failpoint (72 in `catalog::CRASH_WINDOWS`)
    armed at a seeded op index. Aimed — guarantees a specific dangerous
    moment is exercised.
@@ -123,16 +123,26 @@ and `tests/lane_b.rs`.
   failpoints (`catalog::CRASH_WINDOWS`) at a seeded op index. The ignored
   `dst_hunt_crash_window_sweep` test sweeps the whole catalog.
 - **Injected storage faults**: `Scenario::faults` installs a seeded `FaultPlan`
-  over both realms — marked errors + latency charged in VIRTUAL
-  time (`start_paused` clock, so faulty universes still run in milliseconds),
-  plus the corruption/ack-loss/staleness axes listed under Failure models.
+  on the adapter and optionally Lance. Latency uses virtual time. Lance supports
+  errors, latency and lost acknowledgements; adapter text corruption and
+  staleness do not extend to Lance or binary graph-index artifacts.
+- **Engine-effect failures**: `FaultPlan::engine_effect_error_pct` selects an
+  existing pre-publication seam from a separate seeded stream. The atomicity
+  and live-handle owners require counted delivery and full report replay;
+  the latter also requires later model-changing writes without reopening.
+  These process-wide decision seams require serialized scenario ownership.
+- **Legacy contract read weather**: `run_legacy_upgrade_read_weather` exercises
+  offline upgrade admission on flat-v11 fixtures. Stale source, bit rot,
+  truncation and latent errors must reach validation; refused attempts preserve
+  stored objects, and a clean retry preserves data and graph lineage.
+  Current-format serving reads its schema contract through Lance.
 
 ## Known limits
 
 Racing-writer determinism is blocked on the upstream Lance deterministic-mode
 proposal (4 flag-gated items) — the
-`#[ignore]`d instruments flip on when it lands. Crash-mode universes cannot
-yet run in parallel threads (failpoint-registry threading is a planned follow-up).
+`#[ignore]`d instruments flip on when it lands. Crash-mode universes and engine-effect weather use process-wide decision
+seams and must be serialized within a test process.
 
 ## Deferred work (#527 review)
 

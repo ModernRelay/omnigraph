@@ -401,6 +401,13 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         branch: Option<&str>,
     ) -> Result<SnapshotHandle>;
 
+    /// Validate an original empty create and compare its complete physical schema.
+    async fn validate_initial_empty_table(
+        &self,
+        snapshot: &SnapshotHandle,
+        desired: &SchemaRef,
+    ) -> Result<bool>;
+
     /// Native identity of the branch backing an already-open snapshot. Branch
     /// merge uses it to bind a proven source interval and its target to the
     /// exact native ref incarnation, closing delete/recreate ABA.
@@ -852,6 +859,14 @@ impl TableStorage for TableStore {
         TableStore::open_dataset_head(self, dataset_uri, branch)
             .await
             .map(SnapshotHandle::new)
+    }
+
+    async fn validate_initial_empty_table(
+        &self,
+        snapshot: &SnapshotHandle,
+        desired: &SchemaRef,
+    ) -> Result<bool> {
+        TableStore::validate_initial_empty_table(self, snapshot.dataset(), desired).await
     }
 
     async fn branch_identifier(

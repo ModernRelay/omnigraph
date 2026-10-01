@@ -35,17 +35,27 @@ pub(super) struct DetachedOnlyWork {
 }
 
 /// Judge every pin of every live branch without writing.
-pub(super) async fn preflight(root: &str) -> Result<Vec<String>> {
+pub(super) async fn preflight(
+    root: &str,
+    contract: &crate::db::manifest::SchemaContractRow,
+) -> Result<Vec<String>> {
     let _admission = crate::db::manifest::migrations::admit_conversion_source(root, SOURCE_STAMP);
-    let db = Omnigraph::open_read_only(root).await?;
+    let db =
+        Omnigraph::open_for_storage_upgrade(root, crate::db::OpenMode::ReadOnly, contract.clone())
+            .await?;
     blocked_pins(&db).await
 }
 
 /// Promote, reap and record on every live branch; refuse before any write
 /// when a pin is blocked.
-pub(super) async fn execute(root: &str) -> Result<DetachedOnlyWork> {
+pub(super) async fn execute(
+    root: &str,
+    contract: &crate::db::manifest::SchemaContractRow,
+) -> Result<DetachedOnlyWork> {
     let _admission = crate::db::manifest::migrations::admit_conversion_source(root, SOURCE_STAMP);
-    let db = Omnigraph::open(root).await?;
+    let db =
+        Omnigraph::open_for_storage_upgrade(root, crate::db::OpenMode::ReadWrite, contract.clone())
+            .await?;
     let mut work = DetachedOnlyWork {
         blocked: blocked_pins(&db).await?,
         ..DetachedOnlyWork::default()
@@ -135,15 +145,7 @@ pub(super) async fn execute(root: &str) -> Result<DetachedOnlyWork> {
 }
 
 async fn live_branches(db: &Omnigraph) -> Result<Vec<Option<String>>> {
-    Ok(crate::db::omnigraph::optimize::cleanup_graph_branches(db)
-        .await?
-        .into_iter()
-        .filter(|branch| {
-            branch
-                .as_deref()
-                .is_none_or(|branch| !crate::db::is_internal_system_branch(branch))
-        })
-        .collect())
+    crate::db::omnigraph::optimize::cleanup_graph_branches(db).await
 }
 
 /// One pin as several branches can share it: table, lineage and target.
