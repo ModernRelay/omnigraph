@@ -741,3 +741,26 @@ fn derivation_cost_grows_with_the_query() {
         );
     }
 }
+
+/// A rule may name only a node the derivation has reached and not yet
+/// replaced: a forward reference and a superseded node are both refused.
+#[test]
+fn a_reference_to_an_unreached_or_superseded_node_is_refused() {
+    let fixture = filtered();
+    let plan = fixture.plan();
+    let derivation = fixture.derivation().unwrap();
+    let mut forward = derivation.clone();
+    forward.steps[0].at = vec![usize::MAX, 0];
+    let mut superseded = derivation.clone();
+    let first = superseded.steps[0].at.clone();
+    superseded.steps[1].at = first;
+    for broken in [forward, superseded] {
+        match fixture.accept_with(plan.clone(), Some(broken)) {
+            Err(ValidationError::Violated { check, detail }) => {
+                assert_eq!(check, "exact subset");
+                assert!(detail.contains("is not"), "{detail}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
