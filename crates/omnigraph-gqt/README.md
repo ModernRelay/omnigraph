@@ -307,27 +307,45 @@ cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --measure
 ```
 
 `--measure` records, for every step of each DST environment, the object-store
-requests the engine made while the step ran. The measuring store is a
-decorator on the engine's `object_store_seam`, the seam the DST fault
-decorator uses, so every store the registry builds is wrapped: `__manifest`
-and table traffic alike, and the engine is not edited. The ledger keeps every
-request of the run, tagged with the label current when it was made: `setup`
-before the first step, `step` N while step N runs, `runner` N from its end to
-the next step (the runner's own checks); the runner only moves the label, and
-the report is the ledger grouped by it, so the rows add up to every request
-the store saw (`slot` column). Per group it reports:
+requests made while the step ran (the engine's, and under a `--- store` rule
+the fault wrapper's own), in both of the engine's realms. The Lance
+realm: the measuring store is a decorator on the engine's
+`object_store_seam`, the seam the DST fault decorator uses, so every store the
+registry builds is wrapped, `__manifest` and table traffic alike. The control
+realm: the schema contract (`_schema.pg`, `_schema.ir.json`,
+`__schema_state.json` and their `.staging` twins), the init claim and probe,
+the legacy `__recovery/` listing and the graph-index artifact go through the
+engine's `StorageAdapter`, whose DST store is a second in-memory object store
+the registry never builds; the worker wraps the adapter it hands the engine
+and logs each call as the requests the in-memory adapter makes for it: a text
+read one `get`, a bounded read one `get` of `0-(max+1)`, a write one `put`,
+a conditional write the store refused `put_failed`, an `exists` one `head` (a
+miss `head_failed` and the `list` of the prefix that follows), a rename a
+`copy` and a `delete`, a directory listing one `list` per page of the entries
+it returned (a bounded listing walks nested and unmatched entries it does not
+return; those are not paged). The engine is not edited. The ledger keeps every request of the run, tagged with the label
+current when it was made: `setup` before the first step, `step` N while step
+N runs, `runner` N from its end to the next step (the runner's own checks);
+the runner only moves the label, and the report is the ledger grouped by it,
+so the rows add up to every request either store saw (`slot` column; the
+control realm's limits below are the exceptions). Per group it reports:
 
 - `requests`, the work, and `repeat_reads`, the `get`s and `head`s of an
   object and byte range the group had already read (the same bytes paid for
-  twice; objects are told apart by their real names, uuids included);
-- `after_publish`, the requests after the group's last `__manifest` version
-  put, the publish CAS: the crash window, where a crash leaves a published
-  operation unfinished; absent when the group published nothing;
+  twice; objects are told apart by their real names, uuids included, and a
+  control object never meets a Lance object of the same name);
+- `after_publish`, the requests of either realm after the group's last
+  `__manifest` version put, the publish CAS: the crash window, where a crash
+  leaves a published operation unfinished (a schema apply's contract write
+  after its publish is in it); absent when the group published nothing;
 - a count per `<realm>_<kind>.<verb>` class (`manifest_meta.put`,
-  `table_data.get`, …) where the realm is the dataset (`__manifest`, the
-  table, the recovery root) and the kind its Lance directory; a request the
-  store refused counts under `<verb>_failed`, for every verb (`get`, `head`,
-  `put`, `put_part`, `put_multipart`, `put_complete`, `put_abort`, `copy`,
+  `table_data.get`, `control_schema.head`, …) where the realm is the dataset
+  (`__manifest`, the table, the recovery root) and the kind its Lance
+  directory, or `control` and the kind the object's role (`schema`,
+  `recovery`, `graph_index`, `claim`, `probe`, `manifest` for the adapter's
+  probe of the `__manifest` root, `other`); a request the store refused
+  counts under `<verb>_failed`, for every verb (`get`, `head`, `put`,
+  `put_part`, `put_multipart`, `put_complete`, `put_abort`, `copy`,
   `delete`, `list`); a `list` counts one request per 1,000 keys, a multipart
   upload the create, one request per part and the complete or abort, the
   shapes S3 bills;
@@ -390,7 +408,20 @@ row per step and per gap and a row per phase, and writes the long-form TSV
 under `target/gqt-artifacts/cost/` (phase rows as `phase.<name>.<field>`).
 Direct-engine environments record nothing: on a `file` root Lance bypasses
 the wrapped store for data files, so only the DST in-memory object store
-sees every request. Every case measures the same way; nothing in a case
+sees every request. The control realm's counts are the in-memory adapter's:
+under DST its store never holds a Lance object, so the engine's probes of a
+dataset root through the adapter (init's `__manifest` preflight, schema
+apply's leftover-dataset probe) always miss, `head_failed` then `list`, and
+the `delete_prefix` reclaim behind the second is never reached (it is logged
+as its listing alone, the deletes that follow being as many as it found); an
+`exists` the store refused is `head_failed` whether the head or the list
+after it failed. An adapter the engine builds for itself instead of using
+the handle's (`ensure_no_pending_recovery`, the storage upgrade, the
+graph-index load of a historical read) is outside the wrapped one; no gqt
+step reaches one today. A contract file probed then read in one step is a repeat
+read, `head` and whole-object `get` sharing a key, and so is every load of
+the contract after a step's first (a write's revalidation after its capture).
+Every case measures the same way; nothing in a case
 declares it, and the invocation takes several case paths or directories,
 anywhere on disk. `--artifacts <dir>` puts the report and the TSV in that
 directory instead of the build tree's `target/gqt-artifacts/`, so a suite

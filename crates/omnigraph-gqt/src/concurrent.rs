@@ -827,6 +827,14 @@ impl Drop for Permit {
     }
 }
 
+/// A request outside the gate (the control realm's, through the engine's
+/// `StorageAdapter`) is progress for a live block's budgets like a gated one.
+pub(crate) fn touch() {
+    if let Some(run) = active() {
+        run.touch();
+    }
+}
+
 /// Hold the request until its turn, if the script names it. Every request
 /// of a live block, named or not, is progress for the budgets.
 async fn gate(verb: Verb, key: &str) -> Permit {
