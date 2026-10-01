@@ -2015,7 +2015,7 @@ async fn independent_target_merges_overlap_issue_643() {
         .expect("a merge into another target must complete while A is parked")
         .unwrap()
         .expect("B must merge");
-    assert_eq!(merged_b, omnigraph::db::MergeOutcome::Merged);
+    assert_eq!(merged_b.outcome, omnigraph::db::MergeOutcome::Merged);
     assert!(
         !merge_a.is_finished(),
         "A must still be parked before its manifest commit while B published"
@@ -2023,7 +2023,11 @@ async fn independent_target_merges_overlap_issue_643() {
 
     parked.release();
     assert_eq!(
-        merge_a.await.unwrap().expect("A must merge after release"),
+        merge_a
+            .await
+            .unwrap()
+            .expect("A must merge after release")
+            .outcome,
         omnigraph::db::MergeOutcome::Merged
     );
     for target in ["t1", "t2"] {
@@ -2075,11 +2079,19 @@ async fn same_target_merges_serialize_issue_643() {
 
     parked.release();
     assert_eq!(
-        merge_a.await.unwrap().expect("A must merge after release"),
+        merge_a
+            .await
+            .unwrap()
+            .expect("A must merge after release")
+            .outcome,
         omnigraph::db::MergeOutcome::Merged
     );
     assert_eq!(
-        merge_b.await.unwrap().expect("B must merge after A"),
+        merge_b
+            .await
+            .unwrap()
+            .expect("B must merge after A")
+            .outcome,
         omnigraph::db::MergeOutcome::Merged
     );
     assert_eq!(
@@ -2123,7 +2135,8 @@ async fn merge_endpoint_delete_waits_for_the_merge_issue_643() {
             merge
                 .await
                 .unwrap()
-                .expect("the merge must publish after release"),
+                .expect("the merge must publish after release")
+                .outcome,
             omnigraph::db::MergeOutcome::Merged,
             "deleting {victim}"
         );
@@ -2168,7 +2181,7 @@ async fn same_source_merges_both_land_issue_643() {
     );
     for (target, outcome) in [("t1", first), ("t2", second)] {
         assert_eq!(
-            outcome.unwrap().expect("merge must land"),
+            outcome.unwrap().expect("merge must land").outcome,
             omnigraph::db::MergeOutcome::Merged,
             "{target}"
         );
@@ -2246,7 +2259,11 @@ async fn failed_merge_beside_an_independent_merge_issue_643() {
 
     parked.release();
     assert_eq!(
-        merge_b.await.unwrap().expect("B must merge after release"),
+        merge_b
+            .await
+            .unwrap()
+            .expect("B must merge after release")
+            .outcome,
         omnigraph::db::MergeOutcome::Merged
     );
     assert_eq!(
@@ -2256,7 +2273,8 @@ async fn failed_merge_beside_an_independent_merge_issue_643() {
         )
         .await
         .expect("the failed merge must have released its gates")
-        .expect("the same handle must retry A once the fault stops"),
+        .expect("the same handle must retry A once the fault stops")
+        .outcome,
         omnigraph::db::MergeOutcome::Merged
     );
     for target in ["t1", "t2"] {
@@ -2303,7 +2321,10 @@ async fn cancelled_merge_leaves_the_target_whole_issue_643() {
         let seam = seam.name();
         match &outcome {
             Ok(result) => assert_eq!(
-                result.as_ref().expect("an uncancelled merge must land"),
+                &result
+                    .as_ref()
+                    .expect("an uncancelled merge must land")
+                    .outcome,
                 &omnigraph::db::MergeOutcome::Merged,
                 "{seam}"
             ),
@@ -2329,7 +2350,7 @@ async fn cancelled_merge_leaves_the_target_whole_issue_643() {
         .unwrap_or_else(|_| panic!("{seam}: the cancelled merge must have released its gates"))
         .unwrap_or_else(|error| panic!("{seam}: the retry must merge: {error}"));
         assert_eq!(
-            retried,
+            retried.outcome,
             if merged {
                 omnigraph::db::MergeOutcome::AlreadyUpToDate
             } else {

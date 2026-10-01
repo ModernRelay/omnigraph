@@ -540,7 +540,8 @@ async fn parked_merge_blocks_schema_apply_issue_643() {
         merge
             .await
             .unwrap()
-            .expect("the merge must publish after release"),
+            .expect("the merge must publish after release")
+            .outcome,
         omnigraph::db::MergeOutcome::Merged
     );
     let refusal = schema_task
