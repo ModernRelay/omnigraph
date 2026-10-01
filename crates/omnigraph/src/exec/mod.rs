@@ -29,7 +29,7 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::db::Snapshot;
 use crate::db::manifest::ManifestCoordinator;
-use crate::db::{MergeOutcome, MergeResult, Omnigraph, WriteTxn, is_internal_system_branch};
+use crate::db::{MergeOutcome, MergeResult, Omnigraph, WriteTxn};
 use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};
 use crate::storage_layer::SnapshotHandle;
 use tempfile::{Builder as TempDirBuilder, TempDir};

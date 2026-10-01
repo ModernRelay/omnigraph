@@ -92,7 +92,7 @@ fn lifecycle_probe() -> (
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     ];
     let guards = [
-        &omnigraph::seams::catalog::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN,
+        &omnigraph::seams::catalog::INIT_AFTER_COORDINATOR_INIT,
         &omnigraph::seams::catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
     ]
     .into_iter()

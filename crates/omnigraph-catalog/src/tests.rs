@@ -323,10 +323,17 @@ async fn exact_genesis_probe_rejects_another_initialization_attempt() {
         assert_eq!(catalog.system_columns, system_columns);
         let control_session = crate::lance_access::control_session();
         let committed_attempt = GenesisManifestAttempt::mint(catalog.system_columns).unwrap();
+        let contract = SchemaContractRow::for_test_catalog(&catalog).unwrap();
 
-        ManifestCoordinator::init_commit(uri, &catalog, &control_session, &committed_attempt)
-            .await
-            .unwrap();
+        ManifestCoordinator::init_commit(
+            uri,
+            &catalog,
+            &contract,
+            &control_session,
+            &committed_attempt,
+        )
+        .await
+        .unwrap();
         ManifestCoordinator::open_exact_genesis_with_lineage(
             uri,
             &committed_attempt,
@@ -1738,7 +1745,8 @@ impl ManifestBatchPublisher for RecordingPublisher {
                 ManifestChange::Update(update) => Some(update.to_create_table_version_request()),
                 ManifestChange::RegisterTable(_)
                 | ManifestChange::RenameTable(_)
-                | ManifestChange::Tombstone(_) => None,
+                | ManifestChange::Tombstone(_)
+                | ManifestChange::SchemaContract(_) => None,
             })
             .collect();
         self.requests.lock().await.extend_from_slice(&requests);
@@ -2683,6 +2691,19 @@ async fn exact_publish_rejects_named_branch_delete_recreate_aba() {
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     mc.create_branch("feature").await.unwrap();
 
+    let publisher = GraphNamespacePublisher::new(uri, Some("feature"));
+    let contract = mc.read_schema_contract().await.unwrap();
+    publisher
+        .publish(
+            &[ManifestChange::SchemaContract(contract.clone())],
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    mc.commit_changes(&[ManifestChange::SchemaContract(contract)])
+        .await
+        .unwrap();
     let old_branch = open_manifest_dataset(uri, Some("feature")).await.unwrap();
     let old_identifier = old_branch.branch_identifier().await.unwrap();
     assert!(
@@ -2729,13 +2750,14 @@ async fn exact_publish_rejects_named_branch_delete_recreate_aba() {
     let recreated = open_manifest_dataset(uri, Some("feature")).await.unwrap();
     let recreated_identifier = recreated.branch_identifier().await.unwrap();
     assert_ne!(old_identifier, recreated_identifier);
+    assert_eq!(old_branch.version().version, recreated.version().version);
 
     let precondition = PublishPrecondition::ExactGraphHead(GraphHeadExpectation::new(
         Some("feature"),
         old_identifier,
         None,
     ));
-    let err = GraphNamespacePublisher::new(uri, Some("feature"))
+    let err = publisher
         .publish_with_precondition(&[], &HashMap::new(), None, &precondition)
         .await
         .expect_err("recreated branch must reject the old incarnation token");
@@ -3152,7 +3174,7 @@ async fn legacy_manifest_fixture(
         entry.identity,
         entry.version_metadata.to_json_string().unwrap(),
     )]);
-    let batch = super::state::entries_to_batch(&[entry], &metadata, &[]).unwrap();
+    let batch = super::state::entries_to_batch(&[entry], &metadata, &[], None).unwrap();
     let batch = if matches!(mode, lance::dataset::WriteMode::Append) {
         batch.slice(1, 1)
     } else {
@@ -3265,7 +3287,7 @@ async fn legacy_manifest_decoder_preserves_equal_version_tombstone() {
         source.identity,
         source.version_metadata.to_json_string().unwrap(),
     )]);
-    let batch = super::state::entries_to_batch(std::slice::from_ref(&source), &metadata, &[])
+    let batch = super::state::entries_to_batch(std::slice::from_ref(&source), &metadata, &[], None)
         .unwrap()
         .slice(1, 1);
     let mut columns = batch.columns().to_vec();
@@ -3356,6 +3378,8 @@ fn record_states_batch() -> RecordBatch {
         vec![None, Some(9), Some(0)],
         vec![None, Some("main".into()), Some(String::new())],
         vec![None, None, Some(0)],
+        vec![None, None, None],
+        vec![None, None, None],
     )
     .unwrap()
 }
@@ -3365,8 +3389,26 @@ fn packed_record_round_trips_nulls_through_present_bits() {
     let logical = record_states_batch();
     let schema = super::record::manifest_storage_schema(HashMap::new()).unwrap();
     let names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    assert_eq!(names, ["object_id", "object_type", "record"]);
+    assert_eq!(
+        names,
+        [
+            "object_id",
+            "object_type",
+            "record",
+            "schema_source",
+            "schema_ir"
+        ]
+    );
     let stored = super::record::compact_to_storage(&logical, &schema).unwrap();
+    assert!(
+        stored
+            .column_by_name("schema_source")
+            .is_some_and(|column| column.null_count() == 3)
+            && stored
+                .column_by_name("schema_ir")
+                .is_some_and(|column| column.null_count() == 3),
+        "rows without a contract store null content"
+    );
     let record = stored
         .column_by_name("record")
         .unwrap()
@@ -3398,9 +3440,21 @@ fn packed_record_round_trips_nulls_through_present_bits() {
     let expanded = super::record::expand_from_storage(&stored).unwrap();
     assert_eq!(expanded, logical);
 
+    let without_content = stored.project(&[0, 1, 2]).unwrap();
+    assert_eq!(
+        super::record::expand_from_storage(&without_content).unwrap(),
+        logical,
+        "a scan that never projected the content columns expands them null"
+    );
+
     let flat = super::state::flat_manifest_schema();
     assert_eq!(flat.fields().len(), 11);
     assert_eq!(flat.field(4).name(), "base_objects");
+    assert!(
+        flat.field_with_name("schema_source").is_err()
+            && flat.field_with_name("schema_ir").is_err(),
+        "the flat shape never carried the content columns"
+    );
 }
 
 /// `stored` with its `present` column replaced by `present`, the rows a
@@ -3420,15 +3474,20 @@ fn with_present_bits(stored: &RecordBatch, present: Vec<u8>) -> RecordBatch {
         .unwrap();
     children[present_index] = Arc::new(arrow_array::UInt8Array::from(present));
     let tampered = arrow_array::StructArray::new(record.fields().clone(), children, None);
-    RecordBatch::try_new(
-        stored.schema(),
-        vec![
-            stored.column(0).clone(),
-            stored.column(1).clone(),
-            Arc::new(tampered),
-        ],
-    )
-    .unwrap()
+    let columns = stored
+        .schema()
+        .fields()
+        .iter()
+        .zip(stored.columns())
+        .map(|(field, column)| -> arrow_array::ArrayRef {
+            if field.name() == "record" {
+                Arc::new(tampered.clone())
+            } else {
+                column.clone()
+            }
+        })
+        .collect();
+    RecordBatch::try_new(stored.schema(), columns).unwrap()
 }
 
 #[test]
@@ -3456,9 +3515,9 @@ fn packed_record_refuses_a_null_bit_beside_a_value() {
     );
 }
 
-/// A manifest still stored flat at stamp 11 opens and reads as it is, and its
-/// next publish rewrites it packed at stamp 12 with the same state; the
-/// pre-conversion version keeps its flat shape for time travel.
+/// A flat stamp-11 manifest reads as it is; a publish over it rewrites it packed at stamp 13
+/// with the same table state (no `schema_contract` row: the storage upgrade route adds that),
+/// and the pre-conversion version keeps its flat shape for time travel.
 #[tokio::test]
 async fn stamp_11_manifest_converts_on_its_next_publish() {
     let dir = tempfile::tempdir().unwrap();
@@ -3467,7 +3526,7 @@ async fn stamp_11_manifest_converts_on_its_next_publish() {
         .await
         .unwrap();
     let mut born = open_manifest_dataset(uri, None).await.unwrap();
-    assert_eq!(super::migrations::read_stamp(&born), Some(12));
+    assert_eq!(super::migrations::read_stamp(&born), Some(13));
     let at_birth = logical_view(&born).await;
 
     super::migrations::restamp_flat_for_test(&mut born, 11)
@@ -3480,13 +3539,21 @@ async fn stamp_11_manifest_converts_on_its_next_publish() {
     assert!(flat.schema().field("base_objects").is_some());
     let flat_version = flat.version().version;
     assert_eq!(logical_view(&flat).await, at_birth);
+    assert!(
+        super::state::read_manifest_state(&flat)
+            .await
+            .unwrap()
+            .schema_contract
+            .is_none(),
+        "a flat manifest has no schema_contract row"
+    );
 
     let live_rows = read_publish_scan(&flat).await.unwrap().live_rows;
     let empty_pending = live_rows[0].slice(0, 0);
-    let converted = super::commit::overwrite(flat, empty_pending, live_rows)
+    let (converted, _) = super::commit::overwrite(flat, empty_pending, live_rows)
         .await
         .unwrap();
-    assert_eq!(super::migrations::read_stamp(&converted), Some(12));
+    assert_eq!(super::migrations::read_stamp(&converted), Some(13));
     assert!(
         converted.manifest().uses_stable_row_ids(),
         "the conversion overwrite must keep the stable row ids genesis enables"
@@ -3497,13 +3564,22 @@ async fn stamp_11_manifest_converts_on_its_next_publish() {
         .iter()
         .map(|f| f.name.clone())
         .collect();
-    assert_eq!(names, ["object_id", "object_type", "record"]);
+    assert_eq!(
+        names,
+        [
+            "object_id",
+            "object_type",
+            "record",
+            "schema_source",
+            "schema_ir"
+        ]
+    );
     let fragments = converted.get_fragments();
     let file = &fragments[0].metadata().files[0];
     assert_eq!(
         file.column_indices.len(),
-        3,
-        "the packed record is one physical column beside `object_id` and `object_type`: {:?}",
+        5,
+        "the packed record is one physical column beside `object_id`, `object_type` and the two content columns: {:?}",
         file.column_indices
     );
     assert_eq!(logical_view(&converted).await, at_birth);
@@ -3512,6 +3588,464 @@ async fn stamp_11_manifest_converts_on_its_next_publish() {
     assert_eq!(super::migrations::read_stamp(&historical), Some(11));
     assert!(historical.schema().field("base_objects").is_some());
     assert_eq!(logical_view(&historical).await, at_birth);
+}
+
+fn replacement_contract() -> SchemaContractRow {
+    SchemaContractRow {
+        source: "node Person {\n    name: String\n    nickname: String?\n}\n".to_string(),
+        ir: "{\n  \"ir_version\": 5,\n  \"nodes\": []\n}\n".to_string(),
+        head: SchemaContractHead {
+            schema_ir_hash: "sha256:replacement".to_string(),
+            schema_identity_version: 2,
+            schema_identity_domain: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+        },
+    }
+}
+
+async fn schema_contract_row_count(dataset: &Dataset) -> usize {
+    let mut scanner = dataset.scan();
+    scanner.filter_expr(
+        datafusion::prelude::col("object_id")
+            .eq(datafusion::prelude::lit(SCHEMA_CONTRACT_OBJECT_ID)),
+    );
+    scanner.count_rows().await.unwrap() as usize
+}
+
+/// Genesis writes the one `schema_contract` row in the Create commit: the head is folded into
+/// the state and the snapshot, the texts come back byte-exact through both reads.
+#[tokio::test]
+async fn genesis_writes_the_schema_contract_row_and_reads_it_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let expected = SchemaContractRow::for_test_catalog(&catalog).unwrap();
+    let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+
+    assert_eq!(
+        mc.known_state.schema_contract.as_ref(),
+        Some(&expected.head)
+    );
+    assert_eq!(mc.snapshot().schema_contract(), Some(&expected.head));
+    assert_eq!(mc.read_schema_contract().await.unwrap(), expected);
+    assert_eq!(
+        ManifestCoordinator::read_schema_contract_at(uri, None, 1)
+            .await
+            .unwrap(),
+        expected
+    );
+    let ds = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(schema_contract_row_count(&ds).await, 1);
+    let batch = &read_publish_scan(&ds).await.unwrap().live_rows[0];
+    let names: Vec<_> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect();
+    assert_eq!(
+        names,
+        super::state::manifest_schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>(),
+        "the publish scan carries every logical column, the content columns included"
+    );
+}
+
+/// `ManifestChange::SchemaContract` replaces the live row in the same commit as its table rows;
+/// a publish without one carries the row forward; the pre-replacement version still answers
+/// with the old contract; two replacements in one batch are refused.
+#[tokio::test]
+async fn publish_replaces_the_schema_contract_row_and_carries_it_forward() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let genesis_contract = SchemaContractRow::for_test_catalog(&catalog).unwrap();
+    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let genesis_version = mc.version();
+    let person_entry = mc.snapshot().dataset("node:Person").unwrap().clone();
+    let person_update = append_person_and_make_update(uri, &person_entry, "Ann").await;
+
+    let replacement = replacement_contract();
+    let replaced_at = mc
+        .commit_changes(&[
+            ManifestChange::Update(person_update),
+            ManifestChange::SchemaContract(replacement.clone()),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        mc.known_state.schema_contract.as_ref(),
+        Some(&replacement.head),
+        "the publish fold reflects the replaced row without a re-scan"
+    );
+    assert_eq!(mc.read_schema_contract().await.unwrap(), replacement);
+    assert_eq!(
+        mc.snapshot().dataset("node:Person").unwrap().entity_count,
+        1,
+        "the table row and the contract land in one commit"
+    );
+
+    let carried = append_person_and_make_update(uri, &person_entry, "Bob").await;
+    let carried_at = mc
+        .commit_changes(&[ManifestChange::Update(carried)])
+        .await
+        .unwrap();
+    assert!(carried_at > replaced_at);
+    assert_eq!(
+        mc.known_state.schema_contract.as_ref(),
+        Some(&replacement.head)
+    );
+    assert_eq!(mc.read_schema_contract().await.unwrap(), replacement);
+    let ds = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(schema_contract_row_count(&ds).await, 1);
+
+    assert_eq!(
+        ManifestCoordinator::read_schema_contract_at(uri, None, genesis_version)
+            .await
+            .unwrap(),
+        genesis_contract,
+        "time travel below the replacement reads the contract of that version"
+    );
+
+    let reopened = ManifestCoordinator::open(uri).await.unwrap();
+    assert_eq!(
+        reopened.known_state.schema_contract.as_ref(),
+        Some(&replacement.head)
+    );
+
+    let twice = mc
+        .commit_changes(&[
+            ManifestChange::SchemaContract(replacement.clone()),
+            ManifestChange::SchemaContract(genesis_contract.clone()),
+        ])
+        .await
+        .expect_err("two contract replacements in one batch must be refused")
+        .to_string();
+    assert!(twice.contains("replaced twice"), "{twice}");
+    assert_eq!(mc.version(), carried_at, "a refused batch advances nothing");
+}
+
+#[tokio::test]
+async fn publisher_reuses_only_its_exact_bounded_published_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let coordinator = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let publisher = GraphNamespacePublisher::new(uri, None);
+    let mut contract = coordinator.read_schema_contract().await.unwrap();
+    for (round, expected_scans) in [1, 0, 1, 0, 1, 1].into_iter().enumerate() {
+        if round == 2 {
+            contract.source = format!("\n{}\n", contract.source);
+            contract.ir = format!("\n{}\n", contract.ir);
+            let foreign = GraphNamespacePublisher::new(uri, None);
+            foreign
+                .publish(
+                    &[ManifestChange::SchemaContract(contract.clone())],
+                    &HashMap::new(),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        if round == 4 {
+            contract.source = format!(
+                "{}{}",
+                " ".repeat(super::publisher::PUBLISHED_ROWS_CACHE_BYTES + 1024),
+                contract.source
+            );
+            publisher
+                .publish(
+                    &[ManifestChange::SchemaContract(contract.clone())],
+                    &HashMap::new(),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let intent = LineageIntent {
+            graph_commit_id: ulid::Ulid::new().to_string(),
+            branch: None,
+            actor_id: None,
+            merged_parent_commit_id: None,
+            created_at: 0,
+        };
+        let probes = crate::instrumentation::QueryIoProbes::default();
+        let scans = probes.manifest_scan_count.clone();
+        let outcome = crate::instrumentation::with_query_io_probes(
+            probes,
+            publisher.publish(&[], &HashMap::new(), Some(&intent)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::Relaxed),
+            expected_scans,
+            "round {round}: cold, warm, foreign replacement, warm, oversized, oversized"
+        );
+        let scan = read_publish_scan(&outcome.dataset).await.unwrap();
+        assert_eq!(scan.lineage_rows.len(), round + 2);
+        assert_eq!(scan.graph_heads.get("main"), Some(&intent.graph_commit_id));
+        let reopened = ManifestCoordinator::open(uri).await.unwrap();
+        assert_eq!(reopened.read_schema_contract().await.unwrap(), contract);
+        assert_eq!(schema_contract_row_count(&outcome.dataset).await, 1);
+    }
+}
+
+/// The content read checks the row against the head the caller's state
+/// folded from the same version; a disagreement is an error, never a silent
+/// pick of one side.
+#[tokio::test]
+async fn schema_contract_read_refuses_a_row_that_disagrees_with_the_fold() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    mc.known_state.schema_contract = Some(replacement_contract().head);
+    let error = mc
+        .read_schema_contract()
+        .await
+        .expect_err("a folded head that differs from the row must be refused")
+        .to_string();
+    assert!(error.contains("disagrees with the folded state"), "{error}");
+}
+
+/// A live-read refresh after another handle's schema apply observes the
+/// replaced contract, and the refresh's projection folds it.
+#[tokio::test]
+async fn refresh_observes_a_schema_contract_replaced_by_another_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let genesis_contract = SchemaContractRow::for_test_catalog(&catalog).unwrap();
+    ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let control_session = crate::lance_access::control_session();
+    let (mut reader, _) = ManifestCoordinator::open_with_lineage(uri, None, &control_session)
+        .await
+        .unwrap();
+    assert_eq!(
+        reader.known_state.schema_contract.as_ref(),
+        Some(&genesis_contract.head)
+    );
+
+    let mut writer = ManifestCoordinator::open(uri).await.unwrap();
+    let replacement = replacement_contract();
+    writer
+        .commit_changes(&[ManifestChange::SchemaContract(replacement.clone())])
+        .await
+        .unwrap();
+
+    reader.refresh_with_lineage().await.unwrap();
+    assert_eq!(
+        reader.known_state.schema_contract.as_ref(),
+        Some(&replacement.head)
+    );
+    assert_eq!(reader.read_schema_contract().await.unwrap(), replacement);
+    let refreshed = reader.refresh_for_live_read(|_| true).await.unwrap();
+    assert!(refreshed.is_none());
+    assert_eq!(
+        reader.known_state.schema_contract.as_ref(),
+        Some(&replacement.head)
+    );
+}
+
+#[tokio::test]
+async fn cold_contract_capture_scans_once_and_refuses_reserved_id_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mut writer = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let mut expected = writer.read_schema_contract().await.unwrap();
+    expected.source = format!("\n{}\n", expected.source);
+    expected.ir = format!("\n{}\n", expected.ir);
+    writer
+        .commit_changes(&[ManifestChange::SchemaContract(expected.clone())])
+        .await
+        .unwrap();
+    let session = crate::lance_access::control_session();
+    let probes = crate::instrumentation::QueryIoProbes::default();
+    let scans = probes.manifest_scan_count.clone();
+    let (reader, lineage, contract) = crate::instrumentation::with_query_io_probes(
+        probes,
+        ManifestCoordinator::open_with_lineage_and_contract(uri, None, &session),
+    )
+    .await
+    .unwrap();
+    assert_eq!(scans.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(contract.unwrap(), expected);
+    assert_eq!(reader.snapshot().schema_contract(), Some(&expected.head));
+    assert_eq!(reader.version(), writer.version());
+    let dataset = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(lineage, read_graph_lineage(&dataset).await.unwrap().0);
+
+    let rows = read_publish_scan(&dataset).await.unwrap().live_rows;
+    let alias = relabelled_manifest_row(&rows, SCHEMA_CONTRACT_OBJECT_ID);
+    let mut columns = alias.columns().to_vec();
+    columns[alias.schema().index_of("object_type").unwrap()] =
+        Arc::new(StringArray::from(vec!["unknown_extension"]));
+    let alias = RecordBatch::try_new(alias.schema(), columns).unwrap();
+    let schema = super::record::manifest_storage_schema(dataset.schema().metadata.clone()).unwrap();
+    let stored = super::record::compact_to_storage(&alias, &schema).unwrap();
+    InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            skip_auto_cleanup: true,
+            ..Default::default()
+        })
+        .execute(vec![stored])
+        .await
+        .unwrap();
+    let error = ManifestCoordinator::open_with_lineage_and_contract(uri, None, &session)
+        .await
+        .err()
+        .expect("reserved schema-contract id must prevent catalog construction");
+    let OmniError::Manifest(error) = error else {
+        panic!("expected a manifest integrity error, got: {error}");
+    };
+    assert_eq!(error.kind, crate::error::ManifestErrorKind::Internal);
+    assert_eq!(
+        error.message,
+        "manifest row 'schema_contract' has object_type 'unknown_extension'"
+    );
+}
+
+#[tokio::test]
+async fn prepared_contract_capture_retries_only_replaced_unreadable_data() {
+    for replace in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let writer = ManifestCoordinator::init(root, &build_test_catalog())
+            .await
+            .unwrap();
+        let expected = writer.read_schema_contract().await.unwrap();
+        let session = crate::lance_access::control_session();
+        let prepared = ManifestCoordinator::prepare_open_with_contract(root, &session)
+            .await
+            .unwrap();
+        let dataset = open_manifest_dataset(root, None).await.unwrap();
+        let old_version = dataset.version().version;
+        let files = dataset
+            .get_fragments()
+            .iter()
+            .flat_map(|fragment| {
+                fragment
+                    .metadata()
+                    .files
+                    .iter()
+                    .map(|file| file.path.clone())
+            })
+            .collect::<Vec<_>>();
+        if replace {
+            let rows = read_publish_scan(&dataset).await.unwrap().live_rows;
+            let schema =
+                super::record::manifest_storage_schema(dataset.schema().metadata.clone()).unwrap();
+            let stored = rows
+                .iter()
+                .map(|row| super::record::compact_to_storage(row, &schema).unwrap())
+                .collect::<Vec<_>>();
+            let replacement = InsertBuilder::new(Arc::new(dataset))
+                .with_params(&WriteParams {
+                    mode: WriteMode::Overwrite,
+                    skip_auto_cleanup: true,
+                    ..Default::default()
+                })
+                .execute(stored)
+                .await
+                .unwrap();
+            assert!(replacement.version().version > old_version);
+            assert!(replacement.get_fragments().iter().all(|fragment| {
+                fragment
+                    .metadata()
+                    .files
+                    .iter()
+                    .all(|file| !files.contains(&file.path))
+            }));
+        }
+        for file in files {
+            std::fs::remove_file(dir.path().join("__manifest/data").join(file)).unwrap();
+        }
+        let probes = crate::instrumentation::QueryIoProbes::default();
+        let opens = probes.internal_open_count.clone();
+        let scans = probes.manifest_scan_count.clone();
+        let result = crate::instrumentation::with_query_io_probes(
+            probes,
+            ManifestCoordinator::open_prepared_with_lineage_and_contract(root, prepared),
+        )
+        .await;
+        assert_eq!(opens.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::Relaxed),
+            if replace { 2 } else { 1 }
+        );
+        if replace {
+            let (reader, _, contract) = result.unwrap();
+            assert!(reader.version() > old_version);
+            assert_eq!(contract.unwrap(), expected);
+        } else {
+            assert!(
+                result.is_err(),
+                "unchanged unreadable data must remain an error"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn prepared_contract_capture_rejects_another_root_before_scanning() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(root, &build_test_catalog())
+        .await
+        .unwrap();
+    let prepared = ManifestCoordinator::prepare_open_with_contract(
+        root,
+        &crate::lance_access::control_session(),
+    )
+    .await
+    .unwrap();
+    let probes = crate::instrumentation::QueryIoProbes::default();
+    let scans = probes.manifest_scan_count.clone();
+    let result = crate::instrumentation::with_query_io_probes(
+        probes,
+        ManifestCoordinator::open_prepared_with_lineage_and_contract("/another-root", prepared),
+    )
+    .await;
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("different graph root")
+    );
+    assert_eq!(scans.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+/// Routine state scans leave contract content unread; cold admission projects it once.
+#[tokio::test]
+async fn state_scan_projection_leaves_the_content_columns_unread() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let ds = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(
+        super::record::packed_projection(&ds, false),
+        ["object_id", "object_type", "record"]
+    );
+    assert_eq!(
+        super::record::packed_projection(&ds, true),
+        [
+            "object_id",
+            "object_type",
+            "record",
+            "schema_source",
+            "schema_ir"
+        ]
+    );
+    let state = super::state::read_manifest_state(&ds).await.unwrap();
+    assert!(state.schema_contract.is_some());
 }
 
 /// What a reader projects out of a `__manifest` version through either stored shape: the
@@ -3533,4 +4067,612 @@ async fn logical_view(
         commits,
         heads,
     )
+}
+
+/// A retired same-name candidate can lack the wanted version. Continue to the
+/// exact owner, but never accept a different commit or a missing owning manifest.
+#[tokio::test]
+async fn pinned_graph_commit_skips_absent_wrong_incarnation() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut mc = ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let mut main = open_manifest_dataset(uri, None).await.unwrap();
+    let base_version = main.version().version;
+    let old_native = "b1.00000000000000000000000001";
+    let live_native = "b1.00000000000000000000000002";
+    let old = crate::lance_clone::create_branch(&mut main, old_native, base_version)
+        .await
+        .unwrap();
+    mc.delete_branch("b1").await.unwrap();
+    drop(old);
+    crate::lance_clone::create_branch(&mut main, live_native, base_version)
+        .await
+        .unwrap();
+    let mut live = ManifestCoordinator::open_at_branch(uri, "b1")
+        .await
+        .unwrap();
+    let intent = LineageIntent {
+        graph_commit_id: "00000000000000000000000003".into(),
+        branch: Some("b1".into()),
+        actor_id: None,
+        merged_parent_commit_id: None,
+        created_at: 1,
+    };
+    live.commit_changes_with_lineage(&[], &HashMap::new(), Some(&intent))
+        .await
+        .unwrap();
+    let graph = crate::commit_graph::CommitGraph::open_at_branch(uri, "b1")
+        .await
+        .unwrap();
+    let commit = graph.get_commit(&intent.graph_commit_id).unwrap();
+    assert!(commit.graph_manifest_version > base_version);
+    let absent_candidate = main
+        .checkout_version(lance::dataset::refs::Ref::Version(
+            Some(old_native.to_string()),
+            Some(commit.graph_manifest_version),
+        ))
+        .await
+        .expect_err("the retired candidate never published the requested version");
+    assert!(
+        matches!(&absent_candidate, lance::Error::DatasetNotFound { .. }),
+        "{absent_candidate:?}"
+    );
+    let pinned = ManifestCoordinator::pinned_graph_commit(uri, &commit)
+        .await
+        .expect("the retired candidate lacks this version; the live owner has it");
+    assert_eq!(
+        pinned.dataset.manifest().branch.as_deref(),
+        Some(live_native)
+    );
+    assert_eq!(
+        pinned.dataset.version().version,
+        commit.graph_manifest_version
+    );
+
+    let wrong = crate::commit_graph::GraphCommit {
+        graph_commit_id: "00000000000000000000000004".into(),
+        ..commit.clone()
+    };
+    let error = ManifestCoordinator::pinned_graph_commit(uri, &wrong)
+        .await
+        .err()
+        .expect("a same-version manifest must match the full requested graph commit");
+    assert!(
+        matches!(
+            &error,
+            OmniError::Manifest(ManifestError {
+                kind: crate::error::ManifestErrorKind::NotFound,
+                ..
+            })
+        ),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("no matching retained native manifest")
+    );
+
+    let store = pinned.dataset.object_store(None).await.unwrap();
+    store
+        .delete(&pinned.dataset.manifest_location().path)
+        .await
+        .unwrap();
+    let error = ManifestCoordinator::pinned_graph_commit(uri, &commit)
+        .await
+        .err()
+        .expect("the true retained manifest is missing; no candidate may substitute");
+    assert!(
+        matches!(
+            &error,
+            OmniError::Manifest(ManifestError {
+                kind: crate::error::ManifestErrorKind::NotFound,
+                ..
+            })
+        ),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("no matching retained native manifest")
+    );
+}
+
+#[derive(Debug)]
+struct SmallScanProbeMarker;
+
+impl lance::io::WrappingObjectStore for SmallScanProbeMarker {
+    fn wrap(
+        &self,
+        _: &str,
+        original: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        original
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SmallScanIo {
+    requests: u64,
+    bytes: u64,
+    writes: u64,
+}
+
+fn drain_small_scan_io(stores: &crate::instrumentation::ProbedStores) -> SmallScanIo {
+    let mut total = SmallScanIo {
+        requests: 0,
+        bytes: 0,
+        writes: 0,
+    };
+    for store in stores.stores() {
+        let stats = store.io_stats_incremental();
+        total.requests += stats.read_iops;
+        total.bytes += stats.read_bytes;
+        total.writes += stats.write_iops;
+    }
+    total
+}
+
+fn schema_comment_noise(lines: usize) -> String {
+    let mut random = 0xa076_1d64_78bd_642fu64;
+    let mut text = String::new();
+    for _ in 0..lines {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        use std::fmt::Write;
+        writeln!(&mut text, "// {random:016x}").unwrap();
+    }
+    text
+}
+
+async fn small_scan_catalog_fixture(root: &str, large: bool) -> (SchemaContractRow, u64) {
+    let catalog = build_test_catalog();
+    let mut contract = SchemaContractRow::for_test_catalog(&catalog).unwrap();
+    contract.source = format!("{}\n", test_schema_source());
+    contract
+        .source
+        .push_str(&schema_comment_noise(if large { 32_768 } else { 256 }));
+    let attempt = GenesisManifestAttempt::mint(catalog.system_columns).unwrap();
+    let dataset = ManifestCoordinator::init_commit(
+        root,
+        &catalog,
+        &contract,
+        &crate::lance_access::control_session(),
+        &attempt,
+    )
+    .await
+    .unwrap();
+    assert!(
+        dataset
+            .manifest()
+            .fragments
+            .iter()
+            .all(|fragment| fragment.deletion_file.is_none() && fragment.overlays.is_empty())
+    );
+    let total = dataset
+        .manifest()
+        .fragments
+        .iter()
+        .flat_map(|f| &f.files)
+        .map(|file| file.file_size_bytes.get().unwrap().get())
+        .sum::<u64>();
+    if large {
+        assert!(
+            total > 65_536,
+            "fixture did not cross fallback boundary: {total}"
+        );
+    } else {
+        assert!(
+            (4097..=65_536).contains(&total),
+            "fixture missed small-read window: {total}"
+        );
+    }
+    (contract, total)
+}
+
+async fn measured_catalog_scan(
+    root: &str,
+    expected: &SchemaContractRow,
+    optimized: bool,
+) -> (SmallScanIo, Vec<usize>) {
+    use std::sync::atomic::Ordering;
+    let probes = crate::instrumentation::QueryIoProbes {
+        manifest_wrapper: Some(Arc::new(SmallScanProbeMarker)),
+        ..Default::default()
+    };
+    let stores = probes.manifest_stores.clone();
+    let opens = probes.internal_open_count.clone();
+    let scans = probes.manifest_scan_count.clone();
+    crate::instrumentation::with_query_io_probes(probes, async {
+        let session = crate::lance_access::control_session();
+        let dataset = super::layout::open_manifest_dataset_with_session(root, None, &session)
+            .await
+            .unwrap();
+        assert_eq!(dataset.object_store(None).await.unwrap().block_size(), 4096);
+        let original = dataset.object_store(None).await.unwrap();
+        let _ = drain_small_scan_io(&stores);
+        opens.store(0, Ordering::Relaxed);
+        scans.store(0, Ordering::Relaxed);
+
+        if optimized {
+            let (state, _, lineage, row) =
+                super::state::read_manifest_projection_with_contract(&dataset)
+                    .await
+                    .unwrap();
+            assert_eq!(row.unwrap(), *expected);
+            assert_eq!(state.schema_contract.as_ref(), Some(&expected.head));
+            assert_eq!(state.version, dataset.version().version);
+            assert!(!lineage.is_empty());
+        } else {
+            let scan = super::state::read_publish_scan(&dataset).await.unwrap();
+            assert_eq!(scan.schema_contract.as_ref(), Some(&expected.head));
+            assert!(!scan.lineage_rows.is_empty());
+            let mut rows = 0;
+            for batch in scan.live_rows {
+                use arrow_array::Array;
+                let ids = batch
+                    .column_by_name("object_id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let sources = batch
+                    .column_by_name("schema_source")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::LargeStringArray>()
+                    .unwrap();
+                let irs = batch
+                    .column_by_name("schema_ir")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::LargeStringArray>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    if ids.value(row) == SCHEMA_CONTRACT_OBJECT_ID {
+                        assert!(!sources.is_null(row) && !irs.is_null(row));
+                        assert_eq!(sources.value(row), expected.source);
+                        assert_eq!(irs.value(row), expected.ir);
+                        rows += 1;
+                    }
+                }
+            }
+            assert_eq!(rows, 1);
+        }
+        assert_eq!(
+            opens.load(Ordering::Relaxed),
+            0,
+            "scan helper must not reopen __manifest"
+        );
+        assert_eq!(scans.load(Ordering::Relaxed), 1);
+        assert!(Arc::ptr_eq(
+            &original,
+            &dataset.object_store(None).await.unwrap()
+        ));
+        assert_eq!(
+            original.block_size(),
+            4096,
+            "the held control dataset keeps its policy"
+        );
+        let io = drain_small_scan_io(&stores);
+        let mut blocks = stores
+            .stores()
+            .iter()
+            .map(|store| store.block_size())
+            .collect::<Vec<_>>();
+        blocks.sort_unstable();
+        blocks.dedup();
+        (io, blocks)
+    })
+    .await
+}
+
+#[tokio::test]
+async fn cold_catalog_small_scan_reduces_real_reads_and_large_scan_is_unchanged() {
+    for large in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let (expected, encoded_bytes) = small_scan_catalog_fixture(root, large).await;
+        let (baseline, baseline_blocks) = measured_catalog_scan(root, &expected, false).await;
+        let (actual, blocks) = measured_catalog_scan(root, &expected, true).await;
+        let (again, again_blocks) = measured_catalog_scan(root, &expected, true).await;
+        assert_eq!(baseline_blocks, [4096]);
+        assert_eq!(baseline.writes, 0);
+        assert_eq!(actual.writes, 0);
+        assert!(
+            actual.requests > 0,
+            "rebound store IO must remain in probe totals"
+        );
+        assert_eq!(
+            actual, again,
+            "a new cold scan must read again, with no persistent byte reuse"
+        );
+        assert_eq!(blocks, again_blocks);
+        if large {
+            assert_eq!(
+                blocks,
+                [4096],
+                "large file must retain the original tail/gap policy"
+            );
+            assert_eq!(
+                actual, baseline,
+                "large fallback must preserve physical requests AND bytes"
+            );
+        } else {
+            assert_eq!(
+                blocks,
+                [4096, 65_536],
+                "both original and rebound stores must be accounted"
+            );
+            assert!(
+                actual.requests < baseline.requests,
+                "small physical reads did not fall: original={baseline:?}, optimized={actual:?}"
+            );
+            assert_eq!(
+                actual.bytes, encoded_bytes,
+                "eligible encoded data should be fetched once, without overlapping ranges"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn cold_catalog_small_scan_failure_does_not_poison_a_fresh_retry() {
+    use object_store::ObjectStoreExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let (expected, _) = small_scan_catalog_fixture(root, false).await;
+    let probes = crate::instrumentation::QueryIoProbes {
+        manifest_wrapper: Some(Arc::new(SmallScanProbeMarker)),
+        ..Default::default()
+    };
+    let stores = probes.manifest_stores.clone();
+    crate::instrumentation::with_query_io_probes(probes, async {
+        let dataset = super::layout::open_manifest_dataset_with_session(
+            root,
+            None,
+            &crate::lance_access::control_session(),
+        )
+        .await
+        .unwrap();
+        let files = dataset
+            .manifest()
+            .fragments
+            .iter()
+            .flat_map(|f| &f.files)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            files.len(),
+            1,
+            "fault fixture should have exactly one physical data file"
+        );
+        let file_path = object_store::path::Path::from_filesystem_path(
+            dir.path()
+                .join("__manifest")
+                .join("data")
+                .join(&files[0].path),
+        )
+        .unwrap();
+        let store = dataset.object_store(None).await.unwrap();
+        let saved = store
+            .inner
+            .get(&file_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        store
+            .inner
+            .put(&file_path, saved.slice(..saved.len() - 1).into())
+            .await
+            .unwrap();
+        let _ = drain_small_scan_io(&stores);
+        let failure = super::state::read_manifest_projection_with_contract(&dataset).await;
+        assert!(failure.is_err(), "captured-size mismatch must fail closed");
+        let failed_io = drain_small_scan_io(&stores);
+        assert!(
+            failed_io.requests > 0,
+            "failure must reach the tracked physical backend"
+        );
+        store.inner.put(&file_path, saved.into()).await.unwrap();
+        let _ = drain_small_scan_io(&stores);
+        let (_, _, _, contract) = super::state::read_manifest_projection_with_contract(&dataset)
+            .await
+            .unwrap();
+        assert_eq!(contract.unwrap(), expected);
+        let retry_io = drain_small_scan_io(&stores);
+        assert!(
+            retry_io.requests > 0,
+            "the retry must issue a fresh physical read"
+        );
+        assert_eq!(retry_io.writes, 0);
+        assert_eq!(dataset.object_store(None).await.unwrap().block_size(), 4096);
+    })
+    .await;
+}
+
+async fn small_read_fixture(uri: &str, fragments: usize) -> Dataset {
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
+    use lance::dataset::{WriteMode, WriteParams};
+    for fragment in 0..fragments {
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+        )])
+        .unwrap();
+        let schema = batch.schema();
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            uri,
+            Some(WriteParams {
+                mode: if fragment == 0 {
+                    WriteMode::Create
+                } else {
+                    WriteMode::Append
+                },
+                skip_auto_cleanup: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    lance::dataset::builder::DatasetBuilder::from_uri(uri)
+        .with_store_params(Default::default())
+        .with_session(Arc::new(lance::session::Session::new(
+            0,
+            0,
+            Arc::new(lance::io::ObjectStoreRegistry::default()),
+        )))
+        .load()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn manifest_scan_read_budget_is_inclusive_and_covers_all_files() {
+    for (sizes, eligible) in [
+        (vec![65_536u64], true),
+        (vec![65_537u64], false),
+        (vec![32_768u64, 32_768], true),
+        (vec![32_768u64, 32_769], false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("__manifest");
+        let dataset = small_read_fixture(uri.to_str().unwrap(), sizes.len()).await;
+        let files = dataset
+            .manifest()
+            .fragments
+            .iter()
+            .flat_map(|fragment| &fragment.files)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            files.len(),
+            sizes.len(),
+            "fixture must have distinct physical files"
+        );
+        for (file, size) in files.iter().zip(&sizes) {
+            file.file_size_bytes
+                .set(std::num::NonZeroU64::new(*size).unwrap());
+        }
+        let original = dataset.object_store(None).await.unwrap();
+        assert_eq!(original.block_size(), 4096);
+        let _ = original.io_stats_incremental();
+        let scan = crate::instrumentation::manifest_scan_dataset(&dataset)
+            .await
+            .unwrap();
+        let scan_store = scan.object_store(None).await.unwrap();
+        assert_eq!(
+            Arc::ptr_eq(&original, &scan_store),
+            !eligible,
+            "sizes={sizes:?}"
+        );
+        assert_eq!(
+            scan_store.block_size(),
+            if eligible { 65_536 } else { 4096 }
+        );
+        assert_eq!(dataset.object_store(None).await.unwrap().block_size(), 4096);
+        assert_eq!(scan.version().version, dataset.version().version);
+        assert_eq!(original.io_stats_incremental().read_iops, 0);
+        if eligible {
+            assert_eq!(
+                scan_store.io_stats_incremental().read_iops,
+                0,
+                "store rebinding must not reopen a dataset or read a file"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn manifest_scan_preserves_existing_large_block_and_real_deletion_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("__manifest");
+    let uri = uri.to_str().unwrap();
+    let mut dataset = small_read_fixture(uri, 1).await;
+    for block_size in [65_536usize, 131_072] {
+        let configured = lance::dataset::builder::DatasetBuilder::from_uri(uri)
+            .with_store_params(lance::io::ObjectStoreParams {
+                block_size: Some(block_size),
+                ..Default::default()
+            })
+            .with_session(crate::lance_access::control_session())
+            .load()
+            .await
+            .unwrap();
+        let before = configured.object_store(None).await.unwrap();
+        let after = crate::instrumentation::manifest_scan_dataset(&configured)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &before,
+            &after.object_store(None).await.unwrap()
+        ));
+        assert_eq!(
+            after.object_store(None).await.unwrap().block_size(),
+            block_size
+        );
+    }
+
+    dataset.delete("value = 1").await.unwrap();
+    assert!(
+        dataset
+            .manifest()
+            .fragments
+            .iter()
+            .any(|f| f.deletion_file.is_some())
+    );
+    let before = dataset.object_store(None).await.unwrap();
+    let scan = crate::instrumentation::manifest_scan_dataset(&dataset)
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &before,
+        &scan.object_store(None).await.unwrap()
+    ));
+    assert_eq!(scan.scan().try_into_batch().await.unwrap().num_rows(), 3);
+}
+
+#[tokio::test]
+async fn manifest_scan_keeps_raw_memory_binding_readable() {
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
+    for scheme in ["memory://", "memory:/", "MeMoRy://"] {
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int32Array::from(vec![31, 47])) as ArrayRef,
+        )])
+        .unwrap();
+        let schema = batch.schema();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &format!("{scheme}raw-memory-{}", ulid::Ulid::new()),
+            Some(lance::dataset::WriteParams {
+                store_params: Some(Default::default()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let before = dataset.object_store(None).await.unwrap();
+        let scan = crate::instrumentation::manifest_scan_dataset(&dataset)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &before,
+            &scan.object_store(None).await.unwrap()
+        ));
+        let actual = scan.scan().try_into_batch().await.unwrap();
+        assert_eq!(actual.num_rows(), 2);
+        let values = actual
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values.values().as_ref(), &[31, 47]);
+    }
 }

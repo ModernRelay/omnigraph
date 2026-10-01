@@ -63,7 +63,7 @@ enum Writer {
     /// a pointer switch with no table effect, so only its pre-publish window.
     Merge,
     /// Schema apply adding a nullable Person property: one detached rewrite
-    /// of Person, no row change, the contract staged and installed.
+    /// of Person, no row change, the contract row published atomically.
     SchemaApply,
     /// Optimize over a Person table with four small fragments: one detached
     /// compaction rewrite, no row change, published with an exact CAS on the
@@ -167,7 +167,7 @@ impl Window {
             Window::PostDetached(n) if schema => {
                 (catalog::SCHEMA_APPLY_POST_TABLE_COMMIT.name(), n as u64)
             }
-            Window::PrePublish if schema => (catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.name(), 1),
+            Window::PrePublish if schema => (catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND.name(), 1),
             Window::PrePublish if merge => (
                 catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.name(),
                 1,
@@ -667,22 +667,23 @@ async fn run_cell(
             }
             if fault == Fault::Race {
                 let race_name = format!("m{index}_race");
-                if matches!(writer, Writer::SchemaApply | Writer::SystemColumnUpgrade) {
-                    // The apply's durable sentinel refuses every concurrent
-                    // writer of the graph while it is in flight (the upgrade
-                    // runs through the same sentinel).
-                    let refused = insert(&db, &race_name).await.unwrap_err();
-                    assert!(
-                        refused.to_string().contains("schema apply"),
-                        "{cell}: the sentinel must refuse the racer: {refused}"
-                    );
-                } else {
-                    insert(&db, &race_name).await.unwrap();
-                    model.names.insert(race_name);
-                }
+                insert(&db, &race_name).await.unwrap();
+                model.names.insert(race_name);
                 std::fs::write(barrier.join("go"), b"1").unwrap();
                 let out = child.wait_with_output().unwrap();
                 acknowledged = out.status.success();
+                if matches!(writer, Writer::SchemaApply | Writer::SystemColumnUpgrade) {
+                    assert!(
+                        !acknowledged,
+                        "{cell}: the schema writer must lose to the concurrent publication"
+                    );
+                    assert!(
+                        String::from_utf8_lossy(&out.stdout).contains("write authority"),
+                        "{cell}: expected a stale graph-head refusal, stdout: {}",
+                        String::from_utf8_lossy(&out.stdout)
+                    );
+                }
+
                 let stdout = String::from_utf8_lossy(&out.stdout).to_string();
                 if let Some(err) = stdout.lines().find(|line| line.starts_with("CHILD_ERR")) {
                     note = err.chars().take(90).collect();

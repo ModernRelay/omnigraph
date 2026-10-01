@@ -115,7 +115,6 @@ impl Omnigraph {
         branch: &str,
         base: Option<&str>,
     ) -> Result<(Option<String>, Option<String>)> {
-        crate::db::ensure_public_branch_ref(branch, "load")?;
         // Branch convention: `None` represents `main`. A requested base keeps
         // the explicit "main" spelling because it is also returned in the DTO.
         let requested = Self::normalize_branch_name(branch)?;
@@ -356,10 +355,6 @@ impl Omnigraph {
         input_shape: LoadInputShape,
         stage_write_concurrency: usize,
     ) -> Result<LoadReceipt> {
-        // The pending schema-contract install precedes both an implicit
-        // target-branch fork and data staging.
-        let completed_prior_work = self.settle_pending_schema_install().await?;
-
         // Schema/catalog authority is captured once via the `WriteTxn` (plus its
         // cheap trailing identity-marker fence); the only second full validation
         // is the required pre-effect recheck under gates. Per-table resolution
@@ -371,13 +366,7 @@ impl Omnigraph {
             let exists = self
                 .branch_list()
                 .await
-                .map_err(|error| {
-                    if completed_prior_work {
-                        error.without_pre_effect_evidence()
-                    } else {
-                        error.before_effect()
-                    }
-                })?
+                .map_err(OmniError::before_effect)?
                 .iter()
                 .any(|name| name == target);
             if !exists {
@@ -392,14 +381,7 @@ impl Omnigraph {
                     target,
                     actor_id,
                 )
-                .await
-                .map_err(|error| {
-                    if completed_prior_work {
-                        error.without_pre_effect_evidence()
-                    } else {
-                        error
-                    }
-                })?;
+                .await?;
                 branch_created = true;
                 // DST window (loader walk D1 → D2): the implicit fork is
                 // durable, the load has not begun.
@@ -420,7 +402,7 @@ impl Omnigraph {
             )
             .await
             .map_err(|error| {
-                if completed_prior_work || branch_created {
+                if branch_created {
                     error.without_pre_effect_evidence()
                 } else {
                     error
@@ -574,7 +556,7 @@ async fn load_jsonl_data(
                     branch = branch.unwrap_or("main"),
                     "prepared load authority changed before effects; repreparing"
                 );
-                db.refresh_for_reprepare().await?;
+                db.refresh_coordinator_only().await?;
             }
             result => return result,
         }

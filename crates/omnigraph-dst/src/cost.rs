@@ -8,8 +8,8 @@
 //!
 //! Slot-armed and default-None: zero draws, zero behavior change, near
 //! zero cost for every other test. Verbs are prefixed by realm —
-//! `a.` = adapter (manifest/refs/sidecars via `StorageAdapter`),
-//! `l.` = Lance (table data/manifests via the provider shim). Labels are
+//! `a.` = adapter (control objects via `StorageAdapter`),
+//! `l.` = Lance (graph manifest and table datasets via the provider shim). Labels are
 //! the universe's op kinds plus harness phases (`_setup`, `_verify`,
 //! `_history`, `_close`, `_audit`) so oracle reads never pollute op costs.
 
