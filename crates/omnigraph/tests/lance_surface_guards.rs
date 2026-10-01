@@ -2660,6 +2660,146 @@ async fn fts_scan_accepts_score_in_a_projection_set_before_full_text_search() {
     );
 }
 
+/// The two Lance 11 facts BM25 eligibility placement rests on. Lance scores
+/// the fragments no full-text segment covers flat, counting documents and
+/// tokens over the rows its prefilter admits, so a prefilter changes an
+/// uncovered row's score; with `prefilter(false)` the full-text search
+/// scores the whole corpus and the filter refines its output, so the score is
+/// the unfiltered one. OmniGraph filters a bm25 scan before scoring only under
+/// full coverage (`Eligibility::BeforeScoring`) and runs Lance's postfilter
+/// otherwise. If the first assertion goes red (the flat tail scores from
+/// filter-independent statistics), the placement rule can be dropped.
+#[tokio::test]
+async fn fts_prefilter_changes_unindexed_scores_and_postfilter_keeps_them() {
+    use arrow_array::types::Float32Type;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("tail_scores.lance");
+    let uri = uri.to_str().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("text", DataType::Utf8, false),
+        Field::new("year", DataType::Int64, false),
+    ]));
+    let batch = |rows: &[(&str, &str, i64)]| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(arrow_array::Int64Array::from(
+                    rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    };
+    let indexed = batch(&[
+        ("d1", "graph engines", 2020),
+        ("d2", "graph search", 2021),
+        ("d3", "databases", 2019),
+    ]);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(indexed)], schema.clone()),
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let tail = batch(&[
+        ("t1", "graph", 2022),
+        (
+            "t2",
+            "graph graph graph graph graph graph graph graph",
+            1990,
+        ),
+    ]);
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(tail)], schema.clone()),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    let score_of = |batch: &RecordBatch, id: &str| {
+        let ids = batch.column_by_name("id").unwrap().as_string::<i32>();
+        let scores = batch
+            .column_by_name("_score")
+            .unwrap()
+            .as_primitive::<Float32Type>();
+        (0..batch.num_rows())
+            .find(|row| ids.value(*row) == id)
+            .map(|row| scores.value(row))
+    };
+    let search = |filter: Option<(&'static str, bool)>| {
+        let dataset = dataset.clone();
+        async move {
+            let mut scanner = dataset.scan();
+            scanner.project(&["id", "_score"]).unwrap();
+            if let Some((filter, prefilter)) = filter {
+                scanner.filter(filter).unwrap();
+                scanner.prefilter(prefilter);
+            }
+            scanner
+                .full_text_search(
+                    FullTextSearchQuery::new("graph".to_string())
+                        .with_column("text".to_string())
+                        .unwrap(),
+                )
+                .unwrap();
+            scanner.try_into_batch().await.unwrap()
+        }
+    };
+    let unfiltered = search(None).await;
+    let prefiltered = search(Some(("year >= 2000", true))).await;
+    let postfiltered = search(Some(("year >= 2000", false))).await;
+    let whole = score_of(&unfiltered, "t1").expect("t1 matches");
+    assert_ne!(
+        score_of(&prefiltered, "t1"),
+        Some(whole),
+        "a prefilter changes the score of a row no full-text segment covers"
+    );
+    assert_eq!(
+        score_of(&postfiltered, "t1"),
+        Some(whole),
+        "a postfilter keeps the whole corpus's score"
+    );
+    assert_eq!(
+        score_of(&postfiltered, "t2"),
+        None,
+        "the postfilter still refines"
+    );
+    assert_eq!(
+        score_of(&prefiltered, "d1"),
+        score_of(&unfiltered, "d1"),
+        "an indexed row scores from the index's statistics either way"
+    );
+}
+
 // --- Lance 10 compatibility: fence late-hydrated KNN ordering --------------
 //
 // lance#7868 makes execute_plan preserve order when the plan still advertises
