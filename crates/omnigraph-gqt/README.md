@@ -223,6 +223,7 @@ filter reads [d.rank, e.rank]
 sort tiebreak [$d, $e]
 pass projection_pushdown
 not pass aggregate_pushdown
+validation scope exact_subset
 ```
 
 A `scan <Type>[ as $var]:` line selects the scans of that type (or the one
@@ -267,11 +268,16 @@ csr`): the side of the node's declared switch the run took, read from the
 execution report of the same run (the last attempt of the node's row, joined
 to the explain row by the node's `id`); it fails when the run recorded no
 side on that node or another side. A `scan <Type>[ as $var]: ranked
-<nearest|bm25>[ fetch <n>][ nprobes <n>]` line claims the ranked access path
-of the scan, the candidates it asks the index for and, on a `nearest` scan,
-the probe cap the plan carries (`0` spells no cap, as the `ann_nprobes`
-setting does). Nothing is compared as rendered text, so a planner that
-reaches the same facts by another route keeps the case green.
+<nearest|bm25>[ fetch <n>][ nprobes <n>][ eligibility <placement>]` line
+claims the ranked access path of the scan, the candidates it asks the index
+for, on a `nearest` scan the probe cap the plan carries (`0` spells no cap,
+as the `ann_nprobes` setting does), and on a `bm25` scan where it applies its
+eligibility (`before_scoring` under full full-text coverage, else
+`after_scoring`). `validation scope <exact_subset|invariants_only>` claims
+what acceptance checked of the plan, as the document's `validation` reports
+it; a failed planning step has no document and keeps its `expect error:`.
+Nothing is compared as rendered text, so a planner that reaches the same
+facts by another route keeps the case green.
 
 ## Reference comparison
 

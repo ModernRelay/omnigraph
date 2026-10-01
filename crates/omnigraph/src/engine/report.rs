@@ -225,8 +225,9 @@ impl Executed {
 
     /// The report as actuals rows in the explain row schema: `tree`
     /// `profile`, no `depth`, `node` the plan node's kind, `detail` the row's
-    /// own fields (`id`, `operator`, `status`, `attempts`). The third public
-    /// surface beside the rows and explain.
+    /// own fields (`id`, `operator`, `status`, `attempts`), then one row per
+    /// search decision (`node` `gate` or `probes`). The third public surface
+    /// beside the rows and explain.
     pub fn profile(&self) -> Result<omnigraph_compiler::result::QueryResult> {
         let mut rows = ExplainRows::default();
         for row in &self.report.rows {
@@ -241,6 +242,19 @@ impl Executed {
                     row.id
                 ))
             })?;
+            rows.push(PROFILE_TREE, None, node, detail.to_string());
+        }
+        for decision in &self.report.search {
+            let detail = serde_json::to_value(decision).map_err(|error| {
+                OmniError::manifest_internal(format!(
+                    "search decision of node {} cannot serialize: {error}",
+                    decision.id
+                ))
+            })?;
+            let node = match decision.taken {
+                Taken::Gate { .. } => "gate",
+                Taken::Probes { .. } => "probes",
+            };
             rows.push(PROFILE_TREE, None, node, detail.to_string());
         }
         rows.into_result()

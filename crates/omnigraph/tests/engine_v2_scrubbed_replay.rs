@@ -333,7 +333,8 @@ async fn ann_nprobes_is_a_field_of_the_ranked_scan_and_the_rows_do_not_move() {
 }
 
 /// The profile surface: one row per report row in the explain row schema,
-/// its `node` the plan node's kind and its `detail` the row's own fields.
+/// its `node` the plan node's kind and its `detail` the row's own fields,
+/// then one row per search decision the run took.
 #[tokio::test]
 async fn profile_rows_carry_the_report_in_the_explain_row_schema() {
     let dir = tempfile::tempdir().unwrap();
@@ -384,4 +385,49 @@ async fn profile_rows_carry_the_report_in_the_explain_row_schema() {
             );
         }
     }
+
+    let docs = tempfile::tempdir().unwrap();
+    let db = session(
+        Omnigraph::init(docs.path().to_str().unwrap(), DOC_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"d0","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d1","embedding":[1.0,0.0,0.0,0.0]}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let params = ParamMap::from([("q".to_string(), Literal::List(vec![Literal::Float(0.0); 4]))]);
+    let run = with_setting(&db, "engine", "v2")
+        .query_inspected(ReadTarget::branch("main"), NEAREST, "by_vector", &params)
+        .await
+        .unwrap();
+    let batch = run.profile().unwrap().concat_batches().unwrap();
+    let nodes = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let details = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let probes: Vec<Value> = (0..batch.num_rows())
+        .filter(|row| nodes.value(*row) == "probes")
+        .map(|row| serde_json::from_str(details.value(row)).unwrap())
+        .collect();
+    assert_eq!(
+        probes.len(),
+        1,
+        "the nearest scan's one pass records its probes"
+    );
+    assert_eq!(probes[0]["decision"], "probes");
+    assert_eq!(probes[0]["rung"], 0);
+    assert!(
+        !probes[0]["attempts"].as_array().unwrap().is_empty(),
+        "{probes:?}"
+    );
 }
