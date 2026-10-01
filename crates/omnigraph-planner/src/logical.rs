@@ -4,10 +4,11 @@ use std::hash::Hash;
 use arrow_schema::SchemaRef;
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, SubqueryPredicate};
-use omnigraph_compiler::types::Direction;
+use omnigraph_compiler::traversal::EdgeSelection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::mirror::EdgeSelectionMirror;
 use crate::operation::TableRef;
 use crate::optimizer::gq_conjunct;
 use crate::physical::RankKind;
@@ -169,13 +170,11 @@ pub struct ColumnRef {
 }
 
 pub const IDENTITY_MEMBER: &str = "@id";
+pub use omnigraph_compiler::traversal::EDGE_TYPE_META as EDGE_TYPE_MEMBER;
 
-/// A sort's tie-break bindings as the keys they add, `$p.@id`.
-pub fn tiebreak_text(bindings: &[String]) -> Vec<String> {
-    bindings
-        .iter()
-        .map(|binding| format!("${binding}.{IDENTITY_MEMBER}"))
-        .collect()
+/// A sort's declared metadata keys, such as `$p.@id` or `$e.@type`.
+pub fn tiebreak_text(columns: &[ColumnRef]) -> Vec<String> {
+    columns.iter().map(|column| format!("${column}")).collect()
 }
 
 impl ColumnRef {
@@ -345,14 +344,14 @@ pub enum LogicalNode {
         return_exprs: Vec<IRProjection>,
     },
     /// `keys` for the passes; `order_by`, `fetch` and `tiebreak` for the
-    /// engine's sort, `tiebreak` the name-sorted bindings whose ids follow
-    /// the keys (empty where ids cannot change the order, `sort_tiebreak`).
+    /// engine's sort. `tiebreak` declares metadata columns in binding order;
+    /// a selected edge's concrete type precedes its id.
     Sort {
         input: LogicalId,
         keys: Vec<String>,
         order_by: Vec<IROrdering>,
         fetch: Option<usize>,
-        tiebreak: Vec<String>,
+        tiebreak: Vec<ColumnRef>,
     },
     /// Required input ordering for a diff or change-feed plan.
     Ordered {
@@ -394,8 +393,8 @@ pub enum LogicalNode {
         input: LogicalId,
         src: String,
         dst: String,
-        edge_type: String,
-        direction: Direction,
+        edges: EdgeSelection,
+        src_type: String,
         dst_type: String,
         min_hops: u32,
         max_hops: Option<u32>,
@@ -444,6 +443,7 @@ pub enum LogicalNode {
         k: Option<IRExpr>,
         limit: Option<u64>,
         reads: Vec<ColumnRef>,
+        row_tiebreak: Vec<ColumnRef>,
     },
     /// A `return` with an aggregate: the group keys and aggregate arguments
     /// it reads; `count($v)` reads the identity alone.
@@ -564,11 +564,21 @@ pub struct LogicalPlan {
     slots: Vec<Option<LogicalNode>>,
     schemas: Vec<Option<SchemaRef>>,
     root: LogicalId,
+    traversal_work_limit: Option<u64>,
 }
 
 impl LogicalPlan {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Query-wide policy captured before any rewrite or physical choice.
+    pub(crate) fn traversal_work_limit(&self) -> Option<u64> {
+        self.traversal_work_limit
+    }
+
+    pub(crate) fn set_traversal_work_limit(&mut self, limit: Option<u64>) {
+        self.traversal_work_limit = limit;
     }
 
     pub fn add(&mut self, node: LogicalNode, schema: SchemaRef) -> LogicalId {
@@ -765,8 +775,8 @@ impl LogicalPlan {
             LogicalNode::Expand {
                 src,
                 dst,
-                edge_type,
-                direction,
+                edges,
+                src_type,
                 dst_type,
                 min_hops,
                 max_hops,
@@ -776,8 +786,8 @@ impl LogicalPlan {
                 "node": "Expand",
                 "src": src,
                 "dst": dst,
-                "edge_type": edge_type,
-                "direction": direction_word(direction),
+                "edges": EdgeSelectionMirror::from(edges),
+                "src_type": src_type,
                 "dst_type": dst_type,
                 "min_hops": min_hops,
                 "max_hops": max_hops,
@@ -820,10 +830,16 @@ impl LogicalPlan {
                 "property": property,
                 "reads": rendered(reads),
             }),
-            LogicalNode::RankFuse { arms, reads, .. } => json!({
+            LogicalNode::RankFuse {
+                arms,
+                reads,
+                row_tiebreak,
+                ..
+            } => json!({
                 "node": "RankFuse",
                 "targets": arms.iter().map(|arm| &arm.binding).collect::<Vec<_>>(),
                 "reads": rendered(reads),
+                "row_tiebreak": tiebreak_text(row_tiebreak),
             }),
             LogicalNode::Aggregate { reads, .. } => json!({
                 "node": "Aggregate",
@@ -880,15 +896,6 @@ pub(crate) fn filters_json(filters: &[IRExpr]) -> Vec<String> {
 pub(crate) fn ordering_text(ordering: &IROrdering) -> String {
     let direction = if ordering.descending { "desc" } else { "asc" };
     format!("{} {direction}", ordering.expr)
-}
-
-/// The direction as the docs and the CLI spell it.
-pub(crate) fn direction_word(direction: &Direction) -> &'static str {
-    match direction {
-        Direction::Out => "out",
-        Direction::In => "in",
-        Direction::Both => "both",
-    }
 }
 
 fn rendered(reads: &[ColumnRef]) -> Vec<String> {

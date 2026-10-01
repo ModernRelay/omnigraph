@@ -67,6 +67,7 @@ omnigraph_seams::catalog! {
     crate::exec::merge::BRANCH_MERGE_POST_CANDIDATE_VALIDATION,
     crate::exec::merge::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
     crate::exec::merge::BRANCH_MERGE_POST_TABLE_EFFECT,
+    crate::exec::merge::BRANCH_MERGE_PRE_RETURN,
     crate::exec::merge::BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_CONFIRM,
     crate::exec::merge::BRANCH_MERGE_REWRITE_AFTER_INSERT_PRE_UPDATE,
     crate::exec::merge::BRANCH_MERGE_REWRITE_AFTER_MERGE_PRE_DELETE,

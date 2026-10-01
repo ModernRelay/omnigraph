@@ -6,6 +6,7 @@
 .DS_Store
 .env
 .env.*
+.venv-docs/
 *.tfstate
 *.tfstate.*
 .terraform/

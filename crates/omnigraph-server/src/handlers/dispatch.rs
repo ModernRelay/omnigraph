@@ -195,12 +195,13 @@ pub(super) fn refuse_statement_envelope(
 
 /// Run one control write through its `/branches` route body and answer the
 /// `ChangeOutput` of a mutation body: `branch` received the effect, both
-/// counts are `0`, `commit` is the target's head after a publishing merge.
+/// counts are `0`, `commit` is this merge's own publication, or null for a no-op.
 pub(super) async fn run_branch_statement(
     state: &AppState,
     handle: &GraphHandle,
     session: &Session,
     actor: Option<&AuthenticatedActor>,
+    ingress: IngressLease,
     write: BranchWrite,
 ) -> std::result::Result<ChangeOutput, ApiError> {
     let query_name = write.statement_name().to_string();
@@ -208,7 +209,7 @@ pub(super) async fn run_branch_statement(
     let (branch, commit, outcome) = match write {
         BranchWrite::Create { name, from } => {
             let from = from.unwrap_or_else(|| "main".to_string());
-            branch_create_body(state, handle, actor, &from, &name).await?;
+            branch_create_body(state, handle, actor, ingress, &from, &name).await?;
             (
                 name.clone(),
                 None,
@@ -216,7 +217,7 @@ pub(super) async fn run_branch_statement(
             )
         }
         BranchWrite::Delete { name } => {
-            branch_delete_body(state, handle, actor, &name).await?;
+            branch_delete_body(state, handle, actor, ingress, &name).await?;
             (
                 name.clone(),
                 None,
@@ -225,19 +226,10 @@ pub(super) async fn run_branch_statement(
         }
         BranchWrite::Merge { source, into } => {
             let target = into.unwrap_or_else(|| "main".to_string());
-            let merge: api::BranchMergeOutcome =
-                branch_merge_body(state, handle, session, actor, &source, &target)
-                    .await?
-                    .into();
-            let commit = match merge {
-                api::BranchMergeOutcome::AlreadyUpToDate => None,
-                api::BranchMergeOutcome::FastForward | api::BranchMergeOutcome::Merged => handle
-                    .engine
-                    .list_commits(Some(&target))
-                    .await
-                    .ok()
-                    .and_then(|commits| commits.first().map(api::commit_output)),
-            };
+            let result =
+                branch_merge_body(state, handle, session, actor, ingress, &source, &target).await?;
+            let merge = result.outcome.into();
+            let commit = result.commit.as_ref().map(api::commit_output);
             (
                 target.clone(),
                 commit,

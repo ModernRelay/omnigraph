@@ -24,6 +24,12 @@ use utoipa::{IntoParams, ToSchema};
 /// re-exported so a wire consumer needs no second dependency for it.
 pub use omnigraph_compiler::settings;
 
+/// The single request/response discriminator for the v0.12 HTTP contract.
+/// This is independent of the package version and graph-storage stamp.
+pub const HTTP_API_CONTRACT_HEADER: &str = "omnigraph-http-api";
+/// Exact header value; consumers must reject missing or repeated values.
+pub const HTTP_API_CONTRACT: &str = "0.12";
+
 /// Lowercase wire name for the raw graph-head conditional-write token.
 /// Documentation presents the canonical spelling
 /// `Omnigraph-If-Graph-Commit`; HTTP header names are case-insensitive.
@@ -109,6 +115,10 @@ pub struct SettingsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = ann_nprobes_schema)]
     pub ann_nprobes: Option<i64>,
+    /// Positive query-wide traversal row-work cap for statements using edge selectors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(schema_with = traversal_work_limit_schema)]
+    pub traversal_work_limit: Option<i64>,
 }
 
 impl SettingsRequest {
@@ -130,6 +140,9 @@ impl SettingsRequest {
         }
         if let Some(ann_nprobes) = self.ann_nprobes {
             assignments.push((SettingId::AnnNprobes, SettingValue::Integer(ann_nprobes)));
+        }
+        if let Some(limit) = self.traversal_work_limit {
+            assignments.push((SettingId::TraversalWorkLimit, SettingValue::Integer(limit)));
         }
         assignments
     }
@@ -163,6 +176,10 @@ fn merge_lineage_schema() -> utoipa::openapi::schema::Object {
 
 fn ann_nprobes_schema() -> utoipa::openapi::schema::Object {
     setting_schema(SettingId::AnnNprobes)
+}
+
+fn traversal_work_limit_schema() -> utoipa::openapi::schema::Object {
+    setting_schema(SettingId::TraversalWorkLimit)
 }
 
 /// Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.
@@ -294,7 +311,7 @@ pub struct BranchMergeRequest {
     pub target: Option<String>,
     /// Delete the source branch after a successful merge. The deletion runs
     /// under its own `branch_delete` policy check; a refusal or failure is
-    /// reported via `branch_deleted` / `branch_delete_error` on the response
+    /// reported via `branch_deleted` / `branch_delete_error_details` on the response
     /// and never fails the already-landed merge.
     #[serde(default)]
     pub delete_branch: bool,
@@ -336,17 +353,22 @@ pub struct BranchMergeOutput {
     pub source: String,
     pub target: String,
     pub outcome: BranchMergeOutcome,
+    /// This merge's own publication, including for a fast-forward. Always
+    /// present on the wire; `null` only when already up to date.
+    #[serde(deserialize_with = "Option::deserialize")]
+    #[schema(required = true)]
+    pub commit: Option<CommitOutput>,
     pub actor_id: Option<String>,
     /// Result of the requested post-merge source-branch deletion. Absent when
     /// `delete_branch` was not requested; `true` when the source branch was
     /// deleted; `false` when the deletion was refused or failed (the merge
-    /// itself still succeeded — see `branch_delete_error`).
+    /// itself still succeeded — see `branch_delete_error_details`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_deleted: Option<bool>,
     /// Why the requested source-branch deletion did not happen. Present iff
     /// `branch_deleted` is `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch_delete_error: Option<String>,
+    pub branch_delete_error_details: Option<ErrorOutput>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -495,11 +517,11 @@ pub struct ChangeOutput {
     /// Edges the mutation touched, under the `affected_nodes` rule.
     pub affected_edges: usize,
     pub actor_id: Option<String>,
-    /// The commit this write published, if any. For a branch statement: the
-    /// target's head, read after the merge released its gates, so under a
-    /// concurrent writer it may name a later commit than the merge published.
-    /// `null` for `created`, `deleted`, and `already_up_to_date`, which publish
-    /// nothing, and `null` when that head read fails.
+    /// This write's own publication, including for a fast-forward merge.
+    /// Always present on the wire; `null` for branch creation, deletion, or
+    /// an already-up-to-date merge, which publish no graph content commit.
+    #[serde(deserialize_with = "Option::deserialize")]
+    #[schema(required = true)]
     pub commit: Option<CommitOutput>,
     /// Present only when the request was a branch statement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1348,6 +1370,9 @@ pub enum ErrorCode {
     Unauthorized,
     Forbidden,
     BadRequest,
+    /// 400: the request lacks the exact supported HTTP contract header.
+    /// Authentication and contract admission precede graph access and effects.
+    ApiContractMismatch,
     NotFound,
     /// 405 Method Not Allowed — the route exists but the active server
     /// mode doesn't serve this method (e.g. `GET /graphs` in single-graph
@@ -1358,6 +1383,8 @@ pub enum ErrorCode {
     /// 429 Too Many Requests — per-actor admission cap exceeded.
     /// Clients should respect the `Retry-After` header.
     TooManyRequests,
+    /// 503: operation admission is closed; reconcile any earlier write.
+    ServiceUnavailable,
     Internal,
 }
 
@@ -1444,9 +1471,8 @@ pub struct PreconditionFailureOutput {
 
 /// A change continuation can no longer be reconstructed from retained history
 /// (HTTP 410). Recovery is the baseline handshake; retrying the same cursor
-/// cannot succeed. `code` stays unset: [`ErrorCode`] is closed and this
-/// additive detail is the machine-readable discriminator (the same rolling
-/// contract as `external_blob_source`).
+/// cannot succeed. `code` stays unset: this structured detail is the
+/// machine-readable discriminator, as with `external_blob_source`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeFeedGapOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1618,8 +1644,7 @@ pub struct ErrorOutput {
     pub blob_range: Option<BlobRangeOutput>,
     /// Set with HTTP 424 when an external Blob URI passed admission policy but
     /// its source could not be probed or read. This optional detail is the
-    /// rolling-safe machine-readable discriminator; `code` is omitted because
-    /// [`ErrorCode`] is a closed compatibility contract.
+    /// machine-readable discriminator; `code` is omitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_blob_source: Option<ExternalBlobSourceOutput>,
     /// Set when an overlapping durable recovery intent must be resolved before
@@ -1627,8 +1652,8 @@ pub struct ErrorOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_required: Option<RecoveryRequiredOutput>,
     /// Set when a mutation's graph-commit precondition failed
-    /// (HTTP 412). Like `recovery_required`, the meaning rides this additive
-    /// field — `ErrorCode` is a closed rolling wire contract.
+    /// (HTTP 412). Like `recovery_required`, this structured field carries
+    /// the machine-readable meaning and `code` is omitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub precondition_failure: Option<PreconditionFailureOutput>,
     /// Set with HTTP 410 when retained history can no longer reconstruct a
@@ -2155,12 +2180,13 @@ mod tests {
             engine: Some(Engine::V2),
             merge_lineage: Some(MergeLineage::Off),
             ann_nprobes: Some(7),
+            traversal_work_limit: Some(123),
         };
         let expected = format!(
-            "{{\"{}\":\"v2\",\"{}\":\"off\",\"{}\":7}}",
-            request_rows[0], request_rows[1], request_rows[2]
+            "{{\"{}\":\"v2\",\"{}\":\"off\",\"{}\":7,\"{}\":123}}",
+            request_rows[0], request_rows[1], request_rows[2], request_rows[3]
         );
-        assert_eq!(request_rows.len(), 3);
+        assert_eq!(request_rows.len(), 4);
         assert_eq!(serde_json::to_string(&populated).unwrap(), expected);
         assert_eq!(
             populated
@@ -2202,6 +2228,22 @@ mod tests {
             "a negative cap reaches the settings validation with its own spelling"
         );
         assert!(serde_json::from_str::<SettingsRequest>("{\"traversal\": \"csr\"}").is_err());
+        let parsed: SettingsRequest =
+            serde_json::from_str("{\"traversal_work_limit\": 123}").unwrap();
+        assert_eq!(
+            parsed.assignments(),
+            vec![(SettingId::TraversalWorkLimit, SettingValue::Integer(123))]
+        );
+        assert!(
+            serde_json::from_str::<SettingsRequest>("{\"traversal_work_limit\": \"many\"}")
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<SettingsRequest>(
+                "{\"traversal_work_limit\": 9223372036854775808}"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2226,6 +2268,39 @@ mod tests {
         for invalid in ["Person", "node:", "edge:", "table:Person"] {
             assert_eq!(entity_type_parts(invalid), Err(EntityTypeMappingError));
         }
+    }
+
+    #[test]
+    fn merge_and_change_receipts_require_commit_even_when_null() {
+        let mut merge = json!({
+            "source": "feature", "target": "main", "outcome": "already_up_to_date",
+            "actor_id": null, "commit": null
+        });
+        let decoded: BranchMergeOutput = serde_json::from_value(merge.clone()).unwrap();
+        assert!(decoded.commit.is_none());
+        assert_eq!(serde_json::to_value(decoded).unwrap(), merge);
+        merge.as_object_mut().unwrap().remove("commit");
+        assert!(
+            serde_json::from_value::<BranchMergeOutput>(merge)
+                .unwrap_err()
+                .to_string()
+                .contains("missing field `commit`")
+        );
+        let mut change = json!({
+            "branch": "main", "query_name": "branch merge",
+            "affected_nodes": 0, "affected_edges": 0, "actor_id": null, "commit": null,
+            "outcome": {"kind": "merged", "source": "feature", "target": "main", "merge": "already_up_to_date"}
+        });
+        let decoded: ChangeOutput = serde_json::from_value(change.clone()).unwrap();
+        assert!(decoded.commit.is_none());
+        assert_eq!(serde_json::to_value(decoded).unwrap(), change);
+        change.as_object_mut().unwrap().remove("commit");
+        assert!(
+            serde_json::from_value::<ChangeOutput>(change)
+                .unwrap_err()
+                .to_string()
+                .contains("missing field `commit`")
+        );
     }
 
     #[test]

@@ -14,6 +14,16 @@ use crate::error::PlanError;
 use crate::mirror::BoundPlanMirror;
 use crate::physical::{NodeId, PhysicalPlan};
 
+/// Saved execution plans use a separate version from rendered explain output.
+pub const BOUND_PLAN_VERSION: u32 = 1;
+
+/// The envelope omits top-level `plan` and `values` so unversioned readers reject it.
+#[derive(Serialize, Deserialize)]
+struct BoundPlanEnvelope {
+    bound_plan_version: u32,
+    body: BoundPlanMirror,
+}
+
 /// The values of one run: every parameter as the engine resolved it (`now()`
 /// among them) and the query vector of every `nearest` scan, keyed by the
 /// scan's node id.
@@ -32,14 +42,28 @@ pub struct BoundPlan {
 
 impl Serialize for BoundPlan {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        BoundPlanMirror::from(self).serialize(serializer)
+        BoundPlanEnvelope {
+            bound_plan_version: BOUND_PLAN_VERSION,
+            body: BoundPlanMirror::from(self),
+        }
+        .serialize(serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for BoundPlan {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mirror = BoundPlanMirror::deserialize(deserializer)?;
-        Self::try_from(mirror).map_err(D::Error::custom)
+        let envelope = BoundPlanEnvelope::deserialize(deserializer).map_err(|error| {
+            D::Error::custom(format!(
+                "cannot read saved bound plan; regenerate it with this version: {error}"
+            ))
+        })?;
+        if envelope.bound_plan_version != BOUND_PLAN_VERSION {
+            return Err(D::Error::custom(format!(
+                "unsupported bound plan version {}; expected {}; regenerate the saved plan",
+                envelope.bound_plan_version, BOUND_PLAN_VERSION
+            )));
+        }
+        Self::try_from(envelope.body).map_err(D::Error::custom)
     }
 }
 

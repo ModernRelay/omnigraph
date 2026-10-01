@@ -5,7 +5,10 @@ pub mod api;
 mod blob_transport;
 mod export_transport;
 mod handlers;
+mod http_contract;
+mod ingress;
 mod mcp;
+pub mod operations;
 mod settings;
 use handlers::*;
 use settings::*;
@@ -154,6 +157,7 @@ pub struct ApiDoc;
 pub fn served_openapi() -> utoipa::openapi::OpenApi {
     let mut doc = ApiDoc::openapi();
     handlers::nest_paths_under_cluster_prefix(&mut doc);
+    http_contract::describe_contract(&mut doc);
     doc
 }
 
@@ -376,6 +380,7 @@ pub struct AppState {
     /// Per-actor admission control. Process-wide (not per-graph) —
     /// see MR-668 decision Q6.
     workload: Arc<workload::WorkloadController>,
+    operations: operations::OperationRuntime,
     bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
     data_token_trust: Option<Arc<data_tokens::DataTokenTrust>>,
     oidc_identity_trust: Option<Arc<oidc_identity::OidcIdentityTrust>>,
@@ -443,6 +448,7 @@ pub struct ApiError {
     code: Option<ErrorCode>,
     message: Box<str>,
     details: Option<Box<ApiErrorDetails>>,
+    completion_uncertain: bool,
 }
 
 #[derive(Debug)]
@@ -463,6 +469,19 @@ enum ApiErrorDetails {
 }
 
 impl AppState {
+    /// Logical server owners only; this is not an engine-reuse/drain proof.
+    /// Embedding hosts must close admission on shutdown and wait for these
+    /// owners. An uncertain result requires process containment. `serve`
+    /// provides that supervision and its absolute watchdog deadline.
+    pub fn operation_runtime(&self) -> &operations::OperationRuntime {
+        &self.operations
+    }
+
+    fn with_operations(mut self, operations: operations::OperationRuntime) -> Self {
+        self.operations = operations;
+        self
+    }
+
     /// Canonical single-mode constructor. Every other `new_*` / `open_*`
     /// helper is a thin convenience wrapper around this one. Builds the
     /// engine + per-graph policy through `build_single_mode`, which
@@ -712,6 +731,7 @@ impl AppState {
             server_policy: None,
             data_token_trust: None,
             oidc_identity_trust: None,
+            operations: operations::OperationRuntime::new(),
             export_transport: export_transport::ExportTransport::with_defaults(),
             witness: Arc::new(BootWitness::default()),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -745,6 +765,7 @@ impl AppState {
             server_policy: server_policy.map(Arc::new),
             data_token_trust: None,
             oidc_identity_trust: None,
+            operations: operations::OperationRuntime::new(),
             export_transport: export_transport::ExportTransport::with_defaults(),
             witness: Arc::new(BootWitness::default()),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -915,6 +936,7 @@ fn hash_bearer_tokens(bearer_tokens: Vec<(String, String)>) -> Arc<[(BearerToken
 impl ApiError {
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self {
+            completion_uncertain: false,
             status: StatusCode::UNAUTHORIZED,
             code: Some(ErrorCode::Unauthorized),
             message: message.into().into_boxed_str(),
@@ -924,6 +946,7 @@ impl ApiError {
 
     pub fn forbidden(message: impl Into<String>) -> Self {
         Self {
+            completion_uncertain: false,
             status: StatusCode::FORBIDDEN,
             code: Some(ErrorCode::Forbidden),
             message: message.into().into_boxed_str(),
@@ -933,6 +956,7 @@ impl ApiError {
 
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self {
+            completion_uncertain: false,
             status: StatusCode::BAD_REQUEST,
             code: Some(ErrorCode::BadRequest),
             message: message.into().into_boxed_str(),
@@ -957,6 +981,7 @@ impl ApiError {
 
     pub fn not_found(message: impl Into<String>) -> Self {
         Self {
+            completion_uncertain: false,
             status: StatusCode::NOT_FOUND,
             code: Some(ErrorCode::NotFound),
             message: message.into().into_boxed_str(),
@@ -970,6 +995,7 @@ impl ApiError {
     /// distinguish "wrong context" from "no such resource").
     pub fn method_not_allowed(message: impl Into<String>) -> Self {
         Self {
+            completion_uncertain: false,
             status: StatusCode::METHOD_NOT_ALLOWED,
             code: Some(ErrorCode::MethodNotAllowed),
             message: message.into().into_boxed_str(),
@@ -979,6 +1005,7 @@ impl ApiError {
 
     pub fn conflict(message: impl Into<String>) -> Self {
         Self {
+            completion_uncertain: false,
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into().into_boxed_str(),
@@ -988,6 +1015,7 @@ impl ApiError {
 
     fn unsupported_media_type(message: impl Into<String>) -> Self {
         Self {
+            completion_uncertain: false,
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
             code: Some(ErrorCode::BadRequest),
             message: message.into().into_boxed_str(),
@@ -997,6 +1025,7 @@ impl ApiError {
 
     pub(crate) fn range_not_satisfiable(start: u64, end: u64, length: u64) -> Self {
         Self {
+            completion_uncertain: false,
             status: StatusCode::RANGE_NOT_SATISFIABLE,
             code: Some(ErrorCode::BadRequest),
             // Keep the pre-existing `OmniError` display spelling stable while
@@ -1019,6 +1048,7 @@ impl ApiError {
     /// details because no mutation was attempted.
     pub(crate) fn blob_precondition_failed(message: impl Into<String>) -> Self {
         Self {
+            completion_uncertain: false,
             status: StatusCode::PRECONDITION_FAILED,
             code: Some(ErrorCode::Conflict),
             message: message.into().into_boxed_str(),
@@ -1028,9 +1058,23 @@ impl ApiError {
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self {
+            completion_uncertain: true,
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: Some(ErrorCode::Internal),
             message: message.into().into_boxed_str(),
+            details: None,
+        }
+    }
+
+    /// Refusal before an operation acquires ownership in a closed runtime.
+    fn admission_closed() -> Self {
+        Self {
+            completion_uncertain: false,
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: Some(ErrorCode::ServiceUnavailable),
+            message:
+                "server operation admission is closed; reconcile any prior write before retrying"
+                    .into(),
             details: None,
         }
     }
@@ -1050,12 +1094,13 @@ impl ApiError {
     }
 
     /// HTTP 424 Failed Dependency for an external Blob source that passed the
-    /// graph's admission policy but could not be probed or read. `ErrorCode`
-    /// remains a closed rolling contract; the optional structured detail is
-    /// the additive machine-readable discriminator.
+    /// graph's admission policy but could not be probed or read. The admitted
+    /// HTTP contract identifies this condition through the optional structured
+    /// detail; the top-level `code` remains unset.
     fn external_blob_source(uri: String, reason: String) -> Self {
         let message = format!("external blob source '{uri}' is unavailable: {reason}");
         Self {
+            completion_uncertain: false,
             status: StatusCode::FAILED_DEPENDENCY,
             code: None,
             message: message.into_boxed_str(),
@@ -1071,6 +1116,7 @@ impl ApiError {
     /// and `RejectReason::ByteBudgetExceeded`.
     pub fn too_many_requests(message: impl Into<String>) -> Self {
         Self {
+            completion_uncertain: false,
             status: StatusCode::TOO_MANY_REQUESTS,
             code: Some(ErrorCode::TooManyRequests),
             message: message.into().into_boxed_str(),
@@ -1083,14 +1129,25 @@ impl ApiError {
     pub fn from_workload_reject(reject: workload::RejectReason) -> Self {
         match reject {
             workload::RejectReason::InFlightCountExceeded { .. }
-            | workload::RejectReason::ByteBudgetExceeded { .. } => {
+            | workload::RejectReason::ByteBudgetExceeded { .. }
+            | workload::RejectReason::GlobalInFlightCountExceeded { .. }
+            | workload::RejectReason::GlobalByteBudgetExceeded { .. }
+            | workload::RejectReason::ActiveActorLimitExceeded { .. }
+            | workload::RejectReason::IngressInFlightCountExceeded { .. }
+            | workload::RejectReason::IngressByteBudgetExceeded { .. }
+            | workload::RejectReason::ReadIngressInFlightCountExceeded { .. }
+            | workload::RejectReason::ReadIngressByteBudgetExceeded { .. } => {
                 Self::too_many_requests(reject.to_string())
+            }
+            workload::RejectReason::IngressReservationExceeded { .. } => {
+                Self::internal(reject.to_string())
             }
         }
     }
 
     fn merge_conflict(conflicts: Vec<api::MergeConflictOutput>) -> Self {
         Self {
+            completion_uncertain: false,
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: summarize_merge_conflicts(&conflicts).into_boxed_str(),
@@ -1103,6 +1160,7 @@ impl ApiError {
         details: api::PublishedDatasetVersionConflictOutput,
     ) -> Self {
         Self {
+            completion_uncertain: false,
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
@@ -1114,6 +1172,7 @@ impl ApiError {
 
     fn read_set_conflict(message: String, details: api::ReadSetConflictOutput) -> Self {
         Self {
+            completion_uncertain: false,
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
@@ -1123,6 +1182,7 @@ impl ApiError {
 
     fn key_conflict(message: String, details: api::KeyConflictOutput) -> Self {
         Self {
+            completion_uncertain: false,
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
@@ -1132,6 +1192,7 @@ impl ApiError {
 
     fn resource_limit(message: String, details: api::ResourceLimitOutput) -> Self {
         Self {
+            completion_uncertain: false,
             status: StatusCode::PAYLOAD_TOO_LARGE,
             code: Some(ErrorCode::BadRequest),
             message: message.into_boxed_str(),
@@ -1141,10 +1202,10 @@ impl ApiError {
 
     fn recovery_required(message: String, operation_id: String) -> Self {
         Self {
+            completion_uncertain: false,
             status: StatusCode::SERVICE_UNAVAILABLE,
-            // `ErrorCode` is a closed rolling wire contract. The additive
-            // `recovery_required` field carries the new meaning while older
-            // clients continue to deserialize the otherwise familiar body.
+            // The admitted HTTP contract identifies this condition through
+            // `recovery_required`; the top-level `code` remains unset.
             code: None,
             message: message.into_boxed_str(),
             details: Some(Box::new(ApiErrorDetails::RecoveryRequired(
@@ -1155,10 +1216,11 @@ impl ApiError {
 
     /// HTTP 412 Precondition Failed — an
     /// `Omnigraph-If-Graph-Commit` graph-head precondition no longer holds.
-    /// `code` is omitted for the same closed-wire-contract reason as
-    /// [`Self::recovery_required`].
+    /// The admitted HTTP contract identifies this condition through
+    /// `precondition_failure`; the top-level `code` remains unset.
     fn precondition_failed(message: String, details: api::PreconditionFailureOutput) -> Self {
         Self {
+            completion_uncertain: false,
             status: StatusCode::PRECONDITION_FAILED,
             code: None,
             message: message.into_boxed_str(),
@@ -1172,6 +1234,7 @@ impl ApiError {
     /// baseline handshake is the only recovery.
     fn change_feed_gap(cursor: Option<String>, first_unreadable_commit_id: String) -> Self {
         Self {
+            completion_uncertain: false,
             status: StatusCode::GONE,
             code: None,
             message: format!("change feed gap at commit '{first_unreadable_commit_id}'")
@@ -1189,6 +1252,7 @@ impl ApiError {
     /// cannot satisfy (parentless genesis or an unprovable schema boundary).
     fn change_diff_refusal(message: String, details: api::ChangeDiffRefusalOutput) -> Self {
         Self {
+            completion_uncertain: false,
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
@@ -1208,8 +1272,22 @@ impl ApiError {
         response
     }
 
+    pub(crate) fn completion_uncertain(&self) -> bool {
+        self.completion_uncertain
+    }
+
     fn from_omni(err: OmniError) -> Self {
-        match err {
+        let (err, evidence) = err.into_completion_evidence();
+        // Keep completion classification separate from HTTP status. Generic
+        // DataFusion erases plan-vs-execution provenance: if an owned write
+        // unexpectedly returns it, contain the epoch until typed engine
+        // outcomes can prove pre-effect or settled completion.
+        let uncertain = err.is_manifest_publish_in_doubt()
+            || matches!(
+                &err,
+                OmniError::DataFusion(_) | OmniError::RecoveryRequired { .. }
+            );
+        let mut response = match err {
             OmniError::Compiler(err) => Self::from_compiler(&err),
             OmniError::DataFusion(message) => Self::bad_request(format!("query: {message}")),
             OmniError::Manifest(err) => match err.kind {
@@ -1401,7 +1479,19 @@ impl ApiError {
             err @ OmniError::InitializationClaimed { .. } => Self::conflict(err.to_string()),
             err @ (OmniError::InitializationCommitted { .. }
             | OmniError::InitializationIndeterminate { .. }) => Self::internal(err.to_string()),
+            OmniError::Completion { .. } => unreachable!("completion evidence was unwrapped"),
+        };
+        response.completion_uncertain |= uncertain;
+        match evidence {
+            Some(omnigraph::error::CompletionEvidence::BeforeEffect) => {
+                response.completion_uncertain = false;
+            }
+            Some(omnigraph::error::CompletionEvidence::Uncertain) => {
+                response.completion_uncertain = true;
+            }
+            None => {}
         }
+        response
     }
 }
 
@@ -1465,6 +1555,15 @@ impl IntoResponse for ApiError {
                 axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
             );
         }
+        let status = self.status;
+        (status, headers, Json(self.into_output())).into_response()
+    }
+}
+
+impl ApiError {
+    /// Preserve the same typed details in a compound result as in an ordinary
+    /// error response.
+    fn into_output(self) -> ErrorOutput {
         let mut output = ErrorOutput::message(self.message);
         output.code = self.code;
         if let Some(details) = self.details {
@@ -1494,8 +1593,14 @@ impl IntoResponse for ApiError {
                 ApiErrorDetails::Diagnostic(value) => output.diagnostic = Some(value),
             }
         }
-        (self.status, headers, Json(output)).into_response()
+        output
     }
+}
+
+/// Project an engine failure into the shared error body, including structured
+/// details, for embedded callers that compose a second effect after success.
+pub fn engine_error_output(error: OmniError) -> api::ErrorOutput {
+    ApiError::from_omni(error).into_output()
 }
 
 #[cfg(test)]
@@ -2105,10 +2210,12 @@ fn validate_and_attach(
 
 pub fn build_app(state: AppState) -> Router {
     // The per-graph protected routes, identical in single + multi mode.
-    // Two middleware layers wrap them (outer first, inner last):
+    // Middleware wraps them in this order (outer first, inner last):
     //   1. `require_bearer_auth` — extracts the bearer token and injects
     //      `AuthenticatedActor` (or rejects 401).
-    //   2. `resolve_graph_handle` — injects `Arc<GraphHandle>` based on
+    //   2. `require_contract` — refuses unsupported HTTP contracts before
+    //      graph resolution or request-body work.
+    //   3. `resolve_graph_handle` — injects `Arc<GraphHandle>` based on
     //      the active mode (single: the only handle; multi: lookup by
     //      `{graph_id}` in the URI path).
     let per_graph_protected = Router::new()
@@ -2182,6 +2289,7 @@ pub fn build_app(state: AppState) -> Router {
             state.clone(),
             resolve_graph_handle,
         ))
+        .route_layer(middleware::from_fn(http_contract::require_contract))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_auth,
@@ -2196,6 +2304,7 @@ pub fn build_app(state: AppState) -> Router {
     let management = Router::new()
         .route("/graphs", get(server_graphs_list))
         .route("/graphs/discovery", get(server_graphs_discovery))
+        .route_layer(middleware::from_fn(http_contract::require_contract))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_auth,
@@ -2215,7 +2324,8 @@ pub fn build_app(state: AppState) -> Router {
     if state.oidc_identity_trust.is_some() {
         app = app.merge(mcp::router(state.clone()));
     }
-    app.layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
+    app.layer(middleware::from_fn(http_contract::identify_response))
+        .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -2240,11 +2350,21 @@ async fn serve_config(
     // arms the watchdog thread, and releases the graceful shutdown.
     let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_grace = config.shutdown_grace;
+    let operations = operations::OperationRuntime::new();
+    let listener_failed = Arc::new(tokio::sync::Notify::new());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     {
         let draining = Arc::clone(&draining);
+        let operations = operations.clone();
+        let listener_failed = Arc::clone(&listener_failed);
         tokio::spawn(async move {
-            shutdown_signal().await;
+            // The first signal or uncertain owner fixes the one deadline.
+            tokio::select! {
+                () = shutdown_signal() => {},
+                () = operations.fatal() => error!("owned write completion uncertain; containing process"),
+                () = listener_failed.notified() => error!("HTTP listener failed; containing admitted work"),
+            }
+            operations.close();
             draining.store(true, std::sync::atomic::Ordering::SeqCst);
             arm_shutdown_watchdog(shutdown_grace);
             let _ = shutdown_tx.send(true);
@@ -2334,6 +2454,7 @@ async fn serve_config(
     }
 
     let state = state
+        .with_operations(operations.clone())
         .with_boot_witness(
             config.witness.clone(),
             Arc::clone(&draining),
@@ -2350,6 +2471,17 @@ async fn serve_config(
             }
         })
         .await;
+    if served.is_err() {
+        operations.close();
+        listener_failed.notify_one();
+    }
+    if !operations.wait_logical_owners().await {
+        // All known logical owners have finished. Retain unresolved
+        // reservations until this nonzero process exit; this is containment,
+        // not a native-I/O settlement or reusable-engine drain proof.
+        error!("known owners drained after uncertain write; terminating process");
+        std::process::exit(2);
+    }
     served?;
     Ok(())
 }
@@ -2550,10 +2682,14 @@ fn arm_shutdown_watchdog(grace: std::time::Duration) {
         error!("shutdown grace is zero; exiting immediately with unfinished work");
         std::process::exit(2);
     }
+    let Some(deadline) = std::time::Instant::now().checked_add(grace) else {
+        error!("shutdown grace exceeds supported clock range; exiting 2");
+        std::process::exit(2);
+    };
     std::thread::Builder::new()
         .name("shutdown-watchdog".to_string())
         .spawn(move || {
-            std::thread::sleep(grace);
+            std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
             error!(
                 grace_seconds = grace.as_secs(),
                 "shutdown deadline reached with unfinished work; exiting 2"

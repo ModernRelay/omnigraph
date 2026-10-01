@@ -5,6 +5,7 @@ use super::projection::{
 };
 use omnigraph_compiler::ir::SubqueryPredicate;
 
+use crate::gate::V1Refusal;
 use crate::instrumentation::{
     RrfGateFallback, RrfGatePlan, RrfGateVerdict, record_ann_prefilter_verdict,
     record_rrf_gate_verdict,
@@ -338,7 +339,7 @@ fn resolve_nearest_query_vec(expr: &IRExpr, params: &ParamMap) -> Result<Vec<f32
     let lit = resolve_literal_or_param(expr, params)?;
     match lit {
         Literal::List(_) => literal_to_f32_vec(&lit),
-        Literal::String(_) => Err(crate::gate::V1Refusal::StringNearest.error()),
+        Literal::String(_) => Err(V1Refusal::StringNearest.error()),
         _ => Err(OmniError::manifest(
             "nearest query must be a string or list of floats".to_string(),
         )),
@@ -868,19 +869,12 @@ fn rrf_gate_expand_sources<'a>(
             IROp::NodeScan { variable, .. } if variable == ranked_var => {
                 introduced_by_scan = true;
             }
-            // Field-exhaustive on purpose (no `..`): a future Expand field
-            // must be classified here — superset-safe or not — before this
-            // walk compiles, the field-level twin of the exhaustive op match.
-            // The elided-by-name fields are each shrink-only or
-            // multiplicity-only: `dst_type` (typing, checked at the catalog
-            // in the gate), `max_hops` (an upper bound never widens the
-            // first-hop necessity), `dst_filters` (shrink survivors only),
-            // `edge_binding` (row multiplicity, not membership).
+
             IROp::Expand {
                 src_var,
                 dst_var,
-                edge_type,
-                direction,
+                edges,
+                src_type: _,
                 min_hops,
                 dst_type: _,
                 max_hops: _,
@@ -891,7 +885,8 @@ fn rrf_gate_expand_sources<'a>(
                     return None;
                 }
                 if src_var == ranked_var && *min_hops > 0 {
-                    sources.push((edge_type.as_str(), *direction));
+                    let member = edges.named()?;
+                    sources.push((member.edge_type.as_str(), member.direction));
                 }
             }
             IROp::NodeScan { .. } | IROp::Filter(_) | IROp::AntiJoin { .. } => {}
@@ -1740,8 +1735,8 @@ fn collect_pipeline_columns(pipeline: &[IROp], needed: &mut HashMap<String, Need
             IROp::Expand {
                 src_var: _,
                 dst_var: _,
-                edge_type: _,
-                direction: _,
+                edges: _,
+                src_type: _,
                 dst_type: _,
                 min_hops: _,
                 max_hops: _,
@@ -2000,14 +1995,17 @@ fn execute_pipeline<'a>(
                 IROp::Expand {
                     src_var,
                     dst_var,
-                    edge_type,
-                    direction,
+                    edges,
+                    src_type: _,
                     dst_type,
                     min_hops,
                     max_hops,
                     dst_filters,
                     edge_binding,
                 } => {
+                    let member = edges
+                        .named()
+                        .ok_or_else(|| V1Refusal::EdgeSelection.error())?;
                     // Merge lowered destination filters with hoisted ones
                     let mut all_dst_filters: Vec<IRExpr> = dst_filters.clone();
                     if let Some(extra) = hoisted_dst_filters.get(dst_var) {
@@ -2036,8 +2034,8 @@ fn execute_pipeline<'a>(
                             catalog,
                             src_var,
                             dst_var,
-                            edge_type,
-                            *direction,
+                            &member.edge_type,
+                            member.direction,
                             dst_type,
                             *min_hops,
                             *max_hops,
@@ -2107,8 +2105,10 @@ pub(crate) fn referenced_edge_types(
 fn collect_referenced_edge_names(pipeline: &[IROp], out: &mut std::collections::BTreeSet<String>) {
     for op in pipeline {
         match op {
-            IROp::Expand { edge_type, .. } => {
-                out.insert(edge_type.clone());
+            IROp::Expand { edges, .. } => {
+                if let Some(member) = edges.named() {
+                    out.insert(member.edge_type.clone());
+                }
             }
             IROp::AntiJoin { inner, .. } => collect_referenced_edge_names(inner, out),
             // Exhaustive on purpose (no `_` arm): a new edge-referencing IROp must
@@ -3811,14 +3811,12 @@ fn try_bulk_anti_join_mask(
     if !bulk_anti_join_applies(inner_pipeline, outer_var) {
         return None;
     }
-    let IROp::Expand {
-        edge_type,
-        direction,
-        ..
-    } = &inner_pipeline[0]
-    else {
+    let IROp::Expand { edges, .. } = &inner_pipeline[0] else {
         return None;
     };
+    let member = edges.named()?;
+    let edge_type = &member.edge_type;
+    let direction = member.direction;
     let gi = graph_index?;
     let edge_def = catalog.edge_types.get(edge_type.as_str())?;
 

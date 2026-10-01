@@ -118,14 +118,14 @@ fn repeated_merge_refreshes_projection_incrementally() {
 
             diverge(&db, 0).await;
             let outcome = db.branch_merge("feature", "main").await.unwrap();
-            assert_eq!(outcome, MergeOutcome::Merged);
+            assert_eq!(outcome.outcome, MergeOutcome::Merged);
 
             // Both writes use this handle. Publication returns the acknowledged
             // exact projections, so no deleted head row needs reconstructing.
             diverge(&db, 1).await;
 
             let (outcome, io) = measure(db.branch_merge("feature", "main")).await;
-            assert_eq!(outcome.unwrap(), MergeOutcome::Merged);
+            assert_eq!(outcome.unwrap().outcome, MergeOutcome::Merged);
             assert!(
                 io.projection_incremental_refreshes >= 1,
                 "the repeated merge must refresh at least one cached branch authority \
@@ -174,7 +174,7 @@ fn repeated_merge_refreshes_projection_incrementally() {
                 &mixed_params(&[("$name", "Bob")], &[("$age", 28)]),
             ).await.unwrap();
             let (outcome, foreign_io) = measure(db.branch_merge("feature", "main")).await;
-            assert_eq!(outcome.unwrap(), MergeOutcome::Merged);
+            assert_eq!(outcome.unwrap().outcome, MergeOutcome::Merged);
             eprintln!("foreign publication refresh: {foreign_io:?}");
             assert_eq!(
                 (foreign_io.projection_full_refreshes, foreign_io.projection_identity_rows),
@@ -221,16 +221,16 @@ async fn merge_authority_cache_retains_only_one_non_bound_branch() {
     db.branch_create("feature-b").await.unwrap();
 
     assert_eq!(
-        db.branch_merge("feature-a", "main").await.unwrap(),
+        db.branch_merge("feature-a", "main").await.unwrap().outcome,
         MergeOutcome::AlreadyUpToDate
     );
     assert_eq!(
-        db.branch_merge("feature-b", "main").await.unwrap(),
+        db.branch_merge("feature-b", "main").await.unwrap().outcome,
         MergeOutcome::AlreadyUpToDate
     );
 
     let (outcome, io) = measure(db.branch_merge("feature-a", "main")).await;
-    assert_eq!(outcome.unwrap(), MergeOutcome::AlreadyUpToDate);
+    assert_eq!(outcome.unwrap().outcome, MergeOutcome::AlreadyUpToDate);
     assert!(
         io.internal_open_count >= 1,
         "feature-a must have been evicted when feature-b became the one hot authority"
@@ -250,7 +250,7 @@ async fn branch_recreate_is_fenced_from_the_cached_projection() {
 
     diverge(&db, 0).await;
     assert_eq!(
-        db.branch_merge("feature", "main").await.unwrap(),
+        db.branch_merge("feature", "main").await.unwrap().outcome,
         MergeOutcome::Merged
     );
 
@@ -262,7 +262,7 @@ async fn branch_recreate_is_fenced_from_the_cached_projection() {
     // commits) would instead present divergence.
     let outcome = db.branch_merge("feature", "main").await.unwrap();
     assert_eq!(
-        outcome,
+        outcome.outcome,
         MergeOutcome::AlreadyUpToDate,
         "a recreated branch must be re-read from its new lifetime, never \
          served from the deleted lifetime's cached projection"

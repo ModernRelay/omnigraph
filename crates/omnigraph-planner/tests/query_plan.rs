@@ -11,6 +11,7 @@ use omnigraph_compiler::SYSTEM_COLUMNS_V3;
 use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
 use omnigraph_compiler::query::ast::{AggFunc, CompOp, Literal};
 use omnigraph_compiler::settings::Traversal;
+use omnigraph_compiler::traversal::{EdgeMember, EdgeSelection};
 use omnigraph_compiler::types::Direction;
 use omnigraph_planner::optimizer::resolve;
 use omnigraph_planner::{
@@ -146,8 +147,11 @@ fn expand(src: &str, dst: &str, dst_filters: Vec<IRExpr>) -> IROp {
     IROp::Expand {
         src_var: src.to_string(),
         dst_var: dst.to_string(),
-        edge_type: "knows".to_string(),
-        direction: Direction::Out,
+        edges: EdgeSelection::Named(EdgeMember {
+            edge_type: "knows".to_string(),
+            direction: Direction::Out,
+        }),
+        src_type: "T".to_string(),
         dst_type: "T".to_string(),
         min_hops: 1,
         max_hops: Some(1),
@@ -253,3 +257,6 @@ mod cost;
 mod explain;
 #[path = "query_plan/logical.rs"]
 mod logical;
+
+#[path = "query_plan/edge_selections.rs"]
+mod edge_selections;

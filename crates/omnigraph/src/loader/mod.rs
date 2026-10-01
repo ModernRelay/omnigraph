@@ -358,7 +358,7 @@ impl Omnigraph {
     ) -> Result<LoadReceipt> {
         // The pending schema-contract install precedes both an implicit
         // target-branch fork and data staging.
-        self.settle_pending_schema_install().await?;
+        let completed_prior_work = self.settle_pending_schema_install().await?;
 
         // Schema/catalog authority is captured once via the `WriteTxn` (plus its
         // cheap trailing identity-marker fence); the only second full validation
@@ -368,7 +368,18 @@ impl Omnigraph {
         // `requested == None` is `main`, which always exists.
         let mut branch_created = false;
         if let (Some(target), Some(base_name)) = (requested.as_deref(), base_branch.as_deref()) {
-            let exists = self.branch_list().await?.iter().any(|name| name == target);
+            let exists = self
+                .branch_list()
+                .await
+                .map_err(|error| {
+                    if completed_prior_work {
+                        error.without_pre_effect_evidence()
+                    } else {
+                        error.before_effect()
+                    }
+                })?
+                .iter()
+                .any(|name| name == target);
             if !exists {
                 // Thread the actor through to the implicit BranchCreate so
                 // policy decisions match what an explicit `branch_create_from_as`
@@ -381,7 +392,14 @@ impl Omnigraph {
                     target,
                     actor_id,
                 )
-                .await?;
+                .await
+                .map_err(|error| {
+                    if completed_prior_work {
+                        error.without_pre_effect_evidence()
+                    } else {
+                        error
+                    }
+                })?;
                 branch_created = true;
                 // DST window (loader walk D1 → D2): the implicit fork is
                 // durable, the load has not begun.
@@ -400,7 +418,14 @@ impl Omnigraph {
                 input_shape,
                 stage_write_concurrency,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                if completed_prior_work || branch_created {
+                    error.without_pre_effect_evidence()
+                } else {
+                    error
+                }
+            })?;
         receipt.result.branch = requested.unwrap_or_else(|| "main".to_string());
         receipt.result.base_branch = base_branch;
         receipt.result.branch_created = branch_created;
@@ -535,6 +560,7 @@ async fn load_jsonl_data(
             actor_id,
             input_shape,
             stage_write_concurrency,
+            attempt == 0,
         )
         .await
         {
@@ -564,12 +590,19 @@ async fn load_jsonl_reader_once<R: BufRead>(
     actor_id: Option<&str>,
     input_shape: LoadInputShape,
     stage_write_concurrency: usize,
+    first_attempt: bool,
 ) -> Result<LoadReceipt> {
     // Capture the manifest/schema authority before interpreting any input. The
     // catalog rides the WriteTxn and was built from the exact accepted IR named
     // by its schema token; a long-lived handle's global catalog may legitimately
     // lag a schema apply completed through another handle.
-    let txn = db.open_write_txn(branch).await?;
+    let txn = db.open_write_txn(branch).await.map_err(|error| {
+        if first_attempt {
+            error.before_effect()
+        } else {
+            error.without_pre_effect_evidence()
+        }
+    })?;
     let catalog = Arc::clone(&txn.catalog);
     let snapshot = txn.base.clone();
 

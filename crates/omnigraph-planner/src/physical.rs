@@ -1,17 +1,21 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 
 use arrow_schema::SchemaRef;
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, SubqueryPredicate};
 use omnigraph_compiler::query::ast::{BinaryOp, CompOp};
+use omnigraph_compiler::traversal::EdgeSelection;
 use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::cost::{AccessPath, ExpandMode, ExpandPolicy};
+use crate::error::PlanError;
 use crate::logical::{
-    KeyJoinKind, ScanSpec, direction_word, filters_json, metadata_count_json, ordering_text,
-    scan_json,
+    ColumnRef, KeyJoinKind, ScanSpec, filters_json, metadata_count_json, ordering_text, scan_json,
+    tiebreak_text,
 };
+use crate::mirror::EdgeSelectionMirror;
 use crate::source::SideId;
 
 /// The index of a node in a [`PhysicalPlan`].
@@ -113,6 +117,42 @@ pub struct Assumptions {
     pub datasets: BTreeMap<String, Option<DatasetPin>>,
     pub gate_policy: GatePolicy,
     pub memory_limit: u64,
+    /// One shared traversal-work allowance, present for statements using edge selections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traversal_work_limit: Option<u64>,
+    /// Retained even when rewrites remove an expansion, for historical replay admission.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub has_wildcard_traversal: bool,
+}
+
+impl Assumptions {
+    /// Validate the single captured traversal allowance before execution.
+    /// Wildcard provenance survives rewrites, including an eliminated Expand.
+    ///
+    /// # Errors
+    /// Returns an error for a duplicate settings entry, a limit outside
+    /// `1..=i64::MAX`, or wildcard provenance without a captured limit.
+    pub fn validated_traversal_work_limit(&self) -> Result<Option<NonZeroU64>, PlanError> {
+        if self.settings.contains_key("traversal_work_limit") {
+            return Err(PlanError::Unsupported {
+                detail: "traversal_work_limit must use the captured typed allowance, not a duplicate settings entry".to_string(),
+            });
+        }
+        match self.traversal_work_limit {
+            Some(limit) if limit == 0 || limit > i64::MAX as u64 => Err(PlanError::Unsupported {
+                detail: "traversal_work_limit must be in 1..=i64::MAX".to_string(),
+            }),
+            Some(limit) => Ok(NonZeroU64::new(limit)),
+            None if self.has_wildcard_traversal => Err(PlanError::Unsupported {
+                detail: "wildcard traversal requires a finite traversal_work_limit".to_string(),
+            }),
+            None => Ok(None),
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One required first hop from a ranked binding: a top-level `Expand` that
@@ -433,15 +473,15 @@ pub enum PhysicalNode {
         input: NodeId,
         filters: Vec<IRExpr>,
     },
-    /// A traversal: the mode the cost model chose (or the session pinned), the
-    /// estimate it was chosen for, the policy for taking the other mode, and
-    /// the pinned dataset version of the edge table it reads.
+    /// A traversal: its declared mode and fallback policy, input row estimate,
+    /// and pinned member datasets. A budgeted plan uses the input estimate only
+    /// for diagnostics; costed plans also use it to choose their mode.
     Expand {
         input: NodeId,
         src: String,
         dst: String,
-        edge_type: String,
-        direction: Direction,
+        edges: EdgeSelection,
+        src_type: String,
         dst_type: String,
         min_hops: u32,
         max_hops: Option<u32>,
@@ -449,7 +489,7 @@ pub enum PhysicalNode {
         mode: ExpandMode,
         frontier_estimate: Option<u64>,
         policy: ExpandPolicy,
-        version: Option<u64>,
+        versions: BTreeMap<String, Option<u64>>,
     },
     AntiJoin {
         input: NodeId,
@@ -469,6 +509,8 @@ pub enum PhysicalNode {
         k: Option<IRExpr>,
         limit: Option<usize>,
         prefilter: Prefilter,
+        /// Downstream row keys after the arm score and fused node identity.
+        row_tiebreak: Vec<ColumnRef>,
     },
     Projection {
         input: NodeId,
@@ -482,10 +524,9 @@ pub enum PhysicalNode {
         input: NodeId,
         order_by: Vec<IROrdering>,
         fetch: Option<usize>,
-        /// The bindings whose ids follow `order_by`, ascending nulls first,
-        /// so the order is total; empty where ids cannot change the visible
-        /// order.
-        tiebreak: Vec<String>,
+        /// The metadata columns following `order_by`, ascending nulls first,
+        /// so the order is total; empty where they cannot change visible order.
+        tiebreak: Vec<ColumnRef>,
     },
 }
 
@@ -859,8 +900,8 @@ impl PhysicalPlan {
             PhysicalNode::Expand {
                 src,
                 dst,
-                edge_type,
-                direction,
+                edges,
+                src_type,
                 dst_type,
                 min_hops,
                 max_hops,
@@ -868,14 +909,14 @@ impl PhysicalPlan {
                 mode,
                 frontier_estimate,
                 policy,
-                version,
+                versions,
                 ..
             } => json!({
                 "node": "Expand",
                 "src": src,
                 "dst": dst,
-                "edge_type": edge_type,
-                "direction": direction_word(direction),
+                "edges": EdgeSelectionMirror::from(edges),
+                "src_type": src_type,
                 "dst_type": dst_type,
                 "min_hops": min_hops,
                 "max_hops": max_hops,
@@ -883,7 +924,7 @@ impl PhysicalPlan {
                 "mode": mode,
                 "alternatives": policy.alternatives(*mode),
                 "frontier_estimate": frontier_estimate,
-                "version": version,
+                "versions": versions,
             }),
             PhysicalNode::AntiJoin {
                 outer_var,
@@ -898,7 +939,13 @@ impl PhysicalPlan {
                 "node": node.name(),
                 "outer_var": outer_var,
             }),
-            PhysicalNode::RankFuse { arms, k, limit, .. } => json!({
+            PhysicalNode::RankFuse {
+                arms,
+                k,
+                limit,
+                row_tiebreak,
+                ..
+            } => json!({
                 "node": "RankFuse",
                 "arms": arms
                     .iter()
@@ -906,6 +953,7 @@ impl PhysicalPlan {
                     .collect::<Vec<Value>>(),
                 "k": k.as_ref().map(ToString::to_string),
                 "limit": limit,
+                "row_tiebreak": tiebreak_text(row_tiebreak),
             }),
             PhysicalNode::Projection { return_exprs, .. }
             | PhysicalNode::Aggregate { return_exprs, .. } => json!({
@@ -924,7 +972,7 @@ impl PhysicalPlan {
                 "node": "Sort",
                 "keys": order_by.iter().map(ordering_text).collect::<Vec<String>>(),
                 "fetch": fetch,
-                "tiebreak": crate::logical::tiebreak_text(tiebreak),
+                "tiebreak": tiebreak_text(tiebreak),
             }),
             PhysicalNode::CrossJoin { filters, .. } if !filters.is_empty() => json!({
                 "node": "CrossJoin",

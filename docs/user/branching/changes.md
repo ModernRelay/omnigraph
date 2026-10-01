@@ -4,6 +4,10 @@ OmniGraph can describe what one commit changed or deliver an ordered feed of
 changes on a branch. Both surfaces report logical nodes and edges, not storage
 details.
 
+HTTP calls follow the [HTTP contract](../operations/server.md#http-contract),
+including the required request header and response check before consuming a
+JSON or streamed body.
+
 ## Inspect one commit
 
 ```bash

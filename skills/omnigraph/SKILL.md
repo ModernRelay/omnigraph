@@ -20,6 +20,26 @@ use v9; opening v8 preserves its physical columns. A v0.10 graph uses v6 and
 requires an explicit upgrade or rebuild. Read [migration guidance](references/migrations.md)
 before replacing a deployed binary.
 
+## Upcoming GQ 2.1 traversal support
+
+The unreleased v0.12 language extension requires a binary reporting GQ 2.1.
+Do not send this syntax to the v0.11 deployment covered by the rest of this skill.
+`$a (knows | likes) $b` selects named edge types; `$a * $b` selects compatible
+types from the captured schema and requires declared endpoint node types.
+Omitted bounds always mean `{1,1}`; recursive traversal needs finite bounds
+such as `{1,3}`. `$a $e:(knows | likes) $b` binds one-hop concrete edges, exposing
+`$e.@type` and `$e.@id`. Common properties must exist with compatible base types
+on every member; nullability and enum domains widen.
+
+`set traversal_work_limit = 1000000;` controls shared traversal row work in
+statements using selections. Full selected-table sizes count before scans, even
+for selective neighborhoods. A result limit cannot replace this cap. Exhaustion
+terminates the query with an error; received rows do not become partial success.
+Historical wildcard targets are refused. Stored-query validation can refuse a
+schema addition that would invalidate a wildcard common-property reference.
+See [traversal](../../docs/user/queries/traversal.md) and
+[session settings](../../docs/user/queries/settings.md).
+
 ## The Seven Rules
 
 1. **Lint before commit** — `omnigraph lint --schema schema.pg --query queries/foo.gq` validates both sides against each other. No running repo required.

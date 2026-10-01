@@ -267,12 +267,19 @@ the CAS the merge is complete; nothing follows the publication.
 
 ## Outcomes
 
-`MergeOutcome` is one of:
+The engine returns `MergeResult { outcome, commit }`. `MergeOutcome` is one of:
 
 - `AlreadyUpToDate` — source adds no target-visible change;
 - `FastForward` — the target adopts source state without a divergent
   three-way result;
 - `Merged` — a productive three-way merge publishes a new graph commit.
+
+Both publishing outcomes carry their own `GraphCommit`; `AlreadyUpToDate`
+carries `None`. Return this value through the server and CLI without rereading
+HEAD or history: a concurrent writer may have advanced the target already.
+Optional source deletion is a subsequent action with its own authorization and
+structured error; it cannot replace the successful merge receipt. See
+[Exact merge receipts](../rfcs/2026-09-30-exact-merge-receipts.md).
 
 ## Owners
 

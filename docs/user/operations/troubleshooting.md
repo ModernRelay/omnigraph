@@ -9,6 +9,14 @@ plain responses, including 404, 405, 415, or 422.
 
 Do not parse human-readable error text when a structured field is present.
 
+## Server discovery
+
+Remote graph commands first make an anonymous `HEAD /healthz` request to the
+configured service root. Discovery sends neither the data bearer token nor URL
+Basic-auth credentials; reverse proxies must allow that public probe. A timeout
+or connection failure is reported with a credential-safe cause category and
+means the data request was not sent. HTTP discovery refusals retain their status.
+
 ## HTTP errors
 
 | Status | Meaning | Usual action |
@@ -23,9 +31,9 @@ Do not parse human-readable error text when a structured field is present.
 | 413 | Request or operation exceeded a bounded resource limit | Split or reduce the operation using the reported limit |
 | 416 | Blob byte range is outside the value | Use the returned length to choose a valid range |
 | 424 | An allowed external Blob source could not be read | Restore source availability or correct its URI/credentials |
-| 429 | Per-actor admission limit reached | Honor `Retry-After` and retry later |
+| 429 | Server or per-actor admission limit reached | Use the whole-command outcome below before retrying; preserve `Retry-After` |
 | 500 | Server or stored-data integrity failure | Check server logs; do not assume partial success |
-| 503 | A schema change was published but its schema files were not installed | Reopen read-write or restart the server, then retry |
+| 503 | Admission is closed, or a published schema change requires completion | Inspect the structured error; generic 503 is not permission to repeat a write |
 
 A graph-head `412` includes `precondition_failure` with `expected` and, when
 available, `actual`. A change-feed `410` includes `change_feed_gap`; retrying
@@ -37,12 +45,40 @@ refusal or `stage` (and `expression` when known) for a later one, `expected`,
 and `fix` when one exists. Act on the fix; a retry of the same source fails
 the same way. See [Diagnostics](../queries/diagnostics.md).
 
+## Failed data-write commands
+
+CLI data-write failures preserve structured details and add `command_outcome`:
+`execution` is `not_started` or `unknown`, `effects` is `none` or `unknown`, and
+`action` is `retry`, `refresh`, `recover` or `reconcile`. JSON mode writes these
+fields to stdout; human mode prints the action on stderr. HTTP failures also
+retain `http_status` and, when present, the original `retry_after` string.
+
+| CLI exit | What to do |
+|---:|---|
+| 0 | The operation succeeded or was a no-op. A merge can separately report a source-deletion failure without losing its successful result. |
+| 4 | The server verified the requested write precondition failed with no earlier command effects. Re-read the branch and choose a new precondition deliberately. |
+| 75 | The server's typed admission refusal proves this whole command did not start. Honor `Retry-After` and bound any caller retry. |
+| 1 | Inspect the action and details. A conflict, resource limit, unavailable server, incomplete response or lost connection does not by itself permit repeating the write. |
+
+`refresh` means inspect current inputs and correct the command; it does not grant
+automatic replay. `recover` means finish the reported recovery obligation.
+`reconcile` means establish the original operation's outcome before another
+attempt. Only `retry` with exit 75 grants the bounded retry described above; the
+CLI performs no automatic retry.
+
+The outcome covers the entire command. A later refused subrequest cannot undo
+an earlier branch creation, load or publication. Embedded load conflicts and
+conditional mismatches remain exit 1: writable open can complete earlier work.
+Disconnecting an admitted HTTP write does not cancel it: the server keeps
+running the original operation, and a lost response can leave the caller's
+outcome unknown. There is no durable request-result lookup in this release.
+
 ## Conflicts
 
 A `409` is not one universal retry signal:
 
-- A read-set or version conflict means another writer changed an input. Start
-  the operation again from a fresh read.
+- A read-set or version conflict means another writer changed an input. Inspect
+  the whole-command outcome and re-read before deciding on a new operation.
 - A key conflict means strict insertion found an existing ID. Change the ID or
   use merge/upsert semantics; repeating the strict insert is not useful.
 - A merge conflict requires an explicit resolution on one branch before
