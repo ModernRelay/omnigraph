@@ -214,3 +214,6 @@ pub(crate) fn accept(
         },
     })
 }
+
+#[cfg(test)]
+mod tests;

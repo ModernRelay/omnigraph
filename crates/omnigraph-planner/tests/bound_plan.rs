@@ -10,8 +10,8 @@ use omnigraph_compiler::SYSTEM_COLUMNS_V3;
 use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
 use omnigraph_compiler::query::ast::{CompOp, Literal};
 use omnigraph_planner::{
-    BoundPlan, Bounds, MemorySource, NodeTypeSpec, PhysicalNode, PhysicalPlan, RankKind, RankScope,
-    TableRef, ValueTable, plan_query,
+    BOUND_PLAN_VERSION, BoundPlan, Bounds, MemorySource, NodeTypeSpec, PhysicalNode, PhysicalPlan,
+    RankKind, RankScope, TableRef, ValueTable, plan_query,
 };
 
 #[path = "support/bounds.rs"]
@@ -101,7 +101,7 @@ fn saved_plan_version_refuses_both_legacy_and_future_readers() {
         values: Default::default(),
     };
     let encoded = serde_json::to_value(&bound).unwrap();
-    assert_eq!(encoded["bound_plan_version"], 1);
+    assert_eq!(encoded["bound_plan_version"], BOUND_PLAN_VERSION);
     assert!(encoded.get("plan").is_none());
     assert!(encoded["body"]["plan"].is_object());
     assert_eq!(round_trip(&bound), bound);
@@ -109,15 +109,17 @@ fn saved_plan_version_refuses_both_legacy_and_future_readers() {
     let legacy = encoded["body"].clone();
     let error = serde_json::from_value::<BoundPlan>(legacy).unwrap_err();
     assert!(error.to_string().contains("regenerate"), "{error}");
-    let mut future = encoded.clone();
-    future["bound_plan_version"] = serde_json::json!(2);
-    let error = serde_json::from_value::<BoundPlan>(future).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("unsupported bound plan version 2"),
-        "{error}"
-    );
+    for version in [BOUND_PLAN_VERSION - 1, BOUND_PLAN_VERSION + 1] {
+        let mut other = encoded.clone();
+        other["bound_plan_version"] = serde_json::json!(version);
+        let error = serde_json::from_value::<BoundPlan>(other).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("unsupported bound plan version {version}")),
+            "{error}"
+        );
+    }
 
     #[derive(serde::Deserialize)]
     #[allow(dead_code)]

@@ -58,9 +58,9 @@ pub use lower::{
 pub use operation::{Operation, PageBudgetSpec, ScopeSpec, Side, TableRef};
 pub use optimizer::{Bounds, physical_plan, rewrite};
 pub use physical::{
-    Assumptions, DatasetPin, Estimate, GatePolicy, Hop, NodeId, OverfetchRung, PhysicalNode,
-    PhysicalPlan, Prefilter, PrefilterMode, Properties, RankArm, RankKind, RankScope, RankedAccess,
-    ScanInput, StatisticSource,
+    Assumptions, DatasetPin, Estimate, GatePolicy, Hop, NodeId, OrderKey, OverfetchRung,
+    PhysicalNode, PhysicalPlan, Prefilter, PrefilterMode, Properties, RankArm, RankKind, RankScope,
+    RankedAccess, ScanInput, StatisticSource,
 };
 pub use registry::{Coverage, Entry, Route, Shape};
 pub use route::RouteOverride;

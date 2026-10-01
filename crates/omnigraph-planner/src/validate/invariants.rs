@@ -23,7 +23,7 @@ use super::requirements::{
 use super::{AcceptInput, ValidationError};
 use crate::logical::{ColumnRef, EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
 use crate::lower::ContainsJoinFields;
-use crate::optimizer::RRF_NEAREST_ARM_K;
+use crate::optimizer::{RRF_NEAREST_ARM_K, derived_order};
 use crate::physical::{
     NodeId, OverfetchRung, PhysicalNode, PhysicalPlan, RankKind, RankScope, RankedAccess,
 };
@@ -631,6 +631,13 @@ impl Requirements {
         else {
             unreachable!("the loop stops at a sort");
         };
+        budget.visit(u64::try_from(top.len()).unwrap_or(u64::MAX))?;
+        if derived_order(plan, plan.root()) != derived_order(plan, id) {
+            return Err(ValidationError::violated(
+                "order",
+                "the plan's root does not leave its rows in the final sort's order",
+            ));
+        }
         let expected_fetch = self.limit.and_then(|limit| usize::try_from(limit).ok());
         if *fetch != expected_fetch {
             return Err(ValidationError::violated(

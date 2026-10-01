@@ -277,7 +277,8 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
     assert_eq!(sort["fetch"], 10);
     assert_eq!(
         sort["properties"]["ordering"],
-        serde_json::json!(["$c._distance asc", "$c.rank desc"])
+        serde_json::json!(["$c._distance asc", "$c.rank desc", "$c.@id asc"]),
+        "a sort's output order is its whole comparator, identity keys included"
     );
     assert!(sort["properties"].get("schema").is_none());
     let projection = &sort["inputs"][0];

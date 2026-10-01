@@ -357,13 +357,65 @@ pub struct StatisticSource {
     pub origin: &'static str,
 }
 
+/// One key of the order a node's output leaves in, typed: the comparator a
+/// sort establishes, the score order a ranking scan produces, or the logical
+/// id order of a diff or merge plan.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderKey {
+    /// A diff or merge plan's logical column, ascending.
+    Column(String),
+    /// An expression with its direction and null placement.
+    Expr {
+        expr: IRExpr,
+        descending: bool,
+        nulls_first: bool,
+    },
+    /// A binding's identity metadata key (`@id`, or `@type` of a selected
+    /// edge): ascending, nulls first.
+    Identity(ColumnRef),
+    /// The fused reciprocal rank of an `rrf()` over its arms' bindings,
+    /// descending.
+    Fused { bindings: Vec<String> },
+}
+
+impl OrderKey {
+    /// A written or score sort key: ascending keys place nulls first,
+    /// descending keys nulls last (RFC 0047, "One total order").
+    pub fn of(ordering: &IROrdering) -> Self {
+        Self::Expr {
+            expr: ordering.expr.clone(),
+            descending: ordering.descending,
+            nulls_first: !ordering.descending,
+        }
+    }
+}
+
+impl std::fmt::Display for OrderKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Column(column) => f.write_str(column),
+            Self::Expr {
+                expr, descending, ..
+            } => write!(f, "{expr} {}", if *descending { "desc" } else { "asc" }),
+            Self::Identity(column) => write!(f, "${column} asc"),
+            Self::Fused { bindings } => {
+                let targets: Vec<String> = bindings
+                    .iter()
+                    .map(|binding| format!("${binding}"))
+                    .collect();
+                write!(f, "rrf({}) desc", targets.join(", "))
+            }
+        }
+    }
+}
+
 /// The properties a physical node declares: derived after selection,
 /// recomputed when a later pass changes the node, never recomputed by an
 /// executor. Each is a bound the executor adapts within, never above.
 #[derive(Debug, Clone)]
 pub struct Properties {
     pub schema: SchemaRef,
-    pub ordering: Option<Vec<String>>,
+    pub ordering: Option<Vec<OrderKey>>,
     pub rows: Estimate,
     pub work_bytes: Estimate,
     pub retained_limit: Option<u64>,
@@ -374,8 +426,12 @@ impl Properties {
     /// A query plan prints no `schema`: its run-time schemas are the
     /// engine's to derive, and the planner's are conservative input schemas.
     fn to_json(&self, query: bool) -> Value {
+        let ordering: Option<Vec<String>> = self
+            .ordering
+            .as_ref()
+            .map(|keys| keys.iter().map(ToString::to_string).collect());
         let mut value = json!({
-            "ordering": self.ordering,
+            "ordering": ordering,
             "rows": self.rows,
             "work_bytes": self.work_bytes,
             "retained_limit": self.retained_limit,

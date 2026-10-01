@@ -23,8 +23,8 @@ use crate::error::PlanError;
 use crate::logical::{ColumnRef, GqFilter, KeyJoinKind, Predicate, RuntimeFilterSpec, ScanSpec};
 use crate::operation::TableRef;
 use crate::physical::{
-    Assumptions, Estimate, Hop, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter,
-    Properties, RankArm, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
+    Assumptions, Estimate, Hop, NodeId, OrderKey, OverfetchRung, PhysicalNode, PhysicalPlan,
+    Prefilter, Properties, RankArm, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
 };
 use crate::source::SideId;
 
@@ -1437,12 +1437,74 @@ impl From<OrderingMirror> for IROrdering {
     }
 }
 
+/// One typed order key of a node's declared output order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "key", rename_all = "snake_case")]
+pub enum OrderKeyMirror {
+    Column {
+        name: String,
+    },
+    Expr {
+        expr: ExprMirror,
+        descending: bool,
+        nulls_first: bool,
+    },
+    Identity {
+        column: ColumnRef,
+    },
+    Fused {
+        bindings: Vec<String>,
+    },
+}
+
+impl From<&OrderKey> for OrderKeyMirror {
+    fn from(key: &OrderKey) -> Self {
+        match key {
+            OrderKey::Column(name) => Self::Column { name: name.clone() },
+            OrderKey::Expr {
+                expr,
+                descending,
+                nulls_first,
+            } => Self::Expr {
+                expr: ExprMirror::from(expr),
+                descending: *descending,
+                nulls_first: *nulls_first,
+            },
+            OrderKey::Identity(column) => Self::Identity {
+                column: column.clone(),
+            },
+            OrderKey::Fused { bindings } => Self::Fused {
+                bindings: bindings.clone(),
+            },
+        }
+    }
+}
+
+impl From<OrderKeyMirror> for OrderKey {
+    fn from(mirror: OrderKeyMirror) -> Self {
+        match mirror {
+            OrderKeyMirror::Column { name } => Self::Column(name),
+            OrderKeyMirror::Expr {
+                expr,
+                descending,
+                nulls_first,
+            } => Self::Expr {
+                expr: IRExpr::from(expr),
+                descending,
+                nulls_first,
+            },
+            OrderKeyMirror::Identity { column } => Self::Identity(column),
+            OrderKeyMirror::Fused { bindings } => Self::Fused { bindings },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PropertiesMirror {
     pub schema: Vec<FieldMirror>,
     #[serde(default)]
     pub schema_metadata: HashMap<String, String>,
-    pub ordering: Option<Vec<String>>,
+    pub ordering: Option<Vec<OrderKeyMirror>>,
     pub rows: Estimate,
     pub work_bytes: Estimate,
     pub retained_limit: Option<u64>,
@@ -1459,7 +1521,10 @@ impl From<&Properties> for PropertiesMirror {
                 .map(|field| FieldMirror::from(field.as_ref()))
                 .collect(),
             schema_metadata: properties.schema.metadata().clone(),
-            ordering: properties.ordering.clone(),
+            ordering: properties
+                .ordering
+                .as_ref()
+                .map(|keys| keys.iter().map(OrderKeyMirror::from).collect()),
             rows: properties.rows,
             work_bytes: properties.work_bytes,
             retained_limit: properties.retained_limit,
@@ -1484,7 +1549,9 @@ impl TryFrom<PropertiesMirror> for Properties {
         let schema: SchemaRef = Arc::new(Schema::new_with_metadata(fields, mirror.schema_metadata));
         Ok(Self {
             schema,
-            ordering: mirror.ordering,
+            ordering: mirror
+                .ordering
+                .map(|keys| keys.into_iter().map(OrderKey::from).collect()),
             rows: mirror.rows,
             work_bytes: mirror.work_bytes,
             retained_limit: mirror.retained_limit,

@@ -22,13 +22,13 @@ use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::logical::{
     ColumnRef, EDGE_TYPE_MEMBER, GqFilter, IDENTITY_MEMBER, KeyJoinKind, LOGICAL_ID, LogicalId,
     LogicalNode, LogicalPlan, Predicate, RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, SearchArm,
-    ordering_text, tiebreak_text,
+    tiebreak_text,
 };
 use crate::lower::ContainsJoinFields;
 use crate::operation::{Operation, Side};
 use crate::physical::{
-    Assumptions, Estimate, Hop, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter,
-    Properties, RankArm, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
+    Assumptions, Estimate, Hop, NodeId, OrderKey, OverfetchRung, PhysicalNode, PhysicalPlan,
+    Prefilter, Properties, RankArm, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
     TextContains,
 };
 use crate::source::{NodeTypeSpec, PlanSource, SideId};
@@ -2612,8 +2612,9 @@ impl Lowering<'_> {
             }
             LogicalNode::Ordered { input, keys } => {
                 let lowered = self.lower(*input)?;
-                let declared = declared_ordering(&self.physical, lowered).unwrap_or_default();
-                if declared.starts_with(keys) {
+                let declared = derived_order(&self.physical, lowered).unwrap_or_default();
+                let wanted: Vec<OrderKey> = keys.iter().cloned().map(OrderKey::Column).collect();
+                if declared.starts_with(&wanted) {
                     Ok(lowered)
                 } else {
                     Err(PlanError::Internal(format!(
@@ -3071,81 +3072,73 @@ fn variable_offset_width(data_type: &DataType) -> u64 {
 /// no limit.
 pub(crate) const RRF_NEAREST_ARM_K: usize = 100;
 
-/// The ordering a ranked scan or a fusion carries: `nearest` ranks by
-/// ascending `_distance`, `bm25` by descending `_score`, `rrf` by the fused rank.
-fn search_ordering(node: &PhysicalNode) -> Option<Vec<String>> {
+/// The order a node's output leaves in, from the operator's definition and
+/// its inputs' orders (`input`): a ranking scan leaves in score order
+/// (`nearest` ascending `_distance`, `bm25` descending `_score`), a fusion in
+/// fused rank, an id-ordered scan or a key merge in its key's order, a sort
+/// in exactly its comparator (its keys, then its identity keys), and an
+/// order-preserving operator (a dependent scan, a hash join's probe, a
+/// filter, a projection, a limit, a page, a hydration, a row compare) in its
+/// input's order; every other operator declares none.
+pub fn node_order(
+    node: &PhysicalNode,
+    input: impl Fn(NodeId) -> Option<Vec<OrderKey>>,
+) -> Option<Vec<OrderKey>> {
     match node {
         PhysicalNode::Scan {
+            source: ScanInput::Dependent { input: probe, .. },
+            ..
+        } => input(*probe),
+        PhysicalNode::Scan {
+            source: ScanInput::Table,
             spec,
             ranked: Some(ranked),
             ..
-        } => {
-            let binding = spec.binding.as_deref()?;
-            Some(vec![ordering_text(&ranked.ordering(binding))])
-        }
-        PhysicalNode::RankFuse { arms, .. } => {
-            let targets: Vec<String> = arms.iter().map(|arm| format!("${}", arm.binding)).collect();
-            Some(vec![format!("rrf({}) desc", targets.join(", "))])
-        }
-        _ => None,
-    }
-}
-
-/// `keys` appended to `input`'s ordering, each key once: a sort's ordering
-/// is its keys, and a ranked input's score key leads them already.
-fn sorted_ordering(input: Option<Vec<String>>, keys: &[IROrdering]) -> Vec<String> {
-    let mut ordering = input.unwrap_or_default();
-    for key in keys.iter().map(ordering_text) {
-        if !ordering.contains(&key) {
-            ordering.push(key);
-        }
-    }
-    ordering
-}
-
-/// The ordering a node declares by construction, in logical column names.
-pub fn declared_ordering(plan: &PhysicalPlan, id: NodeId) -> Option<Vec<String>> {
-    match plan.node(id)? {
-        PhysicalNode::Scan {
-            source: ScanInput::Dependent { input, .. },
-            ..
-        } => declared_ordering(plan, *input),
-        node @ PhysicalNode::Scan {
-            source: ScanInput::Table,
-            ranked: Some(_),
-            ..
-        } => search_ordering(node),
+        } => Some(vec![OrderKey::of(
+            &ranked.ordering(spec.binding.as_deref()?),
+        )]),
         PhysicalNode::Scan {
             source: ScanInput::Table,
-            ordered: true,
+            ordered,
             ..
-        } => Some(vec![LOGICAL_ID.to_string()]),
-        PhysicalNode::Scan {
-            source: ScanInput::Table,
-            ordered: false,
-            ..
-        } => None,
-        PhysicalNode::SortMergeJoin { on, .. } => Some(vec![on.clone()]),
-        PhysicalNode::HashJoin { probe, .. } => declared_ordering(plan, *probe),
-        PhysicalNode::HydrateByAddress { input, .. }
-        | PhysicalNode::RowCompare { input, .. }
-        | PhysicalNode::ClassifyThreeWay { input }
-        | PhysicalNode::Page { input, .. }
-        | PhysicalNode::Limit { input, .. }
-        | PhysicalNode::Projection { input, .. } => declared_ordering(plan, *input),
-        node @ PhysicalNode::RankFuse { .. } => search_ordering(node),
+        } => ordered.then(|| vec![OrderKey::Column(LOGICAL_ID.to_string())]),
+        PhysicalNode::SortMergeJoin { on, .. } => Some(vec![OrderKey::Column(on.clone())]),
+        PhysicalNode::ClassifyThreeWay { .. } => {
+            Some(vec![OrderKey::Column(LOGICAL_ID.to_string())])
+        }
+        PhysicalNode::HashJoin { probe, .. } => input(*probe),
+        PhysicalNode::HydrateByAddress { input: from, .. }
+        | PhysicalNode::RowCompare { input: from }
+        | PhysicalNode::Page { input: from, .. }
+        | PhysicalNode::Limit { input: from, .. }
+        | PhysicalNode::Filter { input: from, .. }
+        | PhysicalNode::Projection { input: from, .. } => input(*from),
+        PhysicalNode::RankFuse { arms, .. } => Some(vec![OrderKey::Fused {
+            bindings: arms.iter().map(|arm| arm.binding.clone()).collect(),
+        }]),
         PhysicalNode::Sort {
-            input, order_by, ..
-        } => Some(sorted_ordering(declared_ordering(plan, *input), order_by)),
+            order_by, tiebreak, ..
+        } => Some(
+            order_by
+                .iter()
+                .map(OrderKey::of)
+                .chain(tiebreak.iter().cloned().map(OrderKey::Identity))
+                .collect(),
+        ),
         PhysicalNode::MetadataCount { .. }
         | PhysicalNode::CrossJoin { .. }
         | PhysicalNode::ContainsJoin { .. }
         | PhysicalNode::OuterReference { .. }
-        | PhysicalNode::Filter { .. }
         | PhysicalNode::Expand { .. }
         | PhysicalNode::AntiJoin { .. }
         | PhysicalNode::Aggregate { .. } => None,
     }
+}
+
+/// [`node_order`] of `id`, recomputed from the operators of its subtree and
+/// never read from declared properties.
+pub fn derived_order(plan: &PhysicalPlan, id: NodeId) -> Option<Vec<OrderKey>> {
+    node_order(plan.node(id)?, |input| derived_order(plan, input))
 }
 
 /// Stage 3. Bottom-up: output schema, ordering, row estimate, estimated work
@@ -3161,10 +3154,14 @@ fn derive_properties(
             .node(id)
             .cloned()
             .ok_or_else(|| PlanError::Internal(format!("physical node {id} is a tombstone")))?;
+        let ordering = node_order(&node, |input| {
+            plan.properties(input)
+                .and_then(|properties| properties.ordering.clone())
+        });
         let properties = match &node {
             PhysicalNode::MetadataCount { return_exprs, .. } => Properties {
                 schema: metadata_count_schema(return_exprs)?,
-                ordering: None,
+                ordering: ordering.clone(),
                 rows: Estimate::Known(1),
                 work_bytes: Estimate::Unknown,
                 retained_limit: None,
@@ -3178,7 +3175,7 @@ fn derive_properties(
                 let input = props(plan, *input)?;
                 Properties {
                     schema: input.schema.clone(),
-                    ordering: input.ordering.clone(),
+                    ordering: ordering.clone(),
                     rows: Estimate::Unknown,
                     work_bytes: Estimate::Unknown,
                     retained_limit: None,
@@ -3188,7 +3185,6 @@ fn derive_properties(
             PhysicalNode::Scan {
                 source: ScanInput::Table,
                 spec,
-                ordered,
                 keys_only: true,
                 ..
             } => {
@@ -3206,7 +3202,7 @@ fn derive_properties(
                 });
                 Properties {
                     schema: key_schema(spec),
-                    ordering: ordered.then(|| vec![LOGICAL_ID.to_string()]),
+                    ordering: ordering.clone(),
                     rows,
                     work_bytes,
                     retained_limit: None,
@@ -3216,9 +3212,9 @@ fn derive_properties(
             PhysicalNode::Scan {
                 source: ScanInput::Table,
                 spec,
-                ordered,
                 keys_only: false,
                 ranked,
+                ..
             } => {
                 let (rows, sources) = if spec.binding.is_some() {
                     query_scan_rows(spec, source)
@@ -3243,8 +3239,7 @@ fn derive_properties(
                 };
                 Properties {
                     schema,
-                    ordering: search_ordering(&node)
-                        .or_else(|| ordered.then(|| vec![LOGICAL_ID.to_string()])),
+                    ordering: ordering.clone(),
                     rows,
                     work_bytes: Estimate::Unknown,
                     retained_limit: None,
@@ -3255,7 +3250,6 @@ fn derive_properties(
                 left,
                 right,
                 kind,
-                on,
                 build,
                 ..
             } => {
@@ -3294,7 +3288,7 @@ fn derive_properties(
                         &right_props.schema,
                         physical_prefix(plan, *right),
                     ),
-                    ordering: Some(vec![on.clone()]),
+                    ordering: ordering.clone(),
                     rows,
                     work_bytes: sum_estimates(left_props.work_bytes, right_props.work_bytes),
                     retained_limit,
@@ -3306,7 +3300,7 @@ fn derive_properties(
                 let schema = expand_side(&input_props.schema, *side, &source.schema(*side)?);
                 Properties {
                     schema,
-                    ordering: input_props.ordering.clone(),
+                    ordering: ordering.clone(),
                     rows: input_props.rows,
                     work_bytes: Estimate::Unknown,
                     retained_limit: Some(bounds.hydration_chunk_hard_bytes),
@@ -3321,7 +3315,7 @@ fn derive_properties(
                 let input = props(plan, *input)?;
                 Properties {
                     schema: diff_schema(&input.schema),
-                    ordering: input.ordering.clone(),
+                    ordering: ordering.clone(),
                     rows: input.rows,
                     work_bytes: input.work_bytes,
                     retained_limit: None,
@@ -3332,7 +3326,7 @@ fn derive_properties(
                 let input = props(plan, *input)?;
                 Properties {
                     schema: classify_schema(&source.schema(SideId::Base)?),
-                    ordering: Some(vec![LOGICAL_ID.to_string()]),
+                    ordering: ordering.clone(),
                     rows: input.rows,
                     work_bytes: input.work_bytes,
                     retained_limit: None,
@@ -3348,7 +3342,7 @@ fn derive_properties(
                 };
                 Properties {
                     schema: input.schema.clone(),
-                    ordering: input.ordering.clone(),
+                    ordering: ordering.clone(),
                     rows: bounded,
                     work_bytes: input.work_bytes,
                     retained_limit: None,
@@ -3375,7 +3369,7 @@ fn derive_properties(
                         &right_props.schema,
                         physical_prefix(plan, *right),
                     ),
-                    ordering: None,
+                    ordering: ordering.clone(),
                     rows,
                     work_bytes: Estimate::Unknown,
                     retained_limit: None,
@@ -3392,7 +3386,7 @@ fn derive_properties(
                         &right_props.schema,
                         physical_prefix(plan, *right),
                     ),
-                    ordering: None,
+                    ordering: ordering.clone(),
                     rows: Estimate::Unknown,
                     work_bytes: Estimate::Unknown,
                     retained_limit: None,
@@ -3401,19 +3395,17 @@ fn derive_properties(
             }
             PhysicalNode::OuterReference { .. } => Properties {
                 schema: Arc::new(Schema::empty()),
-                ordering: None,
+                ordering: ordering.clone(),
                 rows: Estimate::Unknown,
                 work_bytes: Estimate::Unknown,
                 retained_limit: None,
                 sources: Vec::new(),
             },
-            PhysicalNode::Sort {
-                input, order_by, ..
-            } => {
+            PhysicalNode::Sort { input, .. } => {
                 let input = props(plan, *input)?;
                 Properties {
                     schema: input.schema.clone(),
-                    ordering: Some(sorted_ordering(input.ordering.clone(), order_by)),
+                    ordering: ordering.clone(),
                     rows: input.rows,
                     work_bytes: Estimate::Unknown,
                     retained_limit: None,
@@ -3427,7 +3419,7 @@ fn derive_properties(
                 let input = props(plan, *input)?;
                 Properties {
                     schema: input.schema.clone(),
-                    ordering: None,
+                    ordering: ordering.clone(),
                     rows: Estimate::Unknown,
                     work_bytes: Estimate::Unknown,
                     retained_limit: None,
@@ -3438,7 +3430,7 @@ fn derive_properties(
                 let input = props(plan, *input)?;
                 Properties {
                     schema: input.schema.clone(),
-                    ordering: input.ordering.clone(),
+                    ordering: ordering.clone(),
                     rows: input.rows,
                     work_bytes: Estimate::Unknown,
                     retained_limit: None,
@@ -3455,7 +3447,7 @@ fn derive_properties(
                 };
                 Properties {
                     schema: input.schema.clone(),
-                    ordering: search_ordering(&node),
+                    ordering: ordering.clone(),
                     rows,
                     work_bytes: Estimate::Unknown,
                     retained_limit: None,
@@ -3725,7 +3717,10 @@ mod tests {
             .properties(optimized.physical.root())
             .expect("root props");
         assert_eq!(root.rows, Estimate::Known(1));
-        assert_eq!(root.ordering.as_deref(), Some(&["id".to_string()][..]));
+        assert_eq!(
+            root.ordering.as_deref(),
+            Some(&[OrderKey::Column("id".to_string())][..])
+        );
         let pipelines = optimized.physical.pipelines_json();
         assert_eq!(pipelines.as_array().map(Vec::len), Some(2));
         assert_eq!(pipelines[0]["sink"], "SortMergeJoin(build)");
@@ -3918,7 +3913,10 @@ mod tests {
                 .properties(optimized.physical.root())
                 .expect("root props");
             assert_eq!(root.rows, Estimate::Known(15));
-            assert_eq!(root.ordering.as_deref(), Some(&["id".to_string()][..]));
+            assert_eq!(
+                root.ordering.as_deref(),
+                Some(&[OrderKey::Column("id".to_string())][..])
+            );
             let names: Vec<&str> = root
                 .schema
                 .fields()
