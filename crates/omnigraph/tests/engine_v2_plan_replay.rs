@@ -1308,3 +1308,61 @@ async fn sibling_detached_edge_pins_refuse_traversal_plan_replay() {
     )
     .await;
 }
+
+/// A member of the exact fragment replays with its checked derivation; an
+/// envelope whose derivation was dropped or edited is refused as invalid
+/// evidence, before anything runs.
+#[tokio::test]
+async fn an_exact_subset_member_replays_only_with_its_derivation() {
+    const SOURCE: &str = r#"query elders($min: I64) {
+    match { $p: Person $p.age >= $min }
+    return { $p.name, $p.age as age }
+    order { $p.age desc }
+    limit 2
+}"#;
+    let dir = tempfile::tempdir().unwrap();
+    let db = people(&dir).await;
+    let params = ParamMap::from([("min".to_string(), Literal::Integer(30))]);
+    let run = db
+        .query_inspected(ReadTarget::branch("main"), SOURCE, "elders", &params)
+        .await
+        .unwrap();
+    assert_eq!(
+        run.evidence.scope(),
+        omnigraph_planner::ValidationScope::ExactSubset
+    );
+    let envelope = run.replay_envelope(SOURCE, "elders");
+    let replay = db
+        .replay_bound_plan(ReadTarget::branch("main"), &envelope)
+        .await
+        .unwrap();
+    assert_eq!(rows_of(&replay.result), rows_of(&run.result));
+    assert_eq!(
+        replay.evidence.scope(),
+        omnigraph_planner::ValidationScope::ExactSubset
+    );
+    let saved: Value = serde_json::from_slice(&envelope).unwrap();
+    let mut dropped = saved.clone();
+    dropped.as_object_mut().unwrap().remove("derivation");
+    let mut edited = saved.clone();
+    edited["derivation"]["steps"]
+        .as_array_mut()
+        .unwrap()
+        .remove(0);
+    for (case, altered) in [("dropped", dropped), ("edited", edited)] {
+        let error = db
+            .replay_bound_plan(
+                ReadTarget::branch("main"),
+                &serde_json::to_vec(&altered).unwrap(),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{case}: the replay must be refused"));
+        assert!(
+            matches!(&error, OmniError::Manifest(manifest)
+                if manifest.kind == omnigraph::error::ManifestErrorKind::BadRequest)
+                && error.to_string().contains("exact subset"),
+            "{case}: {error}"
+        );
+    }
+}

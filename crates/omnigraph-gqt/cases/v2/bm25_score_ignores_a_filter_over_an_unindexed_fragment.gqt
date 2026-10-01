@@ -40,7 +40,7 @@ score: F32
 
 --- expect plan
 scan Doc as $d: ranked bm25 eligibility before_scoring
-validation scope invariants_only
+validation scope exact_subset
 
 --- mutate
 query tail() {
@@ -84,4 +84,4 @@ score: F32
 
 --- expect plan
 scan Doc as $d: ranked bm25 eligibility after_scoring
-validation scope invariants_only
+validation scope exact_subset

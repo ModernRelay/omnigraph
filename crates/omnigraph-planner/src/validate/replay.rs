@@ -12,9 +12,10 @@ use omnigraph_compiler::catalog::Catalog;
 use serde::{Deserialize, Serialize};
 
 use super::budget::Budget;
-use super::requirements::Requirements;
+use super::subset::Derivation;
 use super::{
     AcceptInput, AcceptedBoundPlan, Evidence, ValidationError, ValidationLimits, ValidationScope,
+    check,
 };
 use crate::bound::BoundPlan;
 
@@ -52,6 +53,9 @@ pub struct ReplayEnvelope {
     /// different schema is refused as incompatible facts.
     pub catalog: Option<String>,
     pub plan: BoundPlan,
+    /// The checked derivation of a member of the exact fragment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derivation: Option<Derivation>,
 }
 
 /// The versions of an envelope, read before anything else is decoded.
@@ -83,6 +87,7 @@ impl ReplayEnvelope {
             scope: evidence.scope(),
             catalog,
             plan,
+            derivation: evidence.derivation().cloned(),
         }
     }
 
@@ -185,9 +190,12 @@ pub fn accept_replay(
         });
     }
     let mut budget = Budget::new(input.limits);
-    let requirements = Requirements::derive(input, &mut budget)?;
-    requirements.check(&envelope.plan.plan, input, &mut budget)?;
-    let scope = ValidationScope::InvariantsOnly;
+    let (scope, derivation) = check(
+        &envelope.plan.plan,
+        input,
+        envelope.derivation.clone(),
+        &mut budget,
+    )?;
     if scope != envelope.scope {
         return Err(ReplayRefusal::InvalidEvidence {
             reason: format!(
@@ -202,6 +210,7 @@ pub fn accept_replay(
         evidence: Evidence {
             scope,
             limits: input.limits,
+            derivation,
         },
     })
 }

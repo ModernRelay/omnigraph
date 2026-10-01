@@ -32,6 +32,7 @@ use crate::physical::{
     StatisticSource, TextContains,
 };
 use crate::source::{FullTextCoverage, NodeTypeSpec, PlanSource, SideId};
+use crate::validate::subset::{Role, Rule, Tracer};
 
 pub const ROW_ID: &str = "_rowid";
 pub const ROW_ADDR: &str = "_rowaddr";
@@ -447,7 +448,7 @@ fn schema_of(plan: &LogicalPlan, id: LogicalId) -> Result<SchemaRef, PlanError> 
 }
 
 /// `filters` as one `Filter` node over `input`, its conjunct list in written
-/// order; `input` itself when there is none. Where each conjunct runs is the
+/// order, a repeated conjunct kept once; `input` itself when there is none. Where each conjunct runs is the
 /// placement pass's decision, not this builder's.
 fn filter_over(
     plan: &mut LogicalPlan,
@@ -455,11 +456,12 @@ fn filter_over(
     filters: &[IRExpr],
     schema: SchemaRef,
 ) -> LogicalId {
-    let conjuncts: Vec<IRExpr> = filters
-        .iter()
-        .cloned()
-        .flat_map(IRExpr::into_conjuncts)
-        .collect();
+    let mut conjuncts: Vec<IRExpr> = Vec::new();
+    for conjunct in filters.iter().cloned().flat_map(IRExpr::into_conjuncts) {
+        if !conjuncts.contains(&conjunct) {
+            conjuncts.push(conjunct);
+        }
+    }
     if conjuncts.is_empty() {
         input
     } else {
@@ -1023,10 +1025,19 @@ pub fn rewrite(
     plan: &mut LogicalPlan,
     source: &dyn PlanSource,
 ) -> Result<Vec<&'static str>, PlanError> {
+    rewrite_with(plan, source, &mut Tracer::default())
+}
+
+/// [`rewrite`], recording the rules it applies to an exact-fragment chain.
+pub(crate) fn rewrite_with(
+    plan: &mut LogicalPlan,
+    source: &dyn PlanSource,
+    tracer: &mut Tracer,
+) -> Result<Vec<&'static str>, PlanError> {
     let mut fired = vec![PASS_RESOLVE];
     let query = is_query_plan(plan);
     let pushed = if query {
-        place_query_filters(plan, source)
+        place_query_filters(plan, source, tracer)
     } else {
         resume_pushdown(plan)
     };
@@ -1036,7 +1047,7 @@ pub fn rewrite(
     if query && aggregate_pushdown(plan)? {
         fired.push(PASS_AGGREGATE_PUSHDOWN);
     }
-    if query && projection_pushdown(plan, source)? {
+    if query && projection_pushdown(plan, source, tracer)? {
         fired.push(PASS_PROJECTION_PUSHDOWN);
     }
     Ok(fired)
@@ -1058,7 +1069,19 @@ pub fn physical_plan(
     plan: &mut LogicalPlan,
     source: &dyn PlanSource,
     bounds: &Bounds,
+    fired: Vec<&'static str>,
+) -> Result<Optimized, PlanError> {
+    physical_plan_with(plan, source, bounds, fired, &mut Tracer::default())
+}
+
+/// [`physical_plan`], recording the rules it applies to an exact-fragment
+/// chain.
+pub(crate) fn physical_plan_with(
+    plan: &mut LogicalPlan,
+    source: &dyn PlanSource,
+    bounds: &Bounds,
     mut fired: Vec<&'static str>,
+    tracer: &mut Tracer,
 ) -> Result<Optimized, PlanError> {
     let query = is_query_plan(plan);
     let before = plan
@@ -1084,8 +1107,11 @@ pub fn physical_plan(
         decisions: Vec::new(),
         ranking: None,
         limit: None,
+        tracer: std::mem::take(tracer),
     };
-    let root = lowering.lower(plan.root())?;
+    let root = lowering.lower(plan.root());
+    *tracer = std::mem::take(&mut lowering.tracer);
+    let root = root?;
     let Lowering {
         mut physical,
         late_materialization,
@@ -1282,7 +1308,11 @@ fn and_filter(existing: Option<Predicate>, added: Predicate) -> Predicate {
 /// Stage 1, pass 2 on a query plan, per scope (the top-level tree and each
 /// `not { … }` inner tree): adjacent `Filter` nodes coalesce, each conjunct moves
 /// into its `placement_target` scan or onto its `join_target`, an emptied node goes.
-fn place_query_filters(plan: &mut LogicalPlan, source: &dyn PlanSource) -> bool {
+fn place_query_filters(
+    plan: &mut LogicalPlan,
+    source: &dyn PlanSource,
+    tracer: &mut Tracer,
+) -> bool {
     let mut fired = false;
     let mut scopes = vec![plan.root()];
     while let Some(root) = scopes.pop() {
@@ -1328,6 +1358,7 @@ fn place_query_filters(plan: &mut LogicalPlan, source: &dyn PlanSource) -> bool 
                 match target.and_then(|target| plan.node_mut(target)) {
                     Some(LogicalNode::TableScan { spec, .. }) => {
                         spec.filter = Some(and_filter(spec.filter.take(), gq_conjunct(&conjunct)));
+                        tracer.absorb(&conjunct);
                         fired = true;
                     }
                     _ => match join_target(plan, input, &conjunct) {
@@ -1643,7 +1674,11 @@ fn metadata_count_schema(return_exprs: &[IRProjection]) -> Result<SchemaRef, Pla
 /// Project independent and dependent query scans from binding demand; the id
 /// column is a demand like any other (`@id`, a whole entity, `identity_reads`).
 /// A diff or merge plan holds no `Projection` node and never reaches this pass.
-fn projection_pushdown(plan: &mut LogicalPlan, source: &dyn PlanSource) -> Result<bool, PlanError> {
+fn projection_pushdown(
+    plan: &mut LogicalPlan,
+    source: &dyn PlanSource,
+    tracer: &mut Tracer,
+) -> Result<bool, PlanError> {
     let scans = plan
         .live()
         .filter_map(|(id, node)| match node {
@@ -1701,6 +1736,13 @@ fn projection_pushdown(plan: &mut LogicalPlan, source: &dyn PlanSource) -> Resul
             })
             .map(str::to_string)
             .collect();
+        tracer.record(
+            &[Role::Scan],
+            Rule::PruneScanColumns {
+                columns: projection.clone(),
+            },
+            &[],
+        );
         match plan.node_mut(id) {
             Some(LogicalNode::TableScan { spec, .. }) => {
                 spec.projection = Some(projection);
@@ -1983,6 +2025,8 @@ struct Lowering<'a> {
     ranking: Option<Ranking>,
     /// The `limit` above the node being lowered: the fetch of the score sort.
     limit: Option<usize>,
+    /// The record of the rules lowering applies to an exact-fragment chain.
+    tracer: Tracer,
 }
 
 /// What a leading search function became in the physical plan: the score
@@ -2343,6 +2387,7 @@ impl Lowering<'_> {
                     ranked: None,
                 };
                 let Some(input) = input else {
+                    self.tracer.record(&[Role::Scan], Rule::Lower, &[]);
                     return Ok(self.physical.add(scan(ScanInput::Table)));
                 };
                 let access = self.access_path(*input, spec)?;
@@ -2378,6 +2423,7 @@ impl Lowering<'_> {
                 let Some(order_by) = self.sort_keys(lowered, order_by) else {
                     return Ok(lowered);
                 };
+                self.tracer.record(&[Role::Sort], Rule::Lower, &[]);
                 Ok(self.physical.add(PhysicalNode::Sort {
                     input: lowered,
                     order_by,
@@ -2403,6 +2449,7 @@ impl Lowering<'_> {
                     return self.filtered_cross_join(left_lowered, right_lowered, conjuncts);
                 }
                 let lowered = self.lower(*input)?;
+                self.tracer.record(&[Role::Filter], Rule::Lower, &[]);
                 Ok(self.physical.add(PhysicalNode::Filter {
                     input: lowered,
                     filters: conjuncts.clone(),
@@ -2414,6 +2461,7 @@ impl Lowering<'_> {
                 ..
             } => {
                 let lowered = self.lower(*input)?;
+                self.tracer.record(&[Role::Projection], Rule::Lower, &[]);
                 Ok(self.physical.add(PhysicalNode::Projection {
                     input: lowered,
                     return_exprs: return_exprs.clone(),
@@ -2552,7 +2600,19 @@ impl Lowering<'_> {
                     prefilter: None,
                     eligibility: Eligibility::BeforeScoring,
                 };
-                let (score, _) = self.rank(lowered, binding, access)?;
+                let (score, scan) = self.rank(lowered, binding, access)?;
+                if let Some(PhysicalNode::Scan {
+                    ranked: Some(ranked),
+                    ..
+                }) = self.physical.node(scan)
+                {
+                    let eligibility = ranked.eligibility;
+                    self.tracer.record(
+                        &[Role::Search, Role::Scan],
+                        Rule::RankBm25Scan { eligibility },
+                        &[Role::Search],
+                    );
+                }
                 self.ranking = Some(Ranking::Scores(vec![score]));
                 Ok(lowered)
             }
@@ -2644,6 +2704,7 @@ impl Lowering<'_> {
             LogicalNode::Limit { input, rows } => {
                 self.limit = Some(*rows);
                 let lowered = self.lower(*input)?;
+                self.tracer.record(&[Role::Limit], Rule::Lower, &[]);
                 Ok(self.physical.add(PhysicalNode::Limit {
                     input: lowered,
                     rows: *rows,

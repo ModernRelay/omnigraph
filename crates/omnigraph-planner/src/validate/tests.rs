@@ -103,11 +103,27 @@ impl Fixture {
         }
     }
 
+    fn traced(&self) -> crate::gate::Traced {
+        crate::gate::plan_traced(&self.ir, &self.source, &BOUNDS).expect("the query plans")
+    }
+
     fn plan(&self) -> PhysicalPlan {
-        crate::gate::plan_query(&self.ir, &self.source, &BOUNDS).expect("the query plans")
+        self.traced().optimized.physical
+    }
+
+    fn derivation(&self) -> Option<Derivation> {
+        self.traced().derivation
     }
 
     fn accept(&self, plan: PhysicalPlan) -> Result<AcceptedPlan, ValidationError> {
+        self.accept_with(plan, self.derivation())
+    }
+
+    fn accept_with(
+        &self,
+        plan: PhysicalPlan,
+        derivation: Option<Derivation>,
+    ) -> Result<AcceptedPlan, ValidationError> {
         let constants = Bound(&self.params);
         let input = AcceptInput {
             checked: &self.checked,
@@ -117,7 +133,7 @@ impl Fixture {
             constants: &constants,
             limits: ValidationLimits::DEFAULT,
         };
-        accept(plan, &input)
+        accept(plan, &input, derivation)
     }
 
     /// The check that refuses `plan`, which must be refused.
@@ -164,7 +180,127 @@ fn the_planned_plans_are_accepted() {
         let accepted = fixture
             .accept(fixture.plan())
             .expect("a planned plan is accepted");
-        assert_eq!(accepted.scope(), ValidationScope::InvariantsOnly);
+        assert_eq!(accepted.scope(), ValidationScope::ExactSubset);
+        assert!(accepted.evidence().derivation().is_some());
+    }
+    let outside = Fixture::new(
+        r#"query q() {
+    match { $d: Doc $d.title contains "graph" }
+    return { $d.slug }
+}"#,
+        &[],
+    );
+    let accepted = outside
+        .accept(outside.plan())
+        .expect("a planned plan is accepted");
+    assert_eq!(accepted.scope(), ValidationScope::InvariantsOnly);
+    assert!(accepted.evidence().derivation().is_none());
+}
+
+/// The rules each fixture's derivation applies, in order.
+fn rules(derivation: &Derivation) -> Vec<&'static str> {
+    derivation
+        .steps
+        .iter()
+        .map(|step| match step.rule {
+            Rule::AbsorbScanFilter { .. } => "absorb",
+            Rule::PruneScanColumns { .. } => "prune",
+            Rule::Lower => "lower",
+            Rule::RankBm25Scan { .. } => "rank",
+        })
+        .collect()
+}
+
+#[test]
+fn the_derivations_record_every_rule() {
+    assert_eq!(
+        rules(&filtered().derivation().unwrap()),
+        [
+            "absorb", "absorb", "prune", "lower", "lower", "lower", "lower"
+        ]
+    );
+    assert_eq!(
+        rules(&ranked().derivation().unwrap()),
+        [
+            "absorb", "prune", "lower", "rank", "lower", "lower", "lower"
+        ]
+    );
+}
+
+#[test]
+fn a_member_without_its_derivation_is_refused() {
+    let fixture = filtered();
+    let (check, detail) = match fixture.accept_with(fixture.plan(), None) {
+        Err(ValidationError::Violated { check, detail }) => (check, detail),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(check, "exact subset", "{detail}");
+}
+
+#[test]
+fn a_dropped_step_fails_the_reconstruction() {
+    let fixture = filtered();
+    let mut derivation = fixture.derivation().unwrap();
+    derivation.steps.remove(0);
+    let error = fixture
+        .accept_with(fixture.plan(), Some(derivation))
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            ValidationError::Violated {
+                check: "exact subset",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_scan_pruned_below_its_readers_is_refused() {
+    let fixture = filtered();
+    let plan = fixture.plan();
+    let mut derivation = fixture.derivation().unwrap();
+    for step in &mut derivation.steps {
+        if let Rule::PruneScanColumns { columns } = &mut step.rule {
+            columns.retain(|column| column != "year");
+        }
+    }
+    match fixture.accept_with(plan, Some(derivation)) {
+        Err(ValidationError::Violated { check, detail }) => {
+            assert_eq!(check, "exact subset");
+            assert!(detail.contains("drops `year`"), "{detail}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_bm25_rank_before_scoring_needs_full_coverage() {
+    let mut fixture = ranked();
+    fixture.source = std::mem::take(&mut fixture.source).with_full_text_coverage(
+        "node:Doc",
+        "title",
+        crate::source::FullTextCoverage::Full,
+    );
+    let traced = fixture.traced();
+    let accepted = fixture
+        .accept_with(traced.optimized.physical.clone(), traced.derivation.clone())
+        .expect("full coverage admits filtering before scoring");
+    assert_eq!(accepted.scope(), ValidationScope::ExactSubset);
+    let mut plan = traced.optimized.physical;
+    let mut assumptions = plan.assumptions().clone();
+    assumptions.full_text.insert(
+        crate::physical::Assumptions::full_text_key("node:Doc", "title"),
+        crate::source::FullTextCoverage::Partial,
+    );
+    plan.set_assumptions(assumptions);
+    match fixture.accept_with(plan, traced.derivation) {
+        Err(ValidationError::Violated { check, detail }) => {
+            assert_eq!(check, "prerequisite", "{detail}");
+        }
+        other => panic!("{other:?}"),
     }
 }
 
@@ -334,7 +470,7 @@ fn an_exhausted_budget_is_a_resource_outcome() {
         },
     };
     assert_eq!(
-        accept(fixture.plan(), &input).unwrap_err(),
+        accept(fixture.plan(), &input, fixture.derivation()).unwrap_err(),
         ValidationError::Exhausted {
             limit: "work",
             value: 3

@@ -16,6 +16,7 @@ mod budget;
 mod invariants;
 mod replay;
 mod requirements;
+pub(crate) mod subset;
 
 pub use budget::{Budget, ValidationLimits};
 pub use replay::{
@@ -23,6 +24,7 @@ pub use replay::{
     accept_replay, catalog_digest, decode_replay,
 };
 pub use requirements::{ConstantEvaluator, Requirements};
+pub use subset::{ChainNode, ChainRanking, Derivation, Rule, Step};
 
 use omnigraph_compiler::CheckedQuery;
 use omnigraph_compiler::catalog::Catalog;
@@ -116,13 +118,14 @@ pub struct AcceptInput<'a> {
     pub limits: ValidationLimits,
 }
 
-/// The internal record of one acceptance: its scope and the limits it ran
-/// under. Inspection and replay read it; ordinary responses carry only the
-/// scope.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The internal record of one acceptance: its scope, the limits it ran
+/// under and, for a member of the exact fragment, the checked derivation.
+/// Inspection and replay read it; ordinary responses carry only the scope.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Evidence {
     scope: ValidationScope,
     limits: ValidationLimits,
+    derivation: Option<Derivation>,
 }
 
 impl Evidence {
@@ -132,6 +135,10 @@ impl Evidence {
 
     pub fn limits(&self) -> ValidationLimits {
         self.limits
+    }
+
+    pub fn derivation(&self) -> Option<&Derivation> {
+        self.derivation.as_ref()
     }
 }
 
@@ -197,22 +204,49 @@ impl AcceptedBoundPlan {
     }
 }
 
-/// Validate `plan`, built for `input`, and wrap it. Every check reads the
-/// requirements the checked declaration states and the plan alone.
+/// Validate `plan`, built for `input` with the optimizer's `derivation`, and
+/// wrap it. Every check reads the requirements the checked declaration
+/// states, the plan, and for a member of the exact fragment the derivation.
 pub(crate) fn accept(
     plan: PhysicalPlan,
     input: &AcceptInput<'_>,
+    derivation: Option<Derivation>,
 ) -> Result<AcceptedPlan, ValidationError> {
     let mut budget = Budget::new(input.limits);
-    let requirements = Requirements::derive(input, &mut budget)?;
-    requirements.check(&plan, input, &mut budget)?;
+    let (scope, derivation) = check(&plan, input, derivation, &mut budget)?;
     Ok(AcceptedPlan {
         plan,
         evidence: Evidence {
-            scope: ValidationScope::InvariantsOnly,
+            scope,
             limits: input.limits,
+            derivation,
         },
     })
+}
+
+/// The checks of one acceptance, shared by fresh planning and replay: the
+/// invariants for every plan, and for a member of the exact fragment its
+/// derivation, which a member must carry.
+pub(crate) fn check(
+    plan: &PhysicalPlan,
+    input: &AcceptInput<'_>,
+    derivation: Option<Derivation>,
+    budget: &mut Budget,
+) -> Result<(ValidationScope, Option<Derivation>), ValidationError> {
+    let requirements = Requirements::derive(input, budget)?;
+    requirements.check(plan, input, budget)?;
+    let Some(member) = subset::membership(input) else {
+        return Ok((ValidationScope::InvariantsOnly, None));
+    };
+    let derivation = derivation.ok_or_else(|| {
+        ValidationError::violated(
+            "exact subset",
+            "the query is a member of the exact fragment; the plan carries no derivation",
+        )
+    })?;
+    budget.visit(u64::try_from(derivation.steps.len()).unwrap_or(u64::MAX))?;
+    subset::check(&derivation, plan, input, &requirements, &member, budget)?;
+    Ok((ValidationScope::ExactSubset, Some(derivation)))
 }
 
 #[cfg(test)]

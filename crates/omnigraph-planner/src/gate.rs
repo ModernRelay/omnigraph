@@ -15,7 +15,9 @@ use crate::error::PlanError;
 use crate::explain::{EntrySummary, Explain, OperationSummary};
 use crate::logical::{Census, LogicalPlan};
 use crate::operation::Operation;
-use crate::optimizer::{Bounds, Optimized, physical_plan, resolve, rewrite};
+use crate::optimizer::{
+    Bounds, Optimized, physical_plan, physical_plan_with, resolve, rewrite, rewrite_with,
+};
 use crate::physical::{Assumptions, DatasetPin, GatePolicy, NodeId, PhysicalNode, PhysicalPlan};
 use crate::registry::{Coverage, Entry, Route, coverage, lookup};
 use crate::route::RouteOverride;
@@ -23,6 +25,7 @@ use crate::source::{
     AdjacencyProof, EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics,
     FragmentStat, FullTextCoverage, NodeTypeSpec, PlanSource, SideId,
 };
+use crate::validate::subset::{Derivation, Tracer};
 use crate::validate::{self, AcceptInput, AcceptedPlan, ValidationError};
 
 /// A `PlanSource` that records what the planner read through it: the
@@ -374,22 +377,53 @@ pub fn accept_query_explained(
     Ok((accepted, explain))
 }
 
+/// One traced planning run of a read query: the rewritten logical plan, the
+/// optimized physical plan with its assumptions, the passes that fired, and
+/// the derivation the optimizer recorded for an exact-fragment chain.
+pub(crate) struct Traced {
+    pub logical: LogicalPlan,
+    pub optimized: Optimized,
+    pub fired: Vec<&'static str>,
+    pub derivation: Option<Derivation>,
+}
+
+pub(crate) fn plan_traced(
+    query: &QueryIR,
+    source: &dyn PlanSource,
+    bounds: &Bounds,
+) -> Result<Traced, Unrouted> {
+    let operation = Operation::Query(Box::new(query.clone()));
+    let recorded = Recorded::new(source, query.has_wildcard_traversal());
+    let mut logical = resolve(&operation, &recorded).map_err(Unrouted::of)?;
+    let mut tracer = Tracer::for_plan(&logical);
+    let fired = rewrite_with(&mut logical, &recorded, &mut tracer).map_err(Unrouted::of)?;
+    let mut optimized =
+        physical_plan_with(&mut logical, &recorded, bounds, fired.clone(), &mut tracer)
+            .map_err(Unrouted::of)?;
+    optimized
+        .physical
+        .set_assumptions(recorded.assumptions(bounds));
+    Ok(Traced {
+        logical,
+        optimized,
+        fired,
+        derivation: tracer.finish(),
+    })
+}
+
 fn plan_and_accept(
     input: &AcceptInput<'_>,
     source: &dyn PlanSource,
     bounds: &Bounds,
     explain: bool,
 ) -> Result<(AcceptedPlan, Option<Explain>), Unrouted> {
-    let query = input.ir;
-    let operation = Operation::Query(Box::new(query.clone()));
-    let recorded = Recorded::new(source, query.has_wildcard_traversal());
-    let mut logical = resolve(&operation, &recorded).map_err(Unrouted::of)?;
-    let fired = rewrite(&mut logical, &recorded).map_err(Unrouted::of)?;
-    let mut optimized =
-        physical_plan(&mut logical, &recorded, bounds, fired.clone()).map_err(Unrouted::of)?;
-    optimized
-        .physical
-        .set_assumptions(recorded.assumptions(bounds));
+    let operation = Operation::Query(Box::new(input.ir.clone()));
+    let Traced {
+        logical,
+        optimized,
+        fired,
+        derivation,
+    } = plan_traced(input.ir, source, bounds)?;
     let rendered = explain.then(|| {
         LogicalView::of(&logical)
             .explain(
@@ -401,8 +435,8 @@ fn plan_and_accept(
             )
             .engine()
     });
-    let accepted =
-        validate::accept(optimized.physical, input).map_err(ValidationError::into_unrouted)?;
+    let accepted = validate::accept(optimized.physical, input, derivation)
+        .map_err(ValidationError::into_unrouted)?;
     let rendered = rendered.map(|mut explain| {
         explain.pipelines = None;
         explain.validation = Some(accepted.summary());
