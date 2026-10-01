@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - OmniGraph maintainers
 created: 2026-09-29
-updated: 2026-09-30
+updated: 2026-10-01
 discussion: https://github.com/ModernRelay/omnigraph/pull/799
 supersedes:
   - "0034"
@@ -122,6 +122,12 @@ native-I/O settlement and completion reserves required by full B below. Its
 read/write capacity is independent, proven engine pre-effect refusals remain
 nonfatal, and uncertain completion contains the whole process with early
 nonzero exit after remaining known logical owners finish.
+
+The focused [Engine settlement and resource bounds](2026-10-01-engine-settlement-and-resource-bounds.md)
+proposal specifies full B's ownership mechanism, bounded preparation and
+completion allowances. Its pinned-substrate audit and limitation probes keep
+reuse gated on native hooks and remote terminal-outcome qualification; they do
+not turn the owned-operation foundation into a reusable drain.
 
 Before any await or effect, admission registers the write with its owner and
 captures its epoch, trusted actor, Session settings, immutable inputs,
@@ -300,8 +306,9 @@ Reserve bounded execution, memory and local I/O for finishing admitted work,
 qualified completion, shutdown and status. Ordinary traffic cannot consume it,
 and completion cannot wait on permits held by work it must settle. Keep the small
 status allowance separate. Reserves neither guarantee storage progress nor extend
-deadlines. Full B requires these reserves and independently qualified native-I/O
-settlement. Its accepted owned-operation foundation introduces bounded server
+deadlines. Full B requires the reserves and independently qualified native-I/O
+settlement specified by [Engine settlement and resource bounds](2026-10-01-engine-settlement-and-resource-bounds.md).
+Its accepted owned-operation foundation introduces bounded server
 tasks and retained inputs, but cannot use a task join or counter drain to grant
 activation, reclamation or retry authority.
 Reserve candidate headroom before closing healthy admission; insufficient capacity
@@ -439,7 +446,7 @@ cases and unreached faults do not pass qualification.
 | Increment | Deliverable | Shipping gate |
 |---|---|---|
 | A | A1 v0.12 HTTP admission; A2 own-publication merge receipts; A3 CLI outcomes | A1 follows [its accepted decision](2026-09-30-v012-http-admission.md); A2 is qualified under [Exact merge receipts](2026-09-30-exact-merge-receipts.md), including T1/T2; A3's initial typed-429 and qualified-HTTP-412 contract is qualified under [Owned server operations](2026-09-30-owned-server-operations.md) |
-| B | Owned writes, read/stream accounting, drain and shared shutdown | [Owned server operations](2026-09-30-owned-server-operations.md) implements and qualifies the bounded task/body foundation. Full B still requires native-I/O settlement and protected completion reserves under T6/T10 before runtime reuse; task/body lifetime tests do not establish these. |
+| B | Owned writes, read/stream accounting, drain and shared shutdown | [Owned server operations](2026-09-30-owned-server-operations.md) qualifies the task/body foundation. [Engine settlement and resource bounds](2026-10-01-engine-settlement-and-resource-bounds.md) specifies the remaining T6/T10 contract and dependency gates. Native settlement, completion reserves and runtime reuse remain unqualified. |
 | C | Schema/control completion, owned maintenance and bounded transient startup retry | T4/T6/T7/T11; same-process progress and protected reclamation |
 | D | Aggregate budgets, feed progress and embedding diagnostics | T10–T11 and workload qualification |
 | E1 | Same-process schema/query activation with one outstanding deployment | B, relevant C/D bounds, T8.live/T9 and durable ledger/crash gates; Azure separately gated |
@@ -460,11 +467,19 @@ Before accepting each affected increment, its owners must specify:
 2. Cluster/server: versioned pending slot, immutable input/achieved base, exact
    effect/finalization/result binding, active witness, observation interval,
    result retention, migration and stopped-writer handoff.
-3. Engine/server: effect-free validation/reuse interface, late-I/O settlement
-   proof and measured admission/completion bounds.
+3. Engine/server: accept the native settlement mechanism and measured
+   admission/completion profile in [Engine settlement and resource bounds](2026-10-01-engine-settlement-and-resource-bounds.md)
+   before exposing a reuse capability.
 4. Azure: lease-preserving online submission and backend qualification.
 
 ## Decision log
+
+- 2026-10-01: Added the focused full-B proposal. Operation ownership now names
+  its native/remote qualification gap. Resource bounds replaces "Full B requires
+  these reserves and independently qualified native-I/O settlement" with the
+  focused contract reference; the Rollout B shipping-gate sentence and Unresolved
+  questions item 3 now identify that proposal and its outstanding acceptance
+  gates. No runtime-reuse or online-deployment support is claimed.
 
 - 2026-09-29: Consolidated the four server/recovery drafts after detached table
   publication and final pins removed their content-recovery machinery. Preserved

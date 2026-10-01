@@ -67,6 +67,153 @@ use omnigraph_compiler::schema::parser::parse_schema;
 
 use helpers::{init_and_load, open_pinned_dataset_for_test, snapshot_main};
 
+/// Isolate the native blocking pool without changing process-wide settings.
+/// Its bounded shutdown also keeps a failed substrate guard from hanging CI.
+struct NativeIoProbeRuntime(Option<tokio::runtime::Runtime>);
+
+impl NativeIoProbeRuntime {
+    fn new() -> Self {
+        Self(Some(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(1)
+                .build()
+                .unwrap(),
+        ))
+    }
+
+    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+        self.0.as_ref().unwrap().block_on(future)
+    }
+}
+
+impl Drop for NativeIoProbeRuntime {
+    fn drop(&mut self) {
+        self.0
+            .take()
+            .unwrap()
+            .shutdown_timeout(std::time::Duration::from_secs(5));
+    }
+}
+
+/// Releasing on unwind is essential: Tokio cannot cancel a started blocking task.
+struct NativeBlockingGate(Option<std::sync::mpsc::Sender<()>>);
+
+impl NativeBlockingGate {
+    fn occupy_only_worker() -> Self {
+        let (release, released) = std::sync::mpsc::channel();
+        let (entered, started) = std::sync::mpsc::channel();
+        let gate = Self(Some(release));
+        tokio::task::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            let _ = released.recv();
+        });
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the isolated native worker must start");
+        gate
+    }
+}
+
+impl Drop for NativeBlockingGate {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+/// Negative qualification guard: cancelling the future and dropping its writer
+/// is not an I/O-settlement receipt. Lance 11's queued native persist still
+/// publishes the final file. See the server runtime RFC's full-B gate.
+#[test]
+fn dropped_local_writer_can_persist_after_its_owner_returns() {
+    use lance_io::object_store::ObjectStore;
+    use lance_io::traits::Writer;
+    use object_store::path::Path;
+    use tokio::io::AsyncWriteExt;
+
+    let runtime = NativeIoProbeRuntime::new();
+    let directory = tempfile::tempdir().unwrap();
+    let final_path = directory.path().join("late-persist.lance");
+    let path = Path::from_absolute_path(&final_path).unwrap();
+    let payload = b"the native write outlives its caller";
+
+    runtime.block_on(async {
+        let mut writer = ObjectStore::local().create(&path).await.unwrap();
+        writer.write_all(payload).await.unwrap();
+        writer.flush().await.unwrap();
+        let gate = NativeBlockingGate::occupy_only_worker();
+
+        {
+            let mut shutdown = Box::pin(Writer::shutdown(&mut writer));
+            assert!(futures::poll!(&mut shutdown).is_pending());
+        }
+        drop(writer);
+        assert!(
+            !final_path.exists(),
+            "the final path must not exist while native persistence is parked"
+        );
+
+        drop(gate);
+        // One blocking worker makes this barrier follow the queued persist.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(|| ()),
+        )
+        .await
+        .expect("queued native persistence must settle")
+        .unwrap();
+        assert_eq!(std::fs::read(&final_path).unwrap(), payload);
+    });
+}
+
+/// Negative qualification guard: native multipart Drop schedules cleanup but
+/// exposes no join. Observe the actual temporary file, not a wrapper counter.
+#[test]
+fn dropped_local_multipart_upload_cleans_up_after_its_owner_returns() {
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+    use object_store::path::Path;
+
+    let runtime = NativeIoProbeRuntime::new();
+    let directory = tempfile::tempdir().unwrap();
+    let store = LocalFileSystem::new_with_prefix(directory.path()).unwrap();
+    let final_path = directory.path().join("unfinished-upload.lance");
+
+    runtime.block_on(async {
+        let upload = store
+            .put_multipart_opts(&Path::from("unfinished-upload.lance"), Default::default())
+            .await
+            .unwrap();
+        let staged: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(staged.len(), 1, "a native multipart upload stages one file");
+        assert_ne!(staged[0], final_path);
+        let gate = NativeBlockingGate::occupy_only_worker();
+
+        drop(upload);
+        assert!(
+            staged[0].exists(),
+            "dropping the multipart owner must not count as settled cleanup"
+        );
+        assert!(!final_path.exists());
+
+        drop(gate);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(|| ()),
+        )
+        .await
+        .expect("queued native multipart cleanup must settle")
+        .unwrap();
+        assert!(!staged[0].exists());
+        assert!(!final_path.exists(), "abort never publishes the upload");
+    });
+}
+
 #[test]
 fn compiler_rejects_five_surveyed_lance_virtual_system_columns() {
     let names = [
