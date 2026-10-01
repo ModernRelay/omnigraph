@@ -17,15 +17,17 @@
 //!
 //! One batch per repetition on the host's clock: overlap evidence, not a
 //! throughput or latency claim, so the record says `claim_grade: false`.
-//! A fresh handle then requires exact row counts on every branch and reads
-//! merged source keys back on each target; any merge error, any outcome
-//! other than `Merged`, or a verification mismatch fails the run.
+//! A fresh handle then requires exact row counts on every branch, reads
+//! merged source keys back on each target, and requires every merge's
+//! publication receipt to name its target's head with its source's head as
+//! merged parent; any merge error, any outcome other than `Merged`, or a
+//! verification mismatch fails the run.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use omnigraph::Session;
-use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
+use omnigraph::db::{MergeOutcome, MergeResult, Omnigraph, ReadTarget};
 use omnigraph::loader::LoadMode;
 use omnigraph::settings::SessionSettings;
 
@@ -84,12 +86,14 @@ impl MergePair {
     }
 }
 
-/// One measured merge: offsets from its phase's clock, and the outcome.
+/// One measured merge: offsets from its phase's clock, and its result,
+/// whose receipt names the graph commit the merge published.
 struct MergeTiming {
+    source: String,
     target: String,
     started_us: u64,
     completed_us: u64,
-    outcome: Result<MergeOutcome, String>,
+    outcome: Result<MergeResult, String>,
 }
 
 impl MergeTiming {
@@ -99,23 +103,30 @@ impl MergeTiming {
 
     fn error(&self) -> Option<String> {
         match &self.outcome {
-            Ok(MergeOutcome::Merged) => None,
-            Ok(other) => Some(format!(
-                "merge into {}: expected a three-way Merged outcome, got {other:?}",
+            Ok(result) if result.outcome != MergeOutcome::Merged => Some(format!(
+                "merge into {}: expected a three-way Merged outcome, got {:?}",
+                self.target, result.outcome
+            )),
+            Ok(result) if result.commit.is_none() => Some(format!(
+                "merge into {}: merged without a publication receipt",
                 self.target
             )),
+            Ok(_) => None,
             Err(error) => Some(format!("merge into {}: {error}", self.target)),
         }
     }
 }
 
-/// A merge's disposition, or its error rendered for the record.
-fn disposition(
-    result: omnigraph::error::Result<omnigraph::db::MergeResult>,
-) -> Result<MergeOutcome, String> {
-    result
-        .map(|merged| merged.outcome)
-        .map_err(|error| error.to_string())
+/// The newest commit on `branch`'s lineage.
+async fn head_commit(session: &Session, branch: &str) -> Result<String, String> {
+    session
+        .list_commits(Some(branch))
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .next()
+        .map(|commit| commit.graph_commit_id)
+        .ok_or_else(|| format!("branch {branch} has no commits"))
 }
 
 async fn open_session(root_uri: &str) -> Session {
@@ -135,10 +146,11 @@ async fn merge_alone(root_uri: &str, pair: &MergePair) -> MergeTiming {
     let started = Instant::now();
     let outcome = session.branch_merge(&pair.source, &pair.target).await;
     MergeTiming {
+        source: pair.source.clone(),
         target: pair.target.clone(),
         started_us: 0,
         completed_us: started.elapsed().as_micros() as u64,
-        outcome: disposition(outcome),
+        outcome: outcome.map_err(|error| error.to_string()),
     }
 }
 
@@ -156,7 +168,8 @@ async fn merge_batch(root_uri: &str, pairs: &[MergePair]) -> Vec<MergeTiming> {
                 barrier.wait().await;
                 let started = Instant::now();
                 let outcome = session.branch_merge(&source, &target).await;
-                (target, started, Instant::now(), disposition(outcome))
+                let outcome = outcome.map_err(|error| error.to_string());
+                (source, target, started, Instant::now(), outcome)
             })
         })
         .collect();
@@ -164,9 +177,10 @@ async fn merge_batch(root_uri: &str, pairs: &[MergePair]) -> Vec<MergeTiming> {
     barrier.wait().await;
     let mut timings = Vec::with_capacity(handles.len());
     for handle in handles {
-        let (target, started, completed, outcome) = handle.await.expect("merge task join");
+        let (source, target, started, completed, outcome) = handle.await.expect("merge task join");
         let offset = |at: Instant| at.saturating_duration_since(batch_start).as_micros() as u64;
         timings.push(MergeTiming {
+            source,
             target,
             started_us: offset(started),
             completed_us: offset(completed),
@@ -307,6 +321,42 @@ pub(super) async fn run(args: &Args) -> serde_json::Value {
             sampled_readback += 1;
         }
     }
+    // Every merge's receipt names its target's head, and that commit's
+    // merged parent is its source's head, which nothing moved after setup.
+    let mut receipts_checked = 0usize;
+    for timing in [&before, &after].into_iter().chain(&timings) {
+        let Ok(MergeResult {
+            commit: Some(receipt),
+            ..
+        }) = &timing.outcome
+        else {
+            continue;
+        };
+        match (
+            head_commit(&verify, &timing.target).await,
+            head_commit(&verify, &timing.source).await,
+        ) {
+            (Ok(target_head), Ok(source_head)) => {
+                if receipt.graph_commit_id != target_head {
+                    verification_failures.push(format!(
+                        "branch {}: receipt names commit {}, head is {target_head}",
+                        timing.target, receipt.graph_commit_id
+                    ));
+                }
+                if receipt.merged_parent_commit_id.as_deref() != Some(source_head.as_str()) {
+                    verification_failures.push(format!(
+                        "branch {}: receipt's merged parent {:?} is not source {} head {source_head}",
+                        timing.target, receipt.merged_parent_commit_id, timing.source
+                    ));
+                }
+            }
+            (target_head, source_head) => verification_failures.push(format!(
+                "branch {}: reading heads for the receipt check failed: target {target_head:?}, source {source_head:?}",
+                timing.target
+            )),
+        }
+        receipts_checked += 1;
+    }
     drop(verify);
 
     let per_merge: Vec<serde_json::Value> = timings
@@ -371,6 +421,7 @@ pub(super) async fn run(args: &Args) -> serde_json::Value {
         "verification": {
             "branches_counted": expected_rows.len(),
             "sampled_readback": sampled_readback,
+            "receipts_checked": receipts_checked,
             "failures": verification_failures,
             "passed": passed,
         },

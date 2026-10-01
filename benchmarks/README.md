@@ -260,9 +260,11 @@ controls' mean: 1.0 is perfect overlap and N is full serialization.
 from the batch clock. The peak-RSS pair brackets the batch; the process
 high-water mark already covers fixture seeding and the first control, so
 an unchanged post value means the batch did not raise it. A fresh
-handle then requires exact row counts on every branch and reads each
-target's first and last merged source key back; a merge error, an
-outcome other than `Merged`, or a mismatch fails the run.
+handle then requires exact row counts on every branch, reads each
+target's first and last merged source key back, and requires each merge's
+publication receipt to be its target's head commit with its source's head
+as the merged parent; a merge error, an outcome other than `Merged`, or a
+mismatch fails the run.
 
 The record is `claim_grade: false`: one batch on the host's clock is
 overlap evidence, not a throughput or latency claim. `--target-uri`,
