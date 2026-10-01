@@ -301,12 +301,6 @@ pub fn get_request(uri: &str, token: &str) -> Request<Body> {
         .unwrap()
 }
 
-pub fn drifted_test_schema() -> String {
-    fs::read_to_string(fixture("test.pg"))
-        .unwrap()
-        .replace("age: I32?", "age: I64?")
-}
-
 pub async fn manifest_dataset_version(graph: &Path) -> u64 {
     Omnigraph::open(graph.to_string_lossy().as_ref())
         .await

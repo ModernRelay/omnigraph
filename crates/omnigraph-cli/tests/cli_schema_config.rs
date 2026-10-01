@@ -130,7 +130,7 @@ fn init_creates_graph_successfully_on_missing_local_directory() {
     let stdout = stdout_string(&output);
 
     assert!(stdout.contains("initialized"));
-    assert!(graph.join("_schema.pg").exists());
+    assert!(!graph.join("_schema.pg").exists());
     assert!(graph.join("__manifest").exists());
     // RFC-008 stage 3: init no longer scaffolds the legacy config file.
     assert!(!temp.path().join("omnigraph.yaml").exists());

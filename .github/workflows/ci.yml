@@ -1279,7 +1279,7 @@ jobs:
           done
           run_cell azure_write_detached_pin_survives_next_write -p omnigraph-engine --features failpoints --test failpoints
           run_cell azure_optimize_detached_pin_survives_next_write -p omnigraph-engine --features failpoints --test failpoints
-          run_cell azure_schema_apply_recovers_source_and_destination_after_partial_rename -p omnigraph-engine --features failpoints --test failpoints
+          run_cell azure_schema_apply_post_commit_failure_leaves_readable_contract -p omnigraph-engine --features failpoints --test failpoints
           run_cell azure_cluster_full_lifecycle_import_apply_serve_evolve_delete -p omnigraph-cluster --test s3_cluster
           run_cell server_opens_azure_graph_directly_and_serves_snapshot_and_read -p omnigraph-server --test s3
           run_cell server_boots_azure_cluster_from_bare_storage_uri_and_serves_query -p omnigraph-server --test s3

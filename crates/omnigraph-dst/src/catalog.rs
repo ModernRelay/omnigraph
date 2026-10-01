@@ -1,5 +1,5 @@
 //! The full crash-window catalog for the hunt
-//! (`dst_hunt_crash_window_sweep`): 56 of the engine's decision seams
+//! (`dst_hunt_crash_window_sweep`): 52 of the engine's decision seams
 //! (`omnigraph::seams::catalog`) at the pinned engine version. A seam added
 //! to the engine enters here as never-reached until its workload exists.
 //!
@@ -7,7 +7,7 @@
 //! be a name the engine catalog declares, so a typo'd or renamed-away window
 //! fails the suite instead of compiling and silently never firing.
 
-pub const CRASH_WINDOWS: [&str; 56] = [
+pub const CRASH_WINDOWS: [&str; 52] = [
     "blob_read.post_capture",
     "branch_control.pre_gates",
     "branch_create.post_native",
@@ -35,8 +35,6 @@ pub const CRASH_WINDOWS: [&str; 56] = [
     "graph_publish.after_manifest_commit",
     "graph_publish.before_commit_append",
     "init.after_coordinator_init",
-    "init.after_schema_contract_written",
-    "init.after_schema_pg_written",
     "init.post_manifest_create",
     "load.between_table_stages",
     "load.post_branch_create_pre_stage",
@@ -53,8 +51,6 @@ pub const CRASH_WINDOWS: [&str; 56] = [
     "publish.load_state",
     "read.refresh_post_state_pre_lineage",
     "schema_apply.after_manifest_commit",
-    "schema_apply.after_staging_write",
-    "schema_apply.before_staging_write",
     "schema_apply.post_lock_pre_effect",
     "schema_apply.post_table_commit",
     "schema_reload.before_contract_read",

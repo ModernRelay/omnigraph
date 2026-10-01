@@ -10,6 +10,7 @@ use lance_table::format::IndexMetadata;
 use omnigraph_compiler::catalog::Catalog;
 
 use crate::db::DatasetEntry;
+use crate::db::schema_state::SchemaContractIdentity;
 use crate::error::Result;
 
 /// Immutable point-in-time view of the database.
@@ -193,6 +194,10 @@ impl SnapshotDataset {
 }
 
 impl Snapshot {
+    pub(crate) fn same_manifest_image(&self, other: &Self) -> bool {
+        self.inner.same_manifest_image(&other.inner)
+    }
+
     pub(crate) fn wrap(inner: omnigraph_catalog::Snapshot) -> Self {
         Self { inner }
     }
@@ -205,6 +210,18 @@ impl Snapshot {
     #[cfg(test)]
     pub(crate) fn raw_mut(&mut self) -> &mut omnigraph_catalog::Snapshot {
         &mut self.inner
+    }
+
+    /// Load the contract at this snapshot's captured native branch and version.
+    pub(crate) async fn read_schema_contract(
+        &self,
+        root_uri: &str,
+    ) -> Result<omnigraph_catalog::SchemaContractRow> {
+        omnigraph_catalog::ManifestCoordinator::read_schema_contract_for_snapshot(
+            root_uri,
+            &self.inner,
+        )
+        .await
     }
 
     pub(crate) fn graph_branch(&self) -> Option<&str> {
@@ -223,6 +240,15 @@ impl Snapshot {
     /// lineage head must resolve it through `GraphCoordinator`.
     pub fn graph_head(&self, branch: Option<&str>) -> Option<&str> {
         self.inner.graph_head(branch)
+    }
+
+    /// The identity of the `schema_contract` row in this snapshot's own pinned
+    /// graph-manifest version; `None` only for a version written before the
+    /// row existed.
+    pub(crate) fn schema_contract(&self) -> Option<SchemaContractIdentity> {
+        self.inner
+            .schema_contract()
+            .map(SchemaContractIdentity::from)
     }
 
     pub(crate) fn bind_catalog_aliases(&mut self, catalog: &Catalog) -> Result<()> {

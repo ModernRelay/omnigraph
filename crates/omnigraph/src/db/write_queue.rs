@@ -333,8 +333,8 @@ pub(crate) struct ExportDestructivePermit {
 ///
 /// Every `Omnigraph` handle for one canonical root identity shares the same
 /// manager via a process-global weak registry. This matters beyond HTTP's usual
-/// `Arc<Omnigraph>` shape: a separately-opened handle can settle a staged
-/// schema contract or delete refs, which must serialize with a live writer
+/// `Arc<Omnigraph>` shape: a separately-opened handle can apply a schema
+/// or delete refs, which must serialize with a live writer
 /// owned by the first handle. The registry deliberately keys only by the queue root
 /// identity; custom storage adapters for the same URI conservatively serialize
 /// too.
@@ -424,18 +424,6 @@ impl WriteQueueManager {
     /// gate is non-reentrant — see [`SchemaGateSlot`]).
     pub(crate) async fn acquire_schema_shared(&self) -> SchemaSharedPermit {
         scheduled_schema_shared(Arc::clone(&self.schema_gate)).await
-    }
-
-    /// The shared side without waiting: `None` while an exclusive permit is
-    /// held or queued in this process. A standing schema-apply sentinel with
-    /// a free gate is therefore another process's apply (or a dead one).
-    pub(crate) fn try_acquire_schema_shared(&self) -> Option<SchemaSharedPermit> {
-        let _turn = crate::dst_gate::turn();
-        let guard = Arc::clone(&self.schema_gate.lock).try_read_owned().ok()?;
-        Some(SchemaSharedPermit {
-            inner: Some(guard),
-            slot: Arc::clone(&self.schema_gate),
-        })
     }
 
     /// Take the schema gate's exclusive side: sole ownership of the
@@ -670,7 +658,7 @@ mod tests {
         let writer = tokio::spawn(async move { qm_writer.acquire_schema_exclusive().await });
         let qm_probe = Arc::clone(&qm);
         timeout(Duration::from_secs(2), async move {
-            while let Some(permit) = qm_probe.try_acquire_schema_shared() {
+            while let Ok(permit) = Arc::clone(&qm_probe.schema_gate.lock).try_read_owned() {
                 drop(permit);
                 tokio::task::yield_now().await;
             }

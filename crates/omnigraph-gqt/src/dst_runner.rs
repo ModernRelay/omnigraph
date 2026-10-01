@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -29,9 +30,17 @@ tokio::task_local! {
 }
 
 #[derive(Default)]
+struct SessionObservations {
+    values: Vec<String>,
+    evidence: Vec<serde_json::Value>,
+}
+
+#[derive(Default)]
 struct Observations {
     values: Vec<String>,
+    sessions: BTreeMap<usize, SessionObservations>,
     bytes: usize,
+    entries: usize,
     overflow: bool,
     operation: Option<serde_json::Value>,
     evidence: Vec<serde_json::Value>,
@@ -60,10 +69,28 @@ pub(crate) fn observe(value: impl FnOnce() -> String) {
             }
             let value = value();
             events.bytes += value.len();
-            if events.bytes > LIMIT || events.values.len() + events.evidence.len() >= 100_000 {
+            if events.bytes > LIMIT || events.entries >= 100_000 {
                 events.overflow = true;
             } else {
-                events.values.push(value);
+                events.entries += 1;
+                if let Ok(index) = crate::measure::SESSION.try_with(|session| session.index) {
+                    events.sessions.entry(index).or_default().values.push(value);
+                } else {
+                    events.values.push(value);
+                }
+            }
+        })
+        .unwrap_or_default();
+}
+
+/// Append each session's ordered evidence in declaration order, independent of completion timing.
+pub(crate) fn finish_concurrent_observations() {
+    OBSERVATIONS
+        .try_with(|events| {
+            let mut events = events.borrow_mut();
+            for (_, session) in std::mem::take(&mut events.sessions) {
+                events.values.extend(session.values);
+                events.evidence.extend(session.evidence);
             }
         })
         .unwrap_or_default();
@@ -92,7 +119,7 @@ fn lifecycle_probe() -> (
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     ];
     let guards = [
-        &omnigraph::seams::catalog::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN,
+        &omnigraph::seams::catalog::INIT_AFTER_COORDINATOR_INIT,
         &omnigraph::seams::catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
     ]
     .into_iter()
@@ -218,10 +245,20 @@ pub(crate) fn record(kind: &str, value: serde_json::Value) {
                 event["session"] = serde_json::json!(session);
             }
             events.bytes += event.to_string().len();
-            if events.bytes > LIMIT || events.values.len() + events.evidence.len() >= 100_000 {
+            if events.bytes > LIMIT || events.entries >= 100_000 {
                 events.overflow = true;
             } else {
-                events.evidence.push(event);
+                events.entries += 1;
+                if let Ok(index) = crate::measure::SESSION.try_with(|session| session.index) {
+                    events
+                        .sessions
+                        .entry(index)
+                        .or_default()
+                        .evidence
+                        .push(event);
+                } else {
+                    events.evidence.push(event);
+                }
             }
         })
         .unwrap_or_default();
@@ -1736,6 +1773,7 @@ async fn capture(
                 });
             #[cfg(tokio_unstable)]
             clear_phase_observers();
+            finish_concurrent_observations();
             measure_finish();
             let observations = OBSERVATIONS.with(|events| events.take());
             let result = if observations.overflow {
@@ -2094,6 +2132,200 @@ mod action_tests {
             admitted_effect(SeamAction::Contention, &[Effect::Fail, Effect::Skip]),
             None,
             "explicit contention cannot fall back to another effect"
+        );
+    }
+
+    fn concurrent_session(index: usize, step: u64) -> crate::measure::SessionCtx {
+        crate::measure::SessionCtx::new(
+            index,
+            crate::measure::Label {
+                slot: ["w2", "r1"][index],
+                step,
+                line: Some(18),
+                kind: "query",
+            },
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
+    #[tokio::test]
+    async fn concurrent_capture_retains_partial_session_evidence_after_panic() {
+        let report = super::capture(
+            "same-input".into(),
+            crate::measure::SESSION.scope(concurrent_session(1, 1), async {
+                super::begin_operation(serde_json::json!({"ordinal": 1}));
+                super::observe(|| "partial read".into());
+                super::record("query_result", serde_json::json!({"rows": ["alice"]}));
+                panic!("session panicked before block completion");
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.code, "worker_failed");
+        assert_eq!(report.observations, ["partial read"]);
+        assert_eq!(report.evidence.len(), 1);
+        assert_eq!(report.evidence[0]["session"], "r1");
+        assert_eq!(report.evidence[0]["operation"]["ordinal"], 1);
+        assert_eq!(
+            report.evidence[0]["value"]["rows"],
+            serde_json::json!(["alice"])
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_capture_shares_report_limits_across_sessions() {
+        let entries = super::capture("same-input".into(), async {
+            crate::measure::SESSION
+                .scope(concurrent_session(0, 1), async {
+                    for _ in 0..50_000 {
+                        super::observe(|| "observation".into());
+                    }
+                })
+                .await;
+            super::finish_concurrent_observations();
+            crate::measure::SESSION
+                .scope(concurrent_session(1, 1), async {
+                    for _ in 0..50_001 {
+                        super::record("result", serde_json::Value::Null);
+                    }
+                })
+                .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(entries.code, "report_failed");
+        assert_eq!(entries.observations.len(), 50_000);
+        assert_eq!(entries.evidence.len(), 50_000);
+
+        let bytes = super::capture("same-input".into(), async {
+            for index in [0, 1] {
+                crate::measure::SESSION
+                    .scope(concurrent_session(index, 1), async {
+                        super::observe(|| "x".repeat(super::LIMIT / 2));
+                    })
+                    .await;
+            }
+            super::record("result", serde_json::Value::Null);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(bytes.code, "report_failed");
+        assert_eq!(bytes.observations.len(), 2);
+        assert!(bytes.evidence.is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_replay_preserves_session_results_across_interleavings() {
+        async fn report(order: &[usize], row: &str) -> super::WorkerReport {
+            super::capture("same-input".into(), async {
+                for ordinal in [1, 2] {
+                    super::begin_operation(serde_json::json!({"ordinal": ordinal}));
+                    super::observe(|| format!("before block {ordinal}"));
+                    for &event in order {
+                        let index = event / 2;
+                        let ctx = concurrent_session(index, ordinal);
+                        crate::measure::SESSION
+                            .scope(ctx, async {
+                                super::observe(|| format!("session {index} event {}", event % 2));
+                                super::record(
+                                    "query_result",
+                                    serde_json::json!({"event": event % 2, "rows": [{"name": row}]}),
+                                );
+                            })
+                            .await;
+                    }
+                    crate::record_concurrent_outcome(
+                        ordinal as usize,
+                        &[serde_json::json!({"label": "w2", "outcome": "ok"}),
+                          serde_json::json!({"label": "r1", "outcome": "ok"})],
+                        &crate::concurrent::Outcome {
+                            stuck_at: None,
+                            failure: None,
+                            unattributed: 0,
+                            log: Vec::new(),
+                            wall_ms: 0,
+                        },
+                    );
+                    super::observe(|| format!("after block {ordinal}"));
+                }
+                Ok(())
+            })
+            .await
+            .unwrap()
+        }
+
+        let expected = super::comparable(&report(&[0, 2, 1, 3], "alice").await).unwrap();
+        let interleaved = super::comparable(&report(&[2, 0, 3, 1], "alice").await).unwrap();
+        assert!(
+            expected == interleaved,
+            "session completion order must not change replay evidence"
+        );
+        for (order, row) in [
+            (&[1, 2, 0, 3][..], "alice"),
+            (&[0, 2, 1][..], "alice"),
+            (&[0, 2, 1, 3][..], "bob"),
+        ] {
+            assert_ne!(
+                expected,
+                super::comparable(&report(order, row).await).unwrap(),
+                "per-session order, completeness and rows remain replay evidence"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_replay_compares_outcomes_without_background_measurements() {
+        async fn report(
+            sessions: &[serde_json::Value],
+            block: &crate::concurrent::Outcome,
+        ) -> super::WorkerReport {
+            super::capture("same-input".into(), async {
+                crate::record_concurrent_outcome(3, sessions, block);
+                Ok(())
+            })
+            .await
+            .unwrap()
+        }
+
+        let mut sessions = vec![serde_json::json!({
+            "label": "r1", "outcome": "ok", "message": null, "script": null,
+        })];
+        let mut block = crate::concurrent::Outcome {
+            stuck_at: None,
+            failure: None,
+            unattributed: 2,
+            log: Vec::new(),
+            wall_ms: 5,
+        };
+        let expected = super::comparable(&report(&sessions, &block).await).unwrap();
+        block.unattributed = 3;
+        block.wall_ms = 9;
+        block.log.push(serde_json::json!({"wall_ms": 7}));
+        let measured = super::comparable(&report(&sessions, &block).await).unwrap();
+        assert!(
+            expected == measured,
+            "background I/O and timing measurements must not change replay equality"
+        );
+
+        block.stuck_at = Some(0);
+        assert_ne!(
+            expected,
+            super::comparable(&report(&sessions, &block).await).unwrap()
+        );
+        block.stuck_at = None;
+        block.failure = Some("session starved".into());
+        assert_ne!(
+            expected,
+            super::comparable(&report(&sessions, &block).await).unwrap()
+        );
+        block.failure = None;
+        sessions[0]["outcome"] = "failed".into();
+        sessions[0]["message"] = "query failed".into();
+        assert_ne!(
+            expected,
+            super::comparable(&report(&sessions, &block).await).unwrap()
         );
     }
 

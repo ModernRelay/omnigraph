@@ -28,6 +28,7 @@ use crate::seams::{decide_seam, fail};
 
 #[path = "upgrade/detached_only.rs"]
 mod detached_only;
+pub(crate) mod legacy_schema_files;
 pub(crate) mod legacy_sidecars;
 
 #[cfg(all(test, feature = "failpoints"))]
@@ -41,12 +42,43 @@ const HANDLER: &str = "registration-clocks-v6-to-v7";
 const RETIREMENT_HANDLER: &str = "native-retirement-v7-to-v8";
 const DETACHED_PINS_HANDLER: &str = "detached-pins-v8-v9-to-v10";
 const DETACHED_ONLY_HANDLER: &str = "detached-only-v10-to-v11";
-const DEFAULT_TARGET: u32 = 11;
+const SCHEMA_CONTRACT_HANDLER: &str = "schema-contract-v11-v12-to-v13";
+const DEFAULT_TARGET: u32 = 13;
 const RETIREMENT_KEY: &str = "omnigraph.retired_manifest_branch";
 const MAX_VERSIONS: usize = 100_000;
 const MAX_APPENDED_UPGRADE_VERSIONS: u64 = 3;
 const MAX_ROWS: usize = 1_000_000;
 const MAX_METADATA_BYTES: usize = 64 * 1024 * 1024;
+
+/// Prepare a flat-v11 main manifest and return its legacy source, IR, and state text.
+/// The DST harness persists these files before installing or enabling read weather.
+#[cfg(feature = "dst")]
+#[doc(hidden)]
+pub async fn dst_prepare_legacy_upgrade_fixture(root: &str) -> Result<(String, String, String)> {
+    let mut main = Dataset::open(&format!("{root}/__manifest"))
+        .await
+        .map_err(OmniError::storage)?;
+    let row = crate::db::manifest::ManifestCoordinator::read_schema_contract_at(
+        root,
+        None,
+        main.version().version,
+    )
+    .await?;
+    let ir: omnigraph_compiler::SchemaIR =
+        serde_json::from_str(&row.ir).map_err(|error| invalid(error.to_string()))?;
+    let shape_hash = omnigraph_compiler::schema_shape_hash_from_ir(&ir)
+        .map_err(|error| invalid(error.to_string()))?;
+    let state = serde_json::json!({
+        "format_version": 2,
+        "schema_shape_hash": shape_hash,
+        "schema_ir_hash": row.head.schema_ir_hash,
+        "schema_identity_version": row.head.schema_identity_version,
+        "schema_identity_domain": row.head.schema_identity_domain,
+    })
+    .to_string();
+    crate::db::manifest::migrations::restamp_flat_for_test(&mut main, 11).await?;
+    Ok((row.source, row.ir, state))
+}
 
 /// Explicit storage conversion options. Execution requires exclusive operator control.
 #[derive(Debug, Clone, Copy, Default)]
@@ -199,13 +231,13 @@ async fn run(
     policy: Option<&dyn omnigraph_policy::PolicyChecker>,
     report: &mut UpgradeReport,
 ) -> Result<()> {
-    if !matches!(report.target_format, 7 | 8 | 10 | 11) {
+    if !matches!(report.target_format, 7 | 8 | 10 | 11 | 13) {
         if let Ok(main) = open(root, None).await {
             report.observed_format = read_stamp(&main);
         }
         report.finding(
             "unsupported_target",
-            "this binary has registered routes to formats 7, 8, 10 and 11 only; v9 was the system-column vintage, which since v10 is converted on a served graph by `omnigraph schema upgrade-system-columns`",
+            "this binary has registered routes to formats 7, 8, 10, 11 and 13 only; v9 was the system-column vintage, which since v10 is converted on a served graph by `omnigraph schema upgrade-system-columns`",
         );
         return Ok(());
     }
@@ -214,7 +246,7 @@ async fn run(
     } else {
         Some(crate::db::reserve_export_root_exclusion(root)?)
     };
-    for _ in 0..4 {
+    for _ in 0..5 {
         let main = open(root, None).await?;
         let stamp = read_stamp(&main);
         if report.observed_format.is_none() {
@@ -252,7 +284,8 @@ async fn run(
                 Some(6) => 7,
                 Some(7) => report.target_format.min(8),
                 Some(8) | Some(9) => report.target_format.min(10),
-                Some(stamp) if stamp >= 10 => report.target_format,
+                Some(10) => report.target_format.min(11),
+                Some(stamp) if stamp >= 11 => report.target_format,
                 _ => report.target_format.min(8),
             });
         let initial_step = pending
@@ -274,13 +307,22 @@ async fn run(
             report.route.push(DETACHED_PINS_HANDLER.into());
         }
         if matches!(initial_step, 6..=10)
-            && report.target_format == 11
+            && report.target_format >= 11
             && !report
                 .route
                 .iter()
                 .any(|entry| entry == DETACHED_ONLY_HANDLER)
         {
             report.route.push(DETACHED_ONLY_HANDLER.into());
+        }
+        if matches!(initial_step, 6..=12)
+            && report.target_format == 13
+            && !report
+                .route
+                .iter()
+                .any(|entry| entry == SCHEMA_CONTRACT_HANDLER)
+        {
+            report.route.push(SCHEMA_CONTRACT_HANDLER.into());
         }
         run_step(root, options, actor, policy, report, step_target).await?;
         if options.check {
@@ -291,8 +333,11 @@ async fn run(
                 if step_target < 10 && report.target_format >= 10 {
                     report.work.deferred_checks.insert("the v10 stamp step validates the converted v8 output's live branches before it has effects".into());
                 }
-                if report.target_format == 11 {
+                if step_target < 11 && report.target_format >= 11 {
                     report.work.deferred_checks.insert("the v11 step judges the converted v10 output's pins on every live branch before it has effects".into());
+                }
+                if report.target_format == 13 {
+                    report.work.deferred_checks.insert("the v13 step validates legacy contract bytes and each branch's v11/v12 layout before it has effects".into());
                 }
             }
             return Ok(());
@@ -303,7 +348,7 @@ async fn run(
         report.work.deferred_checks.clear();
     }
     Err(invalid(
-        "storage upgrade route exceeded its four registered steps",
+        "storage upgrade route exceeded its five registered steps",
     ))
 }
 
@@ -323,9 +368,48 @@ decide_seam! {
     pub static UPGRADE_AFTER_ACTIVATION = ("upgrade.after_activation", Unreachable, [Fail]);
 }
 
+decide_seam! {
+    pub static UPGRADE_AFTER_SCHEMA_FILE_DELETE = ("upgrade.after_schema_file_delete", Unreachable, [Fail]);
+}
+
+fn refuse_legacy_sentinel(native: &str) -> Result<()> {
+    if crate::branch_names::logical_branch_name(native).trim_start_matches('/')
+        == "__schema_apply_lock__"
+    {
+        return Err(invalid(
+            "legacy schema-apply sentinel requires the source-compatible executable before conversion",
+        ));
+    }
+    Ok(())
+}
+
+async fn validated_manifest_contract(
+    dataset: &Dataset,
+) -> Result<crate::db::manifest::SchemaContractRow> {
+    let row = crate::db::manifest::migrations::read_upgrade_schema_contract(dataset).await?;
+    crate::db::schema_state::refuse_unsupported_schema_versions(&row.ir)?;
+    let (ir, _) = crate::db::schema_state::validate_schema_contract_row(&row)?;
+    let state = read_manifest_state(dataset).await?;
+    crate::db::schema_state::validate_schema_ir_against_entries(
+        &ir,
+        state.entries.iter(),
+        state.version,
+    )?;
+    Ok(row)
+}
+
+async fn validate_converted_contract(dataset: &Dataset, intent: &UpgradeIntent) -> Result<()> {
+    let contract = validated_manifest_contract(dataset).await?;
+    intent
+        .schema_contract
+        .as_ref()
+        .ok_or_else(|| invalid("schema-contract upgrade has no exact contract ownership"))?
+        .validate_row(&contract)
+}
+
 /// Whether a live branch at `branch_stamp` belongs to a current graph whose
-/// main is at `main_stamp`: any served stamp when main is served (a v11 graph
-/// converts to v12 one branch per publish), else main's exact stamp.
+/// main is at `main_stamp`: a served stamp when main is served, otherwise
+/// main's exact intermediate target stamp.
 fn branch_stamp_is_current(main_stamp: u32, branch_stamp: Option<u32>) -> bool {
     if is_served_stamp(main_stamp) {
         branch_stamp.is_some_and(is_served_stamp)
@@ -357,10 +441,7 @@ async fn run_step(
             "an owned storage conversion requires explicit recovery",
         );
     }
-    let storage = storage_for_uri(root)?;
-    let (_, schema_state) =
-        crate::db::schema_state::load_validated_schema_contract(root, Arc::clone(&storage)).await?;
-    report.graph_identity = Some(schema_state.schema_identity_domain.clone());
+    let storage = crate::storage::decorate(storage_for_uri(root)?);
     let sidecars =
         crate::db::upgrade::legacy_sidecars::pending_legacy_sidecars(root, storage.as_ref())
             .await?;
@@ -390,6 +471,26 @@ async fn run_step(
             crate::db::manifest::migrations::guard_stamp(&main)?;
         }
         read_manifest_state(&main).await?;
+        let current_contract = if expected == 13 {
+            Some(validated_manifest_contract(&main).await?)
+        } else {
+            legacy_schema_files::refuse_staging(root, storage.as_ref()).await?;
+            None
+        };
+        let legacy = if current_contract.is_none() {
+            Some(
+                legacy_schema_files::load_validated_schema_contract(root, Arc::clone(&storage))
+                    .await?
+                    .into_row(),
+            )
+        } else {
+            None
+        };
+        let contract = current_contract
+            .as_ref()
+            .or(legacy.as_ref())
+            .ok_or_else(|| invalid("current graph has no schema contract"))?;
+        report.graph_identity = Some(contract.head.schema_identity_domain.clone());
         let branches = if expected >= 8 {
             crate::branch_control::list_live_manifest_branch_contents(&main).await?
         } else {
@@ -400,14 +501,12 @@ async fn run_step(
         }
         let mut logical_names = HashSet::from(["main".to_string()]);
         for native in branches.keys() {
+            if expected < 13 {
+                refuse_legacy_sentinel(native)?;
+            }
             if !logical_names.insert(crate::branch_names::logical_branch_name(native).to_string()) {
                 return Err(invalid(
                     "current graph contains duplicate live logical branch names",
-                ));
-            }
-            if crate::db::is_internal_system_branch(native) {
-                return Err(invalid(
-                    "resolve internal branch recovery before storage upgrade",
                 ));
             }
             let branch = main
@@ -424,6 +523,11 @@ async fn run_step(
                 )));
             }
             read_manifest_state(&branch).await?;
+            if let Some(contract) = &current_contract {
+                if validated_manifest_contract(&branch).await? != *contract {
+                    return Err(invalid("current branch schema contract differs from main"));
+                }
+            }
         }
         report.outcome = if report.completed_handlers.is_empty() {
             UpgradeOutcome::AlreadyCurrent
@@ -462,27 +566,66 @@ async fn run_step(
     if pending.is_none()
         && !matches!(
             (read_stamp(&main), step_target),
-            (Some(6), 7) | (Some(7), 8) | (Some(8), 10) | (Some(9), 10) | (Some(10), 11)
+            (Some(6), 7)
+                | (Some(7), 8)
+                | (Some(8), 10)
+                | (Some(9), 10)
+                | (Some(10), 11)
+                | (Some(11), 13)
+                | (Some(12), 13)
         )
     {
-        report.finding("unsupported_source", "only validated v6, v7, v8, v9 and v10 graphs have conversion handlers; preserve the source and use its executable for export/import");
+        report.finding("unsupported_source", "only validated v6, v7, v8, v9, v10, v11 and v12 graphs have conversion handlers; preserve the source and use its executable for export/import");
         return Ok(());
     }
     let resumed = pending.is_some();
+    legacy_schema_files::refuse_staging(root, storage.as_ref()).await?;
+    let contract = if let Some(intent) = pending.as_ref().filter(|intent| intent.protocol == 5) {
+        let mut complete = true;
+        for branch in &intent.branches {
+            let current = open(root, branch.native.as_deref()).await?;
+            if branch_completed(&current, branch, intent)? {
+                validate_converted_contract(&current, intent).await?;
+            } else {
+                complete = false;
+            }
+        }
+        if complete {
+            verify_inventory(root, intent, true).await?;
+            validated_manifest_contract(&main).await?
+        } else {
+            legacy_schema_files::load_validated_schema_contract(root, Arc::clone(&storage))
+                .await?
+                .into_row()
+        }
+    } else {
+        legacy_schema_files::load_validated_schema_contract(root, Arc::clone(&storage))
+            .await?
+            .into_row()
+    };
+    report.graph_identity = Some(contract.head.schema_identity_domain.clone());
     let mut intent = match pending {
         Some(intent) => {
-            if intent.graph_identity != schema_state.schema_identity_domain {
+            if intent.graph_identity != contract.head.schema_identity_domain {
                 return Err(invalid("upgrade schema identity changed"));
+            }
+            if let Some(expected) = &intent.schema_contract {
+                expected.validate_row(&contract)?;
             }
             intent
         }
-        None => inventory(&main, schema_state.schema_identity_domain.clone()).await?,
+        None => inventory(&main, contract.head.schema_identity_domain.clone()).await?,
     };
+    if intent.protocol == 5 && intent.schema_contract.is_none() {
+        intent.schema_contract =
+            Some(crate::db::manifest::migrations::UpgradeSchemaContract::from_row(&contract));
+    }
     let handler = match intent.source_format {
         6 => HANDLER,
         7 => RETIREMENT_HANDLER,
         8 | 9 => DETACHED_PINS_HANDLER,
-        _ => DETACHED_ONLY_HANDLER,
+        10 => DETACHED_ONLY_HANDLER,
+        _ => SCHEMA_CONTRACT_HANDLER,
     };
     if !report.route.iter().any(|entry| entry == handler) {
         report.route.push(handler.into());
@@ -510,9 +653,9 @@ async fn run_step(
     }
     if handler == DETACHED_ONLY_HANDLER && !resumed {
         let blocked = if options.check {
-            detached_only::preflight(root).await?
+            detached_only::preflight(root, &contract).await?
         } else {
-            let work = detached_only::execute(root).await?;
+            let work = detached_only::execute(root, &contract).await?;
             tracing::info!(
                 promoted = work.promoted,
                 reaped = work.reaped,
@@ -530,11 +673,11 @@ async fn run_step(
         }
         if !options.check {
             let main = open(root, None).await?;
-            intent = inventory(&main, schema_state.schema_identity_domain.clone()).await?;
+            intent = inventory(&main, contract.head.schema_identity_domain.clone()).await?;
         }
     }
     verify_inventory(root, &intent, report.recovery.is_some()).await?;
-    preflight(root, &intent, &mut report.work).await?;
+    preflight(root, &intent, &contract, &mut report.work).await?;
     if options.check {
         if report.recovery.is_none() {
             report.outcome = UpgradeOutcome::CheckPassed;
@@ -575,7 +718,7 @@ async fn run_step(
             .checkout_version(branch.version)
             .await
             .map_err(OmniError::storage)?;
-        publish_conversion(current, source, branch, &intent).await?;
+        publish_conversion(current, source, branch, &intent, &contract).await?;
         report.last_durable_completed_boundary = Some(format!(
             "converted:{}",
             branch.native.as_deref().unwrap_or("main")
@@ -592,11 +735,18 @@ async fn run_step(
             .await
             .map_err(OmniError::storage)?;
         equivalent(&source, &current).await?;
+        if intent.protocol == 5 {
+            validate_converted_contract(&current, &intent).await?;
+        }
     }
     verify_inventory(root, &intent, true).await?;
     let main = open(root, None).await?;
     if intent_from(&main)?.as_ref() != Some(&intent) {
         return Err(invalid("activation ownership changed"));
+    }
+    if intent.protocol == 5 {
+        legacy_schema_files::cleanup(root, storage.as_ref(), &contract).await?;
+        verify_inventory(root, &intent, true).await?;
     }
     fail(&UPGRADE_BEFORE_ACTIVATION)?;
     publish_activation(main).await?;
@@ -648,11 +798,7 @@ async fn inventory(main: &Dataset, graph_identity: String) -> Result<UpgradeInte
     names.sort();
     let mut sources = Vec::with_capacity(names.len() + 1);
     for native in names {
-        if crate::db::is_internal_system_branch(&native) {
-            return Err(invalid(
-                "resolve schema recovery and internal branches before upgrade",
-            ));
-        }
+        refuse_legacy_sentinel(&native)?;
         let ds = main
             .checkout_branch(&native)
             .await
@@ -677,7 +823,8 @@ async fn inventory(main: &Dataset, graph_identity: String) -> Result<UpgradeInte
             6 => 1,
             7 => 2,
             8 | 9 => 3,
-            _ => 4,
+            10 => 4,
+            _ => 5,
         },
         attempt: ulid::Ulid::new().to_string(),
         source_format,
@@ -685,10 +832,12 @@ async fn inventory(main: &Dataset, graph_identity: String) -> Result<UpgradeInte
             6 => 7,
             7 => 8,
             8 | 9 => 10,
+            10 => 11,
             _ => DEFAULT_TARGET,
         },
         graph_identity,
         branches: sources,
+        schema_contract: None,
     })
 }
 
@@ -705,13 +854,15 @@ fn verify_source_head(
     if dataset.version().version != expected {
         return Err(invalid("source branch changed; refusing foreign movement"));
     }
-    if read_stamp(dataset)
-        != Some(if fenced {
-            intent.target_format
-        } else {
-            intent.source_format
-        })
-    {
+    let stamp = read_stamp(dataset);
+    let valid_stamp = if fenced {
+        stamp == Some(intent.target_format)
+    } else if intent.protocol == 5 {
+        matches!(stamp, Some(11 | 12))
+    } else {
+        stamp == Some(intent.source_format)
+    };
+    if !valid_stamp {
         return Err(invalid("source branch has an incompatible format"));
     }
     Ok(())
@@ -775,7 +926,12 @@ fn confined(root: &str, dataset: &Dataset) -> Result<()> {
     Ok(())
 }
 
-async fn preflight(root: &str, intent: &UpgradeIntent, work: &mut UpgradeWork) -> Result<()> {
+async fn preflight(
+    root: &str,
+    intent: &UpgradeIntent,
+    contract: &crate::db::manifest::SchemaContractRow,
+    work: &mut UpgradeWork,
+) -> Result<()> {
     let mut refs = HashSet::new();
     let mut logical_names = HashSet::from(["main"]);
     for native in intent
@@ -797,7 +953,11 @@ async fn preflight(root: &str, intent: &UpgradeIntent, work: &mut UpgradeWork) -
             .checkout_version(branch.version)
             .await
             .map_err(OmniError::storage)?;
-        if read_stamp(&source) != Some(intent.source_format) {
+        if if intent.protocol == 5 {
+            !matches!(read_stamp(&source), Some(11 | 12))
+        } else {
+            read_stamp(&source) != Some(intent.source_format)
+        } {
             return Err(invalid("source history has an unsupported format"));
         }
         if source
@@ -814,6 +974,19 @@ async fn preflight(root: &str, intent: &UpgradeIntent, work: &mut UpgradeWork) -
         validate_metadata_budget(&source).await?;
         let (old, lineage) =
             crate::db::manifest::state::read_manifest_state_and_lineage(&source).await?;
+        if intent.protocol == 5 {
+            if old.schema_contract.is_some() {
+                return Err(invalid(
+                    "legacy source unexpectedly carries a schema contract row",
+                ));
+            }
+            let (ir, _) = crate::db::schema_state::validate_schema_contract_row(contract)?;
+            crate::db::schema_state::validate_schema_ir_against_entries(
+                &ir,
+                old.entries.iter(),
+                old.version,
+            )?;
+        }
         if intent.source_format == 6 {
             validate_source_branch_identity(branch, &old, &lineage)?;
         } else if branch.native.is_some()
@@ -828,7 +1001,9 @@ async fn preflight(root: &str, intent: &UpgradeIntent, work: &mut UpgradeWork) -
         }
         let schema: Schema = source.schema().into();
         let expected = flat_manifest_schema();
-        if schema.fields().len() != expected.fields().len()
+        if intent.protocol == 5 {
+            crate::db::manifest::migrations::validate_schema_contract_source(&source)?;
+        } else if schema.fields().len() != expected.fields().len()
             || schema
                 .fields()
                 .iter()
@@ -1134,6 +1309,7 @@ async fn publish_conversion(
     source: Dataset,
     branch: &SourceBranch,
     intent: &UpgradeIntent,
+    contract: &crate::db::manifest::SchemaContractRow,
 ) -> Result<()> {
     let mut metadata = source.schema().metadata.clone();
     metadata.insert(
@@ -1152,7 +1328,7 @@ async fn publish_conversion(
         serde_json::to_string(&receipt(branch, intent)).map_err(|e| invalid(e.to_string()))?,
     );
     let destination = Arc::new(current);
-    let transaction = if intent.source_format != 6 {
+    let transaction = if intent.source_format != 6 && intent.protocol != 5 {
         let operation = Operation::UpdateConfig {
             config_updates: None,
             table_metadata_updates: None,
@@ -1167,30 +1343,44 @@ async fn publish_conversion(
         };
         Transaction::new(destination.version().version, operation, None)
     } else {
-        let schema: Schema = source.schema().into();
-        let schema = Arc::new(schema.with_metadata(metadata));
-        let mut scan = source.scan();
-        let mut columns: Vec<String> = schema
-            .fields()
-            .iter()
-            .map(|field| field.name().clone())
-            .collect();
-        columns.push("_row_last_updated_at_version".into());
-        scan.project(&columns).map_err(OmniError::storage)?;
-        scan.batch_size(1024);
-        let batches = scan.try_into_stream().await.map_err(OmniError::storage)?;
-        let output_schema = Arc::clone(&schema);
-        let mut seen = HashSet::new();
-        let version = source.version().version;
-        let converted = batches
-            .map_err(datafusion::error::DataFusionError::from)
-            .and_then(move |batch| {
-                let result = convert_batch(batch, Arc::clone(&output_schema), version, &mut seen)
-                    .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)));
-                futures::future::ready(result)
-            });
-        let stream: datafusion::physical_plan::SendableRecordBatchStream =
-            Box::pin(RecordBatchStreamAdapter::new(schema, converted));
+        let stream: datafusion::physical_plan::SendableRecordBatchStream = if intent.protocol == 5 {
+            let (schema, batches) =
+                crate::db::manifest::migrations::schema_contract_conversion_batches(
+                    &source, metadata, contract,
+                )
+                .await?;
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::iter(batches.into_iter().map(Ok)),
+            ))
+        } else {
+            let schema: Schema = source.schema().into();
+            let schema = Arc::new(schema.with_metadata(metadata));
+            let mut scan = source.scan();
+            let mut columns: Vec<String> = schema
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect();
+            columns.push("_row_last_updated_at_version".into());
+            scan.project(&columns).map_err(OmniError::storage)?;
+            scan.batch_size(1024);
+            let batches = scan.try_into_stream().await.map_err(OmniError::storage)?;
+            let output_schema = Arc::clone(&schema);
+            let mut seen = HashSet::new();
+            let version = source.version().version;
+            let converted = batches
+                .map_err(datafusion::error::DataFusionError::from)
+                .and_then(move |batch| {
+                    let result =
+                        convert_batch(batch, Arc::clone(&output_schema), version, &mut seen)
+                            .map_err(|error| {
+                                datafusion::error::DataFusionError::External(Box::new(error))
+                            });
+                    futures::future::ready(result)
+                });
+            Box::pin(RecordBatchStreamAdapter::new(schema, converted))
+        };
         let params = WriteParams {
             mode: WriteMode::Overwrite,
             enable_stable_row_ids: true,
@@ -1218,7 +1408,11 @@ async fn publish_conversion(
             "storage conversion publication did not carry its receipt",
         ));
     }
-    equivalent(&source, &target).await
+    equivalent(&source, &target).await?;
+    if intent.protocol == 5 {
+        validate_converted_contract(&target, intent).await?;
+    }
+    Ok(())
 }
 
 fn convert_batch(

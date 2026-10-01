@@ -177,12 +177,6 @@ pub fn is_merge_input_tag(name: &str) -> bool {
     matches!(merge_input_owner(name), Ok(Some(_)))
 }
 
-pub const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";
-
-pub fn is_schema_apply_lock_branch(name: &str) -> bool {
-    name.trim_start_matches('/') == SCHEMA_APPLY_LOCK_BRANCH
-}
-
 /// Resolve a logical branch to its single live native ref.
 ///
 /// `Ok(None)` means no incarnation exists. More than one live incarnation is a

@@ -6,9 +6,11 @@
 //! decorator uses and the GQT worker otherwise leaves empty, so every store
 //! the engine's registry builds is wrapped: `__manifest` and table traffic,
 //! spawned tasks and cached handles all pass through one ledger. The control
-//! realm: the schema contract, its staging twins, the init claim and probe,
-//! the legacy `__recovery/` listing and the graph-index artifact go through
-//! the engine's `StorageAdapter`, whose DST store is a second in-memory
+//! realm: init claims, capability probes, manifest-root preflights and
+//! graph-index artifacts go through the engine's `StorageAdapter`; legacy
+//! schema and recovery paths also have control classes. The live schema
+//! contract is inline in `__manifest`, in the Lance realm. The adapter's
+//! DST store is a second in-memory
 //! object store the registry never builds; the worker wraps the adapter it
 //! hands the engine ([`wrap_adapter`], the `control` module) and logs each
 //! call as the requests that adapter makes for it, under `control_<kind>`

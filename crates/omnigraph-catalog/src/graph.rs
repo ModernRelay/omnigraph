@@ -19,8 +19,8 @@ use super::layout::{
 use super::metadata::TableVersionMetadata;
 use super::migrations::{guard_stamp, stamp_entry, stamp_for_system_columns};
 use super::state::{
-    DatasetEntry, GraphLineageRow, ManifestState, entries_to_batch, graph_lineage_row_parts,
-    read_manifest_state, read_manifest_state_and_lineage,
+    DatasetEntry, GraphLineageRow, ManifestState, SchemaContractRow, entries_to_batch,
+    graph_lineage_row_parts, read_manifest_state, read_manifest_state_and_lineage,
 };
 use super::{TableIdentity, table_path_for_identity};
 use crate::record::{compact_to_storage, manifest_storage_schema};
@@ -113,13 +113,15 @@ impl From<ManifestInitError> for OmniError {
     }
 }
 
-/// Assembles the initial entries, genesis lineage, and internal-schema stamp,
-/// and lands them all in the one `__manifest` Create commit. A returned error
-/// from the Create call is acknowledgement-unknown; reading the state back is
+/// Assembles the initial entries, genesis lineage, the `schema_contract` row
+/// and the internal-schema stamp, and lands them all in the one `__manifest`
+/// Create commit. A returned error from the Create call is
+/// acknowledgement-unknown; reading the state back is
 /// `load_initial_manifest_state`, on the confirmed post-commit side.
 pub(crate) async fn init_manifest_graph(
     root_uri: &str,
     catalog: &Catalog,
+    contract: &SchemaContractRow,
     control_session: &Arc<lance::session::Session>,
     attempt: &GenesisManifestAttempt,
 ) -> std::result::Result<Dataset, ManifestInitError> {
@@ -131,7 +133,12 @@ pub(crate) async fn init_manifest_graph(
     // commit as every table entry and the internal-schema stamp.
     let genesis_lineage = graph_lineage_row_parts(attempt.lineage(), None)?;
 
-    let manifest_batch = entries_to_batch(&entries, &version_metadata, &genesis_lineage)?;
+    let manifest_batch = entries_to_batch(
+        &entries,
+        &version_metadata,
+        &genesis_lineage,
+        Some(contract),
+    )?;
     // The internal-schema stamp rides the Create write's schema metadata, so
     // the stamp is atomic with manifest birth: no crash window can leave
     // `__manifest` durable but unstamped. The Create commit is the manifest's
@@ -236,6 +243,12 @@ pub(crate) async fn open_exact_genesis_manifest(
             "main graph head does not match this initialization attempt",
         ));
     }
+    if known_state.schema_contract.is_none() {
+        return Err(genesis_probe_mismatch(
+            root_uri,
+            "genesis carries no schema_contract row",
+        ));
+    }
     Ok((dataset, known_state, lineage_rows))
 }
 
@@ -308,7 +321,7 @@ pub(crate) async fn snapshot_state_at(
     root_uri: &str,
     branch: Option<&str>,
     version: u64,
-) -> Result<ManifestState> {
+) -> Result<(Dataset, ManifestState)> {
     let control_session = crate::lance_access::control_session();
     let dataset = open_manifest_dataset_with_session(
         root_uri.trim_end_matches('/'),
@@ -320,7 +333,8 @@ pub(crate) async fn snapshot_state_at(
         .checkout_version(version)
         .await
         .map_err(OmniError::storage)?;
-    read_manifest_state(&dataset).await
+    let state = read_manifest_state(&dataset).await?;
+    Ok((dataset, state))
 }
 
 async fn build_initial_entries(

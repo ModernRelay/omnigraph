@@ -1511,7 +1511,7 @@ impl omnigraph::seams::Decide for MergeReturnHold {
 #[tokio::test(flavor = "multi_thread")]
 async fn disconnected_writes_keep_admission_until_the_original_operation_finishes() {
     use omnigraph::seams::catalog::{
-        BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE, SCHEMA_APPLY_POST_SENTINEL,
+        BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE, SCHEMA_RELOAD_BEFORE_CONTRACT_READ,
     };
     const ATOMIC: &str = r#"query atomic() {
         insert Person { name: "Owned", age: 41 }
@@ -1585,12 +1585,7 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
                         // schema gate, without publishing a main graph commit.
                         holder_db.branch_create("gate-holder").await.unwrap();
                     } else {
-                        let unchanged_schema = fs::read_to_string(fixture("test.pg")).unwrap();
-                        let result = holder_db.apply_schema(&unchanged_schema).await.unwrap();
-                        assert!(
-                            !result.applied,
-                            "the holder must not alter the victim's authority"
-                        );
+                        holder_db.refresh().await.unwrap();
                     }
                 });
         });
@@ -1598,7 +1593,7 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
         let seam = if door == "/branches/merge" {
             &BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE
         } else {
-            &SCHEMA_APPLY_POST_SENTINEL
+            &SCHEMA_RELOAD_BEFORE_CONTRACT_READ
         };
         let guard = seam.install(Arc::new(MergeReturnHold {
             thread: holder_thread.thread().id(),
@@ -4457,8 +4452,17 @@ async fn pre_effect_delete_failure_preserves_receipt_and_write_capacity_under_sl
             .unwrap();
         assert_eq!(held_read.status(), StatusCode::OK);
         assert_eq!(operations.snapshot().active_reads, 1);
-        let schema = graph.join("_schema.pg");
-        let saved = graph.join("schema-held.pg");
+        let mut branch_refs = fs::read_dir(graph.join("__manifest/_refs/branches"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(branch_refs.len(), 1, "the fixture has one named branch");
+        let branch_ref = branch_refs.pop().unwrap();
+        let saved = fs::read(&branch_ref).unwrap();
         let (status, output) = if compound {
             let request_app = app.clone();
             let (start, started) = std::sync::mpsc::channel();
@@ -4477,11 +4481,10 @@ async fn pre_effect_delete_failure_preserves_receipt_and_write_capacity_under_sl
                     ))
             });
             let thread = request.thread().id();
-            let source = schema.clone();
-            let destination = saved.clone();
+            let source = branch_ref.clone();
             let guard = BRANCH_MERGE_PRE_RETURN.observe(move || {
                 if std::thread::current().id() == thread {
-                    fs::rename(&source, &destination).unwrap();
+                    fs::write(&source, b"{").unwrap();
                 }
             });
             start.send(()).unwrap();
@@ -4489,7 +4492,7 @@ async fn pre_effect_delete_failure_preserves_receipt_and_write_capacity_under_sl
             drop(guard);
             result
         } else {
-            fs::rename(&schema, &saved).unwrap();
+            fs::write(&branch_ref, b"{").unwrap();
             json_response(
                 &app,
                 Request::builder()
@@ -4501,7 +4504,7 @@ async fn pre_effect_delete_failure_preserves_receipt_and_write_capacity_under_sl
             )
             .await
         };
-        fs::rename(&saved, &schema).unwrap();
+        fs::write(&branch_ref, &saved).unwrap();
         if compound {
             assert_eq!(status, StatusCode::OK, "{output}");
             assert_eq!(output["outcome"], "fast_forward");
@@ -4518,7 +4521,7 @@ async fn pre_effect_delete_failure_preserves_receipt_and_write_capacity_under_sl
         }
         assert!(
             !operations.snapshot().closed,
-            "a proven schema read failure has no deletion effects"
+            "a proven manifest read failure has no deletion effects"
         );
         assert_eq!(workload.snapshot().ingress_count, 0);
         let (status, sentinel) = json_response(
