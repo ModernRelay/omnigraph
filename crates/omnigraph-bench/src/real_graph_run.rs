@@ -936,7 +936,7 @@ async fn execute_worker(
             ),
         ));
     }
-    if outcome != MergeOutcome::Merged {
+    if outcome.outcome != MergeOutcome::Merged {
         return Err(RealGraphRunError::new(
             "real_graph_vacuous_merge",
             format!("expected Merged, observed {outcome:?}"),

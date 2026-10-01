@@ -19,6 +19,8 @@ pub(crate) enum V1Refusal {
     OrderKey,
     SubqueryPredicate,
     StringNearest,
+    EdgeSelection,
+    EdgeTypeMetadata,
 }
 
 impl V1Refusal {
@@ -33,6 +35,8 @@ impl V1Refusal {
             }
             Self::SubqueryPredicate => "correlated subquery predicates other than not { … }",
             Self::StringNearest => "text queries in nearest",
+            Self::EdgeSelection => "edge alternatives and wildcards",
+            Self::EdgeTypeMetadata => "edge type metadata access",
         }
     }
 
@@ -45,6 +49,18 @@ impl V1Refusal {
 /// comparison over property, literal and parameter operands or the search call,
 /// a Boolean node in `return` or `order`, or an order key of another shape.
 pub(crate) fn v1_refusal(ir: &QueryIR) -> Option<V1Refusal> {
+    if ir.has_edge_selections() {
+        return Some(V1Refusal::EdgeSelection);
+    }
+    if ir
+        .return_exprs
+        .iter()
+        .any(|projection| has_edge_type(&projection.expr))
+        || ir.order_by.iter().any(|key| has_edge_type(&key.expr))
+        || pipeline_has_edge_type(&ir.pipeline)
+    {
+        return Some(V1Refusal::EdgeTypeMetadata);
+    }
     if let Some(refusal) = pipeline_refusal(&ir.pipeline) {
         return Some(refusal);
     }
@@ -92,6 +108,59 @@ fn pipeline_refusal(pipeline: &[IROp]) -> Option<V1Refusal> {
         }
         IROp::AntiJoin { inner, .. } => pipeline_refusal(inner),
     })
+}
+
+fn pipeline_has_edge_type(pipeline: &[IROp]) -> bool {
+    pipeline.iter().any(|op| match op {
+        IROp::NodeScan { filters, .. }
+        | IROp::Expand {
+            dst_filters: filters,
+            ..
+        } => filters.iter().any(has_edge_type),
+        IROp::Filter(expr) => has_edge_type(expr),
+        IROp::AntiJoin {
+            inner, predicate, ..
+        } => {
+            pipeline_has_edge_type(inner)
+                || predicate.arg.as_ref().is_some_and(has_edge_type)
+                || has_edge_type(&predicate.right)
+        }
+    })
+}
+
+fn has_edge_type(expr: &IRExpr) -> bool {
+    match expr {
+        IRExpr::PropAccess { property, .. } => {
+            property == omnigraph_compiler::traversal::EDGE_TYPE_COLUMN
+        }
+        IRExpr::Binary { left, right, .. } => has_edge_type(left) || has_edge_type(right),
+        IRExpr::Not(arg)
+        | IRExpr::IsNull { expr: arg, .. }
+        | IRExpr::Aggregate { arg, .. }
+        | IRExpr::Nearest { query: arg, .. } => has_edge_type(arg),
+        IRExpr::Search { field, query }
+        | IRExpr::MatchText { field, query }
+        | IRExpr::Bm25 { field, query } => has_edge_type(field) || has_edge_type(query),
+        IRExpr::Fuzzy {
+            field,
+            query,
+            max_edits,
+        } => {
+            has_edge_type(field)
+                || has_edge_type(query)
+                || max_edits.as_deref().is_some_and(has_edge_type)
+        }
+        IRExpr::Rrf {
+            primary,
+            secondary,
+            k,
+        } => {
+            has_edge_type(primary)
+                || has_edge_type(secondary)
+                || k.as_deref().is_some_and(has_edge_type)
+        }
+        IRExpr::Variable(_) | IRExpr::Param(_) | IRExpr::Literal(_) | IRExpr::AliasRef(_) => false,
+    }
 }
 
 fn filter_refusal(filter: &IRExpr) -> Option<V1Refusal> {

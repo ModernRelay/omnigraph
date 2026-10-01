@@ -8,8 +8,11 @@ fn expand_destination_filters_and_projection_belong_to_its_dependent_scan() {
             IROp::Expand {
                 src_var: "a".to_string(),
                 dst_var: "b".to_string(),
-                edge_type: "knows".to_string(),
-                direction: Direction::Out,
+                edges: EdgeSelection::Named(EdgeMember {
+                    edge_type: "knows".to_string(),
+                    direction: Direction::Out,
+                }),
+                src_type: "T".to_string(),
                 dst_type: "T".to_string(),
                 min_hops: 1,
                 max_hops: Some(1),
@@ -137,14 +140,14 @@ fn physical_expand_carries_its_pinned_edge_version() {
     assert!(physical.live().any(|(_, node)| matches!(
         node,
         PhysicalNode::Expand {
-            version: Some(5),
+            versions,
             ..
-        }
+        } if versions.get("knows") == Some(&Some(5))
     )));
     let json = physical.to_json();
     let expand = &json["inputs"][0]["inputs"][0]["inputs"][0];
     assert_eq!(expand["node"], "Expand");
-    assert_eq!(expand["version"], 5);
+    assert_eq!(expand["versions"]["knows"], 5);
     let bound = omnigraph_planner::BoundPlan {
         plan: physical,
         values: omnigraph_planner::ValueTable {

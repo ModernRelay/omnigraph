@@ -40,7 +40,7 @@ use serde_json::Value;
 
 use crate::report::Row;
 
-const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `hash join $var[ ran <hash_join|id_lookup>]`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a, $b]`, `sort no tiebreak`, `pass <name>`, `not pass <name>`";
+const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `hash join $var[ ran <hash_join|id_lookup>]`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `rank fuse row tiebreak [$e.@type, $e.@id]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `pass <name>`, `not pass <name>`";
 
 const ID_LOOKUP: &str = "id_lookup";
 const JOIN_SIDES: [&str; 2] = ["hash_join", "id_lookup"];
@@ -109,14 +109,23 @@ pub(crate) enum PlanLine {
     /// ended on that mode.
     ExpandMode {
         src: String,
-        edge_type: String,
+        edge_type: Option<String>,
         dst: String,
         mode: String,
         ran: Option<String>,
     },
+    /// Exact resolved selection, including member order and direction.
+    EdgeSelection {
+        src: String,
+        dst: String,
+        selection_kind: String,
+        members: Vec<(String, String)>,
+    },
+    /// Exact downstream identity keys declared by a physical RankFuse.
+    RankFuse { tiebreak: Vec<String> },
     /// An in-memory `Filter` node stays in the plan reading exactly `reads`.
     Filter { reads: Vec<String> },
-    /// A physical `Sort` declares exactly the ids of `tiebreak` after its
+    /// A physical `Sort` declares exactly the ordered identity keys after its
     /// keys, none when empty.
     Sort { tiebreak: Vec<String> },
     /// The optimizer pass `name` fired, or did not when `negated`.
@@ -175,6 +184,21 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             lines.push(PlanLine::Filter { reads });
             continue;
         }
+        if let Some(claim) = line.strip_prefix("rank fuse ") {
+            let tiebreak = if claim.trim() == "no row tiebreak" {
+                Vec::new()
+            } else {
+                claim
+                    .trim()
+                    .strip_prefix("row tiebreak")
+                    .and_then(identity_key_list)
+                    .ok_or_else(|| {
+                        refused("claims `row tiebreak [$a.@id, $e.@type]` or `no row tiebreak`")
+                    })?
+            };
+            lines.push(PlanLine::RankFuse { tiebreak });
+            continue;
+        }
         if let Some(claim) = line.strip_prefix("sort ") {
             let claim = claim.trim();
             let tiebreak = if claim == "no tiebreak" {
@@ -182,7 +206,7 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             } else {
                 claim
                     .strip_prefix("tiebreak")
-                    .and_then(binding_list)
+                    .and_then(identity_key_list)
                     .ok_or_else(|| refused("claims `tiebreak [$a, $b]` or `no tiebreak`"))?
             };
             lines.push(PlanLine::Sort { tiebreak });
@@ -239,7 +263,7 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             (rest, true)
         } else {
             return Err(refused(
-                "knows eight line heads: `scan`, `hash join`, `contains join`, `cross join`, `expand`, `filter`, `sort`, `pass`",
+                "knows nine line heads: `scan`, `hash join`, `contains join`, `cross join`, `expand`, `filter`, `sort`, `rank fuse`, `pass`",
             ));
         };
         let Some((selector, claim)) = rest.split_once(':') else {
@@ -247,14 +271,58 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
         };
         if expand {
             let ends: Vec<&str> = selector.split_whitespace().collect();
-            let [src, edge_type, dst] = ends[..] else {
-                return Err(refused("spells the traversal `$src <Edge> $dst`"));
+            let (src, edge_type, dst) = match ends.as_slice() {
+                [src, dst] => (*src, None, *dst),
+                [src, edge, dst] if identifier(edge) => (*src, Some((*edge).to_string()), *dst),
+                _ => return Err(refused("spells `$src [<Edge>] $dst`")),
             };
             let (Some(src), Some(dst)) = (src.strip_prefix('$'), dst.strip_prefix('$')) else {
                 return Err(refused("names both bindings with `$`"));
             };
-            if !identifier(src) || !identifier(dst) || !identifier(edge_type) {
-                return Err(refused("names nonempty traversal bindings and edge type"));
+            if !identifier(src) || !identifier(dst) {
+                return Err(refused("names nonempty traversal bindings"));
+            }
+            if let Some(selection) = claim.trim().strip_prefix("selection ") {
+                if edge_type.is_some() {
+                    return Err(refused("selection names only its endpoint bindings"));
+                }
+                let (kind, list) = selection
+                    .split_once(' ')
+                    .ok_or_else(|| refused("lists selection members"))?;
+                if !["named", "alternation", "wildcard"].contains(&kind) {
+                    return Err(refused("uses named, alternation or wildcard"));
+                }
+                let inner = list
+                    .trim()
+                    .strip_prefix('[')
+                    .and_then(|list| list.strip_suffix(']'))
+                    .ok_or_else(|| refused("lists members in [...]"))?;
+                let mut members = Vec::new();
+                if !inner.trim().is_empty() {
+                    for member in inner.split(',') {
+                        let (name, direction) = member
+                            .trim()
+                            .rsplit_once(' ')
+                            .ok_or_else(|| refused("spells each member as `Type out|in|both`"))?;
+                        let name = if name.starts_with('"') {
+                            serde_json::from_str::<String>(name).ok()
+                        } else {
+                            identifier(name).then(|| name.to_string())
+                        }
+                        .ok_or_else(|| refused("names a member type"))?;
+                        if !["out", "in", "both"].contains(&direction) {
+                            return Err(refused("uses out, in or both"));
+                        }
+                        members.push((name, direction.to_string()));
+                    }
+                }
+                lines.push(PlanLine::EdgeSelection {
+                    src: src.to_string(),
+                    dst: dst.to_string(),
+                    selection_kind: kind.to_string(),
+                    members,
+                });
+                continue;
             }
             let (mode, ran) = claim
                 .trim()
@@ -265,7 +333,7 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
                 })?;
             lines.push(PlanLine::ExpandMode {
                 src: src.to_string(),
-                edge_type: edge_type.to_string(),
+                edge_type,
                 dst: dst.to_string(),
                 mode,
                 ran,
@@ -398,21 +466,35 @@ fn identifier(name: &str) -> bool {
 }
 
 /// A non-empty `[$a, $b]` list of bindings, or `None` when the text is not one.
-fn binding_list(text: &str) -> Option<Vec<String>> {
+fn identity_key_list(text: &str) -> Option<Vec<String>> {
     bracket_list(text, |part| {
-        let binding = part.strip_prefix('$')?;
-        identifier(binding).then(|| binding.to_string())
+        let text = part.strip_prefix('$')?;
+        let (binding, property) = text.split_once('.').unwrap_or((text, "@id"));
+        (identifier(binding) && ["@id", "@type"].contains(&property))
+            .then(|| format!("${binding}.{property}"))
     })
 }
 
-/// The binding of a `Sort` row's tie-break key: `$p.@id` names `p`.
-fn tiebreak_binding(key: &str) -> String {
-    key.strip_prefix('$')
-        .unwrap_or(key)
-        .split('.')
-        .next()
-        .unwrap_or_default()
-        .to_string()
+fn declared_keys(node: &Value, key: &str) -> Result<Vec<String>, String> {
+    node.get(key)
+        .and_then(Value::as_array)
+        .and_then(|keys| {
+            keys.iter()
+                .map(|key| key.as_str().map(str::to_string))
+                .collect()
+        })
+        .ok_or_else(|| {
+            let kind = node
+                .get("node")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let id = node
+                .get("id")
+                .and_then(Value::as_u64)
+                .map(|id| format!(" (node {id})"))
+                .unwrap_or_default();
+            format!("expect plan: the physical `{kind}`{id} carries no `{key}` key")
+        })
 }
 
 fn column_list(text: &str) -> Option<Vec<String>> {
@@ -472,7 +554,7 @@ struct PlannedScan {
 struct PlannedExpandMode {
     id: Option<u64>,
     src: String,
-    edge_type: String,
+    edge_type: Option<String>,
     dst: String,
     mode: String,
 }
@@ -563,6 +645,8 @@ struct PlannedNodes {
     contains_joins: Vec<PlannedContainsJoin>,
     cross_joins: Vec<Vec<String>>,
     sorts: Vec<Result<Vec<String>, String>>,
+    fusions: Vec<Result<Vec<String>, String>>,
+    selections: Vec<(String, String, Value)>,
 }
 
 fn planned_physical(node: &Value, out: &mut PlannedNodes) {
@@ -574,13 +658,28 @@ fn planned_physical(node: &Value, out: &mut PlannedNodes) {
     };
     let id = node.get("id").and_then(Value::as_u64);
     match node.get("node").and_then(Value::as_str) {
-        Some("Expand") => out.modes.push(PlannedExpandMode {
-            id,
-            src: text("src"),
-            edge_type: text("edge_type"),
-            dst: text("dst"),
-            mode: text("mode"),
-        }),
+        Some("Expand") => {
+            out.selections.push((
+                text("src"),
+                text("dst"),
+                node.get("edges").cloned().unwrap_or(Value::Null),
+            ));
+            out.modes.push(PlannedExpandMode {
+                id,
+                src: text("src"),
+                edge_type: node
+                    .get("edges")
+                    .filter(|edges| edges.get("kind").and_then(Value::as_str) == Some("named"))
+                    .and_then(|edges| edges.get("members"))
+                    .and_then(Value::as_array)
+                    .and_then(|members| members.first())
+                    .and_then(|member| member.get("edge_type"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                dst: text("dst"),
+                mode: text("mode"),
+            });
+        }
         Some("Scan") => out.accesses.push(PlannedAccess {
             type_key: text("table"),
             binding: node
@@ -628,22 +727,8 @@ fn planned_physical(node: &Value, out: &mut PlannedNodes) {
                 .map(str::to_string)
                 .collect(),
         ),
-        Some("Sort") => out.sorts.push(
-            node.get("tiebreak")
-                .and_then(Value::as_array)
-                .map(|keys| {
-                    sorted_set(
-                        keys.iter()
-                            .filter_map(Value::as_str)
-                            .map(tiebreak_binding)
-                            .collect(),
-                    )
-                })
-                .ok_or_else(|| {
-                    let node = id.map(|id| format!(" (node {id})")).unwrap_or_default();
-                    format!("expect plan: the physical `Sort`{node} carries no `tiebreak` key")
-                }),
-        ),
+        Some("Sort") => out.sorts.push(declared_keys(node, "tiebreak")),
+        Some("RankFuse") => out.fusions.push(declared_keys(node, "row_tiebreak")),
         _ => {}
     }
     if let Some(inputs) = node.get("inputs").and_then(Value::as_array) {
@@ -796,6 +881,35 @@ pub(crate) fn plan_mismatch(
                     ));
                 }
             }
+            PlanLine::EdgeSelection {
+                src,
+                dst,
+                selection_kind,
+                members,
+            } => {
+                let want = serde_json::json!({"kind":selection_kind,"members":members.iter().map(|(name,direction)| serde_json::json!({"edge_type":name,"direction":direction})).collect::<Vec<_>>()});
+                let selected: Vec<_> = nodes
+                    .selections
+                    .iter()
+                    .filter(|(from, to, _)| from == src && to == dst)
+                    .collect();
+                if selected.is_empty() || selected.iter().any(|(_, _, edges)| edges != &want) {
+                    return Some(format!(
+                        "expect plan: selection `${src} -> ${dst}` is not {want}; found {selected:?}"
+                    ));
+                }
+            }
+            PlanLine::RankFuse { tiebreak } => {
+                let declared = match nodes.fusions.iter().cloned().collect::<Result<Vec<_>, _>>() {
+                    Ok(declared) => declared,
+                    Err(missing) => return Some(missing),
+                };
+                if !declared.contains(tiebreak) {
+                    return Some(format!(
+                        "expect plan: no RankFuse row tie-breaks on {tiebreak:?}; found {declared:?}"
+                    ));
+                }
+            }
             PlanLine::Sort { tiebreak } => {
                 if nodes.sorts.is_empty() {
                     return Some("expect plan: the physical plan has no `Sort`".to_string());
@@ -804,7 +918,7 @@ pub(crate) fn plan_mismatch(
                     Ok(declared) => declared,
                     Err(missing) => return Some(missing),
                 };
-                let want = sorted_set(tiebreak.clone());
+                let want = tiebreak.clone();
                 if !declared.contains(&want) {
                     return Some(format!(
                         "expect plan: no sort tie-breaks on {want:?}; the plan's sorts tie-break on {declared:?}"
@@ -822,9 +936,14 @@ pub(crate) fn plan_mismatch(
                     .modes
                     .iter()
                     .filter(|expand| {
-                        expand.src == *src && expand.edge_type == *edge_type && expand.dst == *dst
+                        expand.src == *src
+                            && edge_type
+                                .as_ref()
+                                .is_none_or(|wanted| expand.edge_type.as_ref() == Some(wanted))
+                            && expand.dst == *dst
                     })
                     .collect();
+                let edge_type = edge_type.as_deref().unwrap_or("*");
                 if selected.is_empty() {
                     return Some(format!(
                         "expect plan: no expand `${src} {edge_type} ${dst}` in the physical plan"
@@ -1184,6 +1303,46 @@ mod tests {
         plan_mismatch(lines, explain, None)
     }
 
+    #[test]
+    fn selected_members_and_identity_claims_detect_missing_or_reordered_keys() {
+        let claims = parse_plan_body(&[
+            (
+                0,
+                "expand $a $b: selection alternation [Knows out, Likes in]",
+            ),
+            (1, "expand $a $b: mode indexed_scan"),
+            (2, "sort tiebreak [$e.@type, $e.@id]"),
+            (3, "rank fuse row tiebreak [$e.@type, $e.@id]"),
+        ])
+        .unwrap();
+        let doc = json!({"physical_plan":{"node":"Sort","tiebreak":["$e.@type","$e.@id"],"inputs":[
+            {"node":"RankFuse","row_tiebreak":["$e.@type","$e.@id"],"inputs":[
+                {"node":"Expand","src":"a","dst":"b","mode":"indexed_scan","edges":{"kind":"alternation","members":[{"edge_type":"Knows","direction":"out"},{"edge_type":"Likes","direction":"in"}]}}
+            ]}
+        ]}});
+        assert_eq!(check(&claims, &doc), None);
+        for replacement in [json!(["$e.@id"]), json!(["$e.@id", "$e.@type"])] {
+            let mut wrong = doc.clone();
+            wrong["physical_plan"]["tiebreak"] = replacement.clone();
+            assert!(check(&claims, &wrong).is_some());
+            let mut wrong = doc.clone();
+            wrong["physical_plan"]["inputs"][0]["row_tiebreak"] = replacement;
+            assert!(check(&claims, &wrong).is_some());
+        }
+        for replacement in [json!("out"), json!("both")] {
+            let mut wrong = doc.clone();
+            wrong["physical_plan"]["inputs"][0]["inputs"][0]["edges"]["members"][1]["direction"] =
+                replacement;
+            assert!(check(&claims, &wrong).is_some());
+        }
+        let empty = parse_plan_body(&[(0, "expand $a $b: selection wildcard []")]).unwrap();
+        let empty_doc = json!({"physical_plan":{"node":"Expand","src":"a","dst":"b","edges":{"kind":"wildcard","members":[]}}});
+        assert_eq!(check(&empty, &empty_doc), None);
+        let mut wrong = empty_doc;
+        wrong["physical_plan"]["edges"]["kind"] = json!("alternation");
+        assert!(check(&empty, &wrong).is_some());
+    }
+
     fn explain() -> Value {
         json!({
             "logical_plan": {
@@ -1303,7 +1462,7 @@ mod tests {
         assert!(parse_plan_body(&[]).is_err());
     }
 
-    /// A `sort` line claims the ids a physical `Sort` declares after its
+    /// A `sort` line claims the ordered identity keys a physical `Sort` declares after its
     /// keys; a `Sort` row without a `tiebreak` key declares nothing to compare.
     #[test]
     fn sort_claims_read_the_declared_tiebreak() {
@@ -1313,20 +1472,22 @@ mod tests {
         assert_eq!(
             lines[0],
             PlanLine::Sort {
-                tiebreak: vec!["p".to_string()]
+                tiebreak: vec!["$p.@id".to_string()]
             }
         );
         assert_eq!(check(&lines, &declared), None);
         let mismatch = check(&lines, &bare).unwrap();
         assert!(
-            mismatch.contains("no sort tie-breaks on [\"p\"]; the plan's sorts tie-break on [[]]"),
+            mismatch
+                .contains("no sort tie-breaks on [\"$p.@id\"]; the plan's sorts tie-break on [[]]"),
             "{mismatch}"
         );
         let lines = parse_plan_body(&[(0, "sort no tiebreak")]).unwrap();
         assert_eq!(check(&lines, &bare), None);
         let mismatch = check(&lines, &declared).unwrap();
         assert!(
-            mismatch.contains("no sort tie-breaks on []; the plan's sorts tie-break on [[\"p\"]]"),
+            mismatch
+                .contains("no sort tie-breaks on []; the plan's sorts tie-break on [[\"$p.@id\"]]"),
             "{mismatch}"
         );
         let missing = json!({"physical_plan": {"node": "Sort", "id": 1}});
@@ -1348,9 +1509,9 @@ mod tests {
     #[test]
     fn expand_mode_claims_read_the_physical_plan() {
         let explain = json!({
-            "logical_plan": {"node": "Expand", "dst_type": "Doc", "dst": "e", "src": "d", "edge_type": "Knows"},
+            "logical_plan": {"node": "Expand", "dst_type": "Doc", "dst": "e", "src": "d", "edges": {"kind":"named", "members":[{"edge_type": "Knows", "direction": "out"}]}},
             "physical_plan": {"node": "Projection", "inputs": [
-                {"node": "Expand", "src": "d", "edge_type": "Knows", "dst": "e", "mode": "indexed_scan",
+                {"node": "Expand", "src": "d", "edges": {"kind":"named", "members":[{"edge_type": "Knows", "direction": "out"}]}, "dst": "e", "mode": "indexed_scan",
                  "frontier_estimate": 3, "inputs": [{"node": "Scan"}]}
             ]},
             "passes": ["resolve", "expand_mode"],
@@ -1364,7 +1525,7 @@ mod tests {
             lines[0],
             PlanLine::ExpandMode {
                 src: "d".to_string(),
-                edge_type: "Knows".to_string(),
+                edge_type: Some("Knows".to_string()),
                 dst: "e".to_string(),
                 mode: "indexed_scan".to_string(),
                 ran: None,
@@ -1400,7 +1561,7 @@ mod tests {
         let explain = json!({
             "physical_plan": {"node": "Projection", "id": 4, "inputs": [
                 {"node": "HashJoin", "id": 3, "binding": "d", "fallback": "id_lookup", "inputs": [
-                    {"node": "Expand", "id": 1, "src": "s", "edge_type": "Links", "dst": "d", "mode": "indexed_scan",
+                    {"node": "Expand", "id": 1, "src": "s", "edges": {"kind":"named", "members":[{"edge_type": "Links", "direction": "out"}]}, "dst": "d", "mode": "indexed_scan",
                      "inputs": [{"node": "Scan", "id": 0, "table": "node:Source", "binding": "s"}]},
                     {"node": "Scan", "id": 2, "table": "node:Doc", "binding": "d"}
                 ]}
@@ -1464,7 +1625,7 @@ mod tests {
             "logical_plan": {"node": "TableScan", "table": "node:Doc", "binding": "d"},
             "physical_plan": {"node": "Projection", "inputs": [
                 {"node": "HashJoin", "binding": "d", "fallback": "id_lookup", "inputs": [
-                    {"node": "Expand", "src": "s", "edge_type": "Links", "dst": "d", "mode": "csr",
+                    {"node": "Expand", "src": "s", "edges": {"kind":"named", "members":[{"edge_type": "Links", "direction": "out"}]}, "dst": "d", "mode": "csr",
                      "inputs": [{"node": "Scan", "table": "node:Source", "binding": "s"}]},
                     {"node": "Scan", "table": "node:Doc", "binding": "d"}
                 ]}
@@ -1500,7 +1661,7 @@ mod tests {
             "physical_plan": {"node": "Projection", "inputs": [
                 {"node": "Scan", "table": "node:Doc", "binding": "d", "id_restriction": "input",
                  "access": "id_lookup", "inputs": [
-                    {"node": "Expand", "src": "s", "edge_type": "Links", "dst": "d", "mode": "csr",
+                    {"node": "Expand", "src": "s", "edges": {"kind":"named", "members":[{"edge_type": "Links", "direction": "out"}]}, "dst": "d", "mode": "csr",
                      "inputs": [{"node": "Scan", "table": "node:Source", "binding": "s"}]}
                 ]}
             ]},
@@ -1811,8 +1972,8 @@ mod tests {
     fn duplicate_expand_selectors_check_every_mode() {
         let lines = parse_plan_body(&[(0, "expand $d Knows $e: mode csr")]).unwrap();
         let explain = json!({"physical_plan": {"node": "AntiJoin", "inputs": [
-            {"node":"Expand", "src":"d", "edge_type":"Knows", "dst":"e", "mode":"csr"},
-            {"node":"Expand", "src":"d", "edge_type":"Knows", "dst":"e", "mode":"indexed_scan"}
+            {"node":"Expand", "src":"d", "edges":{"kind":"named","members":[{"edge_type":"Knows","direction":"out"}]}, "dst":"e", "mode":"csr"},
+            {"node":"Expand", "src":"d", "edges":{"kind":"named","members":[{"edge_type":"Knows","direction":"out"}]}, "dst":"e", "mode":"indexed_scan"}
         ]}});
         assert!(check(&lines, &explain).unwrap().contains("indexed_scan"));
     }

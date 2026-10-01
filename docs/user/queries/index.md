@@ -44,41 +44,10 @@ as tools.
 
 ## Match patterns
 
-Inside `match { ... }`:
-
-| Pattern | Meaning |
-|---|---|
-| `$p: Person { name: $name }` | Bind nodes and filter properties. |
-| `$person worksAt $company` | Follow a directed edge. |
-| `$a knows{1,3} $b` | Follow a path from one to three hops. |
-| `$a <related> $b` | Match the edge in either direction. The edge must connect the same node type at both ends. |
-| `$a $rel:related $b` | Bind a single-hop edge instance so its properties can be used. |
-| `$p.age >= 18` | Apply a filter expression. |
-| `not { $p Blocked $other }` | Keep rows for which the inner pattern has no match. |
-| `exists { $p Blocked $other }` | Keep rows for which the inner pattern has at least one match. |
-| `count { $a authored $p } > 2` | Keep rows whose inner pattern matches more than two times. |
-| `sum($d.size) { $p owns $d } > 100` | Aggregate a property over the inner matches, then compare. |
-
-Hop counts are shortest-path distances from the start node: `{2,2}` returns the
-nodes exactly two hops away. A node is never re-reached through its own
-self-loop or through a cycle back to it. The start node is returned only
-through its own self-loop, which counts as one hop, never through a cycle.
-
-An unbound traversal has set semantics for endpoint pairs. Binding the edge
-returns one result per matching edge, so parallel edges remain distinct. Edge
-bindings are available only for a single hop.
-
-Each `$_` is a distinct anonymous node: two anonymous traversals from one
-variable are independent, so a source with two neighbours matches two by two
-rows. Binding a variable a second time (`$p: Person` after `$p` is already
-bound, at the top level or inside `not { }`) adds the second binding's
-property matches as constraints on the same rows; it never introduces a
-second `$p`. Variable names beginning with `__` are reserved.
-
-Traversal spelling begins with a lowercase letter (`worksAt` for the declared
-edge `WorksAt`); edge lookup itself is case-insensitive.
-
-Comparison operators are `=`, `!=`, `<`, `<=`, `>`, and `>=`.
+A match binds nodes and follows typed relationships. For edge alternatives,
+wildcard, bounded hops, direction and edge identity, see
+[Traversal and match patterns](traversal.md). Omitted bounds always mean
+exactly `{1,1}`; multiple hops require an explicit finite range.
 
 ### Boolean expressions and nulls
 
@@ -192,6 +161,11 @@ no binding, the bare form serves: `delete Person where @id = $who`,
 always names a user property called `id`; where none is declared it is the
 unknown-property error, which names the meta-field. Edge inserts keep
 addressing endpoints as `from` and `to`.
+
+`$e.@type` returns the bound edge's canonical schema type name as a non-null
+`String`, including on ordinary named traversals. It is synthesized query
+metadata and cannot be written. `@src` and `@dst` preserve stored orientation,
+including when the query traverses in reverse.
 
 ## Return, order, and limit
 
@@ -312,20 +286,20 @@ Use `set`, `reset`, and `show` to configure query execution. See
 
 ## Linting
 
-Validate queries without running them:
+Validate queries without running them; a refusal reports a stable code, its
+position or stage, the expectation and one fix ([Diagnostics](diagnostics.md)):
 
 ```bash
 omnigraph lint --query queries.gq --schema schema.pg --json
 ```
 
-`Q000` identifies parse errors. A file that holds a [branch
-statement](../branching/index.md) where query declarations were expected also
-reports `Q000`. A [settings line](#session-settings) that names an unknown
-setting or a value outside its row reports `ERROR line <n>, column <c>:
-<message>`. `L201` warns when a nullable
-property is never set by any update query in the inspected set. Type errors
-report the affected query and source location. The command exits nonzero when
-the overall status is an error.
+`Q000` identifies a file the parser refused, at `line <n>, column <c>`; a
+[branch statement](../branching/index.md) where declarations were expected
+and a [settings line](#session-settings) naming an unknown setting or a value
+outside its row report the same way. `L201` warns when a nullable property is
+never set by any update query in the inspected set. Type errors report the
+affected query and their `T…` code. The command exits nonzero when the overall
+status is an error.
 
 For every query that compiles successfully, JSON output includes an
 `operation` descriptor:

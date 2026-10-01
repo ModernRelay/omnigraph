@@ -165,7 +165,7 @@ const SCHEDULE_COUNTS: [&str; 3] = ["makespan", "span", "phases"];
 
 /// At the end of the run, one `io` evidence row per label group (the counts)
 /// and one measurement per group (bytes, the request log); the groups cover
-/// every request the store saw.
+/// every request either store saw, the Lance realm's and the control realm's.
 pub(crate) fn measure_finish() {
     for group in crate::measure::finish() {
         let label = group.label;
@@ -1790,7 +1790,8 @@ impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for G
             crate::measure::prepare(model)
         });
         crate::concurrent::install(measure);
-        let base: std::sync::Arc<dyn StorageAdapter> = resources.adapter.clone();
+        let base: std::sync::Arc<dyn StorageAdapter> =
+            crate::measure::wrap_adapter(resources.adapter.clone(), crate::concurrent::touch);
         let decoration =
             omnigraph_dst::harness::FailingStorage::quiet(base, resources.root.clone());
         omnigraph::storage::STORAGE.clear();

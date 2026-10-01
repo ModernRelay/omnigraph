@@ -41,7 +41,11 @@ async fn repeated_merge_keeps_its_selected_base_through_cleanup() {
         assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
         let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
         assert_eq!(
-            reopened.branch_merge("source", "target").await.unwrap(),
+            reopened
+                .branch_merge("source", "target")
+                .await
+                .unwrap()
+                .outcome,
             MergeOutcome::Merged,
         );
         let snapshot = helpers::snapshot_branch(&reopened, "target").await.unwrap();
@@ -78,7 +82,7 @@ async fn imported_merge_base_survives_owner_retirement_and_recreation() {
         set_age(&db, "carrier", "p", 1).await;
         for target in ["source", "target"] {
             assert_eq!(
-                db.branch_merge("carrier", target).await.unwrap(),
+                db.branch_merge("carrier", target).await.unwrap().outcome,
                 MergeOutcome::FastForward,
             );
         }
@@ -111,7 +115,11 @@ async fn imported_merge_base_survives_owner_retirement_and_recreation() {
         );
         let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
         assert_eq!(
-            reopened.branch_merge("source", "target").await.unwrap(),
+            reopened
+                .branch_merge("source", "target")
+                .await
+                .unwrap()
+                .outcome,
             MergeOutcome::Merged,
             "retired merge-base owner, replacement present={recreate}",
         );

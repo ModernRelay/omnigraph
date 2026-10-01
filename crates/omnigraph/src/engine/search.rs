@@ -776,8 +776,13 @@ pub(super) fn collect_referenced_edge_names(
 ) {
     for op in pipeline {
         match op {
-            IROp::Expand { edge_type, .. } => {
-                out.insert(edge_type.clone());
+            IROp::Expand { edges, .. } => {
+                out.extend(
+                    edges
+                        .members()
+                        .iter()
+                        .map(|member| member.edge_type.clone()),
+                );
             }
             IROp::AntiJoin { inner, .. } => collect_referenced_edge_names(inner, out),
             IROp::NodeScan { .. } | IROp::Filter(_) => {}

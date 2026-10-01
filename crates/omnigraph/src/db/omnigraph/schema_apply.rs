@@ -259,7 +259,7 @@ where
 
     // Install this handle's published-but-uninstalled schema contract, if any,
     // before planning against the accepted contract.
-    db.settle_pending_schema_install().await?;
+    let completed_prior_work = db.settle_pending_schema_install().await?;
 
     // Process-local schema gate, EXCLUSIVE side: schema apply is a
     // contract-lifecycle pass, so it excludes every shared holder (writers,
@@ -271,7 +271,13 @@ where
     // authority; this permit removes the avoidable same-handle race (RFC
     // 2026-09-18-shared-schema-gate).
     let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
-    acquire_schema_apply_lock(db).await?;
+    acquire_schema_apply_lock(db).await.map_err(|error| {
+        if completed_prior_work {
+            error.without_pre_effect_evidence()
+        } else {
+            error
+        }
+    })?;
     let result = async {
         fail(&SCHEMA_APPLY_POST_SENTINEL)?;
         apply_schema_with_lock(db, desired_schema_source, options, actor, validate_catalog).await
@@ -287,7 +293,11 @@ where
         (Ok(result), Ok(())) => Ok(result),
         (Ok(_), Err(err)) => Err(err),
         (Err(err), Ok(())) => Err(err),
-        (Err(err), Err(_)) => Err(err),
+        // Preserve the primary diagnostic, but a failed sentinel completion
+        // cannot be hidden behind its ordinary validation/refusal category.
+        (Err(err), Err(_)) => {
+            Err(err.with_completion_evidence(crate::error::CompletionEvidence::Uncertain))
+        }
     }
 }
 
@@ -1144,9 +1154,21 @@ pub(super) async fn ensure_schema_apply_idle(db: &Omnigraph, operation: &str) ->
 }
 
 pub(super) async fn acquire_schema_apply_lock(db: &Omnigraph) -> Result<()> {
-    db.ensure_schema_state_valid().await?;
-    db.refresh_coordinator_only().await?;
-    let branches = db.coordinator.read().await.all_branches().await?;
+    // Only these initial reads precede this acquisition's durable sentinel.
+    // Composing callers strip the proof if they already attempted effects.
+    db.ensure_schema_state_valid()
+        .await
+        .map_err(OmniError::before_effect)?;
+    db.refresh_coordinator_only()
+        .await
+        .map_err(OmniError::before_effect)?;
+    let branches = db
+        .coordinator
+        .read()
+        .await
+        .all_branches()
+        .await
+        .map_err(OmniError::before_effect)?;
     if branches
         .iter()
         .any(|branch| is_schema_apply_lock_branch(branch))
@@ -1173,6 +1195,10 @@ pub(super) async fn acquire_schema_apply_lock(db: &Omnigraph) -> Result<()> {
         .filter(|branch| branch != "main" && !is_internal_system_branch(branch))
         .collect::<Vec<_>>();
     if !blocking_branches.is_empty() {
+        let refusal = OmniError::manifest_conflict(format!(
+            "schema apply requires a graph with only main; found non-main branches: {}",
+            blocking_branches.join(", ")
+        ));
         // Best-effort release of the sentinel we just took; a failure arms the
         // handle-local retry (liveness contract), so the next write entry on
         // this handle releases it before the sentinel gate instead of staying
@@ -1184,11 +1210,11 @@ pub(super) async fn acquire_schema_apply_lock(db: &Omnigraph) -> Result<()> {
                 "failed to release the schema-apply sentinel after a mono-branch refusal; \
                  the next write entry on this handle retries the release"
             );
+            return Err(
+                refusal.with_completion_evidence(crate::error::CompletionEvidence::Uncertain)
+            );
         }
-        return Err(OmniError::manifest_conflict(format!(
-            "schema apply requires a graph with only main; found non-main branches: {}",
-            blocking_branches.join(", ")
-        )));
+        return Err(refusal);
     }
 
     Ok(())

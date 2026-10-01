@@ -93,7 +93,7 @@ Read output supports `table`, `json`, `jsonl`, `csv`, and `kv`. `--json` is the
 stable machine-readable form for commands that do not use `--format`. Result
 cells use the [JSON result spelling](../queries/index.md#json-result-spelling);
 `table`, `csv`, and `kv` print strings unquoted. `--format json` prints the
-envelope pretty and the `rows` array compact, verbatim.
+envelope pretty and the `rows` array compact; a refusal follows [Diagnostics](../queries/diagnostics.md).
 
 ### Machine-readable read and write positions
 
@@ -108,9 +108,9 @@ that attempt. It contains `graph_commit_id`, optional `graph_branch`,
 `actor_id`, and `created_at` in Unix microseconds. A successful mutation
 that changes no entities returns `"commit": null`.
 
-`--json` and read commands' `--format json` preserve a graph server's complete
-structured error on stdout (for example, `"code": "forbidden"`) and exit 1.
-Malformed responses remain diagnostics. Conditional mismatches retain exit 4.
+`--json` and read `--format json` preserve structured errors on stdout. Data-write failures
+report [whole-command outcomes and exits](../operations/troubleshooting.md#failed-data-write-commands).
+Verified HTTP conditional mismatches exit 4; embedded mismatches exit 1 because writable open can complete earlier work.
 
 ### Conditional mutations
 

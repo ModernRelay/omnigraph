@@ -17,6 +17,10 @@ pub struct Diagnostic {
     pub severity: DiagnosticSeverity,
     pub path: String,
     pub message: String,
+    /// The compiler's own diagnostic (code, position or stage, expectation,
+    /// fix) when the subject is a stored query the compiler refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Box<omnigraph_compiler::QueryDiagnostic>>,
 }
 
 impl Diagnostic {
@@ -30,7 +34,16 @@ impl Diagnostic {
             severity: DiagnosticSeverity::Error,
             path: path.into(),
             message: message.into(),
+            detail: None,
         }
+    }
+
+    pub(crate) fn with_detail(
+        mut self,
+        detail: Option<omnigraph_compiler::QueryDiagnostic>,
+    ) -> Self {
+        self.detail = detail.map(Box::new);
+        self
     }
 
     pub(crate) fn warning(
@@ -43,6 +56,7 @@ impl Diagnostic {
             severity: DiagnosticSeverity::Warning,
             path: path.into(),
             message: message.into(),
+            detail: None,
         }
     }
 }
