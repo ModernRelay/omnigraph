@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-03
-updated: 2026-09-29
+updated: 2026-10-01
 discussion: "https://github.com/ModernRelay/omnigraph/pull/793"
 supersedes: []
 superseded_by: []
@@ -15,12 +15,12 @@ blocked_on:
   - "RFC 0047 accepted: diagnostics, the ranked-root rule and one total order"
   - "Shared expression model accepted: search calls in match, the leading ranking key in order"
   - "The call rule of the shared expression model amendment (PR #805): operands, then options as name: value"
-  - "Embedding recipe declaration and the SchemaIR version, coordinated with RFCs 0040, 0043 and 0044"
+  - "Embedding recipe declaration and its SchemaIR feature name (RFC 0040's feature set), coordinated with RFC 0044"
 ---
 
 # RFC 0048: Search contracts and retrieval algebra
 
-Every code reference is at `main` `b14c22c5`, Lance 11.0.0.
+Every code reference is at `main` `92ea5449`, Lance 11.0.0.
 
 ## Summary
 
@@ -38,8 +38,9 @@ search predicates live in `match` and the leading ranking call lives in
    nodes mean: which targets are eligible, which cut selects them, what a
    score belongs to, and what one execution may claim.
 2. **Windows.** A ranking can declare how many distinct targets it selects
-   (`candidates:`), independent of the final `limit`. Every `rrf()` arm has a
-   window, the same rule for both kinds.
+   (`candidates:`), independent of the final `limit`. A `nearest` arm of
+   `rrf()` always has a window; a `bm25` arm keeps the full matching
+   population RFC 0047 specifies unless the query caps it.
 3. **Fusion.** `rrf()` takes 2 to 16 arms, a weight per arm and a named `k`.
    Each arm's score is a projectable column, null where the arm did not
    select the target.
@@ -70,19 +71,22 @@ best 20 passages, then group by source
     != select passages while keeping at most 2 per source
 ```
 
-Every gap below was checked in code at `b14c22c5`:
+Every gap below was checked in code at `b14c22c5` and again at `92ea5449`:
 
 - **A downstream limit sizes an upstream window.** An `rrf()` arm that runs
   `nearest` fetches the query's `limit` targets
   (`optimizer.rs`: `fetch: Some(limit.unwrap_or(RRF_NEAREST_ARM_K))`; `T21`
   requires the limit), while a `bm25` arm fetches every match (`fetch:
-  None`). A query that asks for 5 rows fuses a 5-target vector arm with an
-  unbounded lexical arm. The same happens under an aggregate: a leading
+  None`). A query that asks for 5 rows fuses a 5-target vector arm with the
+  full lexical match set, so the vector arm's recall depends on the page
+  size. The same happens under an aggregate: a leading
   `nearest` takes `k` from the query's `limit` (`search_node`), which there
-  counts groups, so the aggregate reads as many rows as it returns groups.
+  counts groups, so the aggregate reads the rows of as many targets as it
+  returns groups (the overfetch ladder does not run under an aggregate).
 - **Fusion has two positional arms.** `rrf_call` accepts exactly two ranking
   calls and an optional positional `k` (`query.pest`); arms cannot be
-  weighted, and an arm's own score cannot be projected (`T37`).
+  weighted, and an arm's own score cannot be projected (`T33`: a projected
+  ranking call must repeat the leading order key, here the `rrf()`).
 - **Vector geometry is implicit.** `Vector(n)` declares no distance, every
   vector index is built with `MetricType::L2` (`table_store.rs`), and
   `@embed("source", model="…")` records a provider model label, which does
@@ -110,12 +114,13 @@ Relevance is neither confidence nor evidence that no other fact exists.
 ### Named options on calls
 
 A call takes its positional arguments, then named arguments written `name:
-value`, in any order, each name at most once. A value is a literal or a
-parameter; its type is fixed by the call. An unknown name is a type error that
-lists the names the call admits. This is the call rule of the shared
-expression model's amendment ([PR #805](https://github.com/ModernRelay/omnigraph/pull/805)), which the analyzed lexical
-search RFC also uses for `terms($q, mode: all, max_edits: 1)`; its grammar
-lands with the first call that takes an option.
+value`; an unknown name is a type error that lists the names the call admits.
+That is the call rule of the shared expression model's amendment
+([PR #805](https://github.com/ModernRelay/omnigraph/pull/805), still open),
+which the analyzed lexical search RFC also uses for `terms($q, mode: all,
+max_edits: 1)`; its grammar lands with the first call that takes an option.
+This RFC adds three rules of its own: options come in any order, each name at
+most once, and a value is a literal or a parameter whose type the call fixes.
 
 | Call | Option | Type and range | Default | Meaning |
 |---|---|---|---|---|
@@ -135,14 +140,20 @@ is 16 × 1,000,000 / 2.
 targets of the eligible population, then the rows of those targets continue.
 Where it applies:
 
-- **An `rrf()` arm** always has a window. The default is the query's `limit`
-  or 100, whichever is larger, for both `nearest` and `bm25`, so an arm can
-  fill the limit on its own. Today's vector arm fetches exactly `limit`
-  targets and today's lexical arm is unbounded.
-- **A leading `nearest` or `bm25`** without `candidates` has one cut, the
-  final `limit` over rows, as RFC 0047 defines. With `candidates: n`, the
-  ranking first keeps its `n` best targets, and every row of those targets
-  survives until the final `limit`. This is the evidence shape: the 5 best
+- **A `nearest` arm of `rrf()`** always has a window. The default is the
+  query's `limit` or 100, whichever is larger, so the arm can fill the limit
+  on its own; today it fetches exactly `limit` targets. RFC 0047 keeps that
+  cap distinct from the final row cut.
+- **A `bm25` arm of `rrf()`** supplies its full matching population before
+  fusion, as RFC 0047 specifies. `candidates: n` on it is an explicit cap:
+  the arm's population becomes its `n` best targets, and its retrieval
+  descriptor reports the cap.
+- **A leading `bm25`** without `candidates` has one cut, the final `limit`
+  over rows. **A leading `nearest`** without `candidates` keeps the implicit
+  candidate window RFC 0047 describes (`k` from the `limit`, widened by the
+  overfetch ladder), distinct from the final row cut. With `candidates: n`,
+  either ranking first keeps its `n` best targets, and every row of those
+  targets survives until the final `limit`. This is the evidence shape: the 5 best
   documents, and all of their passages.
 - **In an aggregate query**, a leading `nearest` needs `candidates`: the
   window is the population the aggregate reads, and the `limit` counts groups.
@@ -162,7 +173,10 @@ query topics_near($v: Vector(1536)) {
 ```
 
 This counts topics over the 200 documents nearest to `$v`, orders the topics
-by that count, and returns 5. Today the same shape reads 5 rows.
+by that count, and returns 5. Ordering the groups by `docs` needs `T18` (an
+alias key beside `nearest`) lifted, which RFC 0047's ordering of
+search-ordered aggregates already requires. Today only `order { nearest(…) }
+limit 5` is accepted, and it counts over the 5 nearest documents.
 
 ### Fusion
 
@@ -201,8 +215,12 @@ query hybrid($q: String, $v: Vector(1536)) {
 - **Arm metrics.** A projected `bm25(…)` or `nearest(…)` that matches an
   arm's identity is that arm's score or distance, and it is null for a target
   that arm did not select, even when a value could be computed. Options may
-  be omitted in the projection. The fused score projects under RFC 0047's
-  rule.
+  be omitted in the projection. This relaxes `T33` for `rrf()`, which today
+  admits a projected ranking call only as a repeat of the leading order key:
+  a call that repeats one arm of the leading `rrf()` is admitted too. Its
+  metric descriptor names the arm's `retrieval_id` from RFC 0047's
+  descriptors, and the fused score's names the fusion's. The fused score
+  projects under RFC 0047's rule.
 - **Order and cut.** RFC 0047's total order: fused score, the remaining keys,
   every binding's id; `limit` cuts rows.
 
@@ -213,9 +231,18 @@ query hybrid($q: String, $v: Vector(1536)) {
 | `nearest(f, v)` | the approximate top targets; the index may miss some | index probe plus the uncovered tail | `approximate` |
 | `nearest(f, v, exact: true)` | the exact top targets under every index state | a flat scan of the eligible population | `exact` |
 
+`exact: true` selects the `n` targets with the smallest distance, and a tie
+at the window boundary goes to the smaller target id, so its membership is
+exact and the same on every run. Without it, membership, ties at the window
+boundary included, is approximate, as RFC 0047 states, even when a run
+happens to scan every row.
+
 `recall` reports the call's contract, not what one run did, as RFC 0047
-decided. The approximate route still scans rows the index does not cover:
-missing coverage changes cost, never membership (the index coverage fence in
+decided; with `exact: true` it is `exact`, so it becomes a function of the
+retrieval kind and this option, which extends RFC 0047's rule that it is a
+function of the kind alone. The approximate route still scans rows the index
+does not cover: missing coverage never drops uncovered rows; it changes cost,
+and the contract stays approximate (the index coverage fence in
 [lance.md](../dev/lance.md#current-compatibility-fences)). A returned
 distance is the exact distance between the stored vector and the query
 vector under the field's distance; approximation only affects which targets
@@ -293,10 +320,10 @@ process defaults, as every setting does today.
   it returns and the one trade-off the caller may turn ("`candidates` trades
   recall for cost"). Recipes fix windows and modes; the raw language exposes
   them for authoring.
-- **The schema is the prompt.** Declarations already accept `@description`
-  and `@instruction`; this RFC has `schema show` print each field's resolved
-  analyzer, distance and recipe beside them, so a caller grounds a query in
-  one read.
+- **The schema is the prompt.** Node and edge declarations already accept
+  `@description` and `@instruction`, and properties accept `@description`;
+  this RFC has `schema show` print each field's resolved analyzer, distance
+  and recipe beside them, so a caller grounds a query in one read.
 - **Defaults carry the common case.** Every option has a default the card
   names, and a caller that never sets one gets a sound query.
 - **Diagnostics** follow RFC 0047: a code, a position or stage, the
@@ -329,7 +356,8 @@ arm metric is null.
    Rows reached from a target carry its score and rank; duplicate paths add
    no vote.
 5. **Index state never changes an exact answer.** `bm25` and `nearest(…,
-   exact: true)` return the same targets under every index state. An
+   exact: true)` return the same targets under every index state in which
+   they answer (RFC 0047 refuses an unbuilt full-text index). An
    approximate `nearest` may miss targets but never drops the unindexed rows
    as a whole.
 6. **Every cut is total.** A cut is taken over RFC 0047's total order.
@@ -384,8 +412,20 @@ and the engine never extrapolates a total from it.
 
 A target cut is the plan's own node: the ranking yields distinct targets, the
 cut keeps `n`, and a semi-join on target id restores their rows. The
-planner's `Assumptions` need nothing new: options are query text, which the
-bound plan already carries.
+planner's `Assumptions` need nothing new: options become typed plan fields
+(for example `RankedAccess.fetch`) and bound values, which the bound plan
+already carries.
+
+### Validation
+
+RFC 0047's shared validator checks the plans this RFC's options produce. The
+options are typed plan fields, so the validator checks them as invariants:
+each arm's identity and binding, every window distinct from the final row
+cut, weights and `k` within their ranges, and the declared contract, where
+`exact: true` changes a `nearest` from approximate to exact. None of them is
+in RFC 0047's initial exact subset, which admits one optional BM25 order over
+one scan; each shape joins it only through a versioned rule addition with its
+own regression.
 
 ### Representation identity
 
@@ -404,8 +444,8 @@ distance; the same space does not license mixing `dot` and `cosine`. A
 rename keeps the field's identity; drop and re-add does not (invariant 6).
 Hashes are domain-separated SHA-256 over a canonical typed encoding frozen in
 fixtures, never over `Debug` text. Credentials and endpoints stay runtime
-configuration. The SchemaIR version these declarations need is assigned with
-RFCs 0040, 0043 and 0044, not reserved here.
+configuration. These declarations add a SchemaIR feature name, as RFC 0040
+specifies for every schema feature after it, never a new `ir_version`.
 
 ## Invariants
 
@@ -432,10 +472,9 @@ RFCs 0040, 0043 and 0044, not reserved here.
   is deprecated for one release, then removed at the next GQ language major
   under the [compatibility surfaces](2026-09-14-compatibility-surfaces.md)
   RFC.
-- **Results.** Fusion results change where the new default windows differ
-  from today's: a vector arm of `max(limit, 100)` targets instead of `limit`,
-  and a lexical arm cut at the same window instead of unbounded, so a target
-  ranked past the window no longer gets a small lexical contribution.
+- **Results.** Fusion results change where the new vector-arm window
+  differs from today's: `max(limit, 100)` targets instead of `limit`. A
+  lexical arm keeps its full matching population unless the query caps it.
 - **Schema.** An omitted distance keeps meaning `l2`; recipes and explicit
   distances are additive declarations applied in place.
 - **Wire.** Descriptor fields are additive to RFC 0047's `retrievals` and
@@ -458,8 +497,8 @@ RFCs 0040, 0043 and 0044, not reserved here.
 - **An `oversample` or effort option in the query.** Rejected: physical
   effort is a session setting the plan records (`ann_nprobes`); the query
   states meaning, not effort.
-- **Cross-type fusion now.** Deferred: the compiler binds a variable to one
-  type, so a union of types needs typed union and narrowing first.
+- **Cross-type fusion now.** Deferred: the compiler binds a node variable to
+  one node type, so a union of types needs typed union and narrowing first.
 
 ## Evidence and tests
 
@@ -498,7 +537,7 @@ order.
 | Step | Delivers |
 |---|---|
 | 1 | Named options; `rrf()` with 2 to 16 arms, `weight` and named `k`; the arm identity and binding refusals |
-| 2 | Arm windows with the `max(limit, 100)` default for both kinds |
+| 2 | `nearest` arm windows with the `max(limit, 100)` default; an explicit `candidates` cap on a `bm25` arm |
 | 3 | Projectable arm metrics, null where the arm did not select the target |
 | 4 | `nearest(…, exact: true)` |
 | 5 | `candidates` on a leading ranking, and required in an aggregate query |
@@ -543,3 +582,18 @@ and stable pagination of ranked results.
 - 2026-09-29 — engine v2 became the only query engine (PR #795): the engine
   v1 door column and refusals are removed. The named-option rule now cites
   the shared expression model amendment ([PR #805](https://github.com/ModernRelay/omnigraph/pull/805)).
+- 2026-10-01 — aligned with RFC 0047 as merged (PR #791): a `bm25` arm of
+  `rrf()` keeps its full matching population by default, and `candidates:`
+  on it is an explicit cap; only a `nearest` arm gets the `max(limit, 100)`
+  default window. `exact: true` breaks a boundary tie by target id. Arm
+  metrics reference RFC 0047's retrieval ids, and RFC 0047's validator
+  checks this RFC's options as invariants.
+- 2026-10-01 — every factual claim checked against `main` `92ea5449`.
+  Corrected: an arm's score is refused by `T33`, not `T37`; a leading
+  `nearest` keeps RFC 0047's implicit candidate window; the aggregate example
+  needs `T18` lifted; properties take `@description` only; the bound plan
+  carries typed plan fields, not query text; these declarations add a
+  SchemaIR feature name, not a version; a node variable has one node type
+  since edge bindings may span edge types. Stated: the arm-metric relaxation
+  of `T33`, the `exact` extension of RFC 0047's `recall` rule, and law 5's
+  index states.
