@@ -58,7 +58,10 @@ and enforces the exact graph-head precondition on every attempt. Successful
 publication returns a taken coordinator to the one-entry merge cache; failure
 drops it. Commit IDs and timestamps are minted for the captured branch without
 reloading manifest history. The existing schema and branch gates still serialize
-conflicting control operations.
+conflicting control operations. A merge holds its target's branch gate through
+publication and its source's only until the source snapshot is captured, tagged
+and proved still current, so writes and deletes on the source do not wait for
+the merge.
 
 Native branch creation uses an operation-local capture of the bound coordinator
 or that same one-entry cache after the control gates. Reuse
