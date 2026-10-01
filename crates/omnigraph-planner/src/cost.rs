@@ -35,8 +35,8 @@ impl ExpandMode {
 }
 
 /// What an `Expand` may do at run time beside the mode the plan recorded:
-/// nothing when the session pinned the mode or the source held no edge
-/// statistics, or re-decide with the recorded cost inputs (before the first
+/// nothing when budget admission or the session pinned the mode, or the source
+/// held no edge statistics, or re-decide with the recorded cost inputs (before the first
 /// hop against the probed index coverage, the observed frontier and a warm
 /// CSR; between input batches and at every later hop with
 /// `should_switch_to_csr`).
@@ -45,6 +45,8 @@ impl ExpandMode {
 pub enum ExpandPolicy {
     /// The session's traversal pin chose the mode; the run takes no other.
     Pinned,
+    /// A query-wide work budget admits only indexed scans; no CSR fallback.
+    Budgeted,
     /// No edge statistics: the mode is `Csr` and the run takes no other.
     Uncosted,
     /// The cost model chose the mode from `inputs`; the run may take the
@@ -56,7 +58,7 @@ impl ExpandPolicy {
     /// The modes the run may switch to from `mode`.
     pub fn alternatives(&self, mode: ExpandMode) -> Vec<ExpandMode> {
         match self {
-            Self::Pinned | Self::Uncosted => Vec::new(),
+            Self::Pinned | Self::Uncosted | Self::Budgeted => Vec::new(),
             Self::Costed { .. } => vec![match mode {
                 ExpandMode::IndexedScan => ExpandMode::Csr,
                 ExpandMode::Csr => ExpandMode::IndexedScan,
@@ -68,7 +70,7 @@ impl ExpandPolicy {
     pub fn cost(&self) -> Option<&ExpandCostInputs> {
         match self {
             Self::Costed { inputs } => Some(inputs),
-            Self::Pinned | Self::Uncosted => None,
+            Self::Pinned | Self::Uncosted | Self::Budgeted => None,
         }
     }
 }
@@ -361,14 +363,14 @@ pub fn estimate_rows(plan: &LogicalPlan, node: LogicalId, source: &dyn PlanSourc
         LogicalNode::MetadataCount { .. } => Some(1),
         LogicalNode::Expand {
             input,
-            edge_type,
-            direction,
+            edges,
             min_hops,
             max_hops,
             ..
         } => {
             let input_rows = estimate_rows(plan, *input, source)?;
-            let stats = source.expand_statistics(edge_type, *direction)?;
+            let member = edges.named()?;
+            let stats = source.expand_statistics(&member.edge_type, member.direction)?;
             let fanout = stats
                 .edge_count
                 .div_ceil(stats.src_node_count.max(1))
@@ -376,7 +378,11 @@ pub fn estimate_rows(plan: &LogicalPlan, node: LogicalId, source: &dyn PlanSourc
             let hops = executed_hops(*min_hops, *max_hops, stats.same_type);
             let mut rows = input_rows;
             for _ in 0..hops.max(1) {
-                rows = rows.saturating_mul(fanout).min(stats.dst_node_count);
+                let next = rows.saturating_mul(fanout).min(stats.dst_node_count);
+                if next == rows {
+                    break;
+                }
+                rows = next;
             }
             Some(rows)
         }
@@ -542,7 +548,11 @@ mod tests {
             [ExpandMode::IndexedScan]
         );
         assert!(costed.cost().is_some());
-        for policy in [ExpandPolicy::Pinned, ExpandPolicy::Uncosted] {
+        for policy in [
+            ExpandPolicy::Pinned,
+            ExpandPolicy::Uncosted,
+            ExpandPolicy::Budgeted,
+        ] {
             assert!(policy.alternatives(ExpandMode::Csr).is_empty());
             assert!(policy.cost().is_none());
         }

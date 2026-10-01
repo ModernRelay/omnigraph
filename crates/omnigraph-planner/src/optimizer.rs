@@ -2,14 +2,14 @@
 //! selection, property derivation. The order is written once here with its
 //! reason; a pass runs only when its trigger is present in the plan.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
 use omnigraph_compiler::query::ast::AggFunc;
 use omnigraph_compiler::settings::Traversal;
-use omnigraph_compiler::types::Direction;
+use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeSelection};
 
 use crate::cost::{
     AccessPath, ExpandCostInputs, ExpandMode, ExpandPolicy, HASH_JOIN_POOL_DIVISOR, IndexCoverage,
@@ -18,15 +18,16 @@ use crate::cost::{
 };
 use crate::error::PlanError;
 use crate::logical::{
-    ColumnRef, GqFilter, IDENTITY_MEMBER, KeyJoinKind, LOGICAL_ID, LogicalId, LogicalNode,
-    LogicalPlan, Predicate, RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, SearchArm,
-    ordering_text,
+    ColumnRef, EDGE_TYPE_MEMBER, GqFilter, IDENTITY_MEMBER, KeyJoinKind, LOGICAL_ID, LogicalId,
+    LogicalNode, LogicalPlan, Predicate, RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, SearchArm,
+    ordering_text, tiebreak_text,
 };
 use crate::lower::ContainsJoinFields;
 use crate::operation::{Operation, Side};
 use crate::physical::{
-    Estimate, Hop, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, Properties,
-    RankArm, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource, TextContains,
+    Assumptions, Estimate, Hop, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter,
+    Properties, RankArm, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
+    TextContains,
 };
 use crate::source::{NodeTypeSpec, PlanSource, SideId};
 
@@ -159,6 +160,25 @@ fn resolve_query(
     ir: &QueryIR,
     source: &dyn PlanSource,
 ) -> Result<(), PlanError> {
+    if ir.has_edge_selections() {
+        let limit = source
+            .traversal_work_limit()
+            .ok_or_else(|| PlanError::Unsupported {
+                detail: "edge selections require a finite traversal_work_limit".to_string(),
+            })?;
+        let assumptions = Assumptions {
+            traversal_work_limit: Some(limit),
+            ..Default::default()
+        };
+        assumptions.validated_traversal_work_limit()?;
+        plan.set_traversal_work_limit(Some(limit));
+        if source.traversal() == Traversal::Csr {
+            return Err(PlanError::Unsupported {
+                detail: "edge selections do not support traversal = csr; use auto or indexed"
+                    .to_string(),
+            });
+        }
+    }
     let QueryIR {
         name: _,
         params: _,
@@ -172,8 +192,21 @@ fn resolve_query(
     let schema = schema_of(plan, current)?;
     let mut orderings: &[IROrdering] = order_by;
     let mut ranked = false;
+    let has_aggregates = return_exprs
+        .iter()
+        .any(|projection| matches!(projection.expr, IRExpr::Aggregate { .. }));
     if let Some(leading) = orderings.first() {
-        if let Some(node) = search_node(current, &leading.expr, *limit) {
+        if let Some(mut node) = search_node(current, &leading.expr, *limit) {
+            if let LogicalNode::RankFuse {
+                arms, row_tiebreak, ..
+            } = &mut node
+            {
+                *row_tiebreak = scope_tiebreaks(plan, current, source)?
+                    .into_iter()
+                    .map(|(column, _)| column)
+                    .filter(|column| column.binding != arms[0].binding)
+                    .collect();
+            }
             current = plan.add(node, schema.clone());
             orderings = &orderings[1..];
             ranked = true;
@@ -183,9 +216,6 @@ fn resolve_query(
     for IRProjection { expr, alias: _ } in return_exprs {
         reads_of_expr(expr, &mut reads);
     }
-    let has_aggregates = return_exprs
-        .iter()
-        .any(|projection| matches!(projection.expr, IRExpr::Aggregate { .. }));
     current = if has_aggregates {
         plan.add(
             LogicalNode::Aggregate {
@@ -208,6 +238,7 @@ fn resolve_query(
     if ranked || !orderings.is_empty() {
         let bound: Vec<IROrdering> = orderings
             .iter()
+            .filter(|ordering| !matches!(ordering.expr, IRExpr::Literal(_)))
             .map(|ordering| IROrdering {
                 expr: bind_order_key(&ordering.expr, return_exprs),
                 descending: ordering.descending,
@@ -218,7 +249,7 @@ fn resolve_query(
             order_keys(&ordering.expr, &mut keys);
         }
         let tiebreak = sort_tiebreak(
-            &scope_bindings(plan, current),
+            &scope_tiebreaks(plan, current, source)?,
             order_by,
             return_exprs,
             has_aggregates,
@@ -319,8 +350,8 @@ fn resolve_pipeline(
             IROp::Expand {
                 src_var,
                 dst_var,
-                edge_type,
-                direction,
+                edges,
+                src_type,
                 dst_type,
                 min_hops,
                 max_hops,
@@ -342,8 +373,8 @@ fn resolve_pipeline(
                         input,
                         src: src_var.clone(),
                         dst: dst_var.clone(),
-                        edge_type: edge_type.clone(),
-                        direction: *direction,
+                        edges: edges.clone(),
+                        src_type: src_type.clone(),
                         dst_type: dst_type.clone(),
                         min_hops: *min_hops,
                         max_hops: *max_hops,
@@ -505,6 +536,7 @@ fn search_node(input: LogicalId, expr: &IRExpr, limit: Option<u64>) -> Option<Lo
                 k: k.as_deref().cloned(),
                 limit,
                 reads,
+                row_tiebreak: Vec::new(),
             })
         }
         _ => None,
@@ -592,55 +624,95 @@ fn order_keys(expr: &IRExpr, out: &mut Vec<String>) {
 /// Prefix of a `Sort` key that names a `return` alias, not a column.
 pub const ALIAS_KEY: &str = "alias:";
 
-/// The bindings whose rows a sort above `id` sees: every scan, traversal
-/// destination and edge binding of the pipeline under it, an anti-join's
-/// inner scope excluded, name-sorted and deduplicated.
-fn scope_bindings(plan: &LogicalPlan, id: LogicalId) -> Vec<String> {
-    fn walk(plan: &LogicalPlan, id: LogicalId, out: &mut Vec<String>) {
-        let Some(node) = plan.node(id) else {
-            return;
-        };
-        match node {
-            LogicalNode::TableScan { input, spec } => {
-                out.extend(spec.binding.iter().cloned());
-                if let Some(input) = input {
-                    walk(plan, *input, out);
-                }
-            }
-            LogicalNode::Expand {
-                input,
-                dst,
-                edge_binding,
-                ..
-            } => {
-                out.push(dst.clone());
-                out.extend(edge_binding.iter().cloned());
-                walk(plan, *input, out);
-            }
-            LogicalNode::AntiJoin { input, .. } => walk(plan, *input, out),
-            other => {
-                for input in other.inputs() {
-                    walk(plan, input, out);
-                }
+/// Nodes visible in this scope. Correlated inner plans own separate bindings.
+fn visible_scope(plan: &LogicalPlan, id: LogicalId) -> Vec<&LogicalNode> {
+    fn walk<'a>(plan: &'a LogicalPlan, id: LogicalId, out: &mut Vec<&'a LogicalNode>) {
+        let Some(node) = plan.node(id) else { return };
+        out.push(node);
+        if let LogicalNode::AntiJoin { input, .. } = node {
+            walk(plan, *input, out);
+        } else {
+            for input in node.inputs() {
+                walk(plan, input, out);
             }
         }
     }
-    let mut out = Vec::new();
-    walk(plan, id, &mut out);
-    out.sort();
-    out.dedup();
-    out
+    let mut nodes = Vec::new();
+    walk(plan, id, &mut nodes);
+    nodes
 }
 
-/// The bindings whose ids a sort appends after `keys` so its order is total;
+/// Candidate identity keys in binding order. Physical spellings are used
+/// only to recognize user order keys; the plan retains logical metadata.
+fn scope_tiebreaks(
+    plan: &LogicalPlan,
+    id: LogicalId,
+    source: &dyn PlanSource,
+) -> Result<Vec<(ColumnRef, &'static str)>, PlanError> {
+    let mut bindings = BTreeMap::new();
+    for node in visible_scope(plan, id) {
+        match node {
+            LogicalNode::TableScan { spec, .. } => {
+                if let Some(binding) = &spec.binding {
+                    bindings.insert(binding.clone(), (spec.columns.id, false));
+                }
+            }
+            LogicalNode::Expand {
+                dst,
+                dst_type,
+                edges,
+                edge_binding,
+                ..
+            } => {
+                let id_column = source.node_type(dst_type)?.columns.id;
+                bindings.insert(dst.clone(), (id_column, false));
+                if let Some(binding) = edge_binding {
+                    bindings.insert(binding.clone(), (id_column, edges.named().is_none()));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for (binding, (id_column, selected_edge)) in bindings {
+        if selected_edge {
+            out.push((
+                ColumnRef::property(&binding, EDGE_TYPE_MEMBER),
+                EDGE_TYPE_COLUMN,
+            ));
+        }
+        out.push((ColumnRef::property(&binding, IDENTITY_MEMBER), id_column));
+    }
+    Ok(out)
+}
+
+/// Bindings visible to a filter, excluding correlated inner scopes.
+fn scope_bindings(plan: &LogicalPlan, id: LogicalId) -> Vec<String> {
+    let mut bindings = BTreeSet::new();
+    for node in visible_scope(plan, id) {
+        match node {
+            LogicalNode::TableScan { spec, .. } => bindings.extend(spec.binding.iter().cloned()),
+            LogicalNode::Expand {
+                dst, edge_binding, ..
+            } => {
+                bindings.insert(dst.clone());
+                bindings.extend(edge_binding.iter().cloned());
+            }
+            _ => {}
+        }
+    }
+    bindings.into_iter().collect()
+}
+
+/// The metadata columns a sort appends after `keys` so its order is total;
 /// none for group rows, when every returned expression is a key (equal rows
-/// are indistinguishable), and never a binding whose `@id` is a key.
+/// are indistinguishable), or for an individual column already used as a key.
 fn sort_tiebreak(
-    bindings: &[String],
+    candidates: &[(ColumnRef, &'static str)],
     keys: &[IROrdering],
     returns: &[IRProjection],
     aggregate: bool,
-) -> Vec<String> {
+) -> Vec<ColumnRef> {
     if aggregate {
         return Vec::new();
     }
@@ -660,18 +732,25 @@ fn sort_tiebreak(
     if covered {
         return Vec::new();
     }
-    bindings
+    candidates
         .iter()
-        .filter(|binding| {
+        .filter(|(column, physical)| {
             !keys.iter().any(|key| {
+                let expr = match &key.expr {
+                    IRExpr::AliasRef(alias) => returns
+                        .iter()
+                        .find(|projection| projection.alias.as_deref() == Some(alias))
+                        .map_or(&key.expr, |projection| &projection.expr),
+                    expr => expr,
+                };
                 matches!(
-                    &key.expr,
+                    expr,
                     IRExpr::PropAccess { variable, property }
-                        if variable == *binding && property == IDENTITY_MEMBER
+                        if variable == &column.binding && property.as_str() == *physical
                 )
             })
         })
-        .cloned()
+        .map(|(column, _)| column.clone())
         .collect()
 }
 
@@ -1054,6 +1133,80 @@ fn top_level(plan: &PhysicalPlan, root: NodeId) -> Vec<NodeId> {
         }
     }
     nodes
+}
+
+/// Validate every fusion's canonical downstream identity keys against both arms.
+///
+/// # Errors
+/// Returns an error for a missing arm root or a key list that differs from
+/// either arm's visible identities, excluding the primary fused binding.
+pub fn validate_rank_fuse_row_tiebreaks(plan: &PhysicalPlan) -> Result<(), PlanError> {
+    for (id, node) in plan.live() {
+        let PhysicalNode::RankFuse {
+            arms, row_tiebreak, ..
+        } = node
+        else {
+            continue;
+        };
+        for (arm_index, arm) in arms.iter().enumerate() {
+            let expected = expected_rank_fuse_row_tiebreaks(plan, arm.input, &arms[0].binding)?;
+            if row_tiebreak != &expected {
+                return Err(PlanError::Internal(format!(
+                    "rank fuse {id} arm {arm_index}: incomplete or noncanonical row_tiebreak; expected {:?}, found {:?}",
+                    tiebreak_text(&expected),
+                    tiebreak_text(row_tiebreak),
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn expected_rank_fuse_row_tiebreaks(
+    plan: &PhysicalPlan,
+    arm_root: NodeId,
+    fused_binding: &str,
+) -> Result<Vec<ColumnRef>, PlanError> {
+    if plan.node(arm_root).is_none() {
+        return Err(PlanError::Internal(format!(
+            "rank fuse arm root {arm_root} is missing"
+        )));
+    }
+    let mut bindings = BTreeMap::<String, bool>::new();
+    for id in top_level(plan, arm_root) {
+        match plan.node(id) {
+            Some(PhysicalNode::Scan { spec, .. }) => {
+                if let Some(binding) = &spec.binding {
+                    bindings.entry(binding.clone()).or_insert(false);
+                }
+            }
+            Some(PhysicalNode::Expand {
+                dst,
+                edges,
+                edge_binding,
+                ..
+            }) => {
+                bindings.entry(dst.clone()).or_insert(false);
+                if let Some(binding) = edge_binding {
+                    let selected = edges.named().is_none();
+                    bindings
+                        .entry(binding.clone())
+                        .and_modify(|prior| *prior |= selected)
+                        .or_insert(selected);
+                }
+            }
+            _ => {}
+        }
+    }
+    bindings.remove(fused_binding);
+    let mut keys = Vec::new();
+    for (binding, selected) in bindings {
+        if selected {
+            keys.push(ColumnRef::property(&binding, EDGE_TYPE_MEMBER));
+        }
+        keys.push(ColumnRef::property(&binding, IDENTITY_MEMBER));
+    }
+    Ok(keys)
 }
 
 /// Diff lowering keeps the root schema; a merge derives both sides from
@@ -1556,8 +1709,7 @@ struct Demand {
 }
 
 /// The bindings whose id a node reads beside any column: a traversal's ends,
-/// a dependent scan, an anti-join's outer rows, a ranked scan's binding, and
-/// a sort's declared tie-breaks.
+/// a dependent scan, an anti-join's outer rows, and a ranked scan's binding.
 fn identity_reads(node: &LogicalNode) -> Vec<String> {
     match node {
         LogicalNode::TableScan {
@@ -1569,7 +1721,6 @@ fn identity_reads(node: &LogicalNode) -> Vec<String> {
         LogicalNode::Nearest { binding, .. } | LogicalNode::TextSearch { binding, .. } => {
             vec![binding.clone()]
         }
-        LogicalNode::Sort { tiebreak, .. } => tiebreak.clone(),
         _ => Vec::new(),
     }
 }
@@ -1616,12 +1767,15 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             keys,
             order_by: _,
             fetch: _,
-            tiebreak: _,
-        } => out.extend(
-            keys.iter()
-                .filter(|key| !key.starts_with(ALIAS_KEY))
-                .map(|key| ColumnRef::parse(key)),
-        ),
+            tiebreak,
+        } => {
+            out.extend(
+                keys.iter()
+                    .filter(|key| !key.starts_with(ALIAS_KEY))
+                    .map(|key| ColumnRef::parse(key)),
+            );
+            out.extend(tiebreak.iter().cloned());
+        }
         LogicalNode::Nearest {
             input: _,
             binding: _,
@@ -1648,9 +1802,11 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             k: _,
             limit: _,
             reads,
+            row_tiebreak,
         } => {
             out.extend(arms.iter().map(|arm| ColumnRef::entity(&arm.binding)));
             out.extend(reads.iter().cloned());
+            out.extend(row_tiebreak.iter().cloned());
         }
         LogicalNode::AntiJoin {
             input: _,
@@ -1671,8 +1827,8 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             input: _,
             src: _,
             dst: _,
-            edge_type: _,
-            direction: _,
+            edges: _,
+            src_type: _,
             dst_type: _,
             min_hops: _,
             max_hops: _,
@@ -1953,6 +2109,13 @@ impl Lowering<'_> {
             ))
         })?
         .to_string();
+        if self.logical.traversal_work_limit().is_some() {
+            return Ok(Prefilter {
+                ranked_type,
+                hops: Vec::new(),
+                feeds,
+            });
+        }
         let mut introduced_by_scan = false;
         let mut hops = Vec::new();
         for &id in top {
@@ -1969,14 +2132,20 @@ impl Lowering<'_> {
                 }
                 Some(PhysicalNode::Expand {
                     src,
-                    edge_type,
-                    direction,
+                    edges,
                     min_hops,
                     ..
-                }) if src == binding && *min_hops > 0 => hops.push(Hop {
-                    edge_type: edge_type.clone(),
-                    direction: *direction,
-                }),
+                }) if src == binding && *min_hops > 0 => {
+                    let Some(member) = edges.named() else {
+                        return Err(PlanError::Internal(
+                            "an unbudgeted prefilter contains an edge selection".to_string(),
+                        ));
+                    };
+                    hops.push(Hop {
+                        edge_type: member.edge_type.clone(),
+                        direction: member.direction,
+                    });
+                }
                 _ => {}
             }
         }
@@ -2225,8 +2394,8 @@ impl Lowering<'_> {
                 input,
                 src,
                 dst,
-                edge_type,
-                direction,
+                edges,
+                src_type,
                 dst_type,
                 min_hops,
                 max_hops,
@@ -2235,13 +2404,25 @@ impl Lowering<'_> {
             } => {
                 let lowered = self.lower(*input)?;
                 let (mode, frontier_estimate, policy) =
-                    self.expand_mode(*input, edge_type, *direction, *min_hops, *max_hops);
+                    self.expand_mode(*input, edges, *min_hops, *max_hops)?;
+                let versions = edges
+                    .members()
+                    .iter()
+                    .map(|member| {
+                        (
+                            member.edge_type.clone(),
+                            self.source
+                                .edge_dataset(&member.edge_type)
+                                .map(|pin| pin.version),
+                        )
+                    })
+                    .collect();
                 Ok(self.physical.add(PhysicalNode::Expand {
                     input: lowered,
                     src: src.clone(),
                     dst: dst.clone(),
-                    edge_type: edge_type.clone(),
-                    direction: *direction,
+                    edges: edges.clone(),
+                    src_type: src_type.clone(),
                     dst_type: dst_type.clone(),
                     min_hops: *min_hops,
                     max_hops: *max_hops,
@@ -2249,7 +2430,7 @@ impl Lowering<'_> {
                     mode,
                     frontier_estimate,
                     policy,
-                    version: self.source.edge_dataset(edge_type).map(|pin| pin.version),
+                    versions,
                 }))
             }
             LogicalNode::AntiJoin {
@@ -2338,6 +2519,7 @@ impl Lowering<'_> {
                 arms,
                 k,
                 limit,
+                row_tiebreak,
                 ..
             } => {
                 let primary = self.lower(*input)?;
@@ -2401,6 +2583,7 @@ impl Lowering<'_> {
                     k: k.clone(),
                     limit,
                     prefilter,
+                    row_tiebreak: row_tiebreak.clone(),
                 }))
             }
             LogicalNode::Ordered { input, keys } => {
@@ -2553,11 +2736,22 @@ impl Lowering<'_> {
     fn expand_mode(
         &mut self,
         input: LogicalId,
-        edge_type: &str,
-        direction: Direction,
+        edges: &EdgeSelection,
         min_hops: u32,
         max_hops: Option<u32>,
-    ) -> (ExpandMode, Option<u64>, ExpandPolicy) {
+    ) -> Result<(ExpandMode, Option<u64>, ExpandPolicy), PlanError> {
+        if self.logical.traversal_work_limit().is_some() {
+            return Ok((
+                ExpandMode::IndexedScan,
+                estimate_rows(self.logical, input, self.source),
+                ExpandPolicy::Budgeted,
+            ));
+        }
+        let member = edges.named().ok_or_else(|| PlanError::Unsupported {
+            detail: "edge selections require a finite traversal_work_limit".to_string(),
+        })?;
+        let edge_type = &member.edge_type;
+        let direction = member.direction;
         let forced = match self.source.traversal() {
             Traversal::Indexed => Some(ExpandMode::IndexedScan),
             Traversal::Csr => Some(ExpandMode::Csr),
@@ -2590,7 +2784,7 @@ impl Lowering<'_> {
         if mode == ExpandMode::Csr {
             self.csr_cached = true;
         }
-        (mode, frontier_estimate, policy)
+        Ok((mode, frontier_estimate, policy))
     }
 
     /// Pass 9, the access path of a dependent scan: the cost model over the

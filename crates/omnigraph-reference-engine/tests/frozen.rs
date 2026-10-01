@@ -15,16 +15,16 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-/// The change the hashes below were taken at: PR #795 moved v1 out of the engine
-/// into this crate (`projection.rs` byte-identical to the engine's former pin;
-/// `gate.rs` re-pinned for its refusal advice to the `expect same as v1` caller).
-const BASELINE: &str = "PR #795 move";
+/// The original move plus shared-IR adapters in `gate.rs`, `query.rs` and
+/// `projection.rs`. New selectors and synthetic edge type reads are refused;
+/// named-edge execution remains the reference behavior.
+const BASELINE: &str = "PR #795 move plus typed-edge IR adapters";
 
 /// (path under `src/`, SHA-256 of the file's bytes).
 const FROZEN: &[(&str, &str)] = &[
     (
         "gate.rs",
-        "c88ab5d0534db9e209ab7733330a6b444d5e256b46944167849b5d7a5d73eec0",
+        "10e39429913cf07374149dbca6f8320df12f75da5f31ff361a0cde68c033aeab",
     ),
     (
         "graph_index.rs",
@@ -44,11 +44,11 @@ const FROZEN: &[(&str, &str)] = &[
     ),
     (
         "projection.rs",
-        "0b645a65c338d28d4fcbe5408e0852368d57f12660c6ff8c463a2b062b6c4413",
+        "1188855041cf2514c42e4a66eb2b7dbc5a9df48cd5d6bfd498fc274ecb91e9bd",
     ),
     (
         "query.rs",
-        "51ffdefd26d34d7034213ab325a3e890e660091772808d0cdd037832e0fd76bb",
+        "8caba67ea769e8602ff291ce5b5293c8985bfc547ffddf09014d57816033ac0c",
     ),
     (
         "table_store.rs",

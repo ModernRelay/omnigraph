@@ -25,6 +25,7 @@
 //!     --output bench-results/after-pr2-phase2/actor-isolation.json
 //! ```
 
+use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -130,8 +131,9 @@ fn build_heavy_body(batch_idx: usize, rows: usize) -> String {
 async fn send_heavy_batch(app: Router, batch_idx: usize, rows: usize) -> StatusCode {
     let body = build_heavy_body(batch_idx, rows);
     let req = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::POST)
-        .uri("/ingest")
+        .uri("/graphs/default/ingest")
         .header("authorization", format!("Bearer {HEAVY_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(body))
@@ -210,8 +212,9 @@ async fn drive_light_actor(
         };
         let body = serde_json::to_vec(&request_body).unwrap();
         let req = Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
-            .uri("/change")
+            .uri("/graphs/default/change")
             .header("authorization", format!("Bearer {token}"))
             .header("content-type", "application/json")
             .body(Body::from(body))
