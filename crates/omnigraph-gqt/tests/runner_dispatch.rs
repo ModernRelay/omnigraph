@@ -154,21 +154,16 @@ fn explicit_environment_selection_and_lifetime_evidence() {
             .unwrap()
             .iter()
             .filter(|event| event["kind"] == "engine_lifetime")
+            .map(|event| event["value"].clone())
             .collect::<Vec<_>>();
-        assert_eq!(lifetimes.len(), 3);
-        let mut opens = 0;
-        for event in lifetimes {
-            let before = event["value"]["before"].as_array().unwrap();
-            let after = event["value"]["after"].as_array().unwrap();
-            assert_eq!(
-                before[0], after[0],
-                "ordinary steps cannot initialize a graph"
-            );
-            opens += after[1].as_u64().unwrap() - before[1].as_u64().unwrap();
-        }
         assert_eq!(
-            opens, 1,
-            "the engine's real open hook must fire only for restart"
+            lifetimes,
+            vec![
+                serde_json::json!({"before": [1, 0], "after": [1, 0]}),
+                serde_json::json!({"before": [1, 0], "after": [1, 1]}),
+                serde_json::json!({"before": [1, 1], "after": [1, 1]}),
+            ],
+            "the engine must initialize once and reopen only at the restart step"
         );
         assert_eq!(
             events
