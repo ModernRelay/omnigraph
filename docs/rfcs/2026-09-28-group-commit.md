@@ -297,8 +297,8 @@ It runs one batch at a time:
    no exclusion inside the branch gate (the shared gate's decision log), so
    the publisher does not take them.
 2. **Revalidate once** with the checks `revalidate_write_txn` runs per
-   write today: the schema-apply sentinel (read twice), the branch
-   authority and the schema contract. Since #813, a write to a branch other
+   write today: the branch authority and the schema contract, which since
+   #834 is a row of `__manifest` read with it. Since #813, a write to a branch other
    than the handle's bound branch reuses its captured authority when a
    probe finds the `__manifest` version unchanged; the publisher can reuse
    its own last published authority the same way. This yields the current materialized head Hc, the
@@ -712,11 +712,12 @@ Each step leaves `main` shippable.
   session. Decided in rollout step 2, with the DST seam scheduler's actor
   mapping, which needs the same identity.
 - **The next lever after this one.** Once publication is amortized, a
-  writer's cycle at +30 ms is dominated by preparation's own round trips:
-  the sentinel, the schema contract and the branch probe. #813 removed the
-  branch probe's reopen for writes to a branch other than the handle's bound
-  branch. A capture served from the publisher's known head is the next
-  step. Not part of this RFC.
+  writer's cycle at +30 ms is dominated by preparation's own round trips.
+  Since #834 one insert makes 13 requests: 6 writes, the key check, the
+  table open, and 4 `__manifest` reads. #813 removed the branch probe's
+  reopen for writes to a branch other than the handle's bound branch. A
+  capture served from the publisher's known head is the next step, filed as
+  #837. Not part of this RFC.
 
 ## Decision log
 
@@ -797,3 +798,7 @@ Each step leaves `main` shippable.
     side of the queue.
   - #823's merge receipts and #833's changelog fragments change nothing
     here; step 5's release note becomes a fragment.
+  - #834 moved the schema contract into `__manifest` and removed the
+    schema-apply sentinel, so revalidation no longer reads it and an insert
+    makes 13 requests instead of 20. The next-lever paragraph now cites
+    #837.
