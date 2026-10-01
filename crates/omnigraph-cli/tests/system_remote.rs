@@ -2,8 +2,6 @@ mod support;
 
 use std::fs;
 
-use omnigraph::db::Omnigraph;
-use reqwest::blocking::Client;
 use serde_json::json;
 
 use support::*;
@@ -79,7 +77,7 @@ query insert_person($name: String, $age: I32) {
 "#,
     )
     .unwrap();
-    let client = Client::new();
+    let client = graph_http_client();
 
     let health = client
         .get(format!("{}/healthz", server.base_url))
@@ -263,15 +261,62 @@ query insert_person($name: String, $age: I32) {
     );
 }
 
+/// Compare the served schema and every branch snapshot around a refused apply.
+/// This observes the existing server handle without opening another writer.
+fn assert_cluster_schema_apply_refused(server: &TestServer, schema: &std::path::Path) {
+    let read = |arguments: &[&str]| {
+        parse_stdout_json(&output_success(
+            cli()
+                .args(["--server", &server.base_url, "--graph", GRAPH_ID])
+                .args(arguments)
+                .arg("--json"),
+        ))
+    };
+    let state = || {
+        let schema = read(&["schema", "show"]);
+        let inventory = read(&["branch", "list"]);
+        let mut branches: Vec<_> = inventory["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|branch| branch.as_str().unwrap().to_string())
+            .collect();
+        branches.sort();
+        let snapshots: Vec<_> = branches
+            .iter()
+            .map(|branch| read(&["snapshot", "--branch", branch]))
+            .collect();
+        (schema, branches, snapshots)
+    };
+    let before = state();
+    let output = output_failure(
+        cli()
+            .args(["--server", &server.base_url, "--graph", GRAPH_ID])
+            .args(["schema", "apply", "--schema"])
+            .arg(schema)
+            .arg("--json"),
+    );
+    let refusal = parse_stdout_json(&output);
+    assert_eq!(refusal["code"], "conflict", "{refusal}");
+    assert!(
+        refusal["error"]
+            .as_str()
+            .unwrap()
+            .contains("server-side schema apply is disabled for cluster-backed serving"),
+        "{refusal}"
+    );
+    assert_eq!(
+        state(),
+        before,
+        "refusal must preserve schema and graph state"
+    );
+}
+
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
-fn remote_schema_apply_via_cli_updates_graph() {
+fn remote_schema_apply_refuses_additive_change_for_cluster_backed_graph() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
-    let served_root = cluster
-        .path()
-        .join("graphs")
-        .join(format!("{GRAPH_ID}.omni"));
     let temp = tempfile::tempdir().unwrap();
     let next_schema = temp.path().join("next.pg");
     fs::write(
@@ -283,34 +328,12 @@ fn remote_schema_apply_via_cli_updates_graph() {
     )
     .unwrap();
 
-    let payload = parse_stdout_json(&output_success(
-        cli()
-            .arg("schema")
-            .arg("apply")
-            .arg("--server")
-            .arg(&server.base_url)
-            .arg("--graph")
-            .arg(GRAPH_ID)
-            .arg("--schema")
-            .arg(&next_schema)
-            .arg("--json"),
-    ));
-    assert_eq!(payload["applied"], true);
-
-    let db = tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(Omnigraph::open(served_root.to_string_lossy().as_ref()))
-        .unwrap();
-    assert!(
-        db.catalog().node_types["Person"]
-            .properties
-            .contains_key("nickname")
-    );
+    assert_cluster_schema_apply_refused(&server, &next_schema);
 }
 
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
-fn remote_schema_apply_rejects_unsupported_plan() {
+fn remote_schema_apply_refuses_incompatible_change_for_cluster_backed_graph() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
     let temp = tempfile::tempdir().unwrap();
@@ -323,32 +346,16 @@ fn remote_schema_apply_rejects_unsupported_plan() {
     )
     .unwrap();
 
-    let output = output_failure(
-        cli()
-            .arg("schema")
-            .arg("apply")
-            .arg("--server")
-            .arg(&server.base_url)
-            .arg("--graph")
-            .arg(GRAPH_ID)
-            .arg("--schema")
-            .arg(&breaking_schema),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("changing property type"),
-        "expected unsupported-plan error, got: {stderr}"
-    );
+    assert_cluster_schema_apply_refused(&server, &breaking_schema);
 }
 
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
-fn remote_schema_apply_rejects_when_non_main_branch_exists() {
+fn remote_schema_apply_refuses_branched_cluster_backed_graph() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
 
-    // Create a non-main branch over the served path so the schema-apply
-    // single-branch precondition fails.
+    // The cluster-backed refusal applies before schema-plan or branch checks.
     output_success(
         cli()
             .arg("branch")
@@ -373,22 +380,7 @@ fn remote_schema_apply_rejects_when_non_main_branch_exists() {
     )
     .unwrap();
 
-    let output = output_failure(
-        cli()
-            .arg("schema")
-            .arg("apply")
-            .arg("--server")
-            .arg(&server.base_url)
-            .arg("--graph")
-            .arg(GRAPH_ID)
-            .arg("--schema")
-            .arg(&next_schema),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("schema apply requires a graph with only main"),
-        "expected single-branch precondition error, got: {stderr}"
-    );
+    assert_cluster_schema_apply_refused(&server, &next_schema);
 }
 
 #[test]
@@ -561,6 +553,177 @@ query insert_person($name: String, $age: I32) {
     ));
     assert_eq!(verify["row_count"], 1);
     assert_eq!(verify["rows"][0]["p.name"], "Zoe");
+}
+
+#[test]
+#[ignore = "loopback: actual CLI/server/proxy processes qualify lost merge delivery"]
+fn remote_merge_delivery_loss_never_replays_committed_effect() {
+    use support::managed_http::{IntentApiFixture, MergeDeliveryFault};
+
+    let cluster = converged_loaded_cluster(GRAPH_ID, None);
+    let server = spawn_server_with_cluster(cluster.path());
+    let client = graph_http_client();
+    let graph_url = format!("{}/graphs/{GRAPH_ID}", server.base_url);
+    let get_json = |path: &str| {
+        client
+            .get(format!("{graph_url}/{path}"))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<serde_json::Value>()
+            .unwrap()
+    };
+
+    for statement in [false, true] {
+        for (index, fault) in [
+            MergeDeliveryFault::Disconnect,
+            MergeDeliveryFault::Truncate,
+            MergeDeliveryFault::GatewayTimeout,
+            MergeDeliveryFault::CallerWait,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = format!("delivery-{}-{index}", usize::from(statement));
+            let marker = format!("Merged-{source}");
+            client
+                .post(format!("{graph_url}/branches"))
+                .json(&json!({"from": "main", "name": source}))
+                .send()
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            let change = client
+                .post(format!("{graph_url}/mutate"))
+                .json(&json!({
+                    "branch": source,
+                    "query": "query add($name: String) { insert Person { name: $name, age: 33 } }",
+                    "params": {"name": marker}
+                }))
+                .send()
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json::<serde_json::Value>()
+                .unwrap();
+            let before_target = get_json("commits?branch=main");
+            let before_source = get_json(&format!("commits?branch={source}"));
+
+            let proxy = IntentApiFixture::graph_merge_proxy(&server.base_url, fault);
+            let mut command = cli();
+            if statement {
+                command
+                    .arg("mutate")
+                    .arg("-e")
+                    .arg(format!("branch merge \"{source}\" into main"));
+            } else {
+                command.arg("branch").arg("merge").arg(&source);
+            }
+            command
+                .arg("--server")
+                .arg(&proxy.origin)
+                .arg("--graph")
+                .arg(GRAPH_ID)
+                .arg("--json")
+                // CallerWait deliberately expires this process wait while the
+                // proxy owns a fully consumed successful server response. It
+                // qualifies caller abandonment, not a production deadline flag.
+                .timeout(std::time::Duration::from_secs(15));
+            let output = output_failure(&mut command);
+            if !matches!(fault, MergeDeliveryFault::CallerWait) {
+                assert_eq!(output.status.code(), Some(1), "{statement}/{fault:?}");
+            }
+            if !output.stdout.is_empty() {
+                let error = parse_stdout_json(&output);
+                assert!(
+                    error.get("error").is_some(),
+                    "{statement}/{fault:?}: {error}"
+                );
+                assert!(
+                    error.get("commit").is_none(),
+                    "lost delivery is not success"
+                );
+                assert!(
+                    error.get("outcome").is_none(),
+                    "lost delivery is not success"
+                );
+            }
+
+            let captured = proxy.forwarded_merges();
+            assert_eq!(
+                captured.len(),
+                1,
+                "{statement}/{fault:?}: successful upstream merge"
+            );
+            let upstream: serde_json::Value = serde_json::from_slice(&captured[0].body).unwrap();
+            let outcome = if statement {
+                &upstream["outcome"]["merge"]
+            } else {
+                &upstream["outcome"]
+            };
+            assert_eq!(outcome, "fast_forward", "{statement}/{fault:?}");
+            let receipt = &upstream["commit"];
+            let commit_id = receipt["graph_commit_id"].as_str().unwrap();
+            assert_eq!(
+                receipt["parent_commit_id"],
+                before_target["commits"][0]["graph_commit_id"]
+            );
+            assert_eq!(
+                receipt["merged_parent_commit_id"],
+                change["commit"]["graph_commit_id"]
+            );
+
+            // Inspect the actual server independently of the proxy's captured
+            // body: one target publication, that exact receipt, retained source
+            // and the intended row on both branches despite failed delivery.
+            assert_eq!(get_json(&format!("commits/{commit_id}")), *receipt);
+            let after_target = get_json("commits?branch=main");
+            assert_eq!(after_target["commits"][0], *receipt);
+            assert_eq!(
+                after_target["commits"].as_array().unwrap().len(),
+                before_target["commits"].as_array().unwrap().len() + 1
+            );
+            assert_eq!(get_json(&format!("commits?branch={source}")), before_source);
+            for branch in ["main", source.as_str()] {
+                let rows = client
+                    .post(format!("{graph_url}/query"))
+                    .json(&json!({
+                        "branch": branch,
+                        "query": "query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }",
+                        "params": {"name": marker}
+                    }))
+                    .send()
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json::<serde_json::Value>()
+                    .unwrap();
+                assert_eq!(rows["rows"], json!([{"p.name": marker, "p.age": 33}]));
+            }
+            proxy.assert_complete();
+            let requests = proxy.requests();
+            assert_eq!(
+                requests.len(),
+                2,
+                "discovery and exactly one data submission"
+            );
+            assert_eq!(requests[0].method, "HEAD");
+            assert_eq!(requests[0].path, "/healthz");
+            assert_eq!(requests[1].method, "POST");
+            assert_eq!(
+                requests[1].path,
+                format!(
+                    "/graphs/{GRAPH_ID}/{}",
+                    if statement {
+                        "mutate"
+                    } else {
+                        "branches/merge"
+                    }
+                )
+            );
+        }
+    }
 }
 
 #[test]
@@ -1041,12 +1204,14 @@ query insert_person($name: String, $age: I32) {
             .arg(r#"{"name":"PolicyRemote","age":41}"#)
             .arg("--json"),
     );
-    let denied_main_stderr = String::from_utf8(denied_main_change.stderr).unwrap();
+    let denied_main = parse_stdout_json(&denied_main_change);
+    assert_eq!(denied_main["code"], "forbidden");
+    let denied_main_message = denied_main["error"].as_str().unwrap();
     assert!(
-        denied_main_stderr.contains("denied")
-            && denied_main_stderr.contains("change")
-            && denied_main_stderr.contains("main"),
-        "expected change-on-main denial, got: {denied_main_stderr}"
+        denied_main_message.contains("denied")
+            && denied_main_message.contains("change")
+            && denied_main_message.contains("main"),
+        "expected change-on-main denial, got: {denied_main}"
     );
 
     // bruno can create an unprotected branch.
@@ -1102,13 +1267,16 @@ query insert_person($name: String, $age: I32) {
             .arg("main")
             .arg("--json"),
     );
-    let denied_merge_stderr = String::from_utf8(denied_merge.stderr).unwrap();
+    let denied_merge = parse_stdout_json(&denied_merge);
+    assert_eq!(denied_merge["code"], "forbidden");
+    let denied_merge_message = denied_merge["error"].as_str().unwrap();
     assert!(
-        denied_merge_stderr.contains("denied") && denied_merge_stderr.contains("branch_merge"),
-        "expected branch_merge denial, got: {denied_merge_stderr}"
+        denied_merge_message.contains("denied") && denied_merge_message.contains("branch_merge"),
+        "expected branch_merge denial, got: {denied_merge}"
     );
 
-    // ragnor (admins) can promote into protected main.
+    // ragnor can promote into protected main, but has no branch_delete grant.
+    // The compound request still exits 0 and preserves the merge's receipt.
     let merged = parse_stdout_json(&output_success(
         cli()
             .env("OMNIGRAPH_BEARER_TOKEN", "admin-token")
@@ -1121,9 +1289,42 @@ query insert_person($name: String, $age: I32) {
             .arg("feature")
             .arg("--into")
             .arg("main")
+            .arg("--delete-branch")
             .arg("--json"),
     ));
     assert_eq!(merged["target"], "main");
+    assert_eq!(merged["outcome"], "fast_forward");
+    assert_eq!(merged["branch_deleted"], false);
+    assert_eq!(merged["branch_delete_error_details"]["code"], "forbidden");
+    assert!(merged.get("branch_delete_error").is_none());
+    assert_eq!(merged["commit"]["actor_id"], "act-ragnor");
+    assert_eq!(
+        merged["commit"]["merged_parent_commit_id"],
+        changed["commit"]["graph_commit_id"]
+    );
+    let client = graph_http_client();
+    let get_json = |path: &str| {
+        client
+            .get(format!("{}/graphs/{GRAPH_ID}/{path}", server.base_url))
+            .bearer_auth("team-token")
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<serde_json::Value>()
+            .unwrap()
+    };
+    let commit_id = merged["commit"]["graph_commit_id"].as_str().unwrap();
+    assert_eq!(get_json(&format!("commits/{commit_id}")), merged["commit"]);
+    assert_eq!(
+        get_json("commits?branch=main")["commits"][0],
+        merged["commit"]
+    );
+    assert_eq!(get_json("branches")["branches"], json!(["feature", "main"]));
+    assert_eq!(
+        get_json("commits?branch=feature")["commits"][0],
+        changed["commit"]
+    );
 
     let verify = parse_stdout_json(&output_success(
         cli()
@@ -1300,6 +1501,11 @@ fn mutate_if_commit_lost_cas_exits_4_issue_365() {
     let body: serde_json::Value = serde_json::from_slice(&lost.stdout)
         .expect("--json must emit the structured body on stdout");
     assert_eq!(body["precondition_failure"]["expected"], json!(stale_id));
+    assert_eq!(body["http_status"], 412);
+    assert_eq!(
+        body["command_outcome"],
+        json!({"execution":"not_started","effects":"none","action":"refresh"})
+    );
 
     // An id from a fresh read passes with exit 0.
     let read = parse_stdout_json(&output_success(

@@ -9,7 +9,7 @@ version axes. Never derive one axis from another.
 | Axis | Policy | Guard |
 |---|---|---|
 | Release | Published workspace artifacts move in lockstep. | Workspace manifests, lockfile, generated metadata, release automation. |
-| CLI ↔ server wire | Prefer additive changes; documented breaking release boundaries require coordinated upgrades. No global version handshake. | Shared DTOs, OpenAPI drift tests, and release-specific migration guidance. |
+| CLI ↔ server wire | One v0.12 contract; coordinated client/server upgrades. Exact request admission and CLI discovery/response validation. | Shared contract header, DTOs, HTTP refusal tests and OpenAPI drift tests. |
 | Graph storage | Closed stamp range `[MIN_SUPPORTED, CURRENT]`, independent of system column vintage; explicit registered upgrades into the floor, otherwise rebuild; no open-time migration. | Main-manifest stamp guard on both bounds. |
 | Lance dependency and file format | One deliberately pinned Lance family and explicit stable file version. | Lockfile, write parameters, and Lance surface guards. |
 
@@ -192,26 +192,35 @@ refusal expectations and this matrix together, with storage-maintainer review.
 
 ## Wire compatibility
 
-Prefer additive wire changes so compatible CLI and server releases can roll
-independently:
+The v0.12 HTTP boundary requires `Omnigraph-Http-Api: 0.12` exactly once on
+protected graph and registry requests. Authentication precedes contract admission;
+missing, duplicate or unsupported values return typed 400 `api_contract_mismatch`
+before graph resolution or body execution. Ordinary responses carry the same
+header. Public health, readiness and OpenAPI routes remain accessible without it.
+MCP and OAuth metadata retain their separate standard protocols.
 
-- new request fields are optional or have a server-side default;
-- new response fields do not change existing field meaning;
-- enum growth must be represented in a rolling-safe shape when old clients use
-  closed switches;
-- intentional API changes regenerate and commit `openapi.json`.
+The CLI checks the configured server's `HEAD /healthz` before each data request,
+without credentials and with a five-second discovery bound, then validates the
+actual response header before consuming its body. Discovery failure means that
+request was not sent; a response mismatch after dispatch leaves effects unknown.
+Graph HTTP requests follow no redirects and retry nothing automatically. See the
+[HTTP admission decision](../rfcs/2026-09-30-v012-http-admission.md) and
+[operator guidance](../user/operations/server.md).
 
-Do not infer wire compatibility from a shared graph-storage version. The
-v0.9/v0.10 boundary deliberately removes legacy graph-facing field names and
-public aliases; it is **not rolling-safe**. Upgrade CLI, server, and client
-integrations together according to the [v0.10 release notes](../releases/v0.10.0.md).
-The Lance 9/10 to 11 analyzer transition separately requires a quiesced fleet
-and explicit full-text rebuilds; see [the upgrade procedure](../user/operations/upgrade.md#full-text-index-upgrade).
+Upgrade CLI, server and integrations together. The shared contract identifier is
+independent of package and graph-storage versions; it establishes neither support
+for another server increment nor permission to replay a write. No old-client
+fallback or negotiation framework is supported. New wire changes update shared
+DTOs, the contract decision, OpenAPI and transport qualification together.
 
-Future incompatible wire changes must identify the affected release boundary,
-document the consumer migration, and test fail-closed behavior where an older
-server could otherwise ignore a new write precondition. There is no global
-wire-version handshake; storage strictness is not a reason to add one.
+Server URLs identify the service root, preserving any proxy prefix. Migrate
+graph-qualified URLs to that root plus `--graph`, `default_graph` or alias `graph`;
+the CLI does not infer a root by stripping path segments.
+
+Storage upgrades and the Lance analyzer boundary remain separately owned. The
+Lance 9/10 to 11 analyzer transition requires a quiesced fleet and explicit
+full-text rebuilds; see the
+[upgrade procedure](../user/operations/upgrade.md#full-text-index-upgrade).
 
 ## Registry publication status
 

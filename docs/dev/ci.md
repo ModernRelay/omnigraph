@@ -2,6 +2,32 @@
 
 Workflow YAML under `.github/workflows/` is the source of truth. This page explains the boundaries; it does not duplicate every job or pinned version.
 
+## Issue triage
+
+Issue forms apply `needs-triage` plus `bug` or `feature` according to the selected
+form. `issue-triage.yml` provides an asynchronous fallback for newly opened
+issues submitted through other paths.
+It skips opening events already carrying `needs-triage`, then checks the current
+issue before writing. Closed issues and issues with any lifecycle status are
+left unchanged. It only adds `needs-triage`; it never replaces other labels or
+runs in response to later label edits.
+
+Failed API operations are retried up to three attempts, with a fresh status
+check before each write attempt. Runs for the same issue are serialized; issues
+with different numbers run independently. The workflow uses only `issues: write`
+and does not check out or execute repository or issue content.
+
+To repair missed intake, a maintainer with write access can select **Actions >
+Issue triage > Run workflow** on the default branch and enter one positive issue
+number. Manual runs use the same lifecycle checks and reject pull request
+numbers. They do not scan or relabel the backlog.
+
+Actions must be enabled and the run must succeed. Issues created using
+`GITHUB_TOKEN` do not trigger this workflow automatically; their creators must
+set `needs-triage`, or a maintainer can use the manual repair. Status reads and
+label writes are separate API calls, so a maintainer edit can still race a write.
+Who can change labels is controlled by repository permissions, not this workflow.
+
 ## Pull-request gates
 
 `ci.yml` always classifies the diff (from the merge base with the base branch,
@@ -11,7 +37,7 @@ puts each changed path in one class:
 
 | Class | Paths | Jobs that run |
 |---|---|---|
-| documentation | `docs/**/*.md` (`.mdx`, `.rst`, `.adoc`), the root `README.md`, `AGENTS.md`, `CLAUDE.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `LICENSE.md` | the always-on guards (`Classify Changes`, `Check AGENTS.md Links`, `Check Workflow Action Pins`, `Fix Regression Gate`, `Storage Upgrade Compatibility`, `Dependency Guard (cargo deny)`; of these only `Check AGENTS.md Links` reads documentation, through `scripts/check-docs.py`) |
+| documentation | `docs/**/*.md` (`.mdx`, `.rst`, `.adoc`), `changelog.d/*.md`, `changelog.d/release.json`, the root `README.md`, `AGENTS.md`, `CLAUDE.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `LICENSE.md` | the always-on guards (`Classify Changes`, `Check AGENTS.md Links`, `Check Workflow Action Pins`, `Fix Regression Gate`, `Storage Upgrade Compatibility`, `Dependency Guard (cargo deny)`; of these only `Check AGENTS.md Links` reads documentation, through `scripts/check-docs.py`) |
 | GQT cases | `.gqt` files anywhere under `crates/omnigraph-gqt/cases/` (recursive discovery) | the guards plus `GQ Logic Tests` (`run_gqt`) |
 | deployment | `Dockerfile`, `.dockerignore`, `docker/**`, `deploy/**` | the guards plus `Azure Contract Guards`, `Container Entrypoint`, `Azure Deployment Validation` (`run_deployment`) |
 | engine input | every other path: `crates/**` (a text fixture under a crate is source code; only the `.gqt` corpus is a class of its own), `tools/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/**`, `scripts/**`, `.github/**`, anything unlisted | every job (`run_full_ci`, which also sets `run_gqt` and `run_deployment`) |
@@ -349,7 +375,8 @@ cargo test -p omnigraph-gqt --locked
 cargo clippy -p omnigraph-gqt --all-targets --locked -- -D warnings -W clippy::dbg_macro
 ```
 
-For repository metadata and workflow changes:
+For repository metadata and workflow changes, first
+[activate the documentation environment](documentation.md#documentation-tools):
 
 ```bash
 bash scripts/check-agents-md.sh
@@ -371,6 +398,24 @@ shellcheck scripts/*.sh
 `typos` (`cargo install typos-cli --locked --version 1.50.1`, the version `ci.yml` pins; the misspelling list grows per release, so a newer local binary can flag words CI accepts), `cargo-deny` (`cargo install cargo-deny --locked --version 0.20.2`, the version the pinned `cargo-deny-action` bundles; `deny.toml` uses the `unsound` scope field, which needs 0.19 or newer; run it from the repository root once `Cargo.lock` is current, since `--locked` refuses a stale lockfile and a subdirectory run scopes the graph to that package and reports the root's ignores as unmatched; the advisory database grows daily, so a local run can report an advisory CI has not seen yet or the reverse), `actionlint` and `shellcheck` are developer tools, not workspace dependencies. Run the applicable subset when a change does not touch their surface.
 
 ## Release workflows
+
+`Check AGENTS.md Links` validates release-note inputs, runs the focused Python
+composer tests and uploads a `release-notes-preview` artifact with links pinned
+to its selected commit. The checker and composer use the same pinned CommonMark
+dependencies from `scripts/requirements-docs.txt`, installed in a temporary
+environment. Its full-history checkout supplies the explicit previous release
+and pinned migration source.
+Note-only changes use the documentation class. The
+[authoring guide](documentation.md#release-notes) describes permanent fragments,
+the supported link format and snapshot generation.
+
+For v0.12.0 and later, the stable publisher requires a generated release snapshot
+whose complete note manifest and configuration still match its audited source.
+The recorded input commit is informational, allowing squash merges; release base
+and migration source ancestry are still required. The publisher installs the
+same pinned parser in a temporary environment after the historical cutoff. It
+derives the GitHub body from that same snapshot with links pinned to the release
+tag. Earlier manual backfills keep their asset-only route. Edge is unchanged.
 
 | Workflow | Trigger and output |
 |---|---|

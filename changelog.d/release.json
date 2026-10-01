@@ -1,0 +1,5 @@
+{
+  "version": "v0.12.0",
+  "base": "refs/tags/v0.11.0",
+  "legacy": "d0bbe07fc666d1bf8e89815d39f4dfe20be18d24"
+}

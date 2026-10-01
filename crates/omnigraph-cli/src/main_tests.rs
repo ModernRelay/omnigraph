@@ -24,12 +24,8 @@ fn embedded_cli_preserves_complete_storage_diagnostic_without_reprefixing() {
 
 #[test]
 fn legacy_change_request_body_uses_legacy_field_names() {
-    // `mutate`'s remote arm hits `POST /change`, which old
-    // `omnigraph-server` builds deserialize as `ChangeRequest` with
-    // **required** `query_source` and optional `query_name` keys.
-    // Newer servers accept both spellings via serde alias, but a
-    // newer CLI must still emit the legacy keys on the wire so it
-    // can talk to an old server during a rolling upgrade.
+    // `mutate`'s `POST /change` arm uses the current route DTO spelling:
+    // required `query_source` and optional `query_name`.
     let body = legacy_change_request_body(
         "query insert_person($n: String) { insert Person { name: $n } }",
         Some("insert_person"),
@@ -43,9 +39,7 @@ fn legacy_change_request_body_uses_legacy_field_names() {
     assert_eq!(body["query_name"].as_str(), Some("insert_person"));
     assert_eq!(body["branch"].as_str(), Some("main"));
     assert_eq!(body["params"]["n"].as_str(), Some("Alice"));
-    // Crucially, the **new** field names must NOT appear -- old
-    // servers would silently treat them as unknown fields and then
-    // fail on missing required `query_source`.
+    // Keep this route's exact DTO keys on the wire.
     assert!(
         body.get("query").is_none(),
         "legacy /change body must not carry the renamed `query` key; got {body}"

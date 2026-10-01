@@ -1,11 +1,6 @@
 # issue: none
-# notes: The four best `alpha` scorers carry no edge, so the traversal evicts them. Fusing the
-# notes: complete rankings makes x the winner (1/61 + 1/62 beats n's 1/63 + 1/61 at k = 60);
-# notes: an alpha arm capped before the traversal would fuse on beta alone and flip the winner
-# notes: to n with the row count still full. Replaces the rows of the Rust test
-# notes: rrf_decoy_flood_does_not_flip_the_fused_winner (search.rs); its scan-row and retry
-# notes: counters measured the v1 executor and its forced postfilter `rrf_plan` is a process
-# notes: setting, so both stay out.
+# notes: Four alpha leaders have no edge; named, alternative and wildcard traversals must refill both BM25 arms.
+# notes: Complete rankings make x win; losing the alpha arm flips the winner to n without changing the row count.
 
 --- runner
 timeout_ms: 10000
@@ -23,9 +18,7 @@ node Artifact {
     slug: String @key
 }
 
-edge ChunkOfArtifact: Chunk -> Artifact {
-    label: String
-}
+edge ChunkOfArtifact: Chunk -> Artifact
 
 --- seed
 {"type":"Artifact","data":{"slug":"art-0"}}
@@ -36,14 +29,15 @@ edge ChunkOfArtifact: Chunk -> Artifact {
 {"type":"Chunk","data":{"slug":"x","text":"alpha alpha alpha beta beta beta beta beta beta filler filler filler filler filler filler filler filler filler filler filler"}}
 {"type":"Chunk","data":{"slug":"y","text":"alpha alpha beta beta beta beta beta filler filler filler filler filler filler filler filler filler filler filler filler filler"}}
 {"type":"Chunk","data":{"slug":"n","text":"alpha beta beta beta beta beta beta beta filler filler filler filler filler filler filler filler filler filler filler filler"}}
-{"edge":"ChunkOfArtifact","id":"e-x","from":"x","to":"art-0","data":{"label":"of"}}
-{"edge":"ChunkOfArtifact","id":"e-y","from":"y","to":"art-0","data":{"label":"of"}}
-{"edge":"ChunkOfArtifact","id":"e-n","from":"n","to":"art-0","data":{"label":"of"}}
+{"edge":"ChunkOfArtifact","id":"e-x","from":"x","to":"art-0"}
+{"edge":"ChunkOfArtifact","id":"e-y","from":"y","to":"art-0"}
+{"edge":"ChunkOfArtifact","id":"e-n","from":"n","to":"art-0"}
 
 --- query
 query recall_two_terms($q1: String, $q2: String) {
     match {
         $c: Chunk
+        $a: Artifact
         $c chunkOfArtifact $a
         search($c.text, $q1)
     }
@@ -53,10 +47,68 @@ query recall_two_terms($q1: String, $q2: String) {
 }
 
 --- params
-{"q1": "alpha", "q2": "beta"}
+{"q1":"alpha","q2":"beta"}
 
 --- expect unordered
-{"c.slug": "x"}
+{"c.slug":"x"}
 
 --- expect shape
 c.slug: String
+
+--- expect plan
+expand $c $a: selection named [ChunkOfArtifact out]
+rank fuse row tiebreak [$a.@id]
+
+--- query
+query recall_alternation($q1: String, $q2: String) {
+    match {
+        $c: Chunk
+        $a: Artifact
+        $c (chunkOfArtifact | chunkOfArtifact) $a
+        search($c.text, $q1)
+    }
+    return { $c.slug }
+    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    limit 1
+}
+
+--- params
+{"q1":"alpha","q2":"beta"}
+
+--- expect unordered
+{"c.slug":"x"}
+
+--- expect shape
+c.slug: String
+
+--- expect plan
+expand $c $a: selection alternation [ChunkOfArtifact out]
+rank fuse row tiebreak [$a.@id]
+expand $c $a: mode indexed_scan ran indexed_scan
+
+--- query
+query recall_wildcard($q1: String, $q2: String) {
+    match {
+        $c: Chunk
+        $a: Artifact
+        $c * $a
+        search($c.text, $q1)
+    }
+    return { $c.slug }
+    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    limit 1
+}
+
+--- params
+{"q1":"alpha","q2":"beta"}
+
+--- expect unordered
+{"c.slug":"x"}
+
+--- expect shape
+c.slug: String
+
+--- expect plan
+expand $c $a: selection wildcard [ChunkOfArtifact out]
+rank fuse row tiebreak [$a.@id]
+expand $c $a: mode indexed_scan ran indexed_scan

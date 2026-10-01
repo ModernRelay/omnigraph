@@ -1,0 +1,162 @@
+# issue: 659
+# red_on: 7f1233bb
+# notes: Alternatives preserve concrete edge type and identity, including equal IDs in different types and parallel edges.
+# notes: Unbound traversal uses distinct endpoint pairs and a shared shortest-distance frontier across all members.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+}
+node Doc {
+    slug: String @key
+}
+edge Knows: Person -> Person {
+    weight: I64
+    since: I32?
+}
+edge Likes: Person -> Person {
+    weight: I64?
+}
+edge Owns: Person -> Doc
+
+--- seed
+{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"c"}}
+{"type":"Person","data":{"name":"d"}}
+{"type":"Person","data":{"name":"e"}}
+{"type":"Doc","data":{"slug":"doc"}}
+{"edge":"Knows","id":"shared","from":"a","to":"b","data":{"weight":1}}
+{"edge":"Knows","id":"ab2","from":"a","to":"b","data":{"weight":2}}
+{"edge":"Knows","id":"ac","from":"a","to":"c","data":{"weight":3}}
+{"edge":"Knows","id":"loop","from":"a","to":"a","data":{"weight":4}}
+{"edge":"Knows","id":"de","from":"d","to":"e","data":{"weight":5}}
+{"edge":"Likes","id":"shared","from":"a","to":"b"}
+{"edge":"Likes","id":"bc","from":"b","to":"c","data":{"weight":6}}
+{"edge":"Likes","id":"bd","from":"b","to":"d","data":{"weight":7}}
+{"edge":"Likes","id":"ca","from":"c","to":"a","data":{"weight":8}}
+{"edge":"Owns","id":"document","from":"a","to":"doc"}
+
+--- query
+query concrete_edges() {
+    match {
+        $from: Person { name: "a" }
+        $from $edge:(knows | likes) $to
+    }
+    return { $to.name as destination, $edge.@type as edge_type, $edge.@id as edge_id, $edge.weight as weight }
+}
+
+--- expect unordered
+{"destination":"b","edge_type":"Knows","edge_id":"shared","weight":1}
+{"destination":"b","edge_type":"Knows","edge_id":"ab2","weight":2}
+{"destination":"c","edge_type":"Knows","edge_id":"ac","weight":3}
+{"destination":"a","edge_type":"Knows","edge_id":"loop","weight":4}
+{"destination":"b","edge_type":"Likes","edge_id":"shared"}
+
+--- expect shape
+destination: String
+edge_type: String
+edge_id: String
+weight: I64?
+
+--- expect plan
+expand $from $to: selection alternation [Knows out, Likes out]
+expand $from $to: mode indexed_scan ran indexed_scan
+
+--- query
+query distinct_neighbors() {
+    match {
+        $from: Person { name: "a" }
+        $from (knows | likes) $to
+    }
+    return { $to.name as destination }
+}
+
+--- expect unordered
+{"destination":"a"}
+{"destination":"b"}
+{"destination":"c"}
+
+--- expect shape
+destination: String
+
+--- query
+query exactly_two_hops() {
+    match {
+        $from: Person { name: "a" }
+        $from (knows | likes){2,2} $to
+    }
+    return { $to.name as destination }
+}
+
+--- expect unordered
+{"destination":"d"}
+
+--- expect shape
+destination: String
+
+--- query
+query exactly_three_hops() {
+    match {
+        $from: Person { name: "a" }
+        $from (knows | likes){3,3} $to
+    }
+    return { $to.name as destination }
+}
+
+--- expect unordered
+{"destination":"e"}
+
+--- expect shape
+destination: String
+
+--- query
+query bounded_reachable_people() {
+    match {
+        $from: Person { name: "a" }
+        $from (knows | likes){1,3} $to
+    }
+    return { $to.name as destination }
+}
+
+--- expect unordered
+{"destination":"a"}
+{"destination":"b"}
+{"destination":"c"}
+{"destination":"d"}
+{"destination":"e"}
+
+--- expect shape
+destination: String
+
+--- query
+query wildcard_concrete_edges() {
+    match {
+        $from: Person { name: "a" }
+        $to: Person
+        $from $edge:* $to
+    }
+    return { $to.name as destination, $edge.@type as edge_type, $edge.@id as edge_id, $edge.weight as weight }
+}
+
+--- expect unordered
+{"destination":"b","edge_type":"Knows","edge_id":"shared","weight":1}
+{"destination":"b","edge_type":"Knows","edge_id":"ab2","weight":2}
+{"destination":"c","edge_type":"Knows","edge_id":"ac","weight":3}
+{"destination":"a","edge_type":"Knows","edge_id":"loop","weight":4}
+{"destination":"b","edge_type":"Likes","edge_id":"shared"}
+
+--- expect shape
+destination: String
+edge_type: String
+edge_id: String
+weight: I64?

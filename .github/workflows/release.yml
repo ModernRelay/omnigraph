@@ -160,7 +160,8 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           ref: ${{ needs.vocabulary_gate.outputs.source_sha }}
-          fetch-depth: 1
+          # Validate the input manifest against the audited source and release base.
+          fetch-depth: 0
 
       - name: Verify release tag still selects audited source
         env:
@@ -229,10 +230,49 @@ jobs:
           cd dist
           sha256sum --strict -c ./*.sha256
 
+      - name: Validate and prepare release notes
+        id: release_notes
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ needs.vocabulary_gate.outputs.source_sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"]
+          match = re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag)
+          if not match:
+              raise SystemExit("stable release tags must use vMAJOR.MINOR.PATCH")
+          if tuple(map(int, match.groups())) < (0, 12, 0):
+              # Older audited checkouts do not contain the release-note tool.
+              raise SystemExit(0)
+          environment = Path(os.environ["RUNNER_TEMP"]) / "release-notes-venv"
+          subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
+          python = str(environment / "bin/python")
+          subprocess.run(
+              [python, "-m", "pip", "install", "--disable-pip-version-check",
+               "-r", "scripts/requirements-docs.txt"], check=True,
+          )
+          output = Path(os.environ["RUNNER_TEMP"]) / "release-notes-body.md"
+          with output.open("w", encoding="utf-8") as body:
+              subprocess.run(
+                  [python, "scripts/release_notes.py", "body", "--tag", tag,
+                   "--target", os.environ["SOURCE_SHA"]],
+                  stdout=body, check=True,
+              )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as outputs:
+              print(f"body_path={output}", file=outputs)
+          PY
+
       - name: Publish release (single writer — no matrix race)
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ inputs.tag }}
+          body_path: ${{ steps.release_notes.outputs.body_path }}
           files: dist/**
           overwrite_files: true
 

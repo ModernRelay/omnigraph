@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, SubqueryPredicate};
 use omnigraph_compiler::query::ast::{AggFunc, BinaryOp, CompOp, Literal};
+use omnigraph_compiler::traversal::{EdgeMember, EdgeSelection};
 use omnigraph_compiler::types::Direction;
 use omnigraph_compiler::{
     SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_META, SYSTEM_COLUMNS_V3, SystemColumns,
@@ -29,6 +30,87 @@ use crate::source::SideId;
 
 fn internal(detail: impl std::fmt::Display) -> PlanError {
     PlanError::Internal(format!("the plan mirror does not read back: {detail}"))
+}
+
+/// Stable selector spelling shared by explain and saved plans, independent
+/// of the compiler's Rust enum names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeSelectionMirror {
+    pub kind: EdgeSelectionKind,
+    pub members: Vec<EdgeMemberMirror>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeSelectionKind {
+    Named,
+    Alternation,
+    Wildcard,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeMemberMirror {
+    pub edge_type: String,
+    pub direction: DirectionMirror,
+}
+
+impl From<&EdgeSelection> for EdgeSelectionMirror {
+    fn from(selection: &EdgeSelection) -> Self {
+        Self {
+            kind: match selection {
+                EdgeSelection::Named(_) => EdgeSelectionKind::Named,
+                EdgeSelection::Alternation(_) => EdgeSelectionKind::Alternation,
+                EdgeSelection::Wildcard(_) => EdgeSelectionKind::Wildcard,
+            },
+            members: selection
+                .members()
+                .iter()
+                .map(|member| EdgeMemberMirror {
+                    edge_type: member.edge_type.clone(),
+                    direction: member.direction.into(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<EdgeSelectionMirror> for EdgeSelection {
+    type Error = PlanError;
+
+    fn try_from(mirror: EdgeSelectionMirror) -> Result<Self, Self::Error> {
+        let valid_count = match mirror.kind {
+            EdgeSelectionKind::Named => mirror.members.len() == 1,
+            EdgeSelectionKind::Alternation => !mirror.members.is_empty(),
+            EdgeSelectionKind::Wildcard => true,
+        };
+        if !valid_count
+            || mirror
+                .members
+                .iter()
+                .any(|member| member.edge_type.is_empty())
+            || mirror
+                .members
+                .windows(2)
+                .any(|pair| pair[0].edge_type >= pair[1].edge_type)
+        {
+            return Err(internal(
+                "edge selection requires canonical unique members and valid cardinality",
+            ));
+        }
+        let mut members: Vec<_> = mirror
+            .members
+            .into_iter()
+            .map(|member| EdgeMember {
+                edge_type: member.edge_type,
+                direction: member.direction.into(),
+            })
+            .collect();
+        Ok(match mirror.kind {
+            EdgeSelectionKind::Named => Self::Named(members.remove(0)),
+            EdgeSelectionKind::Alternation => Self::Alternation(members),
+            EdgeSelectionKind::Wildcard => Self::Wildcard(members),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -204,8 +286,8 @@ pub enum NodeMirror {
         input: NodeId,
         src: String,
         dst: String,
-        edge_type: String,
-        direction: DirectionMirror,
+        edges: EdgeSelectionMirror,
+        src_type: String,
         dst_type: String,
         min_hops: u32,
         max_hops: Option<u32>,
@@ -213,7 +295,7 @@ pub enum NodeMirror {
         mode: ExpandMode,
         frontier_estimate: Option<u64>,
         policy: ExpandPolicy,
-        version: Option<u64>,
+        versions: BTreeMap<String, Option<u64>>,
     },
     AntiJoin {
         input: NodeId,
@@ -224,11 +306,13 @@ pub enum NodeMirror {
     OuterReference {
         outer_var: String,
     },
+    #[serde(rename = "RankFuseWithTiebreak")]
     RankFuse {
         arms: [RankArm; 2],
         k: Option<ExprMirror>,
         limit: Option<usize>,
         prefilter: PrefilterMirror,
+        row_tiebreak: Vec<ColumnRef>,
     },
     Projection {
         input: NodeId,
@@ -242,7 +326,7 @@ pub enum NodeMirror {
         input: NodeId,
         order_by: Vec<OrderingMirror>,
         fetch: Option<usize>,
-        tiebreak: Vec<String>,
+        tiebreak: Vec<ColumnRef>,
     },
 }
 
@@ -361,8 +445,8 @@ impl From<&PhysicalNode> for NodeMirror {
                 input,
                 src,
                 dst,
-                edge_type,
-                direction,
+                edges,
+                src_type,
                 dst_type,
                 min_hops,
                 max_hops,
@@ -370,13 +454,13 @@ impl From<&PhysicalNode> for NodeMirror {
                 mode,
                 frontier_estimate,
                 policy,
-                version,
+                versions,
             } => Self::Expand {
                 input: *input,
                 src: src.clone(),
                 dst: dst.clone(),
-                edge_type: edge_type.clone(),
-                direction: DirectionMirror::from(*direction),
+                edges: EdgeSelectionMirror::from(edges),
+                src_type: src_type.clone(),
                 dst_type: dst_type.clone(),
                 min_hops: *min_hops,
                 max_hops: *max_hops,
@@ -384,7 +468,7 @@ impl From<&PhysicalNode> for NodeMirror {
                 mode: *mode,
                 frontier_estimate: *frontier_estimate,
                 policy: policy.clone(),
-                version: *version,
+                versions: versions.clone(),
             },
             PhysicalNode::AntiJoin {
                 input,
@@ -405,11 +489,13 @@ impl From<&PhysicalNode> for NodeMirror {
                 k,
                 limit,
                 prefilter,
+                row_tiebreak,
             } => Self::RankFuse {
                 arms: arms.clone(),
                 k: k.as_ref().map(ExprMirror::from),
                 limit: *limit,
                 prefilter: PrefilterMirror::from(prefilter),
+                row_tiebreak: row_tiebreak.clone(),
             },
             PhysicalNode::Projection {
                 input,
@@ -538,8 +624,8 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 input,
                 src,
                 dst,
-                edge_type,
-                direction,
+                edges,
+                src_type,
                 dst_type,
                 min_hops,
                 max_hops,
@@ -547,13 +633,13 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 mode,
                 frontier_estimate,
                 policy,
-                version,
+                versions,
             } => Self::Expand {
                 input,
                 src,
                 dst,
-                edge_type,
-                direction: Direction::from(direction),
+                edges: EdgeSelection::try_from(edges)?,
+                src_type,
                 dst_type,
                 min_hops,
                 max_hops,
@@ -561,7 +647,7 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 mode,
                 frontier_estimate,
                 policy,
-                version,
+                versions,
             },
             NodeMirror::AntiJoin {
                 input,
@@ -580,11 +666,13 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 k,
                 limit,
                 prefilter,
+                row_tiebreak,
             } => Self::RankFuse {
                 arms,
                 k: k.map(IRExpr::from),
                 limit,
                 prefilter: Prefilter::from(prefilter),
+                row_tiebreak,
             },
             NodeMirror::Projection {
                 input,

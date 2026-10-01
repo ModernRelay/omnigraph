@@ -1,6 +1,7 @@
 //! Schema read/apply routes: migrations over HTTP, drift, gating.
 //! Moved verbatim from tests/server.rs in the modularization.
 
+use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::fs;
 use std::sync::Arc;
 
@@ -19,6 +20,66 @@ use serde_json::json;
 mod support;
 use support::*;
 
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_apply_refuses_a_wildcard_member_missing_a_used_property_issue_659() {
+    let source = r#"query neighbor_since() {
+        match { $p: Person { name: "Alice" } $f: Person $p $e:* $f }
+        return { $f.name, $e.since }
+        order { $f.name }
+    }"#;
+    let (temp, app) = app_with_stored_queries(
+        &[("neighbor_since", source, true)],
+        &[("act-ragnor", "admin-token")],
+        STORED_QUERY_SCHEMA_APPLY_POLICY_YAML,
+    )
+    .await;
+    let (status, before) = json_response(
+        &app,
+        invoke_request("neighbor_since", "admin-token", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert_eq!(before["row_count"], 2);
+    let desired = format!(
+        "{}\nedge Likes: Person -> Person\n",
+        fs::read_to_string(fixture("test.pg")).unwrap()
+    );
+    let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+        .method(Method::POST)
+        .uri(g("/schema/apply"))
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer admin-token")
+        .body(Body::from(
+            serde_json::to_vec(&SchemaApplyRequest {
+                schema_source: desired,
+                ..Default::default()
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, payload) = json_response(&app, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{payload}");
+    let message = payload["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("neighbor_since")
+            && message.contains("schema check")
+            && message.contains("since"),
+        "{payload}"
+    );
+    let reopened = Omnigraph::open(graph_path(temp.path()).to_str().unwrap())
+        .await
+        .unwrap();
+    assert!(!reopened.catalog().edge_types.contains_key("Likes"));
+    let (status, after) = json_response(
+        &app,
+        invoke_request("neighbor_since", "admin-token", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert_eq!(after["rows"], before["rows"]);
+}
+
 #[tokio::test]
 async fn schema_apply_route_updates_graph_for_authorized_admin() {
     let (temp, app) = app_for_graph_with_auth_tokens_and_policy(
@@ -30,6 +91,7 @@ async fn schema_apply_route_updates_graph_for_authorized_admin() {
     let schema = additive_schema_with_nickname();
 
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::POST)
         .uri(g("/schema/apply"))
         .header("content-type", "application/json")
@@ -79,6 +141,7 @@ async fn schema_apply_route_refuses_cluster_backed_server_mode() {
     let app = build_app(state);
 
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::POST)
         .uri(g("/schema/apply"))
         .header("content-type", "application/json")
@@ -139,6 +202,7 @@ async fn schema_apply_route_cluster_backed_denies_unauthorized_actor_before_409(
     let app = build_app(state);
 
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::POST)
         .uri(g("/schema/apply"))
         .header("content-type", "application/json")
@@ -170,6 +234,7 @@ async fn schema_apply_route_rejects_stored_query_breakage_before_publish() {
     .await;
 
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::POST)
         .uri(g("/schema/apply"))
         .header("content-type", "application/json")
@@ -220,6 +285,7 @@ async fn schema_apply_route_noop_keeps_valid_stored_query_registry() {
     .await;
 
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::POST)
         .uri(g("/schema/apply"))
         .header("content-type", "application/json")
@@ -247,6 +313,7 @@ async fn schema_apply_route_requires_schema_apply_policy_permission() {
     .await;
 
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::POST)
         .uri(g("/schema/apply"))
         .header("content-type", "application/json")
@@ -278,6 +345,7 @@ async fn schema_apply_route_requires_bearer_token_when_policy_enabled() {
     .await;
 
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::POST)
         .uri(g("/schema/apply"))
         .header("content-type", "application/json")
@@ -308,6 +376,7 @@ async fn schema_apply_route_can_rename_type() {
     .await;
 
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::POST)
         .uri(g("/schema/apply"))
         .header("content-type", "application/json")
@@ -344,6 +413,7 @@ async fn schema_apply_route_can_rename_property() {
     .await;
 
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::POST)
         .uri(g("/schema/apply"))
         .header("content-type", "application/json")
@@ -383,6 +453,7 @@ async fn schema_apply_route_can_add_index() {
     };
 
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::POST)
         .uri(g("/schema/apply"))
         .header("content-type", "application/json")
@@ -444,6 +515,7 @@ async fn schema_apply_route_rejects_unsupported_plan() {
     .await;
 
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::POST)
         .uri(g("/schema/apply"))
         .header("content-type", "application/json")
@@ -485,6 +557,7 @@ async fn schema_apply_route_rejects_when_non_main_branch_exists() {
     let app = build_app(state);
 
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::POST)
         .uri(g("/schema/apply"))
         .header("content-type", "application/json")
@@ -515,6 +588,7 @@ async fn schema_drift_returns_conflict_for_snapshot_read_and_change() {
     let (snapshot_status, snapshot_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .body(Body::empty())
@@ -544,6 +618,7 @@ async fn schema_drift_returns_conflict_for_snapshot_read_and_change() {
     let (read_status, read_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/read"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -573,6 +648,7 @@ async fn schema_drift_returns_conflict_for_snapshot_read_and_change() {
     let (change_status, change_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/change"))
             .method(Method::POST)
             .header("content-type", "application/json")
@@ -599,6 +675,7 @@ async fn schema_route_returns_current_source() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/schema"))
             .method(Method::GET)
             .body(Body::empty())
@@ -618,6 +695,7 @@ async fn schema_route_requires_bearer_token_when_auth_configured() {
     let (missing_status, missing_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/schema"))
             .method(Method::GET)
             .body(Body::empty())
@@ -634,6 +712,7 @@ async fn schema_route_requires_bearer_token_when_auth_configured() {
     let (ok_status, ok_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/schema"))
             .method(Method::GET)
             .header("authorization", "Bearer demo-token")
@@ -665,6 +744,7 @@ async fn schema_route_denied_when_actor_lacks_read_permission() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/schema"))
             .method(Method::GET)
             .header("authorization", "Bearer team-token")
@@ -705,6 +785,7 @@ async fn schema_apply_route_soft_drops_property_via_http() {
     let (status, payload) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
             .uri(g("/schema/apply"))
             .header("content-type", "application/json")
@@ -765,6 +846,7 @@ async fn schema_apply_route_soft_drops_node_type_via_http() {
     let (status, payload) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
             .uri(g("/schema/apply"))
             .header("content-type", "application/json")
@@ -817,6 +899,7 @@ async fn schema_apply_route_hard_drops_property_with_allow_data_loss() {
     let (status, payload) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
             .uri(g("/schema/apply"))
             .header("content-type", "application/json")
@@ -872,6 +955,7 @@ async fn schema_apply_route_keeps_drops_soft_without_flag() {
     let (status, payload) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
             .uri(g("/schema/apply"))
             .header("content-type", "application/json")
@@ -932,6 +1016,7 @@ async fn schema_apply_route_additive_property_preserves_existing_rows() {
     let (status, payload) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
             .uri(g("/schema/apply"))
             .header("content-type", "application/json")

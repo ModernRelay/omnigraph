@@ -1,9 +1,6 @@
-//! `RankFuseExec`: `rrf()` as a pipeline breaker over two child plans, the
-//! same pipeline lowered under the primary and the secondary arm modes. Each
-//! arm is drained and ranked here, by its score, then the fused binding's id,
-//! then every other binding's id; the body is the copied fusion of
-//! `execute_rrf_fusion`: entity ranks from each leg's row order, `1/(k+rank)`
-//! summed, the winners' rows reconstructed in fused order (`build_fused_batch`).
+//! `RankFuseExec` drains and ranks both arms by score, fused identity, and
+//! downstream row keys. `fuse_arms` sums reciprocal ranks per entity and
+//! reconstructs each winner's output in fused order.
 
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use std::fmt;
@@ -38,6 +35,7 @@ pub(crate) struct RankFuseExec {
     rrf: RrfMode,
     id_column: String,
     orders: [ArmOrder; 2],
+    row_tiebreak: Vec<String>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -49,6 +47,7 @@ impl RankFuseExec {
         rrf: RrfMode,
         id_column: String,
         orders: [ArmOrder; 2],
+        row_tiebreak: Vec<String>,
     ) -> Self {
         let schema = primary.schema();
         Self {
@@ -57,6 +56,7 @@ impl RankFuseExec {
             rrf,
             id_column,
             orders,
+            row_tiebreak,
             properties: breaker_properties(schema),
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -94,12 +94,13 @@ fn direction(descending: bool) -> &'static str {
 }
 
 /// `batch` in the arm's rank order: its score, the fused binding's id, then
-/// every other `<binding>.<id>` column by name, nulls last on every key, so
+/// the declared downstream row columns, nulls last on every key, so
 /// equal scores fuse the same way on every run.
 fn ranked(
     batch: &RecordBatch,
     order: &ArmOrder,
     id_column: &str,
+    row_tiebreak: &[String],
     memory: &WorkMemory,
 ) -> DfResult<RecordBatch> {
     let column = |name: &str| {
@@ -125,23 +126,7 @@ fn ranked(
             }),
         },
     ];
-    let id_suffix = id_column
-        .rfind('.')
-        .map(|dot| &id_column[dot..])
-        .ok_or_else(|| {
-            external(OmniError::manifest_internal(format!(
-                "the fused id column '{id_column}' is not a `<binding>.<id>` column"
-            )))
-        })?;
-    let schema = batch.schema();
-    let mut others: Vec<&str> = schema
-        .fields()
-        .iter()
-        .map(|field| field.name().as_str())
-        .filter(|name| name.ends_with(id_suffix) && *name != id_column)
-        .collect();
-    others.sort_unstable();
-    for name in others {
+    for name in row_tiebreak {
         keys.push(SortColumn {
             values: column(name)?,
             options: Some(SortOptions {
@@ -189,6 +174,7 @@ impl ExecutionPlan for RankFuseExec {
             self.rrf,
             self.id_column.clone(),
             self.orders.clone(),
+            self.row_tiebreak.clone(),
         )))
     }
 
@@ -206,6 +192,7 @@ impl ExecutionPlan for RankFuseExec {
         let rrf = self.rrf;
         let id_column = self.id_column.clone();
         let orders = self.orders.clone();
+        let row_tiebreak = self.row_tiebreak.clone();
         let declared = Arc::clone(&schema);
         let stream = breaker_stream(
             "RankFuseExec",
@@ -217,8 +204,20 @@ impl ExecutionPlan for RankFuseExec {
                 let secondary = drain_one(secondary, &secondary_schema, &reservation).await?;
                 reservation
                     .blocking(move |reservation| async move {
-                        let primary = ranked(&primary, &orders[0], &id_column, &reservation)?;
-                        let secondary = ranked(&secondary, &orders[1], &id_column, &reservation)?;
+                        let primary = ranked(
+                            &primary,
+                            &orders[0],
+                            &id_column,
+                            &row_tiebreak,
+                            &reservation,
+                        )?;
+                        let secondary = ranked(
+                            &secondary,
+                            &orders[1],
+                            &id_column,
+                            &row_tiebreak,
+                            &reservation,
+                        )?;
                         let fused = fuse_arms(&primary, &secondary, &rrf, &id_column, &reservation)
                             .map_err(external)?;
                         conform_positional(fused, &declared).map_err(external)
@@ -227,5 +226,61 @@ impl ExecutionPlan for RankFuseExec {
             },
         );
         Ok(polled(&self.metrics, stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{ArrayRef, Float32Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use omnigraph_compiler::traversal::EDGE_TYPE_COLUMN;
+
+    #[test]
+    fn issue_659_rrf_arm_orders_equal_edge_ids_by_declared_concrete_type() {
+        let edge_type = format!("e.{EDGE_TYPE_COLUMN}");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("p._score", DataType::Float32, false),
+            Field::new("p.__id", DataType::Utf8, false),
+            Field::new("e.__id", DataType::Utf8, false),
+            Field::new(&edge_type, DataType::Utf8, false),
+        ]));
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Float32Array::from(vec![1.0, 1.0, 1.0])),
+            Arc::new(StringArray::from(vec!["p", "p", "p"])),
+            Arc::new(StringArray::from(vec!["shared", "z", "shared"])),
+            Arc::new(StringArray::from(vec!["Likes", "Knows", "Knows"])),
+        ];
+        let batch = RecordBatch::try_new(schema, columns).unwrap();
+        let (_, ctx) = super::super::fixtures::context(1_048_576, 16);
+        let memory = WorkMemory::new(ctx, "typed RRF order test").unwrap();
+        let ranked = ranked(
+            &batch,
+            &ArmOrder {
+                score_column: "p._score".into(),
+                descending: true,
+            },
+            "p.__id",
+            &[edge_type.clone(), "e.__id".into()],
+            &memory,
+        )
+        .unwrap();
+        let types = crate::engine::graph::extract_id_column_by_name(&ranked, &edge_type).unwrap();
+        let ids = crate::engine::graph::extract_id_column_by_name(&ranked, "e.__id").unwrap();
+        assert_eq!(types, vec!["Knows", "Knows", "Likes"]);
+        assert_eq!(ids, vec!["shared", "z", "shared"]);
+        let fused = fuse_arms(
+            &ranked,
+            &ranked,
+            &RrfMode { k: 60, limit: 1 },
+            "p.__id",
+            &memory,
+        )
+        .unwrap();
+        assert_eq!(fused.num_rows(), 3);
+        assert_eq!(
+            crate::engine::graph::extract_id_column_by_name(&fused, &edge_type).unwrap(),
+            types
+        );
     }
 }

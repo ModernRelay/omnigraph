@@ -506,7 +506,7 @@ in Seams at an explicit step. A step is one of:
   `OMNIGRAPH_GQ_BLESS=1` and review the diff. A rows step may carry one
   optional `--- expect plan` section, the ***plan section***, directly after
   its shape section: one assertion per line over the plan the step's query
-  runs under, in nine forms. A `scan <Type>[ as $var]:` head
+  runs under, in the supported forms. A `scan <Type>[ as $var]:` head
   selects the scans of that node type (every scan of it, or the one bound
   to `$var`) and claims one fact of each: `columns [<a>, <b>]` the exact
   columns it projects; `not columns [<a>, <b>]` columns it must not read;
@@ -529,9 +529,19 @@ in Seams at an explicit step. A step is one of:
   id lookup or the destination table read once as a hash join's build side;
   it fails when the physical plan holds no such scan, the scan is a table
   scan, or its access path differs.
-  Every list is a set. A plan section anywhere but directly
-  after a shape section, an empty one, or a line outside the nine forms is
-  refused with the forms spelled out. A plan section on a step that names
+  Projection and filter-read lists are sets. Sort identity keys, RankFuse
+  downstream row keys and edge-selection members are exact ordered lists.
+  `sort tiebreak [$a.@id, $e.@type, $e.@id]` checks the metadata keys
+  appended after user order keys; `$a` abbreviates `$a.@id`, and
+  `sort no tiebreak` requires none. `rank fuse row tiebreak [...]` checks
+  RankFuse's downstream keys; `rank fuse no row tiebreak` requires none.
+  Missing, extra or reordered keys fail these assertions.
+  `expand $a $b: selection alternation [Knows out, Likes in]` checks
+  the resolved member types and directions in order. Selection kinds are
+  `named`, `alternation` and `wildcard`; `wildcard []` checks an empty
+  selection. A plan section anywhere but directly after a shape section,
+  an empty one, or a line outside the supported forms is refused with
+  the forms spelled out. A plan section on a step that names
   any API (Execution routes, below) but `engine` is refused.
   A query step may end with one `--- expect same as v1` section, the
   ***reference comparison***, directly after its shape section or, when it
@@ -1547,11 +1557,16 @@ expect section is JSONL, one object per row, same keys.
   Aggregate result batches have no `<var>.id` columns, so their user sort
   keys must determine a total order. The harness cannot prove this
   statically (`ordered_two_key_sort.gqt` is a corpus example). The harness checks the parsed declaration and refuses
-  `ordered` where no total order is possible: no `order` clause; an
-  `order` clause led by
-  `rrf()`, whose fusion sorts by score alone; and any aggregate in the
+  `ordered` for shapes whose total order it does not support: no `order`
+  clause; an `order` clause led by `rrf()`; and any aggregate in the
   `return` list (an `Aggregate` expression, the engine's own
-  `projections_have_aggregates` definition). One authoring rule follows
+  `projections_have_aggregates` definition). RankFuse orders each arm
+  by score, fused binding identity and downstream metadata keys before
+  fusion. Fused entities are stably sorted by fused score, preserving
+  their arm-derived insertion order on ties, and each winner retains
+  its ranked downstream rows. The harness still refuses `ordered` for
+  RRF because it does not promise a total order for every fusion shape.
+  One authoring rule follows
   for `bm25`-led `ordered` steps: such a step must not follow a `mutate`
   step that adds or changes indexed text, because rows in fragments the
   index does not cover are scored by a different scorer and two score

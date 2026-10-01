@@ -1,0 +1,56 @@
+# issue: 659
+# red_on: 7f1233bb
+# notes: Two distinct Expand operators share statement admission: seven units succeed and six refuse.
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+--- schema
+node Person { name: String @key }
+edge Knows: Person -> Person
+edge Likes: Person -> Person
+--- seed
+{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"c"}}
+{"edge":"Knows","id":"k","from":"a","to":"b"}
+{"edge":"Likes","id":"l","from":"b","to":"c"}
+
+--- query
+set traversal_work_limit = 6;
+query selected_then_named_refuses_one_below_total() {
+    match { $a: Person { name: "a" } $a (knows | likes) $b $b likes $c }
+    return { $c.name as name }
+}
+--- expect error: traversal_work_limit
+
+--- query
+set traversal_work_limit = 7;
+query selected_then_named_accepts_exact_total() {
+    match { $a: Person { name: "a" } $a (knows | likes) $b $b likes $c }
+    return { $c.name as name }
+}
+--- expect unordered
+{"name":"c"}
+--- expect shape
+name: String
+
+--- query
+set traversal_work_limit = 6;
+query selected_then_selected_refuses_one_below_total() {
+    match { $a: Person { name: "a" } $a (knows | likes) $b $b (likes | likes) $c }
+    return { $c.name as name }
+}
+--- expect error: traversal_work_limit
+
+--- query
+set traversal_work_limit = 7;
+query selected_then_selected_accepts_exact_total() {
+    match { $a: Person { name: "a" } $a (knows | likes) $b $b (likes | likes) $c }
+    return { $c.name as name }
+}
+--- expect unordered
+{"name":"c"}
+--- expect shape
+name: String
