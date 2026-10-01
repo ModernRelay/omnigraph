@@ -291,8 +291,27 @@ sealed, exact-`id`, filter-bearing MergeInsert adapter:
   existing ID;
 - upsert updates or inserts without changing modes on retry;
 - a bare Lance Append is not a production graph-table write;
-- one table's keyed input is bounded to 8,192 rows and 32 MiB before any
-  effect.
+- one table's keyed input is bounded to 8,192 rows and 32 MiB before its
+  data is staged.
+
+Insert/update mutations and keyed Append/Merge loads also cap the sum of
+retained Arrow batches across tables at 32 MiB (`retained mutation batch bytes`).
+Admission uses the existing `get_array_memory_size` accounting; shared buffers
+may be conservatively counted more than once. The keyed parse spool separately
+caps its decoded-payload estimate across tables at 32 MiB
+(`keyed parsed entity bytes per operation`). External Blob copy admission adds
+copied payload estimates to the retained keyed batches before reading payloads,
+then checks materialized batches before staging fragments.
+
+Delete mutations, cascades and Overwrite's removed-ID detection stream matches
+instead of collecting the full scan. One 32 MiB `retained deleted-id bytes`
+allowance covers all tables, charging each ID's UTF-8 length plus one `String`
+slot before copying it. Overwrite's bulk input is not subject to the keyed
+row/batch limits. These are fixed representation limits, not a new setting or a
+combined allocator/RSS budget; native scan buffers, conversion copies and
+validation's derived state are outside them. Refusal precedes the current
+operation's fragment staging and publication, though writable open may have
+completed earlier schema work and a load may already have created its branch.
 
 An insertion-only transaction may carry the internal
 `omnigraph.insert_absence = "v1"` certificate after its absence and physical

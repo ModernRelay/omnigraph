@@ -308,9 +308,11 @@ and completion cannot wait on permits held by work it must settle. Keep the smal
 status allowance separate. Reserves neither guarantee storage progress nor extend
 deadlines. Full B requires the reserves and independently qualified native-I/O
 settlement specified by [Engine settlement and resource bounds](2026-10-01-engine-settlement-and-resource-bounds.md).
-Its accepted owned-operation foundation introduces bounded server
-tasks and retained inputs, but cannot use a task join or counter drain to grant
-activation, reclamation or retry authority.
+The accepted owned-operation foundation bounds server tasks and retained inputs;
+the engine decision adds graph-query child joins and specific aggregate
+mutation/load representation limits. Neither a task join nor these limits grant
+activation, reclamation or retry authority. Full native/resource qualification
+remains outstanding.
 Reserve candidate headroom before closing healthy admission; insufficient capacity
 refuses. Keep input, caller-wait, read, deployment and shutdown deadlines distinct.
 
@@ -446,7 +448,7 @@ cases and unreached faults do not pass qualification.
 | Increment | Deliverable | Shipping gate |
 |---|---|---|
 | A | A1 v0.12 HTTP admission; A2 own-publication merge receipts; A3 CLI outcomes | A1 follows [its accepted decision](2026-09-30-v012-http-admission.md); A2 is qualified under [Exact merge receipts](2026-09-30-exact-merge-receipts.md), including T1/T2; A3's initial typed-429 and qualified-HTTP-412 contract is qualified under [Owned server operations](2026-09-30-owned-server-operations.md) |
-| B | Owned writes, read/stream accounting, drain and shared shutdown | [Owned server operations](2026-09-30-owned-server-operations.md) qualifies the task/body foundation. [Engine settlement and resource bounds](2026-10-01-engine-settlement-and-resource-bounds.md) specifies the remaining T6/T10 contract and dependency gates. Native settlement, completion reserves and runtime reuse remain unqualified. |
+| B | Owned writes, read/stream accounting, drain and shared shutdown | [Owned server operations](2026-09-30-owned-server-operations.md) qualifies the task/body foundation. [Engine settlement and resource bounds](2026-10-01-engine-settlement-and-resource-bounds.md) is accepted and partially implements query-child ownership and named aggregate write limits. Native settlement, completion reserves and runtime reuse remain unqualified under its T6/T10 gates. |
 | C | Schema/control completion, owned maintenance and bounded transient startup retry | T4/T6/T7/T11; same-process progress and protected reclamation |
 | D | Aggregate budgets, feed progress and embedding diagnostics | T10–T11 and workload qualification |
 | E1 | Same-process schema/query activation with one outstanding deployment | B, relevant C/D bounds, T8.live/T9 and durable ledger/crash gates; Azure separately gated |
@@ -467,12 +469,17 @@ Before accepting each affected increment, its owners must specify:
 2. Cluster/server: versioned pending slot, immutable input/achieved base, exact
    effect/finalization/result binding, active witness, observation interval,
    result retention, migration and stopped-writer handoff.
-3. Engine/server: accept the native settlement mechanism and measured
+3. Engine/server: qualify the native settlement mechanism and measured
    admission/completion profile in [Engine settlement and resource bounds](2026-10-01-engine-settlement-and-resource-bounds.md)
    before exposing a reuse capability.
 4. Azure: lease-preserving online submission and backend qualification.
 
 ## Decision log
+
+- 2026-10-01: Accepted the focused engine decision on the maintainer's build
+  instruction. Query-child ownership and named aggregate write-representation
+  limits implement part of B/D. Resource bounds, Rollout B and Unresolved item 3
+  now distinguish that shipped scope from full-B qualification; E1 stays gated.
 
 - 2026-10-01: Added the focused full-B proposal. Operation ownership now names
   its native/remote qualification gap. Resource bounds replaces "Full B requires

@@ -23,6 +23,7 @@ use datafusion::physical_plan::{
 use futures::StreamExt;
 use lance_datafusion::exec::HardCapBatchSizeExec;
 
+use crate::engine::context::{QueryWorkLease, QueryWorkScope};
 use crate::error::OmniError;
 use datafusion::physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder};
 
@@ -38,6 +39,7 @@ pub(in crate::engine) struct QueryResources {
     buffers: Mutex<BufferRegistry>,
     registry_memory: MemoryReservation,
     traversal: TraversalWork,
+    work: QueryWorkScope,
 }
 
 /// Monotonic statement-wide work admission. Child operators and repeated
@@ -117,13 +119,14 @@ pub(in crate::engine) struct BatchLease {
 impl QueryResources {
     #[cfg(test)]
     pub(in crate::engine) fn new(pool: Arc<dyn MemoryPool>, limit: u64) -> Self {
-        Self::with_traversal_limit(pool, limit, None)
+        Self::with_traversal_limit(pool, limit, None, QueryWorkScope::default())
     }
 
     pub(in crate::engine) fn with_traversal_limit(
         pool: Arc<dyn MemoryPool>,
         limit: u64,
         traversal_limit: Option<NonZeroU64>,
+        work: QueryWorkScope,
     ) -> Self {
         crate::instrumentation::record_query_memory_pool(&pool);
         let registry_memory = MemoryConsumer::new("graph allocation registry").register(&pool);
@@ -134,6 +137,7 @@ impl QueryResources {
             probes: crate::instrumentation::current_query_memory_probes(),
             buffers: Mutex::new(BufferRegistry::default()),
             traversal: TraversalWork::new(traversal_limit),
+            work,
         }
     }
 
@@ -288,6 +292,38 @@ impl WorkMemory {
         T: Send + 'static,
         F: std::future::Future<Output = DfResult<T>> + Send + 'static,
     {
+        let owner = self.register_owned_work()?;
+        self.blocking_owned(owner, body).await
+    }
+
+    pub(in crate::engine) fn register_owned_work(&self) -> DfResult<QueryWorkLease> {
+        self.resources.work.register()
+    }
+
+    /// The producer already registered before spawning. Its registration can
+    /// still hand work to a blocking child after the query closes admission.
+    pub(in crate::engine) async fn blocking_owned<T, F>(
+        self: &Arc<Self>,
+        owner: QueryWorkLease,
+        body: impl FnOnce(Arc<Self>) -> F + Send + 'static,
+    ) -> DfResult<T>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = DfResult<T>> + Send + 'static,
+    {
+        let child = owner.child();
+        owner.own(Box::pin(self.blocking_body(child, body))).await
+    }
+
+    async fn blocking_body<T, F>(
+        self: &Arc<Self>,
+        owner: QueryWorkLease,
+        body: impl FnOnce(Arc<Self>) -> F + Send + 'static,
+    ) -> DfResult<T>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = DfResult<T>> + Send + 'static,
+    {
         let cancellation = self.cancel_on_drop();
         let memory = Arc::clone(self);
         let io_probes = crate::instrumentation::capture_query_io_probes();
@@ -317,7 +353,14 @@ impl WorkMemory {
             let worker_wake = Arc::clone(&wake);
             let elapsed = elapsed.clone();
             let mut guard = crate::instrumentation::query_blocking_work_guard();
+            let owned = owner.child().own((work, memory));
+            let span = tracing::Span::current();
             let job = tokio::task::spawn_blocking(move || {
+                // Keep the future and memory ahead of the lease in drop order,
+                // including unwind and an abandoned JoinHandle's output.
+                let mut owned = owned;
+                let _span = span.enter();
+                let (work, memory) = &mut owned.value;
                 guard.started();
                 let guard = Arc::new(guard);
                 let checkpoint_guard = Arc::clone(&guard);
@@ -329,14 +372,15 @@ impl WorkMemory {
                     Ok(()) => work.as_mut().poll(&mut context),
                     Err(error) => std::task::Poll::Ready(Err(error)),
                 };
-                (work, state)
+                owned.with_output(state)
             });
             let abort = AbortBlockingOnDrop(job.abort_handle());
-            let (returned, state) = job.await.map_err(|error| {
+            let returned = job.await.map_err(|error| {
                 DataFusionError::Execution(format!("graph worker failed: {error}"))
             })?;
             drop(abort);
-            work = returned;
+            let ((returned_work, _), state) = returned.into_inner();
+            work = returned_work;
             match state {
                 std::task::Poll::Ready(result) => {
                     cancellation.disarm();
@@ -871,10 +915,12 @@ impl Drop for CancelOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::context::QueryContext;
     use arrow_array::{BooleanArray, Int64Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::execution::context::SessionConfig;
     use datafusion::execution::memory_pool::GreedyMemoryPool;
+    use futures::FutureExt;
 
     #[test]
     fn traversal_work_is_shared_by_children_and_repeated_workers_issue_659() {
@@ -883,6 +929,7 @@ mod tests {
             pool,
             65_536,
             NonZeroU64::new(5),
+            QueryWorkScope::default(),
         ));
         let ctx = Arc::new(
             TaskContext::default()
@@ -1170,5 +1217,118 @@ mod tests {
             .await
             .expect("cancelled pending chunk retained its future");
         });
+    }
+
+    /// Cancels a submitted worker behind a busy blocking thread; GQT cannot
+    /// control the runtime queue or distinguish submission from execution.
+    #[test]
+    fn cancelling_queued_work_keeps_ownership_until_the_job_is_dropped() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release, held) = std::sync::mpsc::channel();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                held.recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            });
+            ready.await.unwrap();
+            let context = QueryContext::new(1_048_576).unwrap();
+            let settlement = context.owned_workers();
+            let memory = Arc::new(WorkMemory::new(context.task_ctx(), "queued worker").unwrap());
+            let pool = Arc::clone(&memory.resources.pool);
+            memory.grow(4_096).unwrap();
+            let ran = Arc::new(AtomicBool::new(false));
+            let observed = Arc::clone(&ran);
+            let (submitted, ready) = tokio::sync::oneshot::channel();
+            let query = tokio::spawn(async move {
+                submitted.send(()).unwrap();
+                memory
+                    .blocking(move |_| async move {
+                        observed.store(true, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+            });
+            ready.await.unwrap();
+            query.abort();
+            assert!(query.await.unwrap_err().is_cancelled());
+            drop(context);
+            assert!(settlement.wait().now_or_never().is_none());
+            assert!(pool.reserved() >= 4_096);
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(3), settlement.wait())
+                .await
+                .expect("aborted queued closure must release its registration");
+            assert!(!ran.load(Ordering::SeqCst));
+            assert_eq!(pool.reserved(), 0);
+        });
+    }
+
+    /// A cancelled blocking job can finish with a value that itself owns
+    /// resources; settlement must follow destruction of that abandoned output.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_worker_retains_ownership_through_output_destruction() {
+        struct HeldOutput {
+            _memory: Arc<WorkMemory>,
+            dropping: Option<tokio::sync::oneshot::Sender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl Drop for HeldOutput {
+            fn drop(&mut self) {
+                let _ = self.dropping.take().unwrap().send(());
+                // A failed assertion drops the sender and must release this
+                // destructor too, without causing another panic on unwind.
+                let _ = self.release.recv_timeout(std::time::Duration::from_secs(5));
+            }
+        }
+        let context = QueryContext::new(1_048_576).unwrap();
+        let settlement = context.owned_workers();
+        let memory = Arc::new(WorkMemory::new(context.task_ctx(), "abandoned output").unwrap());
+        let pool = Arc::clone(&memory.resources.pool);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release_worker, worker_held) = std::sync::mpsc::channel();
+        let (dropping, drop_started) = tokio::sync::oneshot::channel();
+        let (release_output, release) = std::sync::mpsc::channel();
+        let query = tokio::spawn(async move {
+            memory
+                .blocking(move |memory| async move {
+                    memory.grow(4_096)?;
+                    started.send(()).unwrap();
+                    worker_held
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    Ok(HeldOutput {
+                        _memory: memory,
+                        dropping: Some(dropping),
+                        release,
+                    })
+                })
+                .await
+        });
+        ready.await.unwrap();
+        query.abort();
+        assert!(matches!(query.await, Err(error) if error.is_cancelled()));
+        drop(context);
+        release_worker.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), drop_started)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            settlement.wait().now_or_never().is_none(),
+            "a completed poll's output remains owned until its destructor finishes"
+        );
+        assert!(pool.reserved() >= 4_096);
+        release_output.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), settlement.wait())
+            .await
+            .unwrap();
+        assert_eq!(pool.reserved(), 0);
     }
 }

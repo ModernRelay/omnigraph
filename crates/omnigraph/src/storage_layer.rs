@@ -70,6 +70,60 @@ use crate::table_store::{
 pub(crate) const KEYED_WRITE_MAX_ROWS: usize = 8192;
 pub(crate) const KEYED_WRITE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
+/// The operation-wide sibling of the per-table keyed ceiling. This uses the
+/// existing Arrow accounting (including its conservative shared-buffer count),
+/// not a second allocator or a claim about native execution/RSS.
+pub(crate) fn retained_keyed_bytes(current: u64, additional: u64) -> Result<u64> {
+    let actual = current.checked_add(additional).ok_or_else(|| {
+        OmniError::manifest_internal("retained mutation batch byte count overflow")
+    })?;
+    if actual > KEYED_WRITE_MAX_BYTES {
+        return Err(OmniError::resource_limit(
+            "retained mutation batch bytes",
+            KEYED_WRITE_MAX_BYTES,
+            actual,
+        ));
+    }
+    Ok(actual)
+}
+
+pub(crate) fn retain_keyed_batch(current: u64, batch: &RecordBatch) -> Result<u64> {
+    let bytes = u64::try_from(batch.get_array_memory_size())
+        .map_err(|_| OmniError::manifest_internal("retained mutation batch bytes exceed u64"))?;
+    retained_keyed_bytes(current, bytes)
+}
+
+/// One allowance for the logical removed-ID collection, shared across all
+/// tables/cascades in a mutation or all replacement removals in a load. Charge
+/// UTF-8 bytes plus one String slot before copying a scanned id. This does not
+/// bound native scan batches, predicate copies or validation's derived state.
+#[derive(Default)]
+pub(crate) struct DeletedIdBudget {
+    bytes: u64,
+}
+
+impl DeletedIdBudget {
+    pub(crate) fn retain(&mut self, id: &str) -> Result<()> {
+        let bytes = id
+            .len()
+            .checked_add(std::mem::size_of::<String>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .and_then(|bytes| self.bytes.checked_add(bytes))
+            .ok_or_else(|| {
+                OmniError::manifest_internal("retained deleted-id byte count overflow")
+            })?;
+        if bytes > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                "retained deleted-id bytes",
+                KEYED_WRITE_MAX_BYTES,
+                bytes,
+            ));
+        }
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+
 /// Resource budget for a pending-aware keyed scan that will feed one mutation
 /// table transaction.
 ///
@@ -457,14 +511,14 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         with_row_id: bool,
     ) -> Result<Vec<RecordBatch>>;
 
-    /// `scan` under a typed DataFusion filter, the form the mutation path
-    /// builds from a GQ `where`; no SQL text is rendered.
+    /// Stream under the typed filter built from a GQ `where`; no SQL text is
+    /// rendered. Scanner sizing is a soft hint; consumers admit retained data.
     async fn scan_filtered(
         &self,
         snapshot: &SnapshotHandle,
         projection: Option<&[&str]>,
         filter: Expr,
-    ) -> Result<Vec<RecordBatch>>;
+    ) -> Result<DatasetRecordBatchStream>;
 
     async fn scan_batches(&self, snapshot: &SnapshotHandle) -> Result<Vec<RecordBatch>>;
 
@@ -930,9 +984,8 @@ impl TableStorage for TableStore {
         snapshot: &SnapshotHandle,
         projection: Option<&[&str]>,
         filter: Expr,
-    ) -> Result<Vec<RecordBatch>> {
-        TableStore::scan_with(
-            self,
+    ) -> Result<DatasetRecordBatchStream> {
+        TableStore::scan_stream_with(
             snapshot.dataset(),
             projection,
             None,
@@ -940,6 +993,8 @@ impl TableStorage for TableStore {
             false,
             |scanner| {
                 scanner.filter_expr(filter);
+                scanner.batch_size(1024);
+                scanner.batch_size_bytes(1024 * 1024);
                 Ok(())
             },
         )

@@ -27,7 +27,7 @@ use crate::error::{OmniError, Result, missing_graph_type_at_snapshot};
 use crate::exec::staging::{MutationStaging, PendingMode};
 use crate::seams::{catalog, decide_seam, fail};
 use crate::session::Session;
-use crate::storage_layer::KEYED_WRITE_MAX_BYTES;
+use crate::storage_layer::{DeletedIdBudget, KEYED_WRITE_MAX_BYTES, retain_keyed_batch};
 
 /// Result of a load operation.
 #[derive(Debug, Clone, Default)]
@@ -592,7 +592,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     let mut node_rows: HashMap<String, Vec<JsonValue>> = HashMap::new();
     let mut edge_rows: HashMap<String, Vec<(String, String, JsonValue)>> = HashMap::new();
     let mut strict_rows = StrictGraphRows::default();
-    let mut keyed_input_budget: HashMap<String, (usize, u64)> = HashMap::new();
+    let mut keyed_input_budget = KeyedInputBudget::default();
     // Strict syntax is independent of the keyed-write transaction ceiling.
     // Append/Merge route through the bounded keyed adapter; Overwrite stages a
     // Lance replacement transaction and must retain the bulk-replacement
@@ -759,20 +759,24 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // Phase 2a: build and validate every node batch up front. Cheap and
     // synchronous — surfaces validation errors before any S3 traffic.
     let mut node_id_remap = TypedNodeIdRemap::default();
+    let mut prepared_keyed_bytes = 0;
     let mut prepared_nodes: Vec<(String, String, Vec<RecordBatch>, usize)> =
         Vec::with_capacity(node_rows.len().saturating_add(strict_nodes.len()));
-    let mut __dst_nr: Vec<_> = node_rows.iter().collect();
-    __dst_nr.sort_by(|a, b| a.0.cmp(b.0));
+    let mut __dst_nr: Vec<_> = node_rows.into_iter().collect();
+    __dst_nr.sort_by(|a, b| a.0.cmp(&b.0));
     for (type_name, rows) in __dst_nr {
-        let node_type = &catalog.node_types[type_name];
-        let batch = build_node_batch(node_type, rows, &mut node_id_remap, catalog.system_columns)?;
+        let node_type = &catalog.node_types[&type_name];
+        let batch = build_node_batch(node_type, &rows, &mut node_id_remap, catalog.system_columns)?;
+        if bounded_keyed_input {
+            prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, &batch)?;
+        }
         // Validation (value/enum/unique) runs end-of-load via the evaluator.
         let loaded_count = batch.num_rows();
         let table_key = format!("node:{}", type_name);
         let _entry = snapshot
             .dataset(&table_key)
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
-        prepared_nodes.push((type_name.clone(), table_key, vec![batch], loaded_count));
+        prepared_nodes.push((type_name, table_key, vec![batch], loaded_count));
     }
     let mut __dst_sn: Vec<_> = strict_nodes.into_iter().collect();
     __dst_sn.sort_by(|a, b| a.0.cmp(&b.0));
@@ -782,6 +786,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
             .dataset(&table_key)
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
         let batch = normalize_strict_json_rows(&catalog, &table_key, &rows)?;
+        if bounded_keyed_input {
+            prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, &batch)?;
+        }
         let loaded_count = batch.num_rows();
         prepared_nodes.push((type_name, table_key, vec![batch], loaded_count));
     }
@@ -817,18 +824,21 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // runs end-of-load via the unified evaluator, below.
     let mut prepared_edges: Vec<(String, String, Vec<RecordBatch>, usize)> =
         Vec::with_capacity(edge_rows.len().saturating_add(strict_edges.len()));
-    let mut __dst_er: Vec<_> = edge_rows.iter().collect();
-    __dst_er.sort_by(|a, b| a.0.cmp(b.0));
+    let mut __dst_er: Vec<_> = edge_rows.into_iter().collect();
+    __dst_er.sort_by(|a, b| a.0.cmp(&b.0));
     for (edge_name, rows) in __dst_er {
-        let edge_type = &catalog.edge_types[edge_name];
-        let batch = build_edge_batch(edge_type, rows, &node_id_remap, catalog.system_columns)?;
+        let edge_type = &catalog.edge_types[&edge_name];
+        let batch = build_edge_batch(edge_type, &rows, &node_id_remap, catalog.system_columns)?;
+        if bounded_keyed_input {
+            prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, &batch)?;
+        }
         // Validation (enum/unique, edge-RI, @card) runs end-of-load via the evaluator.
         let loaded_count = batch.num_rows();
         let table_key = format!("edge:{}", edge_name);
         let _entry = snapshot
             .dataset(&table_key)
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
-        prepared_edges.push((edge_name.clone(), table_key, vec![batch], loaded_count));
+        prepared_edges.push((edge_name, table_key, vec![batch], loaded_count));
     }
     let mut __dst_se: Vec<_> = strict_edges.into_iter().collect();
     __dst_se.sort_by(|a, b| a.0.cmp(&b.0));
@@ -838,6 +848,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
             .dataset(&table_key)
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
         let batch = normalize_strict_json_rows(&catalog, &table_key, &rows)?;
+        if bounded_keyed_input {
+            prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, &batch)?;
+        }
         let loaded_count = batch.num_rows();
         prepared_edges.push((edge_name, table_key, vec![batch], loaded_count));
     }
@@ -882,6 +895,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // Bob while a retained `edge:Knows(Alice->Bob)` would otherwise publish an
     // orphan. (Per-table, like the rest of Overwrite handling.)
     if mode == LoadMode::Overwrite {
+        let mut removed_id_budget = DeletedIdBudget::default();
         let keys: Vec<String> = changeset.keys().cloned().collect();
         for table_key in keys {
             let removed = crate::validate::overwrite_removed_ids(
@@ -889,6 +903,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
                 &table_key,
                 changeset.get(&table_key).expect("key from this changeset"),
                 catalog.system_columns,
+                &mut removed_id_budget,
             )
             .await?;
             if !removed.is_empty() {
@@ -1157,7 +1172,7 @@ fn parse_strict_graph_rows<R: BufRead>(
     mut reader: R,
     catalog: &Catalog,
     bounded_keyed_input: bool,
-    keyed_input_budget: &mut HashMap<String, (usize, u64)>,
+    keyed_input_budget: &mut KeyedInputBudget,
 ) -> Result<StrictGraphRows> {
     let mut rows = StrictGraphRows::default();
     let mut line_number = 0_usize;
@@ -1395,19 +1410,29 @@ fn take_object_or_empty(
     }
 }
 
+#[derive(Default)]
+struct KeyedInputBudget {
+    tables: HashMap<String, (usize, u64)>,
+    bytes: u64,
+}
+
 /// Account a keyed JSON record before retaining it in the per-table parse
 /// spool. This is a conservative lower bound on the Arrow payload (string and
 /// decoded blob bytes, scalar widths, and list offsets); the exact accumulated
 /// Arrow check in `MutationStaging::append_batch` remains the final authority.
-/// The early counter prevents an unbounded JSON spool and catches base64 by its
-/// decoded size before the decoder allocates a second copy.
+/// The early counter bounds the decoded payload estimate across all tables and
+/// catches base64 before a second copy is decoded. It is not a JSON DOM bound:
+/// property names, container overhead and conversion copies are separate.
 fn account_keyed_json_row(
     table_key: &str,
     data: &JsonValue,
     structural_string_bytes: usize,
-    budgets: &mut HashMap<String, (usize, u64)>,
+    budgets: &mut KeyedInputBudget,
 ) -> Result<()> {
-    let entry = budgets.entry(table_key.to_string()).or_insert((0, 0));
+    let entry = budgets
+        .tables
+        .entry(table_key.to_string())
+        .or_insert((0, 0));
     entry.0 = entry
         .0
         .checked_add(1)
@@ -1436,6 +1461,17 @@ fn account_keyed_json_row(
             entry.1,
         ));
     }
+    let total = budgets.bytes.checked_add(row_bytes).ok_or_else(|| {
+        OmniError::manifest_internal("keyed parsed operation byte count overflow")
+    })?;
+    if total > KEYED_WRITE_MAX_BYTES {
+        return Err(OmniError::resource_limit(
+            "keyed parsed entity bytes per operation",
+            KEYED_WRITE_MAX_BYTES,
+            total,
+        ));
+    }
+    budgets.bytes = total;
     Ok(())
 }
 
@@ -3843,6 +3879,36 @@ edge WorksAt: Person -> Company
             } if resource == "graph_batch_json_structural_slots"
                 && actual == GRAPH_BATCH_JSON_MAX_STRUCTURAL_SLOTS + 1
         ));
+
+        // The parse spool is one operation: using more graph types must not
+        // obtain another 32 MiB allowance for every table.
+        let row = serde_json::json!({"payload": "x".repeat(17 * 1024 * 1024)});
+        let mut budget = KeyedInputBudget::default();
+        account_keyed_json_row("node:Person", &row, 0, &mut budget).unwrap();
+        let error = account_keyed_json_row("node:Company", &row, 0, &mut budget)
+            .expect_err("keyed parse bytes must be aggregated across types");
+        assert!(matches!(error,
+            OmniError::ResourceLimitExceeded { ref resource, limit: KEYED_WRITE_MAX_BYTES, actual }
+                if resource == "keyed parsed entity bytes per operation"
+                    && actual > KEYED_WRITE_MAX_BYTES
+        ));
+
+        assert_eq!(
+            crate::storage_layer::retained_keyed_bytes(KEYED_WRITE_MAX_BYTES - 1, 1).unwrap(),
+            KEYED_WRITE_MAX_BYTES
+        );
+        assert!(crate::storage_layer::retained_keyed_bytes(KEYED_WRITE_MAX_BYTES, 1).is_err());
+        let id =
+            &row["payload"].as_str().unwrap()[..16 * 1024 * 1024 - std::mem::size_of::<String>()];
+        let mut removed = DeletedIdBudget::default();
+        removed.retain(id).unwrap();
+        removed
+            .retain(id)
+            .expect("the exact retained-ID byte ceiling is inclusive");
+        assert!(
+            removed.retain("").is_err(),
+            "even an empty ID owns one String slot"
+        );
     }
 
     #[tokio::test]

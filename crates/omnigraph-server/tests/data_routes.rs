@@ -4808,6 +4808,87 @@ async fn change_concurrent_inserts_same_key_serialize_without_409() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aggregate_mutation_memory_refusal_keeps_graph_and_admission_usable() {
+    use std::fmt::Write;
+
+    let temp = init_graph_with_schema_and_data(
+        "node First { name: String @key payload: String }\n\
+         node Second { name: String @key payload: String }",
+        "",
+    )
+    .await;
+    let graph = graph_path(temp.path());
+    let state = AppState::open(graph.to_string_lossy().to_string())
+        .await
+        .unwrap();
+    let operations = state.operation_runtime().clone();
+    let app = build_app(state);
+    let history = || {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/commits"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (_, before) = json_response(&app, history()).await;
+
+    // The wire body fits the ordinary 1 MiB route limit. Reusing one parameter
+    // expands to over 32 MiB of retained Arrow across two individually legal
+    // tables, so the engine's operation bound must make the refusal.
+    let mut query = String::from("query wide($payload: String) {\n");
+    for table in ["First", "Second"] {
+        for row in 0..32 {
+            writeln!(
+                query,
+                "insert {table} {{ name: \"row{row}\", payload: $payload }}"
+            )
+            .unwrap();
+        }
+    }
+    query.push('}');
+    let request = json!({"query": query, "params": {"payload": "x".repeat(600_000)}});
+    assert!(serde_json::to_vec(&request).unwrap().len() < 1024 * 1024);
+    let (status, output) = json_response(&app, json_post("/mutate", &request)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{output}");
+    let error: ErrorOutput = serde_json::from_value(output).unwrap();
+    let refusal = error.resource_limit.expect("engine resource refusal");
+    assert_eq!(refusal.resource, "retained mutation batch bytes");
+    assert_eq!(refusal.limit, 32 * 1024 * 1024);
+    assert!(refusal.actual > refusal.limit);
+    assert_eq!(operations.snapshot().uncertain_writes, 0);
+    assert!(!operations.snapshot().closed);
+    let (_, after) = json_response(&app, history()).await;
+    assert_eq!(after, before, "refusal must publish no graph commit");
+
+    for table in ["First", "Second"] {
+        let (status, rows) = json_response(
+            &app,
+            json_post(
+                "/query",
+                &json!({"query": format!(
+                    "query rows() {{ match {{ $n: {table} }} return {{ $n.name }} }}"
+                )}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+        assert_eq!(rows["row_count"], 0);
+    }
+    let (status, output) = json_response(
+        &app,
+        json_post(
+            "/mutate",
+            &json!({"query":
+                "query small() { insert First { name: \"ok\", payload: \"ok\" } }"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_receipt_commit_matches_get(&app, &output).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn change_concurrent_updates_same_key_return_typed_pre_effect_conflicts() {
     // Strict read-modify-write attempts are never automatically reprepared.
     // Exactly one concurrent UPDATE commits; once it changes branch authority,

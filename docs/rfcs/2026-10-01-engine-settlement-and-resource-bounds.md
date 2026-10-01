@@ -2,8 +2,8 @@
 rfc: "2026-10-01-engine-settlement-and-resource-bounds"
 title: "Engine settlement and resource bounds"
 track: maintainer
-status: draft
-implementation: not-started
+status: accepted
+implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-10-01
@@ -22,17 +22,41 @@ blocked_on:
 
 ## Summary
 
-Complete B of [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md)
-by making engine settlement an explicit prerequisite for runtime reuse. An
-operation owns its children, accepted I/O and resources until they settle.
-Admission reserves both its working capacity and the capacity needed to finish
-any effects it starts. Graph publication and recovery keep their existing owners.
+This decision extends B of
+[Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md)
+with ownership of graph-query producers and blocking workers, and operation-wide
+limits on retained mutation batches, keyed parse estimates and removed IDs.
+These implemented boundaries close specific lifetime and admission gaps.
 
-The pinned Lance 11.0.0 cannot currently establish this whole contract through
-its public hooks. This RFC specifies the required mechanism, qualification and
-dependency work; its accompanying substrate probes establish the limitation.
-They do not enable online deployment or change the implemented
+Full B still requires ownership of accepted native I/O and protected completion
+resources before runtime reuse. The pinned Lance 11.0.0 integration does not
+establish that contract. The remaining sections specify its qualification gates;
+acceptance does not enable online deployment or weaken the existing
 [owned-operation contract](2026-09-30-owned-server-operations.md).
+
+## Implemented boundary
+
+`QueryContext::run_owned` runs the complete query, including successive search
+passes, drops its completed execution future, then waits for registered graph
+producers and blocking workers before returning success or an error. Each child
+registers before dispatch. Its future, captured resources and abandoned result
+remain ahead of its registration in destruction order. Dropping the query closes
+new root registrations; existing children retain their ownership and may finish
+their descendants. A panic follows the existing worker-error path. This joins
+OmniGraph's workers, not opaque DataFusion tasks or Lance/storage I/O, and grants
+no engine-reuse capability.
+
+Named mutations and keyed loads share a 32 MiB retained-batch allowance across
+their touched tables, in addition to the existing per-table keyed limits.
+Keyed parsing and removed-ID collection have their own 32 MiB operation-wide
+allowances. The latter covers deletes, cascades and Overwrite replacement;
+Overwrite's bulk input keeps its existing separate checks. Refusal precedes this
+operation's table effects and publication, but earlier schema completion or an
+implicitly created load branch may already have effects. These fixed allowances
+preserve conservative accounting; they do not track every shared allocation or
+form a combined memory/RSS cap.
+Exact ownership and admission points are documented in
+[execution](../dev/execution.md) and [writes](../dev/writes.md).
 
 ## Motivation and observable behavior
 
@@ -42,7 +66,9 @@ server work finished. A producer, blocking filesystem operation or multipart
 cleanup can still be active below that boundary. Zero requests, zero gauges,
 an exclusive schema gate and an awaited task are insufficient reuse evidence.
 
-| Situation | Required behavior |
+The remaining full-B contract requires:
+
+| Situation | Required behavior before reuse can qualify |
 |---|---|
 | Capacity unavailable before admission | Immediate typed refusal; no effect and no waiting request queue. |
 | Caller disappears | Original work and its reservations remain owned; no replay. |
@@ -51,15 +77,15 @@ an exclusive schema gate and an awaited task are insufficient reuse evidence.
 | Effect or settlement cannot be established | Keep admission closed and retain uncertainty; the existing bounded process shutdown remains the containment path. |
 | Drain succeeds | A root- and epoch-bound capability permits the next validated exclusive transition. It does not itself prove successful publication or authorize retry. |
 
-This slice touches engine/core/storage integration and the server. The supported
+The complete decision touches engine/core/storage integration and the server. The supported
 wire line remains v0.12. Same-PID schema activation still needs E1's deployment
 ledger, authorization and activation protocol after this foundation qualifies.
 
-## Settlement mechanism
+## Required settlement mechanism
 
 ### One ownership tree
 
-The engine creates one operation scope before planning or other work that can
+Full B requires the engine to create one operation scope before planning or other work that can
 spawn a child. It captures canonical root incarnation, serving epoch, operation
 identity, actor, settings and resource reservations. Cached datasets and stores
 do not capture the first caller's scope: each operation passes its own context.
@@ -139,7 +165,7 @@ schema/catalog validation are required before producing a successor capability.
 Writable open and `refresh` are effectful and cannot be candidate-validation
 probes. These rules preserve the single mutation-process boundary.
 
-## Resource contract
+## Required resource contract
 
 Use one admission hierarchy over existing resource owners. DataFusion retains
 its memory pool and spill manager; Lance retains its caches, buffers and native
@@ -190,8 +216,9 @@ Do not advertise a universal RSS ceiling: allocator, runtime, page-cache and
 unaccounted native allocations require separate measured headroom. Reusable
 mode requires explicit finite deployment totals and a qualified workload profile
 covering every invoked path. A path without an enforceable envelope is refused
-in that mode. Numeric defaults and minimum completion allowances are an
-acceptance gate below, not guessed from HTTP body sizes.
+in that mode. Process totals and minimum completion allowances are a
+qualification gate below, not guessed from HTTP body sizes or the implemented
+per-operation limits.
 
 ## Substrate evidence
 
@@ -202,11 +229,13 @@ were read; the live documentation describes newer APIs too, so it is not proof
 that a hook exists in the pinned release.
 
 - Lance's [local path selection](https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance-io/src/object_store.rs)
-  bypasses an inner object-store wrapper for native file I/O. Changing the store
-  identity to force another route is not a transparent fix. The public
-  `file-object-store` provider is a possible adapter foundation, but requires
-  URI/identity/cache parity and complete ownership of multipart/stream lifetimes
-  before it can qualify. Shared control-object storage must participate too.
+  bypasses an inner object-store wrapper for native file I/O. A Unix guard shows
+  that a public `file-object-store` adapter can preserve canonical URI, path and
+  store identity while exchanging datasets with the stock provider. It still
+  starts unwrapped empty-directory cleanup; local copy semantics, local/cloud
+  classification, caches and Windows UNC paths need separate qualification.
+  No production provider changes. Shared control-object storage must participate
+  in any complete integration.
 - [ObjectWriter and LocalWriter](https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance-io/src/object_writer.rs)
   include unjoined multipart abort on drop and blocking persistence whose job
   can outlive its future. Native object_store local multipart cleanup also
@@ -230,42 +259,49 @@ controls; an engine-DST pass cannot certify native local blocking work.
 
 | Gate | Existing owner and decisive observation |
 |---|---|
-| Native limitation probes | `lance_surface_guards`: park the real blocking executor, drop native writer/upload owners, observe persistence/cleanup occur after release through independent filesystem state. These pass by exposing the limitation, not by qualifying reuse. |
+| Query child ownership | Existing context, memory and producer tests: hold an actual worker or its returned resource after caller cancellation; query completion must wait and charges must remain. Cover success, error, panic, queued cancellation and one-thread nested progress. |
+| Write representations | Existing staging, loader and mutation tests: multiple individually valid tables exceed one aggregate allowance; deletion/cascade scans refuse before retaining an excess ID. Verify unchanged publication and a subsequent small write. |
+| Native limitation probes | `lance_surface_guards`: park the real blocking executor, drop native writer/upload/cleanup owners, observe persistence/cleanup occur after release through independent filesystem state. The public alternate-provider guard establishes addressing interchange only. These do not qualify reuse. |
 | T6 settlement | Native/engine guards and server `boot_settings`/`data_routes`: hold actual accepted I/O or a child after its caller returns; no reuse capability or early capacity release; release and prove completion. Cover success, error, panic and remote response loss separately. |
 | T10 resources | `engine_v2_memory`, loader/merge/catalog owners and server workload suites: saturate ordinary capacity while completion and status actually run; compare counters with independent buffer, worker and file lifetimes. Include multi-table inputs, preparation refusal before excess catalog allocation, cache eviction with a live borrower, and Arrow/JSON overlap. |
 | Schema continuation | `schema_apply`, `failpoints`, `detached_commit_matrix`: complete only the original published contract, retain authority on failure, then perform a same-handle sentinel write without stale schema or duplicate publication. |
 | Sensitivity | Deliberately release an owner early, omit one reserve charge or declare settlement while I/O is held; the corresponding test must fail. A timer alone is no reached-fault witness. |
 | Cost | Existing benchmark owners for B1/B2/B5: history/participant widths, mixed traffic and fault settlement; record offered/admitted/refused/completed/unknown work, latency, peak RSS, scratch, I/O bytes and requests. No CI wall-time threshold. |
 
-On 2026-10-01 the full `lance_surface_guards` owner passed 54 tests, including
-both new native-lifetime probes; its existing branch-ref compatibility probe
-remained ignored. Suppressing the persistence submission made the first probe
-fail; retaining the multipart owner made the second fail. Restoring both paths
-returned the full owner to green. The existing server operation-runtime owner
-passed all 11 tests. These results establish the current limitation and preserve
-the logical-ownership baseline; they supply no full-B or performance claim.
+On 2026-10-01 the full `lance_surface_guards` owner passed 56 tests, including
+the native-lifetime probes and alternate-provider addressing check; its existing
+branch-ref compatibility probe remained ignored. Negative controls suppressed
+native persistence, retained the multipart owner, omitted the query-worker wait,
+and released a worker's registration before destroying its abandoned result.
+Each failed its corresponding regression; restored paths passed. Aggregate-write
+regressions also failed before the limits were added. The HTTP regression proves
+that refusal publishes nothing, keeps admission open and permits a subsequent
+small write. This evidence supplies no full-B or performance claim.
 
-1. Land this design and its negative substrate probes. Keep runtime reuse
-   unavailable and the existing fail-stop behavior. Test evidence is not product
-   implementation status.
+1. Ship query-child ownership and the named write-representation limits with
+   their regressions. Keep runtime reuse unavailable and preserve fail-stop for
+   uncertain effectful operations. Native limitation probes remain qualification
+   evidence, not a production settlement API.
 2. Qualify complete native ownership and resource integration through public
    APIs, using a released dependency upgrade if the pinned hooks are insufficient.
    Extend the existing substrate guards; preserve local/S3 semantics and Azure's
    separate admission-wrapper and qualification boundary. A forced wrapper lane
    alone does not pass this gate.
-3. Implement scope propagation, aggregate envelopes and protected completion
-   together. Pass T6/T10 and schema-continuation gates before exposing reuse.
+3. Complete scope propagation, the remaining aggregate envelopes and protected
+   completion together. Pass T6/T10 and schema-continuation gates before exposing reuse.
 4. E1 consumes the capability under its separately specified ledger and
    activation protocol. There is no deployment endpoint or alternate job store.
 
 ## Compatibility, invariants and alternatives
 
-This proposal adds no persistent graph format, graph reset, publication door,
+This decision adds no persistent graph format, graph reset, publication door,
 request idempotency store or older-client adapter. Graph data, identities,
-branches and retained history are preserved. Bounds may refuse previously
-admitted work in the new qualified mode; publish the measured limits and exact
-refusal behavior when that mode is accepted. Reverting this draft and its
-limitation probes changes no serving behavior.
+branches and retained history are preserved. Multi-table writes and large
+deletes that previously fit individual table limits can now receive
+`ResourceLimitExceeded` (HTTP 413 with structured `resource_limit` details).
+These limits add no environment variable or session setting. Query success and error wait for registered
+graph workers; cancelling a caller does not free a running worker's resources.
+Full native settlement, completion reserves and runtime reuse remain unavailable.
 
 Architectural invariants 2–5 and 11–13 remain binding. A task counter or quiet
 interval is rejected because neither proves native settlement. Per-graph engine
@@ -274,7 +310,7 @@ resolve remotely accepted writes; they are not an implicit fallback. A second
 allocator, shadow recovery ledger, patched Lance or cloud-only shortcut would
 create parallel ownership and remains outside this decision.
 
-## Unresolved decisions before acceptance
+## Outstanding qualification
 
 - Select and qualify the public native integration route and define its
   backend-specific terminal evidence. Current Lance 11.0.0 supplies no complete
@@ -285,8 +321,11 @@ create parallel ownership and remains outside this decision.
 
 ## Decision log
 
-- 2026-10-01: Drafted on the maintainer's instruction to proceed with full B.
-  Source audit found missing native settlement/resource hooks, so the decision
-  stays draft and runtime reuse stays unavailable. The first deliverable is the
-  concrete contract and executable limitation evidence; a counter-only partial
-  implementation would not satisfy the promised boundary.
+- 2026-10-01: Initially drafted on the maintainer's instruction to proceed
+  with full B. The source audit found missing native settlement/resource hooks;
+  the first draft and its limitation probes kept runtime reuse unavailable.
+- 2026-10-01: Accepted on the maintainer's instruction to build. The implemented
+  slice owns graph-query children and bounds the named mutation/load
+  representations. The native probes and public-provider experiment establish
+  remaining qualification gaps; they do not provide a reusable drain or change
+  storage routing. Implementation is partial until the full-B gates pass.

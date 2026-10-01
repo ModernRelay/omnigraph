@@ -139,10 +139,19 @@ create a missing review branch and load onto it in the same workflow.
 
 ## Limits and conflicts
 
-Incremental keyed writes are bounded to 8,192 entities and 32 MiB per touched type
-in one commit. Every strict load also rejects an input whose projected in-memory
-representation exceeds 32 MiB. Split a larger import into explicit commits; use
-one initial overwrite only when it fits, followed by merge chunks.
+Insert/update mutations and incremental keyed loads are bounded to 8,192
+entities and 32 MiB per touched type, plus 32 MiB of retained Arrow batches
+across all touched types in one operation. Keyed loads also have a separate
+32 MiB parsed-payload estimate across types. External Blob payloads that require
+copying count toward the aggregate allowance. Every strict load retains its
+projected in-memory size check.
+
+Deletes, including cascades, and overwrite loads collecting replaced IDs have
+a separate 32 MiB allowance for those IDs across all touched types. Oversized
+work returns a resource-limit error before its data is staged or published.
+These checks do not bound total engine memory. Split larger work into explicit
+commits; overwrite keeps its bulk-input behavior and remains subject to its
+separate input and removed-ID checks.
 
 Independent existing constructive datasets stage concurrently. The
 `stage_write_concurrency` [session setting](../queries/index.md#session-settings)

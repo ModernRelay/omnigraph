@@ -592,7 +592,7 @@ fn bulk_update_fixture(rows: usize) -> String {
 #[tokio::test]
 async fn mutation_keyed_write_row_cap_accepts_limit_and_rejects_one_over_pre_effect() {
     const LIMIT: usize = 8192;
-    const SCHEMA: &str = "node Thing { key: String @key }\n";
+    const SCHEMA: &str = "node Thing { key: String @key payload: String? }\nnode Other { key: String @key payload: String? }\n";
 
     let exact_dir = tempfile::tempdir().unwrap();
     let exact = helpers::session(
@@ -648,6 +648,73 @@ async fn mutation_keyed_write_row_cap_accepts_limit_and_rejects_one_over_pre_eff
         ),
         "one-over mutation must return the typed keyed-row limit, got {error:?}"
     );
+    // Each table fits its existing byte limit. The operation must refuse the
+    // sum before staging either table, rather than multiply capacity by table
+    // count. This belongs here because the native HEAD is the effect oracle.
+    let payload = "x".repeat(17 * 1024 * 1024);
+    let probes = StageWriteProbes::rendezvous(1);
+    let error = with_stage_write_probes(
+        probes.clone(),
+        over.mutate(
+            "main",
+            r#"query wide($payload: String) {
+                insert Thing { key: "one", payload: $payload }
+                insert Other { key: "two", payload: $payload }
+            }"#,
+            "wide",
+            &params(&[("$payload", &payload)]),
+        ),
+    )
+    .await
+    .expect_err("retained keyed batches must be bounded across tables");
+    assert_eq!(
+        probes.entered(),
+        0,
+        "aggregate admission must precede any table staging call"
+    );
+    assert!(
+        matches!(
+            error,
+            OmniError::ResourceLimitExceeded { ref resource, limit: 33_554_432, actual }
+                if resource == "retained mutation batch bytes" && actual > 33_554_432
+        ),
+        "unexpected aggregate refusal: {error:?}"
+    );
+    let input = format!(
+        "{}\n{}",
+        serde_json::json!({"type":"Thing","data":{"key":"one","payload":payload}}),
+        serde_json::json!({"type":"Other","data":{"key":"two","payload":payload}}),
+    );
+    drop(payload);
+    for mode in [LoadMode::Append, LoadMode::Merge] {
+        for strict in [false, true] {
+            let outcome = if strict {
+                with_stage_write_probes(probes.clone(), over.load_graph_batch("main", &input, mode))
+                    .await
+            } else {
+                with_stage_write_probes(probes.clone(), over.load_jsonl(&input, mode)).await
+            };
+            let error =
+                outcome.expect_err("every keyed load door must bound its complete parse spool");
+            assert!(
+                matches!(error,
+                    OmniError::ResourceLimitExceeded { ref resource, limit: 33_554_432, actual }
+                        if resource == "keyed parsed entity bytes per operation" && actual > 33_554_432
+                ),
+                "unexpected load refusal (strict={strict}, mode={mode:?}): {error:?}"
+            );
+            assert_eq!(
+                probes.entered(),
+                0,
+                "load refusal must precede fragment staging"
+            );
+            assert_eq!(
+                snapshot_main(&over).await.unwrap().graph_manifest_version(),
+                before_manifest
+            );
+        }
+    }
+    drop(input);
     let after = snapshot_main(&over).await.unwrap();
     assert_eq!(after.graph_manifest_version(), before_manifest);
     assert_eq!(
@@ -663,11 +730,27 @@ async fn mutation_keyed_write_row_cap_accepts_limit_and_rejects_one_over_pre_eff
         "one-over mutation must fail before a Lance table effect"
     );
     assert_eq!(count_rows(&over, "node:Thing").await, 0);
+    assert_eq!(count_rows(&over, "node:Other").await, 0);
     let recovery_dir = over_dir.path().join("__recovery");
     assert!(
         !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
         "one-over mutation must fail before writing a recovery sidecar"
     );
+    let accepted = over
+        .mutate(
+            "main",
+            r#"query small() {
+            insert Thing { key: "one", payload: "fits" }
+            insert Other { key: "two", payload: "fits" }
+        }"#,
+            "small",
+            &params(&[]),
+        )
+        .await
+        .expect("a rejected wide request must not prevent a bounded multi-table write");
+    assert_eq!(accepted.affected_nodes, 2);
+    assert_eq!(count_rows(&over, "node:Thing").await, 1);
+    assert_eq!(count_rows(&over, "node:Other").await, 1);
 }
 
 /// Update predicate matching is itself a bounded allocation. The committed
@@ -970,6 +1053,73 @@ async fn overlapping_delete_predicates_do_not_double_count_affected() {
         1,
         "only Bob→Globex remains",
     );
+
+    // The same accumulator owns ids across statements and graph types. Seed
+    // through bulk replacement (which deliberately has no keyed row/byte cap),
+    // then prove deletion and overwrite-removal scans stop before publication.
+    db.mutate(
+        "main",
+        r#"query clear() {
+            delete Person where name != ""
+            delete Company where name != ""
+        }"#,
+        "clear",
+        &params(&[]),
+    )
+    .await
+    .unwrap();
+    let wide = "x".repeat(16 * 1024 * 1024);
+    let input = format!(
+        "{}\n{}",
+        serde_json::json!({"type":"Person","data":{"name":wide}}),
+        serde_json::json!({"type":"Company","data":{"name":wide}}),
+    );
+    db.load_jsonl(&input, LoadMode::Overwrite).await.unwrap();
+    drop(input);
+    drop(wide);
+    let before = snapshot_main(&db).await.unwrap();
+    let before_manifest = before.graph_manifest_version();
+    let mut native_heads = Vec::new();
+    for key in ["node:Person", "node:Company"] {
+        let entry = before.dataset(key).unwrap();
+        let uri = format!("{}/{}", db.uri(), entry.dataset_path);
+        native_heads.push((
+            uri.clone(),
+            Dataset::open(&uri).await.unwrap().version().version,
+        ));
+    }
+    for error in [
+        db.mutate(
+            "main",
+            r#"query clear() {
+                delete Person where name != ""
+                delete Company where name != ""
+            }"#,
+            "clear",
+            &params(&[]),
+        ).await.expect_err("delete ids must share an operation byte allowance"),
+        db.load_jsonl(
+            "{\"type\":\"Person\",\"data\":{\"name\":\"small\"}}\n{\"type\":\"Company\",\"data\":{\"name\":\"small\"}}",
+            LoadMode::Overwrite,
+        ).await.expect_err("overwrite removals must share the same bounded id scan"),
+    ] {
+        assert!(matches!(error,
+            OmniError::ResourceLimitExceeded { ref resource, limit: 33_554_432, actual }
+                if resource == "retained deleted-id bytes" && actual > 33_554_432
+        ), "unexpected deletion-byte refusal: {error:?}");
+    }
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        before_manifest
+    );
+    for (uri, version) in native_heads {
+        assert_eq!(
+            Dataset::open(&uri).await.unwrap().version().version,
+            version
+        );
+    }
+    assert_eq!(count_rows(&db, "node:Person").await, 1);
+    assert_eq!(count_rows(&db, "node:Company").await, 1);
 }
 
 /// The overlap-exclusion filter must use SQL `IS NOT TRUE`, not `NOT`: a prior

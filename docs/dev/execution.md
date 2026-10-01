@@ -398,7 +398,15 @@ inside Lance or Arrow.
 
 `ExpandExec` runs traversal work on `spawn_blocking` with cooperative
 cancellation checks. Dropping its consumer signals that work to stop;
-reservations held by the worker remain alive until it exits. Custom operators
+reservations held by the worker remain alive until it exits. A query-owned
+registration precedes each graph producer and blocking job. The registration
+outlives its captured future, resources and abandoned result, including on
+panic or cancellation. `QueryContext::run_owned` drops the completed execution
+future, closes new root registrations and joins these children before returning
+success or an error; successive search passes share the same scope. Dropping
+the caller closes registration while surviving children retain their leases.
+This covers OmniGraph's graph workers, not opaque DataFusion tasks or native
+Lance/storage I/O, and cannot authorize engine reuse. Custom operators
 publish output-row and elapsed-compute metrics, with `output_batches` for
 every `ExpandExec` and scan metrics for ANN
 probe/search outcomes. `engine::execute_query` keeps the nearest prefilter
@@ -653,9 +661,21 @@ All load modes share the mutation publisher and recovery protocol:
 | `Append` | Strict insert by exact physical `id`; an existing ID is a typed conflict. The public mode name does not mean a bare Lance Append transaction. |
 | `Merge` | Upsert by exact physical `id`; the last input occurrence wins. |
 
-Mutation and keyed Load reject a table's accumulated input above 8,192 rows or
-32 MiB before recovery is armed. Larger imports must be split into separately
-atomic graph commits; Overwrite remains the initial bulk-replacement path.
+Mutation insert/update and keyed Load retain the per-table limits of 8,192 rows
+and 32 MiB, plus one 32 MiB sum of retained Arrow batches across touched tables.
+The sum uses `get_array_memory_size`, preserving conservative shared-buffer
+counting. Keyed parsing separately caps its decoded-payload estimate across
+types at 32 MiB before retaining each row. External Blob copy admission includes
+the retained keyed batches plus copied payload estimates before payload reads;
+materialized batches are checked again before fragment staging.
+
+Mutation delete, cascading delete and Overwrite replacement removal scan IDs
+incrementally under one 32 MiB allowance per operation, charging UTF-8 bytes
+plus one `String` slot before copying an ID. These checks precede this
+operation's data fragments and publication. They do not bound JSON containers,
+simultaneous conversion copies, predicate/validation state or native scan
+buffers. Overwrite's bulk input retains its existing separate checks and is not
+subject to the keyed row limit. See [writes.md](writes.md#keyed-writes).
 
 `load_graph_batch_as` is the strict graph-level NDJSON boundary. Each nonblank
 line is one logical node or edge envelope; duplicate members, physical fields,

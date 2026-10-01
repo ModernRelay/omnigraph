@@ -4,8 +4,11 @@
 //! sorts and aggregates may spill within the scratch quota.
 
 use std::fmt;
+use std::future::Future;
 use std::num::{NonZero, NonZeroU64};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use datafusion::common::{DataFusionError, Result as DfResult};
 use datafusion::execution::TaskContext;
@@ -15,6 +18,7 @@ use datafusion::execution::memory_pool::{
     FairSpillPool, MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation, TrackConsumersPool,
 };
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use tokio::sync::Notify;
 
 use super::operators::memory::QueryResources;
 use crate::error::{OmniError, Result};
@@ -34,6 +38,155 @@ pub(super) struct QueryContext {
     pool: Arc<SpillHeadroomPool>,
     memory_limit: u64,
     scratch_limit: u64,
+    work: QueryWorkScope,
+}
+
+/// Ownership of graph-operator producers and blocking workers for one query.
+/// This does not observe opaque DataFusion tasks or native storage I/O and
+/// cannot authorize engine reuse. Closing refuses new root registrations;
+/// an already registered child may finish by registering its own workers.
+#[derive(Clone, Debug, Default)]
+pub(in crate::engine) struct QueryWorkScope(Arc<QueryWorkState>);
+
+#[derive(Debug, Default)]
+struct QueryWorkState {
+    state: Mutex<QueryWorkCounts>,
+    changed: Notify,
+}
+
+#[derive(Debug, Default)]
+struct QueryWorkCounts {
+    closed: bool,
+    active: usize,
+}
+
+/// A live child is the only authority to create descendants after closure.
+pub(in crate::engine) struct QueryWorkLease(Arc<QueryWorkState>);
+
+/// Observing settlement keeps no child alive and grants no work admission.
+#[derive(Clone)]
+pub(in crate::engine) struct QueryWorkSettlement(Arc<QueryWorkState>);
+
+impl QueryWorkScope {
+    pub(in crate::engine) fn register(&self) -> DfResult<QueryWorkLease> {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed {
+            return Err(DataFusionError::Execution(
+                "query work admission is closed".into(),
+            ));
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .expect("query child count overflow");
+        Ok(QueryWorkLease(Arc::clone(&self.0)))
+    }
+
+    fn close(&self) {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed = true;
+        self.0.changed.notify_waiters();
+    }
+
+    fn settlement(&self) -> QueryWorkSettlement {
+        QueryWorkSettlement(Arc::clone(&self.0))
+    }
+}
+
+impl QueryWorkLease {
+    pub(in crate::engine) fn child(&self) -> Self {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active = state
+            .active
+            .checked_add(1)
+            .expect("query child count overflow");
+        Self(Arc::clone(&self.0))
+    }
+
+    /// Fields drop in declaration order: actual work and captured resources
+    /// disappear before the registration can announce settlement.
+    pub(in crate::engine) fn own<T>(self, value: T) -> OwnedQueryWork<T> {
+        OwnedQueryWork {
+            value,
+            _lease: self,
+        }
+    }
+}
+
+impl Drop for QueryWorkLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active -= 1;
+        let settled = state.closed && state.active == 0;
+        drop(state);
+        if settled {
+            self.0.changed.notify_waiters();
+        }
+    }
+}
+
+pub(in crate::engine) struct OwnedQueryWork<T> {
+    pub(in crate::engine) value: T,
+    _lease: QueryWorkLease,
+}
+
+impl<T> OwnedQueryWork<T> {
+    /// A completed poll's output can own resources too. Keep it ahead of the
+    /// same lease when a cancelled JoinHandle abandons the returned value.
+    pub(in crate::engine) fn with_output<U>(self, output: U) -> OwnedQueryWork<(T, U)> {
+        OwnedQueryWork {
+            value: (self.value, output),
+            _lease: self._lease,
+        }
+    }
+
+    pub(in crate::engine) fn into_inner(self) -> T {
+        self.value
+    }
+}
+
+impl<F: Future> Future for OwnedQueryWork<Pin<Box<F>>> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().value.as_mut().poll(cx)
+    }
+}
+
+impl QueryWorkSettlement {
+    pub(in crate::engine) async fn wait(&self) {
+        loop {
+            let changed = self.0.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = self
+                    .0
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.closed && state.active == 0 {
+                    return;
+                }
+            }
+            changed.await;
+        }
+    }
 }
 
 impl QueryContext {
@@ -71,6 +224,7 @@ impl QueryContext {
             .with_batch_size(ORDERED_SCAN_EXECUTION_BATCH_ROWS)
             .with_sort_spill_reservation_bytes(sort_spill_reservation_bytes(memory_limit));
         let pool = Arc::new(SpillHeadroomPool::new(memory_limit as usize));
+        let work = QueryWorkScope::default();
         let runtime = RuntimeEnvBuilder::new()
             .with_disk_manager_builder(
                 DiskManagerBuilder::default().with_max_temp_directory_size(scratch_limit),
@@ -84,17 +238,41 @@ impl QueryContext {
                     Arc::clone(&runtime.memory_pool),
                     memory_limit,
                     traversal_limit,
+                    work.clone(),
                 ))),
                 runtime,
             ),
             pool,
             memory_limit,
             scratch_limit,
+            work,
         })
     }
 
     pub(super) fn task_ctx(&self) -> Arc<TaskContext> {
         self.session.task_ctx()
+    }
+
+    /// Call once, after the complete query has dropped its execution streams
+    /// and plans. A search's successive passes share this context, so a pass
+    /// boundary must not close it. This waits only for our registered workers.
+    pub(super) async fn wait_owned_workers(&self) {
+        self.work.close();
+        self.work.settlement().wait().await;
+    }
+
+    /// Finish the complete execution future before closing registration. Both
+    /// ordinary and error results wait for actual graph-worker ownership; an
+    /// abandoned caller instead closes via Drop and leaves its children owned.
+    pub(super) async fn run_owned<F: Future>(&self, future: F) -> F::Output {
+        let result = future.await;
+        self.wait_owned_workers().await;
+        result
+    }
+
+    #[cfg(test)]
+    pub(super) fn owned_workers(&self) -> QueryWorkSettlement {
+        self.work.settlement()
     }
 
     #[cfg(test)]
@@ -112,6 +290,12 @@ impl QueryContext {
             self.memory_limit,
             self.scratch_limit,
         )
+    }
+}
+
+impl Drop for QueryContext {
+    fn drop(&mut self) {
+        self.work.close();
     }
 }
 
@@ -283,6 +467,23 @@ impl MemoryPool for SpillHeadroomPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
+
+    /// Child registration and closure race inside the executor, not in GQ.
+    #[tokio::test]
+    async fn settlement_requires_closed_admission_and_all_descendants() {
+        let scope = QueryWorkScope::default();
+        let settlement = scope.settlement();
+        assert!(settlement.wait().now_or_never().is_none());
+        let parent = scope.register().unwrap();
+        scope.close();
+        assert!(scope.register().is_err());
+        let child = parent.child();
+        drop(parent);
+        assert!(settlement.wait().now_or_never().is_none());
+        drop(child);
+        assert!(settlement.wait().now_or_never().is_some());
+    }
 
     /// Compares both error boundaries under one injected pool and disk manager.
     #[test]
@@ -295,15 +496,20 @@ mod tests {
             )
             .build_arc()
             .unwrap();
-        let config = SessionConfig::new().with_extension(Arc::new(QueryResources::new(
-            Arc::clone(&runtime.memory_pool),
-            1_024,
-        )));
+        let scope = QueryWorkScope::default();
+        let config =
+            SessionConfig::new().with_extension(Arc::new(QueryResources::with_traversal_limit(
+                Arc::clone(&runtime.memory_pool),
+                1_024,
+                None,
+                scope.clone(),
+            )));
         let query = QueryContext {
             session: SessionContext::new_with_config_rt(config, runtime),
             pool,
             memory_limit: 1_024,
             scratch_limit: 1,
+            work: scope,
         };
         let work =
             crate::engine::operators::memory::WorkMemory::new(query.task_ctx(), "boundary test")
