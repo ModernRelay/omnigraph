@@ -223,3 +223,90 @@ pub fn catalog_digest(catalog: &Catalog) -> Option<String> {
         CatalogIdentity::SourceUnbound => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bound::ValueTable;
+    use crate::physical::PhysicalPlan;
+
+    fn envelope() -> ReplayEnvelope {
+        ReplayEnvelope {
+            replay_version: REPLAY_VERSION,
+            rules_version: RULES_VERSION,
+            semantics_version: SEMANTICS_VERSION,
+            query: ReplayQuery {
+                source: "query q() { match { $d: Doc } return { $d.slug } }".to_string(),
+                name: "q".to_string(),
+            },
+            scope: ValidationScope::ExactSubset,
+            catalog: None,
+            plan: BoundPlan {
+                plan: PhysicalPlan::new(),
+                values: ValueTable::default(),
+            },
+            derivation: Some(Derivation::default()),
+        }
+    }
+
+    #[test]
+    fn an_envelope_reads_back_equal() {
+        let bytes = envelope().to_bytes();
+        let decoded = decode_replay(&bytes, ValidationLimits::DEFAULT).unwrap();
+        assert_eq!(decoded.query, envelope().query);
+        assert_eq!(decoded.scope, ValidationScope::ExactSubset);
+        assert_eq!(decoded.derivation, Some(Derivation::default()));
+    }
+
+    /// The byte limit refuses before anything is decoded, so even bytes that
+    /// are no JSON at all exhaust it rather than fail to parse.
+    #[test]
+    fn bytes_over_the_limit_exhaust_before_decoding() {
+        let limits = ValidationLimits {
+            evidence_bytes: 8,
+            ..ValidationLimits::DEFAULT
+        };
+        assert_eq!(
+            decode_replay(b"not json at all", limits).unwrap_err(),
+            ReplayRefusal::Exhausted {
+                limit: "evidence_bytes",
+                value: 8
+            }
+        );
+    }
+
+    /// A version is read before the rest: an unsupported one asks for the
+    /// query again even when the body would not decode, and a missing header
+    /// is no envelope.
+    #[test]
+    fn versions_are_checked_before_the_body() {
+        for field in ["replay_version", "rules_version", "semantics_version"] {
+            let mut value = serde_json::to_value(envelope()).unwrap();
+            value[field] = serde_json::json!(u32::MAX);
+            value["plan"] = serde_json::json!("not a plan");
+            let refusal = decode_replay(
+                &serde_json::to_vec(&value).unwrap(),
+                ValidationLimits::DEFAULT,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&refusal, ReplayRefusal::ReplanRequired { reason } if reason.contains(field)),
+                "{refusal:?}"
+            );
+        }
+        assert!(matches!(
+            decode_replay(br#"{"plan": {}}"#, ValidationLimits::DEFAULT).unwrap_err(),
+            ReplayRefusal::ReplanRequired { .. }
+        ));
+        let mut value = serde_json::to_value(envelope()).unwrap();
+        value["plan"] = serde_json::json!("not a plan");
+        assert!(matches!(
+            decode_replay(
+                &serde_json::to_vec(&value).unwrap(),
+                ValidationLimits::DEFAULT
+            )
+            .unwrap_err(),
+            ReplayRefusal::InvalidEvidence { .. }
+        ));
+    }
+}

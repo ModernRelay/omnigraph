@@ -1412,3 +1412,41 @@ async fn an_exact_subset_member_replays_only_with_its_derivation() {
         );
     }
 }
+
+/// An envelope of another format, rule catalogue or semantics version is
+/// refused before its plan is read, as a conflict that asks for the query
+/// again: a version change never reinterprets an old envelope.
+#[tokio::test]
+async fn an_envelope_of_another_version_asks_for_the_query_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = people(&dir).await;
+    let run = db
+        .query_inspected(
+            ReadTarget::branch("main"),
+            PEOPLE_QUERIES,
+            "liked",
+            &ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    let saved: Value =
+        serde_json::from_slice(&run.replay_envelope(PEOPLE_QUERIES, "liked")).unwrap();
+    for field in ["replay_version", "rules_version", "semantics_version"] {
+        let mut altered = saved.clone();
+        altered[field] = serde_json::json!(saved[field].as_u64().unwrap() + 1);
+        let error = db
+            .replay_bound_plan(
+                ReadTarget::branch("main"),
+                &serde_json::to_vec(&altered).unwrap(),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{field}: the replay must be refused"));
+        assert!(
+            matches!(&error, OmniError::Manifest(manifest)
+                if manifest.kind == omnigraph::error::ManifestErrorKind::Conflict)
+                && error.to_string().contains(field),
+            "{field}: {error}"
+        );
+    }
+}
