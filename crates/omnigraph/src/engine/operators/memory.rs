@@ -1,7 +1,8 @@
 //! Query-owned admission for graph work and shared Arrow allocations.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use arrow_array::{Array, RecordBatch, UInt32Array};
@@ -36,6 +37,43 @@ pub(in crate::engine) struct QueryResources {
     probes: Option<crate::instrumentation::QueryMemoryProbes>,
     buffers: Mutex<BufferRegistry>,
     registry_memory: MemoryReservation,
+    traversal: TraversalWork,
+}
+
+/// Monotonic statement-wide work admission. Child operators and repeated
+/// search passes share this counter; releasing memory never refunds work.
+#[derive(Debug)]
+struct TraversalWork {
+    limit: Option<NonZeroU64>,
+    used: AtomicU64,
+}
+
+impl TraversalWork {
+    fn new(limit: Option<NonZeroU64>) -> Self {
+        Self {
+            limit,
+            used: AtomicU64::new(0),
+        }
+    }
+
+    fn charge(&self, additional: u64) -> DfResult<()> {
+        let Some(limit) = self.limit else {
+            return Ok(());
+        };
+        self.used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(additional)
+                    .filter(|next| *next <= limit.get())
+            })
+            .map(|_| ())
+            .map_err(|used| {
+                super::external(OmniError::resource_limit(
+                    "traversal_work_limit",
+                    limit.get(),
+                    used.saturating_add(additional),
+                ))
+            })
+    }
 }
 
 /// Live charges by allocation start. Dead entries are swept when the map
@@ -77,7 +115,16 @@ pub(in crate::engine) struct BatchLease {
 }
 
 impl QueryResources {
+    #[cfg(test)]
     pub(in crate::engine) fn new(pool: Arc<dyn MemoryPool>, limit: u64) -> Self {
+        Self::with_traversal_limit(pool, limit, None)
+    }
+
+    pub(in crate::engine) fn with_traversal_limit(
+        pool: Arc<dyn MemoryPool>,
+        limit: u64,
+        traversal_limit: Option<NonZeroU64>,
+    ) -> Self {
         crate::instrumentation::record_query_memory_pool(&pool);
         let registry_memory = MemoryConsumer::new("graph allocation registry").register(&pool);
         Self {
@@ -86,6 +133,7 @@ impl QueryResources {
             limit,
             probes: crate::instrumentation::current_query_memory_probes(),
             buffers: Mutex::new(BufferRegistry::default()),
+            traversal: TraversalWork::new(traversal_limit),
         }
     }
 
@@ -382,6 +430,15 @@ impl WorkMemory {
             return Err(DataFusionError::Execution("query cancelled".into()));
         }
         Ok(())
+    }
+
+    pub(in crate::engine) fn traversal_limited(&self) -> bool {
+        self.resources.traversal.limit.is_some()
+    }
+
+    pub(in crate::engine) fn charge_traversal(&self, additional: u64) -> DfResult<()> {
+        self.check()?;
+        self.resources.traversal.charge(additional)
     }
 
     pub(in crate::engine) fn cancel_on_drop(&self) -> CancelOnDrop {
@@ -818,6 +875,65 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::execution::context::SessionConfig;
     use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+    #[test]
+    fn traversal_work_is_shared_by_children_and_repeated_workers_issue_659() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(65_536));
+        let resources = Arc::new(QueryResources::with_traversal_limit(
+            pool,
+            65_536,
+            NonZeroU64::new(5),
+        ));
+        let ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_extension(resources)),
+        );
+        let first = WorkMemory::new(Arc::clone(&ctx), "first pass").unwrap();
+        first.child("scan").unwrap().charge_traversal(2).unwrap();
+        let second = WorkMemory::new(Arc::clone(&ctx), "second pass").unwrap();
+        second.charge_traversal(3).unwrap();
+        drop(first);
+        drop(second);
+        let retry = WorkMemory::new(ctx, "retry").unwrap();
+        let error = retry.error(retry.charge_traversal(1).unwrap_err());
+        assert!(matches!(error, OmniError::ResourceLimitExceeded {
+            resource, limit: 5, actual: 6,
+        } if resource == "traversal_work_limit"));
+    }
+
+    #[test]
+    fn traversal_work_concurrent_admission_never_exceeds_cap_issue_659() {
+        let work = TraversalWork::new(NonZeroU64::new(1_000));
+        let accepted = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| (0..1_000).filter(|_| work.charge(1).is_ok()).count()))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .sum::<usize>()
+        });
+        assert_eq!(accepted, 1_000);
+        assert_eq!(work.used.load(Ordering::Relaxed), 1_000);
+    }
+
+    #[test]
+    fn traversal_work_refuses_overflow_without_wrapping_issue_659() {
+        let work = TraversalWork::new(NonZeroU64::new(u64::MAX));
+        work.charge(u64::MAX).unwrap();
+        assert!(work.charge(1).is_err());
+        assert_eq!(work.used.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn traversal_work_refusal_does_not_admit_partial_request_issue_659() {
+        let work = TraversalWork::new(NonZeroU64::new(7));
+        work.charge(3).unwrap();
+        assert!(work.charge(5).is_err());
+        assert_eq!(work.used.load(Ordering::Relaxed), 3);
+        work.charge(4).unwrap();
+        assert!(work.charge(1).is_err());
+    }
 
     /// Reads the pool's reserved bytes between two holds; a case sees rows and errors only.
     #[test]

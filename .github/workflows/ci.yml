@@ -99,7 +99,7 @@ jobs:
           run_deployment=false
           for path in "${changed[@]}"; do
             case "$path" in
-              docs/*.md|docs/*.mdx|docs/*.rst|docs/*.adoc) ;;
+              docs/*.md|docs/*.mdx|docs/*.rst|docs/*.adoc|changelog.d/*.md|changelog.d/release.json) ;;
               README.md|AGENTS.md|CLAUDE.md|CHANGELOG.md|CONTRIBUTING.md|CODE_OF_CONDUCT.md) ;;
               LICENSE|LICENSE.md) ;;
               crates/omnigraph-gqt/cases/*.gqt) run_gqt=true ;;
@@ -130,9 +130,9 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
-          # The marker check diffs the PR merge commit against its first
-          # parent (the current base tip), so both parents must be present.
-          fetch-depth: 2
+          # Release-note selection needs the configured previous release and
+          # pinned migration source; the marker check still uses HEAD^1.
+          fetch-depth: 0
 
       # Diff-scoped belt over check-docs.py's Markdown scan: flags only
       # conflict-marker lines this pull request ADDS, in any file type, via
@@ -158,11 +158,31 @@ jobs:
             exit 1
           fi
 
+      - name: Install pinned documentation parser
+        run: |
+          python3 -m venv "$RUNNER_TEMP/docs-venv"
+          "$RUNNER_TEMP/docs-venv/bin/python" -m pip install --disable-pip-version-check -r scripts/requirements-docs.txt
+          echo "$RUNNER_TEMP/docs-venv/bin" >> "$GITHUB_PATH"
+
       - name: Verify AGENTS.md ↔ docs/ cross-links
         run: bash scripts/check-agents-md.sh
 
       - name: Verify documentation structure and RFC registry
         run: python3 scripts/check-docs.py
+
+      - name: Test release-note composition
+        run: python3 scripts/test_release_notes.py
+
+      - name: Render release-note preview
+        run: python3 scripts/release_notes.py preview --target HEAD > "$RUNNER_TEMP/release-notes-preview.md"
+
+      - name: Upload release-note preview
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-notes-preview
+          path: ${{ runner.temp }}/release-notes-preview.md
+          if-no-files-found: error
+          retention-days: 14
 
       # Spelling gate: docs/dev/ci.md, "Pull-request gates". typos also reads
       # a sibling typos.toml / _typos.toml, so refuse a second config first.

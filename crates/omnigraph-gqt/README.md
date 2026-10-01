@@ -231,16 +231,25 @@ columns it projects; `not columns [..]` columns it must not read; `filter
 reads [..]` a pushed filter reading exactly those columns (`binding.property`);
 `no filter` no pushed filter at all. `filter reads [..]` on its own states that
 an in-memory `Filter` node stays in the plan reading exactly those columns.
-`sort tiebreak [$a, $b]` states that a physical `Sort` declares exactly those
-bindings' ids as the keys it appends after the order keys, `sort no tiebreak`
-that a `Sort` declares none.
+`sort tiebreak [$a.@id, $e.@type, $e.@id]` states the exact ordered metadata
+keys a physical `Sort` appends after user order keys. `$a` abbreviates `$a.@id`;
+`sort no tiebreak` requires an empty list. `rank fuse row tiebreak [...]` checks
+the exact downstream keys of `RankFuse`, and `rank fuse no row tiebreak` requires
+none. Dropping a type key or swapping key order fails these assertions.
 `pass <name>` states that a named optimizer pass fired, `not pass <name>` that
-it did not. Every list is a set. A mismatch prints the whole explain document.
+it did not. Projection/read lists are sets; identity keys and selection members
+are ordered lists. A mismatch prints the whole explain document.
 Pass names must be registered optimizer passes. Excluded columns must
 exist in the selected type's catalog schema. Unknown names fail even in
 negative assertions. Assert destination projection on the dependent scan;
 `Expand` carries topology alone.
-An `expand $src <Edge> $dst:` line selects every matching physical `Expand` between
+`expand $a $b: selection alternation [Knows out, Likes in]` checks the exact
+resolved member list and per-member directions. Selection kinds are `named`,
+`alternation` and `wildcard`; `wildcard []` checks an empty selection. Types use
+canonical catalog names, with JSON quotes available for a member name. An
+endpoint-only `expand $a $b: mode indexed_scan` applies to every Expand between
+those bindings, including selections.
+An `expand $src <Edge> $dst:` line selects every matching named-edge physical `Expand` between
 those bindings over that edge type and claims `mode csr` or `mode
 indexed_scan`, the traversal mode the planner recorded (pass `expand_mode`
 when the cost model chose it); it fails when no such expand is in the physical
@@ -506,7 +515,8 @@ file invocations refuse that ambient override and take their timeout from the
 runner section. Ambient fault, entropy and pool overrides also refuse
 admission, including replay, as does a set settings variable
 (`OMNIGRAPH_ENGINE`, `OMNIGRAPH_RRF_PLAN`, `OMNIGRAPH_MERGE_LINEAGE`,
-`OMNIGRAPH_ANN_NPROBES`, `OMNIGRAPH_LOAD_CONCURRENCY`) and the retired
+`OMNIGRAPH_ANN_NPROBES`, `OMNIGRAPH_LOAD_CONCURRENCY`,
+`OMNIGRAPH_TRAVERSAL_WORK_LIMIT`) and the retired
 `OMNIGRAPH_TRAVERSAL_MODE`, which names no setting any more. A case session
 never reads the environment (the runner's own `OMNIGRAPH_GQ_ENGINE` above is
 the one seed), so neither variable decides anything; the refusal keeps a stale

@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use omnigraph_compiler::catalog::Catalog;
+use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::ir::{IROp, ParamMap, QueryIR};
 use omnigraph_compiler::lower_query;
 use omnigraph_compiler::query::typecheck::typecheck_query;
@@ -23,6 +24,15 @@ use crate::session::Session;
 enum IndexSource<'a> {
     Cached(&'a crate::db::ResolvedTarget),
     Direct,
+}
+
+fn admit_wildcard_target(historical: bool, has_wildcard: bool) -> Result<()> {
+    if historical && has_wildcard {
+        return Err(CompilerError::Plan(
+            "wildcard traversals are not supported on explicit historical targets; select explicit edge types".to_string(),
+        ).into());
+    }
+    Ok(())
 }
 
 impl Session {
@@ -59,6 +69,10 @@ impl Session {
         let (resolved, catalog) = self.capture_read_view(target).await?;
 
         let compiled = self.compile_named_query(&catalog, query_source, query_name)?;
+        admit_wildcard_target(
+            matches!(&resolved.requested, ReadTarget::Snapshot(_)),
+            compiled.ir().has_wildcard_traversal(),
+        )?;
         let head = resolved.graph_commit_id.clone();
         if let CompiledRead::Explain(ir) = &compiled {
             let rows =
@@ -93,6 +107,7 @@ impl Session {
         let (snapshot, catalog) = self.capture_historical_read_view(version).await?;
 
         let compiled = self.compile_named_query(&catalog, query_source, query_name)?;
+        admit_wildcard_target(true, compiled.ir().has_wildcard_traversal())?;
         if let CompiledRead::Explain(ir) = &compiled {
             return engine::explain_rows(ir, params, &snapshot, &catalog, &settings).await;
         }
@@ -130,6 +145,10 @@ impl Session {
         let settings = self.effective(query_source)?;
         let (resolved, catalog) = self.capture_read_view(target).await?;
         let compiled = self.compile_named_query(&catalog, query_source, query_name)?;
+        admit_wildcard_target(
+            matches!(&resolved.requested, ReadTarget::Snapshot(_)),
+            compiled.ir().has_wildcard_traversal(),
+        )?;
         engine::explain_document(
             compiled.ir(),
             params,
@@ -164,6 +183,10 @@ impl Session {
                 "the inspection door runs no `explain` statement",
             ));
         };
+        admit_wildcard_target(
+            matches!(&resolved.requested, ReadTarget::Snapshot(_)),
+            ir.has_wildcard_traversal(),
+        )?;
         let traverses = ir
             .pipeline
             .iter()
@@ -209,6 +232,13 @@ impl Session {
         bound: omnigraph_planner::BoundPlan,
     ) -> Result<engine::PlanRun> {
         let (resolved, catalog) = self.capture_read_view(target).await?;
+        let has_wildcard = bound.plan.assumptions().has_wildcard_traversal || bound.plan.live().any(|(_, node)| {
+            matches!(node, omnigraph_planner::PhysicalNode::Expand { edges, .. } if edges.is_wildcard())
+        });
+        admit_wildcard_target(
+            matches!(&resolved.requested, ReadTarget::Snapshot(_)),
+            has_wildcard,
+        )?;
         engine::plan_pins_snapshot(&bound.plan, &resolved.snapshot)?;
         let graph_index = if engine::plan_traverses(&bound.plan) {
             engine::GraphIndexHandle::cached(
