@@ -238,3 +238,4 @@ then dated RFCs by date.
 | [2026-09-30](2026-09-30-v012-http-admission.md) | v0.12 HTTP admission | maintainer | accepted | complete |
 | [2026-09-30](2026-09-30-exact-merge-receipts.md) | Exact merge receipts | maintainer | accepted | complete |
 | [2026-09-30](2026-09-30-owned-server-operations.md) | Owned server operations | maintainer | accepted | complete |
+| [2026-09-30](2026-09-30-schema-contract-in-manifest.md) | Schema contract in the manifest | maintainer | draft | in-progress |

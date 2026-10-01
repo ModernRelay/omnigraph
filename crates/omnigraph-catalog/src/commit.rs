@@ -26,14 +26,14 @@ use std::sync::Arc;
 
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::Schema;
-use datafusion::arrow::compute::filter_record_batch;
+use datafusion::arrow::compute::{concat_batches, filter_record_batch};
 use lance::Dataset;
 use lance::dataset::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use lance_file::version::LanceFileVersion;
 
 use crate::error::{OmniError, Result};
 use crate::migrations::{INTERNAL_MANIFEST_SCHEMA_VERSION, read_stamp, stamp_entry};
-use crate::publisher::map_lance_publish_error;
+use crate::publisher::{PUBLISHED_ROWS_CACHE_BYTES, map_lance_publish_error};
 use crate::record::{
     StoredShape, compact_to_storage, flat_manifest_schema, flat_to_storage,
     manifest_storage_schema, written_shape,
@@ -49,7 +49,7 @@ pub(crate) async fn overwrite(
     dataset: Dataset,
     pending: RecordBatch,
     live_rows: Vec<RecordBatch>,
-) -> Result<Dataset> {
+) -> Result<(Dataset, Option<RecordBatch>)> {
     let replaced: HashSet<&str> = string_column(&pending, "object_id")?
         .iter()
         .flatten()
@@ -90,7 +90,17 @@ pub(crate) async fn overwrite(
         }
     }
     batches.push(to_storage(&pending)?);
-    commit_overwrite(dataset, batches).await
+    let retained_bytes = batches.iter().fold(0usize, |bytes, batch| {
+        bytes.saturating_add(batch.get_array_memory_size())
+    });
+    let retained = if shape == StoredShape::Packed && retained_bytes <= PUBLISHED_ROWS_CACHE_BYTES {
+        let empty = RecordBatch::new_empty(schema.clone());
+        concat_batches(&schema, batches.iter().chain([&empty])).ok()
+    } else {
+        None
+    };
+    let dataset = commit_overwrite(dataset, batches).await?;
+    Ok((dataset, retained))
 }
 
 /// Commit `batches` as the whole stored row set at `dataset`'s version + 1 (the module doc: zero

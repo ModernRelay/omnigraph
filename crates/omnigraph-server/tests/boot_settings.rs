@@ -125,11 +125,13 @@ async fn data_trust_root_mismatch_refuses_before_recovery_open() {
     let tokens = data_tokens::DataTokens::new();
     let temp = converged_cluster_dir("").await;
     let graph = temp.path().join("graphs/knowledge.omni");
-    let schema = fs::read_to_string(temp.path().join("people.pg")).unwrap();
-    // A read-write engine open normally cleans matching no-op schema staging.
-    // Wrong public trust must refuse before even that recovery effect.
-    let staging = graph.join("_schema.pg.staging");
-    fs::write(&staging, &schema).unwrap();
+    let recovery = graph.join("__recovery");
+    fs::create_dir_all(&recovery).unwrap();
+    fs::write(recovery.join("unresolved.json"), "malformed sidecar").unwrap();
+    assert!(matches!(
+        Omnigraph::open(graph.to_str().unwrap()).await,
+        Err(omnigraph::error::OmniError::RecoveryRequired { .. })
+    ));
     let trust_path = temp.path().join("trust.json");
     fs::write(&trust_path, serde_json::to_vec(&tokens.document).unwrap()).unwrap();
     let result = omnigraph_server::load_server_settings_with_data_token_trust(
@@ -146,10 +148,6 @@ async fn data_trust_root_mismatch_refuses_before_recovery_open() {
             .to_string()
             .contains("serving-root binding")
     );
-    assert!(
-        staging.exists(),
-        "invalid trust must not open the graph for recovery"
-    );
 }
 
 #[tokio::test]
@@ -159,8 +157,14 @@ async fn oidc_root_mismatch_refuses_even_beside_valid_native_trust_before_recove
     use serde_json::json;
 
     let temp = converged_cluster_dir("").await;
-    let staging = temp.path().join("graphs/knowledge.omni/_schema.pg.staging");
-    fs::copy(temp.path().join("people.pg"), &staging).unwrap();
+    let graph = temp.path().join("graphs/knowledge.omni");
+    let recovery = graph.join("__recovery");
+    fs::create_dir_all(&recovery).unwrap();
+    fs::write(recovery.join("unresolved.json"), "malformed sidecar").unwrap();
+    assert!(matches!(
+        Omnigraph::open(graph.to_str().unwrap()).await,
+        Err(omnigraph::error::OmniError::RecoveryRequired { .. })
+    ));
     let root = format!(
         "file://{}",
         fs::canonicalize(temp.path()).unwrap().display()
@@ -198,10 +202,6 @@ async fn oidc_root_mismatch_refuses_even_beside_valid_native_trust_before_recove
         refused
             .to_string()
             .contains("OIDC identity snapshot or serving-root binding")
-    );
-    assert!(
-        staging.exists(),
-        "OIDC failure opened the graph for recovery"
     );
 }
 
@@ -1029,10 +1029,8 @@ rules:
     }
 }
 
-/// Exercise the production listener and shutdown driver in a contained process.
-/// A no-op schema pass holds the engine's schema gate so the HTTP write
-/// parks at an async acquire; a blocking HTTP seam would keep the connection
-/// alive by itself and could hide missing request ownership.
+/// Exercise production shutdown while a schema refresh holds the exclusive gate.
+/// The HTTP write parks asynchronously so a disconnected client can be observed.
 #[cfg(unix)]
 mod owned_shutdown {
     use super::*;
@@ -1141,17 +1139,12 @@ mod owned_shutdown {
         let graph = graph_path(&root);
         let direct = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
         use omnigraph::seams::catalog::{
-            MUTATION_POST_STAGE_PRE_EFFECT_GATE, SCHEMA_APPLY_POST_SENTINEL,
+            MUTATION_POST_STAGE_PRE_EFFECT_GATE, SCHEMA_RELOAD_BEFORE_CONTRACT_READ,
         };
-        let (hold_guard, hold) = SCHEMA_APPLY_POST_SENTINEL.hold();
+        let (hold_guard, hold) = SCHEMA_RELOAD_BEFORE_CONTRACT_READ.hold();
         let observed_root = root.clone();
         let staged_hold = hold.clone();
         let stage_guard = MUTATION_POST_STAGE_PRE_EFFECT_GATE.observe(move || {
-            // Stage against the accepted snapshot first, then interleave a
-            // no-op schema pass. It takes the exclusive gate without changing
-            // HEAD, so the HTTP write parks asynchronously on that gate after
-            // this callback returns. Blocking the HTTP worker itself would
-            // hide cancellation behind a connection that never gets polled.
             fs::write(observed_root.join("start-holder"), b"start").unwrap();
             staged_hold.wait_until_reached();
             fs::write(observed_root.join("http-staged"), b"reached").unwrap();
@@ -1172,11 +1165,7 @@ mod owned_shutdown {
             while !direct_root.join("start-holder").exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            let result = direct
-                .apply_schema(&fs::read_to_string(fixture("test.pg")).unwrap())
-                .await
-                .unwrap();
-            assert!(!result.applied, "the gate holder must not move graph HEAD");
+            direct.refresh().await.unwrap();
         });
         let signal_root = root.clone();
         let mut terminate =

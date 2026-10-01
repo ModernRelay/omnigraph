@@ -11,7 +11,7 @@ use omnigraph_core::handle_cache::LruMap;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-use crate::db::{ResolvedTarget, Snapshot};
+use crate::db::{ResolvedTarget, SchemaContractIdentity, Snapshot};
 use crate::error::Result;
 use crate::graph_index::{GraphIndex, persist};
 
@@ -277,43 +277,57 @@ pub struct ReadCaches {
     pub session: Arc<Session>,
     pub handles: Arc<TableHandleCache>,
     /// The accepted catalog built by
-    /// `Omnigraph::build_accepted_catalog_with_schema_gate_held`, memoized on
-    /// the contract's exact bytes.
+    /// `Omnigraph::accepted_catalog_for_snapshot`, memoized on the
+    /// exact captured manifest image and validated contract row.
     pub accepted_catalog: AcceptedCatalogMemo,
     /// Named queries compiled against an accepted catalog.
     pub compiled_queries: CompiledQueryCache,
 }
 
-/// Memo of the last accepted catalog, keyed on the contract's byte-exact text
-/// (`SchemaContractText`), which the caller reads on every call, so a
-/// rewritten contract misses. One entry: a graph has one accepted contract at
-/// a time.
+/// One accepted row and catalog, with the immutable image that was validated.
 #[derive(Default)]
 pub struct AcceptedCatalogMemo {
     inner: std::sync::Mutex<Option<Arc<AcceptedCatalogEntry>>>,
 }
 
-struct AcceptedCatalogEntry {
-    text: crate::db::SchemaContractText,
-    catalog: Arc<Catalog>,
+pub(crate) struct AcceptedCatalogEntry {
+    pub snapshot: Snapshot,
+    pub row: omnigraph_catalog::SchemaContractRow,
+    pub identity: SchemaContractIdentity,
+    pub catalog: Arc<Catalog>,
 }
 
 impl AcceptedCatalogMemo {
-    pub(crate) fn get(&self, text: &crate::db::SchemaContractText) -> Option<Arc<Catalog>> {
-        let entry = self
-            .inner
+    pub(crate) fn current(&self) -> Option<Arc<AcceptedCatalogEntry>> {
+        self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()?;
-        (entry.text == *text).then(|| Arc::clone(&entry.catalog))
+            .clone()
     }
 
-    pub(crate) fn memoize(&self, text: crate::db::SchemaContractText, catalog: Arc<Catalog>) {
+    #[cfg(test)]
+    pub(crate) fn get(&self, identity: &SchemaContractIdentity) -> Option<Arc<Catalog>> {
+        let entry = self.current()?;
+        (entry.identity == *identity).then(|| Arc::clone(&entry.catalog))
+    }
+
+    pub(crate) fn memoize(
+        &self,
+        snapshot: Snapshot,
+        row: omnigraph_catalog::SchemaContractRow,
+        catalog: Arc<Catalog>,
+    ) -> Arc<AcceptedCatalogEntry> {
+        let entry = Arc::new(AcceptedCatalogEntry {
+            identity: SchemaContractIdentity::from(&row.head),
+            snapshot,
+            row,
+            catalog,
+        });
         *self
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(Arc::new(AcceptedCatalogEntry { text, catalog }));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&entry));
+        entry
     }
 }
 

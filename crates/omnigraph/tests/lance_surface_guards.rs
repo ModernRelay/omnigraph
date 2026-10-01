@@ -6006,4 +6006,41 @@ async fn packed_struct_refuses_null_values_and_lone_child_projection_lance_11() 
             .contains("invalid variable-width layout for UInt64"),
         "{error}"
     );
+    let mut filtered = dataset.scan();
+    filtered.project(&["id", "record"]).unwrap();
+    filtered.filter("id = 'b'").unwrap();
+    let error = filtered.try_into_batch().await.expect_err(
+        "Lance 11's default materialization splits the fixed child out of a packed struct",
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("invalid variable-width layout for UInt64"),
+        "{error}"
+    );
+    let mut late = dataset.scan();
+    late.project(&["id", "record"]).unwrap();
+    late.filter("id = 'b'").unwrap();
+    late.materialization_style(lance::dataset::scanner::MaterializationStyle::AllLate);
+    let late_batch = late.try_into_batch().await.unwrap();
+    let mut early = dataset.scan();
+    early.project(&["id", "record"]).unwrap();
+    early.filter("id = 'b'").unwrap();
+    early.materialization_style(lance::dataset::scanner::MaterializationStyle::AllEarly);
+    let batch = early.try_into_batch().await.unwrap();
+    assert_eq!(
+        late_batch, batch,
+        "both explicit styles retain the whole record"
+    );
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(batch.column(0).as_string::<i32>().value(0), "b");
+    let record = batch.column(1).as_struct();
+    assert_eq!(record.column(0).as_string::<i32>().value(0), "");
+    assert_eq!(
+        record
+            .column(1)
+            .as_primitive::<arrow_array::types::UInt64Type>()
+            .value(0),
+        0
+    );
 }

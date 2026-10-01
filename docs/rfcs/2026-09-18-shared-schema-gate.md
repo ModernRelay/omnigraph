@@ -19,6 +19,8 @@ blocked_on: []
 > A term set in ***bold italics*** is being defined at that exact spot; it is
 > used plain everywhere after.
 
+The process-local gate remains in force. [Schema contract in the manifest](2026-09-30-schema-contract-in-manifest.md) replaces root-file contract installation and the schema-apply sentinel with atomic manifest publication.
+
 ## Summary
 
 Resolve the schema-gate half of [RFC 0067](0067-detached-table-commits.md)'s

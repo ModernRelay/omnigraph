@@ -2977,11 +2977,9 @@ async fn apply_creates_graph_and_unblocks_dependents() {
 async fn apply_create_failure_blocks_dependents_and_keeps_sidecar() {
     let dir = fixture();
     write_state_resources(dir.path(), &[]);
-    // Make the init fail its strict preflight: a junk _schema.pg already
-    // sits at the derived root (the engine refuses to overwrite it).
     let root = dir.path().join(CLUSTER_GRAPHS_DIR).join("knowledge.omni");
     fs::create_dir_all(&root).unwrap();
-    fs::write(root.join("_schema.pg"), "junk").unwrap();
+    fs::write(root.join("__init_claim.json"), "incomplete initializer").unwrap();
 
     let out = apply_config_dir(dir.path()).await;
     assert!(!out.ok);

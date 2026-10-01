@@ -13,7 +13,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use omnigraph::db::Omnigraph;
-use omnigraph::error::OmniError;
 use omnigraph_cluster::seams::FailScenario;
 use omnigraph_cluster::{
     ApplyOptions, apply_config_dir, apply_config_dir_with_options, approve_config_dir,
@@ -477,7 +476,8 @@ async fn schema_apply_error_before_graph_movement_removes_sidecar() {
     fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
 
     {
-        let _failpoint = omnigraph::seams::catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE.fire_always();
+        let _failpoint =
+            omnigraph::seams::catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND.fire_always();
         let out = Box::pin(apply_config_dir(dir.path())).await;
         assert!(!out.ok);
         assert!(
@@ -512,7 +512,6 @@ async fn schema_apply_error_after_graph_movement_keeps_sidecar() {
     let dir = fixture();
     converge_with_live_graph(dir.path()).await;
     let uri = dir.path().join("graphs/knowledge.omni");
-    let pre_schema_source = fs::read_to_string(uri.join("_schema.pg")).unwrap();
     fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
     let desired = validate_config_dir(dir.path());
     let v2_digest = desired.resource_digests["schema.knowledge"].clone();
@@ -529,28 +528,10 @@ async fn schema_apply_error_after_graph_movement_keeps_sidecar() {
             "{:?}",
             out.diagnostics
         );
-        // Read-only opens cannot repair the torn manifest/schema authority and
-        // must refuse it. Inspect the physical source directly to prove that
-        // recovery has not rewritten it behind the read-only boundary.
-        let read_only_error = match Omnigraph::open_read_only(uri.to_string_lossy().as_ref()).await
-        {
-            Ok(_) => panic!("read-only open must refuse incomplete SchemaApply recovery"),
-            Err(error) => error,
-        };
-        match read_only_error {
-            OmniError::RecoveryRequired { reason, .. } => {
-                assert!(
-                    reason.contains("read-only open found SchemaApply manifest outcome")
-                        && reason.contains("run a read-write open"),
-                    "unexpected read-only recovery refusal: {reason}"
-                );
-            }
-            other => panic!("expected RecoveryRequired from read-only open, got: {other}"),
-        }
-        assert_eq!(
-            fs::read_to_string(uri.join("_schema.pg")).unwrap(),
-            pre_schema_source
-        );
+        let read_only = Omnigraph::open_read_only(uri.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        assert_eq!(read_only.schema_source().as_str(), SCHEMA_V2);
         let sidecars = recovery_sidecars(dir.path());
         assert_eq!(sidecars.len(), 1, "{sidecars:?}");
         let sidecar: serde_json::Value =

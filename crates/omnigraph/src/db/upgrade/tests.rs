@@ -35,6 +35,7 @@ async fn synthetic_v6_fixture_with_branch(root: &str, create_branch: bool) {
     .unwrap();
     drop(db);
     settle_fixture_pins(root).await;
+    persist_legacy_schema_contract(root).await;
     replay_manifest_as_merge_writer(root).await;
     let mut dataset = open(root, None).await.unwrap();
     dataset
@@ -203,7 +204,7 @@ async fn settle_fixture_pins(root: &str) {
 /// The default route on a branch-free synthetic v6 graph runs all four
 /// steps and lands at v11; `--check` names the deferred preflights first.
 #[tokio::test]
-async fn storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v11() {
+async fn storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v13() {
     #[cfg(feature = "failpoints")]
     let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -226,10 +227,11 @@ async fn storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v11() {
             HANDLER,
             RETIREMENT_HANDLER,
             DETACHED_PINS_HANDLER,
-            DETACHED_ONLY_HANDLER
+            DETACHED_ONLY_HANDLER,
+            SCHEMA_CONTRACT_HANDLER
         ]
     );
-    assert_eq!(check.work.deferred_checks.len(), 3, "{check:?}");
+    assert_eq!(check.work.deferred_checks.len(), 4, "{check:?}");
     assert_eq!(stored_files(dir.path()), before);
 
     let upgraded = upgrade_storage(root, UpgradeOptions::default())
@@ -242,7 +244,8 @@ async fn storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v11() {
             HANDLER,
             RETIREMENT_HANDLER,
             DETACHED_PINS_HANDLER,
-            DETACHED_ONLY_HANDLER
+            DETACHED_ONLY_HANDLER,
+            SCHEMA_CONTRACT_HANDLER
         ]
     );
     let reopened = Omnigraph::open(root).await.unwrap();
@@ -251,7 +254,7 @@ async fn storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v11() {
             .internal_schema_version_of(crate::db::ReadTarget::branch("main"))
             .await
             .unwrap(),
-        11
+        13
     );
     // The storage route keeps the legacy spellings; the vintage is the
     // schema IR's, and `omnigraph schema upgrade-system-columns` converts it
@@ -270,6 +273,7 @@ async fn storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v11() {
 /// of a graph an older binary left behind; fresh graphs of either vintage are
 /// born packed at the current stamp.
 async fn restamp_all_manifests(root: &str, stamp: u32) {
+    persist_legacy_schema_contract(root).await;
     let main = open(root, None).await.unwrap();
     let refs: Vec<String> = crate::branch_control::list_branch_contents(&main)
         .await
@@ -286,6 +290,80 @@ async fn restamp_all_manifests(root: &str, stamp: u32) {
     crate::db::manifest::migrations::restamp_flat_for_test(&mut main, stamp)
         .await
         .unwrap();
+}
+
+fn legacy_schema_names() -> [&'static str; 3] {
+    [
+        legacy_schema_files::SCHEMA_SOURCE_FILENAME,
+        legacy_schema_files::SCHEMA_IR_FILENAME,
+        legacy_schema_files::SCHEMA_STATE_FILENAME,
+    ]
+}
+
+async fn persist_legacy_schema_contract(root: &str) -> crate::db::manifest::SchemaContractRow {
+    let row = validated_manifest_contract(&open(root, None).await.unwrap())
+        .await
+        .unwrap();
+    let (ir, _) = crate::db::schema_state::validate_schema_contract_row(&row).unwrap();
+    std::fs::write(
+        Path::new(root).join(legacy_schema_files::SCHEMA_SOURCE_FILENAME),
+        &row.source,
+    )
+    .unwrap();
+    std::fs::write(
+        Path::new(root).join(legacy_schema_files::SCHEMA_IR_FILENAME),
+        &row.ir,
+    )
+    .unwrap();
+    std::fs::write(
+        Path::new(root).join(legacy_schema_files::SCHEMA_STATE_FILENAME),
+        serde_json::to_vec(&serde_json::json!({
+            "format_version": 2,
+            "schema_shape_hash": omnigraph_compiler::schema_shape_hash_from_ir(&ir).unwrap(),
+            "schema_ir_hash": row.head.schema_ir_hash,
+            "schema_identity_version": row.head.schema_identity_version,
+            "schema_identity_domain": row.head.schema_identity_domain,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    row
+}
+
+async fn restamp_schema_contract_source(dataset: &mut Dataset, stamp: u32) {
+    if stamp == 12 {
+        crate::db::manifest::migrations::restamp_packed_v12_for_test(dataset)
+            .await
+            .unwrap();
+    } else {
+        crate::db::manifest::migrations::restamp_flat_for_test(dataset, stamp)
+            .await
+            .unwrap();
+    }
+}
+
+async fn schema_contract_fixture(
+    root: &str,
+    main_stamp: u32,
+    branch_stamp: u32,
+) -> crate::db::manifest::SchemaContractRow {
+    let db = Omnigraph::init(root, "node Person { name: String }")
+        .await
+        .unwrap();
+    db.branch_create("feature").await.unwrap();
+    drop(db);
+    let row = persist_legacy_schema_contract(root).await;
+    let mut main = open(root, None).await.unwrap();
+    for native in crate::branch_control::list_live_manifest_branch_contents(&main)
+        .await
+        .unwrap()
+        .into_keys()
+    {
+        let mut branch = main.checkout_branch(&native).await.unwrap();
+        restamp_schema_contract_source(&mut branch, branch_stamp).await;
+    }
+    restamp_schema_contract_source(&mut main, main_stamp).await;
+    row
 }
 
 fn stored_files(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)> {
@@ -307,6 +385,565 @@ fn stored_files(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTim
     let mut files = BTreeMap::new();
     collect(root, &mut files);
     files
+}
+
+#[tokio::test]
+async fn storage_upgrade_current_contract_ignores_legacy_orphans_and_former_sentinel_name() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(root, "node Person { name: String }")
+        .await
+        .unwrap();
+    db.branch_create("__schema_apply_lock__").await.unwrap();
+    for name in legacy_schema_names() {
+        std::fs::write(dir.path().join(name), "orphan, not authority").unwrap();
+        std::fs::write(dir.path().join(format!("{name}.staging")), "orphan staging").unwrap();
+    }
+    let before = stored_files(dir.path());
+    for check in [true, false] {
+        let report = upgrade_storage(
+            root,
+            UpgradeOptions {
+                check,
+                to_format: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.outcome, UpgradeOutcome::AlreadyCurrent, "{report:?}");
+        assert_eq!(stored_files(dir.path()), before);
+    }
+    assert!(Omnigraph::open_read_only(root).await.is_ok());
+}
+
+async fn append_flat_manifest_extension(
+    root: &str,
+    object_id: &str,
+    object_type: &str,
+    metadata: &str,
+) {
+    let main = open(root, None).await.unwrap();
+    let schema = Arc::new(arrow_schema::Schema::from(main.schema()));
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| -> arrow_array::ArrayRef {
+            let value = match field.name().as_str() {
+                "object_id" => object_id,
+                "object_type" => object_type,
+                "table_key" => "",
+                "metadata" => metadata,
+                _ => return arrow_array::new_null_array(field.data_type(), 1),
+            };
+            Arc::new(arrow_array::StringArray::from(vec![value]))
+        })
+        .collect();
+    let batch = arrow_array::RecordBatch::try_new(schema.clone(), columns).unwrap();
+    let input = arrow_array::RecordBatchIterator::new([Ok(batch)], schema);
+    Dataset::write(
+        input,
+        &format!("{root}/__manifest"),
+        Some(lance::dataset::WriteParams {
+            mode: lance::dataset::WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn storage_upgrade_refuses_restamped_current_layout_and_injected_legacy_contract() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    for (stamp, inject) in [
+        (11, None),
+        (12, None),
+        (11, Some("schema_contract")),
+        (11, Some("unknown_extension")),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        Omnigraph::init(root, "node Person { name: String }")
+            .await
+            .unwrap();
+        let row = persist_legacy_schema_contract(root).await;
+        let mut main = open(root, None).await.unwrap();
+        if let Some(object_type) = inject {
+            restamp_schema_contract_source(&mut main, stamp).await;
+            let head = serde_json::to_string(&row.head).unwrap();
+            append_flat_manifest_extension(root, "schema_contract", object_type, &head).await;
+        } else {
+            main.update_schema_metadata([(
+                INTERNAL_SCHEMA_VERSION_KEY,
+                stamp.to_string().as_str(),
+            )])
+            .await
+            .unwrap();
+        }
+        let before = stored_files(dir.path());
+        for check in [true, false] {
+            let report = upgrade_storage(
+                root,
+                UpgradeOptions {
+                    check,
+                    to_format: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                report.outcome,
+                UpgradeOutcome::CheckFailed,
+                "stamp {stamp}, inject {inject:?}: {report:?}"
+            );
+            if inject == Some("unknown_extension") {
+                assert!(
+                    format!("{report:?}").contains("has object_type 'unknown_extension'"),
+                    "{report:?}"
+                );
+            }
+            assert_eq!(stored_files(dir.path()), before);
+        }
+    }
+}
+
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn storage_upgrade_schema_contract_cleanup_retries_after_each_delete() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    for deleted in 1..=3 {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let contract = schema_contract_fixture(root, 11, 12).await;
+        let failed = {
+            let _fault = catalog::UPGRADE_AFTER_SCHEMA_FILE_DELETE.fire_once_at(deleted);
+            upgrade_storage(root, UpgradeOptions::default())
+                .await
+                .unwrap()
+        };
+        assert_eq!(
+            failed.outcome,
+            UpgradeOutcome::RecoveryRequired,
+            "{failed:?}"
+        );
+        assert!(
+            intent_from(&open(root, None).await.unwrap())
+                .unwrap()
+                .is_some()
+        );
+        for (index, name) in legacy_schema_names().iter().enumerate() {
+            assert_eq!(
+                dir.path().join(name).exists(),
+                u64::try_from(index).unwrap() >= deleted
+            );
+        }
+        assert_eq!(
+            validated_manifest_contract(&open(root, None).await.unwrap())
+                .await
+                .unwrap(),
+            contract
+        );
+        assert!(Omnigraph::open(root).await.is_err());
+        assert!(Omnigraph::open_read_only(root).await.is_err());
+        let resumed = upgrade_storage(root, UpgradeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(resumed.outcome, UpgradeOutcome::Completed, "{resumed:?}");
+        let before = stored_files(dir.path());
+        assert_eq!(
+            upgrade_storage(root, UpgradeOptions::default())
+                .await
+                .unwrap()
+                .outcome,
+            UpgradeOutcome::AlreadyCurrent
+        );
+        assert_eq!(stored_files(dir.path()), before);
+        assert!(Omnigraph::open_read_only(root).await.is_ok());
+    }
+}
+
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn storage_upgrade_schema_contract_resumes_every_partial_cleanup_state() {
+    let _scenario = crate::seams::FailScenario::setup();
+    for absent_mask in 0..8 {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let row = schema_contract_fixture(root, 12, 11).await;
+        {
+            let _fault = catalog::UPGRADE_AFTER_BRANCH.fire_once_at(2);
+            let report = upgrade_storage(root, UpgradeOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                report.outcome,
+                UpgradeOutcome::RecoveryRequired,
+                "{report:?}"
+            );
+        }
+        assert_eq!(
+            validated_manifest_contract(&open(root, None).await.unwrap())
+                .await
+                .unwrap(),
+            row
+        );
+        for (index, name) in legacy_schema_names().iter().enumerate() {
+            if absent_mask & (1 << index) != 0 {
+                std::fs::remove_file(dir.path().join(name)).unwrap();
+            }
+        }
+        let before = stored_files(dir.path());
+        let check = upgrade_storage(
+            root,
+            UpgradeOptions {
+                check: true,
+                to_format: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(check.outcome, UpgradeOutcome::RecoveryRequired, "{check:?}");
+        assert_eq!(stored_files(dir.path()), before);
+        let resumed = upgrade_storage(root, UpgradeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed.outcome,
+            UpgradeOutcome::Completed,
+            "mask {absent_mask}: {resumed:?}"
+        );
+        for name in legacy_schema_names() {
+            assert!(!dir.path().join(name).exists());
+        }
+        assert_eq!(
+            validated_manifest_contract(&open(root, None).await.unwrap())
+                .await
+                .unwrap(),
+            row
+        );
+    }
+}
+
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn storage_upgrade_schema_contract_interruption_boundaries_retry() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    for main_stamp in [11, 12] {
+        for seam in [
+            &catalog::UPGRADE_AFTER_FENCE,
+            &catalog::UPGRADE_AFTER_STAGE,
+            &catalog::UPGRADE_AFTER_BRANCH,
+            &catalog::UPGRADE_BEFORE_ACTIVATION,
+            &catalog::UPGRADE_AFTER_ACTIVATION,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().to_str().unwrap();
+            let row = schema_contract_fixture(root, main_stamp, 11).await;
+            let original = open(root, None).await.unwrap();
+            let fence_version = original.version().version + 1;
+            let failed = {
+                let _fault = seam.fire_always();
+                upgrade_storage(root, UpgradeOptions::default())
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(
+                failed.outcome,
+                UpgradeOutcome::RecoveryRequired,
+                "{}: {failed:?}",
+                seam.name()
+            );
+            let resumed = upgrade_storage(root, UpgradeOptions::default())
+                .await
+                .unwrap();
+            assert!(resumed.success(), "{}: {resumed:?}", seam.name());
+            assert_eq!(
+                validated_manifest_contract(&open(root, None).await.unwrap())
+                    .await
+                    .unwrap(),
+                row
+            );
+            let historical =
+                crate::db::manifest::ManifestCoordinator::snapshot_at(root, None, fence_version)
+                    .await
+                    .unwrap();
+            assert!(historical.dataset("node:Person").is_some());
+            let fence = open(root, None)
+                .await
+                .unwrap()
+                .checkout_version(fence_version)
+                .await
+                .unwrap();
+            equivalent(&original, &fence).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn storage_upgrade_schema_contract_refuses_forged_historical_fence() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    for stamp in [11, 12] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let row = schema_contract_fixture(root, stamp, stamp).await;
+        let mut source = open(root, None).await.unwrap();
+        let mut intent = inventory(&source, row.head.schema_identity_domain.clone())
+            .await
+            .unwrap();
+        intent.schema_contract =
+            Some(crate::db::manifest::migrations::UpgradeSchemaContract::from_row(&row));
+        source
+            .update_schema_metadata([
+                (INTERNAL_SCHEMA_VERSION_KEY.to_string(), "13".to_string()),
+                (
+                    UPGRADE_PENDING_KEY.to_string(),
+                    serde_json::to_string(&intent).unwrap(),
+                ),
+                (
+                    "test:foreign-fence-effect".to_string(),
+                    "unowned".to_string(),
+                ),
+            ])
+            .await
+            .unwrap();
+        let forged_version = source.version().version;
+        let mut source = publish_activation(source).await.unwrap();
+        source
+            .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY, stamp.to_string().as_str())])
+            .await
+            .unwrap();
+        assert!(
+            upgrade_storage(root, UpgradeOptions::default())
+                .await
+                .unwrap()
+                .success()
+        );
+        let error =
+            crate::db::manifest::ManifestCoordinator::snapshot_at(root, None, forged_version)
+                .await
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its exact source"),
+            "{error}"
+        );
+    }
+}
+
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn storage_upgrade_schema_contract_refuses_contract_drift_on_retry() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    for filename in [
+        legacy_schema_files::SCHEMA_SOURCE_FILENAME,
+        legacy_schema_files::SCHEMA_IR_FILENAME,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        schema_contract_fixture(root, 11, 12).await;
+        {
+            let _fault = catalog::UPGRADE_AFTER_BRANCH.fire_once_at(1);
+            let report = upgrade_storage(root, UpgradeOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                report.outcome,
+                UpgradeOutcome::RecoveryRequired,
+                "{report:?}"
+            );
+        }
+        let path = dir.path().join(filename);
+        let original = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{original}\n")).unwrap();
+        let before = stored_files(dir.path());
+        let refused = upgrade_storage(root, UpgradeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            refused.outcome,
+            UpgradeOutcome::RecoveryRequired,
+            "{refused:?}"
+        );
+        assert!(
+            refused
+                .findings
+                .iter()
+                .any(|finding| finding.message.contains("exact text changed")),
+            "{refused:?}"
+        );
+        assert_eq!(stored_files(dir.path()), before);
+        std::fs::write(path, original).unwrap();
+        assert!(
+            upgrade_storage(root, UpgradeOptions::default())
+                .await
+                .unwrap()
+                .success()
+        );
+    }
+}
+
+#[tokio::test]
+async fn storage_upgrade_schema_contract_refuses_legacy_artifacts_without_effects() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    for artifact in [
+        "_schema.pg.staging",
+        "_schema.ir.json.staging",
+        "__schema_state.json.staging",
+        "__schema_apply_lock__",
+        "__schema_apply_lock__.01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        schema_contract_fixture(root, 11, 12).await;
+        if artifact.ends_with(".staging") {
+            std::fs::write(dir.path().join(artifact), "unfinished").unwrap();
+        } else {
+            let mut main = open(root, None).await.unwrap();
+            let version = main.version().version;
+            crate::storage_layer::lance_clone::create_branch(&mut main, artifact, version)
+                .await
+                .unwrap();
+        }
+        let before = stored_files(dir.path());
+        for check in [true, false] {
+            let result = upgrade_storage(
+                root,
+                UpgradeOptions {
+                    check,
+                    to_format: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                result.outcome,
+                UpgradeOutcome::CheckFailed,
+                "{artifact}: {result:?}"
+            );
+            assert_eq!(stored_files(dir.path()), before);
+        }
+    }
+}
+
+#[tokio::test]
+async fn storage_upgrade_schema_contract_refuses_invalid_contract_without_effects() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    for case in [
+        "missing", "source", "ir", "state", "identity", "hash", "shape", "domain", "manifest",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        schema_contract_fixture(root, 12, 11).await;
+        match case {
+            "missing" => std::fs::remove_file(dir.path().join("_schema.ir.json")).unwrap(),
+            "source" => std::fs::write(dir.path().join("_schema.pg"), "invalid schema").unwrap(),
+            "ir" => std::fs::write(dir.path().join("_schema.ir.json"), "{}").unwrap(),
+            "manifest" => {
+                let other = tempfile::tempdir().unwrap();
+                let other_root = other.path().to_str().unwrap();
+                Omnigraph::init(other_root, "node Alien { name: String }")
+                    .await
+                    .unwrap();
+                persist_legacy_schema_contract(other_root).await;
+                for name in legacy_schema_names() {
+                    std::fs::copy(other.path().join(name), dir.path().join(name)).unwrap();
+                }
+            }
+            field => {
+                let path = dir.path().join("__schema_state.json");
+                let mut state: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                match field {
+                    "state" => state["format_version"] = serde_json::json!(99),
+                    "identity" => state["schema_identity_version"] = serde_json::json!(99),
+                    "hash" => state["schema_ir_hash"] = serde_json::json!("sha256:bad"),
+                    "shape" => state["schema_shape_hash"] = serde_json::json!("sha256:bad"),
+                    "domain" => {
+                        state["schema_identity_domain"] =
+                            serde_json::json!("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+                    }
+                    _ => unreachable!(),
+                }
+                std::fs::write(path, serde_json::to_vec(&state).unwrap()).unwrap();
+            }
+        }
+        let before = stored_files(dir.path());
+        let result = upgrade_storage(root, UpgradeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            result.outcome,
+            UpgradeOutcome::CheckFailed,
+            "{case}: {result:?}"
+        );
+        assert_eq!(stored_files(dir.path()), before);
+    }
+}
+
+#[tokio::test]
+async fn storage_upgrade_legacy_constructor_does_not_admit_ordinary_opens() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    for keep_row in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        Omnigraph::init(root, "node Person { name: String }")
+            .await
+            .unwrap();
+        let contract = persist_legacy_schema_contract(root).await;
+        let mut main = open(root, None).await.unwrap();
+        if keep_row {
+            main.update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY, "10")])
+                .await
+                .unwrap();
+        } else {
+            restamp_schema_contract_source(&mut main, 10).await;
+        }
+        let _admission = crate::db::manifest::migrations::admit_conversion_source(root, 10);
+        let converted =
+            Omnigraph::open_for_storage_upgrade(root, crate::db::OpenMode::ReadOnly, contract)
+                .await;
+        assert_eq!(converted.is_ok(), !keep_row);
+        let identity = crate::storage::write_queue_root_identity(
+            &crate::storage::normalize_root_uri(root).unwrap(),
+        )
+        .unwrap();
+        let queue = crate::db::write_queue::WriteQueueManager::for_root(&identity);
+        let gate = queue.acquire_schema_exclusive().await;
+        for read_only in [false, true] {
+            let probes = crate::instrumentation::QueryIoProbes::default();
+            let scans = Arc::clone(&probes.manifest_scan_count);
+            let opened = crate::instrumentation::with_query_io_probes(probes, async {
+                if read_only {
+                    Omnigraph::open_read_only(root).await
+                } else {
+                    Omnigraph::open(root).await
+                }
+            });
+            let error = tokio::time::timeout(std::time::Duration::from_secs(2), opened)
+                .await
+                .expect("ordinary format refusal must precede the schema queue")
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains("reads only v13"), "{error}");
+            assert_eq!(scans.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+        drop(gate);
+        if let Ok(db) = converted {
+            assert!(db.fresh_snapshot_for_branch(None).await.is_ok());
+        }
+    }
 }
 
 #[tokio::test]
@@ -490,7 +1127,7 @@ async fn storage_upgrade_interruption_boundaries_retry_without_mixed_visibility(
             assert!(Omnigraph::open_read_only(root).await.is_ok(), "{boundary}");
             for branch in [None, Some("feature")] {
                 let dataset = open(root, branch).await.unwrap();
-                assert_eq!(read_stamp(&dataset), Some(11), "{boundary}");
+                assert_eq!(read_stamp(&dataset), Some(13), "{boundary}");
             }
         }
     }
@@ -501,56 +1138,72 @@ async fn storage_upgrade_interruption_boundaries_retry_without_mixed_visibility(
 async fn storage_upgrade_recovery_refuses_foreign_head_movement() {
     use crate::seams::FailScenario;
     let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_str().unwrap();
-    synthetic_v6_fixture(root).await;
-    {
-        let _fault = catalog::UPGRADE_AFTER_FENCE.fire_always();
-        let interrupted = upgrade_storage(
+    for source_stamp in [6, 11, 12] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let target = if source_stamp == 6 {
+            synthetic_v6_fixture(root).await;
+            8
+        } else {
+            schema_contract_fixture(root, source_stamp, source_stamp).await;
+            13
+        };
+        {
+            let _fault = catalog::UPGRADE_AFTER_FENCE.fire_always();
+            let interrupted = upgrade_storage(
+                root,
+                UpgradeOptions {
+                    check: false,
+                    to_format: Some(target),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                interrupted.outcome,
+                UpgradeOutcome::RecoveryRequired,
+                "{interrupted:?}"
+            );
+        }
+        let pending = intent_from(&open(root, None).await.unwrap())
+            .unwrap()
+            .unwrap();
+        let native = pending
+            .branches
+            .iter()
+            .find_map(|branch| branch.native.as_deref())
+            .unwrap();
+        let mut foreign = open(root, Some(native)).await.unwrap();
+        foreign
+            .update_schema_metadata([("test:foreign", "movement")])
+            .await
+            .unwrap();
+        let before_retry = stored_files(dir.path());
+        let refused = upgrade_storage(
             root,
             UpgradeOptions {
                 check: false,
-                to_format: Some(8),
+                to_format: Some(target),
             },
         )
         .await
         .unwrap();
         assert_eq!(
-            interrupted.outcome,
+            refused.outcome,
             UpgradeOutcome::RecoveryRequired,
-            "{interrupted:?}"
+            "{refused:?}"
         );
+        assert!(
+            refused
+                .findings
+                .iter()
+                .any(|finding| finding.message.contains("foreign movement")),
+            "{refused:?}"
+        );
+        assert_eq!(stored_files(dir.path()), before_retry);
+        assert!(Omnigraph::open(root).await.is_err());
+        assert!(Omnigraph::open_read_only(root).await.is_err());
     }
-    let mut foreign = open(root, Some("feature")).await.unwrap();
-    foreign
-        .update_schema_metadata([("test:foreign", "movement")])
-        .await
-        .unwrap();
-    let before_retry = stored_files(dir.path());
-    let refused = upgrade_storage(
-        root,
-        UpgradeOptions {
-            check: false,
-            to_format: Some(8),
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        refused.outcome,
-        UpgradeOutcome::RecoveryRequired,
-        "{refused:?}"
-    );
-    assert!(
-        refused
-            .findings
-            .iter()
-            .any(|finding| finding.message.contains("foreign movement")),
-        "{refused:?}"
-    );
-    assert_eq!(stored_files(dir.path()), before_retry);
-    assert!(Omnigraph::open(root).await.is_err());
-    assert!(Omnigraph::open_read_only(root).await.is_err());
 }
 
 #[tokio::test]
@@ -960,7 +1613,11 @@ async fn storage_upgrade_v7_to_v8_preserves_manifest_fragments_and_history() {
     assert_eq!(finished.outcome, UpgradeOutcome::Completed, "{finished:?}");
     assert_eq!(
         finished.completed_handlers,
-        [DETACHED_PINS_HANDLER, DETACHED_ONLY_HANDLER]
+        [
+            DETACHED_PINS_HANDLER,
+            DETACHED_ONLY_HANDLER,
+            SCHEMA_CONTRACT_HANDLER
+        ]
     );
     assert!(Omnigraph::open(root).await.is_ok());
     let before = stored_files(dir.path());
@@ -1100,6 +1757,7 @@ async fn storage_upgrade_preserves_prior_v6_to_v7_pending_intent_before_continui
             .await
             .unwrap(),
         );
+        persist_legacy_schema_contract(root).await;
         let mut dataset = open(root, None).await.unwrap();
         crate::db::manifest::migrations::restamp_flat_for_test(&mut dataset, 6)
             .await
@@ -1130,6 +1788,12 @@ async fn storage_upgrade_preserves_prior_v6_to_v7_pending_intent_before_continui
             .await
             .unwrap();
         drop(dataset);
+        assert!(
+            upgrade_storage(root, UpgradeOptions::default())
+                .await
+                .unwrap()
+                .success()
+        );
         for _ in 0..2 {
             let db = Omnigraph::open(root).await.unwrap();
             assert!(
@@ -1225,7 +1889,11 @@ async fn storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_nam
     assert_eq!(upgraded.outcome, UpgradeOutcome::Completed, "{upgraded:?}");
     assert_eq!(
         upgraded.completed_handlers,
-        [DETACHED_PINS_HANDLER, DETACHED_ONLY_HANDLER]
+        [
+            DETACHED_PINS_HANDLER,
+            DETACHED_ONLY_HANDLER,
+            SCHEMA_CONTRACT_HANDLER
+        ]
     );
     let reopened = Omnigraph::open(root).await.unwrap();
     assert_eq!(
@@ -1238,7 +1906,7 @@ async fn storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_nam
                 .internal_schema_version_of(crate::db::ReadTarget::branch(branch))
                 .await
                 .unwrap(),
-            11,
+            13,
             "live branch {branch} is restamped"
         );
     }
@@ -1309,7 +1977,7 @@ async fn storage_upgrade_current_vintage_is_already_current_without_a_route() {
             Some(crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION)
         );
         assert_eq!(stored_files(dir.path()), before);
-        for to_format in [11] {
+        for to_format in [13] {
             let explicit_served = upgrade_storage(
                 root,
                 UpgradeOptions {
@@ -1331,6 +1999,7 @@ async fn storage_upgrade_current_vintage_is_already_current_without_a_route() {
             (8, "target_below_stamp"),
             (9, "unsupported_target"),
             (10, "target_below_stamp"),
+            (11, "target_below_stamp"),
             (12, "unsupported_target"),
         ] {
             let refused = upgrade_storage(
@@ -1360,7 +2029,7 @@ async fn storage_upgrade_current_vintage_is_already_current_without_a_route() {
     }
     let mut dataset = open(root, None).await.unwrap();
     dataset
-        .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY, "13")])
+        .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY, "14")])
         .await
         .unwrap();
     drop(dataset);
@@ -1444,7 +2113,7 @@ async fn storage_upgrade_legacy_source_refuses_reserved_retirement_metadata_with
 /// v10 restamp and the v11 step, `--to-format 8` stays already current before
 /// and after, and a v8 graph with another branch is refused before any effect.
 #[tokio::test]
-async fn storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v11() {
+async fn storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v13() {
     #[cfg(feature = "failpoints")]
     let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1483,9 +2152,16 @@ async fn storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v11() {
     .await
     .unwrap();
     assert_eq!(check.outcome, UpgradeOutcome::CheckPassed, "{check:?}");
-    assert_eq!(check.target_format, 11);
+    assert_eq!(check.target_format, 13);
     assert!(check.target_defaulted);
-    assert_eq!(check.route, [DETACHED_PINS_HANDLER, DETACHED_ONLY_HANDLER]);
+    assert_eq!(
+        check.route,
+        [
+            DETACHED_PINS_HANDLER,
+            DETACHED_ONLY_HANDLER,
+            SCHEMA_CONTRACT_HANDLER
+        ]
+    );
     assert_eq!(stored_files(dir.path()), before, "check writes nothing");
 
     let upgraded = upgrade_storage(
@@ -1500,7 +2176,11 @@ async fn storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v11() {
     assert_eq!(upgraded.outcome, UpgradeOutcome::Completed, "{upgraded:?}");
     assert_eq!(
         upgraded.completed_handlers,
-        [DETACHED_PINS_HANDLER, DETACHED_ONLY_HANDLER]
+        [
+            DETACHED_PINS_HANDLER,
+            DETACHED_ONLY_HANDLER,
+            SCHEMA_CONTRACT_HANDLER
+        ]
     );
     assert_eq!(
         upgraded.last_durable_completed_boundary.as_deref(),
@@ -1512,7 +2192,7 @@ async fn storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v11() {
             .internal_schema_version_of(crate::db::ReadTarget::branch("main"))
             .await
             .unwrap(),
-        11
+        13
     );
     let snapshot = reopened.snapshot().await;
     let person = reopened
@@ -1525,7 +2205,7 @@ async fn storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v11() {
         "the storage route keeps the legacy spellings"
     );
     drop(reopened);
-    for to_format in [None, Some(11)] {
+    for to_format in [None, Some(13)] {
         let again = upgrade_storage(
             root,
             UpgradeOptions {
@@ -1592,107 +2272,131 @@ async fn storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v11() {
                 .internal_schema_version_of(crate::db::ReadTarget::branch(branch))
                 .await
                 .unwrap(),
-            11
+            13
         );
     }
 }
 
-/// Lazy conversion leaves a graph with v11 and v12 branches until every branch
-/// has published; `upgrade --check` and execute report it already current,
-/// whichever branch converted first.
 #[tokio::test]
-async fn storage_upgrade_accepts_a_graph_converting_branch_by_branch() {
+async fn storage_upgrade_schema_contract_converts_mixed_branch_formats() {
     #[cfg(feature = "failpoints")]
     let _scenario = crate::seams::FailScenario::setup();
-    for published in ["main", "feature"] {
-        let idle = if published == "main" {
-            "feature"
-        } else {
-            "main"
-        };
+    for (main_stamp, branch_stamp) in [(11, 12), (12, 11), (11, 11), (12, 12)] {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(root, "node Person { name: String }")
+        let contract = schema_contract_fixture(root, main_stamp, branch_stamp).await;
+        if main_stamp == 11 {
+            append_flat_manifest_extension(
+                root,
+                "unknown_extension",
+                "unknown_extension",
+                "extension retained verbatim",
+            )
+            .await;
+        }
+        let state_path = dir.path().join("__schema_state.json");
+        let mut legacy_state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        legacy_state["publication"] =
+            serde_json::json!({"graph_manifest_version": 1, "graph_commit_id": "retired-receipt"});
+        std::fs::write(&state_path, serde_json::to_vec(&legacy_state).unwrap()).unwrap();
+        let main = open(root, None).await.unwrap();
+        let branch = crate::branch_control::list_live_manifest_branch_contents(&main)
             .await
+            .unwrap()
+            .into_keys()
+            .next()
             .unwrap();
-        db.branch_create("feature").await.unwrap();
-        drop(db);
-        restamp_all_manifests(root, 11).await;
-        let db = crate::Session::from_defaults(
-            std::sync::Arc::new(Omnigraph::open(root).await.unwrap()),
-            omnigraph_compiler::settings::SessionSettings::default(),
-        );
-        db.mutate(
-            published,
-            "query seed($name: String) { insert Person { name: $name } }",
-            "seed",
-            &HashMap::from([(
-                "name".to_string(),
-                omnigraph_compiler::query::ast::Literal::String("converting".to_string()),
-            )]),
+        let mut sources = Vec::new();
+        for native in [Some(branch.as_str()), None] {
+            let source = open(root, native).await.unwrap();
+            crate::db::manifest::migrations::validate_schema_contract_source(&source).unwrap();
+            sources.push((native.map(str::to_owned), source));
+        }
+        assert!(Omnigraph::open(root).await.is_err());
+        let before = stored_files(dir.path());
+        let check = upgrade_storage(
+            root,
+            UpgradeOptions {
+                check: true,
+                to_format: None,
+            },
         )
         .await
         .unwrap();
-        drop(db);
-        let converting = Omnigraph::open(root).await.unwrap();
-        for (branch, stamp) in [(published, 12), (idle, 11)] {
+        assert_eq!(check.outcome, UpgradeOutcome::CheckPassed, "{check:?}");
+        assert_eq!(check.route, [SCHEMA_CONTRACT_HANDLER]);
+        assert_eq!(stored_files(dir.path()), before);
+        let report = upgrade_storage(root, UpgradeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(report.outcome, UpgradeOutcome::Completed, "{report:?}");
+        assert_eq!(report.completed_handlers, [SCHEMA_CONTRACT_HANDLER]);
+        for (native, source) in sources {
+            let target = open(root, native.as_deref()).await.unwrap();
+            assert_eq!(read_stamp(&target), Some(13));
             assert_eq!(
-                converting
-                    .internal_schema_version_of(crate::db::ReadTarget::branch(branch))
-                    .await
-                    .unwrap(),
-                stamp,
-                "after one publish on {published}, {branch}"
+                validated_manifest_contract(&target).await.unwrap(),
+                contract
             );
-        }
-        drop(converting);
-        let before = stored_files(dir.path());
-        for check in [true, false] {
-            for to_format in [None, Some(11)] {
-                let report = upgrade_storage(root, UpgradeOptions { check, to_format })
-                    .await
+            equivalent(&source, &target).await.unwrap();
+            if native.is_none() && main_stamp == 11 {
+                let batch = target.scan().try_into_batch().await.unwrap();
+                let ids = batch
+                    .column_by_name("object_id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
                     .unwrap();
-                assert_eq!(
-                    report.outcome,
-                    UpgradeOutcome::AlreadyCurrent,
-                    "publish on {published}, check {check}, target {to_format:?}: {report:?}"
-                );
-                assert_eq!(stored_files(dir.path()), before);
+                let extension_rows = (0..batch.num_rows())
+                    .filter(|&row| ids.value(row) == "unknown_extension")
+                    .collect::<Vec<_>>();
+                assert_eq!(extension_rows.len(), 1);
+                let record = batch
+                    .column_by_name("record")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::StructArray>()
+                    .unwrap();
+                for (column, expected) in [
+                    (
+                        batch.column_by_name("object_type").unwrap(),
+                        "unknown_extension",
+                    ),
+                    (
+                        record.column_by_name("metadata").unwrap(),
+                        "extension retained verbatim",
+                    ),
+                ] {
+                    let values = column.as_any().downcast_ref::<StringArray>().unwrap();
+                    assert_eq!(values.value(extension_rows[0]), expected);
+                }
             }
-            for (to_format, expected_code) in
-                [(10, "target_below_stamp"), (12, "unsupported_target")]
-            {
-                let refused = upgrade_storage(
-                    root,
-                    UpgradeOptions {
-                        check,
-                        to_format: Some(to_format),
-                    },
-                )
+            let retained = target
+                .checkout_version(source.version().version)
                 .await
                 .unwrap();
-                assert_eq!(
-                    refused.outcome,
-                    UpgradeOutcome::CheckFailed,
-                    "publish on {published}, check {check}, target {to_format}: {refused:?}"
-                );
-                assert!(
-                    refused
-                        .findings
-                        .iter()
-                        .any(|finding| finding.code == expected_code),
-                    "{refused:?}"
-                );
-                assert_eq!(stored_files(dir.path()), before);
-            }
+            assert_eq!(read_stamp(&retained), read_stamp(&source));
+            equivalent(&source, &retained).await.unwrap();
         }
+        for name in legacy_schema_names() {
+            assert!(!dir.path().join(name).exists());
+        }
+        let db = Omnigraph::open_read_only(root).await.unwrap();
+        assert_eq!(db.branch_list().await.unwrap(), ["main", "feature"]);
+        let before = stored_files(dir.path());
+        let again = upgrade_storage(root, UpgradeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(again.outcome, UpgradeOutcome::AlreadyCurrent);
+        assert_eq!(stored_files(dir.path()), before);
     }
 }
 
 /// A v9 graph, the 0.11.x current vintage, takes the v10 restamp and then the
 /// v11 step, with every branch restamped and no payload copied or rewritten.
 #[tokio::test]
-async fn storage_upgrade_default_route_takes_a_v9_graph_to_v11() {
+async fn storage_upgrade_default_route_takes_a_v9_graph_to_v13() {
     #[cfg(feature = "failpoints")]
     let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1719,8 +2423,15 @@ async fn storage_upgrade_default_route_takes_a_v9_graph_to_v11() {
     .unwrap();
     assert_eq!(check.outcome, UpgradeOutcome::CheckPassed, "{check:?}");
     assert_eq!(check.observed_format, Some(9));
-    assert_eq!(check.target_format, 11);
-    assert_eq!(check.route, [DETACHED_PINS_HANDLER, DETACHED_ONLY_HANDLER]);
+    assert_eq!(check.target_format, 13);
+    assert_eq!(
+        check.route,
+        [
+            DETACHED_PINS_HANDLER,
+            DETACHED_ONLY_HANDLER,
+            SCHEMA_CONTRACT_HANDLER
+        ]
+    );
     assert_eq!(stored_files(dir.path()), before, "check writes nothing");
     let unsupported = upgrade_storage(
         root,
@@ -1745,7 +2456,11 @@ async fn storage_upgrade_default_route_takes_a_v9_graph_to_v11() {
     assert_eq!(upgraded.outcome, UpgradeOutcome::Completed, "{upgraded:?}");
     assert_eq!(
         upgraded.completed_handlers,
-        [DETACHED_PINS_HANDLER, DETACHED_ONLY_HANDLER]
+        [
+            DETACHED_PINS_HANDLER,
+            DETACHED_ONLY_HANDLER,
+            SCHEMA_CONTRACT_HANDLER
+        ]
     );
     assert_eq!(upgraded.work.payload_bytes_copied, 0);
     assert_eq!(upgraded.work.payload_bytes_rewritten, 0);
@@ -1757,7 +2472,7 @@ async fn storage_upgrade_default_route_takes_a_v9_graph_to_v11() {
                 .internal_schema_version_of(crate::db::ReadTarget::branch(branch))
                 .await
                 .unwrap(),
-            11
+            13
         );
     }
     drop(reopened);
@@ -1771,7 +2486,7 @@ async fn storage_upgrade_default_route_takes_a_v9_graph_to_v11() {
 /// pin and writes nothing; execution promotes the pending pin once, reaps its
 /// copy, records the last linear version on every live branch and restamps.
 #[tokio::test]
-async fn storage_upgrade_default_route_takes_a_v10_graph_to_v11() {
+async fn storage_upgrade_default_route_takes_a_v10_graph_to_v13() {
     use crate::db::omnigraph::promotion::{open_at, table_location, walk_chain};
     #[cfg(feature = "failpoints")]
     let _scenario = crate::seams::FailScenario::setup();
@@ -1829,7 +2544,7 @@ async fn storage_upgrade_default_route_takes_a_v10_graph_to_v11() {
         Err(error) => error.to_string(),
     };
     assert!(
-        refused.contains("reads only v11 to v12"),
+        refused.contains("reads only v13 to v13"),
         "a v10 graph is refused by normal open: {refused}"
     );
 
@@ -1845,9 +2560,12 @@ async fn storage_upgrade_default_route_takes_a_v10_graph_to_v11() {
     .unwrap();
     assert_eq!(check.outcome, UpgradeOutcome::CheckPassed, "{check:?}");
     assert_eq!(check.observed_format, Some(10));
-    assert_eq!(check.target_format, 11);
+    assert_eq!(check.target_format, 13);
     assert!(check.target_defaulted);
-    assert_eq!(check.route, [DETACHED_ONLY_HANDLER]);
+    assert_eq!(
+        check.route,
+        [DETACHED_ONLY_HANDLER, SCHEMA_CONTRACT_HANDLER]
+    );
     assert_eq!(stored_files(dir.path()), before, "check writes nothing");
 
     #[cfg(feature = "failpoints")]
@@ -1884,7 +2602,10 @@ async fn storage_upgrade_default_route_takes_a_v10_graph_to_v11() {
         .await
         .unwrap();
     assert_eq!(upgraded.outcome, UpgradeOutcome::Completed, "{upgraded:?}");
-    assert_eq!(upgraded.completed_handlers, [DETACHED_ONLY_HANDLER]);
+    assert_eq!(
+        upgraded.completed_handlers,
+        [DETACHED_ONLY_HANDLER, SCHEMA_CONTRACT_HANDLER]
+    );
     assert_eq!(
         upgraded.last_durable_completed_boundary.as_deref(),
         Some("activated")
@@ -1898,7 +2619,7 @@ async fn storage_upgrade_default_route_takes_a_v10_graph_to_v11() {
                 .internal_schema_version_of(crate::db::ReadTarget::branch(branch))
                 .await
                 .unwrap(),
-            11,
+            13,
             "live branch {branch} is restamped"
         );
         let snapshot = reopened.snapshot_for_branch(Some(branch)).await.unwrap();
@@ -1960,7 +2681,7 @@ async fn storage_upgrade_default_route_takes_a_v10_graph_to_v11() {
     );
     drop(reopened);
 
-    for to_format in [None, Some(11)] {
+    for to_format in [None, Some(13)] {
         let again = upgrade_storage(
             root,
             UpgradeOptions {

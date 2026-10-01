@@ -283,7 +283,7 @@ async fn open_refuses_a_stamp_below_the_served_floor_before_any_effect() {
             };
             let error = result.err().expect("a v9 stamp is below the served floor");
             assert!(
-                error.to_string().contains("reads only v11 to v12"),
+                error.to_string().contains("reads only v13 to v13"),
                 "{error}"
             );
             assert!(error.to_string().contains("omnigraph upgrade"), "{error}");
@@ -308,7 +308,7 @@ async fn open_refuses_a_stamp_below_the_served_floor_before_any_effect() {
 #[tokio::test]
 async fn open_refuses_unknown_schema_features_before_recovery() {
     let _scenario = crate::seams::FailScenario::setup();
-    for staged in [false, true] {
+    {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         drop(
@@ -316,21 +316,21 @@ async fn open_refuses_unknown_schema_features_before_recovery() {
                 .await
                 .unwrap(),
         );
-        let live_path = dir.path().join(crate::db::schema_state::SCHEMA_IR_FILENAME);
-        let mut ir: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&live_path).unwrap()).unwrap();
+        let mut manifest = ManifestCoordinator::open(uri).await.unwrap();
+        let live_row = manifest.read_schema_contract().await.unwrap();
+        let mut ir: serde_json::Value = serde_json::from_str(&live_row.ir).unwrap();
         ir["features"]
             .as_array_mut()
             .unwrap()
             .push(serde_json::Value::String("time-travel".into()));
-        let target = if staged {
-            dir.path()
-                .join(crate::db::schema_state::SCHEMA_IR_STAGING_FILENAME)
-        } else {
-            live_path
-        };
         let tampered = serde_json::to_string(&ir).unwrap();
-        std::fs::write(&target, &tampered).unwrap();
+        manifest
+            .commit_changes(&[ManifestChange::SchemaContract(SchemaContractRow {
+                ir: tampered.clone(),
+                ..live_row
+            })])
+            .await
+            .unwrap();
         let before_version = open_manifest_dataset(uri, None)
             .await
             .unwrap()
@@ -363,18 +363,21 @@ async fn open_refuses_unknown_schema_features_before_recovery() {
                 .expect("an unknown feature name must refuse open");
             assert!(
                 error.to_string().contains("unknown to this build"),
-                "staged {staged}: {error}"
+                "{error}"
             );
             assert_eq!(
                 reached_effects.load(std::sync::atomic::Ordering::SeqCst),
                 0,
                 "unknown feature names must refuse before the local write probe or recovery"
             );
-            assert_eq!(
-                std::fs::read_to_string(&target).unwrap(),
-                tampered,
-                "staged {staged}: the refused artifact must be left in place"
-            );
+            let planted = ManifestCoordinator::open(uri)
+                .await
+                .unwrap()
+                .read_schema_contract()
+                .await
+                .unwrap()
+                .ir;
+            assert_eq!(planted, tampered, "the refused row must be left unchanged");
             assert_eq!(
                 open_manifest_dataset(uri, None)
                     .await
@@ -1007,7 +1010,7 @@ mod migrations_tests {
         .unwrap();
         set_stamp(&mut manifest, 10).await.unwrap();
         let refused = guard_stamp(&manifest).unwrap_err().to_string();
-        assert!(refused.contains("reads only v11 to v12"), "{refused}");
+        assert!(refused.contains("reads only v13 to v13"), "{refused}");
         {
             let _admission = admit_conversion_source(root, 10);
             assert_eq!(guard_stamp(&manifest).unwrap(), 10);

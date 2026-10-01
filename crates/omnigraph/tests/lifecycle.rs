@@ -6,7 +6,7 @@ use omnigraph::db::{InitOptions, Omnigraph, ReadTarget};
 use omnigraph_compiler::schema::parser::{parse_persisted_schema_contract, parse_schema};
 use omnigraph_compiler::{
     SchemaIR, SchemaIdentityDomain, compile_schema_shape, resolve_schema_ir, schema_ir_hash,
-    schema_ir_pretty_json, schema_shape_hash, schema_shape_hash_from_ir,
+    schema_ir_pretty_json,
 };
 
 use helpers::*;
@@ -19,27 +19,198 @@ fn compile_persisted_shape(source: &str) -> omnigraph_compiler::SchemaShape {
     compile_schema_shape(&parse_persisted_schema_contract(source).unwrap()).unwrap()
 }
 
-fn schema_state_json(ir: &SchemaIR) -> serde_json::Value {
-    serde_json::json!({
-        "format_version": 2,
-        "schema_shape_hash": schema_shape_hash_from_ir(ir).unwrap(),
-        "schema_ir_hash": schema_ir_hash(ir).unwrap(),
-        "schema_identity_version": 2,
-        "schema_identity_domain": ir.schema_identity_domain.as_str(),
-    })
+/// Replace the `schema_contract` row of main's `__manifest` with `source` and
+/// `ir` in one publish, as an apply would, without touching any table: the
+/// way a test plants a contract the engine did not write.
+async fn publish_schema_contract_row(uri: &str, source: &str, ir: &SchemaIR) -> u64 {
+    publish_schema_contract_text(uri, source, &schema_ir_pretty_json(ir).unwrap(), ir).await
 }
 
-fn persist_schema_contract(root: &std::path::Path, ir: &SchemaIR) {
-    fs::write(
-        root.join("_schema.ir.json"),
-        schema_ir_pretty_json(ir).unwrap(),
+async fn publish_schema_contract_text(
+    uri: &str,
+    source: &str,
+    ir_text: &str,
+    ir: &SchemaIR,
+) -> u64 {
+    let mut manifest = omnigraph_catalog::ManifestCoordinator::open(uri)
+        .await
+        .unwrap();
+    manifest
+        .commit_changes(&[omnigraph_catalog::ManifestChange::SchemaContract(
+            omnigraph_catalog::SchemaContractRow {
+                source: source.to_string(),
+                ir: ir_text.to_string(),
+                head: omnigraph_catalog::SchemaContractHead {
+                    schema_ir_hash: schema_ir_hash(ir).unwrap(),
+                    schema_identity_version: 2,
+                    schema_identity_domain: ir.schema_identity_domain.as_str().to_string(),
+                },
+            },
+        )])
+        .await
+        .unwrap()
+}
+
+async fn read_contract(uri: &str) -> omnigraph_catalog::SchemaContractRow {
+    omnigraph_catalog::ManifestCoordinator::open(uri)
+        .await
+        .unwrap()
+        .read_schema_contract()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn warm_publisher_preserves_foreign_contract_text_at_the_same_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = init_and_load(&dir).await;
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
     )
+    .await
     .unwrap();
-    fs::write(
-        root.join("__schema_state.json"),
-        serde_json::to_string_pretty(&schema_state_json(ir)).unwrap(),
+    let before = read_contract(uri).await;
+    let ir: SchemaIR = serde_json::from_str(&before.ir).unwrap();
+    let source = format!("\n{}\n", before.source);
+    let ir_text = format!("\n{}\n", serde_json::to_string(&ir).unwrap());
+    let old_head = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .graph_head(None)
+        .map(str::to_owned);
+    publish_schema_contract_text(uri, &source, &ir_text, &ir).await;
+    let replacement = read_contract(uri).await;
+    assert_eq!(replacement.head, before.head);
+    assert_ne!(replacement.source, before.source);
+    assert_ne!(replacement.ir, before.ir);
+    assert_eq!(
+        omnigraph_catalog::ManifestCoordinator::open(uri)
+            .await
+            .unwrap()
+            .exact_graph_head(),
+        old_head
+    );
+    let (resolved, io) = helpers::cost::measure(db.resolve_snapshot("main")).await;
+    let resolved = resolved.unwrap();
+    assert_eq!(Some(resolved.as_str()), old_head.as_deref());
+    assert_eq!(io.version_probes, 1);
+    assert_eq!(io.internal_open_count, 1);
+    assert_eq!(io.manifest_scan_count, 1);
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Bob")], &[("$age", 77)]),
     )
+    .await
     .unwrap();
+    assert_eq!(read_contract(uri).await, replacement);
+    db.refresh().await.unwrap();
+    assert_eq!(db.schema_source().as_str(), source);
+    let fresh = helpers::session(Omnigraph::open_read_only(uri).await.unwrap());
+    for (name, age) in [("Alice", 31), ("Bob", 77)] {
+        let result = fresh
+            .query(
+                ReadTarget::branch("main"),
+                TEST_QUERIES,
+                "get_person",
+                &params(&[("$name", name)]),
+            )
+            .await
+            .unwrap();
+        let batch = result.concat_batches().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .unwrap()
+                .value(0),
+            age
+        );
+    }
+}
+
+#[tokio::test]
+async fn schema_contract_integrity_refuses_mismatched_identity() {
+    for corruption in ["source", "ir", "hash", "domain", "version"] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let held = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        held.branch_create("merge_source").await.unwrap();
+        held.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+        let refreshing = Omnigraph::open(uri).await.unwrap();
+        let writing = Omnigraph::open(uri).await.unwrap();
+        let merging = helpers::session(Omnigraph::open(uri).await.unwrap());
+        let mut manifest = omnigraph_catalog::ManifestCoordinator::open(uri)
+            .await
+            .unwrap();
+        let mut row = manifest.read_schema_contract().await.unwrap();
+        if corruption == "source" {
+            row.source = "node Different { age: String }".to_string();
+        } else if corruption == "ir" {
+            row.ir = "not valid JSON".to_string();
+        } else if corruption == "domain" {
+            row.head.schema_identity_domain = SchemaIdentityDomain::from_ulid(ulid::Ulid::new())
+                .as_str()
+                .to_string();
+        } else if corruption == "version" {
+            row.head.schema_identity_version += 1;
+        } else {
+            row.head.schema_ir_hash = "invalid-hash".to_string();
+        }
+        manifest
+            .commit_changes(&[omnigraph_catalog::ManifestChange::SchemaContract(row)])
+            .await
+            .unwrap();
+        let before = manifest.version();
+        let expected = match corruption {
+            "source" => "source no longer matches",
+            "ir" => "schema contract in the schema_contract row is invalid",
+            "domain" => "identity domain",
+            "version" => "identity version",
+            _ => "schema_ir_hash",
+        };
+        let refresh_error = refreshing.refresh().await.unwrap_err();
+        assert!(
+            refresh_error.to_string().contains(expected),
+            "{refresh_error}"
+        );
+        let warm_error = held
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap_err();
+        assert!(warm_error.to_string().contains(expected), "{warm_error}");
+        let write_error = writing.branch_create("must_refuse").await.unwrap_err();
+        assert!(write_error.to_string().contains(expected), "{write_error}");
+        let merge_error = merging
+            .branch_merge("merge_source", "main")
+            .await
+            .unwrap_err();
+        assert!(merge_error.to_string().contains(expected), "{merge_error}");
+        for read_only in [true, false] {
+            let result = if read_only {
+                Omnigraph::open_read_only(uri).await
+            } else {
+                Omnigraph::open(uri).await
+            };
+            let error = result.err().expect("corrupt contract must refuse open");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        assert_eq!(
+            omnigraph_catalog::ManifestCoordinator::open(uri)
+                .await
+                .unwrap()
+                .version(),
+            before
+        );
+    }
 }
 
 #[tokio::test]
@@ -52,41 +223,29 @@ async fn init_creates_graph() {
         .await
         .unwrap();
 
-    assert!(dir.path().join("_schema.pg").exists());
-    assert!(dir.path().join("_schema.ir.json").exists());
-    assert!(dir.path().join("__schema_state.json").exists());
-
-    let ir: SchemaIR =
-        serde_json::from_str(&fs::read_to_string(dir.path().join("_schema.ir.json")).unwrap())
-            .unwrap();
-    let state: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(dir.path().join("__schema_state.json")).unwrap())
-            .unwrap();
+    for name in ["_schema.pg", "_schema.ir.json", "__schema_state.json"] {
+        assert!(
+            !dir.path().join(name).exists(),
+            "init must not write {name}"
+        );
+    }
+    let contract_row = read_contract(uri).await;
+    let ir: SchemaIR = serde_json::from_str(&contract_row.ir).unwrap();
     assert_eq!(ir.ir_version, 5);
     assert!(ir.features.contains("system-columns"));
-    let persisted: serde_json::Value =
-        serde_json::from_slice(&fs::read(dir.path().join("_schema.ir.json")).unwrap()).unwrap();
+    let persisted: serde_json::Value = serde_json::from_str(&contract_row.ir).unwrap();
     assert!(persisted.get("actor_provenance").is_none());
     assert_eq!(db.schema_source().as_str(), TEST_SCHEMA);
     assert!(ir.next_identity_id > 1);
     assert!(SchemaIdentityDomain::parse(ir.schema_identity_domain.as_str()).is_ok());
-    assert_eq!(state["format_version"].as_u64(), Some(2));
-    assert_eq!(state["schema_identity_version"].as_u64(), Some(2));
+    assert_eq!(contract_row.head.schema_identity_version, 2);
     assert_eq!(
-        state["schema_ir_hash"].as_str(),
-        Some(schema_ir_hash(&ir).unwrap().as_str())
+        contract_row.head.schema_ir_hash,
+        schema_ir_hash(&ir).unwrap()
     );
     assert_eq!(
-        state["schema_shape_hash"].as_str(),
-        Some(
-            schema_shape_hash(&compile_shape(TEST_SCHEMA))
-                .unwrap()
-                .as_str()
-        )
-    );
-    assert_eq!(
-        state["schema_identity_domain"].as_str(),
-        Some(ir.schema_identity_domain.as_str())
+        contract_row.head.schema_identity_domain,
+        ir.schema_identity_domain.as_str()
     );
     assert_eq!(
         db.catalog()
@@ -102,9 +261,10 @@ async fn init_creates_graph() {
         db.internal_schema_version_of(ReadTarget::branch("main"))
             .await
             .unwrap(),
-        12,
-        "fresh graphs are stamped at the current manifest format (v12, the packed catalog record over detached-only tables, RFC 0067 detached table commits, RFC 0040 system columns and RFC 0042 retirement metadata)"
+        13,
+        "fresh graphs are stamped at the current manifest format (v13, the schema contract as a `schema_contract` row of main's `__manifest` over the packed catalog record, detached-only tables, RFC 0067 detached table commits, RFC 0040 system columns and RFC 0042 retirement metadata)"
     );
+    assert_eq!(contract_row.source, TEST_SCHEMA);
     assert!(snap.dataset("node:Person").is_some());
     assert!(snap.dataset("node:Company").is_some());
     assert!(snap.dataset("edge:Knows").is_some());
@@ -186,10 +346,6 @@ node Document {
             .contains("@unique is not supported on blob property Document.content")
     );
 
-    // Build a normal v6 root, then replace its source/accepted identity
-    // artifacts with the exact shape the pre-v0.10 parser admitted. The table
-    // identity and physical schema are unchanged; only the logical constraint
-    // differs, so this models a historical root without weakening new init.
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let db = Omnigraph::init(uri, BASE_SCHEMA).await.unwrap();
@@ -199,8 +355,7 @@ node Document {
     let historical_ir = resolve_schema_ir(&accepted, &compile_persisted_shape(HISTORICAL_SCHEMA))
         .unwrap()
         .schema_ir;
-    fs::write(dir.path().join("_schema.pg"), HISTORICAL_SCHEMA).unwrap();
-    persist_schema_contract(dir.path(), &historical_ir);
+    publish_schema_contract_row(uri, HISTORICAL_SCHEMA, &historical_ir).await;
 
     let reopened = Omnigraph::open(uri)
         .await
@@ -255,67 +410,7 @@ async fn open_reads_existing_graph() {
 }
 
 #[tokio::test]
-async fn open_refuses_missing_identity_contract_without_bootstrap() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-    fs::remove_file(dir.path().join("_schema.ir.json")).unwrap();
-    fs::remove_file(dir.path().join("__schema_state.json")).unwrap();
-
-    let err = match Omnigraph::open(uri).await {
-        Ok(_) => panic!("open must not reconstruct stable IDs from mutable source names"),
-        Err(err) => err,
-    };
-    assert!(
-        err.to_string()
-            .contains("automatic bootstrap is not supported")
-    );
-    assert!(!dir.path().join("_schema.ir.json").exists());
-    assert!(!dir.path().join("__schema_state.json").exists());
-}
-
-#[tokio::test]
-async fn open_refuses_partial_identity_contract() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-    fs::remove_file(dir.path().join("__schema_state.json")).unwrap();
-
-    let err = match Omnigraph::open(uri).await {
-        Ok(_) => panic!("open must reject a partial identity contract"),
-        Err(err) => err,
-    };
-    assert!(err.to_string().contains("schema contract is incomplete"));
-    assert!(dir.path().join("_schema.ir.json").exists());
-    assert!(!dir.path().join("__schema_state.json").exists());
-}
-
-#[tokio::test]
-async fn open_refuses_pre_identity_schema_state_format() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-    let state_path = dir.path().join("__schema_state.json");
-    let mut state: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
-    state["format_version"] = serde_json::json!(1);
-    fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
-
-    let err = match Omnigraph::open(uri).await {
-        Ok(_) => panic!("schema-state v1 must not be served as identity-capable state"),
-        Err(err) => err,
-    };
-    assert!(
-        err.to_string()
-            .contains("schema state format 1 is unsupported")
-    );
-}
-
-#[tokio::test]
-async fn open_refuses_v3_live_or_staged_schema_without_changing_files() {
+async fn open_refuses_v3_schema_without_changing_files() {
     fn files(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
         let mut result = std::collections::BTreeMap::new();
         let mut pending = vec![root.to_path_buf()];
@@ -337,33 +432,25 @@ async fn open_refuses_v3_live_or_staged_schema_without_changing_files() {
 
     // The unsupported version is the boundary, including disabled bindings.
     // Do not require this binary to understand the removed binding shape.
-    for (filename, enabled, duplicate_features) in [
-        ("_schema.ir.json", true, false),
-        ("_schema.ir.json", false, false),
-        ("_schema.ir.json.staging", true, false),
-        ("_schema.ir.json", true, true),
-        ("_schema.ir.json.staging", true, true),
-    ] {
+    for (enabled, duplicate_features) in [(true, false), (false, false), (true, true)] {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        drop(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+        let accepted = Omnigraph::init(uri, TEST_SCHEMA)
+            .await
+            .unwrap()
+            .catalog()
+            .bound_schema_ir()
+            .unwrap()
+            .clone();
         let mut ir: serde_json::Value =
-            serde_json::from_slice(&fs::read(dir.path().join("_schema.ir.json")).unwrap()).unwrap();
+            serde_json::from_str(&schema_ir_pretty_json(&accepted).unwrap()).unwrap();
         ir["ir_version"] = serde_json::json!(3);
         ir["actor_provenance"] = serde_json::json!({ "enabled": enabled });
-        // With matching source, historical recovery would clean these
-        // staged files before later discovering an unsupported live IR.
-        fs::write(dir.path().join("_schema.pg.staging"), TEST_SCHEMA).unwrap();
-        fs::copy(
-            dir.path().join("__schema_state.json"),
-            dir.path().join("__schema_state.json.staging"),
-        )
-        .unwrap();
         let mut ir_text = serde_json::to_string_pretty(&ir).unwrap();
         if duplicate_features {
             ir_text.insert_str(1, "\"features\": [],");
         }
-        fs::write(dir.path().join(filename), ir_text).unwrap();
+        publish_schema_contract_text(uri, TEST_SCHEMA, &ir_text, &accepted).await;
         let before = files(dir.path());
 
         for read_only in [true, false] {
@@ -393,11 +480,13 @@ async fn open_refuses_v3_live_or_staged_schema_without_changing_files() {
 async fn open_rejects_same_alias_with_foreign_table_identity() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-    let accepted: SchemaIR =
-        serde_json::from_str(&fs::read_to_string(dir.path().join("_schema.ir.json")).unwrap())
-            .unwrap();
+    let accepted = Omnigraph::init(uri, TEST_SCHEMA)
+        .await
+        .unwrap()
+        .catalog()
+        .bound_schema_ir()
+        .unwrap()
+        .clone();
     let company_only = r#"
 node Company {
     name: String @key
@@ -423,7 +512,7 @@ node Company {
             .unwrap()
             .type_id
     );
-    persist_schema_contract(dir.path(), &replacement);
+    publish_schema_contract_row(uri, TEST_SCHEMA, &replacement).await;
 
     let err = match Omnigraph::open(uri).await {
         Ok(_) => panic!("open must reject a same-name table with a foreign stable identity"),
@@ -441,11 +530,13 @@ node Company {
 async fn open_rejects_live_manifest_tables_absent_from_schema_ir() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-    let accepted: SchemaIR =
-        serde_json::from_str(&fs::read_to_string(dir.path().join("_schema.ir.json")).unwrap())
-            .unwrap();
+    let accepted = Omnigraph::init(uri, TEST_SCHEMA)
+        .await
+        .unwrap()
+        .catalog()
+        .bound_schema_ir()
+        .unwrap()
+        .clone();
     let company_only = r#"
 node Company {
     name: String @key
@@ -454,8 +545,7 @@ node Company {
     let replacement = resolve_schema_ir(&accepted, &compile_shape(company_only))
         .unwrap()
         .schema_ir;
-    fs::write(dir.path().join("_schema.pg"), company_only).unwrap();
-    persist_schema_contract(dir.path(), &replacement);
+    publish_schema_contract_row(uri, company_only, &replacement).await;
 
     let err = match Omnigraph::open(uri).await {
         Ok(_) => panic!("open must reject manifest tables omitted by accepted SchemaIR"),
@@ -476,8 +566,7 @@ async fn refresh_rejects_schema_ir_tables_missing_from_manifest() {
     let replacement = resolve_schema_ir(&accepted, &compile_shape(&with_temporary_source))
         .unwrap()
         .schema_ir;
-    fs::write(dir.path().join("_schema.pg"), with_temporary_source).unwrap();
-    persist_schema_contract(dir.path(), &replacement);
+    publish_schema_contract_row(uri, &with_temporary_source, &replacement).await;
 
     let err = db
         .refresh()
@@ -488,16 +577,16 @@ async fn refresh_rejects_schema_ir_tables_missing_from_manifest() {
 }
 
 #[tokio::test]
-async fn write_capture_rejects_schema_ir_tables_missing_from_manifest() {
+async fn write_preparation_manifest_read_failures_carry_before_effect_evidence() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let db = helpers::session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
     db.branch_create("refusal-probe").await.unwrap();
     let before = db.list_commits(None).await.unwrap();
     let branches_before = db.branch_list().await.unwrap();
-    let schema_path = dir.path().join("_schema.pg");
-    let unavailable_path = dir.path().join("_schema.pg.unavailable");
-    fs::rename(&schema_path, &unavailable_path).unwrap();
+    let manifest_path = dir.path().join("__manifest");
+    let unavailable_path = dir.path().join("manifest-held");
+    fs::rename(&manifest_path, &unavailable_path).unwrap();
     let mutation_error = mutate_main(
         &db,
         MUTATION_QUERIES,
@@ -533,7 +622,7 @@ async fn write_capture_rejects_schema_ir_tables_missing_from_manifest() {
         .await
         .unwrap_err();
     let schema_error = db.apply_schema(TEST_SCHEMA).await.unwrap_err();
-    fs::rename(&unavailable_path, &schema_path).unwrap();
+    fs::rename(&unavailable_path, &manifest_path).unwrap();
     for (door, error) in [
         ("mutation", mutation_error),
         ("deletion", deletion_error),
@@ -548,7 +637,7 @@ async fn write_capture_rejects_schema_ir_tables_missing_from_manifest() {
         assert_eq!(
             error.completion_evidence(),
             Some(omnigraph::error::CompletionEvidence::BeforeEffect),
-            "{door}: a failed contract GET before effects must carry owning evidence: {error}"
+            "{door}: a failed manifest authority read before effects must carry owning evidence: {error}"
         );
         assert_eq!(
             error.storage_failure().map(|failure| failure.kind),
@@ -558,14 +647,20 @@ async fn write_capture_rejects_schema_ir_tables_missing_from_manifest() {
     assert_eq!(db.list_commits(None).await.unwrap(), before);
     assert_eq!(db.branch_list().await.unwrap(), branches_before);
     db.branch_delete("refusal-probe").await.unwrap();
+}
+
+#[tokio::test]
+async fn write_capture_rejects_schema_ir_tables_missing_from_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
     let accepted = db.catalog().bound_schema_ir().unwrap().clone();
     let with_temporary_source =
         format!("{TEST_SCHEMA}\nnode Temporary {{\n    key: String @key\n}}\n");
     let replacement = resolve_schema_ir(&accepted, &compile_shape(&with_temporary_source))
         .unwrap()
         .schema_ir;
-    fs::write(dir.path().join("_schema.pg"), with_temporary_source).unwrap();
-    persist_schema_contract(dir.path(), &replacement);
+    publish_schema_contract_row(uri, &with_temporary_source, &replacement).await;
 
     let err = db
         .load_jsonl(
@@ -576,93 +671,6 @@ async fn write_capture_rejects_schema_ir_tables_missing_from_manifest() {
         .expect_err("write preparation must reject schema/manifest identity drift");
     assert!(err.to_string().contains("node:Temporary"));
     assert!(err.to_string().contains("is missing from manifest"));
-}
-
-#[tokio::test]
-async fn long_lived_handle_rejects_schema_source_drift() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-    let drifted = TEST_SCHEMA.replace("age: I32?", "age: I64?");
-    fs::write(dir.path().join("_schema.pg"), drifted).unwrap();
-
-    let err = match db.snapshot_of(ReadTarget::branch("main")).await {
-        Ok(_) => panic!("expected schema source drift to be rejected"),
-        Err(err) => err,
-    };
-    assert!(
-        err.to_string()
-            .contains("current _schema.pg no longer matches the accepted compiled schema")
-    );
-}
-
-#[tokio::test]
-async fn long_lived_handle_rejects_schema_ir_drift() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-    fs::write(dir.path().join("_schema.ir.json"), "{not valid json").unwrap();
-
-    let err = match db.snapshot_of(ReadTarget::branch("main")).await {
-        Ok(_) => panic!("expected schema IR drift to be rejected"),
-        Err(err) => err,
-    };
-    assert!(
-        err.to_string()
-            .contains("accepted compiled schema contract in _schema.ir.json is invalid")
-    );
-}
-
-#[tokio::test]
-async fn long_lived_handle_rejects_ir_and_source_updates_without_state_update() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-    let drifted = TEST_SCHEMA.replace("age: I32?", "age: I64?");
-    let accepted_ir: SchemaIR =
-        serde_json::from_str(&fs::read_to_string(dir.path().join("_schema.ir.json")).unwrap())
-            .unwrap();
-    let drifted_ir = resolve_schema_ir(&accepted_ir, &compile_shape(&drifted))
-        .unwrap()
-        .schema_ir;
-    let drifted_ir_json = schema_ir_pretty_json(&drifted_ir).unwrap();
-    fs::write(dir.path().join("_schema.pg"), drifted).unwrap();
-    fs::write(dir.path().join("_schema.ir.json"), drifted_ir_json).unwrap();
-
-    let err = match db.snapshot_of(ReadTarget::branch("main")).await {
-        Ok(_) => panic!("expected schema state mismatch to be rejected"),
-        Err(err) => err,
-    };
-    assert!(
-        err.to_string()
-            .contains("accepted compiled schema does not match the recorded schema state")
-    );
-}
-
-#[tokio::test]
-async fn long_lived_handle_rejects_schema_state_domain_drift() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-    let state_path = dir.path().join("__schema_state.json");
-    let mut state: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
-    state["schema_identity_domain"] =
-        serde_json::Value::String(SchemaIdentityDomain::new().as_str().to_string());
-    fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
-
-    let err = match db.snapshot_of(ReadTarget::branch("main")).await {
-        Ok(_) => panic!("expected schema identity-domain drift to be rejected"),
-        Err(err) => err,
-    };
-    assert!(
-        err.to_string()
-            .contains("identity domain does not match the recorded schema state")
-    );
 }
 
 #[tokio::test]
@@ -693,19 +701,7 @@ async fn refresh_detects_identity_aba_when_source_bytes_are_unchanged() {
         schema_ir_hash(&accepted).unwrap()
     );
 
-    fs::write(
-        dir.path().join("_schema.ir.json"),
-        schema_ir_pretty_json(&replacement).unwrap(),
-    )
-    .unwrap();
-    fs::write(
-        dir.path().join("__schema_state.json"),
-        serde_json::to_string_pretty(&schema_state_json(&replacement)).unwrap(),
-    )
-    .unwrap();
-
-    // `_schema.pg` is deliberately byte-identical. A source-byte fast path
-    // would preserve the stale identity allocator and bound catalog here.
+    publish_schema_contract_row(uri, TEST_SCHEMA, &replacement).await;
     db.refresh().await.unwrap();
     let refreshed = db.catalog();
     let refreshed_ir = refreshed.bound_schema_ir().unwrap();
@@ -714,19 +710,6 @@ async fn refresh_detects_identity_aba_when_source_bytes_are_unchanged() {
         schema_ir_hash(refreshed_ir).unwrap(),
         schema_ir_hash(&replacement).unwrap()
     );
-}
-
-#[tokio::test]
-async fn comment_only_schema_edit_keeps_schema_state_valid() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-    let commented = format!("// comment-only drift\n{}", TEST_SCHEMA);
-    fs::write(dir.path().join("_schema.pg"), commented).unwrap();
-
-    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    assert!(snapshot.dataset("node:Person").is_some());
 }
 
 #[tokio::test]
@@ -758,70 +741,18 @@ async fn snapshot_version_is_pinned() {
     assert_eq!(snap1.graph_manifest_version(), v1);
 }
 
-/// Regression for the `Omnigraph::init` re-init footgun (MR-668
-/// follow-up): a second `init` against a URI that already holds a
-/// graph must NOT modify or destroy the existing graph's schema
-/// artifacts. Today's behavior is destructive either way — the
-/// `write_text(_schema.pg, ...)` call at the top of
-/// `init_commit_phase` overwrites the existing file before any
-/// preflight, and `best_effort_cleanup_init_artifacts` will later
-/// delete all three files if the inner `GraphCoordinator::init`
-/// fails. Both outcomes corrupt an existing graph.
-///
-/// After the fix: strict-mode `init` (no `force` flag) errors out
-/// before touching any file, and the original schema artifacts
-/// match their pre-attempt contents byte-for-byte.
 #[tokio::test]
 async fn init_on_existing_graph_uri_does_not_destroy_existing_schema() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-
-    // Establish the first graph and snapshot its three schema files.
     Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    let original_schema_pg = fs::read_to_string(dir.path().join("_schema.pg")).unwrap();
-    let original_schema_ir = fs::read_to_string(dir.path().join("_schema.ir.json")).unwrap();
-    let original_schema_state = fs::read_to_string(dir.path().join("__schema_state.json")).unwrap();
-
-    // Attempt a re-init with a deliberately different schema so any
-    // overwrite would be observable in the file contents.
-    let different_schema = "node Other { id: String @key }\n";
-    let result = Omnigraph::init(uri, different_schema).await;
-
-    // The new init must report the conflict, not silently mutate.
+    let before = read_contract(uri).await;
     assert!(
-        result.is_err(),
-        "init against an existing graph URI must error, not silently overwrite"
+        Omnigraph::init(uri, "node Other { id: String @key }\n")
+            .await
+            .is_err()
     );
-
-    // The three schema files must remain present and byte-identical to
-    // their pre-attempt contents.
-    assert!(
-        dir.path().join("_schema.pg").exists(),
-        "_schema.pg must not be deleted by a failed re-init"
-    );
-    assert!(
-        dir.path().join("_schema.ir.json").exists(),
-        "_schema.ir.json must not be deleted by a failed re-init"
-    );
-    assert!(
-        dir.path().join("__schema_state.json").exists(),
-        "__schema_state.json must not be deleted by a failed re-init"
-    );
-    assert_eq!(
-        fs::read_to_string(dir.path().join("_schema.pg")).unwrap(),
-        original_schema_pg,
-        "_schema.pg contents must be preserved when re-init is rejected"
-    );
-    assert_eq!(
-        fs::read_to_string(dir.path().join("_schema.ir.json")).unwrap(),
-        original_schema_ir,
-        "_schema.ir.json contents must be preserved when re-init is rejected"
-    );
-    assert_eq!(
-        fs::read_to_string(dir.path().join("__schema_state.json")).unwrap(),
-        original_schema_state,
-        "__schema_state.json contents must be preserved when re-init is rejected"
-    );
+    assert_eq!(read_contract(uri).await, before);
 }
 
 #[tokio::test]
@@ -830,14 +761,7 @@ async fn force_init_refuses_existing_manifest_and_preserves_identity_contract() 
     let uri = dir.path().to_str().unwrap();
     Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
-    let schema_path = dir.path().join("_schema.pg");
-    let ir_path = dir.path().join("_schema.ir.json");
-    let state_path = dir.path().join("__schema_state.json");
-    let before = [
-        fs::read_to_string(&schema_path).unwrap(),
-        fs::read_to_string(&ir_path).unwrap(),
-        fs::read_to_string(&state_path).unwrap(),
-    ];
+    let before = read_contract(uri).await;
 
     let err = match Omnigraph::init_with_options(
         uri,
@@ -850,64 +774,28 @@ async fn force_init_refuses_existing_manifest_and_preserves_identity_contract() 
         Err(err) => err,
     };
     assert!(err.to_string().contains("force init refuses graph root"));
-    assert_eq!(fs::read_to_string(schema_path).unwrap(), before[0]);
-    assert_eq!(fs::read_to_string(ir_path).unwrap(), before[1]);
-    assert_eq!(fs::read_to_string(state_path).unwrap(), before[2]);
+    assert_eq!(read_contract(uri).await, before);
 }
 
-/// Happy-path sibling to the strict re-init regression above:
-/// `InitOptions { force: true }` may replace orphan schema artifacts when the
-/// operator deliberately recovers from a failed prior init.
-///
-/// Force does not purge Lance state and refuses any existing `__manifest`.
-/// The supported recovery scenario is therefore "schema files exist but Lance
-/// state doesn't," which this test reproduces.
-///
-/// Without this test, a future refactor could invert the `if !force`
-/// branch and silently break the operator-facing escape hatch.
 #[tokio::test]
-async fn init_with_force_recovers_from_orphan_schema_files() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-
-    // Simulate orphan schema files: write `_schema.pg` to disk
-    // without running a full init. The preflight will see it and
-    // bail in strict mode.
-    fs::write(dir.path().join("_schema.pg"), TEST_SCHEMA).unwrap();
-
-    // Strict mode refuses because `_schema.pg` exists.
-    let strict_err = match Omnigraph::init(uri, TEST_SCHEMA).await {
-        Ok(_) => panic!("strict init must refuse when orphan _schema.pg exists"),
-        Err(e) => e,
-    };
-    assert!(
-        strict_err.to_string().contains("already initialized"),
-        "strict init must surface AlreadyInitialized (sanity check); got: {strict_err}"
-    );
-
-    // Force init succeeds after proving no manifest exists, overwrites the
-    // orphan file, and proceeds to initialize Lance state.
-    let db = Omnigraph::init_with_options(uri, TEST_SCHEMA, InitOptions { force: true })
-        .await
-        .expect("force init must succeed when only orphan schema files block strict init");
-
-    // Confirm the catalog is populated as expected — proves the
-    // graph is functional after force-recovery, not just that the
-    // call returned Ok.
-    assert!(
-        db.catalog().node_types.contains_key("Person"),
-        "force-recovered graph must have the new catalog installed"
-    );
-    assert!(
-        dir.path().join("__schema_state.json").exists(),
-        "force-recovered graph must have full schema state written"
-    );
+async fn init_ignores_orphan_schema_files() {
+    for force in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        fs::write(dir.path().join("_schema.pg"), "orphan source").unwrap();
+        let db = Omnigraph::init_with_options(uri, TEST_SCHEMA, InitOptions { force })
+            .await
+            .unwrap();
+        assert!(db.catalog().node_types.contains_key("Person"));
+        assert_eq!(read_contract(uri).await.source, TEST_SCHEMA);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("_schema.pg")).unwrap(),
+            "orphan source"
+        );
+    }
 }
 
-/// E2e for the schema-level `.pg` surface: `@description` (node / edge /
-/// property) and `@instruction` (node / edge only) parse, validate, and
-/// persist verbatim into the on-disk `_schema.ir.json` through `Omnigraph::init`
-/// — the contract that surfaces them in catalog metadata for tooling.
+/// Schema annotations persist in the contract row and catalog metadata.
 #[tokio::test]
 async fn schema_annotations_persist_into_ir_json_on_init() {
     let dir = tempfile::tempdir().unwrap();
@@ -923,7 +811,7 @@ edge DependsOn: Task -> Task @description("Hard dependency") @instruction("Use o
 
     Omnigraph::init(uri, schema).await.unwrap();
 
-    let ir_json = fs::read_to_string(dir.path().join("_schema.ir.json")).unwrap();
+    let ir_json = read_contract(uri).await.ir;
     let ir: serde_json::Value = serde_json::from_str(&ir_json).unwrap();
 
     // Helper: collect the {name -> value} map of annotations that carry a

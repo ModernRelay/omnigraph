@@ -104,8 +104,6 @@ impl Omnigraph {
                 actual: 2,
             }
         })?;
-
-        self.settle_pending_schema_install().await?;
         let (resolved, catalog) = self.capture_read_view(ReadTarget::branch(branch)).await?;
         let snapshot = resolved.snapshot;
         let selected_tables = export_type_keys(&snapshot, type_names)?;
@@ -129,7 +127,7 @@ impl Omnigraph {
         branch: &str,
         scope: &crate::changes::ChangeFeedScope,
     ) -> Result<(crate::changes::ChangeBaseline, ExportCut)> {
-        let parts = capture_baseline_parts(self, branch, scope, true).await?;
+        let parts = capture_baseline_parts(self, branch, scope).await?;
         Ok((
             parts.handshake,
             ExportCut {
@@ -265,7 +263,6 @@ async fn capture_baseline_parts(
     db: &Omnigraph,
     branch: &str,
     scope: &crate::changes::ChangeFeedScope,
-    heal: bool,
 ) -> Result<BaselineParts> {
     let slot = db.write_queue().try_acquire_export_cut().ok_or_else(|| {
         OmniError::ResourceLimitExceeded {
@@ -274,9 +271,6 @@ async fn capture_baseline_parts(
             actual: 2,
         }
     })?;
-    if heal {
-        db.settle_pending_schema_install().await?;
-    }
     let normalized_branch = Some(branch).filter(|branch| *branch != "main");
     let cut = db
         .coordinator
@@ -339,7 +333,7 @@ pub(super) async fn capture_change_baseline<W: Write>(
     scope: &crate::changes::ChangeFeedScope,
     writer: &mut W,
 ) -> Result<crate::changes::ChangeBaseline> {
-    let parts = capture_baseline_parts(db, branch, scope, false).await?;
+    let parts = capture_baseline_parts(db, branch, scope).await?;
     let _slot = parts.slot;
     let mut emit =
         |chunk: Vec<u8>| std::future::ready(writer.write_all(&chunk).map_err(OmniError::from));

@@ -16,14 +16,6 @@ static STORE_REGISTRY: LazyLock<Arc<ObjectStoreRegistry>> = LazyLock::new(|| {
     Arc::new(registry)
 });
 
-/// Control-plane session for `__manifest` and other mutable-tip metadata.
-///
-/// Its caches are deliberately disabled. Control paths still share the
-/// process-wide object-store clients, but they cannot retain mutable-tip
-/// metadata across branch-recreation boundaries.
-static CONTROL_SESSION: LazyLock<Arc<Session>> =
-    LazyLock::new(|| Arc::new(Session::new(0, 0, Arc::clone(&STORE_REGISTRY))));
-
 /// The split Lance access context for one graph handle.
 ///
 /// Data tables use a graph-scoped cached session. Control-plane metadata uses a
@@ -48,7 +40,7 @@ impl LanceAccessContext {
                 DEFAULT_METADATA_CACHE_SIZE,
                 Arc::clone(&STORE_REGISTRY),
             )),
-            control_session: Arc::clone(&CONTROL_SESSION),
+            control_session: control_session(),
         }
     }
 
@@ -61,8 +53,14 @@ impl LanceAccessContext {
     }
 }
 
+/// Control-plane session for `__manifest` and other mutable-tip metadata.
+///
+/// Zero-capacity Lance caches still coordinate in-flight loads. Keep the session
+/// local to its owner so separate handles do not wait on each other's metadata
+/// loaders; their object-store clients remain process-wide. No mutable-tip
+/// metadata is retained across branch recreation.
 pub fn control_session() -> Arc<Session> {
-    Arc::clone(&CONTROL_SESSION)
+    Arc::new(Session::new(0, 0, Arc::clone(&STORE_REGISTRY)))
 }
 
 /// DST seam (Lance-realm listing): the process-wide Lance object-store
@@ -283,6 +281,8 @@ mod tests {
 
         assert!(!Arc::ptr_eq(&first_data, &control));
         assert!(!Arc::ptr_eq(&first_data, &second_data));
+        assert!(!Arc::ptr_eq(&control, &second.control_session()));
+        assert!(!Arc::ptr_eq(&control_session(), &control_session()));
         assert!(Arc::ptr_eq(
             &first_data.store_registry(),
             &control.store_registry()
