@@ -501,3 +501,119 @@ fn selecting_engine_does_not_allow_blessing_a_shared_case() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("bless requires"));
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
+
+/// The measured counts are report output, not case evidence: the case format
+/// has no expect mode for them.
+#[cfg(tokio_unstable)]
+#[test]
+fn measure_counts_schema_contract_requests_issue_817() {
+    const CASE: &str = "# issue: none\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n--- schema\nnode Person { name: String @key }\n--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}\n--- mutate\nquery add_bob() { insert Person { name: \"bob\" } }\n--- expect affected: nodes=1 edges=0\n--- mutate\nquery add_carol() { insert Person { name: \"carol\" } }\n--- expect affected: nodes=1 edges=0\n--- query\nquery all() { match { $p: Person } return { $p.name } }\n--- expect unordered\n{\"p.name\":\"alice\"}\n{\"p.name\":\"bob\"}\n{\"p.name\":\"carol\"}\n--- expect shape\np.name: String\n";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("two_inserts_on_main.gqt");
+    std::fs::write(&path, CASE).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(&path)
+        .arg("--measure")
+        .arg("--artifacts")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (_, summary) = report(&output);
+    let measurements = summary["attempts"][0]["outcome"]["Ok"]["measurements"]
+        .as_array()
+        .expect("the first attempt is measured");
+    let contract_files = |slot: &str, step: u64| -> Vec<String> {
+        let group = measurements
+            .iter()
+            .find(|group| group["slot"] == slot && group["step"] == step)
+            .expect("a measured group");
+        let mut files: Vec<String> = group["value"]["log"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|request| request["path"].as_str()?.rsplit('/').next())
+            .filter(|name| {
+                matches!(
+                    *name,
+                    "_schema.pg" | "_schema.ir.json" | "__schema_state.json"
+                )
+            })
+            .map(str::to_string)
+            .collect();
+        files.sort();
+        files
+    };
+    let mut setup = contract_files("setup", 0);
+    setup.dedup();
+    assert_eq!(
+        setup,
+        ["__schema_state.json", "_schema.ir.json", "_schema.pg"]
+    );
+    for step in [1, 2] {
+        assert_eq!(
+            contract_files("step", step),
+            [
+                "__schema_state.json",
+                "__schema_state.json",
+                "__schema_state.json",
+                "__schema_state.json",
+                "__schema_state.json",
+                "_schema.ir.json",
+                "_schema.ir.json",
+                "_schema.ir.json",
+                "_schema.ir.json",
+                "_schema.pg",
+                "_schema.pg",
+            ],
+            "insert {step}: capture loads the contract and re-reads the state, revalidation loads it again"
+        );
+    }
+    let io_counts = |slot: &str, step: u64| -> serde_json::Value {
+        summary["attempts"][0]["outcome"]["Ok"]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| {
+                row["kind"] == "io" && row["value"]["slot"] == slot && row["value"]["step"] == step
+            })
+            .expect("an io evidence row")["value"]
+            .clone()
+    };
+    let control_classes = |counts: &serde_json::Value| -> Vec<(String, u64)> {
+        counts["by_class"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(class, _)| class.starts_with("control_"))
+            .map(|(class, count)| (class.clone(), count.as_u64().unwrap()))
+            .collect()
+    };
+    for step in [1, 2] {
+        let counts = io_counts("step", step);
+        assert_eq!(
+            control_classes(&counts),
+            [
+                ("control_schema.get".to_string(), 7),
+                ("control_schema.head".to_string(), 4),
+            ],
+            "insert {step}: the engine's pin is 7 read_text + 4 exists (tests/write_cost.rs)"
+        );
+        assert_eq!(
+            counts["repeat_reads"], 8,
+            "insert {step}: 11 contract reads on three files; no Lance object is read twice"
+        );
+    }
+    assert_eq!(
+        control_classes(&io_counts("step", 3)),
+        [
+            ("control_schema.get".to_string(), 3),
+            ("control_schema.head".to_string(), 2),
+        ],
+        "a warm query reads the contract once (tests/warm_read_cost.rs)"
+    );
+}

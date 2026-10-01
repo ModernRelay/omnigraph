@@ -1,14 +1,21 @@
-//! `--measure`: every Lance-realm object-store request a DST case makes,
-//! attributed to the step that made it.
+//! `--measure`: every object-store request a DST case makes, in both of the
+//! engine's realms, attributed to the step that made it.
 //!
-//! The worker installs one decorator on `omnigraph::object_store_seam::OBJECT_STORE`,
-//! the seam the DST fault decorator uses and the GQT worker otherwise leaves
-//! empty, so every store the engine's registry builds is wrapped: `__manifest`
-//! and table traffic, spawned tasks and cached handles all pass through one
-//! ledger. The ledger keeps every request of the run, each tagged with the
-//! label current when it was made (`setup`, `step` N, `runner` N); the runner
-//! only moves the label, and the report groups the ledger by it, so no
-//! request can fall outside a row.
+//! The Lance realm: the worker installs one decorator on
+//! `omnigraph::object_store_seam::OBJECT_STORE`, the seam the DST fault
+//! decorator uses and the GQT worker otherwise leaves empty, so every store
+//! the engine's registry builds is wrapped: `__manifest` and table traffic,
+//! spawned tasks and cached handles all pass through one ledger. The control
+//! realm: the schema contract, its staging twins, the init claim and probe,
+//! the legacy `__recovery/` listing and the graph-index artifact go through
+//! the engine's `StorageAdapter`, whose DST store is a second in-memory
+//! object store the registry never builds; the worker wraps the adapter it
+//! hands the engine ([`wrap_adapter`], the `control` module) and logs each
+//! call as the requests that adapter makes for it, under `control_<kind>`
+//! classes. The ledger keeps
+//! every request of the run, each tagged with the label current when it was
+//! made (`setup`, `step` N, `runner` N); the runner only moves the label, and
+//! the report groups the ledger by it, so no request can fall outside a row.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,6 +35,10 @@ use object_store::{
 };
 use omnigraph::object_store_seam::DecorateObjectStore;
 use omnigraph::seams::Behavior;
+
+mod control;
+
+pub(crate) use control::wrap_adapter;
 
 /// One store request as the ledger keeps it. `path` is the object name with
 /// uuids redacted, so the two runs of one seed log the same text. `tick` is the
@@ -565,6 +576,81 @@ fn classify(path: &str) -> String {
     format!("{realm}_{kind}")
 }
 
+/// The control realm: the objects the engine reaches through its
+/// `StorageAdapter`, a store of its own under DST.
+const CONTROL_REALM: &str = "control";
+
+/// The name the engine gives the transient object it writes and deletes to
+/// prove a local root supports create-if-absent (one per read-write bind).
+const PROBE_PREFIX: &str = "__create_if_absent_probe_";
+
+/// `control_<kind>`, the kind being the object's role read off its name
+/// (the control realm has no Lance directories); the roles are pinned by
+/// `control_objects_are_classed_by_their_role` and listed in the README.
+fn control_class(key: &str) -> String {
+    let name = key.rfind('/').map_or(key, |slash| &key[slash + 1..]);
+    let live_name = name.strip_suffix(".staging").unwrap_or(name);
+    let under = |dir: &str| key.split('/').any(|segment| segment == dir);
+    let kind = if matches!(
+        live_name,
+        "_schema.pg" | "_schema.ir.json" | "__schema_state.json"
+    ) {
+        "schema"
+    } else if under("__recovery") {
+        "recovery"
+    } else if under("__graph_index") {
+        "graph_index"
+    } else if under("__manifest") {
+        "manifest"
+    } else if name == "__init_claim.json" {
+        "claim"
+    } else if name.starts_with(PROBE_PREFIX) {
+        "probe"
+    } else {
+        "other"
+    };
+    format!("{CONTROL_REALM}_{kind}")
+}
+
+/// The object key the adapter's store sees for a URI: the scheme dropped,
+/// the way the in-memory adapter keys `shared-memory://<root>/<file>`.
+fn control_key(uri: &str) -> &str {
+    uri.split_once("://")
+        .map_or(uri, |(_, key)| key)
+        .trim_start_matches('/')
+}
+
+/// What a request was made on, as the ledger files it: a Lance object by its
+/// path, a control object by its role, its real name realm-prefixed so the
+/// repeat-read key never meets the same key of the other store.
+struct Object {
+    class: String,
+    dataset: String,
+    path: String,
+    raw_path: String,
+}
+
+impl Object {
+    fn lance(path: &str) -> Self {
+        Self {
+            class: classify(path),
+            dataset: dataset(path),
+            path: redact(path),
+            raw_path: path.to_string(),
+        }
+    }
+
+    fn control(uri: &str) -> Self {
+        let key = control_key(uri);
+        Self {
+            class: control_class(key),
+            dataset: CONTROL_REALM.to_string(),
+            path: redact(key),
+            raw_path: format!("{CONTROL_REALM}:{key}"),
+        }
+    }
+}
+
 /// The dataset directory the object belongs to: the segment before the first
 /// Lance directory (`_versions`, `data`, …), else the object's own directory
 /// (`_latest.manifest` at a dataset root, a file under `__recovery`).
@@ -584,10 +670,14 @@ fn dataset(path: &str) -> String {
 }
 
 /// Replace uuid segments (`data/<uuid>.lance`, `_transactions/<n>-<uuid>.txn`)
-/// so the log reads the same on every run of a seed.
+/// and the create-if-absent probe's ulid so the log reads the same on every
+/// run of a seed.
 fn redact(path: &str) -> String {
     path.split('/')
         .map(|segment| {
+            if segment.starts_with(PROBE_PREFIX) {
+                return format!("{PROBE_PREFIX}<ulid>");
+            }
             let (stem, ext) = match segment.rfind('.') {
                 Some(dot) => (&segment[..dot], &segment[dot..]),
                 None => (segment, ""),
@@ -656,7 +746,7 @@ fn range_bytes(range: Option<&GetRange>) -> Option<u64> {
 }
 
 impl Measure {
-    /// Append the request; its index names it for a later relabel.
+    /// Append a Lance-realm request; its index names it for a later relabel.
     fn note(
         &self,
         started: &Started,
@@ -665,19 +755,30 @@ impl Measure {
         bytes: u64,
         range: Option<String>,
     ) -> usize {
+        self.note_object(started, verb, Object::lance(path), bytes, range)
+    }
+
+    fn note_object(
+        &self,
+        started: &Started,
+        verb: &'static str,
+        object: Object,
+        bytes: u64,
+        range: Option<String>,
+    ) -> usize {
         let mut ledger = self.ledger.lock().unwrap();
         ledger.push(Request {
             verb,
-            class: classify(path),
-            dataset: dataset(path),
-            path: redact(path),
+            class: object.class,
+            dataset: object.dataset,
+            path: object.path,
             range,
             bytes,
             tick: started.start_us / (TICK.as_micros() as u64),
             cost_us: started.cost_us,
             phase: started.phase,
             start_us: started.start_us,
-            raw_path: path.to_string(),
+            raw_path: object.raw_path,
             label: started.label,
         });
         ledger.len() - 1
@@ -747,6 +848,16 @@ impl Started {
             cost_us,
             label,
             phase,
+        }
+    }
+
+    /// Bytes known only once the call returned (a whole-object read): their
+    /// time on the wire, charged after it.
+    async fn charge(&mut self, model: &Model, bytes: u64) {
+        let transfer = model.transfer_us(bytes);
+        if transfer > 0 {
+            tokio::time::sleep(Duration::from_micros(transfer)).await;
+            self.cost_us += transfer;
         }
     }
 }
@@ -873,11 +984,7 @@ impl ObjectStore for MeasureStore {
             _ => 0,
         };
         if expected.is_none() {
-            let transfer = self.measure.model.transfer_us(bytes);
-            if transfer > 0 {
-                tokio::time::sleep(Duration::from_micros(transfer)).await;
-                started.cost_us += transfer;
-            }
+            started.charge(&self.measure.model, bytes).await;
         }
         self.measure.note(
             &started,
@@ -1254,7 +1361,7 @@ mod tests {
         assert!(Model::named("fast").is_none());
     }
 
-    fn measuring(model: Model) -> std::sync::Arc<super::Measure> {
+    pub(super) fn measuring(model: Model) -> std::sync::Arc<super::Measure> {
         std::sync::Arc::new(super::Measure {
             model,
             ledger: std::sync::Mutex::new(Vec::new()),
@@ -1366,5 +1473,51 @@ mod tests {
             "t/_transactions/12-<uuid>.txn"
         );
         assert_eq!(redact("t/_versions/12.manifest"), "t/_versions/12.manifest");
+    }
+
+    /// A class is report output a case cannot assert.
+    #[test]
+    fn control_objects_are_classed_by_their_role() {
+        use super::{Object, control_class};
+        let classes: Vec<String> = [
+            "gqt-dst/case/_schema.pg",
+            "gqt-dst/case/_schema.ir.json.staging",
+            "gqt-dst/case/__schema_state.json",
+            "gqt-dst/case/__recovery/stale.json",
+            "gqt-dst/case/__graph_index/csr-current.bin",
+            "gqt-dst/case/__manifest",
+            "gqt-dst/case/__init_claim.json",
+            "gqt-dst/case/__create_if_absent_probe_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "gqt-dst/case/nodes/Person",
+        ]
+        .map(control_class)
+        .to_vec();
+        assert_eq!(
+            classes,
+            [
+                "control_schema",
+                "control_schema",
+                "control_schema",
+                "control_recovery",
+                "control_graph_index",
+                "control_manifest",
+                "control_claim",
+                "control_probe",
+                "control_other",
+            ]
+        );
+        let probe = Object::control(
+            "shared-memory://gqt-dst/case/__create_if_absent_probe_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        );
+        assert_eq!(probe.path, "gqt-dst/case/__create_if_absent_probe_<ulid>");
+        assert_eq!(
+            probe.raw_path,
+            "control:gqt-dst/case/__create_if_absent_probe_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        );
+        assert_eq!(probe.dataset, "control");
+        assert_eq!(
+            Object::control("shared-memory://gqt-dst/case/_schema.pg").raw_path,
+            "control:gqt-dst/case/_schema.pg"
+        );
     }
 }
