@@ -16,6 +16,7 @@ OLD = "changelog.d/already-shipped.fixed.md"
 NEW = "changelog.d/new-predicate.added.md"
 GUIDE = "docs/user/queries/index.md"
 ORIGINAL = b"# OmniGraph v0.12.0\n\nUnreleased.\n\n## Highlights\n\n- Original [guide](../user/queries/index.md).\n"
+ADOPTED = ORIGINAL.replace(b"Original [guide]", b"Updated CLI [guide]") + b"\n- Landed feature one.\n- Landed feature two.\n- Landed fix one.\n- Landed fix two.\n"
 CONFIG = json.dumps({"version": "v0.13.0", "base": "previous", "legacy": None}).encode()
 
 
@@ -371,10 +372,111 @@ class ReleaseNotesTests(unittest.TestCase):
         with self.assertRaisesRegex(notes.NotesError, "missing link target"):
             notes.verify_snapshot(self.repo, content, AUDITED)
 
-    def test_direct_legacy_addition_fails_working_preview(self):
-        self.repo.working[notes.LEGACY_PATH] += b"\n- Uncollected change.\n"
-        with self.assertRaisesRegex(notes.NotesError, "baseline is frozen"):
-            notes.select(self.repo, BASE, TARGET, LEGACY, working_tree=True)
+    def test_adoption_preview_preserves_selected_tree_legacy_changes(self):
+        self.snapshot(LEGACY, "v0.12.0")
+        self.repo.trees[TARGET][notes.LEGACY_PATH] = ADOPTED
+        output = io.StringIO()
+        with patch.object(notes, "Repository", return_value=self.repo), patch("sys.stdout", output):
+            self.assertEqual(notes.main(["preview", "--target", TARGET]), 0)
+        preview = output.getvalue()
+        self.assertIn("Updated CLI [guide]", preview)
+        self.assertIn(f"/blob/{TARGET}/docs/user/queries/index.md", preview)
+        for number in ("feature one", "feature two", "fix one", "fix two"):
+            self.assertIn(f"Landed {number}.", preview)
+        self.assertNotIn("Original [guide]", preview)
+        self.assertEqual(self.repo.trees[LEGACY][notes.LEGACY_PATH], ORIGINAL)
+        self.assertEqual(self.repo.working[notes.LEGACY_PATH], ORIGINAL)
+
+    def test_adoption_working_preview_preserves_local_legacy_changes(self):
+        self.snapshot(LEGACY, "v0.12.0")
+        self.repo.working[notes.LEGACY_PATH] = ADOPTED
+        selected = notes.select(self.repo, BASE, TARGET, LEGACY, working_tree=True)
+        preview = notes.render(self.repo, selected, notes.metadata(selected, "v0.12.0", None))
+        self.assertIn(ADOPTED.decode().removeprefix(notes.LEGACY_PREFIX), preview)
+        self.assertEqual(self.repo.trees[TARGET][notes.LEGACY_PATH], ORIGINAL)
+
+    def test_adoption_docs_check_and_index_accept_current_unreleased_body(self):
+        self.snapshot(LEGACY, "v0.12.0")
+        for tree in (self.repo.trees[TARGET], self.repo.working):
+            tree[notes.LEGACY_PATH] = ADOPTED
+        with tempfile.TemporaryDirectory() as directory:
+            self.repo.root = Path(directory)
+            path = self.repo.root / notes.LEGACY_PATH
+            path.parent.mkdir(parents=True)
+            path.write_bytes(ADOPTED)
+            index = notes.render_index(self.repo)
+            self.assertIn("unreleased migration baseline", index)
+            (path.parent / "README.md").write_text(index)
+            errors = []
+            with patch.object(notes, "Repository", return_value=self.repo):
+                notes.check_working_notes(self.repo.root, errors)
+            self.assertEqual(errors, [])
+
+    def test_adoption_with_stale_pin_cannot_create_or_verify_snapshot(self):
+        self.snapshot(LEGACY, "v0.12.0")
+        for tree in (self.repo.trees[TARGET], self.repo.trees[AUDITED]):
+            tree[notes.LEGACY_PATH] = ADOPTED
+        selected = notes.select(self.repo, BASE, TARGET, LEGACY)
+        info = notes.metadata(selected, "v0.12.0", "2026-10-01")
+        content = notes.render(self.repo, selected, info)
+        with tempfile.TemporaryDirectory() as directory:
+            self.repo.root = Path(directory)
+            path = self.repo.root / notes.LEGACY_PATH
+            path.parent.mkdir(parents=True)
+            path.write_bytes(ADOPTED)
+            with self.assertRaisesRegex(notes.NotesError, "refresh release.json legacy"):
+                notes.write_snapshot(self.repo, selected, info, False, True)
+            self.assertEqual(path.read_bytes(), ADOPTED)
+            self.assertFalse((path.parent / "README.md").exists())
+        with self.assertRaisesRegex(notes.NotesError, "refresh release.json legacy"):
+            notes.verify_snapshot(self.repo, content, AUDITED)
+        self.repo.trees[AUDITED][notes.LEGACY_PATH] = content.encode()
+        with self.assertRaisesRegex(notes.NotesError, "differs from its recorded inputs"):
+            notes.verify_snapshot(self.repo, content, AUDITED)
+
+    def test_refreshing_pin_to_landed_ancestor_allows_snapshot_and_verification(self):
+        config = json.dumps({"version": "v0.12.0", "base": "previous", "legacy": TARGET}).encode()
+        self.repo.trees[TARGET][notes.LEGACY_PATH] = ADOPTED
+        self.repo.trees[AUDITED][notes.LEGACY_PATH] = ADOPTED
+        self.repo.trees[AUDITED][notes.CONFIG] = config
+        self.repo.working[notes.CONFIG] = config
+        selected = notes.select(self.repo, BASE, AUDITED, TARGET)
+        info = notes.metadata(selected, "v0.12.0", "2026-10-01")
+        with tempfile.TemporaryDirectory() as directory:
+            self.repo.root = Path(directory)
+            path = self.repo.root / notes.LEGACY_PATH
+            path.parent.mkdir(parents=True)
+            path.write_bytes(ADOPTED)
+            notes.write_snapshot(self.repo, selected, info, False, True)
+            content = path.read_text()
+        self.repo.trees[AUDITED][notes.LEGACY_PATH] = content.encode()
+        verified, _ = notes.verify_snapshot(self.repo, content, AUDITED)
+        self.assertEqual(verified.baseline, ADOPTED.decode().removeprefix(notes.LEGACY_PREFIX))
+        self.assertEqual(self.repo.trees[LEGACY][notes.LEGACY_PATH], ORIGINAL)
+
+    def test_malformed_provenance_cannot_turn_raw_legacy_into_generated_snapshot(self):
+        _, _, generated = self.snapshot(LEGACY, "v0.12.0")
+        copied_provenance = notes.PROVENANCE.search(generated).group(0).encode()
+        for suffix in (b"\n<!-- release-notes: broken -->\n", b"\n<!-- release-notes: missing end\n",
+                       b"\n<!--  Release-Notes: {} -->\n", b"\n" + copied_provenance + b"\n"):
+            self.repo.trees[TARGET][notes.LEGACY_PATH] = ADOPTED + suffix
+            with self.subTest(suffix=suffix), self.assertRaises((notes.NotesError, ValueError)):
+                notes.select(self.repo, BASE, TARGET, LEGACY)
+
+    def test_generated_legacy_append_and_tamper_still_fail_docs_check(self):
+        _, _, content = self.snapshot(LEGACY, "v0.12.0")
+        self.repo.trees[TARGET][notes.LEGACY_PATH] = content.encode()
+        for edited in (content + "\n- Late addition.\n", content.replace("Original [guide]", "Tampered [guide]")):
+            self.repo.working[notes.LEGACY_PATH] = edited.encode()
+            with self.subTest(edited=edited), tempfile.TemporaryDirectory() as directory:
+                self.repo.root = Path(directory)
+                path = self.repo.root / notes.LEGACY_PATH
+                path.parent.mkdir(parents=True)
+                path.write_text(edited)
+                errors = []
+                with patch.object(notes, "Repository", return_value=self.repo):
+                    notes.check_working_notes(self.repo.root, errors)
+                self.assertTrue(any("differs from its recorded inputs" in error for error in errors), errors)
 
     def test_snapshot_writes_only_output_and_refuses_unsafe_replacement(self):
         selected, info, _ = self.snapshot()

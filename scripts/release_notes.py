@@ -38,6 +38,8 @@ NOTE_NAME = re.compile(r"changelog\.d/[a-z0-9]+(?:-[a-z0-9]+)*\.([a-z]+)\.md")
 VERSION = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 PROVENANCE = re.compile(r"^<!-- release-notes: (.+) -->$", re.MULTILINE)
+PROVENANCE_MARKER = re.compile(r"<!--\s*release-notes\b", re.IGNORECASE)
+LEGACY_PREFIX = "# OmniGraph v0.12.0\n\nUnreleased.\n\n"
 DEFINITION = re.compile(r"^\[([^\]]+)\]: (\S+)$")
 
 
@@ -218,7 +220,28 @@ class Selection:
         return {path: digest(raw) for path, raw in self.notes.items()}
 
 
-def select(repo: Repository, base: str | None, target: str, legacy: str | None = None, working_tree: bool = False) -> Selection:
+def unreleased_legacy_body(content: str) -> str:
+    if not content.startswith(LEGACY_PREFIX) or PROVENANCE_MARKER.search(content) or not content[len(LEGACY_PREFIX):].strip():
+        raise NotesError("the migration baseline must be a nonempty, ungenerated v0.12.0 document headed 'Unreleased.'")
+    return content[len(LEGACY_PREFIX):]
+
+
+def migration_baseline(repo: Repository, revision: str | None, legacy: str, freeze: bool = False) -> str:
+    original = canonical(repo.read(legacy, LEGACY_PATH)).decode("utf-8")
+    pinned_body = unreleased_legacy_body(original)
+    current = canonical(repo.read(revision, LEGACY_PATH)).decode("utf-8")
+    if PROVENANCE_MARKER.search(current):
+        info = snapshot_info(current)
+        if info["version"] != "v0.12.0" or not current.startswith(f"# OmniGraph v0.12.0\n\nReleased {info['date']}.\n"):
+            raise NotesError("migration provenance requires a dated generated v0.12.0 snapshot")
+        return pinned_body
+    current_body = unreleased_legacy_body(current)
+    if freeze and current != original:
+        raise NotesError("the v0.12.0 migration baseline changed; refresh release.json legacy to a durable, already-landed ancestor containing the current unreleased document before preparing the snapshot")
+    return pinned_body if freeze else current_body
+
+
+def select(repo: Repository, base: str | None, target: str, legacy: str | None = None, working_tree: bool = False, freeze_legacy: bool = False) -> Selection:
     target_sha = repo.resolve(target)
     base_sha = repo.resolve(base) if base is not None else None
     if base_sha is not None:
@@ -230,14 +253,7 @@ def select(repo: Repository, base: str | None, target: str, legacy: str | None =
             raise NotesError("the legacy baseline must use a full commit SHA")
         legacy_sha = repo.resolve(legacy)
         repo.require_ancestor(legacy_sha, target_sha)
-        original = canonical(repo.read(legacy_sha, LEGACY_PATH)).decode("utf-8")
-        prefix = "# OmniGraph v0.12.0\n\nUnreleased.\n\n"
-        if not original.startswith(prefix) or PROVENANCE.search(original):
-            raise NotesError("the legacy revision must contain the original unreleased v0.12.0 document")
-        current = canonical(repo.read(None if working_tree else target_sha, LEGACY_PATH)).decode("utf-8")
-        if current != original and not PROVENANCE.search(current):
-            raise NotesError("the v0.12.0 baseline is frozen; put new entries in changelog.d/")
-        baseline = original[len(prefix):]
+        baseline = migration_baseline(repo, None if working_tree else target_sha, legacy_sha, freeze_legacy)
     return Selection(base_sha, target_sha, notes, legacy_sha, baseline, working_tree,
                      digest(repo.read(None if working_tree else target_sha, CONFIG)))
 
@@ -269,7 +285,7 @@ def render(repo: Repository, selection: Selection, info: dict, publication_ref: 
              "<!-- release-notes: " + json.dumps(info, sort_keys=True, separators=(",", ":")) + " -->\n\n"]
     if selection.baseline:
         baseline = selection.baseline
-        # Only the frozen migration document uses inline local destinations.
+        # Only the migration document uses inline local destinations.
         destinations = [link.destination for link in parse_markdown(baseline).links if not is_external(link.destination)]
         for destination in sorted(set(destinations)):
             replacement = link_destination(repo, revision, LEGACY_PATH, destination, publication_ref)
@@ -340,7 +356,7 @@ def verify_snapshot(repo: Repository, content: str, audited: str | None = None) 
     # The input commit can disappear after squash. Its complete input manifest,
     # checked against the audited tree, is the proof; target is provenance only.
     source = repo.resolve(audited or "HEAD")
-    selected = select(repo, info["base"], source, info["legacy"])
+    selected = select(repo, info["base"], source, info["legacy"], freeze_legacy=True)
     require_configured_selection(repo, selected, info["version"])
     expected_info = metadata(selected, info["version"], info["date"])
     expected_info["target"] = info["target"]
@@ -367,15 +383,17 @@ def render_index(repo: Repository, pending: dict[str, str] | None = None, direct
     for version in sorted(documents, key=lambda value: tuple(map(int, VERSION.fullmatch(value).groups())), reverse=True):
         content = documents[version]
         status = ""
-        if "<!-- release-notes:" in content:
+        if PROVENANCE_MARKER.search(content):
             info = snapshot_info(content)
             if info["version"] != version or not content.startswith(f"# OmniGraph {version}\n\nReleased {info['date']}.\n"):
                 raise NotesError(f"{version}: snapshot filename, heading and provenance disagree")
             status = f": released {info['date']}"
         elif tuple(map(int, VERSION.fullmatch(version).groups())) >= (0, 12, 0):
             config = read_config(repo, None)
-            if version != "v0.12.0" or not config["legacy"] or canonical(content.encode()) != canonical(repo.read(config["legacy"], LEGACY_PATH)):
+            if version != "v0.12.0" or config["version"] != version or not config["legacy"]:
                 raise NotesError(f"{version}: expected a generated snapshot or the pinned migration baseline")
+            unreleased_legacy_body(canonical(repo.read(config["legacy"], LEGACY_PATH)).decode("utf-8"))
+            unreleased_legacy_body(content)
             status = ": unreleased migration baseline; new changes are collected\n  in the documentation CI job's `release-notes-preview` artifact."
         entries.append(f"- [{version}]({version}.md){status}\n")
     return ("# Release notes\n\n"
@@ -412,6 +430,8 @@ def write_snapshot(repo: Repository, selection: Selection, info: dict, replace: 
     if selection.working_tree or not info["date"]:
         raise NotesError("snapshots require a date and committed inputs")
     require_configured_selection(repo, selection, info["version"])
+    if selection.legacy and selection.baseline != migration_baseline(repo, selection.target, selection.legacy, freeze=True):
+        raise NotesError("snapshot baseline differs from its pinned legacy source; select the inputs again")
     path = repo.root / "docs/releases" / f"{info['version']}.md"
     index = path.parent / "README.md"
     for output in (path, index):
@@ -457,8 +477,9 @@ def check_working_notes(root: Path, errors: list[str]) -> None:
         path = root / "docs/releases" / f"{config['version']}.md"
         if path.exists():
             current = path.read_text(encoding="utf-8")
-            original = canonical(repo.read(selected.legacy, LEGACY_PATH)).decode("utf-8") if selected.legacy else None
-            if current != original:
+            if selected.legacy and not PROVENANCE_MARKER.search(current):
+                unreleased_legacy_body(current)
+            else:
                 recorded, _ = verify_snapshot(repo, current, "HEAD")
                 if recorded.inputs() != selected.inputs() or recorded.config != selected.config:
                     raise NotesError("working notes or release configuration changed after snapshot generation")

@@ -151,7 +151,12 @@ historical raw notes are not checked against today's moving documentation.
 
 With the documentation environment active, release preparation creates a
 versioned snapshot and updates `docs/releases/README.md` from committed inputs
-and an explicit date. For the first v0.12.0 snapshot only:
+and an explicit date. Before the first v0.12.0 snapshot, finalize `legacy` in
+`release.json`: it must name a durable, already-landed ancestor containing the
+exact current unreleased v0.12.0 document. If upstream release-note edits landed
+after the configured pin, update the pin to a landed source containing those
+edits before preparing the snapshot. CI never updates it automatically. For
+that first snapshot only:
 
 ```bash
 python3 scripts/release_notes.py snapshot --target HEAD --date 2026-10-01 --replace-legacy
@@ -196,10 +201,15 @@ backfills; v0.12.0 onward require a valid snapshot. Edge releases are unchanged.
 After publication, update the configuration for the next release: set its base
 to the release just published, advance the version and set `legacy` to `null`.
 
-The existing v0.12.0 document remains a frozen, one-time migration baseline,
-pinned to its original Git source. New entries go in `changelog.d/`. Its original
-body precedes new sections in the first snapshot; later releases list upgrade
-actions first. Existing published documents and URLs stay unchanged.
+The existing v0.12.0 document is a one-time migration baseline. During adoption,
+previews and documentation checks use its current unreleased body from the
+selected tree, including upstream edits made after the configured pin. Working
+previews also include local edits. New entries go in `changelog.d/`. Snapshot
+preparation freezes the baseline against the finalized pin and refuses any
+mismatch; publication regenerates from that pinned source. The baseline body
+precedes new sections in the first snapshot; later releases list upgrade actions
+first. Generated snapshots still require exact verification, and existing
+published documents and URLs stay unchanged.
 
 ## Review checklist
 
