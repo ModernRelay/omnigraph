@@ -57,6 +57,7 @@ FIXTURES = [
     ("cases + docs", "pull_request", ["crates/omnigraph-gqt/cases/a.gqt", "docs/dev/ci.md", "README.md"], CASES_ONLY),
     ("case in a subdirectory", "pull_request", ["crates/omnigraph-gqt/cases/drafts/a.gqt"], CASES_ONLY),
     ("docs only", "pull_request", ["docs/user/index.md", "LICENSE", "LICENSE.md"], DOCS_ONLY),
+    ("release notes", "pull_request", ["changelog.d/camelcase.fixed.md", "changelog.d/release.json"], DOCS_ONLY),
     ("docs with a non-ASCII name", "pull_request", ["docs/user/café.md"], DOCS_ONLY),
     ("deployment only", "pull_request", ["deploy/azure/foundation.bicep", "Dockerfile", ".dockerignore", "docker/entrypoint.sh"], ("false", "false", "true")),
     ("cases + deployment", "pull_request", ["crates/omnigraph-gqt/cases/a.gqt", "deploy/azure/runtime.bicep"], ("false", "true", "true")),

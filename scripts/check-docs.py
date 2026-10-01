@@ -133,9 +133,12 @@ def normalize_link(raw: str) -> str | None:
 
 
 def heading_anchors(path: Path) -> set[str]:
+    return heading_anchors_text(path.read_text(encoding="utf-8"))
+
+
+def heading_anchors_text(text: str) -> set[str]:
     anchors: set[str] = set()
     counts: dict[str, int] = {}
-    text = path.read_text(encoding="utf-8")
     for line in text.splitlines():
         match = re.match(r"^#{1,6}\s+(.+?)\s*#*\s*$", line)
         if not match:
@@ -511,6 +514,8 @@ def check_skill_version(errors: list[str]) -> None:
 
 
 def main() -> int:
+    from release_notes import check_working_notes
+
     errors: list[str] = []
     files = tracked_markdown()
     check_locations(files, errors)
@@ -526,6 +531,7 @@ def main() -> int:
     check_conflict_markers(files, errors)
     check_user_boundary(files, errors)
     check_skill_version(errors)
+    check_working_notes(ROOT, errors)
 
     if errors:
         for error in errors:
