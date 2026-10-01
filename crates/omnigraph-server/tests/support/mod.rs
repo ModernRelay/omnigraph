@@ -4,6 +4,7 @@
 
 pub mod data_tokens;
 
+use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -264,6 +265,7 @@ pub fn g(path: &str) -> String {
 
 pub fn invoke_request(name: &str, token: &str, body: Value) -> Request<Body> {
     Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .uri(g(&format!("/queries/{name}")))
         .method(Method::POST)
         .header("content-type", "application/json")
@@ -279,6 +281,7 @@ pub fn invoke_request_bytes(
     content_type: Option<&str>,
 ) -> Request<Body> {
     let mut builder = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .uri(g(&format!("/queries/{name}")))
         .method(Method::POST)
         .header("authorization", format!("Bearer {token}"));
@@ -290,6 +293,7 @@ pub fn invoke_request_bytes(
 
 pub fn get_request(uri: &str, token: &str) -> Request<Body> {
     Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .uri(uri)
         .method(Method::GET)
         .header("authorization", format!("Bearer {token}"))
@@ -690,6 +694,7 @@ pub mod matrix {
                 .clone()
                 .oneshot(
                     Request::builder()
+                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                         .uri(g("/branches"))
                         .method(Method::POST)
                         .header("content-type", "application/json")
@@ -721,6 +726,7 @@ pub mod matrix {
                 .clone()
                 .oneshot(
                     Request::builder()
+                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                         .uri(g("/change"))
                         .method(Method::POST)
                         .header("content-type", "application/json")
@@ -763,6 +769,7 @@ pub mod matrix {
                 .clone()
                 .oneshot(
                     Request::builder()
+                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                         .uri(g(&format!("/snapshot?branch={}", branch)))
                         .method(Method::GET)
                         .body(Body::empty())
@@ -803,6 +810,7 @@ pub mod matrix {
                 .clone()
                 .oneshot(
                     Request::builder()
+                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                         .uri(g("/read"))
                         .method(Method::POST)
                         .header("content-type", "application/json")
@@ -871,6 +879,7 @@ pub mod matrix {
                 .clone()
                 .oneshot(
                     Request::builder()
+                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                         .uri(g("/change"))
                         .method(Method::POST)
                         .header("content-type", "application/json")
@@ -914,6 +923,7 @@ pub mod matrix {
                 let response = app
                     .oneshot(
                         Request::builder()
+                            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                             .uri(g("/branches/merge"))
                             .method(Method::POST)
                             .header("content-type", "application/json")
@@ -951,6 +961,7 @@ pub mod matrix {
                 let response = app
                     .oneshot(
                         Request::builder()
+                            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                             .uri(g("/change"))
                             .method(Method::POST)
                             .header("content-type", "application/json")
@@ -984,6 +995,7 @@ pub mod matrix {
                 let response = app
                     .oneshot(
                         Request::builder()
+                            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                             .uri(g("/branches"))
                             .method(Method::POST)
                             .header("content-type", "application/json")
@@ -1011,6 +1023,7 @@ pub mod matrix {
                 let response = app
                     .oneshot(
                         Request::builder()
+                            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                             .uri(g(&format!("/branches/{}", name)))
                             .method(Method::DELETE)
                             .body(Body::empty())
@@ -1135,6 +1148,7 @@ pub async fn http_change_decision(
     let (status, _body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/change"))
             .method(Method::POST)
             .header(AUTHORIZATION, format!("Bearer {token}"))
@@ -1189,6 +1203,7 @@ pub async fn http_merge_decision(
     let (status, _body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches/merge"))
             .method(Method::POST)
             .header(AUTHORIZATION, format!("Bearer {token}"))

@@ -14,7 +14,7 @@ use lance::dataset::refs::{
 };
 use object_store::{ObjectStoreExt, PutMode, PutOptions};
 
-use crate::error::{OmniError, Result};
+use crate::error::{CompletionEvidence, OmniError, Result};
 use crate::seams::{decide_seam, fail};
 
 /// Result of a recoverable native create attempt.
@@ -551,7 +551,9 @@ pub async fn retire_branch_recoverably(
     let mut contents = match get_branch_contents(dataset, branch).await {
         Ok(contents) => contents,
         Err(lance::Error::RefNotFound { .. }) => {
-            let archive = archived_manifest_branch(dataset, branch).await?;
+            let archive = archived_manifest_branch(dataset, branch)
+                .await
+                .map_err(OmniError::before_effect)?;
             return match archive {
                 Some(archive) if archive.identifier == *expected_identifier => Ok(()),
                 _ => Err(OmniError::manifest_conflict(format!(
@@ -559,15 +561,17 @@ pub async fn retire_branch_recoverably(
                 ))),
             };
         }
-        Err(error) => return Err(OmniError::storage(error)),
+        Err(error) => return Err(OmniError::storage(error).before_effect()),
     };
     if contents.identifier != *expected_identifier {
         return Err(OmniError::manifest_conflict(format!(
             "branch '{branch}' changed before retirement"
         )));
     }
-    if !manifest_branch_is_live(branch, &contents)? {
-        return archive_retired_ref(dataset, branch, &contents).await;
+    if !manifest_branch_is_live(branch, &contents).map_err(OmniError::before_effect)? {
+        return archive_retired_ref(dataset, branch, &contents)
+            .await
+            .map_err(|error| error.with_completion_evidence(CompletionEvidence::Uncertain));
     }
     if expected_identifier == &BranchIdentifier::main()
         || expected_identifier == &BranchIdentifier::missing_identifier_sentinel()
@@ -576,7 +580,11 @@ pub async fn retire_branch_recoverably(
             "branch '{branch}' has no exact retirement identity"
         )));
     }
-    let tags = dataset.tags().list().await.map_err(OmniError::storage)?;
+    let tags = dataset
+        .tags()
+        .list()
+        .await
+        .map_err(|error| OmniError::storage(error).before_effect())?;
     if let Some((tag, _)) = tags.iter().find(|(name, tag)| {
         tag.branch.as_deref() == Some(branch) && !crate::branch_names::is_merge_input_tag(name)
     }) {
@@ -584,7 +592,7 @@ pub async fn retire_branch_recoverably(
             message: format!(
                 "cannot retire graph branch '{branch}' while native manifest tag '{tag}' pins it; remove the tag first"
             ),
-        }));
+        }).before_effect());
     }
     let record = RetiredManifestBranch {
         version: 1,
@@ -593,33 +601,40 @@ pub async fn retire_branch_recoverably(
     };
     let value = serde_json::to_string(&record).map_err(|error| {
         OmniError::manifest_internal(format!("failed to encode branch retirement: {error}"))
+            .before_effect()
     })?;
     contents
         .metadata
         .insert(RETIRED_MANIFEST_BRANCH_KEY.to_string(), value);
-    let result = match dataset
-        .branches()
-        .replace_metadata(branch, contents.metadata.clone())
-        .await
-    {
-        Ok(()) => fail(&BRANCH_DELETE_POST_NATIVE),
-        Err(error) => Err(OmniError::storage(error)),
-    };
-    if let Err(error) = result {
-        let observed = get_branch_contents(dataset, branch)
+    // From submission onward, a refusal-shaped cause cannot establish that
+    // retirement and its required archive/unlink completion made no effects.
+    let completion = async {
+        let result = match dataset
+            .branches()
+            .replace_metadata(branch, contents.metadata.clone())
             .await
-            .map_err(OmniError::storage)?;
-        if observed.identifier != *expected_identifier {
-            return Err(OmniError::manifest_conflict(format!(
-                "branch '{branch}' changed during retirement"
-            )));
+        {
+            Ok(()) => fail(&BRANCH_DELETE_POST_NATIVE),
+            Err(error) => Err(OmniError::storage(error)),
+        };
+        if let Err(error) = result {
+            let observed = get_branch_contents(dataset, branch)
+                .await
+                .map_err(OmniError::storage)?;
+            if observed.identifier != *expected_identifier {
+                return Err(OmniError::manifest_conflict(format!(
+                    "branch '{branch}' changed during retirement"
+                )));
+            }
+            if manifest_branch_is_live(branch, &observed)? {
+                return Err(error);
+            }
+            contents = observed;
         }
-        if manifest_branch_is_live(branch, &observed)? {
-            return Err(error);
-        }
-        contents = observed;
+        archive_retired_ref(dataset, branch, &contents).await
     }
-    archive_retired_ref(dataset, branch, &contents).await
+    .await;
+    completion.map_err(|error| error.with_completion_evidence(CompletionEvidence::Uncertain))
 }
 
 /// Pinned Lance treats an already-absent target tree as success. OmniGraph
@@ -821,8 +836,11 @@ pub async fn create_branch_recoverably(
     source_version: u64,
 ) -> Result<BranchCreateOutcome> {
     // Lance validates inside phase 2 today. Validate before phase 1 so an
-    // invalid name cannot leave a clone-only zombie.
-    check_valid_branch(branch).map_err(OmniError::storage)?;
+    // invalid name cannot leave a clone-only zombie. This validation and the
+    // inventory below precede even orphan-tree reclamation, our first possible
+    // durable effect; native create errors do not carry this proof.
+    check_valid_branch(branch)
+        .map_err(|error| OmniError::manifest(error.to_string()).before_effect())?;
     if source.version().version != source_version {
         return Err(OmniError::manifest_conflict(format!(
             "branch source moved before native create: expected version {}, current {}",
@@ -834,11 +852,16 @@ pub async fn create_branch_recoverably(
     let parent_branch = source.manifest().branch.clone();
     let parent_identifier = dataset_branch_identifier(source)
         .await
-        .map_err(OmniError::storage)?;
+        .map_err(|error| OmniError::storage(error).before_effect())?;
 
-    let initial_branches = branch_ref_names(source).await?;
+    let initial_branches = branch_ref_names(source)
+        .await
+        .map_err(OmniError::before_effect)?;
     if initial_branches.iter().any(|name| name == branch)
-        && branch_contents(source, branch).await?.is_some()
+        && branch_contents(source, branch)
+            .await
+            .map_err(OmniError::before_effect)?
+            .is_some()
     {
         return Ok(BranchCreateOutcome::RefAlreadyExists);
     }
@@ -848,12 +871,24 @@ pub async fn create_branch_recoverably(
              physical Lance path; live graph branch names may not be ancestors or descendants"
         )));
     }
-    refuse_archived_path_ancestor(source, branch).await?;
-    if branch_contents(source, branch).await?.is_some() {
-        return Err(authority_appeared_after_absence(source, branch).await?);
-    }
-    if branch_tree_exists(source, branch).await? && !reclaim_ref_absent_tree(source, branch).await?
+    refuse_archived_path_ancestor(source, branch)
+        .await
+        .map_err(OmniError::before_effect)?;
+    if branch_contents(source, branch)
+        .await
+        .map_err(OmniError::before_effect)?
+        .is_some()
     {
+        return Err(authority_appeared_after_absence(source, branch)
+            .await
+            .map_err(OmniError::before_effect)?);
+    }
+    let tree_exists = branch_tree_exists(source, branch)
+        .await
+        .map_err(OmniError::before_effect)?;
+    // Reclamation can delete durable files. Nothing from this boundary or a
+    // later native attempt is certified as a pre-effect failure.
+    if tree_exists && !reclaim_ref_absent_tree(source, branch).await? {
         return Err(authority_appeared_after_absence(source, branch).await?);
     }
     fail(&BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE)?;

@@ -785,7 +785,7 @@ fn managed_data_direct_override_uses_only_explicit_legacy_transport() {
     let api = IntentApiFixture::new(vec![]);
     write_managed_context(temp.path(), &api.origin);
     fs::write(temp.path().join(".omnigraph/context"), "malformed").unwrap();
-    let data = IntentApiFixture::new(vec![IntentReply::json(
+    let data = IntentApiFixture::graph(vec![IntentReply::json(
         200,
         serde_json::json!({
             "query_name":"q", "target":{"branch":"main"}, "row_count":1,
@@ -806,7 +806,7 @@ fn managed_data_direct_override_uses_only_explicit_legacy_transport() {
         parse_stdout_json(&output)["rows"],
         serde_json::json!([{"value":42}])
     );
-    let requests = data.requests();
+    let requests = data.workflow_requests();
     assert_eq!(requests[0].path, "/graphs/knowledge/queries/q");
     assert_eq!(
         requests[0].headers["authorization"],
@@ -845,7 +845,7 @@ fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
                         "edges":[], "total_entities":1, "actor_id":"legacy-actor", "commit":null
                     })
                 };
-                let data = IntentApiFixture::new(vec![IntentReply::json(200, reply)]);
+                let data = IntentApiFixture::graph(vec![IntentReply::json(200, reply)]);
                 let home = temp.path().join("operator");
                 fs::create_dir(&home).unwrap();
                 fs::write(
@@ -885,7 +885,7 @@ fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
                 } else {
                     assert_eq!(payload["total_entities"], 1);
                 }
-                let requests = data.requests();
+                let requests = data.workflow_requests();
                 assert_eq!(requests.len(), 1);
                 assert_eq!(
                     requests[0].path,
@@ -977,7 +977,7 @@ fn managed_data_issue_633_direct_load_and_commit_preserve_ambient_targets() {
                     "commit-list" => serde_json::json!({"commits":[commit.clone()]}),
                     _ => commit.clone(),
                 };
-                let data = IntentApiFixture::new(vec![IntentReply::json(200, reply)]);
+                let data = IntentApiFixture::graph(vec![IntentReply::json(200, reply)]);
                 let home = temp.path().join("operator");
                 fs::create_dir(&home).unwrap();
                 fs::write(
@@ -1019,7 +1019,7 @@ fn managed_data_issue_633_direct_load_and_commit_preserve_ambient_targets() {
                     "commit-list" => assert_eq!(payload["commits"][0], commit),
                     _ => assert_eq!(payload, commit),
                 }
-                let requests = data.requests();
+                let requests = data.workflow_requests();
                 assert_eq!(requests.len(), 1);
                 assert_eq!(
                     requests[0].path,
@@ -1166,7 +1166,7 @@ fn managed_data_issue_633_direct_preserves_ambient_legacy_resolution() {
         let temp = tempdir().unwrap();
         let api = IntentApiFixture::new(vec![]);
         write_managed_context(temp.path(), &api.origin);
-        let data = IntentApiFixture::new(vec![IntentReply::json(
+        let data = IntentApiFixture::graph(vec![IntentReply::json(
             200,
             serde_json::json!({
                 "query_name":"q", "target":{"branch":"main"}, "row_count":1,
@@ -1196,7 +1196,7 @@ fn managed_data_issue_633_direct_preserves_ambient_legacy_resolution() {
         let output = output_success(&mut command);
         assert_eq!(parse_stdout_json(&output)["rows"][0]["value"], 42);
         assert_eq!(
-            data.requests()[0].headers["authorization"],
+            data.workflow_requests()[0].headers["authorization"],
             "Bearer legacy-ambient-token"
         );
         assert!(api.requests().is_empty());

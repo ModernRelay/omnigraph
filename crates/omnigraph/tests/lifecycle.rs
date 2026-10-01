@@ -492,6 +492,72 @@ async fn write_capture_rejects_schema_ir_tables_missing_from_manifest() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let db = helpers::session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    db.branch_create("refusal-probe").await.unwrap();
+    let before = db.list_commits(None).await.unwrap();
+    let branches_before = db.branch_list().await.unwrap();
+    let schema_path = dir.path().join("_schema.pg");
+    let unavailable_path = dir.path().join("_schema.pg.unavailable");
+    fs::rename(&schema_path, &unavailable_path).unwrap();
+    let mutation_error = mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "blocked")], &[("$age", 12)]),
+    )
+    .await
+    .unwrap_err();
+    let deletion_error = db.branch_delete("refusal-probe").await.unwrap_err();
+    let creation_error = db.branch_create("new-probe").await.unwrap_err();
+    let creation_from_error = db
+        .branch_create_from("main", "from-probe")
+        .await
+        .unwrap_err();
+    let merge_error = db.branch_merge("refusal-probe", "main").await.unwrap_err();
+    let data = r#"{"type":"Person","data":{"name":"blocked","age":12}}"#;
+    let load_error = db
+        .load("main", data, omnigraph::loader::LoadMode::Append)
+        .await
+        .unwrap_err();
+    let graph_batch_error = db
+        .load_graph_batch("main", data, omnigraph::loader::LoadMode::Append)
+        .await
+        .unwrap_err();
+    let fork_load_error = db
+        .load_as(
+            "load-probe",
+            Some("main"),
+            data,
+            omnigraph::loader::LoadMode::Append,
+            None,
+        )
+        .await
+        .unwrap_err();
+    let schema_error = db.apply_schema(TEST_SCHEMA).await.unwrap_err();
+    fs::rename(&unavailable_path, &schema_path).unwrap();
+    for (door, error) in [
+        ("mutation", mutation_error),
+        ("deletion", deletion_error),
+        ("creation", creation_error),
+        ("creation-from", creation_from_error),
+        ("merge", merge_error),
+        ("load", load_error),
+        ("graph-batch", graph_batch_error),
+        ("fork-load", fork_load_error),
+        ("schema", schema_error),
+    ] {
+        assert_eq!(
+            error.completion_evidence(),
+            Some(omnigraph::error::CompletionEvidence::BeforeEffect),
+            "{door}: a failed contract GET before effects must carry owning evidence: {error}"
+        );
+        assert_eq!(
+            error.storage_failure().map(|failure| failure.kind),
+            Some(omnigraph::error::StorageFailureKind::NotFound)
+        );
+    }
+    assert_eq!(db.list_commits(None).await.unwrap(), before);
+    assert_eq!(db.branch_list().await.unwrap(), branches_before);
+    db.branch_delete("refusal-probe").await.unwrap();
     let accepted = db.catalog().bound_schema_ir().unwrap().clone();
     let with_temporary_source =
         format!("{TEST_SCHEMA}\nnode Temporary {{\n    key: String @key\n}}\n");

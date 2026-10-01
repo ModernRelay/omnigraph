@@ -4,7 +4,7 @@
 //! sorts and aggregates may spill within the scratch quota.
 
 use std::fmt;
-use std::num::NonZero;
+use std::num::{NonZero, NonZeroU64};
 use std::sync::{Arc, Mutex};
 
 use datafusion::common::{DataFusionError, Result as DfResult};
@@ -37,13 +37,35 @@ pub(super) struct QueryContext {
 }
 
 impl QueryContext {
-    /// One session per query: `TrackConsumersPool` over `FairSpillPool` so a
-    /// refusal names the consumers, one partition so row order is the
-    /// operators' own, the ordered scan's batch size, scratch quota and sort
-    /// reservation, the pool `memory_limit` sizes: the limit the run's
-    /// `QuerySource` captured, never the ambient one.
+    #[cfg(test)]
     pub(super) fn new(memory_limit: u64) -> Result<Self> {
-        let scratch_limit = ORDERED_SCAN_SCRATCH_BYTES;
+        Self::with_traversal_limit(memory_limit, None)
+    }
+
+    /// One session shares captured memory/work limits and the scratch quota.
+    /// Named consumer tracking preserves refusal causes; one partition preserves
+    /// operator order with the ordered scan's batch size and sort reservation.
+    pub(super) fn with_traversal_limit(
+        memory_limit: u64,
+        traversal_limit: Option<NonZeroU64>,
+    ) -> Result<Self> {
+        Self::with_limits(memory_limit, traversal_limit, ORDERED_SCAN_SCRATCH_BYTES)
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_scratch_limit(
+        memory_limit: u64,
+        traversal_limit: Option<NonZeroU64>,
+        scratch_limit: u64,
+    ) -> Result<Self> {
+        Self::with_limits(memory_limit, traversal_limit, scratch_limit)
+    }
+
+    fn with_limits(
+        memory_limit: u64,
+        traversal_limit: Option<NonZeroU64>,
+        scratch_limit: u64,
+    ) -> Result<Self> {
         let config = SessionConfig::new()
             .with_target_partitions(1)
             .with_batch_size(ORDERED_SCAN_EXECUTION_BATCH_ROWS)
@@ -58,9 +80,10 @@ impl QueryContext {
             .map_err(OmniError::datafusion_internal)?;
         Ok(Self {
             session: SessionContext::new_with_config_rt(
-                config.with_extension(Arc::new(QueryResources::new(
+                config.with_extension(Arc::new(QueryResources::with_traversal_limit(
                     Arc::clone(&runtime.memory_pool),
                     memory_limit,
+                    traversal_limit,
                 ))),
                 runtime,
             ),

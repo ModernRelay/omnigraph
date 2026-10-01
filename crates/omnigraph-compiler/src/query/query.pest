@@ -102,15 +102,19 @@ match_value = { literal | variable | now_call }
 
 // Traversal: $p knows $f (directional) or $p <knows> $f (undirected —
 // matches the edge in either direction; same-endpoint-type edges only).
+// Edge selection also admits (knows | likes) and *, with finite hop bounds.
 // An optional edge binding names the matched edge row: $p $w:knows $f.
 // A node binding also starts `variable ~ ":"`; the case of the next token
 // (lowercase edge_ident vs uppercase type_name) keeps the choice unambiguous.
 // The edge is named bare, or as a string, the one spelling for an edge a
 // reserved word names: `$i "in" $b` follows the edge `In`, as a quoted
 // `branch_name` does for a branch.
-traversal = { variable ~ edge_binding? ~ (undirected_edge | edge_ident | string_lit) ~ traversal_bounds? ~ variable }
+traversal = { variable ~ edge_binding? ~ (undirected_edge | edge_alternation | edge_wildcard | edge_ident | string_lit) ~ traversal_bounds? ~ variable }
 edge_binding = { variable ~ ":" }
-undirected_edge = { "<" ~ (edge_ident | string_lit) ~ ">" }
+undirected_edge = { "<" ~ (edge_wildcard | edge_alternatives | edge_ident | string_lit) ~ ">" }
+edge_alternation = { "(" ~ edge_alternatives ~ ")" }
+edge_alternatives = { (edge_ident | string_lit) ~ ("|" ~ (edge_ident | string_lit))+ }
+edge_wildcard = { "*" }
 traversal_bounds = { "{" ~ integer ~ "," ~ integer? ~ "}" }
 
 // Filter: a Boolean expression, `$f.age > 25 and not $f.retired`
@@ -174,8 +178,8 @@ rank_expr = { nearest_ordering | bm25_call }
 rrf_call = { "rrf" ~ "(" ~ rank_expr ~ "," ~ rank_expr ~ ("," ~ expr)? ~ ")" }
 
 prop_access = { variable ~ "." ~ (meta_field | ident) }
-// A system field named by role (RFC 0040): `$p.@id`, `$e.@src`, `$e.@dst`, and
-// bare `@id` in a mutation predicate. User properties never enter this namespace.
+// Metadata includes `$p.@id`, `$e.@src`, `$e.@dst`, and read-only `$e.@type`.
+// Mutation predicates admit stored metadata. User properties use bare names.
 meta_field = @{ "@" ~ ident }
 
 agg_call = { agg_func ~ "(" ~ expr ~ ")" }

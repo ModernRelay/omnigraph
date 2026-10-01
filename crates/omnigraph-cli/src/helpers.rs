@@ -349,14 +349,15 @@ pub(crate) fn resolve_server_flag(
 /// Param precedence: --params > positional args > the alias's fixed
 /// params. The keyed token applies via the ordinary URL match.
 pub(crate) async fn execute_operator_alias(
-    client: &reqwest::Client,
     alias_name: &str,
     alias: &crate::operator::OperatorAlias,
     alias_args: &[String],
     explicit_params: Option<Value>,
 ) -> Result<ReadOutput> {
-    let uri = resolve_server_flag(Some(&alias.server), alias.graph.as_deref())?
-        .expect("server name is present");
+    let root = resolve_server_flag(Some(&alias.server), None)?.expect("server name is present");
+    let uri =
+        resolve_server_flag(Some(&root), alias.graph.as_deref())?.expect("server name is present");
+    let client = crate::graph_http::GraphHttpClient::new(&root)?;
     let bearer_token = resolve_remote_bearer_token(Some(&uri))?;
 
     let mut params = serde_json::Map::new();
@@ -389,7 +390,7 @@ pub(crate) async fn execute_operator_alias(
         body.insert("params".to_string(), Value::Object(params));
     }
     remote_json(
-        client,
+        &client,
         Method::POST,
         remote_url(&uri, &["queries", &alias.query], &[])?,
         Some(Value::Object(body)),
@@ -416,19 +417,6 @@ pub(crate) fn apply_server_flag(
     resolve_server_flag(server, graph)
 }
 
-pub(crate) fn build_http_client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::new())
-}
-
-/// Blob delivery never follows the server's external-descriptor redirect.
-/// Keeping this client separate prevents a graph-level read from silently
-/// turning into an unbounded request against caller-owned object storage.
-pub(crate) fn build_blob_http_client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?)
-}
-
 pub(crate) fn apply_bearer_token(
     request: reqwest::RequestBuilder,
     token: Option<&str>,
@@ -440,14 +428,13 @@ pub(crate) fn apply_bearer_token(
     }
 }
 
-/// Typed marker for a 412 graph-commit precondition rejection, carried through
-/// `eyre` so the
-/// `mutate` verb can downcast it and exit with `EXIT_PRECONDITION_FAILED` (4)
-/// instead of the generic failure exit. Holds the full structured error body
-/// for `--json` passthrough.
+/// A verified request precondition refusal. The command boundary decides
+/// whether earlier effects prevent promoting it to whole-command exit 4.
 #[derive(Debug)]
 pub(crate) struct PreconditionFailedCli {
     pub(crate) output: ErrorOutput,
+    pub(crate) http_status: Option<u16>,
+    pub(crate) retry_after: Option<String>,
 }
 
 impl std::fmt::Display for PreconditionFailedCli {
@@ -463,6 +450,8 @@ impl std::error::Error for PreconditionFailedCli {}
 #[derive(Debug)]
 pub(crate) struct RemoteErrorCli {
     pub(crate) output: ErrorOutput,
+    pub(crate) status: reqwest::StatusCode,
+    pub(crate) retry_after: Option<String>,
 }
 
 impl std::fmt::Display for RemoteErrorCli {
@@ -485,11 +474,15 @@ pub(crate) fn precondition_failed_cli(
     let mut output = ErrorOutput::message(message);
     output.precondition_failure =
         Some(omnigraph_api_types::PreconditionFailureOutput { expected, actual });
-    PreconditionFailedCli { output }
+    PreconditionFailedCli {
+        output,
+        http_status: None,
+        retry_after: None,
+    }
 }
 
 pub(crate) async fn remote_json<T: DeserializeOwned>(
-    client: &reqwest::Client,
+    client: &crate::graph_http::GraphHttpClient,
     method: Method,
     url: String,
     body: Option<Value>,
@@ -502,7 +495,7 @@ pub(crate) async fn remote_json<T: DeserializeOwned>(
 /// precondition (mutation routes only). A 412 whose body carries
 /// `precondition_failure` surfaces as the typed [`PreconditionFailedCli`].
 pub(crate) async fn remote_json_with_graph_commit_precondition<T: DeserializeOwned>(
-    client: &reqwest::Client,
+    client: &crate::graph_http::GraphHttpClient,
     method: Method,
     url: String,
     body: Option<Value>,
@@ -523,7 +516,7 @@ pub(crate) async fn remote_json_with_graph_commit_precondition<T: DeserializeOwn
 
 /// Same typed graph protocol with an optional response limit for managed data access.
 pub(crate) async fn remote_json_bounded<T: DeserializeOwned>(
-    client: &reqwest::Client,
+    client: &crate::graph_http::GraphHttpClient,
     method: Method,
     url: String,
     body: Option<Value>,
@@ -545,17 +538,34 @@ pub(crate) async fn remote_json_bounded<T: DeserializeOwned>(
     } else {
         request
     };
-    remote_response_json_bounded(request.send().await?, bearer_token, response_limit).await
+    remote_response_json_with_precondition(
+        client.send(request).await?,
+        bearer_token,
+        response_limit,
+        expected_commit,
+    )
+    .await
 }
 
 /// Decode either JSON requests or raw NDJSON loads through the same bounded,
 /// credential-safe response path. The request owner chooses its deadline.
 pub(crate) async fn remote_response_json_bounded<T: DeserializeOwned>(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     bearer_token: Option<&str>,
     response_limit: Option<usize>,
 ) -> Result<T> {
+    remote_response_json_with_precondition(response, bearer_token, response_limit, None).await
+}
+
+async fn remote_response_json_with_precondition<T: DeserializeOwned>(
+    mut response: reqwest::Response,
+    bearer_token: Option<&str>,
+    response_limit: Option<usize>,
+    expected_commit: Option<&str>,
+) -> Result<T> {
     let status = response.status();
+    let retry_after = crate::command_outcome::retry_after(response.headers())
+        .map(|value| crate::command_outcome::scrub_backoff(value, bearer_token));
     let text = if let Some(limit) = response_limit {
         if status.is_redirection() {
             bail!("managed data redirects are not followed");
@@ -582,10 +592,32 @@ pub(crate) async fn remote_response_json_bounded<T: DeserializeOwned>(
             _ => text,
         };
         if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
-            if error.precondition_failure.is_some() {
-                return Err(PreconditionFailedCli { output: error }.into());
+            let verified_precondition = status == reqwest::StatusCode::PRECONDITION_FAILED
+                && error
+                    .precondition_failure
+                    .as_ref()
+                    .is_some_and(|details| Some(details.expected.as_str()) == expected_commit)
+                && error.code.is_none()
+                && crate::command_outcome::single_request()
+                && {
+                    let mut rest = error.clone();
+                    rest.precondition_failure = None;
+                    crate::command_outcome::is_plain_refusal(&rest)
+                };
+            if verified_precondition {
+                return Err(PreconditionFailedCli {
+                    output: error,
+                    http_status: Some(status.as_u16()),
+                    retry_after,
+                }
+                .into());
             }
-            return Err(RemoteErrorCli { output: error }.into());
+            return Err(RemoteErrorCli {
+                output: error,
+                status,
+                retry_after,
+            }
+            .into());
         }
         bail!("server returned {}: {}", status, text);
     }

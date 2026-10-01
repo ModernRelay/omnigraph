@@ -1,0 +1,107 @@
+# issue: 659
+# red_on: 7f1233bb
+# notes: One selected neighbor still reserves all 22 physical edge rows before scans; bounds do not substitute for admission.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person { name: String @key }
+edge Knows: Person -> Person
+edge Likes: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"unrelated"}}
+{"edge":"Knows","id":"neighbor","from":"a","to":"b"}
+{"edge":"Knows","id":"Knows00","from":"unrelated","to":"unrelated"}
+{"edge":"Knows","id":"Knows01","from":"unrelated","to":"unrelated"}
+{"edge":"Knows","id":"Knows02","from":"unrelated","to":"unrelated"}
+{"edge":"Knows","id":"Knows03","from":"unrelated","to":"unrelated"}
+{"edge":"Knows","id":"Knows04","from":"unrelated","to":"unrelated"}
+{"edge":"Knows","id":"Knows05","from":"unrelated","to":"unrelated"}
+{"edge":"Knows","id":"Knows06","from":"unrelated","to":"unrelated"}
+{"edge":"Knows","id":"Knows07","from":"unrelated","to":"unrelated"}
+{"edge":"Knows","id":"Knows08","from":"unrelated","to":"unrelated"}
+{"edge":"Knows","id":"Knows09","from":"unrelated","to":"unrelated"}
+{"edge":"Likes","id":"Likes00","from":"unrelated","to":"unrelated"}
+{"edge":"Likes","id":"Likes01","from":"unrelated","to":"unrelated"}
+{"edge":"Likes","id":"Likes02","from":"unrelated","to":"unrelated"}
+{"edge":"Likes","id":"Likes03","from":"unrelated","to":"unrelated"}
+{"edge":"Likes","id":"Likes04","from":"unrelated","to":"unrelated"}
+{"edge":"Likes","id":"Likes05","from":"unrelated","to":"unrelated"}
+{"edge":"Likes","id":"Likes06","from":"unrelated","to":"unrelated"}
+{"edge":"Likes","id":"Likes07","from":"unrelated","to":"unrelated"}
+{"edge":"Likes","id":"Likes08","from":"unrelated","to":"unrelated"}
+{"edge":"Likes","id":"Likes09","from":"unrelated","to":"unrelated"}
+{"edge":"Likes","id":"Likes10","from":"unrelated","to":"unrelated"}
+
+--- query
+set traversal_work_limit = 23;
+query one_neighbor_refused() {
+    match { $a: Person { name: "a" } $a (knows | likes) $b }
+    return { $b.name as neighbor }
+}
+
+--- expect error: traversal_work_limit
+
+--- query
+set traversal_work_limit = 24;
+query one_neighbor_admitted() {
+    match { $a: Person { name: "a" } $a (knows | likes) $b }
+    return { $b.name as neighbor }
+}
+
+--- expect unordered
+{"neighbor":"b"}
+
+--- expect shape
+neighbor: String
+
+--- query
+set traversal_work_limit = 26;
+query bound_neighbor_refused() {
+    match { $a: Person { name: "a" } $a $e:(knows | likes) $b }
+    return { $b.name as neighbor }
+}
+
+--- expect error: traversal_work_limit
+
+--- query
+set traversal_work_limit = 27;
+query bound_neighbor_admitted() {
+    match { $a: Person { name: "a" } $a $e:(knows | likes) $b }
+    return { $b.name as neighbor }
+}
+
+--- expect unordered
+{"neighbor":"b"}
+
+--- expect shape
+neighbor: String
+
+--- query
+set traversal_work_limit = 45;
+query second_hop_refused() {
+    match { $a: Person { name: "a" } $a (knows | likes){1,3} $b }
+    return { $b.name as neighbor }
+}
+
+--- expect error: traversal_work_limit
+
+--- query
+set traversal_work_limit = 46;
+query second_hop_admitted() {
+    match { $a: Person { name: "a" } $a (knows | likes){1,3} $b }
+    return { $b.name as neighbor }
+}
+
+--- expect unordered
+{"neighbor":"b"}
+
+--- expect shape
+neighbor: String
