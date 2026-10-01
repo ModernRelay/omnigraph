@@ -15,6 +15,7 @@ pub struct IntentApiFixture {
     reply_count: usize,
     graph: bool,
     session: Option<std::sync::Arc<std::sync::Mutex<Value>>>,
+    forwarded_merges: std::sync::Arc<std::sync::Mutex<Vec<IntentReply>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +32,16 @@ pub struct IntentReply {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+/// Delivery faults applied only after a real server's successful merge reply
+/// has been fully read. They cannot stand in for cancelling a server request.
+#[derive(Debug, Clone, Copy)]
+pub enum MergeDeliveryFault {
+    Disconnect,
+    Truncate,
+    GatewayTimeout,
+    CallerWait,
 }
 
 impl IntentReply {
@@ -70,18 +81,30 @@ impl IntentApiFixture {
         Self::start(replies, None, delay, true)
     }
 
+    /// Forward discovery and one merge to an actual server, then break only
+    /// delivery of the successful merge response. Unexpected calls stay counted.
+    pub fn graph_merge_proxy(upstream: &str, fault: MergeDeliveryFault) -> Self {
+        Self::start_with_origin(
+            |_| Vec::new(),
+            None,
+            Duration::ZERO,
+            true,
+            Some((upstream.to_owned(), fault)),
+        )
+    }
+
     fn start(
         replies: Vec<IntentReply>,
         session: Option<Value>,
         delay: Duration,
         graph: bool,
     ) -> Self {
-        Self::start_with_origin(|_| replies, session, delay, graph)
+        Self::start_with_origin(|_| replies, session, delay, graph, None)
     }
 
     /// Build replies after binding the exact origin, for origin-bound signed claims.
     pub fn with_origin(replies: impl FnOnce(&str) -> Vec<IntentReply>) -> Self {
-        Self::start_with_origin(replies, None, Duration::ZERO, false)
+        Self::start_with_origin(replies, None, Duration::ZERO, false, None)
     }
 
     fn start_with_origin(
@@ -89,6 +112,7 @@ impl IntentApiFixture {
         session: Option<Value>,
         delay: Duration,
         graph: bool,
+        forwarding: Option<(String, MergeDeliveryFault)>,
     ) -> Self {
         use std::io::Write;
         use std::sync::atomic::Ordering;
@@ -98,15 +122,29 @@ impl IntentApiFixture {
         listener.set_nonblocking(true).unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let replies = replies(&origin);
-        let reply_count = replies.len();
+        let reply_count = if forwarding.is_some() {
+            1
+        } else {
+            replies.len()
+        };
         let requests = Arc::new(Mutex::new(Vec::new()));
         let received = requests.clone();
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopped = stop.clone();
         let session = session.map(|s| Arc::new(Mutex::new(s)));
         let session_response = session.clone();
+        let forwarded_merges = Arc::new(Mutex::new(Vec::new()));
+        let captured_merges = forwarded_merges.clone();
         let thread = std::thread::spawn(move || {
             let mut replies = std::collections::VecDeque::from(replies);
+            let upstream_client = forwarding.as_ref().map(|_| {
+                reqwest::blocking::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .retry(reqwest::retry::never())
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .unwrap()
+            });
             while !stopped.load(Ordering::SeqCst) {
                 let (mut stream, _) = match listener.accept() {
                     Ok(connection) => connection,
@@ -150,7 +188,7 @@ impl IntentApiFixture {
                 let ndjson = headers
                     .get("content-type")
                     .is_some_and(|value| value == "application/x-ndjson");
-                received.lock().unwrap().push(IntentRequest {
+                let request = IntentRequest {
                     method: request_line[0].clone(),
                     path: request_line[1].clone(),
                     headers,
@@ -160,12 +198,83 @@ impl IntentApiFixture {
                         serde_json::from_slice(&body).unwrap()
                     },
                     raw_body: body,
-                });
+                };
+                received.lock().unwrap().push(request.clone());
                 let discovery = graph && request_line[0] == "HEAD" && request_line[1] == "/healthz";
                 if !discovery {
                     sleep(delay);
                 }
-                let mut reply = if discovery {
+                let mut reply = if let Some((upstream, fault)) = &forwarding {
+                    let mut forwarded = upstream_client.as_ref().unwrap().request(
+                        request.method.parse::<reqwest::Method>().unwrap(),
+                        format!("{}{}", upstream.trim_end_matches('/'), request.path),
+                    );
+                    for (name, value) in &request.headers {
+                        if !matches!(name.as_str(), "host" | "connection" | "content-length") {
+                            forwarded = forwarded.header(name, value);
+                        }
+                    }
+                    let response = forwarded.body(request.raw_body).send().unwrap();
+                    let status = response.status().as_u16();
+                    let headers = response
+                        .headers()
+                        .iter()
+                        .filter(|(name, _)| {
+                            !matches!(
+                                name.as_str(),
+                                "connection"
+                                    | "content-length"
+                                    | "transfer-encoding"
+                                    | "content-type"
+                            )
+                        })
+                        .map(|(name, value)| {
+                            (name.to_string(), value.to_str().unwrap().to_string())
+                        })
+                        .collect();
+                    let mut body = Vec::new();
+                    response
+                        .take(1024 * 1024 + 1)
+                        .read_to_end(&mut body)
+                        .unwrap();
+                    assert!(body.len() <= 1024 * 1024, "proxy response body bound");
+                    let mut reply = IntentReply {
+                        status,
+                        headers,
+                        body,
+                    };
+                    if request.method == "POST"
+                        && (request.path.ends_with("/branches/merge")
+                            || request.path.ends_with("/mutate"))
+                    {
+                        assert_eq!(reply.status, 200, "upstream merge must succeed");
+                        captured_merges.lock().unwrap().push(reply.clone());
+                        match fault {
+                            MergeDeliveryFault::Disconnect => continue,
+                            MergeDeliveryFault::Truncate => {
+                                reply
+                                    .headers
+                                    .push(("content-length".into(), reply.body.len().to_string()));
+                                reply.body.truncate(reply.body.len() / 2);
+                            }
+                            MergeDeliveryFault::GatewayTimeout => {
+                                reply.status = 504;
+                                reply.body =
+                                    br#"{"error":"proxy lost upstream response"}"#.to_vec();
+                            }
+                            MergeDeliveryFault::CallerWait => {
+                                let until = std::time::Instant::now() + Duration::from_secs(32);
+                                while !stopped.load(Ordering::SeqCst)
+                                    && std::time::Instant::now() < until
+                                {
+                                    sleep(Duration::from_millis(2));
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    reply
+                } else if discovery {
                     IntentReply::json(200, serde_json::json!({"status":"ok"}))
                 } else if request_line[0] == "GET"
                     && request_line[1] == "/v1/auth/session"
@@ -178,6 +287,7 @@ impl IntentApiFixture {
                     })
                 };
                 if graph
+                    && forwarding.is_none()
                     && !reply.headers.iter().any(|(name, _)| {
                         name.eq_ignore_ascii_case(omnigraph_api_types::HTTP_API_CONTRACT_HEADER)
                     })
@@ -214,11 +324,16 @@ impl IntentApiFixture {
             reply_count,
             graph,
             session,
+            forwarded_merges,
         }
     }
 
     pub fn requests(&self) -> Vec<IntentRequest> {
         self.requests.lock().unwrap().clone()
+    }
+
+    pub fn forwarded_merges(&self) -> Vec<IntentReply> {
+        self.forwarded_merges.lock().unwrap().clone()
     }
 
     pub fn workflow_requests(&self) -> Vec<IntentRequest> {

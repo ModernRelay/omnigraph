@@ -335,11 +335,11 @@ pagination, checkpointing and recovery.
 
 ## Errors and retries
 
-Application errors are JSON and preserve a stable HTTP status plus structured
-details where available. Routing errors may be plain responses. Admission-limit
-responses use `429` and include `Retry-After`; request and operation limits use
-`413`, and interrupted writes that must recover `503`. See
-[Troubleshooting](troubleshooting.md) before implementing retry logic.
+Application errors preserve structured details. Admission limits use `429` with
+`Retry-After`; size limits use `413`, and closed admission or pending schema
+completion can use `503`. Admitted writes continue after disconnect. Only the
+CLI's qualified whole-command admission refusal permits exit 75 and caller retry;
+generic 409/503 and lost responses do not. See [failure outcomes](troubleshooting.md#failed-data-write-commands).
 
 ## Deployment notes
 

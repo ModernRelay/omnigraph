@@ -144,10 +144,18 @@ impl GraphHttpClient {
             return Err(ApiContractError::discovery(Some(discovery.status())).into());
         }
         drop(discovery);
-        let response = request
+        let request = request
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .send()
-            .await?;
+            .build()?;
+        let bearer = request
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::to_owned);
+        crate::command_outcome::dispatched(request.method());
+        let response = self.client.execute(request).await?;
+        crate::command_outcome::response(response.status(), response.headers(), bearer.as_deref());
         if !has_contract(&response) {
             return Err(ApiContractError::response(response.status()).into());
         }

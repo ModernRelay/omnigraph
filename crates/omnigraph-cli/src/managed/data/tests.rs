@@ -1199,22 +1199,20 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
         ),
     ] {
       for operation in ["mutate", "load", "commit-list", "commit-show"] {
-        let server = IntentApiFixture::graph(vec![IntentReply { status, headers: vec![], body: body.as_bytes().to_vec() }]);
+        let server = IntentApiFixture::graph(vec![IntentReply { status, headers: vec![("Retry-After".into(), format!("retry-{DATA_TOKEN}"))], body: body.as_bytes().to_vec() }]);
         let client = GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
-        let error = match operation {
+        let (error, evidence) = crate::command_outcome::observe(async { match operation {
             "load" => client.load("main", None, batch.path().to_str().unwrap(), crate::cli::CliLoadMode::Append, &[]).await.unwrap_err(),
             "commit-list" => client.list_commits(Some("main")).await.unwrap_err(),
             "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
             _ => client
             .mutate("main", "mutation m() {}", Some("m"), None, Some("head-a"), &[])
             .await
-            .unwrap_err(), };
-        let rendered = if status == 412 {
-            serde_json::to_string(
-                &error.downcast_ref::<crate::helpers::PreconditionFailedCli>().unwrap().output,
-            )
-            .unwrap()
-        } else if let Some(remote) = error.downcast_ref::<crate::helpers::RemoteErrorCli>() {
+            .unwrap_err(), } }).await;
+        // Reflected/mismatched expected tokens do not prove our conditional
+        // request was refused, even when the HTTP status happens to be 412.
+        assert!(error.downcast_ref::<crate::helpers::PreconditionFailedCli>().is_none());
+        let rendered = if let Some(remote) = error.downcast_ref::<crate::helpers::RemoteErrorCli>() {
             serde_json::to_string(&remote.output).unwrap()
         } else {
             error.to_string()
@@ -1225,6 +1223,9 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
         } else {
             assert!(rendered.contains("[redacted]"), "{rendered}");
         }
+        let failure = serde_json::to_string(&crate::command_outcome::Failure::classify(error, evidence)).unwrap();
+        assert!(!failure.contains(DATA_TOKEN), "outcome leaked credential: {failure}");
+        assert!(failure.contains("retry-[redacted]"), "{failure}");
         server.assert_complete();
       }
     }

@@ -82,18 +82,19 @@ fn openapi_json() -> Value {
     serde_json::to_value(openapi_doc()).unwrap()
 }
 
-fn assert_optional_commit_field(doc: &Value, schema_name: &str) {
+fn assert_commit_field(doc: &Value, schema_name: &str, required_on_wire: bool) {
     let schema = &doc["components"]["schemas"][schema_name];
     let properties = schema["properties"].as_object().unwrap();
     let commit = properties
         .get("commit")
         .unwrap_or_else(|| panic!("{schema_name} must expose a commit receipt"));
     let required = schema["required"].as_array().unwrap();
-    assert!(
+    assert_eq!(
         required
             .iter()
-            .all(|field| field.as_str() != Some("commit")),
-        "{schema_name}.commit must remain optional for successful no-op mutations"
+            .any(|field| field.as_str() == Some("commit")),
+        required_on_wire,
+        "{schema_name}.commit presence is independent of its nullable no-op value"
     );
     let commit_ref = commit["$ref"].as_str().or_else(|| {
         commit["oneOf"]
@@ -649,10 +650,10 @@ fn openapi_blob_documents_binary_redirect_conditional_and_range_contracts() {
     }
     assert!(head["responses"].get("206").is_none());
     assert!(head["responses"].get("416").is_none());
-    for status in ["400", "401", "403", "404", "412", "500"] {
+    for (status, response) in head["responses"].as_object().unwrap() {
         assert!(
-            head["responses"][status].get("content").is_none(),
-            "HEAD /blob {status} must not promise a JSON body that Axum strips"
+            response.get("content").is_none(),
+            "HEAD /blob {status} must not promise a body that Axum strips"
         );
     }
 
@@ -867,7 +868,7 @@ fn openapi_raw_graph_batch_has_ndjson_body_and_logical_result() {
     for field in ["branch", "nodes", "edges", "total_entities"] {
         assert!(props.contains_key(field));
     }
-    assert_optional_commit_field(&doc, "GraphBatchLoadOutput");
+    assert_commit_field(&doc, "GraphBatchLoadOutput", false);
     assert!(!props.contains_key("tables"));
     assert!(!props.contains_key("table_key"));
 
@@ -908,6 +909,31 @@ fn openapi_branch_delete_is_delete() {
 fn openapi_branch_merge_is_post() {
     let doc = openapi_json();
     assert!(doc["paths"]["/graphs/{graph_id}/branches/merge"]["post"].is_object());
+    for name in ["BranchMergeOutput", "ChangeOutput"] {
+        let schema = &doc["components"]["schemas"][name];
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("commit"))
+        );
+        let variants = schema["properties"]["commit"]["oneOf"].as_array().unwrap();
+        assert!(variants.iter().any(|variant| variant["type"] == "null"));
+        assert!(
+            variants
+                .iter()
+                .any(|variant| variant["$ref"] == "#/components/schemas/CommitOutput")
+        );
+    }
+    let properties = &doc["components"]["schemas"]["BranchMergeOutput"]["properties"];
+    assert!(properties.get("branch_delete_error").is_none());
+    assert!(
+        properties["branch_delete_error_details"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|variant| variant["$ref"] == "#/components/schemas/ErrorOutput")
+    );
 }
 
 #[test]
@@ -1147,7 +1173,7 @@ fn change_output_schema_has_expected_fields() {
     assert!(props.contains_key("query_name"));
     assert!(props.contains_key("affected_nodes"));
     assert!(props.contains_key("affected_edges"));
-    assert_optional_commit_field(&doc, "ChangeOutput");
+    assert_commit_field(&doc, "ChangeOutput", true);
 
     let outcome = props
         .get("outcome")
@@ -1259,7 +1285,7 @@ fn ingest_output_schema_has_expected_fields() {
     assert!(props.contains_key("nodes"));
     assert!(props.contains_key("edges"));
     assert!(props.contains_key("total_entities"));
-    assert_optional_commit_field(&doc, "IngestOutput");
+    assert_commit_field(&doc, "IngestOutput", false);
     assert!(!props.contains_key("tables"));
 }
 
@@ -1598,6 +1624,7 @@ fn error_code_schema_has_expected_variants() {
             "method_not_allowed",
             "conflict",
             "too_many_requests",
+            "service_unavailable",
             "internal",
         ]),
         "ErrorCode must match the closed v0.12 HTTP contract, including its \
@@ -2601,6 +2628,12 @@ fn openapi_describes_api_contract_admission_and_response_identity() {
                 assert!(contract_parameters.is_empty(), "{method} {path}");
             }
             for (status, response) in operation["responses"].as_object().unwrap() {
+                if method == "head" {
+                    assert!(
+                        response.get("content").is_none(),
+                        "HEAD {path} {status} must not promise a response body"
+                    );
+                }
                 let contract = &response["headers"][HTTP_API_CONTRACT_HEADER];
                 if oauth {
                     assert!(contract.is_null(), "{method} {path} {status}");

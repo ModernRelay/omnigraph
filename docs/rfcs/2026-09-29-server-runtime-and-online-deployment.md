@@ -16,8 +16,7 @@ supersedes:
   - "2026-09-10-server-lifecycle-and-online-deployment"
 superseded_by: []
 blocked_on:
-  - "A2/A3: exact merge receipts and whole-command outcome qualification"
-  - "B: qualified admission bounds, completion reserve and retained-I/O settlement proof"
+  - "B: native accepted-I/O settlement, completion-memory/local-I/O reserves and engine-work bounds"
   - "E1: versioned single-outstanding-deployment ledger, achieved-result and active-witness encoding"
   - "E1: authorization, writer admission/handoff, finalization ordering and crash reconciliation"
   - "E1: effect-free validation, settled-engine reuse and bounded preparation"
@@ -115,6 +114,14 @@ A second writable opener can discard live schema staging, so schema apply stays
 inside the serving mutation owner.
 
 ## Operation ownership
+
+The accepted [Owned server operations](2026-09-30-owned-server-operations.md)
+decision implements bounded request-independent write ownership and shared
+shutdown as a foundation. Its server-task/body accounting does not qualify the
+native-I/O settlement and completion reserves required by full B below. Its
+read/write capacity is independent, proven engine pre-effect refusals remain
+nonfatal, and uncertain completion contains the whole process with early
+nonzero exit after remaining known logical owners finish.
 
 Before any await or effect, admission registers the write with its owner and
 captures its epoch, trusted actor, Session settings, immutable inputs,
@@ -244,7 +251,8 @@ blindly reapplies the bundle.
 | Settled with an exact committed/no-op/compound result | Return that result and any completion obligation |
 | Settled with unknown effects | Reconcile evidence; settlement alone never authorizes replay |
 
-A returns a merge's own `CommitOutput` on the branch merge route, GQ merge through
+A2's accepted [Exact merge receipts](2026-09-30-exact-merge-receipts.md) decision
+returns a merge's own `CommitOutput` on the branch merge route, GQ merge through
 `/mutate`, and CLI JSON: `graph_commit_id`, `graph_manifest_version`, optional
 `graph_branch`, `parent_commit_id`, `merged_parent_commit_id`, `actor_id` and
 `created_at` in Unix microseconds. Optional fields come from that publication.
@@ -258,16 +266,18 @@ Remove the legacy `branch_delete_error` string alias. Exit 0 deliberately means
 the merge succeeded; its separately reported deletion failure does not authorize
 replaying the merge.
 
-For [issue 466](https://github.com/ModernRelay/omnigraph/issues/466), preserve
+The accepted [Owned server operations](2026-09-30-owned-server-operations.md#whole-command-failure-outcomes)
+decision owns A3's initial contract. For
+[issue 466](https://github.com/ModernRelay/omnigraph/issues/466), preserve
 structured errors through ordinary and streamed responses and classify the entire
-data-write command. Non-precondition failures carry
+data-write command. Failures carry
 `command_outcome { execution, effects, action }`; supported actions are `retry`,
 `refresh`, `recover` or `reconcile`.
 
 | CLI result | Contract |
 |---|---|
-| Exit 75 | A bounded caller retry of the whole command is safe with unchanged preconditions and no earlier work still able to produce effects. Initially: verified single-request 429 `too_many_requests`, or effect-free preparation conflict on standalone append/merge load without `--from`. Preserve `Retry-After`; the caller owns the attempt bound. |
-| Exit 4 | Typed conditional mismatch with no write effect; re-read and choose a new precondition. |
+| Exit 75 | A bounded caller retry of the whole command is safe with unchanged preconditions and no earlier work still able to produce effects. Initially only a verified, typed preadmission HTTP 429 `too_many_requests` qualifies. Preserve `Retry-After`; the caller owns the attempt bound. Embedded append/merge load preparation conflicts remain exit 1 pending separate qualification. |
+| Exit 4 | Verified HTTP 412 conditional mismatch with no earlier whole-command work able to produce effects; re-read and choose a new precondition. An embedded mismatch stays exit 1 because writable open may have completed earlier work. |
 | Exit 1 | Other failure, including truncated/malformed success or unknown outcome. Generic 409/503, resource exhaustion, read-set conflict and completion-required errors never imply retry permission. |
 | Exit 0 | Exact successful/no-op result, including merge with separately reported optional deletion failure. |
 
@@ -290,7 +300,10 @@ Reserve bounded execution, memory and local I/O for finishing admitted work,
 qualified completion, shutdown and status. Ordinary traffic cannot consume it,
 and completion cannot wait on permits held by work it must settle. Keep the small
 status allowance separate. Reserves neither guarantee storage progress nor extend
-deadlines. Minimum bounds ship with B, before detached execution retains work.
+deadlines. Full B requires these reserves and independently qualified native-I/O
+settlement. Its accepted owned-operation foundation introduces bounded server
+tasks and retained inputs, but cannot use a task join or counter drain to grant
+activation, reclamation or retry authority.
 Reserve candidate headroom before closing healthy admission; insufficient capacity
 refuses. Keep input, caller-wait, read, deployment and shutdown deadlines distinct.
 
@@ -425,8 +438,8 @@ cases and unreached faults do not pass qualification.
 
 | Increment | Deliverable | Shipping gate |
 |---|---|---|
-| A | A1 v0.12 HTTP admission; A2 own-publication merge receipts; A3 CLI outcomes | A1 follows [its accepted decision](2026-09-30-v012-http-admission.md); A2/A3 require T1–T3 outcome qualification |
-| B | Owned writes, read/stream accounting, drain and shared shutdown | T5–T7 plus minimum T10 bounds/reserve |
+| A | A1 v0.12 HTTP admission; A2 own-publication merge receipts; A3 CLI outcomes | A1 follows [its accepted decision](2026-09-30-v012-http-admission.md); A2 is qualified under [Exact merge receipts](2026-09-30-exact-merge-receipts.md), including T1/T2; A3's initial typed-429 and qualified-HTTP-412 contract is qualified under [Owned server operations](2026-09-30-owned-server-operations.md) |
+| B | Owned writes, read/stream accounting, drain and shared shutdown | [Owned server operations](2026-09-30-owned-server-operations.md) implements and qualifies the bounded task/body foundation. Full B still requires native-I/O settlement and protected completion reserves under T6/T10 before runtime reuse; task/body lifetime tests do not establish these. |
 | C | Schema/control completion, owned maintenance and bounded transient startup retry | T4/T6/T7/T11; same-process progress and protected reclamation |
 | D | Aggregate budgets, feed progress and embedding diagnostics | T10–T11 and workload qualification |
 | E1 | Same-process schema/query activation with one outstanding deployment | B, relevant C/D bounds, T8.live/T9 and durable ledger/crash gates; Azure separately gated |
@@ -440,8 +453,10 @@ Merging this draft supplies no product qualification.
 
 Before accepting each affected increment, its owners must specify:
 
-1. CLI/server: A2/A3 exact receipt and whole-command outcome qualification; A1
-   admission and discovery encoding are fixed by the accepted decision above.
+1. CLI/server: any broader retry allowance needs separate whole-command proof.
+   A3 and the B foundation are qualified under
+   [Owned server operations](2026-09-30-owned-server-operations.md); A1 admission
+   and A2 exact receipt contracts and evidence remain with their accepted owners.
 2. Cluster/server: versioned pending slot, immutable input/achieved base, exact
    effect/finalization/result binding, active witness, observation interval,
    result retention, migration and stopped-writer handoff.
@@ -488,3 +503,20 @@ Before accepting each affected increment, its owners must specify:
   admission decision fixes A1's wire encoding and validation; Compatibility,
   Rollout and Unresolved questions now link to that owner. This umbrella remains
   draft: the instruction to build A1 does not accept the remaining increments.
+- 2026-09-30: Moved A2's exact receipt contract and T1/T2 gates to the accepted
+  Exact merge receipts decision. Exact outcomes and Rollout now identify that
+  owner; Unresolved questions no longer calls A2's contract undecided. A2 is
+  implemented and its T1/T2 qualification is recorded there. A3 and the remaining
+  lifecycle/deployment increments stay proposals in this draft.
+- 2026-09-30: Accepted A3 and the bounded operation-ownership foundation through
+  Owned server operations. Operation ownership, Exact outcomes, Resource bounds,
+  Rollout and Unresolved questions now distinguish its server-task/body contract
+  from full B's unqualified native-I/O settlement and completion reserves. The
+  Exit 75 row replaces the proposed embedded append/merge preparation-conflict
+  allowance with typed preadmission HTTP 429 only; embedded conflicts remain
+  exit 1 pending separate proof. Online activation remains gated on full B.
+
+- 2026-09-30: Qualified the initial A3 contract and B's server-task/body foundation
+  under Owned server operations. Rollout and open gates now distinguish completed
+  local ownership/outcome evidence from native-I/O settlement, completion reserves
+  and engine-work bounds that still gate reusable drain and online activation.

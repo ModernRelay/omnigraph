@@ -556,6 +556,177 @@ query insert_person($name: String, $age: I32) {
 }
 
 #[test]
+#[ignore = "loopback: actual CLI/server/proxy processes qualify lost merge delivery"]
+fn remote_merge_delivery_loss_never_replays_committed_effect() {
+    use support::managed_http::{IntentApiFixture, MergeDeliveryFault};
+
+    let cluster = converged_loaded_cluster(GRAPH_ID, None);
+    let server = spawn_server_with_cluster(cluster.path());
+    let client = graph_http_client();
+    let graph_url = format!("{}/graphs/{GRAPH_ID}", server.base_url);
+    let get_json = |path: &str| {
+        client
+            .get(format!("{graph_url}/{path}"))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<serde_json::Value>()
+            .unwrap()
+    };
+
+    for statement in [false, true] {
+        for (index, fault) in [
+            MergeDeliveryFault::Disconnect,
+            MergeDeliveryFault::Truncate,
+            MergeDeliveryFault::GatewayTimeout,
+            MergeDeliveryFault::CallerWait,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = format!("delivery-{}-{index}", usize::from(statement));
+            let marker = format!("Merged-{source}");
+            client
+                .post(format!("{graph_url}/branches"))
+                .json(&json!({"from": "main", "name": source}))
+                .send()
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            let change = client
+                .post(format!("{graph_url}/mutate"))
+                .json(&json!({
+                    "branch": source,
+                    "query": "query add($name: String) { insert Person { name: $name, age: 33 } }",
+                    "params": {"name": marker}
+                }))
+                .send()
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json::<serde_json::Value>()
+                .unwrap();
+            let before_target = get_json("commits?branch=main");
+            let before_source = get_json(&format!("commits?branch={source}"));
+
+            let proxy = IntentApiFixture::graph_merge_proxy(&server.base_url, fault);
+            let mut command = cli();
+            if statement {
+                command
+                    .arg("mutate")
+                    .arg("-e")
+                    .arg(format!("branch merge \"{source}\" into main"));
+            } else {
+                command.arg("branch").arg("merge").arg(&source);
+            }
+            command
+                .arg("--server")
+                .arg(&proxy.origin)
+                .arg("--graph")
+                .arg(GRAPH_ID)
+                .arg("--json")
+                // CallerWait deliberately expires this process wait while the
+                // proxy owns a fully consumed successful server response. It
+                // qualifies caller abandonment, not a production deadline flag.
+                .timeout(std::time::Duration::from_secs(15));
+            let output = output_failure(&mut command);
+            if !matches!(fault, MergeDeliveryFault::CallerWait) {
+                assert_eq!(output.status.code(), Some(1), "{statement}/{fault:?}");
+            }
+            if !output.stdout.is_empty() {
+                let error = parse_stdout_json(&output);
+                assert!(
+                    error.get("error").is_some(),
+                    "{statement}/{fault:?}: {error}"
+                );
+                assert!(
+                    error.get("commit").is_none(),
+                    "lost delivery is not success"
+                );
+                assert!(
+                    error.get("outcome").is_none(),
+                    "lost delivery is not success"
+                );
+            }
+
+            let captured = proxy.forwarded_merges();
+            assert_eq!(
+                captured.len(),
+                1,
+                "{statement}/{fault:?}: successful upstream merge"
+            );
+            let upstream: serde_json::Value = serde_json::from_slice(&captured[0].body).unwrap();
+            let outcome = if statement {
+                &upstream["outcome"]["merge"]
+            } else {
+                &upstream["outcome"]
+            };
+            assert_eq!(outcome, "fast_forward", "{statement}/{fault:?}");
+            let receipt = &upstream["commit"];
+            let commit_id = receipt["graph_commit_id"].as_str().unwrap();
+            assert_eq!(
+                receipt["parent_commit_id"],
+                before_target["commits"][0]["graph_commit_id"]
+            );
+            assert_eq!(
+                receipt["merged_parent_commit_id"],
+                change["commit"]["graph_commit_id"]
+            );
+
+            // Inspect the actual server independently of the proxy's captured
+            // body: one target publication, that exact receipt, retained source
+            // and the intended row on both branches despite failed delivery.
+            assert_eq!(get_json(&format!("commits/{commit_id}")), *receipt);
+            let after_target = get_json("commits?branch=main");
+            assert_eq!(after_target["commits"][0], *receipt);
+            assert_eq!(
+                after_target["commits"].as_array().unwrap().len(),
+                before_target["commits"].as_array().unwrap().len() + 1
+            );
+            assert_eq!(get_json(&format!("commits?branch={source}")), before_source);
+            for branch in ["main", source.as_str()] {
+                let rows = client
+                    .post(format!("{graph_url}/query"))
+                    .json(&json!({
+                        "branch": branch,
+                        "query": "query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }",
+                        "params": {"name": marker}
+                    }))
+                    .send()
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json::<serde_json::Value>()
+                    .unwrap();
+                assert_eq!(rows["rows"], json!([{"p.name": marker, "p.age": 33}]));
+            }
+            proxy.assert_complete();
+            let requests = proxy.requests();
+            assert_eq!(
+                requests.len(),
+                2,
+                "discovery and exactly one data submission"
+            );
+            assert_eq!(requests[0].method, "HEAD");
+            assert_eq!(requests[0].path, "/healthz");
+            assert_eq!(requests[1].method, "POST");
+            assert_eq!(
+                requests[1].path,
+                format!(
+                    "/graphs/{GRAPH_ID}/{}",
+                    if statement {
+                        "mutate"
+                    } else {
+                        "branches/merge"
+                    }
+                )
+            );
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_branch_delete_removes_branch() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
@@ -1104,7 +1275,8 @@ query insert_person($name: String, $age: I32) {
         "expected branch_merge denial, got: {denied_merge}"
     );
 
-    // ragnor (admins) can promote into protected main.
+    // ragnor can promote into protected main, but has no branch_delete grant.
+    // The compound request still exits 0 and preserves the merge's receipt.
     let merged = parse_stdout_json(&output_success(
         cli()
             .env("OMNIGRAPH_BEARER_TOKEN", "admin-token")
@@ -1117,9 +1289,42 @@ query insert_person($name: String, $age: I32) {
             .arg("feature")
             .arg("--into")
             .arg("main")
+            .arg("--delete-branch")
             .arg("--json"),
     ));
     assert_eq!(merged["target"], "main");
+    assert_eq!(merged["outcome"], "fast_forward");
+    assert_eq!(merged["branch_deleted"], false);
+    assert_eq!(merged["branch_delete_error_details"]["code"], "forbidden");
+    assert!(merged.get("branch_delete_error").is_none());
+    assert_eq!(merged["commit"]["actor_id"], "act-ragnor");
+    assert_eq!(
+        merged["commit"]["merged_parent_commit_id"],
+        changed["commit"]["graph_commit_id"]
+    );
+    let client = graph_http_client();
+    let get_json = |path: &str| {
+        client
+            .get(format!("{}/graphs/{GRAPH_ID}/{path}", server.base_url))
+            .bearer_auth("team-token")
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<serde_json::Value>()
+            .unwrap()
+    };
+    let commit_id = merged["commit"]["graph_commit_id"].as_str().unwrap();
+    assert_eq!(get_json(&format!("commits/{commit_id}")), merged["commit"]);
+    assert_eq!(
+        get_json("commits?branch=main")["commits"][0],
+        merged["commit"]
+    );
+    assert_eq!(get_json("branches")["branches"], json!(["feature", "main"]));
+    assert_eq!(
+        get_json("commits?branch=feature")["commits"][0],
+        changed["commit"]
+    );
 
     let verify = parse_stdout_json(&output_success(
         cli()
@@ -1296,6 +1501,11 @@ fn mutate_if_commit_lost_cas_exits_4_issue_365() {
     let body: serde_json::Value = serde_json::from_slice(&lost.stdout)
         .expect("--json must emit the structured body on stdout");
     assert_eq!(body["precondition_failure"]["expected"], json!(stale_id));
+    assert_eq!(body["http_status"], 412);
+    assert_eq!(
+        body["command_outcome"],
+        json!({"execution":"not_started","effects":"none","action":"refresh"})
+    );
 
     // An id from a fresh read passes with exit 0.
     let read = parse_stdout_json(&output_success(

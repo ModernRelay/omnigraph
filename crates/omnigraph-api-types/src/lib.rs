@@ -311,7 +311,7 @@ pub struct BranchMergeRequest {
     pub target: Option<String>,
     /// Delete the source branch after a successful merge. The deletion runs
     /// under its own `branch_delete` policy check; a refusal or failure is
-    /// reported via `branch_deleted` / `branch_delete_error` on the response
+    /// reported via `branch_deleted` / `branch_delete_error_details` on the response
     /// and never fails the already-landed merge.
     #[serde(default)]
     pub delete_branch: bool,
@@ -353,17 +353,22 @@ pub struct BranchMergeOutput {
     pub source: String,
     pub target: String,
     pub outcome: BranchMergeOutcome,
+    /// This merge's own publication, including for a fast-forward. Always
+    /// present on the wire; `null` only when already up to date.
+    #[serde(deserialize_with = "Option::deserialize")]
+    #[schema(required = true)]
+    pub commit: Option<CommitOutput>,
     pub actor_id: Option<String>,
     /// Result of the requested post-merge source-branch deletion. Absent when
     /// `delete_branch` was not requested; `true` when the source branch was
     /// deleted; `false` when the deletion was refused or failed (the merge
-    /// itself still succeeded — see `branch_delete_error`).
+    /// itself still succeeded — see `branch_delete_error_details`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_deleted: Option<bool>,
     /// Why the requested source-branch deletion did not happen. Present iff
     /// `branch_deleted` is `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch_delete_error: Option<String>,
+    pub branch_delete_error_details: Option<ErrorOutput>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -512,11 +517,11 @@ pub struct ChangeOutput {
     /// Edges the mutation touched, under the `affected_nodes` rule.
     pub affected_edges: usize,
     pub actor_id: Option<String>,
-    /// The commit this write published, if any. For a branch statement: the
-    /// target's head, read after the merge released its gates, so under a
-    /// concurrent writer it may name a later commit than the merge published.
-    /// `null` for `created`, `deleted`, and `already_up_to_date`, which publish
-    /// nothing, and `null` when that head read fails.
+    /// This write's own publication, including for a fast-forward merge.
+    /// Always present on the wire; `null` for branch creation, deletion, or
+    /// an already-up-to-date merge, which publish no graph content commit.
+    #[serde(deserialize_with = "Option::deserialize")]
+    #[schema(required = true)]
     pub commit: Option<CommitOutput>,
     /// Present only when the request was a branch statement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1378,6 +1383,8 @@ pub enum ErrorCode {
     /// 429 Too Many Requests — per-actor admission cap exceeded.
     /// Clients should respect the `Retry-After` header.
     TooManyRequests,
+    /// 503: operation admission is closed; reconcile any earlier write.
+    ServiceUnavailable,
     Internal,
 }
 
@@ -2261,6 +2268,39 @@ mod tests {
         for invalid in ["Person", "node:", "edge:", "table:Person"] {
             assert_eq!(entity_type_parts(invalid), Err(EntityTypeMappingError));
         }
+    }
+
+    #[test]
+    fn merge_and_change_receipts_require_commit_even_when_null() {
+        let mut merge = json!({
+            "source": "feature", "target": "main", "outcome": "already_up_to_date",
+            "actor_id": null, "commit": null
+        });
+        let decoded: BranchMergeOutput = serde_json::from_value(merge.clone()).unwrap();
+        assert!(decoded.commit.is_none());
+        assert_eq!(serde_json::to_value(decoded).unwrap(), merge);
+        merge.as_object_mut().unwrap().remove("commit");
+        assert!(
+            serde_json::from_value::<BranchMergeOutput>(merge)
+                .unwrap_err()
+                .to_string()
+                .contains("missing field `commit`")
+        );
+        let mut change = json!({
+            "branch": "main", "query_name": "branch merge",
+            "affected_nodes": 0, "affected_edges": 0, "actor_id": null, "commit": null,
+            "outcome": {"kind": "merged", "source": "feature", "target": "main", "merge": "already_up_to_date"}
+        });
+        let decoded: ChangeOutput = serde_json::from_value(change.clone()).unwrap();
+        assert!(decoded.commit.is_none());
+        assert_eq!(serde_json::to_value(decoded).unwrap(), change);
+        change.as_object_mut().unwrap().remove("commit");
+        assert!(
+            serde_json::from_value::<ChangeOutput>(change)
+                .unwrap_err()
+                .to_string()
+                .contains("missing field `commit`")
+        );
     }
 
     #[test]

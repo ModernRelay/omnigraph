@@ -25,6 +25,7 @@ pub(crate) async fn require_contract(request: Request, next: Next) -> Result<Res
         || values.next().is_some()
     {
         return Err(ApiError {
+            completion_uncertain: false,
             status: StatusCode::BAD_REQUEST,
             code: Some(ErrorCode::ApiContractMismatch),
             message: mismatch_message().into_boxed_str(),
@@ -92,6 +93,59 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
                     );
                 }
             }
+            if path.starts_with("/graphs/{graph_id}/") {
+                for (status, description) in [
+                    (
+                        "429",
+                        "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+                    ),
+                    (
+                        "503",
+                        "Server operation admission is closed; reconcile any earlier write before retrying",
+                    ),
+                    (
+                        "408",
+                        "Request body deadline exceeded before operation admission",
+                    ),
+                    (
+                        "413",
+                        "Request body exceeds its route limit before operation admission",
+                    ),
+                ] {
+                    if matches!(status, "408" | "413") && operation.request_body.is_none() {
+                        continue;
+                    }
+                    let response = operation
+                        .responses
+                        .responses
+                        .entry(status.into())
+                        .or_insert_with(|| {
+                            let mut response = utoipa::openapi::Response::new(description);
+                            response.content.insert(
+                                "application/json".into(),
+                                Content::new(Some(Ref::from_schema_name(
+                                    if path.contains("/changes") {
+                                        "ChangeErrorOutput"
+                                    } else {
+                                        "ErrorOutput"
+                                    },
+                                ))),
+                            );
+                            response.into()
+                        });
+                    if let RefOr::T(response) = response {
+                        if !response.description.contains(description) {
+                            response.description.push_str("; ");
+                            response.description.push_str(description);
+                        }
+                        if status == "429" {
+                            let mut header = Header::new(Object::with_type(Type::String));
+                            header.description = Some("Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry.".into());
+                            response.headers.insert("Retry-After".into(), header);
+                        }
+                    }
+                }
+            }
             for response in operation.responses.responses.values_mut() {
                 if let RefOr::T(response) = response {
                     let mut header = Header::new(schema.clone());
@@ -116,11 +170,18 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
         && let Some(mut head) = health.get.clone()
     {
         head.operation_id = Some("health_head".into());
+        health.head = Some(head);
+    }
+    // HEAD has no response body even when shared admission adds an error.
+    // Apply this after every modifier, including the generated health HEAD.
+    for item in doc.paths.paths.values_mut() {
+        let Some(head) = item.head.as_mut() else {
+            continue;
+        };
         for response in head.responses.responses.values_mut() {
             if let RefOr::T(response) = response {
                 response.content.clear();
             }
         }
-        health.head = Some(head);
     }
 }

@@ -744,8 +744,56 @@
               }
             }
           },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Stored Blob integrity or pre-header delivery refusal, including ranged external descriptors that cannot be redirected",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -1099,8 +1147,42 @@
               }
             }
           },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            }
+          },
           "500": {
             "description": "Stored Blob integrity or pre-header delivery refusal, including ranged external descriptors that cannot be redirected; HEAD responses have no body",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            }
+          },
+          "503": {
+            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -1218,6 +1300,54 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -1369,6 +1499,27 @@
               }
             }
           },
+          "408": {
+            "description": "Request body deadline exceeded before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Branch already exists",
             "headers": {
@@ -1390,8 +1541,8 @@
               }
             }
           },
-          "429": {
-            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+          "413": {
+            "description": "Request body exceeds its route limit before operation admission",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -1411,8 +1562,35 @@
               }
             }
           },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header; Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -1446,7 +1624,7 @@
           "branches"
         ],
         "summary": "Merge one branch into another.",
-        "description": "Merges `source` into `target` (defaults to `main`). Outcome is one of\n`already_up_to_date`, `fast_forward`, or `merged`. Returns 409 with the\nlist of conflicts if the merge cannot be completed; the target is left\nunchanged in that case. **Destructive** to `target` on success.\n\nWith `delete_branch: true` the source branch is deleted after a successful\nmerge, under its own `branch_delete` policy check. The merge is durable by\nthen, so a deletion refusal or failure never fails the request; it is\nreported via `branch_deleted: false` + `branch_delete_error`.\n\nThe GQ statement `branch merge` on `POST /mutate` runs the same body\n(without the deletion composition) and answers the same 409 on conflict.",
+        "description": "Merges `source` into `target` (defaults to `main`). Outcome is one of\n`already_up_to_date`, `fast_forward`, or `merged`. Returns 409 with the\nlist of conflicts if the merge cannot be completed; the target is left\nunchanged in that case. **Destructive** to `target` on success. `commit`\ncarries this merge's own target publication, including for a fast-forward;\nan already-up-to-date merge returns `commit: null`.\n\nWith `delete_branch: true` the source branch is deleted after a successful\nmerge, under its own `branch_delete` policy check. The merge is durable by\nthen, so a deletion refusal or failure never fails the request; it is\nreported via `branch_deleted: false` + `branch_delete_error_details`.\n\nThe GQ statement `branch merge` on `POST /mutate` runs the same body\n(without the deletion composition) and answers the same 409 on conflict.",
         "operationId": "cluster_mergeBranches",
         "parameters": [
           {
@@ -1566,6 +1744,27 @@
               }
             }
           },
+          "408": {
+            "description": "Request body deadline exceeded before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Merge conflict",
             "headers": {
@@ -1588,7 +1787,7 @@
             }
           },
           "413": {
-            "description": "Merge entity, byte, or recovery-chain ceiling exceeded before effects",
+            "description": "Merge entity, byte, or recovery-chain ceiling exceeded before effects; Request body exceeds its route limit before operation admission",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -1630,8 +1829,14 @@
             }
           },
           "429": {
-            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header; Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
             "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -1651,7 +1856,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -1826,8 +2031,14 @@
             }
           },
           "429": {
-            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header; Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
             "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -1847,7 +2058,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -2001,6 +2212,27 @@
               }
             }
           },
+          "408": {
+            "description": "Request body deadline exceeded before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Write-authority conflict",
             "headers": {
@@ -2023,7 +2255,7 @@
             }
           },
           "413": {
-            "description": "Keyed write exceeds the per-commit entity or byte ceiling",
+            "description": "Keyed write exceeds the per-commit entity or byte ceiling; Request body exceeds its route limit before operation admission",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -2065,8 +2297,14 @@
             }
           },
           "429": {
-            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header; Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
             "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -2086,7 +2324,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -2405,6 +2643,33 @@
               }
             }
           },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal failure while reading changes",
             "headers": {
@@ -2427,7 +2692,7 @@
             }
           },
           "503": {
-            "description": "Recovery required before changes can be read",
+            "description": "Recovery required before changes can be read; Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -2602,9 +2867,57 @@
               }
             }
           },
-          "413": {
-            "description": "Baseline cut or transport capacity exhausted",
+          "408": {
+            "description": "Request body deadline exceeded before operation admission",
             "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Baseline cut or transport capacity exhausted; Request body exceeds its route limit before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -2645,7 +2958,7 @@
             }
           },
           "503": {
-            "description": "Recovery required",
+            "description": "Recovery required; Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -2781,6 +3094,54 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -2935,6 +3296,54 @@
           },
           "404": {
             "description": "Commit not found",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -3217,6 +3626,33 @@
               }
             }
           },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal failure while reading changes",
             "headers": {
@@ -3239,7 +3675,7 @@
             }
           },
           "503": {
-            "description": "Recovery required before changes can be read",
+            "description": "Recovery required before changes can be read; Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -3410,6 +3846,27 @@
               }
             }
           },
+          "408": {
+            "description": "Request body deadline exceeded before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Export authority conflict",
             "headers": {
@@ -3432,7 +3889,7 @@
             }
           },
           "413": {
-            "description": "Export cut or transport capacity exhausted",
+            "description": "Export cut or transport capacity exhausted; Request body exceeds its route limit before operation admission",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -3473,8 +3930,35 @@
               }
             }
           },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
-            "description": "Recovery required",
+            "description": "Recovery required; Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -3628,6 +4112,27 @@
               }
             }
           },
+          "408": {
+            "description": "Request body deadline exceeded before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Prepared load authority changed before effects",
             "headers": {
@@ -3650,7 +4155,7 @@
             }
           },
           "413": {
-            "description": "Load input or external Blob admission exceeds a bounded per-operation entity or byte ceiling",
+            "description": "Load input or external Blob admission exceeds a bounded per-operation entity or byte ceiling; Request body exceeds its route limit before operation admission",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -3692,8 +4197,14 @@
             }
           },
           "429": {
-            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header; Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
             "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -3713,7 +4224,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -3868,6 +4379,27 @@
               }
             }
           },
+          "408": {
+            "description": "Request body deadline exceeded before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Prepared load authority changed before effects",
             "headers": {
@@ -3890,7 +4422,7 @@
             }
           },
           "413": {
-            "description": "Load input or external Blob admission exceeds a bounded per-operation entity or byte ceiling",
+            "description": "Load input or external Blob admission exceeds a bounded per-operation entity or byte ceiling; Request body exceeds its route limit before operation admission",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -3932,8 +4464,14 @@
             }
           },
           "429": {
-            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header; Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
             "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -3953,7 +4491,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -4169,6 +4707,27 @@
               }
             }
           },
+          "408": {
+            "description": "Request body deadline exceeded before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Prepared load authority changed before effects",
             "headers": {
@@ -4191,7 +4750,7 @@
             }
           },
           "413": {
-            "description": "Request, load, or external Blob admission exceeds a bounded ceiling",
+            "description": "Request, load, or external Blob admission exceeds a bounded ceiling; Request body exceeds its route limit before operation admission",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -4254,8 +4813,14 @@
             }
           },
           "429": {
-            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header; Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
             "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -4275,7 +4840,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -4450,6 +5015,27 @@
               }
             }
           },
+          "408": {
+            "description": "Request body deadline exceeded before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Write-authority conflict; also `branch create` of a branch that already exists, and a conflicting `branch merge`, whose body carries `merge_conflicts`",
             "headers": {
@@ -4472,7 +5058,7 @@
             }
           },
           "413": {
-            "description": "Keyed write exceeds the per-commit entity or byte ceiling",
+            "description": "Keyed write exceeds the per-commit entity or byte ceiling; Request body exceeds its route limit before operation admission",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -4514,8 +5100,14 @@
             }
           },
           "429": {
-            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header; Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
             "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -4535,7 +5127,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -4698,6 +5290,27 @@
               }
             }
           },
+          "408": {
+            "description": "Request body deadline exceeded before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Write-authority conflict",
             "headers": {
@@ -4741,7 +5354,7 @@
             }
           },
           "413": {
-            "description": "Keyed write exceeds the per-commit entity or byte ceiling",
+            "description": "Keyed write exceeds the per-commit entity or byte ceiling; Request body exceeds its route limit before operation admission",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -4783,8 +5396,14 @@
             }
           },
           "429": {
-            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header; Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
             "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -4804,7 +5423,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -4929,6 +5548,54 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -5118,6 +5785,27 @@
               }
             }
           },
+          "408": {
+            "description": "Request body deadline exceeded before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Stored mutation write-authority conflict, or a full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying",
             "headers": {
@@ -5140,7 +5828,7 @@
             }
           },
           "413": {
-            "description": "Stored keyed mutation exceeds the per-commit entity or byte ceiling",
+            "description": "Stored keyed mutation exceeds the per-commit entity or byte ceiling; Request body exceeds its route limit before operation admission",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -5182,8 +5870,14 @@
             }
           },
           "429": {
-            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header; Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
             "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -5224,7 +5918,7 @@
             }
           },
           "503": {
-            "description": "A stored mutation is blocked by a durable recovery intent",
+            "description": "A stored mutation is blocked by a durable recovery intent; Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -5423,6 +6117,27 @@
               }
             }
           },
+          "408": {
+            "description": "Request body deadline exceeded before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Stored mutation write-authority conflict",
             "headers": {
@@ -5466,7 +6181,7 @@
             }
           },
           "413": {
-            "description": "Stored keyed mutation exceeds the per-commit entity or byte ceiling",
+            "description": "Stored keyed mutation exceeds the per-commit entity or byte ceiling; Request body exceeds its route limit before operation admission",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -5508,8 +6223,14 @@
             }
           },
           "429": {
-            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header; Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
             "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -5550,7 +6271,7 @@
             }
           },
           "503": {
-            "description": "A stored mutation is blocked by a durable recovery intent",
+            "description": "A stored mutation is blocked by a durable recovery intent; Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -5704,8 +6425,98 @@
               }
             }
           },
+          "408": {
+            "description": "Request body deadline exceeded before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds its route limit before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -5859,8 +6670,98 @@
               }
             }
           },
+          "408": {
+            "description": "Request body deadline exceeded before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds its route limit before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -5986,6 +6887,54 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -6139,6 +7088,27 @@
               }
             }
           },
+          "408": {
+            "description": "Request body deadline exceeded before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Schema apply is disabled for cluster-backed serving; use `omnigraph cluster apply` and restart",
             "headers": {
@@ -6160,8 +7130,56 @@
               }
             }
           },
+          "413": {
+            "description": "Request body exceeds its route limit before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "429": {
-            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header; Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -6297,6 +7315,54 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -6588,7 +7654,8 @@
         "required": [
           "source",
           "target",
-          "outcome"
+          "outcome",
+          "commit"
         ],
         "properties": {
           "actor_id": {
@@ -6597,19 +7664,34 @@
               "null"
             ]
           },
-          "branch_delete_error": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Why the requested source-branch deletion did not happen. Present iff\n`branch_deleted` is `false`."
+          "branch_delete_error_details": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ErrorOutput",
+                "description": "Why the requested source-branch deletion did not happen. Present iff\n`branch_deleted` is `false`."
+              }
+            ]
           },
           "branch_deleted": {
             "type": [
               "boolean",
               "null"
             ],
-            "description": "Result of the requested post-merge source-branch deletion. Absent when\n`delete_branch` was not requested; `true` when the source branch was\ndeleted; `false` when the deletion was refused or failed (the merge\nitself still succeeded — see `branch_delete_error`)."
+            "description": "Result of the requested post-merge source-branch deletion. Absent when\n`delete_branch` was not requested; `true` when the source branch was\ndeleted; `false` when the deletion was refused or failed (the merge\nitself still succeeded — see `branch_delete_error_details`)."
+          },
+          "commit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CommitOutput",
+                "description": "This merge's own publication, including for a fast-forward. Always\npresent on the wire; `null` only when already up to date."
+              }
+            ]
           },
           "outcome": {
             "$ref": "#/components/schemas/BranchMergeOutcome"
@@ -6630,7 +7712,7 @@
         "properties": {
           "delete_branch": {
             "type": "boolean",
-            "description": "Delete the source branch after a successful merge. The deletion runs\nunder its own `branch_delete` policy check; a refusal or failure is\nreported via `branch_deleted` / `branch_delete_error` on the response\nand never fails the already-landed merge."
+            "description": "Delete the source branch after a successful merge. The deletion runs\nunder its own `branch_delete` policy check; a refusal or failure is\nreported via `branch_deleted` / `branch_delete_error_details` on the response\nand never fails the already-landed merge."
           },
           "settings": {
             "oneOf": [
@@ -7057,7 +8139,8 @@
           "branch",
           "query_name",
           "affected_nodes",
-          "affected_edges"
+          "affected_edges",
+          "commit"
         ],
         "properties": {
           "actor_id": {
@@ -7087,7 +8170,7 @@
               },
               {
                 "$ref": "#/components/schemas/CommitOutput",
-                "description": "The commit this write published, if any. For a branch statement: the\ntarget's head, read after the merge released its gates, so under a\nconcurrent writer it may name a later commit than the merge published.\n`null` for `created`, `deleted`, and `already_up_to_date`, which publish\nnothing, and `null` when that head read fails."
+                "description": "This write's own publication, including for a fast-forward merge.\nAlways present on the wire; `null` for branch creation, deletion, or\nan already-up-to-date merge, which publish no graph content commit."
               }
             ]
           },
@@ -7370,6 +8453,7 @@
           "method_not_allowed",
           "conflict",
           "too_many_requests",
+          "service_unavailable",
           "internal"
         ]
       },

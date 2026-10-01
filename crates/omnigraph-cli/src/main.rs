@@ -50,6 +50,7 @@ use read_format::{ReadOutputFormat, ReadRenderOptions, render_read};
 mod blob_cli;
 mod cli;
 mod client;
+mod command_outcome;
 mod graph_http;
 mod helpers;
 mod managed;
@@ -65,9 +66,8 @@ use cli::*;
 use helpers::*;
 use output::*;
 
-/// Exit code for a lost `--if-commit` compare-and-swap (HTTP 412): distinct
-/// from the generic failure exit (1) so scripts can branch on "someone else
-/// wrote first — re-read and retry" without matching message text.
+/// Exit code for a verified remote `--if-commit` refusal (HTTP 412) with
+/// no earlier whole-command effects. Scripts must refresh before retrying.
 const EXIT_PRECONDITION_FAILED: i32 = 4;
 
 /// fsync the directory holding a just-atomically-persisted file so the rename
@@ -183,8 +183,40 @@ async fn main() -> Result<()> {
         };
         (Cli::from_arg_matches(&matches)?, machine)
     };
-    match run(cli).await {
+    let (result, evidence) = if command_outcome::applies(&cli) {
+        let (result, evidence) = command_outcome::observe(run(cli)).await;
+        (result, Some(evidence))
+    } else {
+        (run(cli).await, None)
+    };
+    match result {
         Err(error) => {
+            if let Some(evidence) = evidence {
+                let failure = command_outcome::Failure::classify(error, evidence);
+                match machine {
+                    Some(MachineErrors::Json) => print_json(&failure)?,
+                    Some(MachineErrors::Jsonl) => println!("{}", serde_json::to_string(&failure)?),
+                    None => {
+                        let message = match &failure.output.diagnostic {
+                            Some(diagnostic) => render_diagnostic(&failure.output, diagnostic),
+                            None => failure.output.error.clone(),
+                        };
+                        eprintln!("{message}");
+                        if let Some(status) = failure.http_status {
+                            eprintln!("HTTP {status}");
+                        }
+                        if let Some(backoff) = &failure.retry_after {
+                            eprintln!("Retry-After: {backoff}");
+                        }
+                        eprintln!(
+                            "command_outcome: {}",
+                            serde_json::to_string(&failure.command_outcome)?
+                        );
+                    }
+                }
+                std::io::stdout().flush()?;
+                std::process::exit(failure.exit);
+            }
             if let Some(output) = error_output_of(&error) {
                 match machine {
                     Some(MachineErrors::Json) => print_json(&output)?,
@@ -638,27 +670,13 @@ async fn run(cli: Cli) -> Result<()> {
                 let payload = client
                     .branch_merge(&source, &into, delete_branch, &settings)
                     .await?;
-                // Warnings go to stderr so `--json` consumers reading stdout
-                // are unaffected. `branch_deleted: None` after requesting
-                // deletion means an older server ignored the unknown request
-                // field — surface that instead of silently leaving the branch.
-                if delete_branch {
-                    match payload.branch_deleted {
-                        Some(true) => {}
-                        Some(false) => eprintln!(
-                            "warning: merged, but could not delete branch '{}': {}",
-                            payload.source,
-                            payload
-                                .branch_delete_error
-                                .as_deref()
-                                .unwrap_or("unknown error")
-                        ),
-                        None => eprintln!(
-                            "warning: merged, but the server does not support --delete-branch; \
-                             branch '{}' was not deleted",
-                            payload.source
-                        ),
-                    }
+                // Keep the successful merge receipt on stdout; optional
+                // deletion has its own structured result and human warning.
+                if let Some(error) = &payload.branch_delete_error_details {
+                    eprintln!(
+                        "warning: merged, but could not delete branch '{}': {}",
+                        payload.source, error.error
+                    );
                 }
                 if json {
                     print_json(&payload)?;
@@ -1471,24 +1489,7 @@ async fn run(cli: Cli) -> Result<()> {
                     )
                     .await
             };
-            let output = match result {
-                Ok(output) => output,
-                // A lost --if-commit CAS is an expected outcome, not a failure:
-                // emit the structured body or message, then exit
-                // EXIT_PRECONDITION_FAILED.
-                Err(err) => match err.downcast::<helpers::PreconditionFailedCli>() {
-                    Ok(precondition) => {
-                        if json {
-                            print_json(&precondition.output)?;
-                        } else {
-                            eprintln!("{precondition}");
-                        }
-                        std::io::stdout().flush()?;
-                        std::process::exit(EXIT_PRECONDITION_FAILED);
-                    }
-                    Err(err) => return Err(err),
-                },
-            };
+            let output = result?;
             if json {
                 print_json(&output)?;
             } else {

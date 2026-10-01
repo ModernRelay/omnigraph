@@ -2148,18 +2148,21 @@ fn explain_statement_answers_the_plan_as_rows() {
             .arg(EXPLAIN_ADULTS)
             .arg("--json"),
     );
-    let stderr = String::from_utf8_lossy(&refused.stderr);
+    let refusal: Value = serde_json::from_slice(&refused.stdout).unwrap();
     assert!(
-        stderr.contains("statement 'explain' is a read; use POST /query"),
-        "{stderr}"
+        refusal["error"]
+            .as_str()
+            .unwrap()
+            .contains("statement 'explain' is a read; use POST /query"),
+        "{refusal}"
     );
 }
 
 /// GitHub #365: the embedded transport must preserve the typed stale-head
-/// outcome all the way through the CLI boundary. This is deliberately local
-/// and non-ignored so exit code 4 cannot depend on loopback/server coverage.
+/// details all the way through the CLI boundary. A writable open may complete
+/// older work, so this cannot claim whole-command no effects or exit 4.
 #[test]
-fn mutate_if_commit_lost_cas_exits_4_embedded_issue_365() {
+fn mutate_if_commit_lost_cas_preserves_details_embedded_issue_365() {
     const FIND_PERSON: &str =
         "query find($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
     const SET_AGE: &str = "query set_age($name: String, $age: I32) { update Person set { age: $age } where name = $name }";
@@ -2212,8 +2215,8 @@ fn mutate_if_commit_lost_cas_exits_4_embedded_issue_365() {
         .unwrap();
     assert_eq!(
         lost.status.code(),
-        Some(4),
-        "lost embedded --if-commit must exit 4; stderr: {}",
+        Some(1),
+        "embedded writable open prevents whole-command no-effect proof; stderr: {}",
         String::from_utf8_lossy(&lost.stderr)
     );
     let body: Value = serde_json::from_slice(&lost.stdout)
@@ -2221,6 +2224,10 @@ fn mutate_if_commit_lost_cas_exits_4_embedded_issue_365() {
     assert_eq!(
         body["precondition_failure"]["expected"],
         Value::String(stale_head)
+    );
+    assert_eq!(
+        body["command_outcome"],
+        serde_json::json!({"execution":"unknown","effects":"unknown","action":"refresh"})
     );
 
     let verify = output_success(
@@ -2269,6 +2276,12 @@ fn remote_if_commit_fails_closed_against_an_older_server() {
     assert_eq!(error["code"], "api_contract_mismatch");
     assert_eq!(error["http_status"], 404);
     assert_eq!(error["request_dispatched"], false);
+    assert_eq!(
+        error["command_outcome"],
+        serde_json::json!({
+            "execution":"not_started", "effects":"none", "action":"refresh"
+        })
+    );
     let requests = server.requests();
     assert_eq!(
         requests.len(),
@@ -2321,6 +2334,43 @@ fn remote_json_errors_preserve_server_codes_and_details() {
             }),
             4,
         ),
+        (
+            vec!["mutate", "restricted", "--if-commit", "head-before"],
+            409,
+            serde_json::json!({
+                "error":"wrong status cannot establish a conditional refusal",
+                "precondition_failure":{"expected":"head-before","actual":"head-after"}
+            }),
+            1,
+        ),
+        (
+            vec!["mutate", "restricted", "--if-commit", "head-before"],
+            412,
+            serde_json::json!({
+                "error":"wrong condition cannot establish this request's refusal",
+                "precondition_failure":{"expected":"another-condition","actual":"head-after"}
+            }),
+            1,
+        ),
+        (
+            vec!["mutate", "restricted"],
+            412,
+            serde_json::json!({
+                "error":"unsolicited condition cannot establish a refusal",
+                "precondition_failure":{"expected":"head-before","actual":"head-after"}
+            }),
+            1,
+        ),
+        (
+            vec!["mutate", "restricted", "--if-commit", "head-before"],
+            412,
+            serde_json::json!({
+                "error":"contradictory effect evidence cannot establish a refusal",
+                "precondition_failure":{"expected":"head-before","actual":"head-after"},
+                "recovery_required":{"operation_id":"published"}
+            }),
+            1,
+        ),
     ] {
         let formats: &[&[&str]] = if arguments[0] == "query" {
             &[&["--json"], &["--format", "json"]]
@@ -2341,11 +2391,25 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 Some(exit),
                 "{arguments:?} {format:?}: {output:?}"
             );
+            let mut actual = serde_json::from_slice::<Value>(&output.stdout).unwrap_or_else(|error| {
+                panic!("{arguments:?} {format:?} lost structured HTTP {status}: {error}; {output:?}")
+            });
+            if arguments[0] == "mutate" {
+                assert_eq!(actual["http_status"], status);
+                assert_eq!(
+                    actual["command_outcome"]["execution"],
+                    if exit == 4 { "not_started" } else { "unknown" }
+                );
+                assert_eq!(
+                    actual["command_outcome"]["effects"],
+                    if exit == 4 { "none" } else { "unknown" }
+                );
+                let fields = actual.as_object_mut().unwrap();
+                fields.remove("http_status");
+                fields.remove("command_outcome");
+            }
             assert_eq!(
-                serde_json::from_slice::<Value>(&output.stdout).unwrap_or_else(|error| {
-                    panic!("{arguments:?} {format:?} lost structured HTTP {status}: {error}; {output:?}")
-                }),
-                body,
+                actual, body,
                 "{arguments:?} {format:?} must preserve the server's complete error contract"
             );
             assert!(
@@ -2354,6 +2418,164 @@ fn remote_json_errors_preserve_server_codes_and_details() {
             );
             server.assert_complete();
         }
+    }
+}
+
+/// Whole-command retry classification needs real CLI processes and a wire
+/// census; row/error GQT expectations cannot observe exits or resubmission.
+#[test]
+fn data_write_outcomes_and_retry_permission_issue_466() {
+    use support::managed_http::{IntentApiFixture, IntentReply};
+
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("batch.ndjson");
+    fs::write(&data, "").unwrap();
+    let schema = temp.path().join("schema.pg");
+    fs::write(&schema, "node Person { name: String }").unwrap();
+    let data = data.to_str().unwrap();
+    let schema = schema.to_str().unwrap();
+    let commands = [
+        vec!["mutate", "stored_write"],
+        vec!["mutate", "-e", "mutation write() {}"],
+        vec!["change", "-e", "branch create review"],
+        vec!["branch", "create", "review"],
+        vec!["branch", "delete", "review", "--yes"],
+        vec!["branch", "merge", "review"],
+        vec!["load", "--data", data, "--mode", "append"],
+        vec![
+            "load", "--data", data, "--mode", "merge", "--branch", "review", "--from", "main",
+        ],
+        vec!["ingest", "--data", data],
+        vec!["schema", "apply", "--schema", schema],
+    ];
+    let cases = [
+        (
+            429,
+            serde_json::json!({"error":"actor is busy","code":"too_many_requests"}),
+            75,
+            "retry",
+        ),
+        (
+            429,
+            serde_json::json!({"error":"unqualified proxy throttle"}),
+            1,
+            "reconcile",
+        ),
+        (
+            409,
+            serde_json::json!({"error":"conflict","code":"conflict"}),
+            1,
+            "reconcile",
+        ),
+        (
+            503,
+            serde_json::json!({"error":"unavailable"}),
+            1,
+            "reconcile",
+        ),
+        (
+            409,
+            serde_json::json!({"error":"authority changed","read_set_conflict":{"member":"graph_head","expected":"before","actual":"after"}}),
+            1,
+            "refresh",
+        ),
+        (
+            409,
+            serde_json::json!({"error":"input too large","resource_limit":{"resource":"entities","limit":10,"actual":11}}),
+            1,
+            "refresh",
+        ),
+        (
+            503,
+            serde_json::json!({"error":"schema completion required","recovery_required":{"operation_id":"published-commit"}}),
+            1,
+            "recover",
+        ),
+        (
+            429,
+            serde_json::json!({"error":"contradictory refusal","code":"too_many_requests","recovery_required":{"operation_id":"published-commit"}}),
+            1,
+            "recover",
+        ),
+    ];
+    for arguments in &commands {
+        for (status, body, exit, action) in &cases {
+            let mut reply = IntentReply::json(*status, body.clone());
+            reply.headers.push(("Retry-After".into(), "17".into()));
+            let server = IntentApiFixture::graph(vec![reply]);
+            let output = cli()
+                .env_remove("OMNIGRAPH_BEARER_TOKEN")
+                .args([
+                    "--quiet",
+                    "--server",
+                    &server.origin,
+                    "--graph",
+                    "knowledge",
+                ])
+                .args(arguments)
+                .arg("--json")
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(*exit),
+                "{arguments:?} HTTP {status}: {output:?}"
+            );
+            let mut actual = parse_stdout_json(&output);
+            assert_eq!(actual["http_status"], *status);
+            assert_eq!(actual["retry_after"], "17");
+            assert_eq!(
+                actual["command_outcome"],
+                serde_json::json!({
+                    "execution": if *exit == 75 {"not_started"} else {"unknown"},
+                    "effects": if *exit == 75 {"none"} else {"unknown"},
+                    "action": action,
+                }),
+                "{arguments:?} HTTP {status}"
+            );
+            let fields = actual.as_object_mut().unwrap();
+            fields.remove("command_outcome");
+            fields.remove("http_status");
+            fields.remove("retry_after");
+            assert_eq!(&actual, body, "preserve every typed detail");
+            assert_eq!(
+                server.requests().len(),
+                2,
+                "one discovery and one submission, without replay"
+            );
+            server.assert_complete();
+        }
+    }
+
+    // Both bad JSON and a severed body may follow graph publication. The
+    // fixture writes fewer bytes than Content-Length in the second case.
+    for headers in [vec![], vec![("Content-Length".into(), "1024".into())]] {
+        let server = IntentApiFixture::graph(vec![IntentReply {
+            status: 200,
+            headers,
+            body: b"{unfinished".to_vec(),
+        }]);
+        let output = cli()
+            .args([
+                "--server",
+                &server.origin,
+                "--graph",
+                "knowledge",
+                "mutate",
+                "stored_write",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let actual = parse_stdout_json(&output);
+        assert_eq!(
+            actual["command_outcome"],
+            serde_json::json!({"execution":"unknown","effects":"unknown","action":"reconcile"})
+        );
+        assert_eq!(actual["http_status"], 200);
+        assert_eq!(server.requests().len(), 2);
+        server.assert_complete();
     }
 }
 
@@ -2922,11 +3144,10 @@ fn branch_delete_against_non_local_scope_refuses_without_yes() {
             .arg("feature")
             .arg("--json"),
     );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("refusing destructive `branch delete`") && stderr.contains("--yes"),
-        "expected a non-local destructive refusal; stderr: {stderr}"
-    );
+    let output = parse_stdout_json(&output);
+    let error = output["error"].as_str().unwrap();
+    assert!(error.contains("refusing destructive `branch delete`") && error.contains("--yes"));
+    assert_eq!(output["command_outcome"]["effects"], "none");
 }
 
 #[test]
@@ -2963,11 +3184,14 @@ fn overwrite_load_against_non_local_scope_refuses_without_yes() {
             .arg("s3://fake-bucket/g.omni")
             .arg("--json"),
     );
-    let stderr = String::from_utf8(output.stderr).unwrap();
+    let output = parse_stdout_json(&output);
     assert!(
-        stderr.contains("refusing destructive `load --mode overwrite`"),
-        "expected a non-local overwrite refusal; stderr: {stderr}"
+        output["error"]
+            .as_str()
+            .unwrap()
+            .contains("refusing destructive `load --mode overwrite`")
     );
+    assert_eq!(output["command_outcome"]["effects"], "none");
 }
 
 #[test]
@@ -3070,13 +3294,32 @@ fn branch_merge_defaults_target_to_main() {
             .arg("merge")
             .arg("--uri")
             .arg(&graph)
-            .arg("feature")
+            .arg(" feature ")
             .arg("--json"),
     );
     let merge_payload: Value = serde_json::from_slice(&merge_output.stdout).unwrap();
     assert_eq!(merge_payload["source"], "feature");
     assert_eq!(merge_payload["target"], "main");
     assert_eq!(merge_payload["outcome"], "fast_forward");
+    let receipt = &merge_payload["commit"];
+    assert!(receipt["graph_commit_id"].is_string(), "{merge_payload}");
+    assert!(receipt["parent_commit_id"].is_string(), "{merge_payload}");
+    assert!(
+        receipt["merged_parent_commit_id"].is_string(),
+        "{merge_payload}"
+    );
+    let persisted = parse_stdout_json(&output_success(
+        cli()
+            .args([
+                "commit",
+                "show",
+                receipt["graph_commit_id"].as_str().unwrap(),
+                "--uri",
+            ])
+            .arg(&graph)
+            .arg("--json"),
+    ));
+    assert_eq!(*receipt, persisted);
 
     let snapshot_output = output_success(
         cli()
@@ -3096,6 +3339,172 @@ fn branch_merge_defaults_target_to_main() {
         .as_u64()
         .unwrap();
     assert_eq!(person_entity_count, 5);
+}
+
+#[test]
+fn remote_merge_requires_consistent_receipts_without_replay() {
+    use serde_json::json;
+    use support::managed_http::{IntentApiFixture, IntentReply};
+
+    for (source, target) in [(" ", "main"), ("review", "\t")] {
+        let server = IntentApiFixture::graph(vec![]);
+        let output = output_failure(cli().args([
+            "--server",
+            &server.origin,
+            "--graph",
+            "knowledge",
+            "branch",
+            "merge",
+            source,
+            "--into",
+            target,
+        ]));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("branch merge source and target must not be empty"),
+            "{output:?}"
+        );
+        assert!(server.requests().is_empty());
+        server.assert_complete();
+    }
+
+    let commit = json!({
+        "graph_commit_id": "merge-a", "graph_manifest_version": 9,
+        "graph_branch": null, "parent_commit_id": "target-before",
+        "merged_parent_commit_id": "source-before", "actor_id": "alice",
+        "created_at": 1234567
+    });
+    for (statement, padded) in [(false, false), (false, true), (true, false)] {
+        let mut cases = vec![
+            ("fast_forward", Some(commit.clone()), true),
+            ("merged", Some(commit.clone()), true),
+            ("already_up_to_date", Some(Value::Null), true),
+            ("fast_forward", None, false),
+            ("merged", Some(Value::Null), false),
+            ("already_up_to_date", None, false),
+            ("already_up_to_date", Some(commit.clone()), false),
+        ];
+        for (field, value) in [
+            ("graph_branch", json!("other")),
+            ("graph_commit_id", json!("")),
+            ("graph_manifest_version", json!(0)),
+            ("parent_commit_id", Value::Null),
+            ("merged_parent_commit_id", Value::Null),
+            ("actor_id", json!("somebody-else")),
+        ] {
+            let mut bad_commit = commit.clone();
+            bad_commit[field] = value;
+            cases.push(("merged", Some(bad_commit), false));
+        }
+        for (outcome, receipt, valid) in cases {
+            let mut body = if statement {
+                json!({"branch":"main", "query_name":"branch merge",
+                    "affected_nodes":0, "affected_edges":0, "actor_id":"alice",
+                    "outcome":{"kind":"merged", "source":"review", "target":"main", "merge":outcome}})
+            } else {
+                json!({"source":"review", "target":"main", "outcome":outcome, "actor_id":"alice"})
+            };
+            if let Some(receipt) = receipt {
+                body["commit"] = receipt;
+            }
+            let server = IntentApiFixture::graph(vec![IntentReply::json(200, body.clone())]);
+            let mut command = cli();
+            command.args(["--server", &server.origin, "--graph", "knowledge"]);
+            if statement {
+                command.args(["mutate", "-e", "branch merge review into main", "--json"]);
+            } else if padded {
+                command.args(["branch", "merge", " review ", "--into", " main ", "--json"]);
+            } else {
+                command.args(["branch", "merge", "review", "--json"]);
+            }
+            let output = command.output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(if valid { 0 } else { 1 }),
+                "{body}: {output:?}"
+            );
+            if valid {
+                assert_eq!(parse_stdout_json(&output), body);
+            } else {
+                assert!(
+                    !stdout_string(&output).contains("graph_commit_id"),
+                    "invalid receipt reported as success: {output:?}"
+                );
+            }
+            server.assert_complete();
+            let requests = server.workflow_requests();
+            assert_eq!(
+                requests.len(),
+                1,
+                "a protocol failure must not replay the merge"
+            );
+            assert_eq!(requests[0].method, "POST");
+            if !statement {
+                assert_eq!(requests[0].body["source"], "review");
+                assert_eq!(requests[0].body["target"], "main");
+            }
+        }
+    }
+
+    // Optional deletion has its own required result. An old alias or missing
+    // structured failure cannot turn an incomplete response into success.
+    for (deleted, details, legacy, valid) in [
+        (Some(true), None, None, true),
+        (
+            Some(false),
+            Some(json!({"error":"deletion denied", "code":"forbidden"})),
+            None,
+            true,
+        ),
+        (None, None, None, false),
+        (Some(false), None, None, false),
+        (Some(false), None, Some("deletion denied"), false),
+        (
+            Some(true),
+            Some(json!({"error":"deletion denied"})),
+            None,
+            false,
+        ),
+    ] {
+        let mut body = json!({"source":"review", "target":"main", "outcome":"merged",
+            "actor_id":"alice", "commit":commit});
+        if let Some(deleted) = deleted {
+            body["branch_deleted"] = json!(deleted);
+        }
+        if let Some(details) = details {
+            body["branch_delete_error_details"] = details;
+        }
+        if let Some(legacy) = legacy {
+            body["branch_delete_error"] = json!(legacy);
+        }
+        let server = IntentApiFixture::graph(vec![IntentReply::json(200, body.clone())]);
+        let output = cli()
+            .args([
+                "--server",
+                &server.origin,
+                "--graph",
+                "knowledge",
+                "branch",
+                "merge",
+                " review ",
+                "--into",
+                " main ",
+                "--delete-branch",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if valid { 0 } else { 1 }),
+            "{body}: {output:?}"
+        );
+        if valid {
+            assert_eq!(parse_stdout_json(&output), body);
+        }
+        server.assert_complete();
+        assert_eq!(server.workflow_requests().len(), 1);
+    }
 }
 
 #[test]
@@ -3217,7 +3626,9 @@ fn branch_merge_delete_branch_retires_parent_with_live_child() {
     let merge_payload: Value = serde_json::from_slice(&merge_output.stdout).unwrap();
     assert_eq!(merge_payload["outcome"], "fast_forward");
     assert_eq!(merge_payload["branch_deleted"], true);
-    assert!(merge_payload["branch_delete_error"].is_null());
+    assert!(merge_payload.get("branch_delete_error").is_none());
+    assert!(merge_payload.get("branch_delete_error_details").is_none());
+    assert!(merge_payload["commit"]["graph_commit_id"].is_string());
 
     let list_output = output_success(
         cli()
@@ -3267,8 +3678,11 @@ fn branch_merge_delete_branch_refusal_warns_and_exits_zero() {
     let merge_payload: Value = serde_json::from_slice(&merge_output.stdout).unwrap();
     assert_eq!(merge_payload["outcome"], "already_up_to_date");
     assert_eq!(merge_payload["branch_deleted"], false);
+    assert!(merge_payload.get("branch_delete_error").is_none());
+    assert!(merge_payload["branch_delete_error_details"]["code"].is_string());
+    assert_eq!(merge_payload.get("commit"), Some(&Value::Null));
     assert!(
-        merge_payload["branch_delete_error"]
+        merge_payload["branch_delete_error_details"]["error"]
             .as_str()
             .unwrap()
             .contains("cannot delete branch 'main'")
