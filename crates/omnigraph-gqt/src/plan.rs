@@ -23,6 +23,7 @@
 //! filter reads [a.state, b.state]
 //! pass projection_pushdown
 //! not pass aggregate_pushdown
+//! validation scope exact_subset
 //! ```
 //!
 //! A `ran` claim names the side of the node's declared switch that ran,
@@ -30,6 +31,7 @@
 //! node's row), joined to the explain row by the node's `id`.
 
 use omnigraph_compiler::catalog::Catalog;
+use omnigraph_planner::ValidationScope;
 use omnigraph_planner::optimizer::{
     PASS_ACCESS_PATH, PASS_ADDRESS_SHORT_CIRCUIT, PASS_AGGREGATE_PUSHDOWN, PASS_EXPAND_MODE,
     PASS_FRAGMENT_SCOPE, PASS_JOIN_ALGORITHM, PASS_LATE_MATERIALIZATION, PASS_PREDICATE_PUSHDOWN,
@@ -40,7 +42,7 @@ use serde_json::Value;
 
 use crate::report::Row;
 
-const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `hash join $var[ ran <hash_join|id_lookup>]`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `rank fuse row tiebreak [$e.@type, $e.@id]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `pass <name>`, `not pass <name>`";
+const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `hash join $var[ ran <hash_join|id_lookup>]`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `rank fuse row tiebreak [$e.@type, $e.@id]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `pass <name>`, `not pass <name>`, `validation scope <exact_subset|invariants_only>`";
 
 const ID_LOOKUP: &str = "id_lookup";
 const JOIN_SIDES: [&str; 2] = ["hash_join", "id_lookup"];
@@ -130,6 +132,9 @@ pub(crate) enum PlanLine {
     Sort { tiebreak: Vec<String> },
     /// The optimizer pass `name` fired, or did not when `negated`.
     Pass { name: String, negated: bool },
+    /// Acceptance checked the plan to `scope` (`exact_subset` or
+    /// `invariants_only`), as the document's `validation` reports it.
+    ValidationScope { scope: String },
 }
 
 #[derive(Debug, Default)]
@@ -176,6 +181,21 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             lines.push(PlanLine::Pass {
                 name: name.to_string(),
                 negated,
+            });
+            continue;
+        }
+        if let Some(scope) = line.strip_prefix("validation scope ") {
+            let scope = scope.trim();
+            if ![
+                ValidationScope::ExactSubset.as_str(),
+                ValidationScope::InvariantsOnly.as_str(),
+            ]
+            .contains(&scope)
+            {
+                return Err(refused("names `exact_subset` or `invariants_only`"));
+            }
+            lines.push(PlanLine::ValidationScope {
+                scope: scope.to_string(),
             });
             continue;
         }
@@ -859,6 +879,20 @@ pub(crate) fn plan_mismatch(
         .unwrap_or_default();
     for line in lines {
         match line {
+            PlanLine::ValidationScope { scope } => {
+                let reported = explain
+                    .get("validation")
+                    .and_then(|validation| validation.get("scope"))
+                    .and_then(Value::as_str);
+                if reported != Some(scope.as_str()) {
+                    return Some(format!(
+                        "expect plan: validation scope {scope}; the document reports {}",
+                        reported.map_or("no validation".to_string(), |reported| format!(
+                            "scope {reported}"
+                        ))
+                    ));
+                }
+            }
             PlanLine::Pass { name, negated } => {
                 let fired = passes.iter().any(|pass| pass == name);
                 if fired && *negated {
@@ -1409,6 +1443,30 @@ mod tests {
         let lines = parse_plan_body(&body).unwrap();
         assert_eq!(lines.len(), 7);
         assert_eq!(check(&lines, &explain()), None);
+    }
+
+    /// The scope claim reads the document's `validation`; a different scope
+    /// or a document without one fails, and an unknown scope is refused.
+    #[test]
+    fn validation_scope_claims_read_the_documents_validation() {
+        let lines = parse_plan_body(&[(0, "validation scope invariants_only")]).unwrap();
+        assert_eq!(
+            lines[0],
+            PlanLine::ValidationScope {
+                scope: "invariants_only".to_string()
+            }
+        );
+        let accepted = json!({"validation": {"scope": "invariants_only"}});
+        assert_eq!(check(&lines, &accepted), None);
+        let exact = json!({"validation": {"scope": "exact_subset"}});
+        let mismatch = check(&lines, &exact).unwrap();
+        assert!(
+            mismatch.contains("reports scope exact_subset"),
+            "{mismatch}"
+        );
+        let mismatch = check(&lines, &explain()).unwrap();
+        assert!(mismatch.contains("reports no validation"), "{mismatch}");
+        assert!(parse_plan_body(&[(0, "validation scope everything")]).is_err());
     }
 
     #[test]

@@ -33,6 +33,12 @@ pub enum RankKind {
 }
 
 impl RankKind {
+    /// Whether the retrieval's contract is approximate: `nearest` membership
+    /// is, even when a run scores flat; `bm25` matching is exact.
+    pub fn approximate(self) -> bool {
+        self == Self::Nearest
+    }
+
     /// The column Lance appends and the direction the query sorts it by.
     pub fn score(self) -> (&'static str, bool) {
         match self {

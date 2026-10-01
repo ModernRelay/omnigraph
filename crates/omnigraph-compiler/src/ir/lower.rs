@@ -21,16 +21,26 @@ struct FreshNames {
     temp: usize,
 }
 
+const ANON_PREFIX: &str = "__anon_";
+const TEMP_PREFIX: &str = "__temp_";
+
 impl FreshNames {
     fn anon(&mut self) -> String {
         self.anon += 1;
-        format!("__anon_{}", self.anon)
+        format!("{ANON_PREFIX}{}", self.anon)
     }
 
     fn temp(&mut self, dst: &str) -> String {
         self.temp += 1;
-        format!("__temp_{}_{}", dst, self.temp)
+        format!("{TEMP_PREFIX}{}_{}", dst, self.temp)
     }
+}
+
+/// Whether `variable` is a name the lowering made up: an anonymous `_`
+/// endpoint or a cycle-closing or renamed temp. The query declares no such
+/// binding, so its identity orders nothing a reader can see.
+pub fn is_fresh_variable(variable: &str) -> bool {
+    variable.starts_with(ANON_PREFIX) || variable.starts_with(TEMP_PREFIX)
 }
 
 /// What every expression site shares: the parameters, the physical column

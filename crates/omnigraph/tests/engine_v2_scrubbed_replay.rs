@@ -163,7 +163,10 @@ async fn the_replay_runs_under_the_captured_memory_limit_not_the_ambient_one() {
     );
     let replay = with_query_memory_limit(
         1,
-        v2.replay_bound_plan(ReadTarget::branch("main"), run.plan.clone()),
+        v2.replay_bound_plan(
+            ReadTarget::branch("main"),
+            &run.replay_envelope(QUERY, "liked"),
+        ),
     )
     .await
     .expect("the ambient 1-byte limit is not read; the plan's 64 MiB is");
@@ -209,7 +212,10 @@ async fn the_replay_reads_the_plans_env_pair_not_the_process_environment() {
     // SAFETY: the test is `#[serial]` and restores the variable before it returns.
     unsafe { std::env::set_var(EXPAND_INDEXED_MAX_FRONTIER_ENV, "1") };
     let replay = v2
-        .replay_bound_plan(ReadTarget::branch("main"), run.plan.clone())
+        .replay_bound_plan(
+            ReadTarget::branch("main"),
+            &run.replay_envelope(QUERY, "liked"),
+        )
         .await;
     let replanned = v2
         .query_inspected(ReadTarget::branch("main"), QUERY, "liked", &ParamMap::new())
@@ -301,13 +307,14 @@ async fn ann_nprobes_is_a_field_of_the_ranked_scan_and_the_rows_do_not_move() {
                 .contains(&format!("\"nprobes\":{nprobes}")),
             "{explain}"
         );
+        let envelope = run.replay_envelope(NEAREST, "by_vector");
         let replay = session
-            .replay_bound_plan(ReadTarget::branch("main"), run.plan.clone())
+            .replay_bound_plan(ReadTarget::branch("main"), &envelope)
             .await
             .unwrap();
         assert_eq!(rows_of(&replay.result), rows_of(&run.result));
         runs.push(rows_of(&run.result));
-        plans.push(run.plan.clone());
+        plans.push(envelope);
     }
     assert_eq!(
         runs[0], runs[1],
@@ -315,7 +322,7 @@ async fn ann_nprobes_is_a_field_of_the_ranked_scan_and_the_rows_do_not_move() {
     );
     assert_eq!(runs[0].len(), 3);
     let crossed = with_setting(&v2, "ann_nprobes", "64")
-        .replay_bound_plan(ReadTarget::branch("main"), plans[0].clone())
+        .replay_bound_plan(ReadTarget::branch("main"), &plans[0])
         .await
         .expect("the door takes a plan gathered under another session's cap");
     assert_eq!(

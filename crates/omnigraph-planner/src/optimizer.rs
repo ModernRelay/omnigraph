@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use omnigraph_compiler::QueryDiagnostic;
-use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
+use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR, is_fresh_variable};
 use omnigraph_compiler::query::ast::AggFunc;
 use omnigraph_compiler::query::codes::{P001, P002, P004};
 use omnigraph_compiler::settings::Traversal;
@@ -647,8 +647,11 @@ fn visible_scope(plan: &LogicalPlan, id: LogicalId) -> Vec<&LogicalNode> {
     nodes
 }
 
-/// Candidate identity keys in binding order. Physical spellings are used
-/// only to recognize user order keys; the plan retains logical metadata.
+/// Candidate identity keys: every binding the query declares in
+/// binding-name order, then the bindings the lowering made up (anonymous
+/// endpoints, cycle temps), whose identities only order rows a reader cannot
+/// tell apart. Physical spellings are used only to recognize user order
+/// keys; the plan retains logical metadata.
 fn scope_tiebreaks(
     plan: &LogicalPlan,
     id: LogicalId,
@@ -678,6 +681,8 @@ fn scope_tiebreaks(
             _ => {}
         }
     }
+    let mut bindings: Vec<_> = bindings.into_iter().collect();
+    bindings.sort_by_key(|(binding, _)| is_fresh_variable(binding));
     let mut out = Vec::new();
     for (binding, (id_column, selected_edge)) in bindings {
         if selected_edge {
@@ -1204,6 +1209,8 @@ fn expected_rank_fuse_row_tiebreaks(
         }
     }
     bindings.remove(fused_binding);
+    let mut bindings: Vec<_> = bindings.into_iter().collect();
+    bindings.sort_by_key(|(binding, _)| is_fresh_variable(binding));
     let mut keys = Vec::new();
     for (binding, selected) in bindings {
         if selected {
@@ -3062,7 +3069,7 @@ fn variable_offset_width(data_type: &DataType) -> u64 {
 
 /// The candidates a nearest arm of an `rrf()` asks for when the query has
 /// no limit.
-const RRF_NEAREST_ARM_K: usize = 100;
+pub(crate) const RRF_NEAREST_ARM_K: usize = 100;
 
 /// The ordering a ranked scan or a fusion carries: `nearest` ranks by
 /// ascending `_distance`, `bm25` by descending `_score`, `rrf` by the fused rank.

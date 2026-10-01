@@ -81,9 +81,10 @@ async fn incomplete_rank_fuse_row_tiebreak_refuses_replay_issue_659() {
     let expected =
         vec![serde_json::json!({"edge_type":"Knows","edge_id":"shared","target":larger})];
     assert_eq!(rows_of(&first.result), expected);
-    let encoded = serde_json::to_value(&first.plan).unwrap();
-    let restored = serde_json::from_value(encoded.clone()).unwrap();
-    let replay = db.replay_bound_plan("main", restored).await.unwrap();
+    let encoded: Value =
+        serde_json::from_slice(&first.replay_envelope(query, "selected_page")).unwrap();
+    let restored = serde_json::to_vec(&encoded).unwrap();
+    let replay = db.replay_bound_plan("main", &restored).await.unwrap();
     assert_eq!(rows_of(&replay.result), expected);
     let type_key = serde_json::json!({"binding":"e","property":"@type"});
     let edge_key = serde_json::json!({"binding":"e","property":"@id"});
@@ -103,7 +104,7 @@ async fn incomplete_rank_fuse_row_tiebreak_refuses_replay_issue_659() {
         ),
     ] {
         let mut altered = encoded.clone();
-        let keys = altered["body"]["plan"]["slots"]
+        let keys = altered["plan"]["body"]["plan"]["slots"]
             .as_array_mut()
             .unwrap()
             .iter_mut()
@@ -113,8 +114,8 @@ async fn incomplete_rank_fuse_row_tiebreak_refuses_replay_issue_659() {
             .expect("the saved RankFuse carries a row_tiebreak list");
         assert_eq!(*keys, expected_keys);
         *keys = altered_keys;
-        let altered = serde_json::from_value(altered).unwrap();
-        let error = match db.replay_bound_plan("main", altered).await {
+        let altered = serde_json::to_vec(&altered).unwrap();
+        let error = match db.replay_bound_plan("main", &altered).await {
             Err(error) => error,
             Ok(replay) => panic!(
                 "{mutation}: incomplete RankFuse row_tiebreak must refuse; replay returned {:?}",
@@ -149,10 +150,17 @@ async fn wildcard_replay_keeps_captured_members_and_pins_every_member_issue_659(
     )
     .await
     .unwrap();
-    let captured: omnigraph_planner::BoundPlan =
-        serde_json::from_value(serde_json::to_value(&first.plan).unwrap()).unwrap();
-    let replay = db.replay_bound_plan("main", captured).await.unwrap();
-    assert_eq!(rows_of(&replay.result), rows_of(&first.result));
+    let captured = first.replay_envelope(WILDCARD_LIKES_QUERY, "selected");
+    let error = db
+        .replay_bound_plan("main", &captured)
+        .await
+        .err()
+        .expect("a plan accepted under the old schema is not replayed under the new one");
+    assert!(
+        matches!(&error, OmniError::Manifest(manifest) if manifest.kind == omnigraph::error::ManifestErrorKind::Conflict)
+            && error.to_string().contains("accepted under schema"),
+        "{error}"
+    );
     let fresh = db
         .query_inspected("main", WILDCARD_LIKES_QUERY, "selected", &ParamMap::new())
         .await
@@ -195,7 +203,10 @@ async fn wildcard_replay_keeps_captured_members_and_pins_every_member_issue_659(
     .await
     .unwrap();
     let error = db
-        .replay_bound_plan("main", fresh.plan)
+        .replay_bound_plan(
+            "main",
+            &fresh.replay_envelope(WILDCARD_LIKES_QUERY, "selected"),
+        )
         .await
         .err()
         .expect("every member is pinned");
@@ -409,23 +420,44 @@ async fn historical_replay_checks_marker_and_live_wildcards_issue_659() {
         .query_inspected("main", WILDCARD_LIKES_QUERY, "selected", &ParamMap::new())
         .await
         .unwrap();
+    let wildcard_envelope = |plan| {
+        omnigraph_planner::ReplayEnvelope::new(
+            WILDCARD_LIKES_QUERY,
+            "selected",
+            plan,
+            &wildcard.evidence,
+            wildcard.catalog.clone(),
+        )
+        .to_bytes()
+    };
     let mut live_only = wildcard.plan.clone();
     let mut assumptions = live_only.plan.assumptions().clone();
     assumptions.has_wildcard_traversal = false;
     live_only.plan.set_assumptions(assumptions);
-    let mut marker_only = db
+    let count = db
         .query_inspected("main", PEOPLE_QUERIES, "count_people", &ParamMap::new())
         .await
-        .unwrap()
-        .plan;
+        .unwrap();
+    let mut marker_only = count.plan.clone();
     let mut assumptions = marker_only.plan.assumptions().clone();
     assumptions.has_wildcard_traversal = true;
     assumptions.traversal_work_limit = wildcard.plan.plan.assumptions().traversal_work_limit;
     marker_only.plan.set_assumptions(assumptions);
-    for bound in [wildcard.plan, live_only, marker_only] {
-        let bound = serde_json::from_value(serde_json::to_value(bound).unwrap()).unwrap();
+    let marker_only = omnigraph_planner::ReplayEnvelope::new(
+        PEOPLE_QUERIES,
+        "count_people",
+        marker_only,
+        &count.evidence,
+        count.catalog.clone(),
+    )
+    .to_bytes();
+    for envelope in [
+        wildcard_envelope(wildcard.plan.clone()),
+        wildcard_envelope(live_only),
+        marker_only,
+    ] {
         let error = db
-            .replay_bound_plan(ReadTarget::Snapshot(snapshot.clone()), bound)
+            .replay_bound_plan(ReadTarget::Snapshot(snapshot.clone()), &envelope)
             .await
             .err()
             .expect("historical wildcard replay");
@@ -664,14 +696,14 @@ async fn replayed(db: &Session, source: &str, name: &str, params: &ParamMap) -> 
         .query_inspected(ReadTarget::branch("main"), source, name, params)
         .await
         .unwrap();
-    let serialized = serde_json::to_value(&run.plan).unwrap();
-    let bound: omnigraph_planner::BoundPlan = serde_json::from_value(serialized).unwrap();
-    assert_eq!(bound, run.plan, "the bound plan reads back equal");
+    let envelope = run.replay_envelope(source, name);
+    let read_back = omnigraph_planner::decode_replay(&envelope, Default::default()).unwrap();
+    assert_eq!(read_back.plan, run.plan, "the bound plan reads back equal");
     let result = rows_of(&run.result);
     let rows = report_rows(&run.report);
     for _ in 0..2 {
         let replay = db
-            .replay_bound_plan(ReadTarget::branch("main"), bound.clone())
+            .replay_bound_plan(ReadTarget::branch("main"), &envelope)
             .await
             .unwrap();
         assert_eq!(rows_of(&replay.result), result);
@@ -782,11 +814,14 @@ async fn edited_replay_refusal(
         )
         .await
         .unwrap();
-    let mut serialized = serde_json::to_value(&run.plan).unwrap();
-    edit_objects(&mut serialized, edit);
-    let bound: omnigraph_planner::BoundPlan = serde_json::from_value(serialized).unwrap();
+    let mut serialized: Value =
+        serde_json::from_slice(&run.replay_envelope(CITATION_QUERIES, "cited")).unwrap();
+    edit_objects(&mut serialized["plan"], edit);
     match db
-        .replay_bound_plan(ReadTarget::branch("main"), bound)
+        .replay_bound_plan(
+            ReadTarget::branch("main"),
+            &serde_json::to_vec(&serialized).unwrap(),
+        )
         .await
     {
         Ok(replay) => panic!("the edited plan replays: {:?}", rows_of(&replay.result)),
@@ -817,23 +852,46 @@ async fn a_marker_that_disagrees_with_its_contains_join_refuses_the_replay() {
     }
 }
 
-/// A replayed plan whose `ContainsJoin` became a plain `CrossJoin` leaves a
-/// marked scan no join fills: the lowering refuses it instead of running it.
+/// A replayed plan whose `ContainsJoin` became a `CrossJoin` testing the same
+/// conjuncts passes acceptance but leaves a marked scan no join fills: the
+/// lowering refuses it instead of running it. The same rewrite dropping the
+/// conjunct is refused by acceptance, which finds the predicate gone.
 #[tokio::test]
 async fn a_marker_with_no_contains_join_refuses_the_replay() {
-    let error = edited_replay_refusal(&mut |object| {
-        if object.get("node") == Some(&Value::from("ContainsJoin")) {
+    use omnigraph_compiler::ir::IRExpr;
+    use omnigraph_compiler::query::ast::CompOp;
+    use omnigraph_planner::mirror::ExprMirror;
+    for keep_conjunct in [true, false] {
+        let error = edited_replay_refusal(&mut |object| {
+            if object.get("node") != Some(&Value::from("ContainsJoin")) {
+                return;
+            }
+            let side = |key: &str| {
+                let pair = object[key].as_array().unwrap();
+                IRExpr::PropAccess {
+                    variable: pair[0].as_str().unwrap().to_string(),
+                    property: pair[1].as_str().unwrap().to_string(),
+                }
+            };
+            let conjunct =
+                IRExpr::comparison(side("haystack"), CompOp::StringContains, side("needle"));
+            let mut filters = Vec::new();
+            if keep_conjunct {
+                filters.push(serde_json::to_value(ExprMirror::from(&conjunct)).unwrap());
+            }
+            filters.extend(object["residual"].as_array().cloned().unwrap_or_default());
             object.retain(|key, _| matches!(key.as_str(), "node" | "left" | "right"));
-            object.insert("node".to_string(), Value::from("CrossJoin"));
-        }
-    })
-    .await;
-    assert!(
-        error
-            .to_string()
-            .contains("carries a runtime filter no contains join fills"),
-        "{error}"
-    );
+            object.insert("node".to_string(), Value::from("FilteredCrossJoin"));
+            object.insert("filters".to_string(), Value::from(filters));
+        })
+        .await;
+        let expected = if keep_conjunct {
+            "carries a runtime filter no contains join fills"
+        } else {
+            "predicate retention: the plan tests no conjunct for `$p.text contains $m.number`"
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+    }
 }
 
 #[tokio::test]
@@ -953,7 +1011,10 @@ async fn an_edge_write_after_planning_refuses_the_replay() {
     .await
     .unwrap();
     let refused = db
-        .replay_bound_plan(ReadTarget::branch("main"), run.plan.clone())
+        .replay_bound_plan(
+            ReadTarget::branch("main"),
+            &run.replay_envelope(PEOPLE_QUERIES, "liked"),
+        )
         .await
         .err()
         .expect("the edge table moved");
@@ -987,7 +1048,10 @@ async fn a_write_to_an_unread_table_leaves_the_replay_accepted() {
     .await
     .unwrap();
     let replay = db
-        .replay_bound_plan(ReadTarget::branch("main"), run.plan.clone())
+        .replay_bound_plan(
+            ReadTarget::branch("main"),
+            &run.replay_envelope(PEOPLE_QUERIES, "count_people"),
+        )
         .await
         .expect("the counted table did not move");
     assert_eq!(rows_of(&replay.result), rows_of(&run.result));
@@ -1130,7 +1194,10 @@ async fn an_insert_after_planning_refuses_the_replay_of_a_count() {
     .await
     .unwrap();
     let refused = db
-        .replay_bound_plan(ReadTarget::branch("main"), run.plan.clone())
+        .replay_bound_plan(
+            ReadTarget::branch("main"),
+            &run.replay_envelope(PEOPLE_QUERIES, "count_people"),
+        )
         .await
         .err()
         .expect("the counted table moved");
@@ -1200,15 +1267,14 @@ async fn sibling_plan_replay_is_refused(
         .await
         .unwrap();
     assert_ne!(rows_of(&run.result), rows_of(&other.result));
-    let bound: omnigraph_planner::BoundPlan =
-        serde_json::from_value(serde_json::to_value(&run.plan).unwrap()).unwrap();
+    let envelope = run.replay_envelope(PEOPLE_QUERIES, query_name);
     let same = db
-        .replay_bound_plan(ReadTarget::branch("left"), bound.clone())
+        .replay_bound_plan(ReadTarget::branch("left"), &envelope)
         .await
         .unwrap();
     assert_eq!(rows_of(&same.result), rows_of(&run.result));
     let refused = db
-        .replay_bound_plan(ReadTarget::branch("right"), bound)
+        .replay_bound_plan(ReadTarget::branch("right"), &envelope)
         .await
         .err()
         .expect("equal lineage counters must not admit a different detached pin");

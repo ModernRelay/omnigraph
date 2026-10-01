@@ -23,6 +23,7 @@ use crate::source::{
     AdjacencyProof, EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics,
     FragmentStat, NodeTypeSpec, PlanSource, SideId,
 };
+use crate::validate::{self, AcceptInput, AcceptedPlan, ValidationError};
 
 /// A `PlanSource` that records what the planner read through it: the
 /// parameter names of every filter it asked about and every setting, so the
@@ -234,6 +235,9 @@ pub enum Unrouted {
     UnsupportedQuery {
         diagnostic: Box<omnigraph_compiler::QueryDiagnostic>,
     },
+    /// Plan acceptance ran out of a configured validation limit before it
+    /// finished: a resource outcome, not evidence the plan is invalid.
+    ValidationExhausted { limit: &'static str, value: u64 },
 }
 
 impl Unrouted {
@@ -257,6 +261,7 @@ impl Unrouted {
             Self::Override => "override",
             Self::PlannerError { .. } => "planner_error",
             Self::UnsupportedQuery { .. } => "unsupported_query",
+            Self::ValidationExhausted { .. } => "validation_exhausted",
         }
     }
 
@@ -275,6 +280,9 @@ impl Unrouted {
                 "code": diagnostic.code.as_str(),
                 "message": diagnostic.message,
             }),
+            Self::ValidationExhausted { limit, value } => {
+                json!({ "kind": self.kind(), "limit": limit, "value": value })
+            }
         }
     }
 }
@@ -331,6 +339,67 @@ pub fn plan_query(
             optimized.physical
         })
         .map_err(Unrouted::of)
+}
+
+/// Plan a read query and accept the plan: the one path from a query to an
+/// executable plan, shared by ordinary execution and every explain.
+pub fn accept_query(
+    input: &AcceptInput<'_>,
+    source: &dyn PlanSource,
+    bounds: &Bounds,
+) -> Result<AcceptedPlan, Unrouted> {
+    plan_and_accept(input, source, bounds, false).map(|(accepted, _)| accepted)
+}
+
+/// [`accept_query`] with the explain document of the accepted plan, rendered
+/// from the same planning run.
+pub fn accept_query_explained(
+    input: &AcceptInput<'_>,
+    source: &dyn PlanSource,
+    bounds: &Bounds,
+) -> Result<(AcceptedPlan, Explain), Unrouted> {
+    let (accepted, explain) = plan_and_accept(input, source, bounds, true)?;
+    let explain = explain.ok_or_else(|| Unrouted::PlannerError {
+        message: "an explained acceptance rendered no document".to_string(),
+    })?;
+    Ok((accepted, explain))
+}
+
+fn plan_and_accept(
+    input: &AcceptInput<'_>,
+    source: &dyn PlanSource,
+    bounds: &Bounds,
+    explain: bool,
+) -> Result<(AcceptedPlan, Option<Explain>), Unrouted> {
+    let query = input.ir;
+    let operation = Operation::Query(Box::new(query.clone()));
+    let recorded = Recorded::new(source, query.has_wildcard_traversal());
+    let mut logical = resolve(&operation, &recorded).map_err(Unrouted::of)?;
+    let fired = rewrite(&mut logical, &recorded).map_err(Unrouted::of)?;
+    let mut optimized =
+        physical_plan(&mut logical, &recorded, bounds, fired.clone()).map_err(Unrouted::of)?;
+    optimized
+        .physical
+        .set_assumptions(recorded.assumptions(bounds));
+    let rendered = explain.then(|| {
+        LogicalView::of(&logical)
+            .explain(
+                OperationSummary::of(&operation),
+                RouteOverride::Registry,
+                None,
+                Some(&optimized),
+                &fired,
+            )
+            .engine()
+    });
+    let accepted =
+        validate::accept(optimized.physical, input).map_err(ValidationError::into_unrouted)?;
+    let rendered = rendered.map(|mut explain| {
+        explain.pipelines = None;
+        explain.validation = Some(accepted.summary());
+        explain
+    });
+    Ok((accepted, rendered))
 }
 
 /// Decide the route of one operation. The census is computed from the

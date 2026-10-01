@@ -2,7 +2,7 @@
 //! every live node of the plan, read from that operator's own metrics after
 //! the tree ran. A rerun appends an [`Attempt`] to every row.
 
-use omnigraph_planner::{BoundPlan, Explain, NodeId};
+use omnigraph_planner::{BoundPlan, Evidence, Explain, NodeId};
 use serde::{Deserialize, Serialize};
 
 use super::explain::ExplainRows;
@@ -128,6 +128,8 @@ impl ExecutionReport {
 pub struct PlanRun {
     pub result: omnigraph_compiler::result::QueryResult,
     pub plan: BoundPlan,
+    /// What acceptance checked of `plan`.
+    pub evidence: Evidence,
     pub report: ExecutionReport,
 }
 
@@ -136,11 +138,28 @@ pub struct PlanRun {
 pub struct Executed {
     pub result: omnigraph_compiler::result::QueryResult,
     pub plan: BoundPlan,
+    /// What acceptance checked of `plan`.
+    pub evidence: Evidence,
+    /// The digest of the schema `plan` was accepted under.
+    pub catalog: Option<String>,
     pub explain: Explain,
     pub report: ExecutionReport,
 }
 
 impl Executed {
+    /// The replay envelope of this run: `plan` with the source and name of
+    /// the query it ran, its scope and its schema, serialized.
+    pub fn replay_envelope(&self, source: &str, name: &str) -> Vec<u8> {
+        omnigraph_planner::ReplayEnvelope::new(
+            source,
+            name,
+            self.plan.clone(),
+            &self.evidence,
+            self.catalog.clone(),
+        )
+        .to_bytes()
+    }
+
     /// The report as actuals rows in the explain row schema: `tree`
     /// `profile`, no `depth`, `node` the plan node's kind, `detail` the row's
     /// own fields (`id`, `operator`, `status`, `attempts`). The third public

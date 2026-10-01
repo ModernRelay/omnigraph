@@ -1,20 +1,21 @@
 //! Values into the plan: the one place the embedding client is used. `bind`
-//! fills a `BoundPlan`'s value table from the gathered parameters and, per
-//! `nearest` scan, the query vector its `RankedAccess` names, keyed by the
-//! scan's node id. It reads the plan and the parameters and nothing else,
-//! and refuses a binding that lacks a parameter the plan assumed.
+//! fills an accepted plan's value table from the gathered parameters and,
+//! per `nearest` scan, the query vector its `RankedAccess` names, keyed by
+//! the scan's node id. It reads the plan and the parameters and nothing
+//! else, and refuses a binding that lacks a parameter the plan assumed.
 
 use std::collections::BTreeMap;
 
-use omnigraph_planner::{BoundPlan, PhysicalNode, PhysicalPlan, RankKind, ValueTable};
+use omnigraph_planner::{AcceptedBoundPlan, AcceptedPlan, PhysicalNode, RankKind, ValueTable};
 
 use super::*;
 
 pub(super) async fn bind(
-    plan: PhysicalPlan,
+    accepted: AcceptedPlan,
     source: &QuerySource<'_>,
     embedding: &EmbeddingResolver<'_>,
-) -> Result<BoundPlan> {
+) -> Result<AcceptedBoundPlan> {
+    let plan = accepted.plan();
     let params = Arc::clone(source.params.shared());
     let unbound: Vec<&str> = plan
         .assumptions()
@@ -57,8 +58,5 @@ pub(super) async fn bind(
         .await?;
         vectors.insert(id, vector);
     }
-    Ok(BoundPlan {
-        plan,
-        values: ValueTable { params, vectors },
-    })
+    Ok(accepted.bind(ValueTable { params, vectors }))
 }

@@ -3,10 +3,11 @@
 //! trees, then one per pass and per other field).
 
 use datafusion::physical_plan::{DisplayFormatType, ExecutionPlan};
-use omnigraph_planner::PhysicalPlan;
+use omnigraph_planner::AcceptedPlan;
 
 use super::plan_source::explain_query;
 use super::*;
+use crate::runtime_cache::CompiledQuery;
 
 #[cfg(doc)]
 use omnigraph_planner::BoundPlan;
@@ -14,13 +15,13 @@ use omnigraph_planner::BoundPlan;
 /// The planner's document for `ir` under `settings`, the settings the
 /// caller's query doors run the same source under.
 pub(crate) async fn explain_document(
-    ir: &QueryIR,
+    query: &CompiledQuery,
     params: &ParamMap,
     catalog: &Arc<Catalog>,
     snapshot: &Snapshot,
     settings: &SessionSettings,
 ) -> Result<serde_json::Value> {
-    let source = QuerySource::gather(ir, catalog, snapshot, params, settings).await?;
+    let source = QuerySource::gather(query, catalog, snapshot, params, settings).await?;
     Ok(explain_query(&source)?.explain.to_value())
 }
 
@@ -65,9 +66,9 @@ enum LoweredTree {
 /// The lowered DataFusion tree of the query's first pass in pre-order. An
 /// explain cannot embed query text, so binding such a plan is `Unavailable`;
 /// other failures propagate. Planning may already have read dataset metadata.
-async fn lowered_tree(plan: PhysicalPlan, source: &QuerySource<'_>) -> Result<LoweredTree> {
+async fn lowered_tree(accepted: AcceptedPlan, source: &QuerySource<'_>) -> Result<LoweredTree> {
     let embedding = EmbeddingResolver::explain();
-    let bound = match bind(plan, source, &embedding).await {
+    let bound = match bind(accepted, source, &embedding).await {
         Err(_) if embedding.was_requested() => {
             return Ok(LoweredTree::Unavailable(
                 "the nearest() query is a string; embedding it needs the embedding client"
@@ -81,7 +82,7 @@ async fn lowered_tree(plan: PhysicalPlan, source: &QuerySource<'_>) -> Result<Lo
         catalog: source.catalog,
         graph_index: Arc::new(GraphIndexHandle::none()),
     };
-    let lowering = Lowering::new(&bound, &context);
+    let lowering = Lowering::new(bound.bound(), &context);
     let lowered = lowering.lower_query(&Pass::default())?;
     let mut operators = Vec::new();
     operator_lines(lowered.root.as_ref(), 0, &mut operators);
@@ -212,16 +213,16 @@ fn explain_detail(value: &serde_json::Value) -> String {
 /// read: parameter names, setting values and the memory limit, never a
 /// parameter value.
 pub(crate) async fn explain_rows(
-    ir: &QueryIR,
+    query: &CompiledQuery,
     params: &ParamMap,
     snapshot: &Snapshot,
     catalog: &Arc<Catalog>,
     settings: &SessionSettings,
 ) -> Result<QueryResult> {
-    let source = QuerySource::gather(ir, catalog, snapshot, params, settings).await?;
+    let source = QuerySource::gather(query, catalog, snapshot, params, settings).await?;
     let planned = explain_query(&source)?;
-    let assumptions = planned.physical.assumptions().clone();
-    let lowered = lowered_tree(planned.physical, &source).await?;
+    let assumptions = planned.accepted.plan().assumptions().clone();
+    let lowered = lowered_tree(planned.accepted, &source).await?;
     let omnigraph_planner::explain::Explain {
         explain_version,
         route,
@@ -235,6 +236,7 @@ pub(crate) async fn explain_rows(
         pipelines,
         statistics,
         passes,
+        validation,
     } = &planned.explain;
     let mut rows = ExplainRows::default();
     if let Some(root) = logical_plan {
@@ -271,6 +273,9 @@ pub(crate) async fn explain_rows(
     }
     if let Some(statistics) = statistics {
         rows.push_field("statistics", statistics)?;
+    }
+    if let Some(validation) = validation {
+        rows.push_field("validation", validation)?;
     }
     rows.push_field("assumptions", &assumptions)?;
     rows.into_result()

@@ -19,14 +19,14 @@ use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, ParamMap, QueryIR};
+use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, ParamMap};
 use omnigraph_compiler::query::ast::{AggFunc, BinaryOp, CompOp, Literal};
 use omnigraph_compiler::result::QueryResult;
 use omnigraph_compiler::settings::SessionSettings;
 use omnigraph_compiler::types::Direction;
 use omnigraph_compiler::types::ScalarType;
 use omnigraph_planner::{
-    BoundPlan, DatasetPin, ExpandMode, ExpandPolicy, NodeId, OverfetchRung, PhysicalNode,
+    AcceptedBoundPlan, DatasetPin, ExpandMode, ExpandPolicy, NodeId, OverfetchRung, PhysicalNode,
     PhysicalPlan, Prefilter, RankKind, RankScope,
 };
 
@@ -38,6 +38,7 @@ use crate::instrumentation::{
     RrfGateFallback, RrfGatePlan, RrfGateVerdict, record_ann_prefilter_verdict,
     record_rrf_gate_verdict,
 };
+use crate::runtime_cache::CompiledQuery;
 
 mod adapters;
 mod bind;
@@ -71,7 +72,8 @@ use context::QueryContext;
 pub(crate) use explain::{explain_document, explain_rows};
 pub(crate) use graph::{EmbeddingResolver, GraphIndexHandle};
 use lower::Lowering;
-use plan_source::{ExplainedQuery, QuerySource, explain_query, plan_query};
+use plan_source::{ExplainedQuery, QuerySource, accept_query, explain_query};
+pub(crate) use plan_source::{accept_replay, replay_refused};
 pub(crate) use report::{Executed, PlanRun};
 use report::{ExecutionReport, ReportRow};
 use run::{pass_rows, run_plan};
@@ -102,7 +104,8 @@ pub(crate) fn dataset_pin(entry: &DatasetEntry) -> DatasetPin {
 
 /// Refuse a snapshot that is not the one `plan` was built on: the planner
 /// recorded every dataset it read in the plan's `Assumptions`, by path,
-/// branch and version, and a replay reads exactly those or nothing.
+/// branch and version, and a replay reads exactly those or nothing. A
+/// changed prerequisite is a conflict: replan against the current view.
 pub(crate) fn plan_pins_snapshot(plan: &PhysicalPlan, snapshot: &Snapshot) -> Result<()> {
     for (table, planned) in &plan.assumptions().datasets {
         let pinned = snapshot.dataset(table).map(dataset_pin);
@@ -119,7 +122,7 @@ pub(crate) fn plan_pins_snapshot(plan: &PhysicalPlan, snapshot: &Snapshot) -> Re
                 ),
                 None => "no such table".to_string(),
             };
-            return Err(OmniError::manifest_internal(format!(
+            return Err(OmniError::manifest_conflict(format!(
                 "`{table}` was planned at dataset {}; the snapshot holds {}",
                 spell(planned),
                 spell(&pinned)
@@ -273,7 +276,7 @@ impl ResolvedParams {
 /// Widen nearest candidates when traversal or filtering leaves a full scan's
 /// answer short of the limit.
 pub(crate) async fn execute_query(
-    ir: &QueryIR,
+    query: &CompiledQuery,
     params: &ParamMap,
     snapshot: &Snapshot,
     graph_index: GraphIndexHandle,
@@ -281,9 +284,9 @@ pub(crate) async fn execute_query(
     embedding: &EmbeddingResolver<'_>,
     settings: &SessionSettings,
 ) -> Result<QueryResult> {
-    let source = QuerySource::gather(ir, catalog, snapshot, params, settings).await?;
-    let physical = plan_query(&source)?;
-    let bound = bind(physical, &source, embedding).await?;
+    let source = QuerySource::gather(query, catalog, snapshot, params, settings).await?;
+    let accepted = accept_query(&source)?;
+    let bound = bind(accepted, &source, embedding).await?;
     let context = EngineContext {
         snapshot,
         catalog,
@@ -298,7 +301,7 @@ pub(crate) async fn execute_query(
 /// [`execute_query`] as an [`Executed`]: the gate plans once, and that one
 /// plan is both the plan the run executes and the plan its explain renders.
 pub(crate) async fn execute_query_inspected(
-    ir: &QueryIR,
+    query: &CompiledQuery,
     params: &ParamMap,
     snapshot: &Snapshot,
     graph_index: GraphIndexHandle,
@@ -306,9 +309,9 @@ pub(crate) async fn execute_query_inspected(
     embedding: &EmbeddingResolver<'_>,
     settings: &SessionSettings,
 ) -> Result<Executed> {
-    let source = QuerySource::gather(ir, catalog, snapshot, params, settings).await?;
-    let ExplainedQuery { explain, physical } = explain_query(&source)?;
-    let bound = bind(physical, &source, embedding).await?;
+    let source = QuerySource::gather(query, catalog, snapshot, params, settings).await?;
+    let ExplainedQuery { explain, accepted } = explain_query(&source)?;
+    let bound = bind(accepted, &source, embedding).await?;
     let context = EngineContext {
         snapshot,
         catalog,
@@ -317,11 +320,14 @@ pub(crate) async fn execute_query_inspected(
     let PlanRun {
         result,
         plan,
+        evidence,
         report,
     } = Box::pin(execute(bound, &context)).await?;
     Ok(Executed {
         result,
         plan,
+        evidence,
+        catalog: omnigraph_planner::catalog_digest(catalog),
         explain,
         report,
     })
@@ -407,7 +413,11 @@ fn validate_traversal_admission(plan: &PhysicalPlan) -> Result<Option<std::num::
 
 /// Run `bound` under `context` and report what each of its nodes did, every
 /// pass of the overfetch ladder folded into one report.
-pub(crate) async fn execute(bound: BoundPlan, context: &EngineContext<'_>) -> Result<PlanRun> {
+pub(crate) async fn execute(
+    accepted: AcceptedBoundPlan,
+    context: &EngineContext<'_>,
+) -> Result<PlanRun> {
+    let (bound, evidence) = accepted.into_parts();
     let traversal_limit = validate_traversal_admission(&bound.plan)?;
     omnigraph_planner::optimizer::validate_rank_fuse_row_tiebreaks(&bound.plan)
         .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
@@ -432,6 +442,7 @@ pub(crate) async fn execute(bound: BoundPlan, context: &EngineContext<'_>) -> Re
         return Ok(PlanRun {
             result: QueryResult::new(fused.schema(), vec![fused]),
             plan: bound,
+            evidence,
             report: executed,
         });
     }
@@ -544,6 +555,7 @@ pub(crate) async fn execute(bound: BoundPlan, context: &EngineContext<'_>) -> Re
     Ok(PlanRun {
         result: QueryResult::new(result_batch.schema(), vec![result_batch]),
         plan: bound,
+        evidence,
         report: executed,
     })
 }

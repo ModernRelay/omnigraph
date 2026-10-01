@@ -36,6 +36,7 @@ pub mod physical;
 pub mod registry;
 pub mod route;
 pub mod source;
+pub mod validate;
 
 pub use bound::{BOUND_PLAN_VERSION, BoundPlan, ValueTable};
 pub use cost::{
@@ -46,7 +47,7 @@ pub use cost::{
 };
 pub use error::PlanError;
 pub use explain::Explain;
-pub use gate::{Decision, Unrouted, plan_query, route};
+pub use gate::{Decision, Unrouted, accept_query, accept_query_explained, plan_query, route};
 pub use logical::{
     Census, ColumnRef, JoinKind, KeyJoinKind, LogicalId, LogicalKind, LogicalNode, LogicalPlan,
     Predicate, RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, SearchArm,
@@ -66,6 +67,11 @@ pub use route::RouteOverride;
 pub use source::{
     AdjacencyProof, EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics,
     FragmentStat, MemorySource, NodeTypeSpec, PlanSource, SideId,
+};
+pub use validate::{
+    AcceptInput, AcceptedBoundPlan, AcceptedPlan, ConstantEvaluator, Evidence, ReplayEnvelope,
+    ReplayQuery, ReplayRefusal, ValidationError, ValidationLimits, ValidationScope,
+    ValidationSummary, accept_replay, catalog_digest, decode_replay,
 };
 
 #[cfg(test)]
