@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-09-28
-updated: 2026-09-30
+updated: 2026-10-01
 discussion: "https://github.com/ModernRelay/omnigraph/pull/785"
 supersedes: []
 superseded_by: []
@@ -172,6 +172,21 @@ the field itself is gone. Keeping the ids is a prerequisite (Rollout).
 
   A publication whose outcome is in doubt gives every write in the batch the
   in-doubt error, naming the batch's commit id.
+- **Completion evidence** ([Owned server operations](2026-09-30-owned-server-operations.md)).
+  Each entry's outcome carries the evidence the same failure carries on
+  today's path, so the server's classification is unchanged:
+  - An entry refused at admission has made no detached commit, since
+    commits follow admission. It gets the typed read-set conflict, which
+    the server treats as settled, as it does today's refusal by
+    revalidation before `commit_all`'s first commit.
+  - A batch that loses the compare-and-swap leaves its detached commits
+    unreachable and gives its entries the typed conflict, not in doubt.
+  - An in-doubt batch makes every entry in doubt. The server closes
+    admission once, as it does for one in-doubt write today.
+  - An admitted entry whose batch outcome the engine did not observe (the
+    publisher task panicked, or dropped the batch) gets `Uncertain`, so the
+    server closes admission as it does for a panicking write today. An
+    entry not yet admitted has made no effect and is refused.
 - **Fewer conflicts.** Today any publication on the branch refuses every
   write prepared before it. Under this RFC, a write is refused only when a
   publication since its capture touched its footprint. An update that today
@@ -181,6 +196,11 @@ the field itself is gone. Keeping the ids is a prerequisite (Rollout).
   cannot overtake the writers it made stale (#784). This holds for the kinds
   that re-prepare automatically, which include the benchmark's writes.
 - **Cancellation.**
+  - An HTTP write is an owned operation: its caller's disconnect does not
+    drop the engine future, so it never removes an entry. Dropping applies
+    to an embedded caller's future, and at shutdown the server waits for
+    registered operations, so for the batches their entries are in, under
+    its one deadline.
   - A caller that goes away before its entry is admitted is dropped from the
     queue.
   - Once admitted, the publication runs to its outcome on the publisher's
@@ -499,7 +519,9 @@ reclaims them.
   submission. Unchanged.
 - **11 (bounded).**
   - The queue is bounded by entries and bytes, and the effect log by K and
-    the cap.
+    the cap. For HTTP writes the server's admission already bounds the
+    operations that can wait in it; the queue's own bound covers embedded
+    callers.
   - A refusal goes through the existing bounded re-prepare loop and is
     counted as a re-prepare.
 - **12 (one source of truth).** The effect log caches immutable facts. The
@@ -658,7 +680,8 @@ Each step leaves `main` shippable.
    green.
 3. Batch exclusive entries by footprint.
 4. Compose append-only entries, behind the surface guard.
-5. Run the instrument; update the documentation and the release note.
+5. Run the instrument; update the documentation and add the release-note
+   fragment.
 
 ## Unresolved questions
 
@@ -765,3 +788,12 @@ Each step leaves `main` shippable.
   - The key-existence filter's union is the bitwise OR of the components'
     Bloom filters, pinned by the same guard, in place of rebuilding the
     filter from the ids.
+
+- 2026-10-01 — Rechecked against `main` after #823, #824 and #833.
+  - #824 made every HTTP write a server-owned operation and classifies a
+    failed write by completion evidence. Errors now state each entry's
+    evidence, Cancellation states that a disconnect never removes an HTTP
+    entry, and invariant 11 notes that server admission bounds the HTTP
+    side of the queue.
+  - #823's merge receipts and #833's changelog fragments change nothing
+    here; step 5's release note becomes a fragment.
