@@ -2988,6 +2988,7 @@ async fn run_concurrent_step(
 }
 
 fn record_concurrent_outcome(ordinal: usize, sessions: &[Value], block: &concurrent::Outcome) {
+    dst_runner::finish_concurrent_observations();
     dst_runner::record(
         "concurrent_block",
         serde_json::json!({

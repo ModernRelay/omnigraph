@@ -175,6 +175,10 @@ engine spawned) can never be named. The `--- expect` after the block is
 bare, one `<label>: ok` or `<label>: error: <needle>` line per session;
 rows are not compared inside a block.
 
+For replay, session observations and result evidence are grouped in declaration
+order. Each session's event order and values are preserved; completion timing
+does not determine report order.
+
 While a session waits on the script the block drives the paused clock
 itself (RFC 0045 §Concurrent block says why) up to ten virtual seconds past
 the last cursor move or request; past that the clock stands still and the
