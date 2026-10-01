@@ -1052,6 +1052,34 @@ query nearest_destination($q: Vector(4)) {
             "{refused}"
         );
     }
+
+    // A refusal raised while the query is resolved, before lowering, keeps
+    // its diagnostic too: the statistics pass that resolves the query first
+    // must not turn it into a planner defect. An edge wildcard refuses CSR
+    // traversal mode, which only a session pin selects.
+    let csr = with_traversal(&db, omnigraph_compiler::settings::Traversal::Csr);
+    let wildcard = r#"
+query wildcard() {
+    match { $a: Doc $b: Doc $a * $b }
+    return { $b.slug }
+}
+"#;
+    let refused = csr
+        .query(
+            ReadTarget::branch("main"),
+            wildcard,
+            "wildcard",
+            &ParamMap::new(),
+        )
+        .await
+        .expect_err("an edge wildcard refuses CSR traversal mode");
+    assert_eq!(
+        refused
+            .diagnostic()
+            .map(|diagnostic| diagnostic.code.as_str()),
+        Some("P004"),
+        "{refused:?}"
+    );
 }
 
 /// `now()` is bound at gather and rides in the value table, so the replay
