@@ -123,7 +123,9 @@ fn run_rfc023_external_writer_action(
         LoadMode::Merge => "merge",
         LoadMode::Overwrite => "overwrite",
     };
-    let output = Command::new(std::env::current_exe().map_err(|error| error.to_string())?)
+    let stdout = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+    let stderr = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+    let mut child = Command::new(std::env::current_exe().map_err(|error| error.to_string())?)
         .arg("--exact")
         .arg("rfc023_external_writer_process")
         .arg("--ignored")
@@ -133,16 +135,43 @@ fn run_rfc023_external_writer_action(
         .env(RFC023_EXTERNAL_MODE_ENV, mode)
         .env(RFC023_EXTERNAL_PAYLOAD_ENV, payload)
         .env(RFC023_EXTERNAL_ACTION_ENV, action)
-        .output()
+        .stdout(stdout.reopen().map_err(|error| error.to_string())?)
+        .stderr(stderr.reopen().map_err(|error| error.to_string())?)
+        .spawn()
         .map_err(|error| error.to_string())?;
-    if output.status.success() {
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(if action == "schema_apply_company" {
+            15
+        } else {
+            45
+        });
+    loop {
+        if child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().map_err(|error| error.to_string())?;
+            child.wait().map_err(|error| error.to_string())?;
+            return Err(format!(
+                "external writer timed out: {}",
+                std::fs::read_to_string(stderr.path()).unwrap_or_default()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let status = child.wait().map_err(|error| error.to_string())?;
+    if status.success() {
         return Ok(());
     }
     Err(format!(
         "external writer failed with {}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
+        status,
+        std::fs::read_to_string(stdout.path()).unwrap_or_default(),
+        std::fs::read_to_string(stderr.path()).unwrap_or_default(),
     ))
 }
 
@@ -180,6 +209,15 @@ fn rfc023_external_writer_process() {
             match action.as_str() {
                 "load" => {
                     db.load("main", &payload, mode).await.unwrap();
+                }
+                "schema_apply_company" => {
+                    db.apply_schema(&payload).await.unwrap();
+                    let data = if payload.contains("slug: String") {
+                        r#"{"type":"Company","data":{"slug":"winner"}}"#
+                    } else {
+                        r#"{"type":"Company","data":{"name":"winner"}}"#
+                    };
+                    db.load_jsonl(data, LoadMode::Append).await.unwrap();
                 }
                 "collector_late_live" | "collector_late_retired" => {
                     db.branch_create("collector-late").await.unwrap();
@@ -2551,25 +2589,20 @@ async fn read_capture_proceeds_while_writer_parked() {
     assert_eq!(count_rows(&db_b, "node:Person").await, 5);
 }
 
-// Atomic schema apply: schema apply writes staging files first, then commits
-// the manifest, then renames staging → final. Tests below inject crashes at
-// the two boundaries and assert that reopening the graph yields a consistent
-// state.
-
 #[tokio::test]
 #[serial]
-async fn schema_apply_pre_commit_crash_discards_staging_on_reopen() {
+async fn schema_apply_pre_commit_crash_preserves_published_contract() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
 
     {
         let db = helpers::session(Omnigraph::init(&uri, SCHEMA_V1).await.unwrap());
-        let _failpoint = catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.fire_always();
+        let _failpoint = catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND.fire_always();
         let err = db.apply_schema(SCHEMA_V2_ADDED_TYPE).await.unwrap_err();
         assert!(
             err.to_string()
-                .contains("injected failpoint triggered: schema_apply.after_staging_write"),
+                .contains("injected failpoint triggered: graph_publish.before_commit_append"),
             "got: {}",
             err
         );
@@ -2578,15 +2611,9 @@ async fn schema_apply_pre_commit_crash_discards_staging_on_reopen() {
             "a failure before publication needs no recovery: {err}"
         );
     }
-    assert!(
-        dir.path().join("__schema_state.json.staging").exists(),
-        "the staged contract outlives the writer"
-    );
+    assert_no_staging_files(dir.path());
     assert_no_recovery_sidecars(dir.path());
 
-    // RFC 0067: the staged contract names a graph commit that never landed,
-    // so the next read-write open discards it; the created Company dataset
-    // is unregistered garbage at the path the retry creates at.
     let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
     assert_eq!(db.schema_source().as_str(), SCHEMA_V1);
     assert_no_staging_files(dir.path());
@@ -2601,32 +2628,51 @@ async fn schema_apply_pre_commit_crash_discards_staging_on_reopen() {
     let company_uri = unregistered_node_table_uri(&db).await;
     assert!(
         std::path::Path::new(&company_uri).exists(),
-        "the abandoned create stays as unregistered garbage until the retry reclaims it"
+        "the abandoned create remains available for a non-destructive retry"
     );
 
     db.apply_schema(SCHEMA_V2_ADDED_TYPE)
         .await
-        .expect("the retry reclaims the leftover and publishes");
+        .expect("the retry reuses the leftover and publishes");
     assert_eq!(helpers::count_rows(&db, "node:Company").await, 0);
     assert_eq!(node_table_uri(&db, "Company").await, company_uri);
     assert_no_staging_files(dir.path());
     assert_no_recovery_sidecars(dir.path());
 }
 
-#[tokio::test]
-#[serial]
-async fn schema_apply_recovers_partial_schema_promotion_after_commit_crash() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
+/// A published contract needs neither root schema files nor recovery sidecars.
+async fn assert_no_schema_apply_residue(uri: &str) {
+    let storage = omnigraph_storage::storage_for_uri(uri).unwrap();
+    for name in [
+        "_schema.pg",
+        "_schema.ir.json",
+        "__schema_state.json",
+        "_schema.pg.staging",
+        "_schema.ir.json.staging",
+        "__schema_state.json.staging",
+    ] {
+        let path = omnigraph_storage::join_uri(uri, name);
+        assert!(
+            !storage.exists(&path).await.unwrap(),
+            "atomic schema publication must not leave {path}"
+        );
+    }
+    let recovery = omnigraph_storage::join_uri(uri, "__recovery");
+    assert!(
+        storage.list_dir(&recovery).await.unwrap().is_empty(),
+        "atomic schema publication must not leave recovery sidecars"
+    );
+}
 
+/// Both backend wrappers exercise publication, fresh admission and live-handle progress.
+async fn assert_schema_apply_post_commit_failure_leaves_readable_contract(uri: &str) {
+    let db = helpers::session(Omnigraph::init(uri, SCHEMA_V1).await.unwrap());
     {
-        let db = helpers::session(Omnigraph::init(&uri, SCHEMA_V1).await.unwrap());
         let _failpoint = catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT.fire_always();
         let err = db.apply_schema(SCHEMA_V2_ADDED_TYPE).await.unwrap_err();
         assert!(
             matches!(err, OmniError::RecoveryRequired { .. }),
-            "a failure after publication reports the pending contract installation: {err}"
+            "a failure after publication identifies the committed operation: {err}"
         );
         assert!(
             err.to_string()
@@ -2635,60 +2681,57 @@ async fn schema_apply_recovers_partial_schema_promotion_after_commit_crash() {
             err
         );
     }
-    assert_no_recovery_sidecars(dir.path());
+    assert_no_schema_apply_residue(uri).await;
 
-    // ReadOnly must remain non-mutating, but it also must not combine the
-    // already-published manifest delta with the old live schema contract.
-    // It fails closed until a read-write open performs the promotion.
-    let read_only_error = match Omnigraph::open_read_only(&uri).await {
-        Ok(_) => panic!("read-only open must refuse a committed-but-unpromoted SchemaApply"),
-        Err(error) => error,
-    };
+    let read_only = Omnigraph::open_read_only(uri).await.unwrap();
+    assert_eq!(read_only.schema_source().as_str(), SCHEMA_V2_ADDED_TYPE);
     assert!(
-        matches!(read_only_error, OmniError::RecoveryRequired { .. }),
-        "{read_only_error}"
+        read_only
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .dataset("node:Company")
+            .is_some()
     );
-    assert!(
-        read_only_error
-            .to_string()
-            .contains("schema contract promotion is pending"),
-        "{read_only_error}"
-    );
-    assert!(dir.path().join("_schema.pg.staging").exists());
-    assert!(dir.path().join("_schema.ir.json.staging").exists());
-    assert!(dir.path().join("__schema_state.json.staging").exists());
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("_schema.pg")).unwrap(),
-        SCHEMA_V1,
-        "the read-only coherence guard must not promote schema files"
-    );
+    assert_eq!(helpers::count_rows(&read_only, "node:Company").await, 0);
+    let fresh = helpers::session(Omnigraph::open(uri).await.unwrap());
+    assert_eq!(fresh.schema_source().as_str(), SCHEMA_V2_ADDED_TYPE);
+    assert_eq!(helpers::count_rows(&fresh, "node:Company").await, 0);
+    assert_no_schema_apply_residue(uri).await;
 
-    // Simulate a crash partway through promotion: source reached its final
-    // name, while the IR/state contract remains staged. Recovery must
-    // validate the mixed state as one target identity and finish it.
-    std::fs::rename(
-        dir.path().join("_schema.pg.staging"),
-        dir.path().join("_schema.pg"),
+    db.load_jsonl(
+        r#"{"type":"Company","data":{"name":"SameHandle"}}"#,
+        LoadMode::Merge,
     )
-    .unwrap();
-    assert!(!dir.path().join("_schema.pg.staging").exists());
-    assert!(dir.path().join("_schema.ir.json.staging").exists());
-    assert!(dir.path().join("__schema_state.json.staging").exists());
-
-    // Reopen: the publishing commit is in lineage, so recovery completes the
-    // remaining promotion and the live schema matches v2.
-    let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
-    assert_eq!(db.schema_source().as_str(), SCHEMA_V2_ADDED_TYPE);
-    assert_no_staging_files(dir.path());
-    assert_eq!(helpers::count_rows(&db, "node:Company").await, 0);
-    db.apply_schema(SCHEMA_V2_ADDED_TYPE)
+    .await
+    .expect("the same handle writes the published new type after the fault clears");
+    fresh
+        .load_jsonl(
+            r#"{"type":"Company","data":{"name":"FreshHandle"}}"#,
+            LoadMode::Merge,
+        )
         .await
-        .expect("the reclaimed sentinel admits the next apply, a no-op here");
+        .expect("a fresh handle writes the published new type after the fault clears");
+    let mut names = collect_column_strings(&read_table(&read_only, "node:Company").await, "name");
+    names.sort();
+    assert_eq!(names, vec!["FreshHandle", "SameHandle"]);
+    fresh
+        .apply_schema(SCHEMA_V2_ADDED_TYPE)
+        .await
+        .expect("the next apply recognizes the published contract");
+    assert_no_schema_apply_residue(uri).await;
 }
 
-/// The applying handle's coordinator observes the fixed manifest commit before
-/// schema files and the catalog ArcSwap are promoted. Query capture joins the
-/// schema gate so it cannot pair that new snapshot with the old catalog.
+#[tokio::test]
+#[serial]
+async fn schema_apply_post_commit_failure_leaves_readable_contract() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    assert_schema_apply_post_commit_failure_leaves_readable_contract(dir.path().to_str().unwrap())
+        .await;
+}
+
+/// Query capture joins the schema gate through coherent publication.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn schema_apply_live_query_waits_for_coherent_schema_publication() {
@@ -2776,96 +2819,7 @@ edge WorksAt: Person -> Company
 
 #[tokio::test]
 #[serial]
-async fn schema_apply_recovers_partial_rename() {
-    // Construct a partial-rename state: _schema.pg has been renamed in
-    // (matching v2), but _schema.ir.json.staging and __schema_state.json.staging
-    // were never renamed. Recovery should detect that the live source matches
-    // the staging state's hash and complete the remaining renames.
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-
-    {
-        let db = helpers::session(Omnigraph::init(&uri, SCHEMA_V1).await.unwrap());
-        db.apply_schema(SCHEMA_V2_ADDED_TYPE).await.unwrap();
-    }
-
-    // Simulate: one of the renames (the IR or state file) didn't complete by
-    // copying the live ir/state files back to their staging names.
-    std::fs::copy(
-        dir.path().join("_schema.ir.json"),
-        dir.path().join("_schema.ir.json.staging"),
-    )
-    .unwrap();
-    std::fs::copy(
-        dir.path().join("__schema_state.json"),
-        dir.path().join("__schema_state.json.staging"),
-    )
-    .unwrap();
-
-    // Reopen — recovery should complete the rename (overwriting final files
-    // with identical staging content) and remove the staging files.
-    let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
-    assert_eq!(db.schema_source().as_str(), SCHEMA_V2_ADDED_TYPE);
-    assert_no_staging_files(dir.path());
-}
-
-/// Azure implements schema-contract promotion as GET -> completed PUT ->
-/// DELETE. Model a crash after the destination PUT by leaving the identical
-/// live and staging objects together, then prove the ordinary open-time
-/// recovery completes the remaining source deletions.
-#[tokio::test]
-#[serial]
-async fn azure_schema_apply_recovers_source_and_destination_after_partial_rename() {
-    let Ok(container) = std::env::var("OMNIGRAPH_AZURE_TEST_CONTAINER") else {
-        eprintln!(
-            "skipping Azure schema rename recovery: OMNIGRAPH_AZURE_TEST_CONTAINER is not set"
-        );
-        return;
-    };
-    let _scenario = FailScenario::setup();
-    let uri = format!(
-        "az://{container}/engine-failpoints/schema-rename-{}",
-        ulid::Ulid::new()
-    );
-    let storage = omnigraph_storage::storage_for_uri(&uri).unwrap();
-
-    {
-        let db = helpers::session(Omnigraph::init(&uri, SCHEMA_V1).await.unwrap());
-        db.apply_schema(SCHEMA_V2_ADDED_TYPE).await.unwrap();
-    }
-
-    for name in ["_schema.ir.json", "__schema_state.json"] {
-        let live = format!("{uri}/{name}");
-        let staging = format!("{live}.staging");
-        let body = storage.read_text(&live).await.unwrap();
-        storage.write_text(&staging, &body).await.unwrap();
-        assert!(storage.exists(&live).await.unwrap());
-        assert!(storage.exists(&staging).await.unwrap());
-    }
-
-    let reopened = helpers::session(
-        Omnigraph::open(&uri)
-            .await
-            .expect("Azure open must complete the interrupted schema-contract rename"),
-    );
-    assert_eq!(reopened.schema_source().as_str(), SCHEMA_V2_ADDED_TYPE);
-    for name in ["_schema.ir.json", "__schema_state.json"] {
-        assert!(storage.exists(&format!("{uri}/{name}")).await.unwrap());
-        assert!(
-            !storage
-                .exists(&format!("{uri}/{name}.staging"))
-                .await
-                .unwrap()
-        );
-    }
-    drop(reopened);
-    storage.delete_prefix(&uri).await.unwrap();
-}
-
-#[tokio::test]
-#[serial]
-async fn schema_apply_retries_over_its_own_unpublished_staging_without_reopen() {
+async fn schema_apply_retries_after_unpublished_effects_without_reopen() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
@@ -2875,7 +2829,7 @@ async fn schema_apply_retries_over_its_own_unpublished_staging_without_reopen() 
         helpers::TEST_SCHEMA
     );
     {
-        let _failpoint = catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.fire_always();
+        let _failpoint = catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND.fire_always();
         let err = db.apply_schema(&desired).await.unwrap_err();
         assert!(
             !matches!(err, OmniError::RecoveryRequired { .. }),
@@ -2883,7 +2837,7 @@ async fn schema_apply_retries_over_its_own_unpublished_staging_without_reopen() 
         );
     }
     assert_no_recovery_sidecars(dir.path());
-    assert!(dir.path().join("__schema_state.json.staging").exists());
+    assert_no_staging_files(dir.path());
 
     db.apply_schema(&desired)
         .await
@@ -2917,11 +2871,11 @@ async fn load_after_schema_apply_pre_publish_failure_keeps_the_accepted_catalog(
         schema_with_person_city()
     );
     {
-        let _failpoint = catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.fire_always();
+        let _failpoint = catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND.fire_always();
         let err = db.apply_schema(&v2_schema).await.unwrap_err();
         assert!(
             err.to_string()
-                .contains("injected failpoint triggered: schema_apply.after_staging_write"),
+                .contains("injected failpoint triggered: graph_publish.before_commit_append"),
             "unexpected error: {err}"
         );
     }
@@ -2950,18 +2904,9 @@ async fn load_after_schema_apply_pre_publish_failure_keeps_the_accepted_catalog(
     assert_eq!(helpers::count_rows(&reopened, "node:Person").await, 2);
 }
 
-/// A concurrent write's entry heal must NOT promote a LIVE schema
-/// apply's staging files. The apply pauses just after writing its
-/// staging files (sidecar on disk from Phase A, staging on disk,
-/// manifest not yet committed); a load on the same handle fires the
-/// heal in that window. If the heal's schema-staging reconcile runs
-/// unserialized, it promotes the staging files from under the live
-/// apply — putting the NEW catalog live against the OLD manifest — and
-/// the resumed apply's own renames then fail on the missing sources:
-/// an error (and a corrupted catalog) for an otherwise-healthy apply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn heal_does_not_promote_live_schema_apply_staging() {
+async fn load_waits_for_schema_apply_publication() {
     use omnigraph::loader::LoadMode;
     use std::sync::Arc;
 
@@ -2973,9 +2918,8 @@ async fn heal_does_not_promote_live_schema_apply_staging() {
         Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap(),
     ));
 
-    // Park the apply right after its staging files land (its sidecar is
-    // already on disk from Phase A; the manifest commit has not run).
-    let rv = helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+    let rv =
+        helpers::failpoint::Rendezvous::park_first(&catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND);
 
     let apply_db = Arc::clone(&db);
     let desired = format!(
@@ -2984,17 +2928,9 @@ async fn heal_does_not_promote_live_schema_apply_staging() {
     );
     let apply = tokio::spawn(async move { apply_db.apply_schema(&desired).await });
 
-    // Wait until the apply is parked in the window (staging files written).
     rv.wait_until_reached().await;
-    let staging_pg = dir.path().join("_schema.pg.staging");
-    assert!(
-        staging_pg.exists(),
-        "schema apply never reached the paused window"
-    );
+    assert_no_staging_files(dir.path());
 
-    // Concurrent load on the same handle: its entry heal runs while the
-    // apply is paused. The load itself may fail (schema apply in
-    // progress) — what matters is what its heal does to the live apply.
     let load_db = Arc::clone(&db);
     let load = tokio::spawn(async move {
         load_db
@@ -3008,22 +2944,17 @@ async fn heal_does_not_promote_live_schema_apply_staging() {
             .await
     });
 
-    // Give the load's heal time to act inside the window. Broken code
-    // completes the load here (its heal promoted the staging files and
-    // stole the apply's commit); fixed code leaves the load blocked on
-    // the schema-apply serialization key until the apply finishes.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!load.is_finished(), "load waits for the schema gate");
     rv.release();
 
     let apply_result = apply.await.unwrap();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), load)
+    tokio::time::timeout(std::time::Duration::from_secs(30), load)
         .await
         .expect("load must complete once the apply releases its guards")
+        .unwrap()
         .unwrap();
-    apply_result.expect(
-        "a concurrent write's heal must not promote the live schema \
-         apply's staging files out from under it",
-    );
+    apply_result.expect("the apply publishes while the load waits for its schema gate");
 
     // The migration landed and nothing recovery-shaped remains.
     assert_eq!(helpers::count_rows(&db, "node:Tag").await, 0);
@@ -3230,11 +3161,11 @@ async fn schema_apply_pre_staging_failure_leaves_no_residue() {
     );
     {
         let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
-        let _failpoint = catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE.fire_always();
+        let _failpoint = catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND.fire_always();
         let err = db.apply_schema(&v2_schema).await.unwrap_err();
         assert!(
             err.to_string()
-                .contains("injected failpoint triggered: schema_apply.before_staging_write"),
+                .contains("injected failpoint triggered: graph_publish.before_commit_append"),
             "unexpected error: {err}"
         );
     }
@@ -3268,7 +3199,7 @@ async fn schema_apply_pre_staging_failure_leaves_no_residue() {
         "a detached rewrite never moves the linear HEAD"
     );
     assert!(snapshot.dataset("node:Tag").is_none());
-    let live_schema = std::fs::read_to_string(dir.path().join("_schema.pg")).unwrap();
+    let live_schema = db.schema_source();
     assert!(!live_schema.contains("city: String?"), "{live_schema}");
     assert!(!live_schema.contains("node Tag"), "{live_schema}");
 
@@ -3289,11 +3220,11 @@ async fn metadata_only_schema_apply_before_staging_leaves_no_residue() {
     let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
     {
         let db = helpers::session(Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap());
-        let _failpoint = catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE.fire_always();
+        let _failpoint = catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND.fire_always();
         let err = db.apply_schema(&indexed_schema).await.unwrap_err();
         assert!(
             err.to_string()
-                .contains("injected failpoint triggered: schema_apply.before_staging_write"),
+                .contains("injected failpoint triggered: graph_publish.before_commit_append"),
             "unexpected error: {err}"
         );
     }
@@ -3323,16 +3254,16 @@ async fn metadata_only_schema_apply_after_staging_discards_on_next_open() {
     let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
     {
         let db = helpers::session(Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap());
-        let _failpoint = catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.fire_always();
+        let _failpoint = catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND.fire_always();
         let err = db.apply_schema(&indexed_schema).await.unwrap_err();
         assert!(
             err.to_string()
-                .contains("injected failpoint triggered: schema_apply.after_staging_write"),
+                .contains("injected failpoint triggered: graph_publish.before_commit_append"),
             "unexpected error: {err}"
         );
     }
     assert_no_recovery_sidecars(dir.path());
-    assert!(dir.path().join("__schema_state.json.staging").exists());
+    assert_no_staging_files(dir.path());
 
     // Metadata-only applies have no table effect: the staged contract is
     // their only durable state, and its recorded commit never landed.
@@ -3365,58 +3296,17 @@ async fn metadata_only_schema_apply_post_publish_failure_heals_on_next_write() {
         let err = db.apply_schema(&indexed_schema).await.unwrap_err();
         assert!(
             matches!(err, OmniError::RecoveryRequired { .. }),
-            "a failure after publication reports the pending contract installation: {err}"
+            "a failure after publication identifies the committed operation: {err}"
+        );
+        assert_eq!(
+            err.completion_evidence(),
+            Some(CompletionEvidence::Uncertain),
+            "the post-publication failure retains uncertain completion: {err}"
         );
     }
-    assert!(dir.path().join("__schema_state.json.staging").exists());
+    assert_no_staging_files(dir.path());
     assert_no_recovery_sidecars(dir.path());
 
-    // A validation-shaped error while completing this already-published
-    // contract is not a fresh mutation's ordinary pre-effect refusal.
-    let staging_path = dir.path().join("_schema.pg.staging");
-    let staged_source = std::fs::read(&staging_path).unwrap();
-    std::fs::write(&staging_path, "node {").unwrap();
-    let blocked = mutate_main(
-        &db,
-        MUTATION_QUERIES,
-        "insert_person",
-        &mixed_params(&[("$name", "blocked")], &[("$age", 12)]),
-    )
-    .await
-    .unwrap_err();
-    std::fs::write(&staging_path, staged_source).unwrap();
-    assert_eq!(
-        blocked.completion_evidence(),
-        Some(CompletionEvidence::Uncertain),
-        "published schema completion dominates a validation-shaped cause: {blocked}"
-    );
-
-    // Completion succeeds before native branch-name validation. The whole
-    // command cannot claim no effects, but its validation cause stays nonfatal.
-    let invalid_branch = db.branch_create_from("main", "bad?name").await.unwrap_err();
-    assert_eq!(invalid_branch.completion_evidence(), None);
-    assert!(
-        matches!(invalid_branch, OmniError::Manifest(ref error)
-            if error.kind == omnigraph::error::ManifestErrorKind::BadRequest),
-        "completed pending work must leave an ordinary name refusal: {invalid_branch}"
-    );
-
-    // Completion succeeds before the next mutation's ordinary validation
-    // refusal. Prior successful work is neither an effect-free command nor
-    // evidence of uncertain completion.
-    let invalid = mutate_main(&db, MUTATION_QUERIES, "missing_mutation", &params(&[]))
-        .await
-        .unwrap_err();
-    assert_eq!(
-        invalid.completion_evidence(),
-        None,
-        "successful completion does not poison later validation: {invalid}"
-    );
-    assert_no_staging_files(dir.path());
-    assert_eq!(helpers::count_rows(&db, "node:Person").await, 0);
-
-    // The same handle now admits the ordinary write against the installed
-    // contract, with the dead apply's sentinel released.
     db.load_jsonl(
         "{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n",
         LoadMode::Append,
@@ -3431,96 +3321,200 @@ async fn metadata_only_schema_apply_post_publish_failure_heals_on_next_write() {
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 1);
     db.apply_schema(&indexed_schema)
         .await
-        .expect("the released sentinel admits the next apply, a no-op here");
+        .expect("the next apply recognizes the published contract");
 
-    let before_refusal = db.list_commits(None).await.unwrap();
-    let refused = {
-        let _release_failure = catalog::BRANCH_DELETE_POST_ARCHIVE.fire_always();
-        db.apply_schema("node {").await.unwrap_err()
-    };
-    assert_eq!(
-        refused.completion_evidence(),
-        Some(CompletionEvidence::Uncertain),
-        "failed sentinel completion must dominate the primary validation refusal: {refused}"
+    let invalid_branch = db.branch_create_from("main", "bad?name").await.unwrap_err();
+    let (invalid_branch, evidence) = invalid_branch.into_completion_evidence();
+    assert_eq!(evidence, Some(CompletionEvidence::BeforeEffect));
+    assert!(
+        matches!(invalid_branch, OmniError::Manifest(ref error)
+            if error.kind == ManifestErrorKind::BadRequest),
+        "the accepted contract leaves an ordinary name refusal: {invalid_branch}"
     );
-    assert_eq!(db.list_commits(None).await.unwrap(), before_refusal);
-    db.apply_schema(&indexed_schema)
+    let invalid = mutate_main(&db, MUTATION_QUERIES, "missing_mutation", &params(&[]))
         .await
-        .expect("the next apply completes the failed sentinel release on the same handle");
-
-    db.branch_create("blocks-schema").await.unwrap();
-    let refused = {
-        let _release_failure = catalog::BRANCH_DELETE_POST_ARCHIVE.fire_always();
-        db.apply_schema(&indexed_schema).await.unwrap_err()
-    };
+        .unwrap_err();
     assert_eq!(
-        refused.completion_evidence(),
-        Some(CompletionEvidence::Uncertain),
-        "failed sentinel completion must dominate the mono-branch refusal: {refused}"
+        invalid.completion_evidence(),
+        None,
+        "successful completion does not poison later validation: {invalid}"
     );
-    assert_eq!(db.list_commits(None).await.unwrap(), before_refusal);
-    db.branch_delete("blocks-schema").await.unwrap();
-    db.apply_schema(&indexed_schema)
-        .await
-        .expect("the mono-branch refusal's pending release also heals on the same handle");
+    assert_no_staging_files(dir.path());
+    assert_no_recovery_sidecars(dir.path());
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 1);
 }
 
 #[tokio::test]
 #[serial]
-async fn schema_apply_retry_reclaims_an_abandoned_add_type_dataset() {
+async fn schema_apply_retry_preserves_the_original_empty_create() {
     let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let db = helpers::session(Omnigraph::init(&uri, SCHEMA_V1).await.unwrap());
-
-    {
-        let _failpoint = catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE.fire_always();
-        db.apply_schema(SCHEMA_V2_ADDED_TYPE)
-            .await
-            .expect_err("the pre-staging failpoint must stop the apply after the create");
-    }
-    let company_uri = unregistered_node_table_uri(&db).await;
-    assert!(
-        std::path::Path::new(&company_uri).exists(),
-        "the version-one create is durable before the failure"
-    );
-    drop(db);
-    let recovered = helpers::session(
-        Omnigraph::open(&uri)
-            .await
-            .expect("an unregistered dataset is not recovery state"),
-    );
-    assert!(
+    for changed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        let db = helpers::session(Omnigraph::init(&uri, SCHEMA_V1).await.unwrap());
+        {
+            let _failpoint = catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND.fire_always();
+            db.apply_schema(SCHEMA_V2_ADDED_TYPE).await.unwrap_err();
+        }
+        let company_uri = unregistered_node_table_uri(&db).await;
+        let original = lance::Dataset::open(&company_uri).await.unwrap();
+        let original_uuid = original.read_transaction().await.unwrap().unwrap().uuid;
+        let manifest_path = format!("/{}", original.manifest_location().path);
+        let original_bytes = std::fs::read(&manifest_path).unwrap();
+        drop(db);
+        let recovered = helpers::session(Omnigraph::open(&uri).await.unwrap());
+        let desired = if changed {
+            SCHEMA_V2_ADDED_TYPE.replace(
+                "node Company { name: String @key }",
+                "node Company { slug: String @key }",
+            )
+        } else {
+            SCHEMA_V2_ADDED_TYPE.to_string()
+        };
+        recovered.apply_schema(&desired).await.unwrap();
+        assert_eq!(helpers::count_rows(&recovered, "node:Company").await, 0);
+        assert_eq!(node_table_uri(&recovered, "Company").await, company_uri);
+        let company = lance::Dataset::open(&company_uri).await.unwrap();
+        assert_eq!(company.version().version, 1);
+        assert_eq!(
+            company.read_transaction().await.unwrap().unwrap().uuid,
+            original_uuid
+        );
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), original_bytes);
+        let snapshot = helpers::snapshot_main(&recovered).await.unwrap();
+        let entry = snapshot.dataset("node:Company").unwrap();
+        assert_eq!(entry.published_dataset_version, if changed { 2 } else { 1 });
+        assert_eq!(entry.version_metadata.staged_version().is_some(), changed);
+        assert_eq!(entry.version_metadata.last_linear_version(), Some(1));
         recovered
-            .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+            .repair(omnigraph::db::RepairOptions {
+                confirm: true,
+                force: false,
+            })
+            .await
+            .unwrap();
+        recovered.ensure_indices().await.unwrap();
+        let cleaned = recovered.cleanup(keep_one()).await.unwrap();
+        assert!(cleaned.iter().all(|row| row.error.is_none()), "{cleaned:?}");
+        drop(recovered);
+        let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
+        assert_eq!(reopened.schema_source().as_str(), desired);
+        let data = if changed {
+            r#"{"type":"Company","data":{"slug":"winner"}}"#
+        } else {
+            r#"{"type":"Company","data":{"name":"winner"}}"#
+        };
+        reopened.load_jsonl(data, LoadMode::Append).await.unwrap();
+        assert_eq!(helpers::count_rows(&reopened, "node:Company").await, 1);
+        let export = reopened.export_jsonl("main", &[]).await.unwrap();
+        assert!(export.contains("winner"));
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), original_bytes);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn schema_apply_added_type_loser_preserves_a_concurrent_process_winner() {
+    let _scenario = FailScenario::setup();
+    for changed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        let db = std::sync::Arc::new(helpers::session(
+            Omnigraph::init(&uri, SCHEMA_V1).await.unwrap(),
+        ));
+        let original_paths = std::fs::read_dir(dir.path().join("nodes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<std::collections::BTreeSet<_>>();
+        let parked =
+            helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_POST_LOCK_PRE_EFFECT);
+        let loser = std::sync::Arc::clone(&db);
+        let apply = tokio::spawn(async move { loser.apply_schema(SCHEMA_V2_ADDED_TYPE).await });
+        parked.wait_until_reached().await;
+        let winner_source = if changed {
+            SCHEMA_V2_ADDED_TYPE.replace(
+                "node Company { name: String @key }",
+                "node Company { slug: String @key }",
+            )
+        } else {
+            SCHEMA_V2_ADDED_TYPE.to_string()
+        };
+        let child_uri = uri.clone();
+        let child_source = winner_source.clone();
+        tokio::task::spawn_blocking(move || {
+            run_rfc023_external_writer_action(
+                child_uri,
+                LoadMode::Append,
+                child_source,
+                "schema_apply_company",
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let company_path = std::fs::read_dir(dir.path().join("nodes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| !original_paths.contains(path))
+            .unwrap();
+        let company_uri = company_path.to_str().unwrap();
+        let before = lance::Dataset::open(company_uri).await.unwrap();
+        let manifest_path = format!("/{}", before.manifest_location().path);
+        let original_bytes = std::fs::read(&manifest_path).unwrap();
+        let paths_before_loser = std::fs::read_dir(dir.path().join("nodes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<std::collections::BTreeSet<_>>();
+        parked.release();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(15), apply)
             .await
             .unwrap()
-            .dataset("node:Company")
-            .is_none(),
-        "nothing registers the orphan target"
-    );
-    assert!(
-        std::path::Path::new(&company_uri).exists(),
-        "the open leaves the unregistered leftover for the retry"
-    );
-    assert_no_recovery_sidecars(dir.path());
-
-    recovered
-        .apply_schema(SCHEMA_V2_ADDED_TYPE)
-        .await
-        .expect("the retry reclaims the leftover under the sentinel and publishes");
-    assert_eq!(
-        helpers::count_rows(&recovered, "node:Company").await,
-        0,
-        "the retried AddType must be registered and queryable"
-    );
-    assert_eq!(node_table_uri(&recovered, "Company").await, company_uri);
-    let company = lance::Dataset::open(&company_uri).await.unwrap();
-    assert_eq!(
-        company.version().version,
-        1,
-        "the reclaimed path holds the retry's own version-one create"
-    );
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            !parked.timed_out(),
+            "the winner must finish before the loser resumes"
+        );
+        assert!(
+            !matches!(error, OmniError::RecoveryRequired { .. }),
+            "{error}"
+        );
+        assert!(error.is_read_set_changed(), "{error}");
+        let paths_after_loser = std::fs::read_dir(dir.path().join("nodes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            paths_after_loser, paths_before_loser,
+            "both applies must use the same allocated table path"
+        );
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), original_bytes);
+        assert_eq!(
+            lance::Dataset::open(company_uri)
+                .await
+                .unwrap()
+                .version()
+                .version,
+            1
+        );
+        let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
+        assert_eq!(reopened.schema_source().as_str(), winner_source);
+        assert_eq!(helpers::count_rows(&reopened, "node:Company").await, 1);
+        assert!(
+            reopened
+                .export_jsonl("main", &[])
+                .await
+                .unwrap()
+                .contains("winner")
+        );
+        let data = if changed {
+            r#"{"type":"Company","data":{"slug":"after"}}"#
+        } else {
+            r#"{"type":"Company","data":{"name":"after"}}"#
+        };
+        reopened.load_jsonl(data, LoadMode::Append).await.unwrap();
+        assert_eq!(helpers::count_rows(&reopened, "node:Company").await, 2);
+    }
 }
 
 #[tokio::test]
@@ -3672,10 +3666,7 @@ async fn schema_apply_partial_table_effect_leaves_no_residue() {
     );
 }
 
-/// A concurrent publication on main between the staged effects and the
-/// manifest commit: the apply loses its graph-head CAS, which is a plain
-/// refusal before publication. Its detached rewrite and staged contract are
-/// garbage, the winner is untouched, and the retry plans from the winner.
+/// A concurrent graph publication makes the schema writer lose its head CAS.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn schema_apply_loses_the_manifest_cas_to_a_concurrent_publication_without_residue() {
@@ -3689,7 +3680,7 @@ async fn schema_apply_loses_the_manifest_cas_to_a_concurrent_publication_without
     let schema_db = std::sync::Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
     let winner_db = helpers::session(Omnigraph::open(&uri).await.unwrap());
     let rendezvous =
-        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND);
     let desired = schema_with_person_city();
     let apply_handle = std::sync::Arc::clone(&schema_db);
     let apply_task = tokio::spawn(async move { apply_handle.apply_schema(&desired).await });
@@ -4823,91 +4814,6 @@ async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_neede
     );
 }
 
-// ─── MR-668 PR 2a: Omnigraph::init cleanup on partial failure ──────────────
-//
-// `init_with_storage` writes three schema artifacts before invoking
-// `GraphCoordinator::init`. Without cleanup, a failure between any of those
-// steps left orphan files behind, making the URI unusable for a retry of
-// `init` (it would refuse because `_schema.pg` already exists). The tests
-// below pin: on failpoint trigger at the two pre-commit phase boundaries,
-// the three schema files are removed before the error is returned.
-//
-// The third boundary (`init.after_coordinator_init`) sits past the graph's
-// commit point, where the cleanup must not run (issue #495 — deleting the
-// schema files there left a graph that could neither open nor re-init).
-// Its test asserts the graph survives an error at that window.
-//
-// Coverage note: orphan Lance directories after a failure DURING
-// `GraphCoordinator::init` are a known limitation — see the coverage-gap
-// comment in `init_with_storage`.
-
-#[tokio::test]
-#[serial]
-async fn init_failpoint_after_schema_pg_written_cleans_up_schema_file() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let _failpoint = catalog::INIT_AFTER_SCHEMA_PG_WRITTEN.fire_always();
-
-    let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
-        Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
-        Err(e) => e,
-    };
-    assert!(
-        err.to_string()
-            .contains("injected failpoint triggered: init.after_schema_pg_written"),
-        "got: {err}"
-    );
-
-    // Only `_schema.pg` was written at this phase boundary, but the
-    // cleanup attempts all three — `delete` treats not-found as Ok,
-    // so the other two deletes are no-ops.
-    assert!(
-        !dir.path().join("_schema.pg").exists(),
-        "_schema.pg must be cleaned up after init failure"
-    );
-    assert!(
-        !dir.path().join("__init_claim.json").exists(),
-        "pre-create failure must release the init claim after cleanup"
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn init_failpoint_after_schema_contract_written_cleans_up_all_schema_files() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let _failpoint = catalog::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN.fire_always();
-
-    let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
-        Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
-        Err(e) => e,
-    };
-    assert!(
-        err.to_string()
-            .contains("injected failpoint triggered: init.after_schema_contract_written"),
-        "got: {err}"
-    );
-
-    assert!(
-        !dir.path().join("_schema.pg").exists(),
-        "_schema.pg must be cleaned up"
-    );
-    assert!(
-        !dir.path().join("_schema.ir.json").exists(),
-        "_schema.ir.json must be cleaned up"
-    );
-    assert!(
-        !dir.path().join("__schema_state.json").exists(),
-        "__schema_state.json must be cleaned up"
-    );
-    assert!(
-        !dir.path().join("__init_claim.json").exists(),
-        "pre-create failure must release the init claim after cleanup"
-    );
-}
-
 #[tokio::test]
 #[serial]
 async fn init_failpoint_after_coordinator_init_leaves_completed_store_intact() {
@@ -4938,8 +4844,8 @@ async fn init_failpoint_after_coordinator_init_leaves_completed_store_intact() {
     // files must survive the failed init.
     for schema_file in ["_schema.pg", "_schema.ir.json", "__schema_state.json"] {
         assert!(
-            dir.path().join(schema_file).exists(),
-            "{schema_file} must survive a post-commit-point init failure"
+            !dir.path().join(schema_file).exists(),
+            "{schema_file} is not part of a row-contract graph"
         );
     }
 
@@ -4991,8 +4897,8 @@ async fn init_failpoint_post_manifest_create_leaves_completed_graph_intact() {
 
     for schema_file in ["_schema.pg", "_schema.ir.json", "__schema_state.json"] {
         assert!(
-            dir.path().join(schema_file).exists(),
-            "{schema_file} must survive a post-commit-point init failure"
+            !dir.path().join(schema_file).exists(),
+            "{schema_file} is not part of a row-contract graph"
         );
     }
 
@@ -5027,10 +4933,7 @@ async fn init_manifest_create_lost_ack_recovers_exact_genesis() {
     );
     drop(db);
     for artifact in ["_schema.pg", "_schema.ir.json", "__schema_state.json"] {
-        assert!(
-            dir.path().join(artifact).exists(),
-            "lost-ack recovery must preserve {artifact}"
-        );
+        assert!(!dir.path().join(artifact).exists());
     }
     assert!(
         !dir.path().join("__init_claim.json").exists(),
@@ -5079,17 +4982,10 @@ async fn init_table_create_lost_ack_preserves_claim_and_schema() {
     };
     assert_eq!(error_uri, uri);
     assert!(source.to_string().contains("init.table_create_post_native"));
-    for artifact in [
-        "_schema.pg",
-        "_schema.ir.json",
-        "__schema_state.json",
-        "__init_claim.json",
-    ] {
-        assert!(
-            dir.path().join(artifact).exists(),
-            "physical-init ambiguity must preserve {artifact}"
-        );
-    }
+    assert!(
+        dir.path().join("__init_claim.json").exists(),
+        "physical-init ambiguity must preserve __init_claim.json"
+    );
     assert!(
         dir.path().join("nodes").exists() || dir.path().join("edges").exists(),
         "the injected error must follow a real durable table Create"
@@ -5128,17 +5024,10 @@ async fn init_manifest_create_unknown_and_probe_failure_preserves_claim_and_sche
             .contains("init.manifest_create_post_native")
     );
     assert!(probe.to_string().contains("init.manifest_create_probe"));
-    for artifact in [
-        "_schema.pg",
-        "_schema.ir.json",
-        "__schema_state.json",
-        "__init_claim.json",
-    ] {
-        assert!(
-            dir.path().join(artifact).exists(),
-            "indeterminate initialization must preserve {artifact}"
-        );
-    }
+    assert!(
+        dir.path().join("__init_claim.json").exists(),
+        "indeterminate initialization must preserve __init_claim.json"
+    );
 
     drop(probe_failure);
     drop(lost_ack);
@@ -5151,44 +5040,30 @@ async fn init_manifest_create_unknown_and_probe_failure_preserves_claim_and_sche
     );
 }
 
-// The floor under the schema-files-gone damage state: however a graph loses
-// its schema files while keeping its data and `__manifest`, `open` must
-// diagnose the state by name.
 #[tokio::test]
 #[serial]
-async fn open_missing_schema_pg_reports_schema_files_missing() {
+async fn open_serves_the_row_contract_without_the_schema_files() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
     Omnigraph::init(&uri, helpers::TEST_SCHEMA)
         .await
         .expect("init must succeed");
-    std::fs::remove_file(dir.path().join("_schema.pg")).unwrap();
+    for name in ["_schema.pg", "_schema.ir.json", "__schema_state.json"] {
+        assert!(!dir.path().join(name).exists());
+    }
 
-    let err = match Omnigraph::open(&uri).await {
-        Ok(_) => panic!("open must fail without _schema.pg"),
-        Err(e) => e,
-    };
-    let OmniError::Manifest(manifest) = &err else {
-        panic!("missing schema source must remain a typed manifest error");
-    };
-    assert_eq!(manifest.kind, ManifestErrorKind::NotFound);
-    let msg = err.to_string();
-    assert!(
-        msg.contains("missing its schema files") && msg.contains("_schema.pg"),
-        "open must name the missing schema files, got: {msg}"
-    );
+    let db = Omnigraph::open(&uri)
+        .await
+        .expect("open reads the contract from main's __manifest, not the files");
+    assert_eq!(db.schema_source().as_str(), helpers::TEST_SCHEMA);
+    assert!(db.catalog().type_id("Person").is_some());
+    drop(db);
+    let read_only = Omnigraph::open_read_only(&uri)
+        .await
+        .expect("read-only open reads the contract from main's __manifest too");
+    assert_eq!(read_only.schema_source().as_str(), helpers::TEST_SCHEMA);
+    drop(read_only);
 
-    let read_only_err = match Omnigraph::open_read_only(&uri).await {
-        Ok(_) => panic!("read-only open must also fail without _schema.pg"),
-        Err(err) => err,
-    };
-    let OmniError::Manifest(manifest) = read_only_err else {
-        panic!("read-only missing schema source must remain a typed manifest error");
-    };
-    assert_eq!(manifest.kind, ManifestErrorKind::NotFound);
-
-    std::fs::remove_file(dir.path().join("_schema.ir.json")).unwrap();
-    std::fs::remove_file(dir.path().join("__schema_state.json")).unwrap();
     let reinit = match Omnigraph::init(&uri, "node Replacement { key: String @key }\n").await {
         Ok(_) => panic!("strict init must not rebind a readable manifest with missing schema"),
         Err(err) => err,
@@ -5253,37 +5128,6 @@ async fn init_crash_after_manifest_create_leaves_openable_store() {
     .await
     .expect("store must accept writes after the crash");
     assert_eq!(count_rows(&db, "node:Person").await, 1);
-}
-
-#[tokio::test]
-#[serial]
-async fn init_failpoint_returns_original_error_not_cleanup_error() {
-    // A delete failure is outcome-unknown: retain the claim so a delayed
-    // delete cannot race a later initializer, but still return the original
-    // pre-physical init error rather than masking it with cleanup failure.
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let _failpoint = catalog::INIT_AFTER_SCHEMA_PG_WRITTEN.fire_always();
-    let _delete_failure = catalog::INIT_SCHEMA_CLEANUP_DELETE.fire_always();
-
-    let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
-        Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
-        Err(e) => e,
-    };
-    let msg = err.to_string();
-    assert!(
-        msg.contains("init.after_schema_pg_written"),
-        "init error must surface the failpoint cause, got: {msg}"
-    );
-    assert!(
-        dir.path().join("_schema.pg").exists(),
-        "the injected delete failure must leave the owned schema artifact"
-    );
-    assert!(
-        dir.path().join("__init_claim.json").exists(),
-        "an indeterminate schema delete must retain the init claim"
-    );
 }
 
 // Local roots probe create-if-absent on init and on read-write open (issue
@@ -6912,6 +6756,21 @@ async fn azure_optimize_detached_pin_survives_next_write() {
     assert_optimize_detached_pin_survives_next_write(&uri).await;
     delete_azure_graph(&uri).await;
 }
+/// Atomic schema publication on configured Azure/Azurite, followed by fixture cleanup.
+#[tokio::test]
+#[serial]
+async fn azure_schema_apply_post_commit_failure_leaves_readable_contract() {
+    let Some(uri) = azure_test_graph_uri("schema-apply-post-commit") else {
+        eprintln!(
+            "skipping Azure atomic schema publication: OMNIGRAPH_AZURE_TEST_CONTAINER is not set"
+        );
+        return;
+    };
+    let _scenario = FailScenario::setup();
+    assert_schema_apply_post_commit_failure_leaves_readable_contract(&uri).await;
+    delete_azure_graph(&uri).await;
+}
+
 /// Person HEAD and published version on `branch`, with the linear HEAD read
 /// from the ref the entry names.
 async fn person_versions(db: &Omnigraph, branch: &str) -> (u64, u64) {
@@ -8057,15 +7916,34 @@ async fn rfc_0067_unavailable_ack_readback_is_indeterminate_without_replay() {
     };
     let error = outcome.unwrap_err().to_string();
     assert!(error.contains("outcome is in doubt"), "{error}");
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "after_indeterminate")], &[("$age", 43)]),
+    )
+    .await
+    .expect("same handle continues before any read refresh");
     let fresh = Omnigraph::open_read_only(dir.path().to_str().unwrap())
         .await
         .unwrap();
     assert_eq!(
         count_rows(&fresh, "node:Person").await,
-        before + 1,
+        before + 2,
         "no automatic replay"
     );
-    assert_eq!(count_rows(&db, "node:Person").await, before + 1);
+    let people = read_table(&fresh, "node:Person").await;
+    let names = collect_column_strings(&people, "name");
+    for expected in ["indeterminate", "after_indeterminate"] {
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_str() == expected)
+                .count(),
+            1
+        );
+    }
+    assert_eq!(count_rows(&db, "node:Person").await, before + 2);
 }
 
 /// GENERALIZED LIVENESS, persistent pre-publish faults: the same live handle
@@ -8253,7 +8131,7 @@ async fn live_handle_writes_after_every_write_family_seam_failure() {
             Driver::Merge,
         ),
         ("schema_apply.post_lock_pre_effect", Driver::SchemaApply),
-        ("schema_apply.before_staging_write", Driver::SchemaApply),
+        ("graph_publish.before_commit_append", Driver::SchemaApply),
         ("schema_apply.after_manifest_commit", Driver::SchemaApply),
         (
             "ensure_indices.post_stage_pre_commit_btree",

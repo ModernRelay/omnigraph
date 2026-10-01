@@ -3,8 +3,6 @@
 
 mod helpers;
 
-use std::fs;
-
 use arrow_array::{StringArray, StructArray};
 use omnigraph::changes::{ChangeFeedScope, ChangeFilter, ChangeOp, ChangeOpKind};
 
@@ -45,9 +43,16 @@ async fn legacy_vintage_graph_works_end_to_end() {
             .unwrap(),
     );
 
-    let ir: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(dir.path().join("_schema.ir.json")).unwrap())
-            .unwrap();
+    let ir: serde_json::Value = serde_json::from_str(
+        &omnigraph_catalog::ManifestCoordinator::open(uri)
+            .await
+            .unwrap()
+            .read_schema_contract()
+            .await
+            .unwrap()
+            .ir,
+    )
+    .unwrap();
     assert_eq!(
         ir["ir_version"].as_u64(),
         Some(u64::from(SCHEMA_IR_VERSION)),
@@ -57,7 +62,7 @@ async fn legacy_vintage_graph_works_end_to_end() {
         db.internal_schema_version_of(ReadTarget::branch("main"))
             .await
             .unwrap(),
-        12,
+        omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
         "a legacy-vintage graph is born at the current `__manifest` stamp; the vintage lives in the schema IR (RFC 0040 Compatibility, RFC 0067, detached-only tables)"
     );
     let snap = snapshot_main(&db).await.unwrap();
@@ -428,9 +433,16 @@ edge WorksAt: Person -> Company {
     )
     .await
     .expect("legacy evolution restates historically legal underscore names");
-    let ir: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(dir.path().join("_schema.ir.json")).unwrap())
-            .unwrap();
+    let ir: serde_json::Value = serde_json::from_str(
+        &omnigraph_catalog::ManifestCoordinator::open(uri)
+            .await
+            .unwrap()
+            .read_schema_contract()
+            .await
+            .unwrap()
+            .ir,
+    )
+    .unwrap();
     assert_eq!(
         ir["ir_version"].as_u64(),
         Some(u64::from(SCHEMA_IR_VERSION)),
@@ -538,23 +550,22 @@ async fn legacy_endpoint_constraints_keep_the_accepted_shape_hash() {
                 .await
                 .unwrap(),
         );
-        let old_state: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(dir.path().join("__schema_state.json")).unwrap(),
+        let old_ir: omnigraph_compiler::SchemaIR = serde_json::from_str(
+            &omnigraph_catalog::ManifestCoordinator::open(uri)
+                .await
+                .unwrap()
+                .read_schema_contract()
+                .await
+                .unwrap()
+                .ir,
         )
         .unwrap();
-        let old_ir: omnigraph_compiler::SchemaIR =
-            serde_json::from_str(&fs::read_to_string(dir.path().join("_schema.ir.json")).unwrap())
-                .unwrap();
         let old_shape = omnigraph_compiler::compile_schema_shape(
             &omnigraph_compiler::schema::parser::parse_persisted_schema_contract(&source).unwrap(),
         )
         .unwrap();
         assert_eq!(
-            old_state["schema_shape_hash"],
-            omnigraph_compiler::schema_shape_hash(&old_shape).unwrap()
-        );
-        assert_eq!(
-            old_state["schema_shape_hash"],
+            omnigraph_compiler::schema_shape_hash(&old_shape).unwrap(),
             omnigraph_compiler::schema_shape_hash_from_ir(&old_ir).unwrap()
         );
         drop(db);

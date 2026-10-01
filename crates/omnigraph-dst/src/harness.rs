@@ -146,6 +146,12 @@ pub(crate) const LATENT_MARKER: &str = "latent sector error (dst)";
 pub struct FaultPlan {
     pub seed: u64,
     pub error_pct: u64,
+    /// Seeded failures at current engine pre-publication effect boundaries.
+    /// Unlike Lance IO weather, selection follows the sequential workload,
+    /// not internal call order, so these universes retain strict replay.
+    /// Requires failpoints and a serialized `FailScenario`; zero leaves
+    /// the existing schedule unchanged.
+    pub engine_effect_error_pct: u64,
     /// Slatedb-derived doctrine (probe/list failpoints): faults on READ-class
     /// calls too — reads and listings (`read_fault` call sites) — one seam knob instead of
     /// per-point instrumentation.
@@ -275,6 +281,7 @@ impl FaultPlan {
         Self {
             seed: 0,
             error_pct: 0,
+            engine_effect_error_pct: 0,
             read_error_pct: 0,
             latency_pct: 0,
             max_latency_ms: 1,
@@ -1063,6 +1070,10 @@ pub struct UniverseReport {
     /// model-predicted merge conflict, keep-serving deferral refusals —
     /// the watched streak and the maintenance-barrier spelling).
     pub legal_rejections: usize,
+    /// Counted engine effect seams that fired and returned their exact error.
+    pub engine_effects_injected: usize,
+    /// Successful model-changing data writes after at least one such failure.
+    pub writes_after_engine_effect: usize,
     /// errors the Lance-realm injector actually delivered —
     /// evidence the table realm saw weather (0 in clean universes).
     pub lance_realm_injected: usize,
@@ -5254,6 +5265,14 @@ pub fn run_universe(root: &str, scenario: &Scenario) -> UniverseReport {
 /// Retain detector panic payloads while the shared executor finalizes resources.
 pub fn run_universe_caught(root: &str, sc: &Scenario) -> std::thread::Result<UniverseReport> {
     assert!(
+        cfg!(feature = "failpoints")
+            || sc
+                .faults
+                .as_ref()
+                .is_none_or(|plan| plan.engine_effect_error_pct == 0),
+        "engine effect weather requires --features failpoints"
+    );
+    assert!(
         !(sc.keep_handle
             && (sc.crash_at.is_some()
                 || sc.crash_on_match.is_some()
@@ -5305,6 +5324,302 @@ pub fn run_universe_caught(root: &str, sc: &Scenario) -> std::thread::Result<Uni
                 "universe cleanup failed: {error}; original={result:?}"
             ))),
         },
+    }
+}
+
+/// Replay evidence for legacy-file admission during offline storage upgrade.
+/// These adapter reads are not part of current-format serving.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LegacyUpgradeReadReport {
+    pub checks_passed: usize,
+    pub checks_failed: usize,
+    pub reads_corrupted: usize,
+    pub reads_truncated: usize,
+    pub latent_errors: usize,
+    pub stale_reads_served: usize,
+    pub detections: Vec<String>,
+    pub missing_ir_refused: bool,
+    pub final_rows: Vec<(String, i64, i64)>,
+    pub commit_ids: Vec<String>,
+}
+
+struct LegacyUpgradeReadScenario {
+    plan: FaultPlan,
+    attempts: usize,
+    execute_under_weather: bool,
+}
+
+/// Exercise the actual legacy-file consumer in a seeded universe. The fixture
+/// becomes genuine flat-v11 rows before weather starts. Every weathered attempt
+/// must leave all stored objects unchanged; execution attempts are refusal-only.
+pub fn run_legacy_upgrade_read_weather(
+    root: &str,
+    seed: u64,
+    plan: FaultPlan,
+    attempts: usize,
+    execute_under_weather: bool,
+) -> LegacyUpgradeReadReport {
+    assert!(
+        !plan.lance_realm,
+        "legacy adapter weather requires strict replay"
+    );
+    assert!(attempts > 0);
+    crate::env_knobs::require_pool_env();
+    let environment = MemoryEnvironment::new(root, seed, UniverseProcess::Shared);
+    let scenario = LegacyUpgradeReadScenario {
+        plan,
+        attempts,
+        execute_under_weather,
+    };
+    let run = crate::environment::run_universe(&environment, &scenario);
+    run.cleanup
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        .expect("legacy upgrade universe cleanup");
+    run.result
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        .expect("legacy upgrade universe setup")
+}
+
+async fn legacy_upgrade_stored_objects(resources: &MemoryStorage) -> BTreeMap<String, Vec<u8>> {
+    use futures::TryStreamExt;
+    use lance_io::object_store::providers::shared_memory::SharedMemoryStoreProvider;
+    use lance_io::object_store::{ObjectStoreParams, ObjectStoreProvider};
+    use object_store::ObjectStoreExt;
+
+    let mut objects = BTreeMap::new();
+    for uri in resources.adapter.list_dir(&resources.root).await.unwrap() {
+        let text = resources.adapter.read_text(&uri).await.unwrap();
+        objects.insert(format!("adapter:{uri}"), text.into_bytes());
+    }
+    let url = url::Url::parse(&resources.root).unwrap();
+    let provider = SharedMemoryStoreProvider::default();
+    let prefix = provider.extract_path(&url).unwrap();
+    let store = provider
+        .new_store(url, &ObjectStoreParams::default())
+        .await
+        .unwrap()
+        .inner;
+    let mut listing = store.list(Some(&prefix));
+    while let Some(object) = listing.try_next().await.unwrap() {
+        let bytes = store
+            .get(&object.location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        objects.insert(format!("lance:{}", object.location), bytes.to_vec());
+    }
+    objects
+}
+
+impl UniverseScenario<MemoryStorage> for LegacyUpgradeReadScenario {
+    type Output = LegacyUpgradeReadReport;
+
+    async fn run<'a>(
+        &'a self,
+        resources: &'a mut MemoryStorage,
+        _workload_seed: u64,
+    ) -> LegacyUpgradeReadReport {
+        use omnigraph::db::{UpgradeOptions, UpgradeOutcome, upgrade_storage};
+
+        let root = resources.root.as_str();
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init_with_storage(
+                    root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            ),
+            SessionSettings::default(),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+        let expected_export = db.export_jsonl("main", &[]).await.unwrap();
+        let expected_rows = person_rows(&db).await;
+        let expected_edges = knows_pairs(&db).await;
+        let expected_commits = db.list_commits(None).await.unwrap();
+        drop(db);
+        let (source, ir, state) = omnigraph::db::dst_prepare_legacy_upgrade_fixture(root)
+            .await
+            .unwrap();
+        for (name, text) in [
+            ("_schema.pg", source.as_str()),
+            ("_schema.ir.json", ir.as_str()),
+            ("__schema_state.json", state.as_str()),
+        ] {
+            resources
+                .adapter
+                .write_text(&format!("{root}/{name}"), text)
+                .await
+                .unwrap();
+        }
+
+        let source_uri = format!("{root}/_schema.pg");
+        if self.plan.stale_read_pct > 0 {
+            resources
+                .adapter
+                .write_text(
+                    &source_uri,
+                    &format!("{}\nnode FormerFixture {{ value: String }}\n", source),
+                )
+                .await
+                .unwrap();
+        }
+        let failing = Arc::new(FailingStorage::new(
+            resources.adapter.clone(),
+            self.plan.clone(),
+            None,
+            None,
+        ));
+        if self.plan.stale_read_pct > 0 {
+            failing.write_text(&source_uri, &source).await.unwrap();
+        }
+        let _decoration =
+            omnigraph::storage::STORAGE.install(Arc::new(FailingStorageDecorator(failing.clone())));
+        let before = legacy_upgrade_stored_objects(resources).await;
+
+        let clean_check = upgrade_storage(
+            root,
+            UpgradeOptions {
+                check: true,
+                to_format: Some(13),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(clean_check.outcome, UpgradeOutcome::CheckPassed);
+        assert_eq!(legacy_upgrade_stored_objects(resources).await, before);
+
+        let mut report = LegacyUpgradeReadReport {
+            checks_passed: 0,
+            checks_failed: 0,
+            reads_corrupted: 0,
+            reads_truncated: 0,
+            latent_errors: 0,
+            stale_reads_served: 0,
+            detections: Vec::new(),
+            missing_ir_refused: false,
+            final_rows: Vec::new(),
+            commit_ids: Vec::new(),
+        };
+        failing.enable();
+        for attempt in 0..self.attempts {
+            let damage_before = failing.damage_events() + failing.stale_reads_count();
+            let result = upgrade_storage(
+                root,
+                UpgradeOptions {
+                    check: !self.execute_under_weather,
+                    to_format: Some(13),
+                },
+            )
+            .await
+            .expect("upgrade exposes preflight refusals as a typed report");
+            assert!(
+                result.last_durable_completed_boundary.is_none(),
+                "{result:?}"
+            );
+            assert!(result.recovery.is_none(), "{result:?}");
+            match result.outcome {
+                UpgradeOutcome::CheckPassed if !self.execute_under_weather => {
+                    report.checks_passed += 1;
+                }
+                UpgradeOutcome::CheckFailed => {
+                    report.checks_failed += 1;
+                    assert!(
+                        failing.damage_events() + failing.stale_reads_count() > damage_before,
+                        "refusal without a delivered read fault: {result:?}"
+                    );
+                    assert!(
+                        result
+                            .findings
+                            .iter()
+                            .any(|finding| finding.code == "preflight_failed"),
+                        "{result:?}"
+                    );
+                    for finding in result.findings {
+                        report.detections.push(format!(
+                            "attempt={attempt} {}: {}",
+                            finding.code,
+                            finding.message.replace(root, "<root>"),
+                        ));
+                    }
+                }
+                other => panic!("unexpected legacy admission outcome {other:?}: {result:?}"),
+            }
+            assert_eq!(legacy_upgrade_stored_objects(resources).await, before);
+        }
+        failing.suspend();
+        report.reads_corrupted = failing.reads_corrupted();
+        report.reads_truncated = failing.reads_truncated();
+        report.latent_errors = failing.latent_errors();
+        report.stale_reads_served = failing.stale_reads_count();
+
+        let ir_uri = format!("{root}/_schema.ir.json");
+        resources.adapter.delete(&ir_uri).await.unwrap();
+        let missing_before = legacy_upgrade_stored_objects(resources).await;
+        let missing = upgrade_storage(
+            root,
+            UpgradeOptions {
+                check: false,
+                to_format: Some(13),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(missing.outcome, UpgradeOutcome::CheckFailed);
+        assert!(missing.last_durable_completed_boundary.is_none());
+        assert!(missing.recovery.is_none());
+        assert!(
+            missing
+                .findings
+                .iter()
+                .any(|finding| finding.code == "preflight_failed")
+        );
+        assert_eq!(
+            legacy_upgrade_stored_objects(resources).await,
+            missing_before
+        );
+        resources.adapter.write_text(&ir_uri, &ir).await.unwrap();
+        report.missing_ir_refused = true;
+        assert_eq!(legacy_upgrade_stored_objects(resources).await, before);
+
+        let converted = upgrade_storage(root, UpgradeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            converted.outcome,
+            UpgradeOutcome::Completed,
+            "{converted:?}"
+        );
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::open_with_storage(root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            ),
+            SessionSettings::default(),
+        );
+        assert_eq!(db.export_jsonl("main", &[]).await.unwrap(), expected_export);
+        report.final_rows = person_rows(&db).await;
+        assert_eq!(report.final_rows, expected_rows);
+        assert_eq!(knows_pairs(&db).await, expected_edges);
+        let commits = db.list_commits(None).await.unwrap();
+        assert_eq!(
+            commits, expected_commits,
+            "storage conversion preserves graph lineage"
+        );
+        report.commit_ids = commits
+            .into_iter()
+            .map(|commit| commit.graph_commit_id)
+            .collect();
+        assert!(!report.commit_ids.is_empty());
+        assert!(!report.final_rows.is_empty());
+        assert!(resources.adapter.list_dir(root).await.unwrap().is_empty());
+        report
     }
 }
 
@@ -5391,6 +5706,14 @@ impl UniverseScenario<RustResources> for Scenario {
         let mut crashes = 0usize;
         let mut verified = 0usize;
         let mut legal_rejections = 0usize;
+        #[cfg(feature = "failpoints")]
+        let mut engine_effects_injected = 0usize;
+        #[cfg(not(feature = "failpoints"))]
+        let engine_effects_injected = 0usize;
+        let mut writes_after_engine_effect = 0usize;
+        #[cfg(feature = "failpoints")]
+        let mut effect_rng =
+            SplitMix64(sc.faults.as_ref().map_or(0, |plan| plan.seed) ^ 0x4546_4645_4354_4453);
         // Reopens performed while judging failures (reconcile / crash
         // recovery). A `keep_handle` universe must end with zero.
         let mut reopens = 0usize;
@@ -5708,7 +6031,49 @@ impl UniverseScenario<RustResources> for Scenario {
                     }
                     _ => None,
                 };
-                exec_world_op(&db, &wop).await
+                let effect_window = sc.faults.as_ref().and_then(|plan| {
+                    if plan.engine_effect_error_pct == 0
+                        || sc.probe_window.is_some()
+                        || (sc.probe_only && crash_now.is_some())
+                        || !matches!(&wop, WorldOp::Data { op, .. } if is_mutation_op(op) || is_load_op(op))
+                        || effect_rng.below(100) >= plan.engine_effect_error_pct
+                    {
+                        return None;
+                    }
+                    let windows = [
+                        "mutation.post_table_commit",
+                        "graph_publish.before_commit_append",
+                    ];
+                    Some(windows[effect_rng.below(windows.len() as u64) as usize])
+                });
+                let effect_guard = effect_window.map(|window| {
+                    omnigraph::seams::catalog::decide(window)
+                        .expect("engine effect weather names a catalog seam")
+                        .count_and_fire_at(1)
+                });
+                let result = exec_world_op(&db, &wop).await;
+                let fired = effect_guard
+                    .as_ref()
+                    .is_some_and(|(_, count)| count.fired());
+                drop(effect_guard);
+                if fired {
+                    let window = effect_window.expect("a counted injection has a selected seam");
+                    let error = result.expect_err("pre-publication effect failure was absorbed");
+                    assert!(
+                        matches!(&error, OmniError::Manifest(detail)
+                            if detail.kind == omnigraph::error::ManifestErrorKind::BadRequest
+                                && detail.details.is_none()
+                                && !detail.publication_in_doubt
+                                && detail.message == format!("injected failpoint triggered: {window}")),
+                        "counted effect fired but an unrelated error escaped: {error}"
+                    );
+                    engine_effects_injected += 1;
+                    Err(OmniError::manifest(format!(
+                        "{FAULT_MARKER}: engine effect {window}: {error}"
+                    )))
+                } else {
+                    result
+                }
             };
             #[cfg(not(feature = "failpoints"))]
             let exec_result = exec_world_op(&db, &wop).await;
@@ -5862,7 +6227,13 @@ impl UniverseScenario<RustResources> for Scenario {
                                 f.resume();
                             }
                         }
+                        let prior_data = (engine_effects_injected > 0
+                            && matches!(&wop, WorldOp::Data { op, .. } if is_mutation_op(op) || is_load_op(op)))
+                            .then(|| world.render());
                         apply_world(&mut world, &wop);
+                        if prior_data.is_some_and(|before| before != world.render()) {
+                            writes_after_engine_effect += 1;
+                        }
                     }
                     Err(err) => {
                         // One damage snapshot for the WHOLE failure handling:
@@ -6421,6 +6792,8 @@ impl UniverseScenario<RustResources> for Scenario {
             bystander_trail,
             verified,
             legal_rejections,
+            engine_effects_injected,
+            writes_after_engine_effect,
             lance_realm_injected,
             writes_observed,
             crash_state_hit,

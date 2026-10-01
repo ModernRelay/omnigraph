@@ -309,6 +309,9 @@ async fn historical_query_resolves_rename_by_identity_but_rejects_reincarnation(
     .await
     .unwrap();
     let before_rename = version_main(&db).await.unwrap();
+    let stale_handle = session(Omnigraph::open(uri).await.unwrap());
+    let stale_snapshot_handle = session(Omnigraph::open(uri).await.unwrap());
+    let snapshot_before_rename = db.resolve_snapshot("main").await.unwrap();
 
     db.apply_schema(
         "node Human @rename_from(\"Person\") { name: String @key }\n\
@@ -328,6 +331,32 @@ async fn historical_query_resolves_rename_by_identity_but_rejects_reincarnation(
     assert_eq!(
         collect_column_strings(renamed_view.batches(), "p.name"),
         vec!["Alice".to_string()]
+    );
+    let stale_view = stale_handle
+        .run_query_at(
+            before_rename,
+            ALL_HUMANS_QUERY,
+            "all_humans",
+            &ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_column_strings(stale_view.batches(), "p.name"),
+        vec!["Alice"]
+    );
+    let stale_snapshot_view = stale_snapshot_handle
+        .query(
+            omnigraph::db::ReadTarget::Snapshot(snapshot_before_rename),
+            ALL_HUMANS_QUERY,
+            "all_humans",
+            &ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_column_strings(stale_snapshot_view.batches(), "p.name"),
+        vec!["Alice"]
     );
 
     db.apply_schema(

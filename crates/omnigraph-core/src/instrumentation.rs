@@ -9,12 +9,12 @@
 //!   a task-local ([`QueryIoProbes`]) set by the test; production leaves it unset,
 //!   so the open helpers attach nothing (one unset-`Option` check per open).
 //! - **omnigraph `StorageAdapter`** — [`CountingStorageAdapter`], a decorator that
-//!   counts per-method calls (the schema-contract reads on the query path).
+//!   counts per-method calls at the adapter boundary.
 //! - **branch merge** — [`MergeWriteProbes`] reports structural route counters
 //!   and completed timing intervals without reading the clock when unset.
 //!
 //! The probes themselves only observe, and the decorator delegates every call.
-//! The shared dataset opener also supplies the process control session when a
+//! The shared dataset opener also supplies a zero-cache control session when a
 //! caller has no graph-scoped data session, so detached opens still reuse the
 //! process object-store registry without caching mutable metadata. `IOTracker`
 //! (the concrete counter) lives in tests via the `lance-io` dev-dependency; this
@@ -1717,6 +1717,9 @@ pub enum VersionResolution {
     At(u64),
 }
 
+mod small_manifest_reads;
+pub use small_manifest_reads::manifest_scan_dataset;
+
 /// Open a table pin (RFC 0067): a pin without a staged version opens its
 /// target, a staged pin above `last_linear_version` opens its detached
 /// version, and any older pin keeps the v10 twin rule for historical rows.
@@ -1812,7 +1815,7 @@ pub async fn open_pinned_dataset(
 ///    store). No wrapper (production) adds nothing.
 /// 3. A caller-provided graph data `Session` warms Lance's metadata/index
 ///    caches across data-table opens. When absent (for example a detached
-///    historical snapshot), the process-wide zero-cache
+///    historical snapshot), a fresh zero-cache
 ///    control session is attached instead. Every open therefore reuses the
 ///    shared object-store registry/client pool without letting mutable control
 ///    metadata become stale in a session cache.

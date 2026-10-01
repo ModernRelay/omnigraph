@@ -204,8 +204,10 @@ Schema v8 defines native-ref retirement metadata; schema v9 adds the
 system-column namespace (RFC 0040); schema v10 lets a registration name a
 detached table commit (RFC 0067); schema v11 makes that commit the table's
 version for life and records `omnigraph.last_linear_version` on every
-registration (RFC: Detached-only tables). Normal open serves v11 only;
-qualified v6/v7/v8/v9/v10 graphs have explicit offline routes to v11, and the
+registration (RFC: Detached-only tables). Schema v12 packs the catalog record;
+schema v13 stores the schema contract row in each branch's `__manifest`.
+Normal open serves v13 only; qualified v6/v7/v8/v9/v10/v11/v12 graphs have
+explicit offline routes to v13, and the
 system-column respelling is a separate step on a served graph. The v7 → v8 handler
 changes only manifest configuration metadata and does not infer fork ownership
 or retire branches. Source v6/v7 graphs with reserved retirement metadata refuse;

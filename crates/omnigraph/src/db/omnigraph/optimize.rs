@@ -224,7 +224,6 @@ decide_seam! {
 pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimizeStats>> {
     let _export_exclusion = db.reserve_export_destructive_control()?;
     db.ensure_schema_state_valid().await?;
-    db.ensure_schema_apply_idle("optimize").await?;
 
     // Capture complete graph authority before entering any writer gate, then
     // revalidate it after schema -> main -> table acquisition. A concurrent
@@ -238,7 +237,6 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
     // under the same schema gate as schema apply and the exact RFC-022 writers.
     let schema_permit = db.write_queue().acquire_schema_shared().await;
     db.refresh_coordinator_only().await?;
-    db.ensure_schema_apply_not_locked("optimize").await?;
     let catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
 
     // Optimize's one visibility point advances main's graph head, so its
@@ -846,7 +844,6 @@ pub async fn cleanup_all_datasets(
 
     let _export_exclusion = db.reserve_export_destructive_control()?;
     db.ensure_schema_state_valid().await?;
-    db.ensure_schema_apply_idle("cleanup").await?;
     fail(&CLEANUP_PRE_GATES)?;
 
     // GC must be bound to one accepted graph view. Capture before acquiring
@@ -856,7 +853,6 @@ pub async fn cleanup_all_datasets(
 
     let _cleanup_schema_permit = db.write_queue().acquire_schema_shared().await;
     db.refresh_coordinator_only().await?;
-    db.ensure_schema_apply_not_locked("cleanup").await?;
     let cleanup_catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
     let snapshot = db.revalidate_write_txn(&authority_txn).await?;
 
@@ -1402,7 +1398,6 @@ fn native_table_retention_roots(
             .iter()
             .filter(|native| {
                 native.as_str() == "main"
-                    || crate::db::is_internal_system_branch(native)
                     || collector_retains_native_tree(plan, full_path, object_base, native)
                     || crate::branch_names::retain_unpublished_table_fork(native, |incarnation| {
                         plan.live_branch_incarnations.contains(incarnation)

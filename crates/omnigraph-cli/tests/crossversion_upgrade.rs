@@ -821,7 +821,7 @@ fn current_v10_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v10() {
 /// The guide's own preflight spelling and the default both report
 /// already_current on a graph this binary created.
 #[test]
-fn current_binary_reports_already_current_on_a_fresh_graph() {
+fn storage_upgrade_current_binary_reports_already_current_on_a_fresh_graph() {
     let temp = tempdir().unwrap();
     let graph = temp.path().join("fresh-current.omni");
     let uri = graph.to_str().unwrap();
@@ -832,14 +832,14 @@ fn current_binary_reports_already_current_on_a_fresh_graph() {
     for args in [
         vec!["upgrade", uri, "--check", "--json"],
         vec!["upgrade", uri, "--json"],
-        vec!["upgrade", uri, "--check", "--to-format", "11", "--json"],
+        vec!["upgrade", uri, "--check", "--to-format", "13", "--json"],
     ] {
         let report = support::parse_stdout_json(&output_success(cli().args(&args)));
         assert_eq!(report["outcome"], "already_current", "{args:?}");
-        assert_eq!(report["observed_format"], 12, "{args:?}");
+        assert_eq!(report["observed_format"], 13, "{args:?}");
     }
 
-    for lower in ["7", "8", "10"] {
+    for lower in ["7", "8", "10", "11"] {
         let refused = support::parse_stdout_json(&output_failure(cli().args([
             "upgrade",
             uri,
@@ -1296,7 +1296,17 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
 }
 
 fn migration_bin(variable: &str, version: &str) -> Option<PathBuf> {
-    let Some(path) = std::env::var_os(variable).map(PathBuf::from) else {
+    let fixtures =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/storage-upgrade-binaries");
+    let local = fixtures.join(match variable {
+        "OMNIGRAPH_V09_BIN" => "v0.9.0/omnigraph",
+        "OMNIGRAPH_V6_BIN" => "v0.10.0/omnigraph",
+        _ => panic!("unknown migration predecessor {variable}"),
+    });
+    let selected = std::env::var_os(variable)
+        .map(PathBuf::from)
+        .or_else(|| fixtures.exists().then_some(local));
+    let Some(path) = selected else {
         assert!(
             std::env::var_os("OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS").is_none(),
             "required storage migration predecessor {variable} is unset"
@@ -1307,6 +1317,10 @@ fn migration_bin(variable: &str, version: &str) -> Option<PathBuf> {
     assert!(
         path.is_file(),
         "{variable} is not a binary: {}",
+        path.display()
+    );
+    eprintln!(
+        "storage migration predecessor {version}: {}",
         path.display()
     );
     let output = run_old(&path, &["version"]);
@@ -1568,6 +1582,22 @@ query vectors($q: Vector(4)) {
         payloads(&before),
         "storage migration must preserve every table object without adding table objects"
     );
+    let immutable_payloads = |files: &std::collections::BTreeMap<PathBuf, Vec<u8>>| {
+        payloads(files)
+            .into_iter()
+            .filter(|(path, _)| {
+                !path.components().any(|part| {
+                    ["_versions", "_transactions", "_refs"]
+                        .iter()
+                        .any(|name| part.as_os_str() == std::ffi::OsStr::new(name))
+                })
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let original_payloads = immutable_payloads(&before);
+    for kind in ["nodes", "edges"] {
+        assert!(original_payloads.keys().any(|path| path.starts_with(kind)));
+    }
     for check_mode in [true, false] {
         let mut command = cli();
         command.args(["upgrade", uri, "--to-format", "8", "--json"]);
@@ -1583,25 +1613,32 @@ query vectors($q: Vector(4)) {
             default_route.arg("--check");
         }
         let completed = support::parse_stdout_json(&output_success(&mut default_route));
-        assert_eq!(completed["target_format"], 11);
+        assert_eq!(completed["target_format"], 13);
         assert_eq!(completed["target_defaulted"], true);
         if check_mode {
             assert_eq!(
                 completed["outcome"], "check_passed",
-                "the default route reaches v11 through the live branches: {completed}"
+                "the default route reaches v13 through the live branches: {completed}"
             );
             assert_eq!(
                 graph_files(&graph),
                 after,
-                "the v11 check must be effect-free"
+                "the v13 check must be effect-free"
             );
         } else {
             assert_eq!(
                 completed["outcome"], "completed",
-                "the default route takes a branched graph to v11: {completed}"
+                "the default route takes a branched graph to v13: {completed}"
             );
-            assert_eq!(completed["completed_handlers"].as_array().unwrap().len(), 2);
+            assert_eq!(completed["completed_handlers"].as_array().unwrap().len(), 3);
             after = graph_files(&graph);
+            assert_eq!(
+                immutable_payloads(&after),
+                original_payloads,
+                "the complete v6-to-v13 route must preserve every immutable table object"
+            );
+            assert_eq!(completed["work"]["payload_bytes_copied"], 0);
+            assert_eq!(completed["work"]["payload_bytes_rewritten"], 0);
         }
         let mut downgrade = cli();
         downgrade.args(["upgrade", uri, "--to-format", "7", "--json"]);
@@ -1616,6 +1653,25 @@ query vectors($q: Vector(4)) {
             "downgrade refusal must be effect-free"
         );
     }
+    for name in ["_schema.pg", "_schema.ir.json", "__schema_state.json"] {
+        assert!(!graph.join(name).exists(), "converted graph retains {name}");
+    }
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = Omnigraph::open_read_only(uri).await.unwrap();
+        for branch in ["main", "review"] {
+            db.sync_branch(branch).await.unwrap();
+            assert_eq!(
+                db.schema_source().as_bytes(),
+                before[Path::new("_schema.pg")]
+            );
+            let expected_ir: serde_json::Value =
+                serde_json::from_slice(&before[Path::new("_schema.ir.json")]).unwrap();
+            assert_eq!(
+                serde_json::to_value(db.catalog().bound_schema_ir().unwrap()).unwrap(),
+                expected_ir
+            );
+        }
+    });
     let refused = support::parse_stdout_json(&output_failure(cli().args([
         "upgrade",
         uri,
@@ -1631,7 +1687,7 @@ query vectors($q: Vector(4)) {
             .unwrap()
             .iter()
             .any(|finding| finding["code"] == "target_below_stamp"),
-        "v8 is below the served floor once the graph is at v11: {refused}"
+        "v8 is below the served floor once the graph is at v13: {refused}"
     );
     assert_eq!(
         graph_files(&graph),
@@ -1835,10 +1891,10 @@ query vectors($q: Vector(4)) {
     };
     assert_eq!(
         stamps(),
-        [11, 11],
-        "the upgrade stops at v11 on every live branch"
+        [13, 13],
+        "the upgrade converts every live branch to v13"
     );
-    for (branch, after_rebuild) in [("main", [12, 11]), ("review", [12, 12])] {
+    for (branch, after_rebuild) in [("main", [13, 13]), ("review", [13, 13])] {
         output_success(cli().args([
             "rebuild-full-text-indexes",
             uri,
@@ -1849,7 +1905,7 @@ query vectors($q: Vector(4)) {
         assert_eq!(
             stamps(),
             after_rebuild,
-            "the rebuild is {branch}'s first publish, so {branch} alone converts to v12"
+            "the rebuild preserves stamp 13 on {branch} and every other live branch"
         );
         assert_eq!(
             current_query("--branch", branch, "terms"),

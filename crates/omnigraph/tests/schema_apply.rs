@@ -1,6 +1,5 @@
 mod helpers;
 
-use std::fs;
 #[cfg(feature = "failpoints")]
 use std::sync::Arc;
 
@@ -161,6 +160,23 @@ async fn apply_schema_interface_evolution_is_identity_only_and_durable() {
         .collect::<Vec<_>>();
     table_versions_after.sort();
     assert_eq!(table_versions_after, table_versions_before);
+
+    let contract_row = omnigraph_catalog::ManifestCoordinator::open(uri)
+        .await
+        .unwrap()
+        .read_schema_contract()
+        .await
+        .expect("the apply's publish replaced the schema_contract row");
+    let accepted_ir = db.catalog().bound_schema_ir().unwrap().clone();
+    assert_eq!(
+        contract_row.head.schema_ir_hash,
+        omnigraph_compiler::schema_ir_hash(&accepted_ir).unwrap()
+    );
+    assert_eq!(contract_row.source, extended_interface);
+    assert_eq!(
+        contract_row.ir,
+        omnigraph_compiler::schema_ir_pretty_json(&accepted_ir).unwrap()
+    );
 
     drop(db);
     let reopened = Omnigraph::open(uri).await.unwrap();
@@ -393,11 +409,8 @@ async fn mutation_waits_for_mid_apply_schema_gate_then_reprepares() {
     });
     mutation_rv.wait_until_reached().await;
 
-    // Start schema apply and park it after its staging files (and any table
-    // rewrite) exist but before manifest/schema promotion. The outer apply owns
-    // the schema-control gate throughout this window.
     let schema_rv =
-        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_POST_LOCK_PRE_EFFECT);
     let schema_db = Arc::clone(&db);
     let schema_task = tokio::spawn(async move { schema_db.apply_schema(&desired).await });
     schema_rv.wait_until_reached().await;
@@ -429,9 +442,7 @@ async fn mutation_waits_for_mid_apply_schema_gate_then_reprepares() {
     assert_eq!(count_rows(&db, "node:Person").await, 5);
 }
 
-/// The mis-classified-writer tripwire: a writer parked inside its envelope
-/// holds its SHARED permit, so the apply must not reach the seam after its
-/// sentinel. Falsified by dropping the permit in `HeldWriteGates::new`: red.
+/// A writer holds its shared schema permit through publication.
 #[cfg(feature = "failpoints")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
@@ -457,13 +468,13 @@ async fn parked_writer_blocks_schema_apply() {
     });
     in_envelope.wait_until_reached().await;
 
-    let post_sentinel =
-        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_POST_SENTINEL);
+    let post_gate =
+        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_POST_LOCK_PRE_EFFECT);
     let schema_db = Arc::clone(&db);
     let schema_task = tokio::spawn(async move { schema_db.apply_schema(&desired).await });
     // Wall time: an apply past the gate makes store requests before the seam.
     let crossed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while !post_sentinel.reached() {
+        while !post_gate.reached() {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     })
@@ -471,7 +482,7 @@ async fn parked_writer_blocks_schema_apply() {
     assert!(
         crossed.is_err(),
         "schema apply must wait behind a writer's held shared schema permit; it \
-         created its sentinel while the writer was parked",
+         crossed its effect gate while the writer was parked",
     );
     assert!(!schema_task.is_finished());
 
@@ -480,8 +491,8 @@ async fn parked_writer_blocks_schema_apply() {
         .await
         .unwrap()
         .expect("the parked writer must publish after release");
-    post_sentinel.wait_until_reached().await;
-    post_sentinel.release();
+    post_gate.wait_until_reached().await;
+    post_gate.release();
     schema_task
         .await
         .unwrap()
@@ -557,10 +568,7 @@ async fn parked_merge_blocks_schema_apply_issue_643() {
     assert_eq!(count_rows(&db, "node:Person").await, 6);
 }
 
-/// ReadOnly opens participate in the process-local schema publication gate even
-/// though they perform no recovery writes. Park an open immediately before its
-/// source/IR/state read: schema apply must not reach staging until that coherent
-/// catalog capture finishes.
+/// Read-only opens hold the schema gate through coherent catalog capture.
 #[cfg(feature = "failpoints")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
@@ -582,7 +590,7 @@ async fn read_only_open_holds_schema_gate_through_catalog_capture() {
     open_rv.wait_until_reached().await;
 
     let apply_rv =
-        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_POST_LOCK_PRE_EFFECT);
     let apply_owner = Arc::clone(&owner);
     let apply_task = tokio::spawn(async move { apply_owner.apply_schema(&desired).await });
     assert!(
@@ -639,7 +647,7 @@ async fn refresh_holds_schema_gate_through_catalog_publication() {
     reload_rv.wait_until_reached().await;
 
     let apply_rv =
-        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_POST_LOCK_PRE_EFFECT);
     let apply_owner = Arc::clone(&owner);
     let apply_task = tokio::spawn(async move { apply_owner.apply_schema(&desired).await });
     assert!(
@@ -669,18 +677,32 @@ async fn refresh_holds_schema_gate_through_catalog_publication() {
 
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
-async fn plan_schema_rejects_when_schema_contract_has_drifted() {
+async fn plan_schema_on_unrefreshed_handle_plans_against_the_applied_contract() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let schema_owner = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let stale_handle = Omnigraph::open(uri).await.unwrap();
 
-    let drifted = TEST_SCHEMA.replace("age: I32?", "age: I64?");
-    fs::write(dir.path().join("_schema.pg"), drifted).unwrap();
+    let with_nickname = TEST_SCHEMA.replace("age: I32?", "age: I32?\n    nickname: String?");
+    schema_owner.apply_schema(&with_nickname).await.unwrap();
 
-    let err = db.plan_schema(TEST_SCHEMA).await.unwrap_err();
+    let plan = stale_handle.plan_schema(TEST_SCHEMA).await.unwrap();
     assert!(
-        err.to_string()
-            .contains("current _schema.pg no longer matches the accepted compiled schema")
+        plan.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::DropProperty { type_name, property_name, .. }
+                if type_name == "Person" && property_name == "nickname"
+        )),
+        "an unrefreshed handle plans against the applied contract, so the original schema drops the added property: {:?}",
+        plan.steps
+    );
+    assert!(
+        stale_handle
+            .plan_schema(&with_nickname)
+            .await
+            .unwrap()
+            .steps
+            .is_empty()
     );
 }
 
