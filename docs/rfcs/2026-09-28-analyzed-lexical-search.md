@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-28
-updated: 2026-09-29
+updated: 2026-10-01
 discussion: "https://github.com/ModernRelay/omnigraph/pull/792"
 supersedes: []
 superseded_by: []
@@ -15,11 +15,12 @@ blocked_on:
   - "NFC analyzer pipeline qualified through the query, scan and index-builder paths against the pinned Lance tokenizer"
   - "bm25_v1 evaluator implemented against the Decimal oracle, with scan and index score and winner parity"
   - "Deprecation route for fuzzy, search and match_text agreed with the compatibility-surfaces RFC"
+  - "The call rule for named options, proposed in the open shared expression model amendment (PR #805)"
 ---
 
 # RFC: Analyzed lexical search: schema-owned matching and ranking
 
-Every code reference is at `main` `b14c22c5`, Lance 11.0.0.
+Every code reference is at `main` `b14c22c5` and was checked again at `92ea5449`, Lance 11.0.0.
 
 ## Summary
 
@@ -37,7 +38,8 @@ field-corpus statistics that graph filters do not rescope.
 
 `match_terms` replaces `search`, `match_text` and `fuzzy`, which are three
 spellings of one operation whose analysis today depends on index presence and
-coverage. They compile to `match_terms` with a deprecation diagnostic for one
+coverage. On an `@analyzed` field they compile to `match_terms`; on any other
+field they keep today's behavior. Both carry a deprecation diagnostic for one
 release before removal.
 
 The query surface is the [Shared expression model](2026-09-24-shared-expression-model.md):
@@ -45,10 +47,12 @@ predicates live in `match`, a search call is a top-level conjunct, and the
 leading ranking call lives in `order`. This RFC adds a function, an argument
 type and a schema capability; it adds no clause. It is implemented on engine
 v2, the only query engine since PR #795, and the compiler. Its named options
-follow the call rule of the shared expression model amendment
+follow the call rule proposed in the open shared expression model amendment
 ([PR #805](https://github.com/ModernRelay/omnigraph/pull/805)). RFC 0047 ([PR #791](https://github.com/ModernRelay/omnigraph/pull/791))
-owns the interim refusal of full-text search on an unindexed property, which
-this RFC's exact scan later lifts. RFC 0048
+owns `T27`, the refusal of full-text search on a property without `@index`,
+and `FullTextIndexRequired`, the refusal of an unbuilt index. This RFC's exact
+scan lifts `FullTextIndexRequired` for `@analyzed` fields, and at its removal
+release `T27` requires `@analyzed` instead of `@index`. RFC 0048
 ([PR #793](https://github.com/ModernRelay/omnigraph/pull/793)) owns
 retrieval beyond one lexical ranking: fusion, windows and populations.
 
@@ -63,8 +67,12 @@ open issue with a reproduction:
 - With an index, `fuzzy` analyzes the query bare at a nonzero edit budget
   while the index stores lowercased terms, so a capitalized typo spends its
   budget on letter case (#748).
-- Rows appended after an index build sit in an uncovered fragment, where
-  `beto` misses `beta` and `running` misses the stored stem `run` (#749).
+- Rows appended after an index build sit in an uncovered fragment, which is
+  analyzed differently from the indexed segment: at one edit, `beto` matches
+  the indexed `beta` but misses the appended one, because the flat path
+  passes no edit budget, and `running` matches the appended row but misses
+  the indexed stem `run`, because a nonzero budget analyzes the query bare
+  (#749).
 
 Each violates invariant 7: physical acceleration is derived state and may
 change cost, never meaning. The repair is a schema-owned analyzer, an exact
@@ -190,15 +198,26 @@ predicate agree on membership for the same `terms` value before any cut.
 | Existing usage | Change | What users do |
 |---|---|---|
 | `search(f, q)`, `match_text(f, q)` | Compile to `match_terms(f, terms(q, mode: any))` with a deprecation diagnostic for one release, then removed at the GQ language major the [compatibility surfaces](2026-09-14-compatibility-surfaces.md) RFC defines | Rewrite to `match_terms`; choose `mode` deliberately. Stored queries are re-parsed at boot, so rewrite them inside the window |
-| `fuzzy(f, q, n)` | Compiles to `match_terms(f, terms(q, mode: any, max_edits: n))`, `n` refused outside `0..=2` | Same |
+| `fuzzy(f, q, n)` | Compiles to `match_terms(f, terms(q, mode: any, max_edits: n))`. An `n` outside `0..=2`, accepted today, becomes a type error | Same |
+| `fuzzy(f, q)` | Compiles to `match_terms(f, terms(q, mode: any, max_edits: 2))`, today's default of two edits | Same |
 | `bm25(f, q)` with a String | Unchanged spelling; on an `@analyzed` field it scores with `bm25_v1` over the field's analyzer | Review score thresholds and tie fixtures |
-| `@index` makes a String searchable | Searchability requires `@analyzed`, which enables ranking by default; `@index` keeps its separate meaning | Declare `@analyzed` on searchable text |
+| `@index` selects the index analyzer, and RFC 0047's `T27` makes it required for full-text search | Searchability requires `@analyzed`, which enables ranking by default; `@index` keeps its separate meaning | Declare `@analyzed` on searchable text; `english_v1` is closest to today's index analysis |
 
-The mapping keeps today's any-term membership; it changes rows only where
-today's answer depended on index state or letter case, and the diagnostic
-says so. A predicate keeps its position: a search call inside `not { }` stays
-inside it as `match_terms`. The legacy spellings gain no new semantics during
-the window.
+The mapping keeps today's any-term membership. It applies to a field that
+declares `@analyzed`; on a field that declares only `@index`, the legacy
+spellings keep today's behavior for the window, under RFC 0047's `T27` and
+`FullTextIndexRequired`, and the deprecation warning names `@analyzed`. No
+query that runs before the window stops running in it. A predicate keeps its
+position: a search call inside `not { }` stays inside it as `match_terms`.
+
+Adopting `@analyzed` changes rows in two places, and the diagnostic says
+which. First, where today's answer depended on index state or letter case,
+the correction this RFC exists for. Second, where today's index analysis
+differs from the declared profile: every full-text index today uses Lance's
+default analyzer (`InvertedIndexParams::default()`: English stemming, stop
+words, ASCII folding and a 40-byte token filter), while bare `@analyzed`
+means `standard_v1`, which does none of those. `english_v1` is the closest
+profile, differing by the token filter and NFC.
 
 ### Errors and operations
 
@@ -207,12 +226,18 @@ Type errors: a missing analyzed capability, a ranking call on a
 errors: exhausted resources, typed, never an empty or truncated result. Each
 carries RFC 0047's diagnostic fields.
 
-Index reconciliation stays explicit (`omnigraph optimize`) under RFC 0043's
-certification and publication discipline; reads and content writes never
-build indexes inline. Adopting `@analyzed` applies in place: a graph that
-declares no `@analyzed` field is unchanged, and a field that adopts it needs
-its full-text index rebuilt once, because an RFC 0043 certificate for the old
-analysis does not establish the new one.
+Index reconciliation stays explicit under RFC 0043's certification and
+publication discipline; reads and content writes never build indexes inline.
+`omnigraph optimize` builds a missing declared index, and
+`omnigraph rebuild-full-text-indexes` replaces an existing one. Adopting
+`@analyzed` applies in place: a graph that declares no `@analyzed` field is
+unchanged, and a field that adopts it needs its full-text index rebuilt once
+with the new profile. Two RFC 0043 pieces change for that. The rebuild builds
+with the field's profile instead of the engine's default English analysis,
+and the certificate, which today records one engine-wide analyzer generation
+and the artifact digest, also records the field's analyzer fingerprint, which
+its check compares, so a certificate for the old analysis does not establish
+the new one.
 
 ## Design
 
@@ -281,9 +306,12 @@ declared but unbuilt index answer instead of refusing (RFC 0047's
 `FullTextIndexRequired`).
 
 It is a new evaluator, not Lance's flat BM25 scanner, which collects per-row
-counts, implements no edit matching and rejects its fuzzy post-filter path.
+counts and silently ignores a nonzero edit budget; Lance's separate full-text
+post-filter exec rejects fuzzy queries.
 `InvertedIndexParams::build()` exposes the tokenizer without a dataset; the
-NFC step is added around it and qualified before use. The evaluator bounds
+NFC step is added around it and qualified before use: the guard
+`nfc_preprocessing_requires_an_explicit_bounded_integration` shows the
+tokenizer can be reused after NFC, and that no builder option adds it. The evaluator bounds
 query bytes, distinct terms, value sizes, matching state and work, admitting
 allocations before they happen: NFC can expand UTF-8 (two-byte U+0344 becomes
 four bytes) and consume a long combining sequence before emitting output. The
@@ -298,14 +326,24 @@ not exact membership, and raising the cap is not a proof. Until an adapter or
 upstream change provides complete expansion, the affected shapes use the exact
 scan even with an index, within the query's budget or a typed failure.
 
+RFC 0047's shared validator checks the plans these constructs produce. Its
+initial exact subset admits one leading `bm25` order whose argument is a
+String literal or parameter; `bm25(f, terms(…))`, a `match_terms` predicate
+and the exact scan are outside it and get its invariant checks: search
+identity, the retained predicate, the scoring corpus, score origin, the
+required ordering, cut placement, prerequisites and the declared contract
+(RFC 0047, "Checked rewrites for exact search"). Each joins the exact subset only through a versioned rule addition,
+with the regression RFC 0047 requires for every admitted rule.
+
 ### Analyzer identity
 
 Accepted SchemaIR owns each `@analyzed` field's analyzer and scorer
 fingerprints: the profile, the normalizer implementation and Unicode data
 identity, the pinned tokenizer and filter order, and the scorer version. RFC
-0043 certificates bind a physical index to that fingerprint. The SchemaIR
-version assignment coordinates with RFCs 0040 and 0044 through the existing
-`required_ir_version` owner. Renames keep the binding; drop and re-add
+0043 certificates will bind a physical index to that fingerprint (Errors and
+operations). `@analyzed` adds a SchemaIR feature name, which RFC 0040 makes
+the only way a schema feature is recorded (`is_known_feature`,
+`required_features`); no `ir_version` is assigned. Renames keep the binding; drop and re-add
 creates a new one.
 
 ## Invariants
@@ -366,19 +404,21 @@ results.
 Evidence, all historical and reproducible:
 
 - The [source and probe receipt](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/docs/rfcs/assets/0048-upstream-contract-checkpoint.json)
-  records the inspected Lance 11.0.0 sources, archive checksums and probe
-  results, including 73,008 tokenizer and edit-distance comparisons against an
-  independent evaluator at budgets 0 to 2 (the primitive only, not the NFC
-  pipeline).
+  records the inspected Lance 11.0.0 sources, archive checksums and the
+  scheduler, Arrow and stage probe results. The 73,008 tokenizer and
+  edit-distance comparisons against an independent evaluator at budgets 0 to
+  2 (the primitive only, not the NFC pipeline) are recorded in the
+  [draft of that date](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/docs/rfcs/0048-search-contracts.md).
 - The [Decimal oracle](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph/tests/fixtures/lexical_scoring_v1.py)
   and its [fixtures](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph/tests/fixtures/lexical_scoring_v1.json)
-  cover the formula, zero edits, repeated and reordered terms, alternatives,
-  `all`/`any`, null and token-empty values and two-edit membership, over
-  already-analyzed terms.
+  cover the formula, zero edits, alternatives, `all`/`any`, null and
+  token-empty values and two-edit membership, over already-analyzed terms;
+  the Rust test `lexical_scoring_v1_reference_oracle` that consumes them
+  checks repeated and reordered query terms.
 - The four Lance guards named above, with `lance_provider_scan_payloads_need_accounting_beyond_the_session_pool`
   and `native_scheduler_drop_distinguishes_queued_and_dispatched_reads`, are at
   [`1e0bed40`](https://github.com/ModernRelay/omnigraph/blob/1e0bed40dbf1650ca78bb1b4fca225c04dd21810/crates/omnigraph/tests/lance_surface_guards.rs)
-  and passed on `main` of 2026-09-25. Each returns to `lance_surface_guards.rs`
+  and passed CI on PR #751, over `main` of 2026-09-24. Each returns to `lance_surface_guards.rs`
   with the change whose code depends on it.
 - The regression cases for #747, #748 and #749 are on the
   [evidence branch](https://github.com/ModernRelay/omnigraph/tree/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-gqt/cases);
@@ -407,7 +447,7 @@ Qualification the implementation must add:
 | Step | Delivers | Closes |
 |---|---|---|
 | 1 | `@analyzed`, the three profiles and fingerprints in SchemaIR; schema plan and apply in place | — |
-| 2 | `terms(…)`, `match_terms` and the exact scan on engine v2, which lifts RFC 0047's unbuilt-index refusal for `@analyzed` fields | #747, #748, #749 |
+| 2 | `terms(…)`, `match_terms` and the exact scan on engine v2, which lifts RFC 0047's unbuilt-index refusal for `@analyzed` fields | #748, #749 |
 | 3 | `bm25_v1` scoring for `bm25` on `@analyzed` fields, exact path | — |
 | 4 | Deprecation diagnostics and the compiled mapping for `search`, `match_text`, `fuzzy` | — |
 | 5 | Removal at the next GQ language major | — |
@@ -418,8 +458,8 @@ step 6 is performance work.
 
 ## Unresolved questions
 
-1. Normalizer and Unicode data identity, the fingerprint's mapping onto RFC
-   0043 certificates, and the SchemaIR version shared with RFCs 0040 and 0044.
+1. Normalizer and Unicode data identity, and the fingerprint's mapping onto
+   RFC 0043 certificates.
 2. Whether the deprecation diagnostic's `fix` carries the rewritten query
    text or names the replacement only.
 
@@ -437,3 +477,17 @@ step 6 is performance work.
 - 2026-09-29 — engine v2 became the only query engine (PR #795): the engine
   v1 refusals are removed. Named options cite the shared expression model
   amendment ([PR #805](https://github.com/ModernRelay/omnigraph/pull/805)).
+- 2026-10-01 — aligned with RFC 0047 as merged (PR #791): its validator
+  checks `terms(…)`, `match_terms` and the exact scan as invariants until a
+  versioned rule admits them to its exact subset. #747 is closed by RFC
+  0047's refusal; this RFC's exact scan later lifts that refusal.
+- 2026-10-01 — every factual claim checked against `main` `92ea5449`.
+  Resolved two conflicts: the legacy spellings keep today's behavior on a
+  field without `@analyzed` for the deprecation window, so no query breaks
+  in it, and `T27` requires `@analyzed` from the removal release. Added: the
+  two-argument `fuzzy` mapping and the new refusal of an edit budget outside
+  `0..=2`; the row change from today's English index analysis to the
+  declared profile; `rebuild-full-text-indexes` and the RFC 0043 certificate
+  extension; the feature name instead of a SchemaIR version. Corrected the
+  #749 mechanism, the flat scanner's fuzzy behavior, the evidence citations
+  and the named guards.
