@@ -19,6 +19,8 @@ from functools import cache
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
+from markdown_links import descendants, parse as parse_markdown, preserves_boundary
+
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = "changelog.d/release.json"
 LEGACY_PATH = "docs/releases/v0.12.0.md"
@@ -37,15 +39,18 @@ VERSION = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 PROVENANCE = re.compile(r"^<!-- release-notes: (.+) -->$", re.MULTILINE)
 DEFINITION = re.compile(r"^\[([^\]]+)\]: (\S+)$")
-INLINE_LINK = re.compile(r"!?\[[^\]\n]*\]\(([^)\n]+)\)")
 
 
 class NotesError(Exception):
     pass
 
 
+def canonical(data: bytes) -> bytes:
+    return data.replace(b"\r\n", b"\n")
+
+
 def digest(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+    return hashlib.sha256(canonical(data)).hexdigest()
 
 
 @cache
@@ -86,8 +91,8 @@ class Repository:
             file = self.root / path
             if file.is_symlink() or not file.resolve().is_relative_to(self.root.resolve()):
                 raise NotesError(f"unsupported symlink or escaping path: {path}")
-            return file.read_bytes()
-        return self.git("show", f"{revision}:{path}")
+            return canonical(file.read_bytes())
+        return canonical(self.git("show", f"{revision}:{path}"))
 
     def notes(self, revision: str | None) -> dict[str, bytes]:
         if revision is None:
@@ -115,39 +120,6 @@ class Repository:
 
     def released(self, version: str) -> bool:
         return self.git("rev-parse", "--verify", "--end-of-options", f"refs/tags/{version}^{{commit}}", optional=True) is not None
-
-
-def prose_lines(text: str):
-    """Yield original lines and a code-masked view; only link definitions are rewritten."""
-    fence: tuple[str, int] | None = None
-    inline: int | None = None
-    for line in text.splitlines(keepends=True):
-        marker = re.match(r"^\s*(`{3,}|~{3,})", line)
-        if marker and inline is None:
-            token = marker.group(1)
-            if fence is None:
-                fence = (token[0], len(token))
-            elif token[0] == fence[0] and len(token) >= fence[1] and not line[marker.end():].strip():
-                fence = None
-            yield line, ""
-        elif fence is not None or (inline is None and (line.startswith("    ") or line.startswith("\t"))):
-            yield line, ""
-        else:
-            masked = list(line)
-            start = 0
-            for token in re.finditer(r"(?<!\\)`+", line):
-                if inline is None:
-                    inline, start = len(token.group()), token.start()
-                elif len(token.group()) == inline:
-                    masked[start:token.end()] = " " * (token.end() - start)
-                    inline = None
-            if inline is not None:
-                masked[start:] = " " * (len(line) - start)
-            yield line, "".join(masked)
-    if fence is not None:
-        raise NotesError("unclosed Markdown fence")
-    if inline is not None:
-        raise NotesError("unclosed Markdown code span; escape a literal backtick")
 
 
 def is_external(destination: str) -> bool:
@@ -185,7 +157,7 @@ def note_text(path: str, raw: bytes) -> tuple[str, str]:
     match = NOTE_NAME.fullmatch(path)
     if not match or match.group(1) not in CATEGORIES:
         raise NotesError(f"{path}: expected changelog.d/<slug>.<category>.md; categories: {', '.join(CATEGORIES)}")
-    text = raw.decode("utf-8")
+    text = canonical(raw).decode("utf-8")
     if not text.startswith("- ") or not text[2:].strip() or not text.endswith("\n"):
         raise NotesError(f"{path}: write a nonempty Markdown bullet ending with a newline")
     return match.group(1), text
@@ -193,30 +165,37 @@ def note_text(path: str, raw: bytes) -> tuple[str, str]:
 
 def render_note(repo: Repository, revision: str | None, path: str, raw: bytes, publication_ref: str | None, labels: set[str]) -> str:
     _, text = note_text(path, raw)
-    result = []
-    for line, prose in prose_lines(text):
-        definition = DEFINITION.fullmatch(prose.rstrip("\n"))
-        if definition:
-            label, destination = definition.groups()
-            normalized = " ".join(label.casefold().split())
-            if normalized in labels:
-                raise NotesError(f"{path}: repeated reference label {label!r}; use a label unique to this note")
-            labels.add(normalized)
-            destination = link_destination(repo, revision, path, destination, publication_ref)
-            result.append(f"[{label}]: {destination}\n")
-            continue
-        if re.match(r"^\s*\[[^\]]+\]:", prose):
-            raise NotesError(f"{path}: link definitions must be unindented '[label]: destination', without a title")
-        if re.match(r"^#{1,2}\s", prose):
+    document = parse_markdown(text)
+    if not preserves_boundary(text):
+        raise NotesError(f"{path}: unclosed Markdown block would consume the following note")
+    if document.environment.get("duplicate_refs"):
+        raise NotesError(f"{path}: repeated reference label")
+    for token in descendants(document.tokens):
+        if token.type == "heading_open" and token.tag in {"h1", "h2"}:
             raise NotesError(f"{path}: release headings belong to the renderer")
-        for match in INLINE_LINK.finditer(prose):
-            if not is_external(match.group(1)):
-                raise NotesError(f"{path}: put local links in '[label]: ../docs/...' reference definitions")
-        result.append(line)
-    return "".join(result)
+        if token.type in {"html_inline", "html_block"}:
+            raise NotesError(f"{path}: raw HTML is unsupported outside code; use Markdown")
+    for link in document.links:
+        if link.label is None and not is_external(link.destination):
+            raise NotesError(f"{path}: put local links in '[label]: ../docs/...' reference definitions")
+    lines = text.splitlines(keepends=True)
+    for token in document.definitions:
+        start, end = token.map
+        definition = DEFINITION.fullmatch(lines[start].rstrip("\n"))
+        if end != start + 1 or not definition or token.meta["title"]:
+            raise NotesError(f"{path}: link definitions must be unindented '[label]: destination', without a title")
+        normalized = token.meta["id"]
+        if normalized in labels:
+            raise NotesError(f"{path}: repeated reference label {normalized!r}; use a label unique to this note")
+        labels.add(normalized)
+        destination = link_destination(repo, revision, path, token.meta["url"], publication_ref)
+        lines[start] = f"[{definition.group(1)}]: {destination}\n"
+    return "".join(lines)
 
 
 def select_notes(base: dict[str, bytes], target: dict[str, bytes]) -> dict[str, bytes]:
+    base = {path: canonical(raw) for path, raw in base.items()}
+    target = {path: canonical(raw) for path, raw in target.items()}
     changed = [path for path, raw in base.items() if target.get(path) != raw]
     if changed:
         raise NotesError("published notes were changed, renamed or removed: " + ", ".join(sorted(changed)))
@@ -251,11 +230,11 @@ def select(repo: Repository, base: str | None, target: str, legacy: str | None =
             raise NotesError("the legacy baseline must use a full commit SHA")
         legacy_sha = repo.resolve(legacy)
         repo.require_ancestor(legacy_sha, target_sha)
-        original = repo.read(legacy_sha, LEGACY_PATH).decode("utf-8")
+        original = canonical(repo.read(legacy_sha, LEGACY_PATH)).decode("utf-8")
         prefix = "# OmniGraph v0.12.0\n\nUnreleased.\n\n"
         if not original.startswith(prefix) or PROVENANCE.search(original):
             raise NotesError("the legacy revision must contain the original unreleased v0.12.0 document")
-        current = repo.read(None if working_tree else target_sha, LEGACY_PATH).decode("utf-8")
+        current = canonical(repo.read(None if working_tree else target_sha, LEGACY_PATH)).decode("utf-8")
         if current != original and not PROVENANCE.search(current):
             raise NotesError("the v0.12.0 baseline is frozen; put new entries in changelog.d/")
         baseline = original[len(prefix):]
@@ -290,19 +269,15 @@ def render(repo: Repository, selection: Selection, info: dict, publication_ref: 
              "<!-- release-notes: " + json.dumps(info, sort_keys=True, separators=(",", ":")) + " -->\n\n"]
     if selection.baseline:
         baseline = selection.baseline
-        # The pinned migration input uses only simple inline local links.
-        lines = []
-        for line, prose in prose_lines(baseline):
-            for match in reversed(list(INLINE_LINK.finditer(prose))):
-                destination = match.group(1)
-                if is_external(destination):
-                    continue
-                replacement = link_destination(repo, revision, LEGACY_PATH, destination, publication_ref)
-                if publication_ref:
-                    start, end = match.span(1)
-                    line = line[:start] + replacement + line[end:]
-            lines.append(line)
-        baseline = "".join(lines)
+        # Only the frozen migration document uses inline local destinations.
+        destinations = [link.destination for link in parse_markdown(baseline).links if not is_external(link.destination)]
+        for destination in sorted(set(destinations)):
+            replacement = link_destination(repo, revision, LEGACY_PATH, destination, publication_ref)
+            original = f"]({destination})"
+            if baseline.count(original) != destinations.count(destination):
+                raise NotesError("legacy links no longer match the pinned simple-inline format")
+            if publication_ref:
+                baseline = baseline.replace(original, f"]({replacement})")
         parts.append(baseline.rstrip("\n") + "\n\n")
     labels: set[str] = set()
     for category, title in CATEGORIES.items():
@@ -322,14 +297,21 @@ def read_config(repo: Repository, revision: str | None) -> dict:
         raise NotesError(f"{CONFIG}: expected exactly version, base and legacy")
     if not isinstance(config["version"], str) or not VERSION.fullmatch(config["version"]):
         raise NotesError(f"{CONFIG}: invalid version")
-    if not isinstance(config["base"], str) or not config["base"]:
-        raise NotesError(f"{CONFIG}: base must name the previous release explicitly")
+    if config["base"] is not None and (not isinstance(config["base"], str) or not config["base"]):
+        raise NotesError(f"{CONFIG}: base must name the previous release, or be null for an initial release")
     if config["legacy"] is not None and (not isinstance(config["legacy"], str) or not SHA.fullmatch(config["legacy"])):
         raise NotesError(f"{CONFIG}: legacy must be null or a full commit SHA")
     return config
 
 
-def verify_snapshot(repo: Repository, content: str, audited: str | None = None) -> tuple[Selection, dict]:
+def require_configured_selection(repo: Repository, selected: Selection, version: str) -> None:
+    config = read_config(repo, None if selected.working_tree else selected.target)
+    base = repo.resolve(config["base"]) if config["base"] is not None else None
+    if config["version"] != version or base != selected.base or config["legacy"] != selected.legacy:
+        raise NotesError("snapshot base, version and legacy source must match changelog.d/release.json")
+
+
+def snapshot_info(content: str) -> dict:
     matches = PROVENANCE.findall(content)
     if len(matches) != 1:
         raise NotesError("release snapshot must contain exactly one provenance record")
@@ -343,43 +325,126 @@ def verify_snapshot(repo: Repository, content: str, audited: str | None = None) 
         if (value is None and name != "target") or (isinstance(value, str) and SHA.fullmatch(value)):
             continue
         raise NotesError(f"snapshot {name} must be a full commit SHA")
-    selected = select(repo, info["base"], info["target"], info["legacy"])
+    if not isinstance(info["notes"], dict) or any(
+        not isinstance(path, str) or not NOTE_NAME.fullmatch(path) or not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+        for path, value in info["notes"].items()
+    ) or not isinstance(info["config"], str) or not re.fullmatch(r"[0-9a-f]{64}", info["config"]):
+        raise NotesError("snapshot must record note and configuration SHA-256 digests")
+    metadata(Selection(info["base"], info["target"], {}, info["legacy"]), info["version"], info["date"])
+    return info
+
+
+def verify_snapshot(repo: Repository, content: str, audited: str | None = None) -> tuple[Selection, dict]:
+    content = canonical(content.encode("utf-8")).decode("utf-8")
+    info = snapshot_info(content)
+    # The input commit can disappear after squash. Its complete input manifest,
+    # checked against the audited tree, is the proof; target is provenance only.
+    source = repo.resolve(audited or "HEAD")
+    selected = select(repo, info["base"], source, info["legacy"])
+    require_configured_selection(repo, selected, info["version"])
     expected_info = metadata(selected, info["version"], info["date"])
+    expected_info["target"] = info["target"]
+    if info["config"] != expected_info["config"]:
+        raise NotesError("release configuration changed after snapshot generation; regenerate it")
+    if info["notes"] != expected_info["notes"]:
+        raise NotesError("release notes changed after snapshot generation; regenerate it")
     if info != expected_info or content != render(repo, selected, expected_info):
         raise NotesError("snapshot differs from its recorded inputs; regenerate it")
-    if audited is not None:
-        source = repo.resolve(audited)
-        repo.require_ancestor(selected.target, source)
-        current = select(repo, selected.base, source, selected.legacy)
-        if current.config != selected.config:
-            raise NotesError("release configuration changed after snapshot generation; regenerate it")
-        if current.inputs() != selected.inputs():
-            raise NotesError("release notes changed after snapshot generation; regenerate it")
-        # Check the destinations against the release tree, not just its older input tree.
-        render(repo, current, expected_info)
     return selected, expected_info
 
 
+def render_index(repo: Repository, pending: dict[str, str] | None = None, directory: Path | None = None) -> str:
+    directory = directory or repo.root / "docs/releases"
+    documents = {}
+    for path in directory.glob("v*.md"):
+        if not VERSION.fullmatch(path.stem):
+            continue
+        if path.is_symlink():
+            raise NotesError(f"release documents must not be symlinks: {path}")
+        documents[path.stem] = path.read_text(encoding="utf-8")
+    documents.update(pending or {})
+    entries = []
+    for version in sorted(documents, key=lambda value: tuple(map(int, VERSION.fullmatch(value).groups())), reverse=True):
+        content = documents[version]
+        status = ""
+        if "<!-- release-notes:" in content:
+            info = snapshot_info(content)
+            if info["version"] != version or not content.startswith(f"# OmniGraph {version}\n\nReleased {info['date']}.\n"):
+                raise NotesError(f"{version}: snapshot filename, heading and provenance disagree")
+            status = f": released {info['date']}"
+        elif tuple(map(int, VERSION.fullmatch(version).groups())) >= (0, 12, 0):
+            config = read_config(repo, None)
+            if version != "v0.12.0" or not config["legacy"] or canonical(content.encode()) != canonical(repo.read(config["legacy"], LEGACY_PATH)):
+                raise NotesError(f"{version}: expected a generated snapshot or the pinned migration baseline")
+            status = ": unreleased migration baseline; new changes are collected\n  in the documentation CI job's `release-notes-preview` artifact."
+        entries.append(f"- [{version}]({version}.md){status}\n")
+    return ("# Release notes\n\n"
+            "Release documents describe user-visible changes and actions needed before\n"
+            "upgrading. The [upgrade guide](../user/operations/upgrade.md) owns the current\n"
+            "upgrade procedure.\n\n" + "".join(entries) +
+            "\nContributors add individual notes using the\n"
+            "[release-note authoring guide](../dev/documentation.md#release-notes).\n")
+
+
+def validate_output(repo: Repository, output: Path) -> None:
+    if output.is_symlink() or not output.resolve().is_relative_to(repo.root.resolve()):
+        raise NotesError(f"unsupported output symlink or escaping path: {output}")
+    if output.exists() and not output.is_file():
+        raise NotesError(f"release outputs must be regular files: {output}")
+
+
+def write_index(repo: Repository) -> Path:
+    path = repo.root / "docs/releases/README.md"
+    validate_output(repo, path)
+    content = render_index(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", dir=path.parent, prefix=".release-notes-", delete=False) as temporary:
+        temporary_path = Path(temporary.name)
+    try:
+        temporary_path.write_text(content, encoding="utf-8", newline="\n")
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return path
+
+
 def write_snapshot(repo: Repository, selection: Selection, info: dict, replace: bool, replace_legacy: bool) -> Path:
+    if selection.working_tree or not info["date"]:
+        raise NotesError("snapshots require a date and committed inputs")
+    require_configured_selection(repo, selection, info["version"])
     path = repo.root / "docs/releases" / f"{info['version']}.md"
+    index = path.parent / "README.md"
+    for output in (path, index):
+        validate_output(repo, output)
     content = render(repo, selection, info)
     if repo.released(info["version"]):
         raise NotesError("a tag already exists for this version; published notes are immutable")
     if path.exists():
         existing = path.read_text(encoding="utf-8")
-        original = repo.read(selection.legacy, LEGACY_PATH).decode("utf-8") if selection.legacy else None
+        original = canonical(repo.read(selection.legacy, LEGACY_PATH)).decode("utf-8") if selection.legacy else None
         migration = replace_legacy and info["version"] == "v0.12.0" and existing == original
         generated = replace and PROVENANCE.search(existing) is not None
         if not migration and not generated:
             raise NotesError(f"{path}: already exists; use --replace for a generated snapshot or --replace-legacy for the pinned baseline")
+    index_content = render_index(repo, {info["version"]: content})
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, prefix=".release-notes-", delete=False) as temporary:
-        temporary.write(content)
-        temporary_path = Path(temporary.name)
+    staged: list[tuple[Path, Path]] = []
+    written = []
     try:
-        os.replace(temporary_path, path)
+        for output, text in ((path, content), (index, index_content)):
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", dir=path.parent, prefix=".release-notes-", delete=False) as temporary:
+                staged.append((Path(temporary.name), output))
+                temporary.write(text)
+        for temporary_path, output in staged:
+            os.replace(temporary_path, output)
+            written.append(output)
+    except OSError as error:
+        if written:
+            raise NotesError("snapshot written but index update failed; retry snapshot with --replace, or run 'python3 scripts/release_notes.py index --write'") from error
+        raise
     finally:
-        temporary_path.unlink(missing_ok=True)
+        for temporary_path, _ in staged:
+            temporary_path.unlink(missing_ok=True)
     return path
 
 
@@ -389,15 +454,17 @@ def check_working_notes(root: Path, errors: list[str]) -> None:
         config = read_config(repo, None)
         selected = select(repo, config["base"], "HEAD", config["legacy"], working_tree=True)
         render(repo, selected, metadata(selected, config["version"], None))
-        if selected.legacy:
-            current = repo.read(None, LEGACY_PATH).decode("utf-8")
-            original = repo.read(selected.legacy, LEGACY_PATH).decode("utf-8")
+        path = root / "docs/releases" / f"{config['version']}.md"
+        if path.exists():
+            current = path.read_text(encoding="utf-8")
+            original = canonical(repo.read(selected.legacy, LEGACY_PATH)).decode("utf-8") if selected.legacy else None
             if current != original:
-                if not PROVENANCE.search(current):
-                    raise NotesError("the v0.12.0 baseline is frozen; put new entries in changelog.d/")
                 recorded, _ = verify_snapshot(repo, current, "HEAD")
                 if recorded.inputs() != selected.inputs() or recorded.config != selected.config:
                     raise NotesError("working notes or release configuration changed after snapshot generation")
+        index = root / "docs/releases/README.md"
+        if not index.exists() or index.read_text(encoding="utf-8") != render_index(repo, directory=index.parent):
+            raise NotesError("release index is stale; run 'python3 scripts/release_notes.py index --write'")
     except (NotesError, OSError, ValueError) as error:
         errors.append(f"release notes: {error}")
 
@@ -405,6 +472,8 @@ def check_working_notes(root: Path, errors: list[str]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    index = sub.add_parser("index", help="print the release-document index")
+    index.add_argument("--write", action="store_true", help="atomically update docs/releases/README.md")
     for command in ("preview", "snapshot"):
         child = sub.add_parser(command)
         target = child.add_mutually_exclusive_group(required=True)
@@ -428,6 +497,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         repo = Repository(ROOT)
+        if args.command == "index":
+            if args.write:
+                print(write_index(repo))
+            else:
+                print(render_index(repo), end="")
+            return 0
         if args.command in {"verify", "body"}:
             version = args.tag if args.command == "body" else args.version
             if not VERSION.fullmatch(version):
@@ -449,7 +524,7 @@ def main(argv: list[str] | None = None) -> int:
         selected = select(repo, None if args.initial_release else (args.base or config["base"]), target, config["legacy"], working)
         info = metadata(selected, args.version or config["version"], args.date)
         if args.command == "preview":
-            print(render(repo, selected, info), end="")
+            print(render(repo, selected, info, publication_ref=None if working else selected.target), end="")
         else:
             print(write_snapshot(repo, selected, info, args.replace, args.replace_legacy))
         return 0

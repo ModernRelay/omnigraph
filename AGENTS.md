@@ -142,6 +142,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- \
   -D warnings -W clippy::dbg_macro
 
+# Activate the documentation environment first; see docs/dev/documentation.md.
 bash scripts/check-agents-md.sh
 python3 scripts/check-docs.py
 python3 scripts/check-workflow-action-pins.py

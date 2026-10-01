@@ -158,6 +158,12 @@ jobs:
             exit 1
           fi
 
+      - name: Install pinned documentation parser
+        run: |
+          python3 -m venv "$RUNNER_TEMP/docs-venv"
+          "$RUNNER_TEMP/docs-venv/bin/python" -m pip install --disable-pip-version-check -r scripts/requirements-docs.txt
+          echo "$RUNNER_TEMP/docs-venv/bin" >> "$GITHUB_PATH"
+
       - name: Verify AGENTS.md ↔ docs/ cross-links
         run: bash scripts/check-agents-md.sh
 

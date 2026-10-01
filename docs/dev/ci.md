@@ -375,7 +375,8 @@ cargo test -p omnigraph-gqt --locked
 cargo clippy -p omnigraph-gqt --all-targets --locked -- -D warnings -W clippy::dbg_macro
 ```
 
-For repository metadata and workflow changes:
+For repository metadata and workflow changes, first
+[activate the documentation environment](documentation.md#documentation-tools):
 
 ```bash
 bash scripts/check-agents-md.sh
@@ -399,14 +400,20 @@ shellcheck scripts/*.sh
 ## Release workflows
 
 `Check AGENTS.md Links` validates release-note inputs, runs the focused Python
-composer tests and uploads a `release-notes-preview` artifact. Its full-history
-checkout supplies the explicit previous release and pinned migration source.
+composer tests and uploads a `release-notes-preview` artifact with links pinned
+to its selected commit. The checker and composer use the same pinned CommonMark
+dependencies from `scripts/requirements-docs.txt`, installed in a temporary
+environment. Its full-history checkout supplies the explicit previous release
+and pinned migration source.
 Note-only changes use the documentation class. The
 [authoring guide](documentation.md#release-notes) describes permanent fragments,
 the supported link format and snapshot generation.
 
 For v0.12.0 and later, the stable publisher requires a generated release snapshot
-whose recorded notes and configuration still match its audited source. It
+whose complete note manifest and configuration still match its audited source.
+The recorded input commit is informational, allowing squash merges; release base
+and migration source ancestry are still required. The publisher installs the
+same pinned parser in a temporary environment after the historical cutoff. It
 derives the GitHub body from that same snapshot with links pinned to the release
 tag. Earlier manual backfills keep their asset-only route. Edge is unchanged.
 

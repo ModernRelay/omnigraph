@@ -63,6 +63,23 @@ is one namespace and one lifecycle for public and maintainer-authored RFCs.
 An RFC remains a decision record after implementation. Update its disposition,
 but keep day-to-day instructions in user or developer docs.
 
+## Documentation tools
+
+Use Python 3.10 or newer. From the repository root, create and activate a local
+environment before running the documentation checker or release-note commands:
+
+```bash
+python3 -m venv .venv-docs
+source .venv-docs/bin/activate
+python3 -m pip install -r scripts/requirements-docs.txt
+```
+
+The requirements pin `markdown-it-py` and its `mdurl` dependency. The checker and
+composer share its CommonMark parser, with table and strikethrough support, so
+links in nested lists and code examples have the same meaning in both tools.
+CI installs these same dependencies in a temporary environment. Reuse the local
+environment on later runs; reinstall when the requirements change.
+
 ## Release notes
 
 Add one permanent `changelog.d/<descriptive-slug>.<category>.md` file with each
@@ -91,60 +108,87 @@ at column zero, with a relative destination and optional heading anchor:
 [predicate-guide]: ../docs/user/queries/index.md
 ```
 
-Give reference labels names unique to the note; labels are case-insensitive.
+Give reference labels names unique to the note; CommonMark normalizes their case
+and whitespace.
 Definitions occupy one line and have no optional title. Local inline links,
 fragment-only links and URL query parameters on local links are refused; name
-the destination document explicitly. Inline external URLs are allowed. Escape
-a literal backtick or close its code span. The composer only rewrites link
-definitions outside code, leaving the rest of each fragment intact. Do not
-add release headings to fragments.
+the destination document explicitly. Raw HTML outside code is unsupported; use
+Markdown. Inline external URLs are allowed. Code spans follow CommonMark,
+including literal unmatched backticks and backslashes. Close fenced code blocks
+so they cannot consume the following note. The composer only rewrites link
+definitions outside code, preserving the rest of each fragment apart from
+normalizing CRLF line endings to LF. Do not add release headings to fragments.
 
-Preview local edits and untracked notes from anywhere inside the checkout:
+Preview local edits and untracked notes from the repository root after
+[activating the documentation environment](#documentation-tools):
 
 ```bash
 python3 scripts/release_notes.py preview --working-tree
 python3 scripts/check-docs.py
 ```
 
-For a committed preview, use `preview --target HEAD`. The existing documentation
+Working previews have local links relative to `docs/releases/`; save them there
+temporarily if viewing in a Markdown reader. For a committed preview, use
+`preview --target HEAD`. Its links point to the full selected Git SHA, so the
+downloaded Markdown also works outside the checkout. The existing documentation
 CI job uploads this output as `release-notes-preview`; no generated preview is
 checked in and no bot comment is needed.
 
 `changelog.d/release.json` names the next `version`, the previous release `base`
 for that maintenance line, and an optional `legacy` baseline SHA. These are
-explicit inputs, not inferred from the newest tag. Both Git revisions must be
-available with enough history to prove ancestry. The selected notes are paths
+explicit inputs, not inferred from the newest tag. Set `base` to `null` only for
+an initial release without a predecessor. The base and optional legacy source
+must be available with enough history to prove ancestry. The selected notes are paths
 present in the target tree and absent from the base tree. Content comes from
 the target; category and filename ordering are deterministic.
 
 An unreleased note can be edited or removed with a reverted change. Once a
-release includes it, retain its path and bytes: a correction or reversal gets
+release includes it, retain its path and content: a correction or reversal gets
 a new note. A backport carries the same path and uses that branch's previous
-release. The checker validates selected notes' links against the selected tree;
+release. CRLF and LF checkouts have the same identity; other content changes do
+not. The checker validates selected notes' links against the selected tree;
 historical raw notes are not checked against today's moving documentation.
 
-Release preparation creates a versioned snapshot from committed inputs and an
-explicit date. For the first v0.12.0 snapshot only:
+With the documentation environment active, release preparation creates a
+versioned snapshot and updates `docs/releases/README.md` from committed inputs
+and an explicit date. For the first v0.12.0 snapshot only:
 
 ```bash
 python3 scripts/release_notes.py snapshot --target HEAD --date 2026-10-01 --replace-legacy
 ```
 
-For later releases omit `--replace-legacy`. `--replace` regenerates an existing
+Replace the example date with the intended release date. For later releases
+omit `--replace-legacy`. `--replace` regenerates an existing
 generated snapshot before its tag exists. Nothing moves, deletes or stages
-fragments. `--base REF` and `--version vX.Y.Z` explicitly override configuration
-for a selected run; `--initial-release` is the only mode without a previous
+fragments. Preview accepts `--base REF`, `--version vX.Y.Z` and
+`--initial-release` for comparison runs. A snapshot must agree with the version,
+base and legacy source in `release.json`, including `base: null` for an initial
 release. Configuration itself remains part of the recorded inputs.
 
-The snapshot records the selected target SHA, base SHA and note digests. It need
-not name the commit that later includes the snapshot itself. Validation requires
-that recorded target to be an ancestor of the audited release source, with the
-same note inputs and configuration. Any later note/configuration change requires
-regeneration. Verify a prepared committed snapshot with:
+The snapshot records the selected target SHA, base SHA and note digests. The
+target SHA documents where generation ran; squash merging may remove that
+commit. Validation compares the complete selected note set and digests,
+configuration, and regenerated document against the audited release tree. It
+requires ancestry only for the durable release base and legacy source. Any later
+note or configuration change requires regeneration. Verify a prepared committed
+snapshot with the documentation environment active:
 
 ```bash
 python3 scripts/release_notes.py verify --version v0.12.0 --target HEAD
 ```
+
+Snapshot creation validates both outputs before writing and replaces each file
+atomically. An interruption between replacements can leave a current snapshot
+with an old index; retry with `--replace`. The checker detects a stale index.
+To repair only the index, including after a version is tagged, activate the
+documentation environment and run:
+
+```bash
+python3 scripts/release_notes.py index --write
+```
+
+Without `--write`, the index command only prints its result. With `--write`, it
+validates the version documents before atomically replacing the existing index.
 
 The stable publisher validates the snapshot from its audited checkout and renders
 its local links at the release tag. Versions before v0.12.0 retain asset-only
@@ -168,6 +212,8 @@ Before merging documentation:
    developer docs.
 5. Use relative Markdown links and run the documentation checks.
 6. Read the rendered diff for examples, headings, and scanability.
+
+After [activating the documentation environment](#documentation-tools):
 
 ```bash
 bash scripts/check-agents-md.sh

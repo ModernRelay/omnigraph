@@ -160,7 +160,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           ref: ${{ needs.vocabulary_gate.outputs.source_sha }}
-          # Validate the snapshot against both recorded inputs and audited source.
+          # Validate the input manifest against the audited source and release base.
           fetch-depth: 0
 
       - name: Verify release tag still selects audited source
@@ -250,10 +250,17 @@ jobs:
           if tuple(map(int, match.groups())) < (0, 12, 0):
               # Older audited checkouts do not contain the release-note tool.
               raise SystemExit(0)
+          environment = Path(os.environ["RUNNER_TEMP"]) / "release-notes-venv"
+          subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
+          python = str(environment / "bin/python")
+          subprocess.run(
+              [python, "-m", "pip", "install", "--disable-pip-version-check",
+               "-r", "scripts/requirements-docs.txt"], check=True,
+          )
           output = Path(os.environ["RUNNER_TEMP"]) / "release-notes-body.md"
           with output.open("w", encoding="utf-8") as body:
               subprocess.run(
-                  [sys.executable, "scripts/release_notes.py", "body", "--tag", tag,
+                  [python, "scripts/release_notes.py", "body", "--tag", tag,
                    "--target", os.environ["SOURCE_SHA"]],
                   stdout=body, check=True,
               )

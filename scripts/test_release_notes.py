@@ -67,6 +67,9 @@ class ReleaseNotesTests(unittest.TestCase):
         self.repo = MemoryRepository()
 
     def snapshot(self, legacy=None, version="v0.13.0"):
+        config = json.dumps({"version": version, "base": "previous", "legacy": legacy}).encode()
+        for tree in (self.repo.trees[TARGET], self.repo.trees[AUDITED], self.repo.working):
+            tree[notes.CONFIG] = config
         selected = notes.select(self.repo, "previous", "HEAD", legacy)
         info = notes.metadata(selected, version, "2026-10-01")
         return selected, info, notes.render(self.repo, selected, info)
@@ -155,9 +158,9 @@ class ReleaseNotesTests(unittest.TestCase):
         for code in (
             "- Example: `[x](../missing.md)`.\n",
             "- Example: `first\n[x]: ../missing.md\nlast`.\n",
-            "- Example:\n\n  ```markdown\n[x]: ../missing.md\n  ```\n",
-            "- Example:\n\n  ````markdown\n  ```\n[x]: ../missing.md\n  ````\n",
-            "- Example:\n\n  ```markdown\n  ```not-a-close\n[x]: ../missing.md\n  ```\n",
+            "- Example:\n\n  ```markdown\n  [x]: ../missing.md\n  ```\n",
+            "- Example:\n\n  ````markdown\n  ```\n  [x]: ../missing.md\n  ````\n",
+            "- Example:\n\n  ```markdown\n  ```not-a-close\n  [x]: ../missing.md\n  ```\n",
         ):
             with self.subTest(code=code):
                 self.repo.trees[TARGET][NEW] = code.encode()
@@ -166,10 +169,44 @@ class ReleaseNotesTests(unittest.TestCase):
     def test_bad_definition_and_unclosed_examples_fail(self):
         for text in ('- See guide.\n\n [x]: ../docs/user/queries/index.md\n',
                      '- See guide.\n\n[x]: ../docs/user/queries/index.md "title"\n',
-                     '- Example: `unfinished.\n', '- Example:\n\n```text\nunfinished\n'):
+                     '- Example:\n\n```text\nunfinished\n'):
             self.repo.trees[TARGET][NEW] = text.encode()
             with self.subTest(text=text), self.assertRaises(notes.NotesError):
                 self.snapshot()
+
+    def test_commonmark_code_spans_include_literal_backslash_and_unmatched_ticks(self):
+        for text in ('- A backslash is `\\`.\n', '- A Windows path is `C:\\temp\\`.\n',
+                     '- An unmatched ` is literal prose.\n'):
+            self.repo.trees[TARGET][NEW] = text.encode()
+            self.assertIn(text, self.snapshot()[2])
+
+    def test_real_links_in_nested_lists_and_multiline_syntax_are_refused(self):
+        for text in ('- Feature:\n  - Details:\n    [guide](../docs/user/queries/index.md)\n',
+                     '- See [guide](\n../docs/user/queries/index.md\n).\n'):
+            self.repo.trees[TARGET][NEW] = text.encode()
+            with self.subTest(text=text), self.assertRaisesRegex(notes.NotesError, "reference definitions"):
+                selected = notes.select(self.repo, BASE, TARGET)
+                notes.render(self.repo, selected, notes.metadata(selected, "v0.13.0", "2026-10-01"), "v0.13.0")
+
+    def test_generated_code_examples_pass_the_same_documentation_checker(self):
+        self.repo.trees[TARGET][NEW] = b"- Example: `[x](../missing.md)`.\n\n  ```markdown\n  [x](../also-missing.md)\n  ```\n"
+        _, _, content = self.snapshot()
+        checker = notes.docs_checker()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "docs/releases/v0.13.0.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(content)
+            errors = []
+            with patch.object(checker, "ROOT", root):
+                checker.check_links([path], errors)
+            self.assertEqual(errors, [])
+
+    def test_doc_link_scanner_checks_unused_references_and_skips_image_alt_links(self):
+        checker = notes.docs_checker()
+        self.assertEqual(checker.local_link_targets("[unused]: ../missing.md\n"), [(1, "../missing.md")])
+        links = checker.local_link_targets("![an [alt link](../not-outgoing.md)](https://example.com/image.png)\n")
+        self.assertEqual([destination for _, destination in links], ["https://example.com/image.png"])
 
     def test_raw_html_attributes_are_refused_only_outside_code(self):
         for text in ('- <a href="../docs/user/queries/index.md">guide</a>.\n',
@@ -184,12 +221,121 @@ class ReleaseNotesTests(unittest.TestCase):
             self.repo.trees[TARGET][NEW] = text.encode()
             self.assertIn(text, self.snapshot()[2])
 
+    def test_unclosed_html_container_cannot_hide_following_notes(self):
+        self.repo.trees[TARGET][NEW] = b"- Fix.\n\n<details><summary>Details</summary>\n\nA detail.\n"
+        with self.assertRaisesRegex(notes.NotesError, "raw HTML"):
+            self.snapshot()
+        self.repo.trees[TARGET][NEW] = b"- Example: `<details><summary>Details</summary>`.\n"
+        self.assertIn("`<details><summary>Details</summary>`", self.snapshot()[2])
+
     def test_deterministic_dated_snapshot_and_audited_descendant(self):
         selected, info, content = self.snapshot()
         self.assertEqual(content, notes.render(self.repo, selected, info))
         checked, checked_info = notes.verify_snapshot(self.repo, content, AUDITED)
         self.assertEqual(checked_info, info)
         self.assertEqual(checked.inputs(), selected.inputs())
+
+    def test_squash_keeps_manifest_valid_without_the_old_input_commit(self):
+        _, info, content = self.snapshot()
+        del self.repo.trees[TARGET]
+        self.repo.refs["HEAD"] = AUDITED
+        ancestor = self.repo.require_ancestor
+
+        def only_durable_ancestors(base, target):
+            if base == TARGET:
+                raise notes.NotesError("squash removed this ancestry")
+            ancestor(base, target)
+
+        with patch.object(self.repo, "require_ancestor", side_effect=only_durable_ancestors):
+            selected, verified = notes.verify_snapshot(self.repo, content, AUDITED)
+        self.assertEqual(selected.target, AUDITED)
+        self.assertEqual(verified["target"], TARGET)
+        self.assertEqual(verified, info)
+
+    def test_squash_does_not_hide_omitted_or_changed_manifest_inputs(self):
+        _, info, content = self.snapshot()
+        del self.repo.trees[TARGET]
+        self.repo.refs["HEAD"] = AUDITED
+        for path, value in ((NEW, b"- Different.\n"), ("changelog.d/extra.fixed.md", b"- Omitted note.\n")):
+            previous = dict(self.repo.trees[AUDITED])
+            self.repo.trees[AUDITED][path] = value
+            with self.subTest(path=path), self.assertRaisesRegex(notes.NotesError, "after snapshot"):
+                notes.verify_snapshot(self.repo, content, AUDITED)
+            self.repo.trees[AUDITED] = previous
+        forged = dict(info, notes={})
+        malformed = content.replace(json.dumps(info, sort_keys=True, separators=(",", ":")), json.dumps(forged, sort_keys=True, separators=(",", ":")))
+        with self.assertRaisesRegex(notes.NotesError, "after snapshot"):
+            notes.verify_snapshot(self.repo, malformed, AUDITED)
+
+    def test_snapshot_configuration_is_semantically_bound(self):
+        selected, info, content = self.snapshot()
+        with tempfile.TemporaryDirectory() as directory:
+            self.repo.root = Path(directory)
+            for version, base in (("v0.14.0", selected.base), ("v0.13.0", None)):
+                candidate = copy.copy(selected)
+                candidate.base = base
+                with self.subTest(version=version, base=base), self.assertRaisesRegex(notes.NotesError, "must match"):
+                    notes.write_snapshot(self.repo, candidate, notes.metadata(candidate, version, "2026-10-01"), False, False)
+            self.assertFalse((self.repo.root / "docs/releases").exists())
+        config = json.loads(CONFIG)
+        config["base"] = LEGACY
+        self.repo.trees[AUDITED][notes.CONFIG] = json.dumps(config).encode()
+        forged = dict(info, config=notes.digest(self.repo.trees[AUDITED][notes.CONFIG]))
+        edited = content.replace(json.dumps(info, sort_keys=True, separators=(",", ":")), json.dumps(forged, sort_keys=True, separators=(",", ":")))
+        with self.assertRaisesRegex(notes.NotesError, "must match"):
+            notes.verify_snapshot(self.repo, edited, AUDITED)
+
+    def test_crlf_inputs_have_the_same_meaning_and_hashes(self):
+        _, info, content = self.snapshot(LEGACY, "v0.12.0")
+        config = json.dumps(json.loads(self.repo.working[notes.CONFIG]), indent=2).encode() + b"\n"
+        for tree in (self.repo.trees[TARGET], self.repo.trees[AUDITED], self.repo.working):
+            tree[notes.CONFIG] = config
+        selected = notes.select(self.repo, BASE, TARGET, LEGACY)
+        info = notes.metadata(selected, "v0.12.0", "2026-10-01")
+        content = notes.render(self.repo, selected, info)
+        self.repo.working = {path: raw.replace(b"\n", b"\r\n") for path, raw in self.repo.working.items()}
+        local = notes.select(self.repo, BASE, TARGET, LEGACY, working_tree=True)
+        self.assertEqual(local.inputs(), selected.inputs())
+        self.assertEqual(local.config, selected.config)
+        self.assertEqual(local.baseline, selected.baseline)
+        self.assertEqual(notes.verify_snapshot(self.repo, content.replace("\n", "\r\n"), AUDITED)[1], info)
+        self.repo.working[OLD] = b"- Real content change.\r\n"
+        with self.assertRaisesRegex(notes.NotesError, "published notes"):
+            notes.select(self.repo, BASE, TARGET, LEGACY, working_tree=True)
+
+    def test_committed_preview_links_include_the_selected_sha(self):
+        self.repo.trees[TARGET][NEW] = b"- See [guide][new].\n\n[new]: ../docs/user/queries/index.md#predicates\n"
+        self.snapshot(LEGACY, "v0.12.0")
+        output = io.StringIO()
+        with patch.object(notes, "Repository", return_value=self.repo), patch("sys.stdout", output):
+            self.assertEqual(notes.main(["preview", "--target", TARGET]), 0)
+        self.assertIn(f"/blob/{TARGET}/docs/user/queries/index.md#predicates", output.getvalue())
+        self.assertIn(f"Original [guide]({notes.REPOSITORY}/blob/{TARGET}/docs/user/queries/index.md)", output.getvalue())
+
+    def test_initial_release_configuration_works_through_snapshot_check_and_body(self):
+        config = json.dumps({"version": "v0.13.0", "base": None, "legacy": None}).encode()
+        for tree in (self.repo.trees[TARGET], self.repo.trees[AUDITED], self.repo.working):
+            tree[notes.CONFIG] = config
+        selected = notes.select(self.repo, None, TARGET)
+        info = notes.metadata(selected, "v0.13.0", "2026-10-01")
+        content = notes.render(self.repo, selected, info)
+        self.assertEqual(set(info["notes"]), {OLD, NEW})
+        with tempfile.TemporaryDirectory() as directory:
+            self.repo.root = Path(directory)
+            path = notes.write_snapshot(self.repo, selected, info, False, False)
+            errors = []
+            with patch.object(notes, "Repository", return_value=self.repo):
+                notes.check_working_notes(self.repo.root, errors)
+            self.assertEqual(errors, [])
+            self.repo.trees[AUDITED]["docs/releases/v0.13.0.md"] = path.read_bytes()
+        self.repo.refs["refs/tags/v0.13.0"] = AUDITED
+        with patch.object(notes, "Repository", return_value=self.repo), patch("sys.stdout", io.StringIO()):
+            self.assertEqual(notes.main(["body", "--tag", "v0.13.0", "--target", AUDITED]), 0)
+
+    def test_initial_flag_cannot_override_noninitial_snapshot_configuration(self):
+        with patch.object(notes, "Repository", return_value=self.repo), patch("sys.stderr", io.StringIO()) as output:
+            self.assertEqual(notes.main(["snapshot", "--target", TARGET, "--date", "2026-10-01", "--initial-release"]), 1)
+        self.assertIn("must match", output.getvalue())
 
     def test_provenance_or_body_edits_fail(self):
         _, _, content = self.snapshot()
@@ -284,6 +430,105 @@ class ReleaseNotesTests(unittest.TestCase):
                     notes.write_snapshot(self.repo, selected, info, True, False)
             self.assertEqual(path.read_text(), content)
             self.assertEqual(list(path.parent.glob(".release-notes-*")), [])
+
+    def test_snapshot_updates_index_and_orders_versions_numerically(self):
+        selected, info, _ = self.snapshot()
+        with tempfile.TemporaryDirectory() as directory:
+            self.repo.root = Path(directory)
+            releases = self.repo.root / "docs/releases"
+            releases.mkdir(parents=True)
+            (releases / "v0.9.0.md").write_text("# Old release\n")
+            (releases / "v0.10.0.md").write_text("# Old release\n")
+            notes.write_snapshot(self.repo, selected, info, False, False)
+            index = (releases / "README.md").read_text()
+            self.assertIn("[v0.13.0](v0.13.0.md): released 2026-10-01", index)
+            self.assertLess(index.index("[v0.13.0]"), index.index("[v0.10.0]"))
+            self.assertLess(index.index("[v0.10.0]"), index.index("[v0.9.0]"))
+            output = io.StringIO()
+            with patch.object(notes, "Repository", return_value=self.repo), patch("sys.stdout", output):
+                self.assertEqual(notes.main(["index"]), 0)
+            self.assertEqual(output.getvalue(), index)
+
+    def test_index_refuses_invalid_snapshot_before_writing_either_output(self):
+        selected, info, content = self.snapshot()
+        with tempfile.TemporaryDirectory() as directory:
+            self.repo.root = Path(directory)
+            releases = self.repo.root / "docs/releases"
+            releases.mkdir(parents=True)
+            (releases / "v0.14.0.md").write_text(content)
+            index = releases / "README.md"
+            index.write_text("Existing index.\n")
+            with self.assertRaisesRegex(notes.NotesError, "disagree"):
+                notes.write_snapshot(self.repo, selected, info, False, False)
+            self.assertFalse((releases / "v0.13.0.md").exists())
+            self.assertEqual(index.read_text(), "Existing index.\n")
+
+    def test_index_directory_is_refused_before_snapshot_write(self):
+        selected, info, _ = self.snapshot()
+        with tempfile.TemporaryDirectory() as directory:
+            self.repo.root = Path(directory)
+            releases = self.repo.root / "docs/releases"
+            (releases / "README.md").mkdir(parents=True)
+            with self.assertRaisesRegex(notes.NotesError, "regular files"):
+                notes.write_snapshot(self.repo, selected, info, False, False)
+            self.assertFalse((releases / "v0.13.0.md").exists())
+
+    def test_interrupted_index_update_has_explicit_repair_after_tagging(self):
+        selected, info, content = self.snapshot()
+        with tempfile.TemporaryDirectory() as directory:
+            self.repo.root = Path(directory)
+            releases = self.repo.root / "docs/releases"
+            releases.mkdir(parents=True)
+            index = releases / "README.md"
+            index.write_text("Old index.\n")
+            replace = notes.os.replace
+            def fail_index(source, destination):
+                if destination == index:
+                    raise OSError("interrupted index update")
+                replace(source, destination)
+            with patch.object(notes.os, "replace", side_effect=fail_index):
+                with self.assertRaisesRegex(notes.NotesError, "snapshot written but index update failed"):
+                    notes.write_snapshot(self.repo, selected, info, False, False)
+            self.assertEqual((releases / "v0.13.0.md").read_text(), content)
+            self.assertEqual(index.read_text(), "Old index.\n")
+            self.assertEqual(list(releases.glob(".release-notes-*")), [])
+            self.repo.tags.add("v0.13.0")
+            with patch.object(notes, "Repository", return_value=self.repo), patch("sys.stdout", io.StringIO()):
+                self.assertEqual(notes.main(["index", "--write"]), 0)
+            self.assertIn("[v0.13.0]", index.read_text())
+
+    def test_index_repair_preserves_old_index_on_validation_or_replace_failure(self):
+        _, _, content = self.snapshot()
+        with tempfile.TemporaryDirectory() as directory:
+            self.repo.root = Path(directory)
+            releases = self.repo.root / "docs/releases"
+            releases.mkdir(parents=True)
+            index = releases / "README.md"
+            index.write_text("Keep this index.\n")
+            bad = releases / "v0.14.0.md"
+            bad.write_text(content)
+            with self.assertRaises(notes.NotesError):
+                notes.write_index(self.repo)
+            self.assertEqual(index.read_text(), "Keep this index.\n")
+            bad.unlink()
+            with patch.object(notes.os, "replace", side_effect=OSError("interrupted")):
+                with self.assertRaises(OSError):
+                    notes.write_index(self.repo)
+            self.assertEqual(index.read_text(), "Keep this index.\n")
+            self.assertEqual(list(releases.glob(".release-notes-*")), [])
+
+    def test_index_marks_frozen_baseline_unreleased_then_dated_snapshot(self):
+        selected, info, _ = self.snapshot(LEGACY, "v0.12.0")
+        with tempfile.TemporaryDirectory() as directory:
+            self.repo.root = Path(directory)
+            path = self.repo.root / notes.LEGACY_PATH
+            path.parent.mkdir(parents=True)
+            path.write_bytes(ORIGINAL)
+            self.assertIn("unreleased migration baseline", notes.render_index(self.repo))
+            notes.write_snapshot(self.repo, selected, info, False, True)
+            index = (path.parent / "README.md").read_text()
+            self.assertNotIn("unreleased", index)
+            self.assertIn("released 2026-10-01", index)
 
     def test_body_requires_release_tag_to_select_audited_source(self):
         self.repo.refs["refs/tags/v0.13.0"] = TARGET
