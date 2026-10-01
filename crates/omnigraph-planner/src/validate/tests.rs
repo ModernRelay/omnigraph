@@ -24,6 +24,10 @@ node Doc {
     title: String
     year: I64
     open: Bool
+    rank: I32?
+    score: F64
+    born: Date
+    tags: [String]
     embedding: Vector(2)
 }
 edge Cites: Doc -> Doc
@@ -569,4 +573,171 @@ fn a_bm25_scan_with_a_nearest_policy_fails_the_declared_policy() {
     ranked_access(&mut plan).policy = Some(crate::physical::NearestPolicy::DEFAULT);
     let (check, detail) = fixture.refused(plan);
     assert_eq!(check, "declared policy", "{detail}");
+}
+
+/// The scope one query is accepted under.
+fn scope_of(query: &str, params: &[(&str, Literal)]) -> ValidationScope {
+    let fixture = Fixture::new(query, params);
+    fixture
+        .accept(fixture.plan())
+        .unwrap_or_else(|error| panic!("`{query}` is not accepted: {error:?}"))
+        .scope()
+}
+
+/// Every admitted form of the exact fragment is a member, and every
+/// excluded family is not: membership reads the checked declaration only.
+#[test]
+fn membership_admits_the_fragment_and_nothing_else() {
+    let members = [
+        "query q() { match { $d: Doc } return { $d.slug } }",
+        "query q() { match { $d: Doc { open: true } } return { $d.slug } }",
+        "query q($y: I64) { match { $d: Doc $d.year >= $y } return { $d.slug } }",
+        "query q() { match { $d: Doc $d.year != 3 and not ($d.title < \"m\" or $d.open) } return { $d.slug } }",
+        "query q() { match { $d: Doc $d.rank is null or $d.rank > 2 } return { $d.slug, $d.rank } }",
+        "query q() { match { $d: Doc $d.open } return { $d.title as t } order { $d.year desc, $d.title } limit 4 }",
+        "query q($t: String) { match { $d: Doc $d.title = $t } return { $d.slug } limit 0 }",
+        "query q($q: String) { match { $d: Doc } return { bm25($d.title, $q) as s, $d.slug } order { bm25($d.title, $q), $d.slug desc } limit 2 }",
+    ];
+    for query in members {
+        let params = [
+            ("y", Literal::Integer(1)),
+            ("t", Literal::String("x".into())),
+            ("q", Literal::String("graph".into())),
+        ];
+        let used: Vec<(&str, Literal)> = params
+            .iter()
+            .filter(|(name, _)| query.contains(&format!("${name}:")))
+            .cloned()
+            .collect();
+        assert_eq!(
+            scope_of(query, &used),
+            ValidationScope::ExactSubset,
+            "{query}"
+        );
+    }
+    let outside = [
+        "query q() { match { $d: Doc $d.title contains \"g\" } return { $d.slug } }",
+        "query q() { match { $d: Doc $d.score > 1.5 } return { $d.slug } }",
+        "query q() { match { $d: Doc $d.born > date(\"2020-01-01\") } return { $d.slug } }",
+        "query q() { match { $d: Doc { tags: \"a\" } } return { $d.slug } }",
+        "query q() { match { $d: Doc $d cites $e } return { $d.slug } }",
+        "query q() { match { $d: Doc $e: Doc } return { $d.slug } }",
+        "query q() { match { $d: Doc not { $d cites $e } } return { $d.slug } }",
+        "query q() { match { $d: Doc } return { count($d) as n } }",
+        "query q() { match { $d: Doc } return { $d } }",
+        "query q() { match { $d: Doc } return { $d.@id } }",
+        "query q() { match { $d: Doc } return { $d.slug } order { $d.score } }",
+        "query q() { match { $d: Doc search($d.title, \"g\") } return { $d.slug } }",
+        "query q($v: Vector(2)) { match { $d: Doc } return { $d.slug } order { nearest($d.embedding, $v) } limit 2 }",
+        "query q($q: String) { match { $d: Doc } return { $d.slug } order { rrf(bm25($d.title, $q), bm25($d.title, $q)) } limit 2 }",
+    ];
+    for query in outside {
+        let params = [
+            (
+                "v",
+                Literal::List(vec![Literal::Float(0.0), Literal::Float(1.0)]),
+            ),
+            ("q", Literal::String("graph".into())),
+        ];
+        let used: Vec<(&str, Literal)> = params
+            .iter()
+            .filter(|(name, _)| query.contains(&format!("${name}:")))
+            .cloned()
+            .collect();
+        assert_eq!(
+            scope_of(query, &used),
+            ValidationScope::InvariantsOnly,
+            "{query}"
+        );
+    }
+}
+
+/// The plain and the explained acceptance share one path: the same plan and
+/// scope, and the same outcome when a validation limit runs out.
+#[test]
+fn both_acceptance_entries_agree_even_when_a_limit_runs_out() {
+    for limits in [
+        ValidationLimits::DEFAULT,
+        ValidationLimits {
+            work: 5,
+            ..ValidationLimits::DEFAULT
+        },
+        ValidationLimits {
+            steps: 2,
+            ..ValidationLimits::DEFAULT
+        },
+    ] {
+        let fixture = ranked();
+        let constants = Bound(&fixture.params);
+        let input = AcceptInput {
+            checked: &fixture.checked,
+            catalog: &fixture.catalog,
+            ir: &fixture.ir,
+            params: &fixture.params,
+            constants: &constants,
+            limits,
+        };
+        let plain = crate::gate::accept_query(&input, &fixture.source, &BOUNDS);
+        let explained = crate::gate::accept_query_explained(&input, &fixture.source, &BOUNDS);
+        match (plain, explained) {
+            (Ok(plain), Ok((explained, explain))) => {
+                assert_eq!(plain.plan(), explained.plan());
+                assert_eq!(plain.scope(), explained.scope());
+                assert_eq!(explain.validation, Some(explained.summary()));
+            }
+            (Err(plain), Err(explained)) => {
+                assert_eq!(plain, explained);
+                assert!(
+                    matches!(plain, crate::gate::Unrouted::ValidationExhausted { .. }),
+                    "{plain:?}"
+                );
+            }
+            (plain, explained) => panic!("the entries disagree: {plain:?} / {explained:?}"),
+        }
+    }
+}
+
+/// Evidence size and checking work as a member query grows: serialized
+/// derivation bytes, rule applications, retained nodes and visits, and the
+/// checking time. A decision instrument, not a gate.
+#[test]
+#[ignore = "instrument: prints derivation bytes, steps, nodes, visits and time per conjunct count"]
+fn derivation_cost_grows_with_the_query() {
+    for conjuncts in [1usize, 4, 16, 64, 256] {
+        let filter: Vec<String> = (0..conjuncts)
+            .map(|index| format!("$d.year != {index}"))
+            .collect();
+        let query = format!(
+            "query q() {{ match {{ $d: Doc {} }} return {{ $d.slug }} order {{ $d.year }} limit 10 }}",
+            filter.join(" ")
+        );
+        let fixture = Fixture::new(&query, &[]);
+        let traced = fixture.traced();
+        let derivation = traced.derivation.clone().unwrap();
+        let bytes = serde_json::to_vec(&derivation).unwrap().len();
+        let constants = Bound(&fixture.params);
+        let input = AcceptInput {
+            checked: &fixture.checked,
+            catalog: &fixture.catalog,
+            ir: &fixture.ir,
+            params: &fixture.params,
+            constants: &constants,
+            limits: ValidationLimits::DEFAULT,
+        };
+        let mut budget = Budget::new(ValidationLimits::DEFAULT);
+        let started = std::time::Instant::now();
+        let (scope, _) = check(
+            &traced.optimized.physical,
+            &input,
+            Some(derivation),
+            &mut budget,
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        let (nodes, steps, work) = budget.used();
+        println!(
+            "conjuncts={conjuncts} scope={} bytes={bytes} steps={steps} nodes={nodes} work={work} elapsed={elapsed:?}",
+            scope.as_str()
+        );
+    }
 }

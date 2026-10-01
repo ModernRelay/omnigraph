@@ -220,14 +220,20 @@ impl Requirements {
         for clause in &self.eligibility {
             matcher.conjuncts(clause, &mut written_conjuncts);
         }
+        // Placement keeps written order within each node, so the search
+        // resumes after the last match: in-order placement costs one match
+        // per conjunct, and any other order still finds its conjunct.
+        let mut cursor = 0;
         for written in written_conjuncts {
             if matcher.constant(written) && matcher.value(written) == Some(Literal::Bool(true)) {
                 continue;
             }
             let mut found = false;
-            for conjunct in &placed {
-                if matcher.matches(written, conjunct, Position::Filter, budget)? {
+            for offset in 0..placed.len() {
+                let index = (cursor + offset) % placed.len();
+                if matcher.matches(written, &placed[index], Position::Filter, budget)? {
                     found = true;
+                    cursor = index + 1;
                     break;
                 }
             }

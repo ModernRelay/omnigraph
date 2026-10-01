@@ -891,6 +891,7 @@ fn apply(
                     "a filter is absorbed only between logical nodes".into(),
                 ));
             }
+            budget.visit(u64::try_from(conjuncts.len() + filter.len()).unwrap_or(u64::MAX))?;
             let Some(position) = conjuncts.iter().position(|held| held == conjunct) else {
                 return Err(invalid(format!(
                     "the filter holds no conjunct `{}` to absorb",

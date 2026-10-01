@@ -62,6 +62,11 @@ impl Budget {
         self.limits
     }
 
+    /// What the checks charged so far: `(nodes, steps, work)`.
+    pub fn used(&self) -> (u64, u64, u64) {
+        (self.nodes, self.steps, self.work)
+    }
+
     /// Charge `count` visits before making them.
     pub fn visit(&mut self, count: u64) -> Result<(), ValidationError> {
         charge(&mut self.work, count, self.limits.work, "work")
