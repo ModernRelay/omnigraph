@@ -476,6 +476,43 @@ pub(crate) fn accept_replay(
     omnigraph_planner::accept_replay(envelope, &input).map_err(replay_refused)
 }
 
+/// Re-establish from the pinned snapshot every full-text coverage fact a
+/// replayed plan records, since a serialized fact cannot vouch for itself:
+/// a pinned dataset version fixes its index coverage, so a recorded value
+/// that differs, or one for a table the plan pins no version of, is invalid
+/// evidence. The dataset pins are checked first (`plan_pins_snapshot`).
+pub(crate) async fn replayed_coverage_holds(
+    plan: &omnigraph_planner::PhysicalPlan,
+    snapshot: &Snapshot,
+) -> Result<()> {
+    let refuse = |reason: String| replay_refused(ReplayRefusal::InvalidEvidence { reason });
+    for (key, recorded) in &plan.assumptions().full_text {
+        let Some((type_key, property)) = key.rsplit_once('.') else {
+            return Err(refuse(format!(
+                "the plan records full-text coverage under `{key}`, which names no table property"
+            )));
+        };
+        if !plan.assumptions().datasets.contains_key(type_key) {
+            return Err(refuse(format!(
+                "the plan records full-text coverage of `{key}` without pinning `{type_key}`"
+            )));
+        }
+        let actual = match snapshot.dataset(type_key) {
+            Some(_) => {
+                let dataset = snapshot.open_lance_dataset(type_key).await?;
+                crate::table_store::TableStore::fts_coverage(&dataset, property).await?
+            }
+            None => FullTextCoverage::Absent,
+        };
+        if actual != *recorded {
+            return Err(refuse(format!(
+                "the plan records full-text coverage {recorded:?} of `{key}`; the pinned snapshot holds {actual:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// A refused replay as the caller sees it: replanning is a conflict to
 /// resolve by resubmitting the query, invalid evidence is a bad request, an
 /// exhausted limit is a resource outcome.

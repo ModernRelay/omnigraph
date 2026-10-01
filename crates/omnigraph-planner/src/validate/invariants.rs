@@ -740,7 +740,9 @@ impl Requirements {
     }
 
     /// Whether a planned sort key is the written key: as written, or the
-    /// `return` item the planner bound it to by its result column. In a
+    /// `return` item the planner bound it to by its result column, which the
+    /// written key must lower to (two differently written expressions may
+    /// lower to one, and the planner binds the first such item). In a
     /// grouped query a written meta-field key binds by name to the unaliased
     /// return item whose column it names, as the compiler lowers it.
     fn same_key(
@@ -768,7 +770,9 @@ impl Requirements {
                 && item.alias.is_none()
                 && meta_field_result_key(written).as_deref() == Some(column)
                 && meta_field_result_key(&item.expr).as_deref() == Some(column);
-            return Ok(item.expr == *written || by_name);
+            return Ok(by_name
+                || item.expr == *written
+                || matcher.matches(written, &returns[index].expr, Position::Return, budget)?);
         }
         matcher.matches(written, &planned.expr, Position::Plain, budget)
     }
@@ -825,7 +829,25 @@ impl Requirements {
                     _ => false,
                 }
         });
-        if covered {
+        // The same claim over the lowered expressions: an expression a key
+        // lowers to, compared with what each returned item lowers to, since
+        // two differently written expressions may lower to one.
+        fn lowered_key<'k>(key: &'k IROrdering, returns: &'k [IRProjection]) -> &'k IRExpr {
+            match &key.expr {
+                IRExpr::AliasRef(alias) => returns
+                    .iter()
+                    .find(|projection| result_column(projection).as_deref() == Some(alias))
+                    .map_or(&key.expr, |projection| &projection.expr),
+                expr => expr,
+            }
+        }
+        let covered_lowered = !returns.is_empty()
+            && returns.iter().all(|projection| {
+                order_by
+                    .iter()
+                    .any(|key| *lowered_key(key, returns) == projection.expr)
+            });
+        if covered || covered_lowered {
             return Ok(());
         }
         let keyed = |column: &ColumnRef| {

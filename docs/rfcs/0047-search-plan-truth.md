@@ -668,7 +668,10 @@ captured parameters) and a member's derivation, under `replay_version`,
 `rules_version` and `semantics_version` 1. A version mismatch, a different
 schema digest and a dataset the plan did not pin are conflicts (409) that ask
 for the query again; malformed evidence or a plan failing a check is a bad
-request (400); exhaustion is `ResourceLimitExceeded` (413).
+request (400); exhaustion is `ResourceLimitExceeded` (413). The recorded
+full-text coverage is data-dependent evidence: replay reads it again from the
+pinned datasets, and a recorded value the snapshot contradicts is invalid
+evidence.
 
 Existing query-legality refusals and unavailable index prerequisites retain
 their distinct outcomes. Cross-version executable-plan portability is not

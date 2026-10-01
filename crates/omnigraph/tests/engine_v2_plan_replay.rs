@@ -1450,3 +1450,80 @@ async fn an_envelope_of_another_version_asks_for_the_query_again() {
         );
     }
 }
+
+/// A replay re-establishes the full-text coverage its plan records from the
+/// pinned snapshot instead of trusting the envelope: an envelope claiming
+/// full coverage of a partially indexed property, with its bm25 scan and
+/// derivation switched to filter before scoring, is refused, since that run
+/// would change BM25 scores.
+#[tokio::test]
+async fn a_replay_rechecks_recorded_full_text_coverage() {
+    const SOURCE: &str = r#"query recent($t: String) {
+    match { $d: Doc $d.year >= 2000 }
+    return { $d.slug, bm25($d.text, $t) as score }
+    order { bm25($d.text, $t) }
+}"#;
+    let dir = tempfile::tempdir().unwrap();
+    let db = session(
+        Omnigraph::init(
+            dir.path().to_str().unwrap(),
+            "node Doc { slug: String @key text: String @index year: I64 }",
+        )
+        .await
+        .unwrap(),
+    );
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"d1","text":"graph engines","year":2020}}
+{"type":"Doc","data":{"slug":"d2","text":"databases","year":2019}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    db.ensure_indices().await.unwrap();
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"t1","text":"graph","year":2022}}
+{"type":"Doc","data":{"slug":"t2","text":"graph graph graph graph","year":1990}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    let params = ParamMap::from([("t".to_string(), Literal::String("graph".to_string()))]);
+    let run = db
+        .query_inspected(ReadTarget::branch("main"), SOURCE, "recent", &params)
+        .await
+        .unwrap();
+    let envelope = run.replay_envelope(SOURCE, "recent");
+    let honest = db
+        .replay_bound_plan(ReadTarget::branch("main"), &envelope)
+        .await
+        .unwrap();
+    assert_eq!(rows_of(&honest.result), rows_of(&run.result));
+    let mut forged: Value = serde_json::from_slice(&envelope).unwrap();
+    let mut placements = 0;
+    edit_objects(&mut forged, &mut |object| {
+        if object.get("eligibility") == Some(&Value::from("after_scoring")) {
+            object.insert("eligibility".to_string(), Value::from("before_scoring"));
+            placements += 1;
+        }
+        if let Some(Value::Object(coverage)) = object.get_mut("full_text") {
+            for recorded in coverage.values_mut() {
+                *recorded = Value::from("full");
+            }
+        }
+    });
+    assert_eq!(placements, 2, "the scan and its derivation step");
+    let error = db
+        .replay_bound_plan(
+            ReadTarget::branch("main"),
+            &serde_json::to_vec(&forged).unwrap(),
+        )
+        .await
+        .err()
+        .expect("a forged coverage claim must be refused");
+    assert!(
+        matches!(&error, OmniError::Manifest(manifest)
+            if manifest.kind == omnigraph::error::ManifestErrorKind::BadRequest)
+            && error.to_string().contains("full-text coverage"),
+        "{error}"
+    );
+}

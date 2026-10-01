@@ -224,7 +224,8 @@ impl Session {
     /// `query_inspected` builds (the snapshot and catalog of `target`, a
     /// graph index scoped to the plan's `Expand`s), refuses a snapshot whose
     /// dataset versions are not the ones the plan's scans, counts and
-    /// traversals pinned, and calls the same `execute`.
+    /// traversals pinned, re-establishes every full-text coverage fact the
+    /// plan records from that snapshot, and calls the same `execute`.
     ///
     /// # Errors
     ///
@@ -253,6 +254,7 @@ impl Session {
             has_wildcard,
         )?;
         engine::plan_pins_snapshot(plan, &resolved.snapshot)?;
+        engine::replayed_coverage_holds(plan, &resolved.snapshot).await?;
         let CompiledRead::Query(query) =
             self.compile_named_query(&catalog, &envelope.query.source, &envelope.query.name)?
         else {

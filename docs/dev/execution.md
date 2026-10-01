@@ -635,8 +635,10 @@ design keeps its diagnostic and is a bad request. The replay door
 source and name, the scope, the schema digest, the bound plan and a member's
 derivation. It checks the byte limit and the envelope's versions before
 decoding the plan, refuses another schema and a dataset the plan did not pin
-as conflicts, recompiles the query, and accepts the plan again; a plan that
-fails a check there is invalid evidence, a bad request.
+as conflicts, re-establishes every full-text coverage fact the plan records
+from the pinned snapshot, recompiles the query, and accepts the plan again; a
+recorded fact the snapshot contradicts, or a plan that fails a check, is
+invalid evidence, a bad request.
 
 ## Search and rank
 

@@ -73,7 +73,7 @@ pub(crate) use explain::{explain_document, explain_rows};
 pub(crate) use graph::{EmbeddingResolver, GraphIndexHandle};
 use lower::Lowering;
 use plan_source::{ExplainedQuery, QuerySource, accept_query, explain_query};
-pub(crate) use plan_source::{accept_replay, replay_refused};
+pub(crate) use plan_source::{accept_replay, replay_refused, replayed_coverage_holds};
 pub(crate) use report::{Executed, PlanRun};
 use report::{ExecutionReport, ReportRow};
 use run::{pass_rows, run_plan};
