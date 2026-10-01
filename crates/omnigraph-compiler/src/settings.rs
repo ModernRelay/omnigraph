@@ -99,6 +99,17 @@ pub const DEFINITIONS: &[SettingSpec] = &[
         env: "OMNIGRAPH_LOAD_CONCURRENCY",
         doc: "the width of the staged-write fan-out for `load` and `mutate`",
     },
+    SettingSpec {
+        name: "traversal_work_limit",
+        kind: SettingKind::Integer {
+            min: 1,
+            max: Some(i64::MAX),
+        },
+        default: "1000000",
+        scope: SettingScope::Request,
+        env: "OMNIGRAPH_TRAVERSAL_WORK_LIMIT",
+        doc: "the finite work budget shared by edge selections in one query; exhaustion terminates the query with an error",
+    },
 ];
 
 /// One variant per [`DEFINITIONS`] row, in the table's order.
@@ -109,6 +120,7 @@ pub enum SettingId {
     MergeLineage,
     AnnNprobes,
     StageWriteConcurrency,
+    TraversalWorkLimit,
 }
 
 impl SettingId {
@@ -119,6 +131,7 @@ impl SettingId {
         SettingId::MergeLineage,
         SettingId::AnnNprobes,
         SettingId::StageWriteConcurrency,
+        SettingId::TraversalWorkLimit,
     ];
 
     /// The setting a name denotes.
@@ -328,6 +341,7 @@ pub struct SessionSettings {
     merge_lineage: MergeLineage,
     ann_nprobes: Option<usize>,
     stage_write_concurrency: usize,
+    traversal_work_limit: u64,
 }
 
 impl Default for SessionSettings {
@@ -341,6 +355,7 @@ impl Default for SessionSettings {
             merge_lineage: MergeLineage::On,
             ann_nprobes: None,
             stage_write_concurrency: 1,
+            traversal_work_limit: 1,
         };
         for id in SettingId::ALL {
             settings
@@ -397,6 +412,10 @@ impl SessionSettings {
                 let probes = parse_integer(id, value)?;
                 self.ann_nprobes = usize::try_from(probes).ok().filter(|probes| *probes > 0);
             }
+            SettingId::TraversalWorkLimit => {
+                self.traversal_work_limit = u64::try_from(parse_integer(id, value)?)
+                    .expect("invariant: the row's range is 1..=i64::MAX");
+            }
             SettingId::StageWriteConcurrency => {
                 let width = parse_integer(id, value)?;
                 self.stage_write_concurrency =
@@ -414,6 +433,7 @@ impl SessionSettings {
             SettingId::RrfPlan => self.rrf_plan = from.rrf_plan,
             SettingId::MergeLineage => self.merge_lineage = from.merge_lineage,
             SettingId::AnnNprobes => self.ann_nprobes = from.ann_nprobes,
+            SettingId::TraversalWorkLimit => self.traversal_work_limit = from.traversal_work_limit,
             SettingId::StageWriteConcurrency => {
                 self.stage_write_concurrency = from.stage_write_concurrency;
             }
@@ -428,6 +448,7 @@ impl SessionSettings {
             SettingId::MergeLineage => self.merge_lineage.as_str().to_string(),
             SettingId::AnnNprobes => self.ann_nprobes.unwrap_or(0).to_string(),
             SettingId::StageWriteConcurrency => self.stage_write_concurrency.to_string(),
+            SettingId::TraversalWorkLimit => self.traversal_work_limit.to_string(),
         }
     }
 
@@ -470,6 +491,10 @@ impl SessionSettings {
     /// The probe cap; `None` is no cap (spelled `0`).
     pub fn ann_nprobes(&self) -> Option<usize> {
         self.ann_nprobes
+    }
+
+    pub fn traversal_work_limit(&self) -> u64 {
+        self.traversal_work_limit
     }
 
     pub fn stage_write_concurrency(&self) -> usize {
@@ -650,6 +675,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn traversal_work_budget_is_positive_and_finite_issue_659() {
+        let defaults = SessionSettings::default();
+        assert_eq!(defaults.traversal_work_limit(), 1_000_000);
+        for value in ["0", "-1", "9223372036854775808"] {
+            assert!(
+                defaults
+                    .clone()
+                    .with("traversal_work_limit", value)
+                    .is_err()
+            );
+        }
+        let upper = defaults
+            .clone()
+            .with("traversal_work_limit", "9223372036854775807")
+            .unwrap();
+        assert_eq!(
+            upper.traversal_work_limit(),
+            u64::try_from(i64::MAX).unwrap()
+        );
+        SettingId::TraversalWorkLimit.refuse_from_request().unwrap();
+        let mut copied = defaults;
+        copied.copy_field(&upper, SettingId::TraversalWorkLimit);
+        assert_eq!(copied, upper);
+    }
+
+    #[test]
     fn definitions_ids_and_fields_agree_in_both_directions() {
         assert_eq!(SettingId::ALL.len(), DEFINITIONS.len());
         for (index, id) in SettingId::ALL.into_iter().enumerate() {
@@ -679,7 +730,7 @@ mod tests {
         let err = SettingId::parse("merge_linage").unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown setting `merge_linage`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency"
+            "unknown setting `merge_linage`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit"
         );
         let err = SessionSettings::default().with("engine", "v1").unwrap_err();
         assert_eq!(

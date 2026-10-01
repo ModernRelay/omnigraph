@@ -54,7 +54,9 @@ pub(super) use anti_join::{
 };
 pub(super) use contains_join::ContainsJoinExec;
 pub(super) use cross_join::CrossJoinExec;
-pub(super) use expand::{ExpandExec, ExpandStep, GraphEnv};
+pub(super) use expand::{
+    ExpandExec, ExpandExecution, ExpandStep, GraphEnv, NamedExpand, validate_expand_structure,
+};
 pub(super) use filter::FilterExec;
 pub(super) use hash_join::{HashJoinExec, LookupSpec};
 pub(super) use limit::LimitExec;

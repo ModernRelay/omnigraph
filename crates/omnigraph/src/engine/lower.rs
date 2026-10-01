@@ -21,16 +21,19 @@ use datafusion::physical_expr::expressions::{CastExpr, Column};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use omnigraph_compiler::ir::SubqueryPredicate;
+use omnigraph_compiler::traversal::EDGE_TYPE_COLUMN;
+use omnigraph_planner::logical::{EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
 use omnigraph_planner::{
-    BoundPlan, ContainsJoinFields, ExpandFields, HashJoinFields, Lower, NodeId, PhysicalNode,
-    PhysicalPlan, PlanError, Predicate, RankArm, RankKind, RankedAccess, RuntimeFilterKind,
-    RuntimeFilterSpec, ScanInput, ScanSpec, SideId, SortMergeJoinFields, ValueTable,
+    BoundPlan, ColumnRef, ContainsJoinFields, ExpandFields, HashJoinFields, Lower, NodeId,
+    PhysicalNode, PhysicalPlan, PlanError, Predicate, RankArm, RankFuseFields, RankKind,
+    RankedAccess, RuntimeFilterKind, RuntimeFilterSpec, ScanInput, ScanSpec, SideId,
+    SortMergeJoinFields, ValueTable,
 };
 
 use super::adapters::{GqProjectionExpr, LoweringId, Projected};
 use super::operators::{
-    AntiJoinMaskExec, ArmOrder, ContainsJoinExec, CrossJoinExec, ExpandExec, ExpandStep,
-    FilterExec, GraphEnv, HashJoinExec, LimitExec, LookupSpec, MetadataCountExec,
+    AntiJoinMaskExec, ArmOrder, ContainsJoinExec, CrossJoinExec, ExpandExec, ExpandExecution,
+    ExpandStep, FilterExec, GraphEnv, HashJoinExec, LimitExec, LookupSpec, MetadataCountExec,
     OuterReferenceExec, OuterSlot, ProjectionExec, RankFuseExec, RuntimeFilterSlot, ScanExec,
     ScanSource, SortExec, SortKey, fresh_tag_column, tagged_schema,
 };
@@ -249,8 +252,8 @@ impl<'a> Lowering<'a> {
             PhysicalNode::Expand {
                 input,
                 src,
-                edge_type,
-                direction,
+                edges,
+                policy,
                 min_hops,
                 max_hops,
                 edge_binding: None,
@@ -258,10 +261,15 @@ impl<'a> Lowering<'a> {
             } if src == outer_var
                 && *min_hops == 1
                 && max_hops.unwrap_or(1) == 1
-                && (*direction != Direction::Both || predicate.is_existence_test())
+                && !matches!(policy, omnigraph_planner::ExpandPolicy::Budgeted)
                 && matches!(self.node(*input)?, PhysicalNode::OuterReference { .. }) =>
             {
-                Some((edge_type.clone(), *direction))
+                edges
+                    .named()
+                    .filter(|member| {
+                        member.direction != Direction::Both || predicate.is_existence_test()
+                    })
+                    .map(|member| (member.edge_type.clone(), member.direction))
             }
             _ => None,
         })
@@ -278,7 +286,7 @@ impl<'a> Lowering<'a> {
 
     /// The `Sort` that consumes node `id`, when one does: the projection
     /// below it carries the sort's columns hidden.
-    fn sort_above(&self, id: NodeId) -> Option<(&'a [IROrdering], &'a [String])> {
+    fn sort_above(&self, id: NodeId) -> Option<(&'a [IROrdering], &'a [ColumnRef])> {
         match self
             .plan
             .parent_of(id)
@@ -583,17 +591,15 @@ impl Lower for Walk<'_, '_> {
         let step = ExpandStep {
             src: fields.src.to_string(),
             dst: fields.dst.to_string(),
-            edge_type: fields.edge_type.to_string(),
-            direction: fields.direction,
+            execution: ExpandExecution::new(fields.edges.clone(), fields.mode, fields.policy)?,
+            src_type: fields.src_type.to_string(),
             dst_type: fields.dst_type.to_string(),
             min_hops: fields.min_hops,
             max_hops: fields.max_hops.ok_or_else(|| {
                 OmniError::manifest_internal("the read engine requires a bounded traversal")
             })?,
             edge_binding: fields.edge_binding.map(str::to_string),
-            mode: fields.mode,
             frontier_estimate: fields.frontier_estimate,
-            origin: ExpandStep::origin(fields.policy),
         };
         let expand = ExpandExec::try_new(input, step, Arc::clone(&self.scope.env))?;
         Ok(self.built(id, expand))
@@ -656,12 +662,16 @@ impl Lower for Walk<'_, '_> {
     fn rank_fuse(
         &mut self,
         id: NodeId,
-        arms: &[RankArm; 2],
-        k: Option<&IRExpr>,
-        limit: Option<usize>,
+        fields: RankFuseFields<'_>,
         primary: Plan,
         secondary: Plan,
     ) -> Lowers<Plan> {
+        let RankFuseFields {
+            arms,
+            k,
+            limit,
+            row_tiebreak,
+        } = fields;
         let limit = limit.ok_or_else(|| {
             OmniError::manifest("rrf() ordering requires a limit clause".to_string())
         })?;
@@ -686,6 +696,10 @@ impl Lower for Walk<'_, '_> {
             RrfMode { k, limit },
             id_column,
             [order(&arms[0]), order(&arms[1])],
+            row_tiebreak
+                .iter()
+                .map(|key| tiebreak_column(key, self.lowering.catalog.system_columns.id))
+                .collect::<Result<Vec<_>>>()?,
         );
         Ok(self.built(id, fuse))
     }
@@ -799,13 +813,13 @@ impl Lower for Walk<'_, '_> {
 
     /// The node's keys over the columns its input carries (hidden under the
     /// projection below, plain over an aggregate or a count), then the
-    /// declared tie-break ids, ascending nulls first.
+    /// declared tie-break columns, ascending nulls first.
     fn sort(
         &mut self,
         id: NodeId,
         order_by: &[IROrdering],
         fetch: Option<usize>,
-        tiebreak: &[String],
+        tiebreak: &[ColumnRef],
         input: Plan,
     ) -> Lowers<Plan> {
         if !self.outers.is_empty() {
@@ -851,8 +865,8 @@ impl Lower for Walk<'_, '_> {
                 nulls_first: !key.descending,
             });
         }
-        for binding in tiebreak {
-            let name = format!("{binding}.{}", self.lowering.catalog.system_columns.id);
+        for key in tiebreak {
+            let name = tiebreak_column(key, self.lowering.catalog.system_columns.id)?;
             let column = carried(&name).ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "the planned tie-break column '{name}' is not in the sort input"
@@ -895,11 +909,11 @@ fn return_name(proj: &IRProjection) -> Result<String> {
 }
 
 /// The wide columns the return projection carries for the sort above it, each
-/// once: the `PropAccess` keys and the declared tie-break ids, which the same
+/// once: the `PropAccess` keys and the declared tie-break columns, which the same
 /// planner pass projects, so a missing one is a planner defect.
 fn hidden_columns(
     keys: &[IROrdering],
-    tiebreak: &[String],
+    tiebreak: &[ColumnRef],
     input_schema: &Schema,
     id_column: &str,
 ) -> Result<Vec<String>> {
@@ -925,8 +939,8 @@ fn hidden_columns(
             }
         }
     }
-    for binding in tiebreak {
-        let name = format!("{binding}.{id_column}");
+    for key in tiebreak {
+        let name = tiebreak_column(key, id_column)?;
         if input_schema.column_with_name(&name).is_none() {
             return Err(OmniError::manifest_internal(format!(
                 "the planned tie-break column '{name}' is not in the sort input"
@@ -937,6 +951,20 @@ fn hidden_columns(
         }
     }
     Ok(hidden)
+}
+
+/// Resolve the metadata key declared by the plan to its runtime column.
+fn tiebreak_column(key: &ColumnRef, id_column: &str) -> Result<String> {
+    let property = match key.property.as_deref() {
+        Some(IDENTITY_MEMBER) => id_column,
+        Some(EDGE_TYPE_MEMBER) => EDGE_TYPE_COLUMN,
+        _ => {
+            return Err(OmniError::manifest_internal(format!(
+                "the planned tie-break '{key}' is not an identity or edge type column"
+            )));
+        }
+    };
+    Ok(format!("{}.{}", key.binding, property))
 }
 
 /// The columns of `batch` in `names`' order, for a root whose operator emits

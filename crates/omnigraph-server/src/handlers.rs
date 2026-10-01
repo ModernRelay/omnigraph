@@ -3,11 +3,33 @@
 //! verbatim from lib.rs in the modularization).
 
 use super::*;
+use crate::operations::OwnedResult;
+use crate::workload::{AdmissionGuard, IngressLease};
 use futures::StreamExt;
 use omnigraph::Session;
-use omnigraph::db::MergeOutcome;
+use omnigraph::db::MergeResult;
 use omnigraph::settings::{SettingId, SettingValue};
 use omnigraph_compiler::query::ast::{BranchStmt, EmptyFile, FileBody, QueryDecl, QueryFile};
+use tracing::Instrument;
+
+/// Inputs, actor admission and execution leave the request together. Dropping
+/// this waiter never cancels the registered write.
+async fn owned_write<T, F>(
+    state: &AppState,
+    admission: AdmissionGuard,
+    ingress: IngressLease,
+    operation: F,
+) -> std::result::Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = std::result::Result<T, ApiError>> + Send + 'static,
+{
+    state
+        .operations
+        .submit((admission, ingress), async move { operation.await.into() })?
+        .result()
+        .await
+}
 
 mod dispatch;
 use dispatch::{
@@ -61,7 +83,8 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
 pub(crate) async fn server_ready(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<ReadinessOutput>) {
-    let draining = state.draining.load(std::sync::atomic::Ordering::SeqCst);
+    let draining = state.draining.load(std::sync::atomic::Ordering::SeqCst)
+        || state.operations.snapshot().closed;
     let served_graph_count = state.routing().registry.list().len();
     let quarantined_graph_count = state.quarantined_graphs().len();
     let output = ReadinessOutput {
@@ -422,7 +445,7 @@ pub(crate) async fn resolve_graph_handle(
     info!(graph_id = %handle.key.graph_id, "graph routed");
 
     request.extensions_mut().insert(handle);
-    Ok(next.run(request).await)
+    ingress::admit(&state, request, next).await
 }
 
 pub(crate) fn log_policy_decision(
@@ -1001,6 +1024,8 @@ fn redact_blob_api_error(mapped: ApiError) -> ApiError {
 pub(crate) async fn server_export(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(observer): Extension<operations::ReadObserver>,
+    Extension(input): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     request: std::result::Result<Json<ExportRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ApiError> {
@@ -1031,43 +1056,48 @@ pub(crate) async fn server_export(
         .map_err(ApiError::from_omni)?;
     let producer_queue_lease = Arc::clone(&queue_lease);
     let (tx, body_stream) = export_transport::channel(queue_lease);
-    tokio::spawn(async move {
-        // The producer half prevents disconnect from recycling queue bytes
-        // until every pending send/scan future owned by this task is gone.
-        let _producer_queue_lease = producer_queue_lease;
-        let closed_tx = tx.clone();
-        let data_tx = tx.clone();
-        let export = cut.write_chunks(move |chunk| {
-            let data_tx = data_tx.clone();
-            async move {
-                data_tx
-                    .send(export_transport::ExportFrame::Data(Bytes::from(chunk)))
-                    .await
-                    .map_err(|_| {
-                        OmniError::Io(std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "served export response closed",
-                        ))
-                    })
-            }
-        });
-        tokio::pin!(export);
-        tokio::select! {
-            biased;
-            _ = closed_tx.closed() => {
-                // Cancelling the pinned export future drops its move-only cut.
-            }
-            (cut, result) = &mut export => {
-                let error = result.err().map(|error| std::io::Error::other(error.to_string()));
-                let _ = tx
-                    .send(export_transport::ExportFrame::Terminal {
-                        cut: Box::new(cut),
-                        error,
-                    })
-                    .await;
+    tokio::spawn(
+        async move {
+            let _producer_observer = observer;
+            let _producer_input = input;
+            // The producer half prevents disconnect from recycling queue bytes
+            // until every pending send/scan future owned by this task is gone.
+            let _producer_queue_lease = producer_queue_lease;
+            let closed_tx = tx.clone();
+            let data_tx = tx.clone();
+            let export = cut.write_chunks(move |chunk| {
+                let data_tx = data_tx.clone();
+                async move {
+                    data_tx
+                        .send(export_transport::ExportFrame::Data(Bytes::from(chunk)))
+                        .await
+                        .map_err(|_| {
+                            OmniError::Io(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "served export response closed",
+                            ))
+                        })
+                }
+            });
+            tokio::pin!(export);
+            tokio::select! {
+                biased;
+                _ = closed_tx.closed() => {
+                    // Cancelling the pinned export future drops its move-only cut.
+                }
+                (cut, result) = &mut export => {
+                    let error = result.err().map(|error| std::io::Error::other(error.to_string()));
+                    let _ = tx
+                        .send(export_transport::ExportFrame::Terminal {
+                            cut: Box::new(cut),
+                            error,
+                        })
+                        .await;
+                }
             }
         }
-    });
+        .in_current_span(),
+    );
     let body = Body::from_stream(body_stream);
     Ok((
         StatusCode::OK,
@@ -1156,6 +1186,7 @@ fn reject_graph_commit_expected_head(
 pub(crate) async fn run_mutate(
     state: AppState,
     handle: Arc<GraphHandle>,
+    ingress: IngressLease,
     session: Session,
     actor: Option<&AuthenticatedActor>,
     door: Door,
@@ -1181,7 +1212,7 @@ pub(crate) async fn run_mutate(
             return match stmt {
                 BranchStmt::Write(write) => {
                     let session = session_with_prefix(&session, &file.settings)?;
-                    run_branch_statement(&state, &handle, &session, actor, write).await
+                    run_branch_statement(&state, &handle, &session, actor, ingress, write).await
                 }
                 BranchStmt::List => Err(read_at_write_door()),
             };
@@ -1212,7 +1243,7 @@ pub(crate) async fn run_mutate(
     // size as a coarse proxy; engine memory pressure can run higher.
     let est_bytes =
         query.len() as u64 + params_json.map(|p| p.to_string().len() as u64).unwrap_or(0);
-    let _admission = state
+    let admission = state
         .workload
         .try_admit(&actor_arc, est_bytes)
         .map_err(ApiError::from_workload_reject)?;
@@ -1221,26 +1252,32 @@ pub(crate) async fn run_mutate(
     let params = query_params_from_json(&query_params, params_json)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
-    let receipt = session
-        .mutate_as_with_expected_head_receipt(
-            &branch,
-            query,
-            &selected_name,
-            &params,
+    let query = query.to_owned();
+    let expected_head = expected_head.map(str::to_owned);
+    let actor_id = actor_id.map(str::to_owned);
+    owned_write(&state, admission, ingress, async move {
+        let receipt = session
+            .mutate_as_with_expected_head_receipt(
+                &branch,
+                &query,
+                &selected_name,
+                &params,
+                actor_id.as_deref(),
+                expected_head.as_deref(),
+            )
+            .await
+            .map_err(ApiError::from_omni)?;
+        Ok(ChangeOutput {
+            branch,
+            query_name: selected_name,
+            affected_nodes: receipt.result.affected_nodes,
+            affected_edges: receipt.result.affected_edges,
             actor_id,
-            expected_head,
-        )
-        .await
-        .map_err(ApiError::from_omni)?;
-    Ok(ChangeOutput {
-        branch,
-        query_name: selected_name,
-        affected_nodes: receipt.result.affected_nodes,
-        affected_edges: receipt.result.affected_edges,
-        actor_id: actor_id.map(str::to_string),
-        commit: receipt.commit.as_ref().map(api::commit_output),
-        outcome: None,
+            commit: receipt.commit.as_ref().map(api::commit_output),
+            outcome: None,
+        })
     })
+    .await
 }
 
 /// Shared backend for `/query` (canonical), `/read` (deprecated alias), and
@@ -1258,7 +1295,7 @@ pub(crate) async fn run_mutate(
 /// every door but `Read` when it contains mutations, and runs.
 ///
 /// Intentionally does **not** take [`AppState`] (unlike [`run_mutate`]):
-/// reads are not admission-gated, so there is no `state.workload` consumer.
+/// reads use the bounded server observer lane, so there is no `state.workload` consumer.
 pub(crate) async fn run_query(
     handle: Arc<GraphHandle>,
     session: Session,
@@ -1408,6 +1445,7 @@ pub(crate) async fn resolve_authorized_read_target(
 pub(crate) async fn server_change(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     headers: axum::http::HeaderMap,
     request: std::result::Result<Json<ChangeRequest>, JsonRejection>,
@@ -1424,6 +1462,7 @@ pub(crate) async fn server_change(
     let output = run_mutate(
         state,
         handle,
+        ingress,
         session,
         actor.as_ref().map(|Extension(actor)| actor),
         Door::Change,
@@ -1468,10 +1507,8 @@ pub(crate) async fn server_change(
 /// mutations may still acquire locks briefly. Returns 409 when the prepared
 /// write authority changes before effects.
 ///
-/// Conditional callers use `POST /mutate/if-graph-commit`. Keeping that
-/// capability on a distinct path makes rolling upgrades fail closed: an older
-/// server returns 404 instead of ignoring an unknown optional header and
-/// mutating unconditionally.
+/// Conditional callers use `POST /mutate/if-graph-commit`, which requires and
+/// validates `Omnigraph-If-Graph-Commit`. This endpoint rejects that header.
 ///
 /// Pairs with `POST /query` (read-only). The legacy `POST /change` route
 /// has identical semantics and is kept as a deprecated alias.
@@ -1486,6 +1523,7 @@ pub(crate) async fn server_change(
 pub(crate) async fn server_mutate(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     headers: axum::http::HeaderMap,
     request: std::result::Result<Json<ChangeRequest>, JsonRejection>,
@@ -1498,6 +1536,7 @@ pub(crate) async fn server_mutate(
         run_mutate(
             state,
             handle,
+            ingress,
             session,
             actor.as_ref().map(|Extension(actor)| actor),
             Door::Mutate,
@@ -1536,12 +1575,13 @@ pub(crate) async fn server_mutate(
 )]
 /// Apply a mutation only while the branch still has the required graph head.
 ///
-/// The dedicated path is the rolling-safe capability signal. Clients must not
-/// send this header to `/mutate`: an older server could ignore an unknown
-/// optional header after executing the write.
+/// This explicit conditional route requires `Omnigraph-If-Graph-Commit` and
+/// validates its precondition before mutation effects. `/mutate` rejects the
+/// precondition header; conditional callers must use this route.
 pub(crate) async fn server_mutate_if_graph_commit(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     headers: axum::http::HeaderMap,
     request: std::result::Result<Json<ChangeRequest>, JsonRejection>,
@@ -1554,6 +1594,7 @@ pub(crate) async fn server_mutate_if_graph_commit(
         run_mutate(
             state,
             handle,
+            ingress,
             session,
             actor.as_ref().map(|Extension(actor)| actor),
             Door::Mutate,
@@ -1624,13 +1665,14 @@ pub(crate) fn parse_optional_invoke_body(
 pub(crate) async fn server_invoke_query(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     Path(QueryNamePath { name }): Path<QueryNamePath>,
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> std::result::Result<Json<InvokeStoredQueryResponse>, ApiError> {
     reject_graph_commit_expected_head(&headers, &format!("/queries/{name}/if-graph-commit"))?;
-    invoke_stored_query(state, handle, actor, name, body, None).await
+    invoke_stored_query(state, handle, ingress, actor, name, body, None).await
 }
 
 #[utoipa::path(
@@ -1666,18 +1708,29 @@ pub(crate) async fn server_invoke_query(
 pub(crate) async fn server_invoke_query_if_graph_commit(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     Path(QueryNamePath { name }): Path<QueryNamePath>,
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> std::result::Result<Json<InvokeStoredQueryResponse>, ApiError> {
     let expected_head = require_graph_commit_expected_head(&headers)?;
-    invoke_stored_query(state, handle, actor, name, body, Some(expected_head)).await
+    invoke_stored_query(
+        state,
+        handle,
+        ingress,
+        actor,
+        name,
+        body,
+        Some(expected_head),
+    )
+    .await
 }
 
 async fn invoke_stored_query(
     state: AppState,
     handle: Arc<GraphHandle>,
+    ingress: IngressLease,
     actor: Option<Extension<AuthenticatedActor>>,
     name: String,
     body: Bytes,
@@ -1760,6 +1813,7 @@ async fn invoke_stored_query(
         let output = run_mutate(
             state,
             handle,
+            ingress,
             session,
             actor_ref,
             Door::Mutate,
@@ -1908,6 +1962,7 @@ pub(crate) async fn server_schema_get(
 pub(crate) async fn server_schema_apply(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<SchemaApplyRequest>,
 ) -> std::result::Result<Json<SchemaApplyOutput>, ApiError> {
@@ -1939,42 +1994,46 @@ pub(crate) async fn server_schema_apply(
         ));
     }
     let est_bytes = request.schema_source.len() as u64;
-    let _admission = state
+    let admission = state
         .workload
         .try_admit(&actor_arc, est_bytes)
         .map_err(ApiError::from_workload_reject)?;
-    let result = {
-        let db = &handle.engine;
-        let registry = handle.queries.as_deref();
-        let label = handle.key.graph_id.as_str().to_string();
-        // Engine-layer policy enforcement (MR-722): pass the resolved
-        // actor through so apply_schema_as can call enforce() with the
-        // authoritative identity. With a policy installed in AppState,
-        // engine-side enforcement re-checks the same decision the
-        // HTTP-layer authorize_request just made above. PR #3 collapses
-        // the redundancy.
-        db.apply_schema_as_with_catalog_check(
-            &request.schema_source,
-            omnigraph::db::SchemaApplyOptions {
-                allow_data_loss: request.allow_data_loss,
-            },
-            actor_id,
-            |catalog| {
-                if let Some(registry) = registry {
-                    validate_registry_against_catalog(registry, catalog, &label)?;
-                }
-                Ok(())
-            },
-        )
-        .await
-        .map_err(ApiError::from_omni)?
-    };
-    // Physical indexes are derived state. Schema apply records intent only;
-    // explicit `ensure_indices` / `optimize` maintenance owns convergence on
-    // every surface, including a long-lived server. Keeping the handler free
-    // of detached physical writes also makes a successful response describe
-    // the complete effect envelope of this request.
-    Ok(Json(schema_apply_output(handle.uri.as_str(), result)))
+    let actor_id = actor_id.map(str::to_owned);
+    owned_write(&state, admission, ingress, async move {
+        let result = {
+            let db = &handle.engine;
+            let registry = handle.queries.as_deref();
+            let label = handle.key.graph_id.as_str().to_string();
+            // Engine-layer policy enforcement (MR-722): pass the resolved
+            // actor through so apply_schema_as can call enforce() with the
+            // authoritative identity. With a policy installed in AppState,
+            // engine-side enforcement re-checks the same decision the
+            // HTTP-layer authorize_request just made above. PR #3 collapses
+            // the redundancy.
+            db.apply_schema_as_with_catalog_check(
+                &request.schema_source,
+                omnigraph::db::SchemaApplyOptions {
+                    allow_data_loss: request.allow_data_loss,
+                },
+                actor_id.as_deref(),
+                |catalog| {
+                    if let Some(registry) = registry {
+                        validate_registry_against_catalog(registry, catalog, &label)?;
+                    }
+                    Ok(())
+                },
+            )
+            .await
+            .map_err(ApiError::from_omni)?
+        };
+        // Physical indexes are derived state. Schema apply records intent only;
+        // explicit `ensure_indices` / `optimize` maintenance owns convergence on
+        // every surface, including a long-lived server. Keeping the handler free
+        // of detached physical writes also makes a successful response describe
+        // the complete effect envelope of this request.
+        Ok(Json(schema_apply_output(handle.uri.as_str(), result)))
+    })
+    .await
 }
 
 /// Authorize one load target without touching request data.
@@ -2030,6 +2089,7 @@ async fn authorize_load_scope(
 async fn run_ingest(
     state: AppState,
     handle: Arc<GraphHandle>,
+    ingress: IngressLease,
     actor: Option<&AuthenticatedActor>,
     request: IngestRequest,
 ) -> std::result::Result<IngestOutput, ApiError> {
@@ -2043,23 +2103,32 @@ async fn run_ingest(
 
     authorize_load_scope(&handle, actor, &branch, from.as_deref()).await?;
     let est_bytes = request.data.len() as u64;
-    let _admission = state
+    let admission = state
         .workload
         .try_admit(&actor_arc, est_bytes)
         .map_err(ApiError::from_workload_reject)?;
+    let session = state.session(&handle, None)?;
+    let actor_id = actor_id.map(str::to_owned);
+    owned_write(&state, admission, ingress, async move {
+        let receipt = session
+            .load_as_with_receipt(
+                &branch,
+                from.as_deref(),
+                &request.data,
+                mode,
+                actor_id.as_deref(),
+            )
+            .await
+            .map_err(ApiError::from_omni)?;
 
-    let receipt = state
-        .session(&handle, None)?
-        .load_as_with_receipt(&branch, from.as_deref(), &request.data, mode, actor_id)
-        .await
-        .map_err(ApiError::from_omni)?;
-
-    Ok(ingest_receipt_output(
-        handle.uri.as_str(),
-        &receipt,
-        mode,
-        actor_id.map(str::to_string),
-    ))
+        Ok(ingest_receipt_output(
+            handle.uri.as_str(),
+            &receipt,
+            mode,
+            actor_id,
+        ))
+    })
+    .await
 }
 
 #[utoipa::path(
@@ -2096,6 +2165,7 @@ async fn run_ingest(
 pub(crate) async fn server_load(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<IngestRequest>,
 ) -> std::result::Result<Json<IngestOutput>, ApiError> {
@@ -2103,6 +2173,7 @@ pub(crate) async fn server_load(
         run_ingest(
             state,
             handle,
+            ingress,
             actor.as_ref().map(|Extension(actor)| actor),
             request,
         )
@@ -2175,6 +2246,11 @@ pub(crate) async fn server_load_ndjson(
     Query(query): Query<GraphBatchLoadQuery>,
     request: Request,
 ) -> std::result::Result<Json<GraphBatchLoadOutput>, ApiError> {
+    let ingress = request
+        .extensions()
+        .get::<IngressLease>()
+        .cloned()
+        .ok_or_else(|| ApiError::internal("missing ingress reservation"))?;
     let actor = actor.as_ref().map(|Extension(actor)| actor);
     let branch = query.branch.unwrap_or_else(|| "main".to_string());
     let from = query.from;
@@ -2214,28 +2290,47 @@ pub(crate) async fn server_load_ndjson(
         ));
     }
 
-    let data = collect_graph_batch_body(request.into_body()).await?;
+    let deadline = request
+        .extensions()
+        .get::<ingress::BodyDeadline>()
+        .copied()
+        .ok_or_else(|| ApiError::internal("missing request body deadline"))?;
+    let data = tokio::time::timeout_at(deadline.0, collect_graph_batch_body(request.into_body()))
+        .await
+        .map_err(|_| ingress::body_timeout())??;
+    ingress
+        .shrink(data.len() as u64)
+        .map_err(ApiError::from_workload_reject)?;
     let data = std::str::from_utf8(&data)
-        .map_err(|_| ApiError::bad_request("graph-batch request body must be valid UTF-8"))?;
+        .map_err(|_| ApiError::bad_request("graph-batch request body must be valid UTF-8"))?
+        .to_owned();
     let actor_arc = actor
         .map(|actor| Arc::clone(&actor.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
     let actor_id = actor.map(|actor| actor.actor_id.as_ref());
-    let _admission = state
+    let admission = state
         .workload
         .try_admit(&actor_arc, data.len() as u64)
         .map_err(ApiError::from_workload_reject)?;
 
-    let receipt = state
-        .session(&handle, None)?
-        .load_graph_batch_as_with_receipt(&branch, from.as_deref(), data, mode, actor_id)
-        .await
-        .map_err(ApiError::from_omni)?;
-    Ok(Json(graph_batch_load_receipt_output(
-        &receipt,
-        mode,
-        actor_id.map(str::to_string),
-    )))
+    let session = state.session(&handle, None)?;
+    let actor_id = actor_id.map(str::to_owned);
+    owned_write(&state, admission, ingress, async move {
+        let receipt = session
+            .load_graph_batch_as_with_receipt(
+                &branch,
+                from.as_deref(),
+                &data,
+                mode,
+                actor_id.as_deref(),
+            )
+            .await
+            .map_err(ApiError::from_omni)?;
+        Ok(Json(graph_batch_load_receipt_output(
+            &receipt, mode, actor_id,
+        )))
+    })
+    .await
 }
 
 #[utoipa::path(
@@ -2268,12 +2363,14 @@ pub(crate) async fn server_load_ndjson(
 pub(crate) async fn server_ingest(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<IngestRequest>,
 ) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<IngestOutput>), ApiError> {
     let output = run_ingest(
         state,
         handle,
+        ingress,
         actor.as_ref().map(|Extension(actor)| actor),
         request,
     )
@@ -2367,6 +2464,7 @@ async fn branch_list_body(
 pub(crate) async fn server_branch_create(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<BranchCreateRequest>,
 ) -> std::result::Result<Json<BranchCreateOutput>, ApiError> {
@@ -2375,6 +2473,7 @@ pub(crate) async fn server_branch_create(
         &state,
         &handle,
         actor.as_ref().map(|Extension(actor)| actor),
+        ingress,
         &from,
         &request.name,
     )
@@ -2393,6 +2492,7 @@ async fn branch_create_body(
     state: &AppState,
     handle: &GraphHandle,
     actor: Option<&AuthenticatedActor>,
+    ingress: IngressLease,
     from: &str,
     name: &str,
 ) -> std::result::Result<(), ApiError> {
@@ -2411,19 +2511,21 @@ async fn branch_create_body(
     // Branch metadata only — small constant bytes estimate. The Lance
     // shallow-clone work is bounded by the parent's manifest size, not
     // the request body.
-    let _admission = state
+    let admission = state
         .workload
         .try_admit(&actor_arc, 256)
         .map_err(ApiError::from_workload_reject)?;
-    handle
-        .engine
-        .branch_create_from_as(
-            ReadTarget::branch(from),
-            name,
-            actor.map(|actor| actor.actor_id.as_ref()),
-        )
-        .await
-        .map_err(ApiError::from_omni)
+    let engine = Arc::clone(&handle.engine);
+    let from = from.to_owned();
+    let name = name.to_owned();
+    let actor_id = actor.map(|actor| actor.actor_id.to_string());
+    owned_write(state, admission, ingress, async move {
+        engine
+            .branch_create_from_as(ReadTarget::branch(&from), &name, actor_id.as_deref())
+            .await
+            .map_err(ApiError::from_omni)
+    })
+    .await
 }
 
 /// Path-param shape for [`server_branch_delete`]. Named-field
@@ -2467,11 +2569,12 @@ pub(crate) struct BranchPath {
 pub(crate) async fn server_branch_delete(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     Path(BranchPath { branch }): Path<BranchPath>,
 ) -> std::result::Result<Json<BranchDeleteOutput>, ApiError> {
     let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
-    branch_delete_body(&state, &handle, actor_ref, &branch).await?;
+    branch_delete_body(&state, &handle, actor_ref, ingress, &branch).await?;
     Ok(Json(BranchDeleteOutput {
         uri: handle.uri.clone(),
         name: branch,
@@ -2485,6 +2588,7 @@ async fn branch_delete_body(
     state: &AppState,
     handle: &GraphHandle,
     actor: Option<&AuthenticatedActor>,
+    ingress: IngressLease,
     name: &str,
 ) -> std::result::Result<(), ApiError> {
     let actor_arc = actor
@@ -2500,15 +2604,20 @@ async fn branch_delete_body(
         },
     )?;
     // Metadata-only manifest tombstone — small constant estimate.
-    let _admission = state
+    let admission = state
         .workload
         .try_admit(&actor_arc, 256)
         .map_err(ApiError::from_workload_reject)?;
-    handle
-        .engine
-        .branch_delete_as(name, actor.map(|actor| actor.actor_id.as_ref()))
-        .await
-        .map_err(ApiError::from_omni)
+    let engine = Arc::clone(&handle.engine);
+    let name = name.to_owned();
+    let actor_id = actor.map(|actor| actor.actor_id.to_string());
+    owned_write(state, admission, ingress, async move {
+        engine
+            .branch_delete_as(&name, actor_id.as_deref())
+            .await
+            .map_err(ApiError::from_omni)
+    })
+    .await
 }
 
 #[utoipa::path(
@@ -2535,18 +2644,21 @@ async fn branch_delete_body(
 /// Merges `source` into `target` (defaults to `main`). Outcome is one of
 /// `already_up_to_date`, `fast_forward`, or `merged`. Returns 409 with the
 /// list of conflicts if the merge cannot be completed; the target is left
-/// unchanged in that case. **Destructive** to `target` on success.
+/// unchanged in that case. **Destructive** to `target` on success. `commit`
+/// carries this merge's own target publication, including for a fast-forward;
+/// an already-up-to-date merge returns `commit: null`.
 ///
 /// With `delete_branch: true` the source branch is deleted after a successful
 /// merge, under its own `branch_delete` policy check. The merge is durable by
 /// then, so a deletion refusal or failure never fails the request; it is
-/// reported via `branch_deleted: false` + `branch_delete_error`.
+/// reported via `branch_deleted: false` + `branch_delete_error_details`.
 ///
 /// The GQ statement `branch merge` on `POST /mutate` runs the same body
 /// (without the deletion composition) and answers the same 409 on conflict.
 pub(crate) async fn server_branch_merge(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     request: std::result::Result<Json<BranchMergeRequest>, JsonRejection>,
 ) -> std::result::Result<Json<BranchMergeOutput>, ApiError> {
@@ -2555,31 +2667,52 @@ pub(crate) async fn server_branch_merge(
     let target = request.target.unwrap_or_else(|| "main".to_string());
     let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
     let session = state.session(&handle, request.settings.as_ref())?;
-    let outcome = branch_merge_body(
-        &state,
-        &handle,
-        &session,
-        actor_ref,
-        &request.source,
-        &target,
-    )
-    .await?;
-    let (branch_deleted, branch_delete_error) = if request.delete_branch {
-        match delete_merged_source_branch(&handle, actor_ref, &request.source).await {
-            Ok(()) => (Some(true), None),
-            Err(message) => (Some(false), Some(message)),
-        }
-    } else {
-        (None, None)
-    };
-    Ok(Json(BranchMergeOutput {
-        source: request.source,
-        target,
-        outcome: outcome.into(),
-        actor_id: actor_ref.map(|actor| actor.actor_id.as_ref().to_string()),
-        branch_deleted,
-        branch_delete_error,
-    }))
+    let admission = admit_branch_merge(&state, &handle, actor_ref, &request.source, &target)?;
+    let actor = actor.map(|Extension(actor)| actor);
+    state
+        .operations
+        .submit((admission, ingress), async move {
+            let result = match session
+                .branch_merge_as(
+                    &request.source,
+                    &target,
+                    actor.as_ref().map(|actor| actor.actor_id.as_ref()),
+                )
+                .await
+                .map_err(ApiError::from_omni)
+            {
+                Ok(result) => result,
+                Err(error) => return OwnedResult::from(Err(error)),
+            };
+            let mut uncertain = false;
+            let (branch_deleted, branch_delete_error_details) = if request.delete_branch {
+                match delete_merged_source_branch(&handle, actor.as_ref(), &request.source).await {
+                    Ok(()) => (Some(true), None),
+                    Err(error) => {
+                        uncertain = error.completion_uncertain();
+                        (Some(false), Some(error.into_output()))
+                    }
+                }
+            } else {
+                (None, None)
+            };
+            OwnedResult {
+                uncertain,
+                result: Ok(Json(BranchMergeOutput {
+                    source: request.source,
+                    target,
+                    outcome: result.outcome.into(),
+                    commit: result.commit.as_ref().map(api::commit_output),
+                    actor_id: actor
+                        .as_ref()
+                        .map(|actor| actor.actor_id.as_ref().to_string()),
+                    branch_deleted,
+                    branch_delete_error_details,
+                })),
+            }
+        })?
+        .result()
+        .await
 }
 
 /// Body shared by `POST /branches/merge` and the `branch merge` statement:
@@ -2590,9 +2723,31 @@ async fn branch_merge_body(
     handle: &GraphHandle,
     session: &Session,
     actor: Option<&AuthenticatedActor>,
+    ingress: IngressLease,
     source: &str,
     target: &str,
-) -> std::result::Result<MergeOutcome, ApiError> {
+) -> std::result::Result<MergeResult, ApiError> {
+    let admission = admit_branch_merge(state, handle, actor, source, target)?;
+    let session = session.clone();
+    let source = source.to_owned();
+    let target = target.to_owned();
+    let actor_id = actor.map(|actor| actor.actor_id.to_string());
+    owned_write(state, admission, ingress, async move {
+        session
+            .branch_merge_as(&source, &target, actor_id.as_deref())
+            .await
+            .map_err(ApiError::from_omni)
+    })
+    .await
+}
+
+fn admit_branch_merge(
+    state: &AppState,
+    handle: &GraphHandle,
+    actor: Option<&AuthenticatedActor>,
+    source: &str,
+    target: &str,
+) -> std::result::Result<AdmissionGuard, ApiError> {
     let actor_arc = actor
         .map(|actor| Arc::clone(&actor.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
@@ -2608,27 +2763,23 @@ async fn branch_merge_body(
     // Merge body is small JSON; the heavy work is in the engine but is
     // bounded per-(table, branch) by the writer queue. Small constant
     // estimate suffices for the actor in-flight count.
-    let _admission = state
+    state
         .workload
         .try_admit(&actor_arc, 256)
-        .map_err(ApiError::from_workload_reject)?;
-    session
-        .branch_merge_as(source, target, actor.map(|actor| actor.actor_id.as_ref()))
-        .await
-        .map_err(ApiError::from_omni)
+        .map_err(ApiError::from_workload_reject)
 }
 
 /// Delete the source branch of a just-landed merge, mirroring
 /// `server_branch_delete`'s authorization (same action and target scope) but
 /// converting every failure — policy denial, dependent-branch refusal,
-/// operational error — into a message instead of an error status: the merge is
-/// already durable, so the request must not report failure for it.
+/// operational error — into structured details instead of an error status.
+/// The merge is already durable, so the request must not report failure for it.
 async fn delete_merged_source_branch(
     handle: &GraphHandle,
     actor: Option<&AuthenticatedActor>,
     source: &str,
-) -> std::result::Result<(), String> {
-    match authorize(
+) -> std::result::Result<(), ApiError> {
+    authorize_request(
         actor,
         handle.policy.as_deref(),
         PolicyRequest {
@@ -2636,17 +2787,20 @@ async fn delete_merged_source_branch(
             branch: None,
             target_branch: Some(source.to_string()),
         },
-    ) {
-        Ok(Authz::Allowed) => {}
-        Ok(Authz::Denied(message)) => return Err(message),
-        Err(err) => return Err(err.message.into()),
-    }
+    )
+    .map_err(|mut error| {
+        // This optional action has not called the engine yet. Preserve the
+        // completed merge receipt without treating a policy evaluation error
+        // as uncertainty about branch deletion.
+        error.completion_uncertain = false;
+        error
+    })?;
     let actor_id = actor.map(|actor| actor.actor_id.as_ref());
     handle
         .engine
         .branch_delete_as(source, actor_id)
         .await
-        .map_err(|err| err.to_string())
+        .map_err(ApiError::from_omni)
 }
 
 #[utoipa::path(
@@ -3380,6 +3534,8 @@ pub(crate) async fn server_changes_feed(
 pub(crate) async fn server_changes_baseline(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(observer): Extension<operations::ReadObserver>,
+    Extension(input): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<api::ChangeBaselineRequest>,
 ) -> std::result::Result<Response, ApiError> {
@@ -3418,58 +3574,63 @@ pub(crate) async fn server_changes_baseline(
 
     let producer_queue_lease = Arc::clone(&queue_lease);
     let (tx, body_stream) = export_transport::channel(queue_lease);
-    tokio::spawn(async move {
-        let _producer_queue_lease = producer_queue_lease;
-        let closed_tx = tx.clone();
-        let data_tx = tx.clone();
-        let export = cut.write_chunks(move |chunk| {
-            let data_tx = data_tx.clone();
-            async move {
-                data_tx
-                    .send(export_transport::ExportFrame::Data(Bytes::from(chunk)))
-                    .await
-                    .map_err(|_| {
-                        OmniError::Io(std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "served baseline response closed",
-                        ))
-                    })
-            }
-        });
-        tokio::pin!(export);
-        tokio::select! {
-            biased;
-            _ = closed_tx.closed() => {
-                // Cancelling the pinned export future drops its move-only cut.
-            }
-            (cut, result) = &mut export => {
-                // The structural guarantee: the terminal handshake record is
-                // sent ONLY after every snapshot record succeeded. A failed or
-                // interrupted stream carries no usable cursor.
-                let error = match result {
-                    Ok(()) => {
-                        match tx
-                            .send(export_transport::ExportFrame::Data(terminal_record))
-                            .await
-                        {
-                            Ok(()) => None,
-                            Err(_) => Some(std::io::Error::new(
+    tokio::spawn(
+        async move {
+            let _producer_observer = observer;
+            let _producer_input = input;
+            let _producer_queue_lease = producer_queue_lease;
+            let closed_tx = tx.clone();
+            let data_tx = tx.clone();
+            let export = cut.write_chunks(move |chunk| {
+                let data_tx = data_tx.clone();
+                async move {
+                    data_tx
+                        .send(export_transport::ExportFrame::Data(Bytes::from(chunk)))
+                        .await
+                        .map_err(|_| {
+                            OmniError::Io(std::io::Error::new(
                                 std::io::ErrorKind::BrokenPipe,
                                 "served baseline response closed",
-                            )),
+                            ))
+                        })
+                }
+            });
+            tokio::pin!(export);
+            tokio::select! {
+                biased;
+                _ = closed_tx.closed() => {
+                    // Cancelling the pinned export future drops its move-only cut.
+                }
+                (cut, result) = &mut export => {
+                    // The structural guarantee: the terminal handshake record is
+                    // sent ONLY after every snapshot record succeeded. A failed or
+                    // interrupted stream carries no usable cursor.
+                    let error = match result {
+                        Ok(()) => {
+                            match tx
+                                .send(export_transport::ExportFrame::Data(terminal_record))
+                                .await
+                            {
+                                Ok(()) => None,
+                                Err(_) => Some(std::io::Error::new(
+                                    std::io::ErrorKind::BrokenPipe,
+                                    "served baseline response closed",
+                                )),
+                            }
                         }
-                    }
-                    Err(error) => Some(std::io::Error::other(error.to_string())),
-                };
-                let _ = tx
-                    .send(export_transport::ExportFrame::Terminal {
-                        cut: Box::new(cut),
-                        error,
-                    })
-                    .await;
+                        Err(error) => Some(std::io::Error::other(error.to_string())),
+                    };
+                    let _ = tx
+                        .send(export_transport::ExportFrame::Terminal {
+                            cut: Box::new(cut),
+                            error,
+                        })
+                        .await;
+                }
             }
         }
-    });
+        .in_current_span(),
+    );
     let body = Body::from_stream(body_stream);
     Ok((
         StatusCode::OK,

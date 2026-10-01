@@ -207,7 +207,11 @@ pub(super) async fn upgrade_system_columns(
     }
 
     let _export_exclusion = db.reserve_export_destructive_control()?;
-    super::schema_apply::acquire_schema_apply_lock(db).await?;
+    // This path may already have completed a prior contract installation.
+    // Do not let acquisition's local read proof certify the entire upgrade.
+    super::schema_apply::acquire_schema_apply_lock(db)
+        .await
+        .map_err(OmniError::without_pre_effect_evidence)?;
     let result = execute_with_lock(db, actor, &accepted_ir, &accepted_schema_state).await;
     let release_result = super::schema_apply::release_schema_apply_lock(db).await;
     if release_result.is_err() {

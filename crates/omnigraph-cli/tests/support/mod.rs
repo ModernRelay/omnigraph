@@ -19,6 +19,18 @@ use tempfile::{NamedTempFile, TempDir, tempdir};
 /// exercising the operator layer override the var explicitly.
 pub const HERMETIC_OPERATOR_HOME: &str = "/nonexistent/omnigraph-test-home";
 
+/// Direct HTTP assertions exercise the current graph contract. CLI journeys
+/// still use the production client and its independent discovery gate.
+pub fn graph_http_client() -> Client {
+    Client::builder()
+        .default_headers(reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::HeaderName::from_static(omnigraph_api_types::HTTP_API_CONTRACT_HEADER),
+            reqwest::header::HeaderValue::from_static(omnigraph_api_types::HTTP_API_CONTRACT),
+        )]))
+        .build()
+        .unwrap()
+}
+
 pub fn cli() -> Command {
     let mut command = Command::cargo_bin("omnigraph").unwrap();
     command.env("OMNIGRAPH_HOME", HERMETIC_OPERATOR_HOME);

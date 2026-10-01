@@ -5,7 +5,7 @@ pub(crate) mod validate;
 use std::collections::HashMap;
 
 use crate::query::ast::{AggFunc, BinaryOp, CompOp, Literal, NOW_PARAM_NAME, Param, Precedence};
-use crate::types::Direction;
+use crate::traversal::EdgeSelection;
 
 #[derive(Debug, Clone)]
 pub struct QueryIR {
@@ -15,6 +15,51 @@ pub struct QueryIR {
     pub return_exprs: Vec<IRProjection>,
     pub order_by: Vec<IROrdering>,
     pub limit: Option<u64>,
+}
+
+impl QueryIR {
+    pub fn has_edge_selections(&self) -> bool {
+        self.any_edge_selection(|edges| edges.named().is_none())
+    }
+
+    pub fn has_wildcard_traversal(&self) -> bool {
+        self.any_edge_selection(EdgeSelection::is_wildcard)
+    }
+
+    fn any_edge_selection(&self, predicate: impl Fn(&EdgeSelection) -> bool) -> bool {
+        let mut pending: Vec<_> = self.pipeline.iter().collect();
+        while let Some(op) = pending.pop() {
+            match op {
+                IROp::Expand {
+                    edges,
+                    src_var: _,
+                    dst_var: _,
+                    src_type: _,
+                    dst_type: _,
+                    min_hops: _,
+                    max_hops: _,
+                    dst_filters: _,
+                    edge_binding: _,
+                } => {
+                    if predicate(edges) {
+                        return true;
+                    }
+                }
+                IROp::AntiJoin {
+                    inner,
+                    outer_var: _,
+                    predicate: _,
+                } => pending.extend(inner),
+                IROp::NodeScan {
+                    variable: _,
+                    type_name: _,
+                    filters: _,
+                }
+                | IROp::Filter(_) => {}
+            }
+        }
+        false
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -64,8 +109,8 @@ pub enum IROp {
     Expand {
         src_var: String,
         dst_var: String,
-        edge_type: String,
-        direction: Direction,
+        edges: EdgeSelection,
+        src_type: String,
         dst_type: String,
         min_hops: u32,
         max_hops: Option<u32>,

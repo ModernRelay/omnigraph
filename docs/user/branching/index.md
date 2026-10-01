@@ -118,7 +118,10 @@ omnigraph query sources_for_claim --query queries.gq \
   --snapshot <graph-commit-id> --store graph.omni
 ```
 
-A query stays on one snapshot for its entire lifetime. Historical reads can
+A query stays on one snapshot for its entire lifetime. Wildcard traversal is
+refused on an explicit historical target because historical schema membership
+is not reconstructed. Explicit edge alternatives retain named-edge historical
+read rules. Historical reads can
 eventually fail after destructive cleanup removes the versions that commit
 needs. Branch deletion can likewise end access to branch-only history.
 

@@ -831,13 +831,16 @@ fn parse_traversal(pair: pest::iterators::Pair<Rule>) -> Result<Traversal> {
         None
     };
     let edge_pair = next;
-    let (edge_name, undirected) = match edge_pair.as_rule() {
-        // `<edge>` — the inner edge_ident carries the name.
+    let (selector, undirected) = match edge_pair.as_rule() {
         Rule::undirected_edge => (
-            parse_edge_name(edge_pair.into_inner().next().unwrap())?,
+            parse_edge_selector(edge_pair.into_inner().next().ok_or_else(|| {
+                CompilerError::Parse(
+                    "undirected traversal is missing its edge selection".to_string(),
+                )
+            })?)?,
             true,
         ),
-        _ => (parse_edge_name(edge_pair)?, false),
+        _ => (parse_edge_selector(edge_pair)?, false),
     };
     let mut min_hops = 1u32;
     let mut max_hops = Some(1u32);
@@ -859,13 +862,30 @@ fn parse_traversal(pair: pest::iterators::Pair<Rule>) -> Result<Traversal> {
 
     Ok(Traversal {
         src,
-        edge_name,
+        selector,
         dst,
         min_hops,
         max_hops,
         undirected,
         edge_binding,
     })
+}
+
+fn parse_edge_selector(pair: pest::iterators::Pair<Rule>) -> Result<EdgeSelector> {
+    match pair.as_rule() {
+        Rule::edge_wildcard => Ok(EdgeSelector::Wildcard),
+        Rule::edge_alternation => {
+            parse_edge_selector(pair.into_inner().next().ok_or_else(|| {
+                CompilerError::Parse("edge alternation is missing its members".to_string())
+            })?)
+        }
+        Rule::edge_alternatives => pair
+            .into_inner()
+            .map(parse_edge_name)
+            .collect::<Result<Vec<_>>>()
+            .map(EdgeSelector::Alternation),
+        _ => parse_edge_name(pair).map(EdgeSelector::Named),
+    }
 }
 
 /// The edge a traversal names, bare or as a string; the string holds what the

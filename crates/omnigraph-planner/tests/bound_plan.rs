@@ -95,6 +95,95 @@ fn round_trip(bound: &BoundPlan) -> BoundPlan {
 }
 
 #[test]
+fn saved_plan_version_refuses_both_legacy_and_future_readers() {
+    let bound = BoundPlan {
+        plan: plan(prop("d", "slug")),
+        values: Default::default(),
+    };
+    let encoded = serde_json::to_value(&bound).unwrap();
+    assert_eq!(encoded["bound_plan_version"], 1);
+    assert!(encoded.get("plan").is_none());
+    assert!(encoded["body"]["plan"].is_object());
+    assert_eq!(round_trip(&bound), bound);
+
+    let legacy = encoded["body"].clone();
+    let error = serde_json::from_value::<BoundPlan>(legacy).unwrap_err();
+    assert!(error.to_string().contains("regenerate"), "{error}");
+    let mut future = encoded.clone();
+    future["bound_plan_version"] = serde_json::json!(2);
+    let error = serde_json::from_value::<BoundPlan>(future).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported bound plan version 2"),
+        "{error}"
+    );
+
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct OldReader {
+        plan: serde_json::Value,
+        values: serde_json::Value,
+    }
+    assert!(serde_json::from_value::<OldReader>(encoded).is_err());
+}
+
+#[test]
+fn fused_saved_node_refuses_a_reader_without_declared_row_keys() {
+    let arm = IRExpr::Bm25 {
+        field: Box::new(prop("d", "text")),
+        query: Box::new(IRExpr::Literal(Literal::String("needle".into()))),
+    };
+    let bound = BoundPlan {
+        plan: plan(IRExpr::Rrf {
+            primary: Box::new(arm.clone()),
+            secondary: Box::new(arm),
+            k: None,
+        }),
+        values: Default::default(),
+    };
+    let encoded = serde_json::to_value(&bound).unwrap();
+    let node = encoded["body"]["plan"]["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["node"] == "RankFuseWithTiebreak")
+        .unwrap()
+        .clone();
+    assert_eq!(node["row_tiebreak"], serde_json::json!([]));
+    let mut missing = encoded.clone();
+    let slot = missing["body"]["plan"]["slots"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|node| node["node"] == "RankFuseWithTiebreak")
+        .unwrap();
+    slot.as_object_mut().unwrap().remove("row_tiebreak");
+    let error = serde_json::from_value::<BoundPlan>(missing).unwrap_err();
+    assert!(error.to_string().contains("row_tiebreak"), "{error}");
+
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "node")]
+    #[allow(dead_code)]
+    enum OldReader {
+        RankFuse {
+            arms: serde_json::Value,
+            k: Option<serde_json::Value>,
+            limit: Option<usize>,
+            prefilter: serde_json::Value,
+        },
+    }
+    let error = serde_json::from_value::<OldReader>(node).err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("unknown variant `RankFuseWithTiebreak`"),
+        "{error}"
+    );
+    assert_eq!(round_trip(&bound), bound);
+}
+
+#[test]
 fn a_nearest_plan_with_its_vector_reads_back_equal() {
     let plan = plan(IRExpr::Nearest {
         variable: "d".to_string(),
@@ -266,7 +355,7 @@ fn a_contains_join_plan_reads_back_with_its_scan_marker() {
         "the scan's runtime filter is part of equality"
     );
     let mut keyless = serde_json::to_value(&bound).expect("the bound plan serializes");
-    let join_slot = keyless["plan"]["slots"]
+    let join_slot = keyless["body"]["plan"]["slots"]
         .as_array_mut()
         .expect("the plan's slots")
         .iter_mut()
@@ -288,7 +377,7 @@ fn a_contains_join_plan_reads_back_with_its_scan_marker() {
 /// The `CrossJoin` node of the serialized `bound`, as JSON.
 fn cross_join_json(bound: &BoundPlan, tag: &str) -> serde_json::Value {
     let value = serde_json::to_value(bound).expect("the bound plan serializes");
-    value["plan"]["slots"]
+    value["body"]["plan"]["slots"]
         .as_array()
         .expect("the plan's slots")
         .iter()

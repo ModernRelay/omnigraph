@@ -15,7 +15,10 @@ use crate::route::RouteOverride;
 /// node's `predicate` key became `conjuncts`, one entry per conjunct. Version
 /// 3: the physical `ContainsJoin` node kind was added, and a physical
 /// `CrossJoin` may carry `filters`, the conjuncts it tests on its pairs.
-pub const EXPLAIN_VERSION: u32 = 3;
+/// Version 4: `Expand` carries typed `edges`, `src_type` and per-member
+/// `versions` instead of one `edge_type`, `direction` and `version`; Sort
+/// and RankFuse declare exact metadata tie-break keys, including edge type.
+pub const EXPLAIN_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EntrySummary {

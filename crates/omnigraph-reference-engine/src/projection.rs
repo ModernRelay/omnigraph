@@ -40,8 +40,8 @@ fn collect_node_bindings(pipeline: &[IROp], out: &mut HashMap<String, String>) {
             IROp::Expand {
                 src_var: _,
                 dst_var,
-                edge_type: _,
-                direction: _,
+                edges: _,
+                src_type: _,
                 dst_type,
                 min_hops: _,
                 max_hops: _,

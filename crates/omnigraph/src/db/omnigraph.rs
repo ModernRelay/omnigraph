@@ -20,7 +20,7 @@ use omnigraph_compiler::{
 
 use crate::db::commit_graph::CommitGraphSnapshot;
 use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot, ResolvedCommitRange};
-use crate::error::{OmniError, Result, dataset_subject};
+use crate::error::{CompletionEvidence, OmniError, Result, dataset_subject};
 use crate::runtime_cache::RuntimeCache;
 use crate::seams::{decide_seam, fail};
 use crate::storage::{
@@ -80,6 +80,15 @@ pub enum MergeOutcome {
     AlreadyUpToDate,
     FastForward,
     Merged,
+}
+
+/// A merge's disposition and the graph commit published by that invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeResult {
+    pub outcome: MergeOutcome,
+    /// `None` only when the merge was already up to date. This receipt is
+    /// captured at publication, so later writers cannot replace its identity.
+    pub commit: Option<GraphCommit>,
 }
 
 #[derive(Debug, Clone)]
@@ -2128,24 +2137,27 @@ impl Omnigraph {
     /// The same entry also retries a sentinel release this handle failed
     /// (`note_failed_sentinel_release`), before the sentinel gate every write
     /// takes, so a transient release fault never wedges the handle.
-    pub(crate) async fn settle_pending_schema_install(&self) -> Result<()> {
-        if self
+    /// Returns whether completion attempted durable work. A caller must not
+    /// certify a later failure as pre-effect after such an attempt. Successful
+    /// completion alone does not make a later validation refusal uncertain.
+    pub(crate) async fn settle_pending_schema_install(&self) -> Result<bool> {
+        let released_sentinel = self
             .pending_sentinel_release
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-            && let Err(error) = schema_apply::release_schema_apply_lock(self).await
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if released_sentinel && let Err(error) = schema_apply::release_schema_apply_lock(self).await
         {
             // Restore the flag so the retry is not lost, and fail loud: the
             // sentinel this handle owns still stands, so the write would be
             // refused at the gate anyway — with a less actionable message.
             self.pending_sentinel_release
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            return Err(error);
+            return Err(error.with_completion_evidence(CompletionEvidence::Uncertain));
         }
         if !self
             .pending_schema_install
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            return Ok(());
+            return Ok(released_sentinel);
         }
         let result = {
             let _serial = self.write_queue.acquire_schema_exclusive().await;
@@ -2161,15 +2173,19 @@ impl Omnigraph {
         match result {
             Ok(recovery) => {
                 if matches!(recovery, SchemaStateRecovery::Promoted) {
-                    self.reload_schema_if_source_changed().await?;
+                    self.reload_schema_if_source_changed()
+                        .await
+                        .map_err(|error| {
+                            error.with_completion_evidence(CompletionEvidence::Uncertain)
+                        })?;
                     self.invalidate_read_caches().await;
                 }
-                Ok(())
+                Ok(true)
             }
             Err(error) => {
                 self.pending_schema_install
                     .store(true, std::sync::atomic::Ordering::SeqCst);
-                Err(error)
+                Err(error.with_completion_evidence(CompletionEvidence::Uncertain))
             }
         }
     }
@@ -3014,7 +3030,10 @@ impl Omnigraph {
             )));
         }
 
-        let expected_identifier = target.branch_identifier().await?;
+        let expected_identifier = target
+            .branch_identifier()
+            .await
+            .map_err(OmniError::before_effect)?;
 
         // Authority removal is the logical branch deletion. Lance tree cleanup
         // follows that ref removal. The disposable target capture supplies the
@@ -3070,29 +3089,55 @@ impl Omnigraph {
         let target = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
         let _export_exclusion = self.reserve_export_destructive_control()?;
-        self.ensure_schema_state_valid().await?;
+        self.ensure_schema_state_valid()
+            .await
+            .map_err(OmniError::before_effect)?;
         let source = self.active_branch().await;
-        self.settle_pending_schema_install().await?;
-        fail(&BRANCH_CONTROL_PRE_GATES)?;
+        let completed_prior_work = self.settle_pending_schema_install().await?;
+        let preparation_error = |error: OmniError| {
+            if completed_prior_work {
+                error.without_pre_effect_evidence()
+            } else {
+                error.before_effect()
+            }
+        };
+        fail(&BRANCH_CONTROL_PRE_GATES).map_err(preparation_error)?;
         let _schema_permit = self.write_queue().acquire_schema_exclusive().await;
         let _branch_guards = self
             .write_queue()
             .acquire_branches(&[source.clone(), Some(target.clone())])
             .await;
-        self.ensure_schema_apply_not_locked("branch_create").await?;
-        let control_catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
+        self.ensure_schema_apply_not_locked("branch_create")
+            .await
+            .map_err(preparation_error)?;
+        let control_catalog = self
+            .build_accepted_catalog_with_schema_gate_held()
+            .await
+            .map_err(preparation_error)?;
         let table_queue_keys = self.table_queue_keys_for_branches(
             &[source.clone(), Some(target.clone())],
             &control_catalog,
         );
         let _table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
-        self.ensure_schema_apply_not_locked("branch_create").await?;
-        self.ensure_schema_state_valid().await?;
+        self.ensure_schema_apply_not_locked("branch_create")
+            .await
+            .map_err(preparation_error)?;
+        self.ensure_schema_state_valid()
+            .await
+            .map_err(preparation_error)?;
         let mut source_coord = self
             .capture_branch_control_source(source.as_deref())
-            .await?;
-        validate_bound_catalog_against_snapshot(&control_catalog, &source_coord.snapshot())?;
-        source_coord.branch_create(&target).await?;
+            .await
+            .map_err(preparation_error)?;
+        validate_bound_catalog_against_snapshot(&control_catalog, &source_coord.snapshot())
+            .map_err(preparation_error)?;
+        source_coord.branch_create(&target).await.map_err(|error| {
+            if completed_prior_work {
+                error.without_pre_effect_evidence()
+            } else {
+                error
+            }
+        })?;
         self.invalidate_read_caches().await;
         Ok(())
     }
@@ -3154,33 +3199,60 @@ impl Omnigraph {
         let target_branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
         let _export_exclusion = self.reserve_export_destructive_control()?;
-        self.ensure_schema_state_valid().await?;
-        self.settle_pending_schema_install().await?;
-        fail(&BRANCH_CONTROL_PRE_GATES)?;
+        self.ensure_schema_state_valid()
+            .await
+            .map_err(OmniError::before_effect)?;
+        let completed_prior_work = self.settle_pending_schema_install().await?;
+        let preparation_error = |error: OmniError| {
+            if completed_prior_work {
+                error.without_pre_effect_evidence()
+            } else {
+                error.before_effect()
+            }
+        };
+        fail(&BRANCH_CONTROL_PRE_GATES).map_err(preparation_error)?;
         let _schema_permit = self.write_queue().acquire_schema_exclusive().await;
         let _branch_guards = self
             .write_queue()
             .acquire_branches(&[branch.clone(), Some(target_branch.clone())])
             .await;
         self.ensure_schema_apply_not_locked("branch_create_from")
-            .await?;
-        let control_catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
+            .await
+            .map_err(preparation_error)?;
+        let control_catalog = self
+            .build_accepted_catalog_with_schema_gate_held()
+            .await
+            .map_err(preparation_error)?;
         let table_queue_keys = self.table_queue_keys_for_branches(
             &[branch.clone(), Some(target_branch.clone())],
             &control_catalog,
         );
         let _table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
         self.ensure_schema_apply_not_locked("branch_create_from")
-            .await?;
-        self.ensure_schema_state_valid().await?;
+            .await
+            .map_err(preparation_error)?;
+        self.ensure_schema_state_valid()
+            .await
+            .map_err(preparation_error)?;
         let mut source_coord = self
             .capture_branch_control_source(branch.as_deref())
-            .await?;
-        validate_bound_catalog_against_snapshot(&control_catalog, &source_coord.snapshot())?;
+            .await
+            .map_err(preparation_error)?;
+        validate_bound_catalog_against_snapshot(&control_catalog, &source_coord.snapshot())
+            .map_err(preparation_error)?;
         // A locally owned source coordinator cannot be swapped by a concurrent
         // `branch_create_from`; the ref write is durable whichever handle
         // issued it.
-        source_coord.branch_create(&target_branch).await?;
+        source_coord
+            .branch_create(&target_branch)
+            .await
+            .map_err(|error| {
+                if completed_prior_work {
+                    error.without_pre_effect_evidence()
+                } else {
+                    error
+                }
+            })?;
         self.invalidate_read_caches().await;
         Ok(())
     }
@@ -3214,9 +3286,18 @@ impl Omnigraph {
         let branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot delete branch 'main'".to_string()))?;
         let _export_exclusion = self.reserve_export_destructive_control()?;
-        self.ensure_schema_state_valid().await?;
-        self.settle_pending_schema_install().await?;
-        fail(&BRANCH_CONTROL_PRE_GATES)?;
+        self.ensure_schema_state_valid()
+            .await
+            .map_err(OmniError::before_effect)?;
+        let completed_prior_work = self.settle_pending_schema_install().await?;
+        let preparation_error = |error: OmniError| {
+            if completed_prior_work {
+                error.without_pre_effect_evidence()
+            } else {
+                error.before_effect()
+            }
+        };
+        fail(&BRANCH_CONTROL_PRE_GATES).map_err(preparation_error)?;
         let _schema_permit = self.write_queue().acquire_schema_shared().await;
         let _branch_guard = self.write_queue().acquire_branch(Some(&branch)).await;
         // Purge only after taking the branch gate. Merge capture takes the
@@ -3230,20 +3311,38 @@ impl Omnigraph {
             *cache = None;
         }
         drop(cache);
-        self.ensure_schema_apply_not_locked("branch_delete").await?;
-        let control_catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
+        self.ensure_schema_apply_not_locked("branch_delete")
+            .await
+            .map_err(preparation_error)?;
+        let control_catalog = self
+            .build_accepted_catalog_with_schema_gate_held()
+            .await
+            .map_err(preparation_error)?;
         let table_queue_keys =
             self.table_queue_keys_for_branches(&[Some(branch.clone())], &control_catalog);
         let _table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
-        fail(&BRANCH_DELETE_POST_TABLE_GATES)?;
-        self.ensure_schema_apply_not_locked("branch_delete").await?;
-        self.ensure_schema_state_valid().await?;
+        fail(&BRANCH_DELETE_POST_TABLE_GATES).map_err(preparation_error)?;
+        self.ensure_schema_apply_not_locked("branch_delete")
+            .await
+            .map_err(preparation_error)?;
+        self.ensure_schema_state_valid()
+            .await
+            .map_err(preparation_error)?;
         let mut target_control = self
             .open_coordinator_for_branch(Some(branch.as_str()))
-            .await?;
-        validate_bound_catalog_against_snapshot(&control_catalog, &target_control.snapshot())?;
+            .await
+            .map_err(preparation_error)?;
+        validate_bound_catalog_against_snapshot(&control_catalog, &target_control.snapshot())
+            .map_err(preparation_error)?;
         self.delete_captured_branch_storage(&branch, &mut target_control)
             .await
+            .map_err(|error| {
+                if completed_prior_work {
+                    error.without_pre_effect_evidence()
+                } else {
+                    error
+                }
+            })
     }
 
     pub async fn get_commit(&self, commit_id: &str) -> Result<GraphCommit> {
