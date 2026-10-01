@@ -6,6 +6,16 @@ pub type Result<T> = std::result::Result<T, OmniError>;
 
 const STORAGE_MESSAGE_PREFIX: &str = "storage: ";
 
+/// Evidence supplied by the operation that owns its effect boundary, independent
+/// of the error's cause. This does not authorize replay or prove native I/O drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionEvidence {
+    /// The owning operation has not attempted any durable effect.
+    BeforeEffect,
+    /// The owning operation cannot establish settled completion.
+    Uncertain,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestErrorKind {
     BadRequest,
@@ -147,6 +157,14 @@ fn format_merge_conflicts(conflicts: &[MergeConflict]) -> String {
 
 #[derive(Debug, Error)]
 pub enum OmniError {
+    /// Operation-local completion evidence. Composing callers must discard
+    /// `BeforeEffect` once earlier work may have had effects; uncertainty wins.
+    #[error("{source}")]
+    Completion {
+        evidence: CompletionEvidence,
+        #[source]
+        source: Box<OmniError>,
+    },
     #[error("{0}")]
     Compiler(#[from] omnigraph_compiler::error::CompilerError),
     #[error("{0}")]
@@ -338,6 +356,10 @@ pub enum OmniError {
 /// part of the stream adapter's typed recovery contract.
 #[derive(Debug, Clone)]
 enum DataFusionStreamFailure {
+    Completion {
+        evidence: CompletionEvidence,
+        source: Box<DataFusionStreamFailure>,
+    },
     Storage(StorageFailure),
     Manifest(ManifestError),
     ResourceLimitExceeded {
@@ -361,6 +383,9 @@ enum DataFusionStreamFailure {
 impl DataFusionStreamFailure {
     fn into_omni_error(self) -> OmniError {
         match self {
+            Self::Completion { evidence, source } => {
+                source.into_omni_error().with_completion_evidence(evidence)
+            }
             Self::Storage(failure) => OmniError::Storage(failure),
             Self::Manifest(error) => OmniError::Manifest(error),
             Self::ResourceLimitExceeded {
@@ -388,6 +413,13 @@ impl TryFrom<OmniError> for DataFusionStreamFailure {
 
     fn try_from(error: OmniError) -> std::result::Result<Self, Self::Error> {
         match error {
+            OmniError::Completion { evidence, source } => match Self::try_from(*source) {
+                Ok(source) => Ok(Self::Completion {
+                    evidence,
+                    source: Box::new(source),
+                }),
+                Err(source) => Err(source.with_completion_evidence(evidence)),
+            },
             OmniError::Storage(failure) => Ok(Self::Storage(failure)),
             OmniError::Manifest(error) => Ok(Self::Manifest(error)),
             OmniError::ResourceLimitExceeded {
@@ -438,6 +470,87 @@ impl From<omnigraph_storage::StorageError> for OmniError {
 }
 
 impl OmniError {
+    /// Attach evidence only where the whole owning operation's effect boundary
+    /// is known. An inner refusal alone cannot certify a compound operation.
+    pub fn with_completion_evidence(self, evidence: CompletionEvidence) -> Self {
+        let (source, existing) = self.into_completion_evidence();
+        let evidence = if existing == Some(CompletionEvidence::Uncertain) {
+            CompletionEvidence::Uncertain
+        } else {
+            evidence
+        };
+        Self::Completion {
+            evidence,
+            source: Box::new(source),
+        }
+    }
+
+    pub fn before_effect(self) -> Self {
+        self.with_completion_evidence(CompletionEvidence::BeforeEffect)
+    }
+
+    /// Remove only a sub-operation's no-effect proof when composing it after
+    /// earlier work. Never erase explicit uncertainty or recovery evidence.
+    pub fn without_pre_effect_evidence(self) -> Self {
+        let (source, evidence) = self.into_completion_evidence();
+        match evidence {
+            Some(CompletionEvidence::Uncertain) => {
+                source.with_completion_evidence(CompletionEvidence::Uncertain)
+            }
+            _ => source,
+        }
+    }
+
+    pub fn completion_evidence(&self) -> Option<CompletionEvidence> {
+        let mut current = self;
+        let mut evidence = None;
+        while let Self::Completion {
+            evidence: next,
+            source,
+        } = current
+        {
+            if *next == CompletionEvidence::Uncertain {
+                evidence = Some(CompletionEvidence::Uncertain);
+            } else if evidence.is_none() {
+                evidence = Some(*next);
+            }
+            current = source;
+        }
+        if matches!(
+            current,
+            Self::RecoveryRequired { .. }
+                | Self::InitializationCommitted { .. }
+                | Self::InitializationIndeterminate { .. }
+                | Self::Manifest(ManifestError {
+                    publication_in_doubt: true,
+                    ..
+                })
+        ) {
+            Some(CompletionEvidence::Uncertain)
+        } else {
+            evidence
+        }
+    }
+
+    /// Keep the original typed cause available for transport mapping. Explicit
+    /// recovery/publication uncertainty dominates every nested wrapper.
+    pub fn into_completion_evidence(self) -> (Self, Option<CompletionEvidence>) {
+        let evidence = self.completion_evidence();
+        let mut source = self;
+        while let Self::Completion { source: next, .. } = source {
+            source = *next;
+        }
+        (source, evidence)
+    }
+
+    fn without_evidence(&self) -> &Self {
+        let mut source = self;
+        while let Self::Completion { source: next, .. } = source {
+            source = next;
+        }
+        source
+    }
+
     /// Convert a Lance failure at a graph-storage boundary. This is named
     /// instead of a blanket `From` implementation so every call site must
     /// choose storage, domain, or engine-internal semantics.
@@ -461,7 +574,7 @@ impl OmniError {
     }
 
     pub fn storage_failure(&self) -> Option<&StorageFailure> {
-        match self {
+        match self.without_evidence() {
             Self::Storage(failure) => Some(failure),
             _ => None,
         }
@@ -520,8 +633,10 @@ impl OmniError {
         ) {
             return !is_scratch_exhaustion(error);
         }
-        matches!(recover_datafusion_stream_failure(error),
-            Some(Self::ResourceLimitExceeded { resource, .. }) if resource == "query_memory_bytes")
+        recover_datafusion_stream_failure(error).is_some_and(|error| {
+            matches!(error.without_evidence(),
+                Self::ResourceLimitExceeded { resource, .. } if resource == "query_memory_bytes")
+        })
     }
 
     /// Preserve typed storage evidence carried through DataFusion execution;
@@ -561,6 +676,9 @@ impl OmniError {
     /// Add operation context without discarding an existing typed category.
     pub fn with_context(self, context: impl std::fmt::Display) -> Self {
         match self {
+            Self::Completion { evidence, source } => source
+                .with_context(context)
+                .with_completion_evidence(evidence),
             Self::Storage(mut failure) => {
                 let message = failure
                     .message
@@ -614,12 +732,21 @@ impl OmniError {
 
     pub fn is_read_set_changed(&self) -> bool {
         matches!(
-            self,
+            self.without_evidence(),
             Self::Manifest(ManifestError {
                 details: Some(ManifestConflictDetails::ReadSetChanged { .. }),
                 ..
             })
         )
+    }
+
+    /// The structured query compile diagnostic behind this error, when it is
+    /// one (RFC 0047's diagnostics contract).
+    pub fn diagnostic(&self) -> Option<&omnigraph_compiler::QueryDiagnostic> {
+        match self.without_evidence() {
+            Self::Compiler(err) => err.diagnostic(),
+            _ => None,
+        }
     }
 
     pub fn manifest(message: impl Into<String>) -> Self {
@@ -649,7 +776,7 @@ impl OmniError {
     /// This signal is independent of the diagnostic text and conflict details.
     pub fn is_manifest_publish_in_doubt(&self) -> bool {
         matches!(
-            self,
+            self.without_evidence(),
             Self::Manifest(ManifestError {
                 publication_in_doubt: true,
                 ..
@@ -992,8 +1119,80 @@ mod tests {
         assert_eq!(classify_lance_error(&error), expected, "{error}");
     }
 
+    #[test]
+    fn completion_evidence_preserves_causes_and_cannot_downgrade_uncertainty() {
+        let cause = OmniError::Storage(StorageFailure::new(
+            StorageFailureKind::Transient,
+            "storage: unavailable contract read",
+        ));
+        assert_eq!(cause.completion_evidence(), None);
+        let proved = cause.before_effect().with_context("prepare");
+        assert_eq!(
+            proved.to_string(),
+            "storage: prepare: unavailable contract read"
+        );
+        assert_eq!(
+            proved.storage_failure().unwrap().kind,
+            StorageFailureKind::Transient
+        );
+        let (cause, evidence) = proved.into_completion_evidence();
+        assert_eq!(evidence, Some(CompletionEvidence::BeforeEffect));
+        assert!(matches!(cause, OmniError::Storage(_)));
+        assert_eq!(
+            cause
+                .before_effect()
+                .without_pre_effect_evidence()
+                .completion_evidence(),
+            None
+        );
+
+        let explicit = [
+            OmniError::manifest_publish_in_doubt("publish acknowledgement lost"),
+            OmniError::recovery_required("commit", "contract pending"),
+            OmniError::InitializationCommitted {
+                uri: "memory://graph".to_string(),
+                source: Box::new(OmniError::manifest("late read failed")),
+            },
+            OmniError::InitializationIndeterminate {
+                uri: "memory://graph".to_string(),
+                source: Box::new(OmniError::manifest("create failed")),
+                probe: Box::new(OmniError::manifest("probe failed")),
+            },
+            OmniError::manifest("returned after effects")
+                .with_completion_evidence(CompletionEvidence::Uncertain),
+        ];
+        for source in explicit {
+            // Construct nested wrappers directly too: consumers must not rely
+            // only on the convenience constructor having normalized evidence.
+            let nested = OmniError::Completion {
+                evidence: CompletionEvidence::BeforeEffect,
+                source: Box::new(OmniError::Completion {
+                    evidence: CompletionEvidence::BeforeEffect,
+                    source: Box::new(source),
+                }),
+            };
+            assert_eq!(
+                nested.completion_evidence(),
+                Some(CompletionEvidence::Uncertain)
+            );
+            let (_, evidence) = nested
+                .without_pre_effect_evidence()
+                .into_completion_evidence();
+            assert_eq!(evidence, Some(CompletionEvidence::Uncertain));
+        }
+        let changed = OmniError::manifest_read_set_changed("head", None, None).before_effect();
+        assert!(changed.is_read_set_changed());
+    }
+
     fn supported_stream_failures() -> Vec<OmniError> {
         vec![
+            OmniError::Storage(StorageFailure::new(
+                StorageFailureKind::Transient,
+                "storage: proved pre-effect read failure",
+            ))
+            .before_effect(),
+            OmniError::manifest("result lost after publication")
+                .with_completion_evidence(CompletionEvidence::Uncertain),
             OmniError::Storage(StorageFailure::new(
                 StorageFailureKind::NotFound,
                 "storage: exact carried failure",
@@ -1024,6 +1223,9 @@ mod tests {
     }
 
     fn assert_same_stream_failure(actual: OmniError, expected: OmniError) {
+        let (actual, actual_evidence) = actual.into_completion_evidence();
+        let (expected, expected_evidence) = expected.into_completion_evidence();
+        assert_eq!(actual_evidence, expected_evidence);
         match (actual, expected) {
             (OmniError::Storage(actual), OmniError::Storage(expected)) => {
                 assert_eq!(actual, expected);
@@ -1993,6 +2195,12 @@ mod tests {
             ),
             (
                 OmniError::resource_limit("query_memory_bytes", 1, 2).into_datafusion_external(),
+                true,
+            ),
+            (
+                OmniError::resource_limit("query_memory_bytes", 1, 2)
+                    .before_effect()
+                    .into_datafusion_external(),
                 true,
             ),
             (

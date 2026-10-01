@@ -1,0 +1,113 @@
+# issue: 659
+# red_on: 7f1233bb
+# notes: Each selected member resolves its own direction; bound metadata preserves stored orientation.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person { name: String @key }
+node Doc { name: String @key }
+edge Owns: Person -> Doc { label: String weight: I64 }
+edge OwnedBy: Doc -> Person { label: String weight: I32 }
+edge In: Person -> Person { label: String }
+
+--- seed
+{"type":"Person","data":{"name":"p"}}
+{"type":"Person","data":{"name":"q"}}
+{"type":"Doc","data":{"name":"d"}}
+{"edge":"Owns","id":"forward","from":"p","to":"d","data":{"label":"owns","weight":1}}
+{"edge":"OwnedBy","id":"reverse","from":"d","to":"p","data":{"label":"reverse","weight":2}}
+{"edge":"In","id":"reserved","from":"p","to":"q","data":{"label":"inside"}}
+
+--- query
+query concrete_orientations() {
+    match { $p: Person { name: "p" } $p $e:(owns | ownedBy) $d }
+    return { $d.name as destination, $e.@type as edge_type, $e.@id as edge_id, $e.@src as source, $e.@dst as target, $e.label as label }
+}
+
+--- expect unordered
+{"destination":"d","edge_type":"Owns","edge_id":"forward","source":"p","target":"d","label":"owns"}
+{"destination":"d","edge_type":"OwnedBy","edge_id":"reverse","source":"d","target":"p","label":"reverse"}
+
+--- expect shape
+destination: String
+edge_type: String
+edge_id: String
+source: String
+target: String
+label: String
+
+--- expect plan
+expand $p $d: selection alternation [OwnedBy in, Owns out]
+
+--- query
+query cross_type_wildcard() {
+    match { $p: Person { name: "p" } $d: Doc $p $e:* $d }
+    return { $d.name as destination, $e.@type as edge_type }
+}
+
+--- expect unordered
+{"destination":"d","edge_type":"Owns"}
+{"destination":"d","edge_type":"OwnedBy"}
+
+--- expect shape
+destination: String
+edge_type: String
+
+--- query
+query distinct_cross_type_destination() {
+    match { $p: Person { name: "p" } $p (owns | ownedBy) $d }
+    return { $d.name as destination }
+}
+
+--- expect unordered
+{"destination":"d"}
+
+--- expect shape
+destination: String
+
+--- query
+query incompatible_common_property() {
+    match { $p: Person $p $e:(owns | ownedBy) $d }
+    return { $e.weight }
+}
+
+--- expect error: must exist with compatible types on every selected edge
+
+--- query
+query asymmetric_recursion() {
+    match { $p: Person $p (owns | ownedBy){1,2} $d }
+    return { $d.name }
+}
+
+--- expect error: recursive edge selection requires the same node type at both endpoints
+
+--- query
+query quoted_repeated_member() {
+    match { $p: Person { name: "p" } $p $e:("in" | "in") $q }
+    return { $q.name as destination, $e.@type as edge_type, $e.@id as edge_id }
+}
+
+--- expect unordered
+{"destination":"q","edge_type":"In","edge_id":"reserved"}
+
+--- expect shape
+destination: String
+edge_type: String
+edge_id: String
+
+--- query
+query correlated_common_string_argument() {
+    match { $p: Person count($e.label contains "own") { $p $e:(owns | ownedBy) $d } = 2 }
+    return { $p.name as name }
+}
+
+--- expect unordered
+{"name":"p"}
+
+--- expect shape
+name: String

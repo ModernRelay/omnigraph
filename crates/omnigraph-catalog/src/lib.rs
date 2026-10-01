@@ -1849,7 +1849,9 @@ impl ManifestCoordinator {
     pub async fn create_branch(&mut self, name: &str) -> Result<()> {
         crate::branch_names::ensure_logical_branch_name(name)?;
         let mut ds = self.dataset.clone();
-        crate::branch_control::ensure_manifest_branch_create_namespace(&ds, name).await?;
+        crate::branch_control::ensure_manifest_branch_create_namespace(&ds, name)
+            .await
+            .map_err(OmniError::before_effect)?;
         let native =
             crate::branch_names::native_branch_name(name, &crate::branch_names::mint_incarnation());
         match crate::branch_control::create_branch_recoverably(&mut ds, &native, self.version())
@@ -1888,7 +1890,11 @@ impl ManifestCoordinator {
             .identifier
             .clone();
         crate::branch_control::retire_branch_recoverably(&ds, &native, &expected_identifier)
-            .await?;
+            .await
+            // Legacy control is also used to finish a schema apply. Its
+            // caller may already have effects, so an inner refusal cannot
+            // certify the whole operation as effect-free.
+            .map_err(OmniError::without_pre_effect_evidence)?;
         Ok(())
     }
 
@@ -1906,8 +1912,13 @@ impl ManifestCoordinator {
         name: &str,
         expected_identifier: &lance::dataset::refs::BranchIdentifier,
     ) -> Result<()> {
-        let ds = self.open_branch_control_dataset().await?;
-        let native = resolve_native_manifest_branch(&ds, name).await?;
+        let ds = self
+            .open_branch_control_dataset()
+            .await
+            .map_err(OmniError::before_effect)?;
+        let native = resolve_native_manifest_branch(&ds, name)
+            .await
+            .map_err(OmniError::before_effect)?;
         crate::branch_control::retire_branch_recoverably(&ds, &native, expected_identifier).await
     }
 

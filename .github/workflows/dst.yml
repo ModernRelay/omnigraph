@@ -112,7 +112,7 @@ jobs:
           run_deployment=false
           for path in "${changed[@]}"; do
             case "$path" in
-              docs/*.md|docs/*.mdx|docs/*.rst|docs/*.adoc) ;;
+              docs/*.md|docs/*.mdx|docs/*.rst|docs/*.adoc|changelog.d/*.md|changelog.d/release.json) ;;
               README.md|AGENTS.md|CLAUDE.md|CHANGELOG.md|CONTRIBUTING.md|CODE_OF_CONDUCT.md) ;;
               LICENSE|LICENSE.md) ;;
               crates/omnigraph-gqt/cases/*.gqt) run_gqt=true ;;

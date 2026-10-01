@@ -5,7 +5,14 @@ COMMENT = _{ LINE_COMMENT | BLOCK_COMMENT }
 LINE_COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
 BLOCK_COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
 
-query_file = { SOI ~ setting_stmt* ~ (show_stmt ~ statement_trailer? | branch_stmt ~ ";"? ~ statement_trailer? | explain_stmt ~ statement_trailer? | query_decl*) ~ EOI }
+query_file = { SOI ~ setting_stmt* ~ (show_stmt ~ statement_trailer? | branch_stmt ~ ";"? ~ statement_trailer? | explain_stmt ~ statement_trailer? | query_decl* ~ missing_param_list?) ~ EOI }
+// A declaration whose name is not followed by `(`, matched after the well
+// formed declarations so the parser refuses it at the name's end with the
+// one fix (`query name()`) instead of reporting the file's first position;
+// pest tracks attempts per rule, never per token, so the missing `(` is
+// otherwise not an attempt it can name.
+missing_param_list = { missing_query_keyword ~ ident ~ !"(" ~ ANY* }
+missing_query_keyword = @{ "query" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 // Settings statements stand at the head of a file, before its one statement
 // or its declarations; `show` is itself the one statement. Names are looked
@@ -95,15 +102,19 @@ match_value = { literal | variable | now_call }
 
 // Traversal: $p knows $f (directional) or $p <knows> $f (undirected —
 // matches the edge in either direction; same-endpoint-type edges only).
+// Edge selection also admits (knows | likes) and *, with finite hop bounds.
 // An optional edge binding names the matched edge row: $p $w:knows $f.
 // A node binding also starts `variable ~ ":"`; the case of the next token
 // (lowercase edge_ident vs uppercase type_name) keeps the choice unambiguous.
 // The edge is named bare, or as a string, the one spelling for an edge a
 // reserved word names: `$i "in" $b` follows the edge `In`, as a quoted
 // `branch_name` does for a branch.
-traversal = { variable ~ edge_binding? ~ (undirected_edge | edge_ident | string_lit) ~ traversal_bounds? ~ variable }
+traversal = { variable ~ edge_binding? ~ (undirected_edge | edge_alternation | edge_wildcard | edge_ident | string_lit) ~ traversal_bounds? ~ variable }
 edge_binding = { variable ~ ":" }
-undirected_edge = { "<" ~ (edge_ident | string_lit) ~ ">" }
+undirected_edge = { "<" ~ (edge_wildcard | edge_alternatives | edge_ident | string_lit) ~ ">" }
+edge_alternation = { "(" ~ edge_alternatives ~ ")" }
+edge_alternatives = { (edge_ident | string_lit) ~ ("|" ~ (edge_ident | string_lit))+ }
+edge_wildcard = { "*" }
 traversal_bounds = { "{" ~ integer ~ "," ~ integer? ~ "}" }
 
 // Filter: a Boolean expression, `$f.age > 25 and not $f.retired`
@@ -167,8 +178,8 @@ rank_expr = { nearest_ordering | bm25_call }
 rrf_call = { "rrf" ~ "(" ~ rank_expr ~ "," ~ rank_expr ~ ("," ~ expr)? ~ ")" }
 
 prop_access = { variable ~ "." ~ (meta_field | ident) }
-// A system field named by role (RFC 0040): `$p.@id`, `$e.@src`, `$e.@dst`, and
-// bare `@id` in a mutation predicate. User properties never enter this namespace.
+// Metadata includes `$p.@id`, `$e.@src`, `$e.@dst`, and read-only `$e.@type`.
+// Mutation predicates admit stored metadata. User properties use bare names.
 meta_field = @{ "@" ~ ident }
 
 agg_call = { agg_func ~ "(" ~ expr ~ ")" }

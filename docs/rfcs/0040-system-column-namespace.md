@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-08-23
-updated: 2026-09-29
+updated: 2026-09-30
 discussion: https://github.com/ModernRelay/omnigraph/issues/529
 supersedes: []
 superseded_by: []
@@ -346,7 +346,8 @@ pre-upgrade schemas, including user properties introduced after the upgrade,
 and the end-to-end guarantee that old queries and feed cursors cross the upgrade.
 It must resolve only datasets the read needs; unrelated reclaimed history must
 not make a pinned query fail. A manifest stamp cannot select a historical
-vintage: step 3 advances the stamp before publishing the table renames.
+vintage: both spellings may share a storage format, and each selected table
+image supplies its own system-column roles.
 
 ### Pre-RFC graphs with colliding properties
 
@@ -376,7 +377,9 @@ Per-name reservation lists must never come back.
 and [detached-only tables](2026-09-21-detached-only-tables.md) replaced the
 recovery-intent protocol below. The upgrade now stages detached renames, publishes
 once, and installs the schema contract using its publishing commit evidence;
-published table pins need no promotion and both column vintages use format v11.
+published table pins need no promotion. Column vintage is independent of storage
+format: both vintages are served at v11 and v12, and an upgrade on v11 publishes
+v12 through the ordinary manifest conversion.
 See [schema completion](../dev/recovery.md) and the supported
 [offline, standalone upgrade procedure](../user/operations/upgrade.md#system-column-upgrade-legacy-spellings).
 Cluster-managed system-column upgrades remain refused.
@@ -570,57 +573,39 @@ user fields.
 
 ## Compatibility and reversibility
 
-The proposed stamp is provisionally 9 after RFC 0042's schema v8. Recheck the
-next available stamp when this draft is activated.
+Storage format and system-column vintage have separate authorities. The
+manifest stamp determines whether a binary can serve the graph; the accepted
+schema IR's `system-columns` feature determines its column spellings. Both
+vintages are served at v11 and v12. Fresh graphs use v12, and any publication
+on a v11 branch converts that branch to v12, including a system-column
+upgrade. Changing storage format does not implicitly respell columns; adding
+`system-columns` remains an explicit operation.
 
-Two fences keep a new-vintage graph away from binaries that predate this
-RFC, and they act at different depths. The `__manifest` internal-schema
-stamp advances from 8 to 9 on every new-vintage graph, at creation or as
-the upgrade's first effect; `read_supported_internal_schema_version` reads
-it as the first object-store read of both open modes, before the recovery
-sweeps a read-write open runs, so every binary that predates this RFC,
-whether it reads v6 (0.9.x, 0.10.x), development v7, or v8
-(the 0.11.x line, RFCs 0042 and 0062),
-refuses the graph before it can write anything,
-with the existing ceiling refusal ("`__manifest` is stamped at internal
-schema v9 but this binary expects v8", from `refuse_if_stamp_unsupported` in
-`crates/omnigraph/src/db/manifest/migrations.rs`; a v6 reader names v6),
-whose remedy
-is the newer binary, never a rebuild. The feature set in the schema IR is
-the second fence: on today's main its number is refused before recovery as
-well, by `refuse_unsupported_schema_versions` in
-`crates/omnigraph/src/db/schema_state.rs` (added with RFC 0054's
-withdrawal), while 0.10.x reads it only after recovery; its names are read
-at contract validation after recovery on every binary, and it carries the
-capability knowledge. The stamp stays the first fence because renamed
-physical columns are a storage-format change (`docs/dev/versioning.md`
-§Changing an axis) and because the publisher's per-branch `guard_stamp` is
-the one gate a process already holding the graph re-runs, where the envelope
-check does not run.
-Old-vintage graphs stay stamped 8 permanently, as they never gain
-`system-columns`: the stamp is a storage-format fence, not a migration floor,
-so `MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION` stays 8 while
-`INTERNAL_MANIFEST_SCHEMA_VERSION` becomes 9, and this RFC's binary is the
-first to serve two stamps. That retires the single-version contract stated
-in `crates/omnigraph/src/db/manifest/migrations.rs` (its module doc, the
-sub-floor refusal text, `release_for_internal_schema_version`, and the
-guard's range test) and in `docs/user/operations/upgrade.md` ("one storage
-format per binary", including its export-binary table), in
-`docs/dev/versioning.md` (the storage row of its policy table, §Current
-storage contract, and §Changing an axis), and in the doc comment on
-`read_supported_internal_schema_version` in
-`crates/omnigraph/src/db/manifest.rs` (main's stamp, read before recovery): 8 is the
-one stamp
-this binary can upgrade in place, through the explicit operation rather than
-an open-time dispatcher. Rollout step 2 owns those rewrites.
+Normal open refuses unsupported storage stamps before recovery or writes.
+Older graphs use the qualified, offline storage-conversion route before the
+system-column operation; the conversion preserves their spellings and retained
+history. The schema IR envelope and feature validation independently refuse
+unknown schema capabilities. See [versioning](../dev/versioning.md) for the
+current format boundaries and [upgrade](../user/operations/upgrade.md) for
+qualified source generations and older-binary refusal. Cluster-managed
+system-column upgrades are not supported.
 
-On the second fence, old binaries refuse graphs beyond their knowledge with
-the existing hard "unsupported ir_version" error:
+Historically, v8 meant legacy spellings and v9 meant new spellings. The
+proposed 8→9 first-effect fence in The upgrade protected older binaries before
+any table rename, because those binaries could run recovery before validating
+schema capabilities. Detached publication replaced that procedure; v10 and
+later decouple column vintage from the storage stamp. The early-refusal
+requirement survives, but neither a permanent v8 legacy population nor an
+8→9 stamp transition is part of the current system-column operation.
+
+The schema IR compatibility generations are independent of those storage
+stamps. Once storage admission succeeds, binaries refuse schema envelopes or
+features beyond their knowledge:
 
 | Binary generation | Accepts | Mechanism |
 |---|---|---|
 | predating RFC 0044's implementation (0.10.x and earlier) | 2 | exact-equality check on the scalar |
-| implementing RFC 0044 (today's main, [#593](https://github.com/ModernRelay/omnigraph/pull/593)) | {2, 4} | membership check on the scalar; 3 refused (RFC 0054) |
+| implementing RFC 0044 before this RFC ([#593](https://github.com/ModernRelay/omnigraph/pull/593)) | {2, 4} | membership check on the scalar; 3 refused (RFC 0054) |
 | this RFC's | {2, 4, 5} | membership check, plus refusal within 5 of any feature name it does not know; 3 stays refused |
 
 No binary can half-read unknown
@@ -635,7 +620,7 @@ first accept under this RFC's release, which re-stamps it 5 (or 2 when
 nothing requires a name) and moves it beyond the {2, 4} generation that
 minted it; the move is fail-closed on those binaries. The spelling
 populations are exactly two, permanently: neither is a deprecation
-window, because this RFC's promise is that old graphs never migrate, and
+window, because this RFC's promise is that old graphs never respell implicitly, and
 Future system columns (in Design) adds no third. The scalar ends at 5,
 so the numbering race between this RFC, RFC 0044, and their successors
 is closed: the numbers 2 and 4 keep their merged meanings, 3 stays
@@ -646,9 +631,11 @@ the default for new graphs is a one-line policy change. The meta-field
 namespace is additive. The prefix reservation is the least reversible piece
 socially (releasing a namespace is easy, reclaiming it is not) and the one
 with the strongest external precedent. The upgrade itself is not reversible
-in place: its recovery is roll-forward-only (Design), and a new-vintage
-graph never returns to the old spellings, since a rebuilt graph is
-new-vintage and this release's export does not load into an older binary.
+in place after publication: the next read-write open or write on the same
+handle finishes installing the published schema contract. Before publication,
+an interrupted attempt leaves the accepted legacy graph unchanged and may be
+retried. There is no reverse respelling operation; a rebuilt graph is
+new-vintage and the new export envelope does not load into an older binary.
 Rollback is restoring the whole pre-upgrade graph root with the pre-upgrade
 fleet, as for every storage-format change.
 
@@ -675,13 +662,16 @@ that changed no logical schema, while the identity marker is already durable in 
 
 **Rejected: the `ir_version` envelope as the only old-binary fence.** On
 0.10.x it is read after a read-write open's recovery sweeps, so that binary
-would write before refusing; today's main refuses the number before recovery
-but still after the stamp, which is the first object-store read on every
-binary, and only the stamp is re-checked by a process already holding the
-graph, at its next publish.
+could write before refusing. The namespace proposal therefore required storage
+admission before recovery, with a publisher-side stamp check for an already-open
+handle. That historical rationale does not make current column vintage a
+storage-format discriminator; current admission follows Compatibility above.
 
-**Rejected: compensating a failed upgrade.** The reason is stated in
-Recovery (The upgrade).
+**Rejected: compensating a published upgrade.** Once publication makes the new
+pins authoritative, completion installs their exact schema contract rather than
+renaming tables back. Before publication, detached renames remain unreachable
+and no visible graph effect needs compensation. The earlier intent-based
+roll-forward rationale remains in the historical protocol in The upgrade.
 
 **Cost: a novel spelling.** Cypher/ISO GQL users know `id(n)`, not `.@id`.
 The function spelling was rejected: it consumes generic function names and
@@ -727,16 +717,17 @@ its own; stopping there hardens the break's cost with every release toward
 
 The gates this RFC owns, each stated beside the behavior that defines it:
 
-- Old-vintage continuity: an old-vintage fixture graph opens and answers
-  identically before and after the release (result rows and diagnostics,
+- Old-vintage continuity: at the original namespace release, an old-vintage
+  fixture graph opens and answers identically before and after (result rows and diagnostics,
   except the new hint on a bare `id` and the `@id` member of a projected
   node object), and a graph with no schema apply keeps its
-  IR bytes and hash identical to today's (Per-graph role resolution).
-- Refusal: the {2, 4} generation (today's main) refuses an old-vintage
-  `ir_version` 5 graph, stamped 8, with the existing hard "unsupported
-  ir_version" error at `refuse_unsupported_schema_versions`, before any
-  write; the 2-only generation never reaches the IR, refusing at the stamp
-  (Early fence); a set-carrying graph
+  IR bytes and hash identical to the fixture's (Per-graph role resolution).
+  Current-format fixtures cover both column vintages; legacy storage fixtures
+  follow the explicit conversion route rather than requiring old stamps to open.
+- Refusal: historical compatibility fixtures isolate the IR fence on a storage
+  stamp the tested binary accepts: the {2, 4} generation refuses an
+  `ir_version` 5 graph before any write. Current admission independently
+  refuses unsupported storage stamps and schema envelopes; a set-carrying graph
   naming a capability the binary does not know is refused; an IR whose
   feature set mismatches its declarations is refused at accept and by
   `validate_schema_ir` on load; a 2 or 4 IR carrying a set field is
@@ -770,13 +761,12 @@ The gates this RFC owns, each stated beside the behavior that defines it:
   they returned before it, the page crossing the commit because the boundary
   gate's fingerprint no longer keys on the system roles' names (Historical
   reads).
-- Early fence: a binary of the 2-only and of the {2, 4} generation refuses
-  a new-vintage graph at `read_supported_internal_schema_version` with no
-  object-store write, in both open modes, including a graph left
-  half-upgraded (Compatibility and reversibility); on a graph carrying the
-  intent but not yet the stamp, a read-write open on those
-  binaries fails on the undecodable upgrade intent, and a read-only open
-  serves the pre-upgrade rows (The upgrade).
+- Early fence: both open modes of an older binary refuse a graph above their
+  supported storage ceiling before any object-store write. The current binary
+  refuses legacy recovery records before starting an explicit storage conversion;
+  the source-compatible binary must resolve them. A system-column upgrade writes
+  no recovery intent, so an undecodable-intent window is not a current gate
+  (Compatibility and reversibility).
 - Vintage stability: an ordinary schema apply never changes
   `system-columns` membership; only the upgrade adds it (Per-graph role
   resolution names the resolver change this requires).
@@ -789,14 +779,18 @@ The gates this RFC owns, each stated beside the behavior that defines it:
   graphs).
 - Upgrade effects: after the upgrade every table spells `__id`/`__src`/
   `__dst`, the IR carries `system-columns` at `ir_version` 5, `_schema.pg`
-  constraint references read `@src`/`@dst`, the stamp reads 9, and a
-  query valid before the upgrade returns the same rows after it (The
-  upgrade).
-- Upgrade recovery: under the DST harness, a crash at every schema-apply
-  failpoint and between any two table renames leaves a graph the next
-  read-write open rolls forward to the complete upgrade, never to a mixed
-  state, and a read-only open of the half-upgraded graph refuses (The
-  upgrade).
+  constraint references read `@src`/`@dst`, and a query valid before the upgrade
+  returns the same rows after it. Its publication follows ordinary format
+  conversion: a v11 main becomes v12, while a v12 main stays v12; `--check`
+  changes neither stamp nor spelling (The upgrade).
+- Upgrade interruption: faults before publication, including between detached
+  renames, leave the legacy graph readable with no recovery sidecar. The next
+  read-write open discards unpublished schema staging, and a fresh attempt can
+  retry. Faults after publication leave exact published pins and the staged
+  contract: a read-only open refuses until the next read-write open or write on
+  the same handle installs that contract. Neither outcome exposes mixed
+  spellings. Extend the system-column failure tests and DST schema-apply owner
+  at these boundaries (The upgrade).
 - Lance surface guard: on the pinned Lance version, a rename-only
   `alter_columns` commits a `Project` transaction, preserves every field ID
   and fragment, keeps each index attached under its creation-time name, and
@@ -818,77 +812,47 @@ The suites these gates extend exist today:
 validation), the compiler's schema-IR unit tests beside
 `validate_schema_ir`, the graph fixture suites,
 `crates/omnigraph/tests/failpoints.rs` and the DST harness (RFC 0037) for
-the recovery gates, `crates/omnigraph/tests/lance_surface_guards.rs` for
+the schema-apply failure gates, `crates/omnigraph/tests/system_column_upgrade.rs`
+for respelling, format conversion and pre-/post-publication interruption,
+`crates/omnigraph/tests/lance_surface_guards.rs` for
 the Lance gate, and `crates/omnigraph-cli/tests/crossversion_upgrade.rs`
 (cross-version refusal and continuity). Acceptance: every gate above lands as a test in
 one of these suites, or a new suite beside them, and passes in the same
-CI battery as today's. The draft implementation ([#548](https://github.com/ModernRelay/omnigraph/pull/548)) carries the
-per-test enumeration.
+CI battery. The original namespace implementation
+([#548](https://github.com/ModernRelay/omnigraph/pull/548)) records the initial
+per-test enumeration; the owners above carry later protocol changes.
 
 ## Rollout
 
-1. The companion reservation patch lands first and ships alone: `id`,
-   `src`, `dst` are refused at admission with a clear error, closing
-   [#529](https://github.com/ModernRelay/omnigraph/issues/529)'s misleading failure and fencing the coexistence guarantees this
-   RFC depends on.
-2. Resolution and admission (the draft implementation, [#548](https://github.com/ModernRelay/omnigraph/pull/548)): system
-   columns resolve by role through the accepted vintage for query planning
-   and through selected images for change feeds, net diffs, and entity reads
-   (Historical reads). New graphs admit under the prefix rule,
-   spell `__id`/`__src`/`__dst`, and stamp `__manifest` 9 (this binary
-   serves {8, 9}), the meta-field namespace lands in `.gq` and in `.pg`
-   constraint references, the wire envelope moves the identity beside
-   `type`/`edge` on export and load, and the versioning machinery ships
-   whole: the feature-set field, {2, 4, 5} acceptance (4 with the
-   edge-key machinery of [#593](https://github.com/ModernRelay/omnigraph/pull/593) present, 3 refused, per Compatibility),
-   unknown-name refusal, the
-   derivation check at accept and load, and the total stamping rule (2 or
-   5 with the set, never 4). Old graphs and queries see no behavior change
-   beyond the `@id` member of a projected node object; export consumers see
-   the envelope, and the step rewrites the
-   `data.id` shape in `docs/user/schema/index.md` §IDs,
-   `docs/dev/ingestion.md`, and the export and load test fixtures. It also
-   respells `@unique(src, dst)` and `@key(src, dst)` to the meta-field form
-   in `docs/user/schema/index.md`, `docs/user/branching/merge.md`, and the
-   keyed `.gqt` cases under `crates/omnigraph-gqt/cases/`, which init
-   new-vintage graphs. It also
-   carries the single-version-contract retirement named in Compatibility and
-   reversibility: the `migrations.rs` module doc, the sub-floor refusal text,
-   `release_for_internal_schema_version`, the guard's range test,
-   `docs/user/operations/upgrade.md` with its export-binary table,
-   `docs/dev/versioning.md`, and the doc comment on
-   `read_supported_internal_schema_version`.
-   `implementation` stays `in-progress`.
-3. The upgrade: the engine operation with its preflight, ordered effects,
-   roll-forward recovery, and `_schema.pg` respelling; its CLI and
-   cluster-config surfaces; query planning across the upgrade; the end-to-end
-   historical-read and change-feed gates; the Lance surface guard. The operating
-   procedure in cluster mode is one revision: back up the whole graph root
-   and the deployment bundle, stop every server serving the graph first,
-   apply the revision carrying the per-graph field, boot, and resume.
-   Stop-first is the step this upgrade adds to the ordinary
-   apply-then-restart procedure, because a serving process holds an
-   old-vintage catalog and the control plane does not fence servers, its
-   one-writer boundary being operator-owned
-   (`docs/dev/control-plane.md` §Concurrency); servers do not hot-reload, so
-   the restart is one the control plane already requires. Completion is the
-   stamp reading 9 in `omnigraph snapshot` (which opens read-write and
-   completes a pending roll-forward first) and the new-vintage spellings in
-   `GET /schema`'s system-column field, and the
-   boot-time registry check validates the stored queries against the
-   upgraded catalog as it does today. `implementation` advances to
-   `complete` when this lands.
+1. Reservation and namespace admission landed in sequence: the original
+   `id`/`src`/`dst` refusal fenced the collision reported in
+   [#529](https://github.com/ModernRelay/omnigraph/issues/529), then per-vintage
+   admission released those names on new-vintage graphs while preserving legacy
+   graphs' rules.
+2. Role resolution, the meta-field namespace, logical wire envelopes and schema
+   features are implemented; the original implementation discussion is
+   [#548](https://github.com/ModernRelay/omnigraph/pull/548). Query planning
+   uses the accepted vintage; historical decoding uses the selected image.
+   Schema IR accepts {2, 4, 5}, with edge-key support for 4, rejects 3 and unknown
+   features, and stamps newly accepted IR at 2 or 5. The original v8/v9 storage
+   split is historical; current format admission and conversion are independent
+   of spelling vintage (Compatibility and reversibility).
+3. The engine operation, standalone CLI, historical query planning and Lance
+   surface guard are implemented. The operation stages detached renames,
+   publishes once, then installs the contract; interruption is classified by
+   whether publication occurred (Evidence and tests). Use the
+   [standalone operator procedure](../user/operations/upgrade.md#system-column-upgrade-legacy-spellings):
+   stop all servers serving the graph, retain a verified backup, run the
+   preflight and explicit upgrade, and verify the accepted schema and data
+   before resuming service. Completion means the new column vintage is installed,
+   not that a particular historical manifest stamp is present.
 
-The engine operation, standalone CLI, historical query planning and Lance
-surface guard in step 3 are implemented. The cluster-config surface and the
-end-to-end change-feed gate across the upgrade remain follow-ups. The
-standalone operation does not complete those parts of step 3.
-
-Stopping after step 1 leaves the bug fenced; stopping after step 2 leaves
-every graph fully working with the upgrade not yet offered. No step
-strands a graph. Release timing relative to other pre-1.0 format work is
-the maintainers' scheduling call for the format batch, outside this
-document.
+The proposed cluster-config surface and the end-to-end change-feed gate across
+the upgrade remain follow-ups; cluster-managed upgrades are refused today.
+The historical cluster apply/restart procedure in The upgrade does not authorize
+that surface. The implementation remains in progress until these remaining
+parts have their own implementation and qualification. Release timing relative
+to other pre-1.0 format work remains the maintainers' scheduling decision.
 
 ## Unresolved questions
 
@@ -1000,3 +964,23 @@ None.
   schema completion; current operator instructions own the standalone-only
   support boundary. This supersedes that section's claims of current recovery
   behavior, not the accepted system-column namespace decision.
+- 2026-09-30: Completed the current-protocol amendment outside The upgrade.
+  - Historical reads and Alternatives: replaced the first-effect stamp claim
+    and unconditional failed-upgrade recovery rationale with per-image roles
+    and the publication boundary; retained the old-binary fence's history.
+  - Compatibility: replaced the provisional v9 activation, 8→9 first-effect
+    fence and "Old-vintage graphs stay stamped 8 permanently" passages with
+    independent storage-format and column-vintage admission. The upgrade's
+    "both column vintages use format v11" sentence now includes v12 and normal
+    conversion on publication; the original v8/v9 rationale remains historical.
+  - Compatibility: replaced "its recovery is roll-forward-only" with unchanged
+    accepted state before publication and contract completion after publication.
+  - Evidence: replaced the current-main {2, 4} label, undecodable-intent window,
+    "the stamp reads 9", and unconditional crash roll-forward gates with the
+    historical IR refusal fixture, current format refusal, no-sidecar upgrade,
+    v11→v12 publication and the two interruption outcomes. Named the existing
+    system-column test owner; namespace and historical-read gates remain.
+  - Rollout: replaced the active {8, 9} admission, roll-forward-only upgrade and
+    cluster apply/restart instructions with implemented detached publication and
+    the supported standalone procedure. Cluster configuration and the cross-upgrade
+    change-feed gate remain follow-ups; no implementation status changes.

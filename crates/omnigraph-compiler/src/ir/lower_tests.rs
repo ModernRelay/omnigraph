@@ -3,6 +3,7 @@ use crate::catalog::build_catalog;
 use crate::query::parser::parse_query;
 use crate::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
 use crate::schema::parser::parse_schema;
+use crate::types::Direction;
 
 fn setup() -> Catalog {
     let schema = parse_schema(
@@ -651,15 +652,11 @@ return { $f.name }
     let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
     let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
     match &ir.pipeline[1] {
-        IROp::Expand { direction, .. } => assert_eq!(*direction, Direction::Both),
+        IROp::Expand { edges, .. } => assert_eq!(edges.named().unwrap().direction, Direction::Both),
         op => panic!("expected Expand, got {op:?}"),
     }
 }
 
-// The discarded-context-clone regression: negation inners are typechecked into
-// a clone that never reaches lowering's ResolvedTraversal lookup, so direction
-// used to silently fall back to Out inside not{}. Undirectedness now travels
-// on the AST node; this pins Both surviving into the AntiJoin's inner Expand.
 #[test]
 fn test_lower_undirected_inside_negation_keeps_direction_both() {
     let catalog = setup();
@@ -681,8 +678,8 @@ return { $p.name }
         panic!("expected AntiJoin, got {:?}", ir.pipeline[1]);
     };
     match &inner[0] {
-        IROp::Expand { direction, .. } => assert_eq!(
-            *direction,
+        IROp::Expand { edges, .. } => assert_eq!(
+            edges.named().unwrap().direction,
             Direction::Both,
             "negation inner must not fall back to Out"
         ),
@@ -1325,4 +1322,151 @@ return { $p.name }
         left,
         IRExpr::PropAccess { variable, property } if variable == "c" && property == "name"
     ));
+}
+
+#[test]
+fn test_edge_selection_nested_lowering_issue_659() {
+    let catalog = setup();
+    let ir = lower(
+        &catalog,
+        "query q() { match { $c: Company not { $c: Company exists { $c (worksAt | worksAt) $p } } } return { $c.name } }",
+    );
+    assert!(ir.has_edge_selections());
+    assert!(!ir.has_wildcard_traversal());
+    let IROp::AntiJoin { inner, .. } = &ir.pipeline[1] else {
+        panic!("expected outer block");
+    };
+    let IROp::AntiJoin { inner, .. } = &inner[0] else {
+        panic!("expected nested block");
+    };
+    let IROp::Expand {
+        edges,
+        src_type,
+        dst_type,
+        ..
+    } = &inner[0]
+    else {
+        panic!("expected expand");
+    };
+    assert_eq!(edges.members().len(), 1);
+    assert!(edges.named().is_none());
+    assert_eq!(edges.members()[0].direction, Direction::In);
+    assert_eq!(src_type, "Company");
+    assert_eq!(dst_type, "Person");
+
+    let ir = lower(
+        &catalog,
+        "query q() { match { $p: Person $f: Person exists { $p: Person not { $p * $f } } } return { $p.name } }",
+    );
+    assert!(ir.has_edge_selections());
+    assert!(ir.has_wildcard_traversal());
+}
+
+#[test]
+fn test_edge_type_projection_is_virtual_issue_659() {
+    let schema = parse_schema(
+        "node Person { name: String } edge Knows: Person -> Person edge Likes: Person -> Person",
+    )
+    .unwrap();
+    let catalog = build_catalog(&schema).unwrap();
+    let ir = lower(
+        &catalog,
+        "query q() { match { $p: Person $p $e:(knows | likes) $f } return { $e.@type } }",
+    );
+    assert_eq!(
+        ir.return_exprs[0].expr,
+        IRExpr::PropAccess {
+            variable: "e".into(),
+            property: EDGE_TYPE_COLUMN.into()
+        }
+    );
+    assert_eq!(ir.return_exprs[0].alias.as_deref(), Some("e.@type"));
+}
+
+#[test]
+fn test_edge_selection_block_predicate_uses_child_scope_issue_659() {
+    let schema = parse_schema("node Person { name: String } edge Knows: Person -> Person { label: String } edge Likes: Person -> Person { label: String }").unwrap();
+    let catalog = build_catalog(&schema).unwrap();
+    for selector in ["knows", "(knows | likes)"] {
+        let ir = lower(
+            &catalog,
+            &format!(
+                r#"query q() {{ match {{ $p: Person count($e.label contains "x") {{ $p $e:{selector} $q }} > 0 }} return {{ $p.name }} }}"#
+            ),
+        );
+        let IROp::AntiJoin { predicate, .. } = &ir.pipeline[1] else {
+            panic!("expected block");
+        };
+        assert!(matches!(
+            &predicate.arg,
+            Some(IRExpr::Binary {
+                op: BinaryOp::Compare(CompOp::StringContains),
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn test_singleton_edge_type_is_constant_everywhere_issue_659() {
+    let catalog = setup();
+    for selector in ["knows", "(knows | knows)"] {
+        let ir = lower(
+            &catalog,
+            &format!(
+                "query q() {{ match {{ $p: Person $p $e:{selector} $f $e.@type = \"Knows\" }} return {{ $e.@type }} order {{ $e.@type }} }}"
+            ),
+        );
+        assert_eq!(
+            ir.return_exprs[0].expr,
+            IRExpr::Literal(Literal::String("Knows".into()))
+        );
+        assert_eq!(
+            ir.order_by[0].expr,
+            IRExpr::Literal(Literal::String("Knows".into()))
+        );
+        assert!(
+            ir.pipeline
+                .iter()
+                .any(|op| matches!(op, IROp::Filter(IRExpr::Literal(Literal::Bool(true)))))
+        );
+        let ir = lower(
+            &catalog,
+            &format!(
+                "query q() {{ match {{ $p: Person $p $e:{selector} $f }} return {{ count($e.@type) }} }}"
+            ),
+        );
+        assert!(
+            matches!(&ir.return_exprs[0].expr, IRExpr::Aggregate { arg, .. }
+            if **arg == IRExpr::Literal(Literal::String("Knows".into())))
+        );
+    }
+}
+
+#[test]
+fn future_outer_column_does_not_capture_inner_binding_issue_659() {
+    let catalog = setup();
+    let ir = lower(
+        &catalog,
+        "query q() { match { $p: Person count($x.name contains \"x\") { $p knows $x } > 0 $x: Company } return { $p.name, $x.name } }",
+    );
+    let IROp::AntiJoin {
+        inner, predicate, ..
+    } = ir.pipeline.last().unwrap()
+    else {
+        panic!("expected block");
+    };
+    let IROp::Expand { dst_var, .. } = &inner[0] else {
+        panic!("expected expand");
+    };
+    assert_ne!(dst_var, "x");
+    let Some(IRExpr::Binary {
+        left,
+        op: BinaryOp::Compare(CompOp::StringContains),
+        ..
+    }) = &predicate.arg
+    else {
+        panic!("expected a StringContains argument");
+    };
+    assert!(matches!(left.as_ref(), IRExpr::PropAccess { variable, .. } if variable == dst_var));
 }

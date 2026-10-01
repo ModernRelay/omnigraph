@@ -9,8 +9,8 @@ use crate::schema::parser::parse_schema;
 fn node_type_of(binding: &BoundVariable) -> &str {
     match binding {
         BoundVariable::Node { type_name } => type_name,
-        BoundVariable::Edge { type_name } => {
-            panic!("expected a node binding, found edge type `{type_name}`")
+        BoundVariable::Edge { type_names } => {
+            panic!("expected a node binding, found edge types {type_names:?}")
         }
     }
 }
@@ -18,7 +18,10 @@ fn node_type_of(binding: &BoundVariable) -> &str {
 /// Edge type name of a binding — the dual of `node_type_of`.
 fn edge_type_of(binding: &BoundVariable) -> &str {
     match binding {
-        BoundVariable::Edge { type_name } => type_name,
+        BoundVariable::Edge { type_names } => {
+            assert_eq!(type_names.len(), 1);
+            &type_names[0]
+        }
         BoundVariable::Node { type_name } => {
             panic!("expected an edge binding, found node type `{type_name}`")
         }
@@ -913,7 +916,10 @@ return { $f.name }
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert_eq!(ctx.traversals[0].direction, Direction::Both);
+    assert_eq!(
+        ctx.traversals[0].edges.named().unwrap().direction,
+        Direction::Both
+    );
     assert_eq!(node_type_of(&ctx.bindings["f"]), "Person");
 }
 
@@ -954,7 +960,10 @@ return { $f.name }
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert_eq!(ctx.traversals[0].direction, Direction::Out);
+    assert_eq!(
+        ctx.traversals[0].edges.named().unwrap().direction,
+        Direction::Out
+    );
     assert_eq!(node_type_of(&ctx.bindings["f"]), "Person");
 }
 
@@ -976,7 +985,10 @@ return { $p.name }
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     // $c is Company (to_type), $p is src — direction should be Out
     // because $p (Person=from_type) worksAt $c (Company=to_type) is forward
-    assert_eq!(ctx.traversals[0].direction, Direction::Out);
+    assert_eq!(
+        ctx.traversals[0].edges.named().unwrap().direction,
+        Direction::Out
+    );
 }
 
 #[test]
@@ -1643,6 +1655,7 @@ return { count($d.payload) }
         )]),
         aliases: HashMap::new(),
         traversals: Vec::new(),
+        subqueries: Vec::new(),
     };
     let error = infer_query_result_schema(&catalog, qf.single_decl(), &ctx).unwrap_err();
     assert_eq!(
@@ -2251,5 +2264,149 @@ fn test_assignments_and_binding_matches_take_constants() {
             "query q() { match { $p: Person { active: $missing or true } } return { $p.name } }"
         ),
         "type error: T3: match variable `$missing` must be a declared query parameter"
+    );
+}
+
+#[test]
+fn test_edge_selection_resolution_and_scope_issue_659() {
+    let schema = parse_schema(
+        "node Person { name: String } node Company { name: String } \
+         edge WorksAt: Person -> Company { title: String } \
+         edge Employs: Company -> Person { title: String? } \
+         edge Knows: Person -> Person",
+    )
+    .unwrap();
+    let catalog = build_catalog(&schema).unwrap();
+    let query = parse_query("query q() { match { $p: Person $c: Company $p $e:(worksAt | employs | worksAt) $c } return { $e.title, $e.@type } }").unwrap();
+    let ctx = typecheck_query(&catalog, query.single_decl()).unwrap();
+    let resolved = &ctx.traversals[0];
+    assert_eq!(
+        (&resolved.src_type, &resolved.dst_type),
+        (&"Person".to_string(), &"Company".to_string())
+    );
+    assert_eq!(
+        resolved.edges,
+        EdgeSelection::Alternation(vec![
+            EdgeMember {
+                edge_type: "Employs".into(),
+                direction: Direction::In
+            },
+            EdgeMember {
+                edge_type: "WorksAt".into(),
+                direction: Direction::Out
+            },
+        ])
+    );
+    let BoundVariable::Edge { type_names } = &ctx.bindings["e"] else {
+        panic!("expected edge binding");
+    };
+    assert_eq!(type_names, &["Employs", "WorksAt"]);
+    assert!(
+        read_property_type(&catalog, &ctx, "e", "title")
+            .unwrap()
+            .nullable
+    );
+    assert_eq!(
+        read_property_type(&catalog, &ctx, "e", "@type").unwrap(),
+        PropType::scalar(ScalarType::String, false)
+    );
+
+    let query = parse_query(
+        "query q() { match { $p: Person $c: Company exists { $p * $c } } return { $p.name } }",
+    )
+    .unwrap();
+    typecheck_query(&catalog, query.single_decl()).unwrap();
+}
+
+#[test]
+fn test_empty_wildcard_has_no_representative_edge_issue_659() {
+    let catalog = setup();
+    let query = parse_query(
+        "query q() { match { $a: Company $b: Company $a $e:* $b } return { $e.@type, $e.@id } }",
+    )
+    .unwrap();
+    let ctx = typecheck_query(&catalog, query.single_decl()).unwrap();
+    assert_eq!(ctx.traversals[0].edges, EdgeSelection::Wildcard(vec![]));
+    assert_eq!(ctx.traversals[0].src_type, "Company");
+    assert_eq!(ctx.traversals[0].dst_type, "Company");
+    assert!(
+        matches!(&ctx.bindings["e"], BoundVariable::Edge { type_names } if type_names.is_empty())
+    );
+}
+
+#[test]
+fn checked_scopes_retain_local_resolution_issue_659() {
+    let schema = parse_schema("node Person { name: String } node Company { name: String } edge WorksAt: Person -> Company edge Employs: Company -> Person").unwrap();
+    let catalog = build_catalog(&schema).unwrap();
+    let mut selections = Vec::new();
+    for selector in ["(worksAt | employs)", "(employs | worksAt)", "*"] {
+        let query = parse_query(&format!("query q() {{ match {{ $c: Company exists {{ $c {selector} $p $p: Person }} }} return {{ $c.name }} }}")).unwrap();
+        let checked = typecheck_query(&catalog, query.single_decl()).unwrap();
+        assert!(!checked.bindings.contains_key("p"));
+        assert!(checked.traversals.is_empty());
+        let child = &checked.subqueries[0];
+        assert!(!child.outer_bindings.contains_key("p"));
+        assert_eq!(child.inner.traversals[0].src_type, "Company");
+        selections.push(child.inner.traversals[0].edges.members().to_vec());
+    }
+    assert!(selections.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+#[test]
+fn typecheck_only_doors_reject_unanchored_traversals_issue_659() {
+    let catalog = setup();
+    for pattern in [
+        "$x knows $y",
+        "$x (knows | knows) $y",
+        "not { $p.name = \"a\" $x knows $y }",
+    ] {
+        let query = parse_query(&format!(
+            "query q() {{ match {{ $p: Person {pattern} }} return {{ $p.name }} }}"
+        ))
+        .unwrap();
+        let error = typecheck_query_decl(&catalog, query.single_decl()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("executable source or destination node binding"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn future_outer_declarations_are_not_inner_correlations_issue_659() {
+    let catalog = setup();
+    let query = parse_query("query q() { match { $p: Person not { $p knows $x } $x: Company } return { $p.name, $x.name } }").unwrap();
+    let checked = typecheck_query(&catalog, query.single_decl()).unwrap();
+    assert_eq!(node_type_of(&checked.bindings["x"]), "Company");
+    let block = &checked.subqueries[0];
+    assert!(!block.outer_bindings.contains_key("x"));
+    assert_eq!(node_type_of(&block.inner.bindings["x"]), "Person");
+}
+
+#[test]
+fn a_type_error_exposes_its_diagnostic_with_code_and_stage() {
+    let catalog = setup();
+    let file = parse_query("query q() { match { $x: Nowhere } return { $x.name } }").unwrap();
+    let decl = &file.into_declarations().unwrap()[0];
+    let err = typecheck_query_decl(&catalog, decl).unwrap_err();
+    let diagnostic = err
+        .diagnostic()
+        .expect("a typecheck refusal carries its diagnostic");
+    assert_eq!(diagnostic.code.as_str(), "T1");
+    assert_eq!(
+        diagnostic.stage.as_ref().map(|stage| stage.name),
+        Some("typecheck")
+    );
+    assert!(diagnostic.position.is_none());
+    assert_eq!(
+        err.to_string(),
+        format!("type error: T1: {}", diagnostic.message)
+    );
+    assert!(
+        crate::query::codes::ALL
+            .iter()
+            .any(|code| code.as_str() == "T1")
     );
 }

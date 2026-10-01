@@ -2023,7 +2023,7 @@ async fn cleanup_age_window_preserves_a_recent_snapshot_across_a_pointer_switch(
     let saved_pin = helpers::pinned_version(&db, "feature", "node:Company").await;
     let company_uri = node_table_uri(&db, "Company").await;
     assert_eq!(
-        db.branch_merge("feature", "main").await.unwrap(),
+        db.branch_merge("feature", "main").await.unwrap().outcome,
         MergeOutcome::FastForward
     );
     db.load_as(
@@ -2036,7 +2036,7 @@ async fn cleanup_age_window_preserves_a_recent_snapshot_across_a_pointer_switch(
     .await
     .unwrap();
     assert_eq!(
-        db.branch_merge("main", "feature").await.unwrap(),
+        db.branch_merge("main", "feature").await.unwrap().outcome,
         MergeOutcome::FastForward
     );
     assert_eq!(
@@ -2351,7 +2351,7 @@ async fn cleanup_preserves_the_pin_a_lazy_child_reads_after_its_parent_retires()
         let borrowed = helpers::pinned_version(&db, "child", "node:Company").await;
 
         assert_eq!(
-            db.branch_merge("feature", "main").await.unwrap(),
+            db.branch_merge("feature", "main").await.unwrap().outcome,
             MergeOutcome::FastForward
         );
         db.load_as(
@@ -2364,7 +2364,7 @@ async fn cleanup_preserves_the_pin_a_lazy_child_reads_after_its_parent_retires()
         .await
         .unwrap();
         assert_eq!(
-            db.branch_merge("main", "feature").await.unwrap(),
+            db.branch_merge("main", "feature").await.unwrap().outcome,
             MergeOutcome::FastForward
         );
         let switched = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();

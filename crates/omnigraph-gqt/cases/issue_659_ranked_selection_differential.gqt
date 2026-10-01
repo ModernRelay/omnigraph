@@ -1,0 +1,212 @@
+# issue: 659
+# red_on: 7f1233bb
+# traversal: indexed
+# notes: Named and selected traversals refill ranked windows after sparse eligibility; every named hop in a selected statement keeps its rows.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc { slug: String @key embedding: Vector(4) @index }
+node Marker { slug: String @key }
+edge Knows: Doc -> Doc
+edge Tagged: Doc -> Marker
+
+--- seed
+{"type":"Doc","data":{"slug":"d000","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d001","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d002","embedding":[2.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d003","embedding":[3.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d004","embedding":[4.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d005","embedding":[5.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d006","embedding":[6.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d007","embedding":[7.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d008","embedding":[8.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d009","embedding":[9.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d010","embedding":[10.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d011","embedding":[11.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d012","embedding":[12.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d013","embedding":[13.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d014","embedding":[14.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d015","embedding":[15.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d016","embedding":[16.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d017","embedding":[17.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d018","embedding":[18.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d019","embedding":[19.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d020","embedding":[20.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d021","embedding":[21.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d022","embedding":[22.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d023","embedding":[23.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d024","embedding":[24.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d025","embedding":[25.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d026","embedding":[26.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d027","embedding":[27.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d028","embedding":[28.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d029","embedding":[29.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d030","embedding":[30.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d031","embedding":[31.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d032","embedding":[32.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d033","embedding":[33.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d034","embedding":[34.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d035","embedding":[35.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d036","embedding":[36.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d037","embedding":[37.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d038","embedding":[38.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d039","embedding":[39.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d040","embedding":[40.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d041","embedding":[41.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d042","embedding":[42.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d043","embedding":[43.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d044","embedding":[44.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d045","embedding":[45.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d046","embedding":[46.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d047","embedding":[47.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d048","embedding":[48.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d049","embedding":[49.0,0.0,0.0,0.0]}}
+{"type":"Marker","data":{"slug":"ok"}}
+{"edge":"Knows","id":"k10","from":"d010","to":"d011"}
+{"edge":"Tagged","id":"t10","from":"d011","to":"ok"}
+{"edge":"Knows","id":"k20","from":"d020","to":"d021"}
+{"edge":"Tagged","id":"t20","from":"d021","to":"ok"}
+{"edge":"Knows","id":"k30","from":"d030","to":"d031"}
+{"edge":"Tagged","id":"t30","from":"d031","to":"ok"}
+{"edge":"Knows","id":"k40","from":"d040","to":"d041"}
+{"edge":"Tagged","id":"t40","from":"d041","to":"ok"}
+
+--- query
+query nearest_named($q: Vector(4)) {
+    match { $d: Doc $t: Doc $d knows $t  }
+    return { $d.slug as slug }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+--- params
+{"q":[25.3,0.0,0.0,0.0]}
+--- expect ordered
+{"slug":"d030"}
+{"slug":"d020"}
+{"slug":"d040"}
+--- expect shape
+slug: String
+--- expect plan
+expand $d $t: selection named [Knows out]
+expand $d $t: mode indexed_scan ran indexed_scan
+
+--- query
+query nearest_alternative($q: Vector(4)) {
+    match { $d: Doc $t: Doc $d (knows | knows) $t  }
+    return { $d.slug as slug }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+--- params
+{"q":[25.3,0.0,0.0,0.0]}
+--- expect ordered
+{"slug":"d030"}
+{"slug":"d020"}
+{"slug":"d040"}
+--- expect shape
+slug: String
+--- expect plan
+expand $d $t: selection alternation [Knows out]
+expand $d $t: mode indexed_scan ran indexed_scan
+
+--- query
+query nearest_wildcard($q: Vector(4)) {
+    match { $d: Doc $t: Doc $d * $t  }
+    return { $d.slug as slug }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+--- params
+{"q":[25.3,0.0,0.0,0.0]}
+--- expect ordered
+{"slug":"d030"}
+{"slug":"d020"}
+{"slug":"d040"}
+--- expect shape
+slug: String
+--- expect plan
+expand $d $t: selection wildcard [Knows out]
+expand $d $t: mode indexed_scan ran indexed_scan
+
+--- query
+query nearest_named_chain($q: Vector(4)) {
+    match { $d: Doc $t: Doc $d knows $t $t tagged $m }
+    return { $d.slug as slug }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+--- params
+{"q":[25.3,0.0,0.0,0.0]}
+--- expect ordered
+{"slug":"d030"}
+{"slug":"d020"}
+{"slug":"d040"}
+--- expect shape
+slug: String
+--- expect plan
+expand $d $t: selection named [Knows out]
+expand $d $t: mode indexed_scan ran indexed_scan
+expand $t $m: selection named [Tagged out]
+expand $t $m: mode indexed_scan ran indexed_scan
+
+--- query
+query nearest_selected_chain($q: Vector(4)) {
+    match { $d: Doc $t: Doc $d knows $t $t (tagged | tagged) $m }
+    return { $d.slug as slug }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+--- params
+{"q":[25.3,0.0,0.0,0.0]}
+--- expect ordered
+{"slug":"d030"}
+{"slug":"d020"}
+{"slug":"d040"}
+--- expect shape
+slug: String
+--- expect plan
+expand $d $t: selection named [Knows out]
+expand $d $t: mode indexed_scan ran indexed_scan
+expand $t $m: selection alternation [Tagged out]
+expand $t $m: mode indexed_scan ran indexed_scan
+
+--- query
+query fused_sparse_named($q: Vector(4), $other: Vector(4)) {
+    match { $d: Doc $t: Doc $d knows $t }
+    return { $d.slug as slug }
+    order { rrf(nearest($d.embedding, $q), nearest($d.embedding, $other)) }
+    limit 3
+}
+--- params
+{"q":[20.3,0.0,0.0,0.0],"other":[40.3,0.0,0.0,0.0]}
+--- expect unordered
+{"slug":"d020"}
+{"slug":"d040"}
+--- expect shape
+slug: String
+--- expect plan
+expand $d $t: selection named [Knows out]
+rank fuse row tiebreak [$t.@id]
+
+--- query
+query fused_sparse_wildcard($q: Vector(4), $other: Vector(4)) {
+    match { $d: Doc $t: Doc $d * $t }
+    return { $d.slug as slug }
+    order { rrf(nearest($d.embedding, $q), nearest($d.embedding, $other)) }
+    limit 3
+}
+--- params
+{"q":[20.3,0.0,0.0,0.0],"other":[40.3,0.0,0.0,0.0]}
+--- expect unordered
+{"slug":"d020"}
+{"slug":"d040"}
+--- expect shape
+slug: String
+--- expect plan
+expand $d $t: selection wildcard [Knows out]
+rank fuse row tiebreak [$t.@id]

@@ -1,7 +1,5 @@
-//! Expand aligns source rows with destination IDs in bounded output batches.
-//! A single unbound hop streams through `single_hop`; a bound edge runs the
-//! pair producer and its sort per input batch; multi-hop drains its frontier
-//! into the BFS breaker, which emits its pairs a chunk at a time.
+//! Expand aligns source rows with destinations in bounded output batches.
+//! Budgeted traversals stream source windows; legacy multi-hop uses a breaker.
 
 use std::fmt;
 use std::sync::Arc;
@@ -16,14 +14,19 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use futures::StreamExt;
+use omnigraph_compiler::traversal::EDGE_TYPE_COLUMN;
 
-use super::expand::{ExpandStep, GraphEnv};
+use super::expand::{ExpandExecution, ExpandStep, GraphEnv};
 use super::memory::WorkMemory;
 use super::producer::{BatchSender, producer_stream};
 use super::{Switch, drain_one, external};
 use crate::engine::graph::{
-    ExpandedPairs, bound_edge_pair_schema, execute_expand, produce_bound_edge_pairs,
+    ExpandedPairs, PreparedEdge, bound_edge_pair_schema, execute_expand, prepare_selected_edges,
+    produce_bound_edge_pairs,
 };
+use crate::error::OmniError;
+use crate::instrumentation::record_expand_path;
+use crate::table_store::ORDERED_SCAN_EXECUTION_BATCH_ROWS;
 
 /// The most rows of one aligned output chunk, on all three strategies: the
 /// source columns of a chunk are one `WorkMemory::take`, reserved at twice
@@ -42,7 +45,10 @@ pub(super) fn execute(
     metrics: &ExecutionPlanMetricsSet,
 ) -> Result<SendableRecordBatchStream> {
     if step.single_hop() && step.edge_binding.is_none() {
-        return super::single_hop::execute(input, schema, step, env, ctx, metrics);
+        if let ExpandExecution::Named(named) = &step.execution {
+            let named = named.clone();
+            return super::single_hop::execute(input, schema, step, named, env, ctx, metrics);
+        }
     }
     let switch = Switch::gauge(metrics);
     let ctx = Arc::new(TaskContext::new(
@@ -69,13 +75,68 @@ pub(super) fn execute(
         memory,
         Some(metrics),
         move |memory, sender| async move {
-            if step.edge_binding.is_none() {
+            if step.budgeted() && !memory.traversal_limited() {
+                return Err(external(OmniError::manifest_internal(
+                    "budgeted expansion has no traversal work limit",
+                )));
+            }
+            if step.budgeted() {
+                Switch::IndexedScan.record(&switch);
+                record_expand_path(true);
+                memory.metric("expand_indexed", 1);
+                let mut input =
+                    SourceWindows::new(input, Arc::clone(&input_schema), Arc::clone(&memory));
+                let mut prepared = None;
+                while let Some(window) = input.next().await? {
+                    let prepared = match &prepared {
+                        Some(prepared) => Arc::clone(prepared),
+                        None => {
+                            let edges = Arc::new(
+                                prepare_selected_edges(&env, &step, &memory)
+                                    .await
+                                    .map_err(external)?,
+                            );
+                            prepared = Some(Arc::clone(&edges));
+                            edges
+                        }
+                    };
+                    let wide = Arc::new(window.batch);
+                    if step.edge_binding.is_some() {
+                        emit_bound(
+                            &wide,
+                            &step,
+                            &env,
+                            Some(Arc::clone(&prepared)),
+                            &memory,
+                            &sender,
+                            &declared,
+                        )
+                        .await?;
+                    } else {
+                        emit_unbound(
+                            &wide,
+                            &step,
+                            &env,
+                            Some(prepared.as_slice()),
+                            &switch,
+                            &memory,
+                            &sender,
+                            &declared,
+                        )
+                        .await?;
+                    }
+                }
+                return Ok(());
+            }
+            if step.edge_binding.is_none() && !step.single_hop() {
                 let wide = Arc::new(drain_one(input, &input_schema, &memory).await?);
                 if wide.num_rows() == 0 {
                     return Ok(());
                 }
-                return emit_unbound(&wide, &step, &env, &switch, &memory, &sender, &declared)
-                    .await;
+                return emit_unbound(
+                    &wide, &step, &env, None, &switch, &memory, &sender, &declared,
+                )
+                .await;
             }
             let mut input = input;
             while let Some(batch) = input.next().await {
@@ -87,31 +148,107 @@ pub(super) fn execute(
                 let input_memory = memory.child("expand input batch")?;
                 input_memory.hold(&batch)?;
                 let wide = Arc::new(batch);
-                emit_bound(&wide, &step, &env, &memory, &sender, &declared).await?;
+                if step.edge_binding.is_some() {
+                    emit_bound(&wide, &step, &env, None, &memory, &sender, &declared).await?;
+                } else {
+                    emit_unbound(
+                        &wide, &step, &env, None, &switch, &memory, &sender, &declared,
+                    )
+                    .await?;
+                }
             }
             Ok(())
         },
     ))
 }
 
-/// One input batch's bound-edge pairs, sorted by (source row, edge id,
+/// Exact source windows make scan admission independent of upstream batches.
+const SOURCE_WINDOW_ROWS: usize = ORDERED_SCAN_EXECUTION_BATCH_ROWS;
+
+struct SourceWindow {
+    batch: RecordBatch,
+    _memory: WorkMemory,
+}
+
+struct SourceWindows {
+    input: SendableRecordBatchStream,
+    schema: SchemaRef,
+    memory: Arc<WorkMemory>,
+    pending: Option<(RecordBatch, usize, WorkMemory)>,
+}
+
+impl SourceWindows {
+    fn new(input: SendableRecordBatchStream, schema: SchemaRef, memory: Arc<WorkMemory>) -> Self {
+        Self {
+            input,
+            schema,
+            memory,
+            pending: None,
+        }
+    }
+
+    async fn next(&mut self) -> Result<Option<SourceWindow>> {
+        let work = self.memory.child("expand source window")?;
+        let mut pieces = Vec::new();
+        let mut rows = 0;
+        while rows < SOURCE_WINDOW_ROWS {
+            self.memory.check()?;
+            if self.pending.is_none() {
+                let Some(batch) = self.input.next().await.transpose()? else {
+                    break;
+                };
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let lease = self.memory.child("expand pending source batch")?;
+                lease.hold(&batch)?;
+                self.pending = Some((batch, 0, lease));
+            }
+            let (batch, offset, lease) = self.pending.take().expect("pending batch populated");
+            let take = (SOURCE_WINDOW_ROWS - rows).min(batch.num_rows() - offset);
+            work.charge_traversal(take as u64)?;
+            work.entries::<RecordBatch>(1)?;
+            let piece = batch.slice(offset, take);
+            work.hold(&piece)?;
+            pieces.push(piece);
+            self.memory.metric("input_rows", take);
+            rows += take;
+            if offset + take < batch.num_rows() {
+                self.pending = Some((batch, offset + take, lease));
+            }
+        }
+        if rows == 0 {
+            return Ok(None);
+        }
+        let batch = work.concat(&self.schema, &pieces)?;
+        Ok(Some(SourceWindow {
+            batch,
+            _memory: work,
+        }))
+    }
+}
+
+/// One input batch's bound-edge pairs, sorted by (source row, type, edge id,
 /// destination id) and hydrated in `EXPAND_OUTPUT_ROWS` chunks. A source row's
 /// pairs never cross an input batch, so input order keeps one global sort.
 async fn emit_bound(
     wide: &Arc<RecordBatch>,
     step: &ExpandStep,
     env: &Arc<GraphEnv>,
+    prepared: Option<Arc<Vec<PreparedEdge>>>,
     memory: &Arc<WorkMemory>,
     sender: &BatchSender,
     declared: &SchemaRef,
 ) -> Result<()> {
-    let pair_schema = bound_edge_pair_schema(&env.catalog, &step.edge_type).map_err(external)?;
+    let pair_schema = bound_edge_pair_schema(&env.catalog, step.members(), step.has_type_column())
+        .map_err(external)?;
     let partition = Arc::new(EdgePairs {
         schema: Arc::clone(&pair_schema),
         wide: Arc::clone(wide),
         step: step.clone(),
         env: Arc::clone(env),
         memory: Arc::clone(memory),
+        prepared,
     });
     let pairs: Arc<dyn ExecutionPlan> = Arc::new(StreamingTableExec::try_new(
         Arc::clone(&pair_schema),
@@ -121,7 +258,12 @@ async fn emit_bound(
         false,
         None,
     )?);
-    let ordering = LexOrdering::new([0, 2, 1].map(|index| {
+    let mut keys = vec![0];
+    if let Ok(type_index) = pair_schema.index_of(EDGE_TYPE_COLUMN) {
+        keys.push(type_index);
+    }
+    keys.extend([2, 1]);
+    let ordering = LexOrdering::new(keys.into_iter().map(|index| {
         PhysicalSortExpr::new(
             Arc::new(Column::new(pair_schema.field(index).name(), index)),
             datafusion::arrow::compute::SortOptions {
@@ -167,16 +309,25 @@ async fn emit_unbound(
     wide: &RecordBatch,
     step: &ExpandStep,
     env: &GraphEnv,
+    prepared: Option<&[PreparedEdge]>,
     switch: &Gauge,
     memory: &Arc<WorkMemory>,
     sender: &BatchSender,
     schema: &SchemaRef,
 ) -> Result<()> {
-    execute_expand(wide, env, step, switch, memory, move |pairs| async move {
-        emit_pairs(wide, &pairs, memory, sender, schema)
-            .await
-            .map_err(|error| memory.error(error))
-    })
+    execute_expand(
+        wide,
+        env,
+        step,
+        prepared,
+        switch,
+        memory,
+        move |pairs| async move {
+            emit_pairs(wide, &pairs, memory, sender, schema)
+                .await
+                .map_err(|error| memory.error(error))
+        },
+    )
     .await
     .map_err(external)
 }
@@ -237,6 +388,7 @@ pub(super) fn align_sources(
 }
 
 struct EdgePairs {
+    prepared: Option<Arc<Vec<PreparedEdge>>>,
     schema: SchemaRef,
     wide: Arc<RecordBatch>,
     step: ExpandStep,
@@ -258,35 +410,44 @@ impl PartitionStream for EdgePairs {
     }
 
     fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+        let prepared = self.prepared.clone();
         let wide = Arc::clone(&self.wide);
         let step = self.step.clone();
         let env = Arc::clone(&self.env);
         let memory = Arc::clone(&self.memory);
+        let schema = Arc::clone(&self.schema);
         producer_stream(
             Arc::clone(&self.schema),
             memory,
             None,
             move |memory, sender: BatchSender| async move {
-                let work = Arc::new(memory.child("bound edge producer")?);
                 let sender = &sender;
-                produce_bound_edge_pairs(
-                    &wide,
-                    &env.snapshot,
-                    &env.catalog,
-                    &step.src,
-                    &step.edge_type,
-                    step.direction,
-                    &work,
-                    |batch, lease| async move {
-                        sender
-                            .send_bounded(batch, lease)
-                            .await
-                            .map_err(crate::error::OmniError::datafusion)
-                    },
-                )
-                .await
-                .map_err(external)
+                for (index, member) in step.members().iter().enumerate() {
+                    let work = Arc::new(memory.child("bound edge producer")?);
+                    produce_bound_edge_pairs(
+                        &wide,
+                        &env.snapshot,
+                        &env.catalog,
+                        &step.src,
+                        member,
+                        prepared.as_ref().map(|edges| &edges[index].dataset),
+                        &schema,
+                        &work,
+                        |batch, lease| async move {
+                            sender
+                                .send_bounded(batch, lease)
+                                .await
+                                .map_err(OmniError::datafusion)
+                        },
+                    )
+                    .await
+                    .map_err(external)?;
+                }
+                Ok(())
             },
         )
     }
 }
+
+#[cfg(test)]
+mod tests;

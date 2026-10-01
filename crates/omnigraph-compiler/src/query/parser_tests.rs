@@ -100,7 +100,7 @@ return { $f.name }
     let q = qf.single_decl();
     match &q.match_clause[1] {
         Clause::Traversal(t) => {
-            assert_eq!(t.edge_name, "knows");
+            assert_eq!(t.selector, EdgeSelector::Named("knows".to_string()));
             assert!(t.undirected, "bare undirected form");
             assert_eq!((t.min_hops, t.max_hops), (1, Some(1)));
         }
@@ -139,7 +139,7 @@ return { $f.name, $f.age }
     match &q.match_clause[1] {
         Clause::Traversal(t) => {
             assert_eq!(t.src, "p");
-            assert_eq!(t.edge_name, "knows");
+            assert_eq!(t.selector, EdgeSelector::Named("knows".to_string()));
             assert_eq!(t.dst, "f");
             assert_eq!(t.min_hops, 1);
             assert_eq!(t.max_hops, Some(1));
@@ -170,7 +170,7 @@ return { $p.name }
             match &block.clauses[0] {
                 Clause::Traversal(t) => {
                     assert_eq!(t.src, "p");
-                    assert_eq!(t.edge_name, "worksAt");
+                    assert_eq!(t.selector, EdgeSelector::Named("worksAt".to_string()));
                     assert_eq!(t.dst, "_");
                     assert_eq!(t.min_hops, 1);
                     assert_eq!(t.max_hops, Some(1));
@@ -245,7 +245,7 @@ return { $p.name }
     match &q.match_clause[1] {
         Clause::Traversal(t) => {
             assert_eq!(t.src, "p");
-            assert_eq!(t.edge_name, "worksAt");
+            assert_eq!(t.selector, EdgeSelector::Named("worksAt".to_string()));
             assert_eq!(t.dst, "c");
             assert_eq!(t.min_hops, 1);
             assert_eq!(t.max_hops, Some(1));
@@ -665,7 +665,7 @@ fn test_parse_boolean_words_are_word_bounded_and_reserved_words_never_edge_names
         parse_query("query q() { match { $p: Person  $p andy $f } return { $p.name } }").unwrap();
     assert!(matches!(
         &qf.single_decl().match_clause[1],
-        Clause::Traversal(traversal) if traversal.edge_name == "andy"
+        Clause::Traversal(traversal) if traversal.selector == EdgeSelector::Named("andy".to_string())
     ));
     for (clause, edge, undirected, binding) in [
         (r#"$p "in" $f"#, "in", false, None),
@@ -679,7 +679,11 @@ fn test_parse_boolean_words_are_word_bounded_and_reserved_words_never_edge_names
         let Clause::Traversal(traversal) = &qf.single_decl().match_clause[1] else {
             panic!("expected a traversal: {source}");
         };
-        assert_eq!(traversal.edge_name, edge, "{source}");
+        assert_eq!(
+            traversal.selector,
+            EdgeSelector::Named(edge.to_string()),
+            "{source}"
+        );
         assert_eq!(traversal.undirected, undirected, "{source}");
         assert_eq!(traversal.edge_binding.as_deref(), binding, "{source}");
     }
@@ -1420,7 +1424,7 @@ return { $p.name
 }
 "#;
     let err = parse_query_diagnostic(input).unwrap_err();
-    assert!(err.span.is_some());
+    assert!(err.position.is_some());
 }
 
 #[test]
@@ -1444,7 +1448,7 @@ return { $f.name }
     match &q.match_clause[1] {
         Clause::Traversal(t) => {
             assert_eq!(t.src, "p");
-            assert_eq!(t.edge_name, "knows");
+            assert_eq!(t.selector, EdgeSelector::Named("knows".to_string()));
             assert_eq!(t.dst, "f");
             assert!(!t.undirected);
             assert_eq!(t.edge_binding.as_deref(), Some("w"));
@@ -1657,7 +1661,12 @@ fn explain_statement_never_shares_a_file_with_a_declaration() {
         format!("branch list\nexplain {decl}"),
     ] {
         let error = parse_query(&input).unwrap_err();
-        assert!(matches!(error, CompilerError::Parse(_)), "{input}: {error}");
+        assert!(
+            error.diagnostic().is_some_and(|diagnostic| {
+                diagnostic.kind == crate::query::diagnostic::QueryDiagnosticKind::Parse
+            }),
+            "{input}: {error}"
+        );
     }
 }
 
@@ -1672,7 +1681,12 @@ fn explain_keyword_ends_at_a_word_boundary_and_needs_a_declaration() {
         format!("explain explain {decl}"),
     ] {
         let error = parse_query(&input).unwrap_err();
-        assert!(matches!(error, CompilerError::Parse(_)), "{input}: {error}");
+        assert!(
+            error.diagnostic().is_some_and(|diagnostic| {
+                diagnostic.kind == crate::query::diagnostic::QueryDiagnosticKind::Parse
+            }),
+            "{input}: {error}"
+        );
     }
 }
 
@@ -1845,7 +1859,7 @@ fn settings_statements_are_checked_against_the_definition() {
             "{input}: {} (the full text is `settings::tests::messages_follow_the_definition`'s)",
             err.message
         );
-        assert!(err.span.is_some(), "{input} carries a position");
+        assert!(err.position.is_some(), "{input} carries a position");
     }
     let rendered = parse_query("set merge_lineage = v3;")
         .unwrap_err()
@@ -1939,4 +1953,193 @@ return { $p.set, $q.traversal as all }
     assert_eq!(file.single_decl().name, "q");
     assert_eq!(parse_branch("branch create set"), create("set", None));
     assert_eq!(parse_branch("branch create all"), create("all", None));
+}
+
+#[test]
+fn test_parse_edge_selectors_issue_659() {
+    for (spelling, selector, undirected) in [
+        (
+            "(knows | likes)",
+            EdgeSelector::Alternation(vec!["knows".into(), "likes".into()]),
+            false,
+        ),
+        (
+            "<knows | likes>",
+            EdgeSelector::Alternation(vec!["knows".into(), "likes".into()]),
+            true,
+        ),
+        ("*", EdgeSelector::Wildcard, false),
+        ("<*>", EdgeSelector::Wildcard, true),
+        (
+            "(knows | \"in\")",
+            EdgeSelector::Alternation(vec!["knows".into(), "in".into()]),
+            false,
+        ),
+    ] {
+        for bounds in ["", "{1,1}"] {
+            let source = format!(
+                "query q() {{ match {{ $a $e:{spelling}{bounds} $b }} return {{ $e.@type }} }}"
+            );
+            let parsed = parse_query(&source).unwrap();
+            let Clause::Traversal(traversal) = &parsed.single_decl().match_clause[0] else {
+                panic!("expected traversal");
+            };
+            assert_eq!(traversal.selector, selector, "{source}");
+            assert_eq!(traversal.undirected, undirected, "{source}");
+            assert_eq!((traversal.min_hops, traversal.max_hops), (1, Some(1)));
+            assert_eq!(traversal.edge_binding.as_deref(), Some("e"));
+        }
+    }
+    for selector in [
+        "(knows |)",
+        "(| knows)",
+        "(knows | \"bad name\")",
+        "(knows | *)",
+    ] {
+        let source = format!("query q() {{ match {{ $a {selector} $b }} return {{ $a }} }}");
+        assert!(parse_query(&source).is_err(), "{source}");
+    }
+    let parsed = parse_query("query q() { match { $a (knows) $b } return { $a } }").unwrap();
+    assert!(
+        parsed
+            .single_decl()
+            .match_clause
+            .iter()
+            .all(|clause| !matches!(clause, Clause::Traversal(_)))
+    );
+}
+
+#[test]
+fn query_without_parameter_list_reports_q002_at_the_name_end_with_fix() {
+    let err =
+        parse_query_diagnostic("query name {\n  match { $p: Person }\n  return { $p.name }\n}")
+            .unwrap_err();
+    assert_eq!(err.code.as_str(), "Q002");
+    assert_eq!(
+        err.message,
+        "expected `(`: a query declares its parameters even when it has none"
+    );
+    assert_eq!(err.fix.as_deref(), Some("query name()"));
+    let at = err.position.expect("positioned at the name's end");
+    assert_eq!((at.line, at.column, at.byte), (1, 11, 10));
+    assert!(err.stage.is_none());
+    let rendered = parse_query("query name {").unwrap_err().to_string();
+    assert_eq!(
+        rendered,
+        "parse error: expected `(`: a query declares its parameters even when it has none"
+    );
+    // A well-formed declaration before the broken one leaves the fix's
+    // subject the broken one.
+    let err =
+        parse_query_diagnostic("query a() { match { $p: Person } return { $p.name } }\nquery b {")
+            .unwrap_err();
+    assert_eq!(err.fix.as_deref(), Some("query b()"));
+    assert_eq!(err.position.unwrap().line, 2);
+    // The declaration keeps its parameter list when it has one.
+    assert!(parse_query("query a() { match { $p: Person } return { $p.name } }").is_ok());
+}
+
+#[test]
+fn query_diagnostic_suggestion_edits_preserve_source_and_reparse() {
+    for source in [
+        "query name { match { $p: Person } return { $p.name } }",
+        "/* café */\nquery name /* keep */ { match { $p: Person } return { $p.name } }",
+        "query name // keep\n{ match { $p: Person } return { $p.name } }",
+        "query first() { match { $p: Person } return { $p.name } }\nquery name { match { $p: Person } return { $p.name } }",
+        "query name @description(\"hello\") { match { $p: Person } return { $p.name } }",
+    ] {
+        let diagnostic = parse_query_diagnostic(source).unwrap_err();
+        assert_eq!(diagnostic.code, Q002, "{source}");
+        let json = serde_json::to_value(&diagnostic).unwrap();
+        let suggestion = &json["suggestion"];
+        assert_eq!(
+            suggestion["applicability"], "machine_applicable",
+            "{source}"
+        );
+        let edits = suggestion["edits"].as_array().unwrap();
+        assert_eq!(edits.len(), 1);
+        let edit = &edits[0];
+        let byte = source.find("query name").unwrap() + "query name".len();
+        assert_eq!(edit["start"], byte);
+        assert_eq!(edit["end"], byte);
+        assert_eq!(edit["replacement"], "()");
+        let mut repaired = source.to_string();
+        repaired.replace_range(byte..byte, edit["replacement"].as_str().unwrap());
+        parse_query_diagnostic(&repaired).unwrap();
+    }
+
+    for source in [
+        "query name garbage",
+        "query café {",
+        "query name {",
+        "query name { match { $p: Person } return { $p.name } } query second { match { $p: Person } return { $p.name } }",
+    ] {
+        let json = serde_json::to_value(parse_query_diagnostic(source).unwrap_err()).unwrap();
+        assert!(json.get("suggestion").is_none(), "{source}: {json}");
+    }
+    let source = "queryname { match { $p: Person } return { $p.name } }";
+    assert_eq!(parse_query_diagnostic(source).unwrap_err().code, Q001);
+    parse_query_diagnostic("query name /* keep */ () { match { $p: Person } return { $p.name } }")
+        .unwrap();
+}
+
+#[test]
+fn handwritten_query_diagnostics_locate_the_refused_token() {
+    for (source, token, code) in [
+        (
+            "/* café */\nquery q() { delete Person where in = 1 }",
+            "in =",
+            Q005,
+        ),
+        (
+            "query q() { match { $p: Person } return { $p.name as in } }",
+            "in }",
+            Q005,
+        ),
+        (
+            "query q() { match { $p: Person } return { 99999999999999999999999 as n } }",
+            "99999999999999999999999",
+            Q005,
+        ),
+        (
+            "query q() { match { $p: Person } return { $p.name } limit 99999999999999999999999 }",
+            "99999999999999999999999",
+            Q005,
+        ),
+        (
+            r#"query q() { match { $p: Person } return { "bad\x" as n } }"#,
+            r#""bad\x""#,
+            Q005,
+        ),
+        (r#"set engine = "bad\x";"#, r#""bad\x""#, Q003),
+        (r#"branch create "bad\x""#, r#""bad\x""#, Q004),
+        (
+            "query q() { match { $p: Person } return { $p.name } order { (nearest($p.embedding, [1.0])) desc } }",
+            "desc",
+            Q005,
+        ),
+    ] {
+        let diagnostic = parse_query_diagnostic(source).unwrap_err();
+        assert_eq!(diagnostic.code, code, "{source}: {diagnostic}");
+        assert_eq!(
+            diagnostic.position,
+            Some(Position::at(source, source.find(token).unwrap())),
+            "{source}"
+        );
+        assert!(diagnostic.stage.is_none());
+    }
+}
+
+#[test]
+fn grammar_mismatch_reports_q001_at_the_deepest_failure() {
+    let err = parse_query_diagnostic("mutation { insert Person { name: \"a\" } }").unwrap_err();
+    assert_eq!(err.code.as_str(), "Q001");
+    assert!(err.message.starts_with("expected "), "{}", err.message);
+    assert_eq!(err.position.unwrap().byte, 0);
+    assert!(err.fix.is_none());
+    // A settings refusal is positioned at the offending token.
+    let err = parse_query_diagnostic("set merge_lineage = v3;").unwrap_err();
+    assert_eq!(err.code.as_str(), "Q003");
+    let at = err.position.unwrap();
+    assert_eq!((at.line, at.column), (1, 21));
 }

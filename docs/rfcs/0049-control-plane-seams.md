@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-09-03
-updated: 2026-09-29
+updated: 2026-09-30
 discussion: null
 supersedes: []
 superseded_by: []
@@ -39,8 +39,11 @@ crate already does, and without bypassing it:
 Nothing here changes a storage format, the ledger's schema, the lock, the
 recovery protocol, or any existing route's success shape. The wider
 [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md)
-proposal stays independent; this RFC takes none of its proposed decisions and
-its seams remain valid under it. Restoring a ledger is deliberately not here:
+proposal stays independent. Its proposed v0.12 wire contract may replace the
+readiness and inventory shapes while retaining observe-only authority and the
+absolute shutdown deadline. This RFC's accepted wire shapes remain current until
+a replacement is accepted and implemented with its coordinated consumer
+transition. Restoring a ledger is deliberately not here:
 its real use arrives with coherent restore points, where the ledger and the graphs come back
 together, and it will be designed once, against those.
 
@@ -289,3 +292,7 @@ RFC 0035 proposal; it is a default, not a contract.
   RFCs 0034 and 0035 in Summary, Motivation, and Shutdown. Alternatives retain
   those identifiers as historical context. Observe, readiness, and bounded
   shutdown remain this RFC's accepted decisions.
+- 2026-09-30: Clarified that the proposed v0.12 server contract may replace
+  readiness and inventory wire shapes; observe-only authority and the absolute
+  shutdown deadline remain its foundations. This clarification changes none of
+  this RFC's accepted behavior or current wire shapes.

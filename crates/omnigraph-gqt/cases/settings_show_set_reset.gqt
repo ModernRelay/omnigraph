@@ -30,6 +30,7 @@ show all;
 {"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}
 {"name": "ann_nprobes", "value": "20", "default": "20", "source": "default", "scope": "request"}
 {"name": "stage_write_concurrency", "value": "8", "default": "8", "source": "default", "scope": "process"}
+{"name": "traversal_work_limit", "value": "1000000", "default": "1000000", "source": "default", "scope": "request"}
 
 --- query
 show merge_lineage;

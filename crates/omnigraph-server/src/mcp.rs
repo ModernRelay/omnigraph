@@ -25,9 +25,10 @@ use tokio::sync::Semaphore;
 use crate::api::InvokeStoredQueryRequest;
 use crate::handlers::{self, QueryNamePath};
 use crate::registry::{GraphHandle, RegistryLookup};
+use crate::workload::IngressLease;
 use crate::{ApiError, AppState, AuthenticatedActor, GraphId, GraphKey};
 
-const REQUEST_BYTES: usize = 64 * 1024;
+pub(crate) const REQUEST_BYTES: usize = 64 * 1024;
 const RESULT_BYTES: usize = 1024 * 1024;
 const READ_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -62,6 +63,12 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
     );
     let protected = Router::new()
         .route_service("/mcp", service)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            |State(state): State<AppState>, request: Request, next: Next| async move {
+                crate::ingress::admit(&state, request, next).await
+            },
+        ))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             handlers::require_bearer_auth,
@@ -170,9 +177,8 @@ impl ServerHandler for GraphTools {
         if self.get_tool(&request.name).is_none() {
             return Err(ErrorData::invalid_params("unknown MCP tool", None));
         }
-        let actor = context
-            .extensions
-            .get::<axum::http::request::Parts>()
+        let parts = context.extensions.get::<axum::http::request::Parts>();
+        let actor = parts
             .and_then(|parts| parts.extensions.get::<AuthenticatedActor>())
             .cloned();
         let Some(actor) = actor else {
@@ -182,6 +188,20 @@ impl ServerHandler for GraphTools {
             )
             .into());
         };
+        // The SDK transports the admitted HTTP request's extensions into its
+        // task. Reuse that one lease and observer instead of admitting again
+        // after collection or releasing them before the SDK task finishes.
+        let Some((observer, input)) = parts.and_then(|parts| {
+            parts
+                .extensions
+                .get::<crate::operations::ReadObserver>()
+                .zip(parts.extensions.get::<IngressLease>())
+                .map(|(observer, input)| (observer.clone(), input.clone()))
+        }) else {
+            return Ok(failure("internal_error", "MCP admission context is missing.").into());
+        };
+        let _observer = observer;
+        let _input = input.clone();
         let Ok(_permit) = self.slots.try_acquire() else {
             return Ok(failure(
                 "capacity_exceeded",
@@ -191,7 +211,7 @@ impl ServerHandler for GraphTools {
         };
         let result = tokio::select! {
             _ = context.ct.cancelled() => failure("cancelled", "The read was cancelled."),
-            result = tokio::time::timeout(READ_DEADLINE, self.execute(request, actor)) => {
+            result = tokio::time::timeout(READ_DEADLINE, self.execute(request, actor, input)) => {
                 match result {
                     Ok(Ok(result)) => result,
                     Ok(Err(error)) => api_failure(error).await,
@@ -208,6 +228,7 @@ impl GraphTools {
         &self,
         request: CallToolRequestParams,
         actor: AuthenticatedActor,
+        input: IngressLease,
     ) -> Result<CallToolResult, ApiError> {
         let arguments = Value::Object(request.arguments.unwrap_or_default());
         match request.name.as_ref() {
@@ -244,6 +265,7 @@ impl GraphTools {
                 let output = handlers::server_invoke_query(
                     State(self.state.clone()),
                     Extension(handle),
+                    Extension(input),
                     Some(Extension(actor)),
                     Path(QueryNamePath { name: args.name }),
                     HeaderMap::new(),

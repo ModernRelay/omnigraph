@@ -6,9 +6,10 @@ use serde::Serialize;
 use crate::catalog::Catalog;
 use crate::error::{CompilerError, Result};
 
-use super::ast::{Clause, Mutation, QueryDecl};
+use super::ast::{Mutation, QueryDecl};
 use super::typecheck::{
-    CheckedQuery, MutationTarget, infer_query_result_schema, typecheck_query_decl,
+    BoundVariable, CheckedQuery, MutationTarget, TypeContext, infer_query_result_schema,
+    typecheck_query_decl,
 };
 
 /// A compiled query's conservative graph access set and result shape.
@@ -92,7 +93,7 @@ fn describe_checked_query_operation(
 
     let result = match checked {
         CheckedQuery::Read(ctx) => {
-            collect_clause_reads(catalog, &query.match_clause, &mut reads)?;
+            collect_checked_reads(ctx, &mut reads);
             infer_query_result_schema(catalog, query, ctx)?
                 .fields()
                 .iter()
@@ -101,7 +102,7 @@ fn describe_checked_query_operation(
         }
         CheckedQuery::Mutation(ctx) => {
             if ctx.targets.len() != query.mutations.len() {
-                return Err(CompilerError::Type(
+                return Err(CompilerError::Plan(
                     "typechecked mutation target count does not match the query".to_string(),
                 ));
             }
@@ -113,7 +114,7 @@ fn describe_checked_query_operation(
                 match (mutation, target) {
                     (Mutation::Insert(_), MutationTarget::Edge { type_name }) => {
                         let edge = catalog.edge_types.get(type_name).ok_or_else(|| {
-                            CompilerError::Type(format!(
+                            CompilerError::Plan(format!(
                                 "typechecked edge type `{type_name}` is absent from the catalog"
                             ))
                         })?;
@@ -146,37 +147,26 @@ fn describe_checked_query_operation(
     })
 }
 
-fn collect_clause_reads(
-    catalog: &Catalog,
-    clauses: &[Clause],
-    reads: &mut BTreeSet<QueryGraphFact>,
-) -> Result<()> {
-    for clause in clauses {
-        match clause {
-            Clause::Binding(binding) => {
-                reads.insert(node_fact(&binding.type_name));
+fn collect_checked_reads(ctx: &TypeContext, reads: &mut BTreeSet<QueryGraphFact>) {
+    let mut pending = vec![ctx];
+    while let Some(scope) = pending.pop() {
+        for binding in scope.bindings.values() {
+            if let BoundVariable::Node { type_name } = binding {
+                reads.insert(node_fact(type_name));
             }
-            Clause::Traversal(traversal) => {
-                let edge = catalog
-                    .lookup_edge_by_name(&traversal.edge_name)
-                    .ok_or_else(|| {
-                        CompilerError::Type(format!(
-                            "typechecked edge type `{}` is absent from the catalog",
-                            traversal.edge_name
-                        ))
-                    })?;
+        }
+        for traversal in &scope.traversals {
+            reads.insert(node_fact(&traversal.src_type));
+            reads.insert(node_fact(&traversal.dst_type));
+            for member in traversal.edges.members() {
                 reads.insert(QueryGraphFact {
                     kind: QueryGraphFactKind::Edge,
-                    type_name: edge.name.clone(),
+                    type_name: member.edge_type.clone(),
                 });
-                reads.insert(node_fact(&edge.from_type));
-                reads.insert(node_fact(&edge.to_type));
             }
-            Clause::Subquery(subquery) => collect_clause_reads(catalog, &subquery.clauses, reads)?,
-            Clause::Filter(_) => {}
         }
+        pending.extend(scope.subqueries.iter().map(|subquery| &subquery.inner));
     }
-    Ok(())
 }
 
 fn target_fact(target: &MutationTarget) -> QueryGraphFact {
@@ -213,7 +203,7 @@ fn result_value_shape(
     match data_type {
         DataType::FixedSizeList(field, dim) if field.data_type() == &DataType::Float32 => {
             let dim = u32::try_from(*dim).map_err(|_| {
-                CompilerError::Type(format!(
+                CompilerError::Plan(format!(
                     "query result vector dimension `{dim}` cannot be represented"
                 ))
             })?;
@@ -222,7 +212,7 @@ fn result_value_shape(
         DataType::List(field) => {
             let (item_kind, nested_item, vector_dim) = result_value_shape(field.data_type())?;
             if nested_item.is_some() || item_kind == QueryValueKind::List {
-                return Err(CompilerError::Type(
+                return Err(CompilerError::Plan(
                     "nested query result lists are not representable".to_string(),
                 ));
             }
@@ -243,7 +233,7 @@ fn scalar_result_kind(data_type: &DataType) -> Result<QueryValueKind> {
         DataType::Date32 => Ok(QueryValueKind::Date),
         DataType::Date64 => Ok(QueryValueKind::DateTime),
         DataType::LargeBinary => Ok(QueryValueKind::Blob),
-        other => Err(CompilerError::Type(format!(
+        other => Err(CompilerError::Plan(format!(
             "query result data type `{other}` is not representable"
         ))),
     }

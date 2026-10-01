@@ -3,9 +3,9 @@
 
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
 use omnigraph_planner::{
-    ContainsJoinFields, ExpandFields, HashJoinFields, Lower, NodeId, PhysicalNode, PhysicalPlan,
-    PlanError, Prefilter, RankArm, RankKind, RankedAccess, ScanInput, ScanSpec, SideId,
-    SortMergeJoinFields,
+    ColumnRef, ContainsJoinFields, ExpandFields, HashJoinFields, Lower, NodeId, PhysicalNode,
+    PhysicalPlan, PlanError, Prefilter, RankArm, RankFuseFields, RankKind, RankedAccess, ScanInput,
+    ScanSpec, SideId, SortMergeJoinFields,
 };
 
 fn no_prefilter() -> Prefilter {
@@ -162,9 +162,7 @@ impl Lower for Trace {
     fn rank_fuse(
         &mut self,
         id: NodeId,
-        _: &[RankArm; 2],
-        _: Option<&IRExpr>,
-        _: Option<usize>,
+        _: RankFuseFields<'_>,
         primary: String,
         secondary: String,
     ) -> Result<String, PlanError> {
@@ -194,7 +192,7 @@ impl Lower for Trace {
         id: NodeId,
         _: &[IROrdering],
         _: Option<usize>,
-        _: &[String],
+        _: &[ColumnRef],
         input: String,
     ) -> Result<String, PlanError> {
         self.call("sort", id, &[&input])
@@ -377,6 +375,7 @@ fn a_rank_fuse_lowers_each_arm_once_primary_first() {
         k: None,
         limit: Some(3),
         prefilter: no_prefilter(),
+        row_tiebreak: Vec::new(),
     });
     plan.set_root(fuse);
 
@@ -447,6 +446,7 @@ fn a_node_with_two_consumers_refuses_the_lowering() {
         k: None,
         limit: Some(3),
         prefilter: no_prefilter(),
+        row_tiebreak: Vec::new(),
     });
     plan.set_root(fuse);
 

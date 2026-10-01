@@ -10,7 +10,7 @@ use arrow_array::{Int32Array, RecordBatch, StringArray};
 use arrow_schema::Schema;
 use lance::Dataset;
 use omnigraph::db::{Omnigraph, ReadTarget, StagingVerdict};
-use omnigraph::error::{ManifestErrorKind, OmniError};
+use omnigraph::error::{CompletionEvidence, ManifestErrorKind, OmniError};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
 use omnigraph::seams::FailScenario;
@@ -1256,15 +1256,43 @@ async fn mutation_revalidates_unique_after_pre_effect_authority_change() {
 async fn strict_mutation_rejects_disjoint_head_change_before_effects() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
-    let db = std::sync::Arc::new(helpers::init_and_load(&dir).await);
+    let db = Arc::new(helpers::init_and_load(&dir).await);
+    assert_strict_update_refuses_head_change(db, "main").await;
+}
 
+/// The same refusal on a branch other than the handle's bound one, where
+/// revalidation trusts the captured manifest probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn named_branch_strict_mutation_rejects_head_change_before_effects() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(helpers::init_and_load(&dir).await);
+    db.branch_create("feature").await.unwrap();
+    db.mutate(
+        "feature",
+        OCC_DISJOINT_MUTATIONS,
+        "insert_company",
+        &params(&[("$name", "OldFeatureCo")]),
+    )
+    .await
+    .unwrap();
+    assert_strict_update_refuses_head_change(db, "feature").await;
+}
+
+/// Parks a strict Person update on `branch`, commits a disjoint Company insert
+/// on the same branch, and requires the refusal before any table effect.
+async fn assert_strict_update_refuses_head_change(
+    db: Arc<omnigraph::Session>,
+    branch: &'static str,
+) {
     let rendezvous =
         helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
-    let writer_a_db = std::sync::Arc::clone(&db);
-    let writer_a = tokio::spawn(async move {
-        writer_a_db
+    let writer_db = Arc::clone(&db);
+    let writer = tokio::spawn(async move {
+        writer_db
             .mutate(
-                "main",
+                branch,
                 OCC_DISJOINT_MUTATIONS,
                 "set_age",
                 &helpers::mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
@@ -1274,61 +1302,103 @@ async fn strict_mutation_rejects_disjoint_head_change_before_effects() {
 
     rendezvous.wait_until_reached().await;
     db.mutate(
-        "main",
+        branch,
         OCC_DISJOINT_MUTATIONS,
         "insert_company",
         &params(&[("$name", "ConcurrentCo")]),
     )
     .await
     .expect("the disjoint Company insert commits while Person update is parked");
-
-    let winner_person_pin = helpers::snapshot_main(&db)
-        .await
-        .unwrap()
-        .dataset("node:Person")
-        .unwrap()
-        .published_dataset_version;
-    let person_uri = node_table_uri(&db, "Person").await;
-    let winner_person_head = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .latest_version_id()
-        .await
-        .unwrap();
+    let _no_table_effect = catalog::MUTATION_POST_TABLE_COMMIT.fire_always();
     rendezvous.release();
 
-    let err = writer_a
+    let err = writer
         .await
         .unwrap()
         .expect_err("strict stale read set must fail rather than auto-reprepare");
-    let OmniError::Manifest(manifest_err) = err else {
-        panic!("expected a typed manifest conflict");
-    };
-    assert!(matches!(
-        manifest_err.details,
-        Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged {
-            ref member,
-            ..
-        }) if member == "graph_head:main"
-    ));
+    assert_refused_before_effects(err, &format!("graph_head:{branch}"));
+}
 
-    let final_person_pin = helpers::snapshot_main(&db)
-        .await
-        .unwrap()
-        .dataset("node:Person")
-        .unwrap()
-        .published_dataset_version;
-    let final_person_head = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .latest_version_id()
-        .await
-        .unwrap();
-    assert_eq!(
-        (final_person_pin, final_person_head),
-        (winner_person_pin, winner_person_head),
-        "strict rejection must happen before any Person table effect"
+/// With `MUTATION_POST_TABLE_COMMIT` armed, a write that reached a table effect
+/// carries the injected error, which has no conflict details.
+fn assert_refused_before_effects(err: OmniError, member: &str) {
+    let refusal = err.to_string();
+    let OmniError::Manifest(manifest_err) = err else {
+        panic!("expected a typed manifest conflict, got {refusal}");
+    };
+    assert!(
+        matches!(
+            manifest_err.details,
+            Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged {
+                member: ref changed,
+                ..
+            }) if changed == member
+        ),
+        "the write must be refused with {member} before a table effect, got {refusal}"
     );
+}
+
+/// A write on a branch other than the handle's bound one keeps its captured
+/// authority only while the branch's version and identifier are unchanged. A
+/// delete and recreate of that name while the write is parked must refuse it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn named_branch_write_refuses_delete_recreate_before_effects() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = std::sync::Arc::new(helpers::init_and_load(&dir).await);
+    db.branch_create("feature").await.unwrap();
+    db.mutate(
+        "feature",
+        OCC_DISJOINT_MUTATIONS,
+        "insert_company",
+        &params(&[("$name", "OldFeatureCo")]),
+    )
+    .await
+    .unwrap();
+    let old_ref = helpers::graph_native_ref(&uri, "feature").await;
+
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let _no_table_effect = catalog::MUTATION_POST_TABLE_COMMIT.fire_always();
+    let writer_db = std::sync::Arc::clone(&db);
+    let writer = tokio::spawn(async move {
+        writer_db
+            .mutate(
+                "feature",
+                OCC_DISJOINT_MUTATIONS,
+                "set_age",
+                &helpers::mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+            )
+            .await
+    });
+
+    rendezvous.wait_until_reached().await;
+    let recreated = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        db.branch_delete("feature").await?;
+        db.branch_create("feature").await
+    })
+    .await;
+    rendezvous.release();
+    recreated
+        .expect("delete and recreate must not wait for the parked write")
+        .unwrap();
+    let new_ref = helpers::graph_native_ref(&uri, "feature").await;
+    assert_ne!(new_ref, old_ref, "recreate must mint a new incarnation");
+
+    let err = writer
+        .await
+        .unwrap()
+        .expect_err("a write captured on the deleted incarnation must be refused");
+    assert_refused_before_effects(err, "branch_identifier:feature");
+
+    assert_eq!(
+        helpers::count_rows_branch(&db, "feature", "node:Company").await,
+        helpers::count_rows_branch(&db, "main", "node:Company").await,
+        "the recreated branch must hold main's rows only"
+    );
+    assert_eq!(helpers::graph_native_ref(&uri, "feature").await, new_ref);
 }
 
 /// A caller graph-head precondition is terminal even when the race occurs
@@ -2820,8 +2890,52 @@ async fn metadata_only_schema_apply_post_publish_failure_heals_on_next_write() {
     assert!(dir.path().join("__schema_state.json.staging").exists());
     assert_no_recovery_sidecars(dir.path());
 
-    // The next write's entry heal finds the recorded commit in lineage,
-    // installs the contract and releases the dead apply's sentinel.
+    // A validation-shaped error while completing this already-published
+    // contract is not a fresh mutation's ordinary pre-effect refusal.
+    let staging_path = dir.path().join("_schema.pg.staging");
+    let staged_source = std::fs::read(&staging_path).unwrap();
+    std::fs::write(&staging_path, "node {").unwrap();
+    let blocked = mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "blocked")], &[("$age", 12)]),
+    )
+    .await
+    .unwrap_err();
+    std::fs::write(&staging_path, staged_source).unwrap();
+    assert_eq!(
+        blocked.completion_evidence(),
+        Some(CompletionEvidence::Uncertain),
+        "published schema completion dominates a validation-shaped cause: {blocked}"
+    );
+
+    // Completion succeeds before native branch-name validation. The whole
+    // command cannot claim no effects, but its validation cause stays nonfatal.
+    let invalid_branch = db.branch_create_from("main", "bad?name").await.unwrap_err();
+    assert_eq!(invalid_branch.completion_evidence(), None);
+    assert!(
+        matches!(invalid_branch, OmniError::Manifest(ref error)
+            if error.kind == omnigraph::error::ManifestErrorKind::BadRequest),
+        "completed pending work must leave an ordinary name refusal: {invalid_branch}"
+    );
+
+    // Completion succeeds before the next mutation's ordinary validation
+    // refusal. Prior successful work is neither an effect-free command nor
+    // evidence of uncertain completion.
+    let invalid = mutate_main(&db, MUTATION_QUERIES, "missing_mutation", &params(&[]))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        invalid.completion_evidence(),
+        None,
+        "successful completion does not poison later validation: {invalid}"
+    );
+    assert_no_staging_files(dir.path());
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 0);
+
+    // The same handle now admits the ordinary write against the installed
+    // contract, with the dead apply's sentinel released.
     db.load_jsonl(
         "{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n",
         LoadMode::Append,
@@ -2837,6 +2951,37 @@ async fn metadata_only_schema_apply_post_publish_failure_heals_on_next_write() {
     db.apply_schema(&indexed_schema)
         .await
         .expect("the released sentinel admits the next apply, a no-op here");
+
+    let before_refusal = db.list_commits(None).await.unwrap();
+    let refused = {
+        let _release_failure = catalog::BRANCH_DELETE_POST_ARCHIVE.fire_always();
+        db.apply_schema("node {").await.unwrap_err()
+    };
+    assert_eq!(
+        refused.completion_evidence(),
+        Some(CompletionEvidence::Uncertain),
+        "failed sentinel completion must dominate the primary validation refusal: {refused}"
+    );
+    assert_eq!(db.list_commits(None).await.unwrap(), before_refusal);
+    db.apply_schema(&indexed_schema)
+        .await
+        .expect("the next apply completes the failed sentinel release on the same handle");
+
+    db.branch_create("blocks-schema").await.unwrap();
+    let refused = {
+        let _release_failure = catalog::BRANCH_DELETE_POST_ARCHIVE.fire_always();
+        db.apply_schema(&indexed_schema).await.unwrap_err()
+    };
+    assert_eq!(
+        refused.completion_evidence(),
+        Some(CompletionEvidence::Uncertain),
+        "failed sentinel completion must dominate the mono-branch refusal: {refused}"
+    );
+    assert_eq!(db.list_commits(None).await.unwrap(), before_refusal);
+    db.branch_delete("blocks-schema").await.unwrap();
+    db.apply_schema(&indexed_schema)
+        .await
+        .expect("the mono-branch refusal's pending release also heals on the same handle");
 }
 
 #[tokio::test]
@@ -3841,7 +3986,7 @@ async fn branch_merge_pointer_keeps_an_unregistered_target_ref() {
         "the source's write is its own detached pin"
     );
     assert_eq!(
-        db.branch_merge("source", "target").await.unwrap(),
+        db.branch_merge("source", "target").await.unwrap().outcome,
         omnigraph::db::MergeOutcome::FastForward
     );
     assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
@@ -3949,7 +4094,7 @@ async fn branch_merge_pointer_failure_retries_without_sidecar() {
     );
     assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
     assert_eq!(
-        db.branch_merge("source", "target").await.unwrap(),
+        db.branch_merge("source", "target").await.unwrap().outcome,
         omnigraph::db::MergeOutcome::FastForward
     );
     assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
@@ -5369,14 +5514,25 @@ async fn branch_merge_fences_target_delete_recreate_aba() {
         "the target's write keeps main's registration: branch writes never fork"
     );
     let old_target_ref = helpers::graph_native_ref(&uri, "target").await;
+    let target_head_before = branch_head_commit_id(dir.path(), "target").await.unwrap();
+    let source_head_before = branch_head_commit_id(dir.path(), "source").await.unwrap();
 
     let merge_rv =
         helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+    let return_rv = helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_MERGE_PRE_RETURN);
     let control_rv = helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_CONTROL_PRE_GATES);
 
     let merge_handle = std::sync::Arc::clone(&merge_db);
-    let merge_task =
-        tokio::spawn(async move { merge_handle.branch_merge("source", "target").await });
+    // Hold blocks its crossing thread. Keep A off B's runtime so releasing
+    // the branch gate cannot queue B in A's non-stealable Tokio LIFO slot
+    // immediately before A parks at the return seam.
+    let merge_task = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(merge_handle.branch_merge("source", "target"))
+    });
     merge_rv.wait_until_reached().await;
 
     let control_handle = std::sync::Arc::clone(&control_db);
@@ -5416,9 +5572,40 @@ async fn branch_merge_fences_target_delete_recreate_aba() {
         "the target ref incarnation changed while merge authority was parked"
     );
 
-    let outcome = merge_task.await.unwrap().unwrap();
-    assert_eq!(outcome, omnigraph::db::MergeOutcome::Merged);
-    control_task.await.unwrap().unwrap();
+    // The operation result survives later control work: once publication has
+    // finished, the return boundary must not retain the branch write gates.
+    return_rv.wait_until_reached().await;
+    let control_result =
+        tokio::time::timeout(std::time::Duration::from_secs(10), &mut control_task).await;
+    let merge_still_held = !merge_task.is_finished();
+    return_rv.release();
+    let outcome = merge_task.join().unwrap().unwrap();
+    control_result
+        .expect("target replacement must finish while the merge receipt is held")
+        .unwrap()
+        .unwrap();
+    assert!(
+        merge_still_held,
+        "the merge must still be held before returning its receipt"
+    );
+    assert_eq!(outcome.outcome, omnigraph::db::MergeOutcome::Merged);
+    let commit = outcome
+        .commit
+        .expect("the original merge published a commit");
+    assert_eq!(commit.graph_branch.as_deref(), Some("target"));
+    assert_eq!(
+        commit.parent_commit_id.as_deref(),
+        Some(target_head_before.as_str())
+    );
+    assert_eq!(
+        commit.merged_parent_commit_id.as_deref(),
+        Some(source_head_before.as_str())
+    );
+    assert_ne!(
+        commit.graph_commit_id,
+        branch_head_commit_id(dir.path(), "target").await.unwrap(),
+        "the receipt must not identify the replacement branch's later writer"
+    );
 
     let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
     assert_eq!(
@@ -5457,6 +5644,25 @@ async fn branch_merge_fences_target_delete_recreate_aba() {
         (&old_entry.dataset_path, old_entry.published_dataset_version),
         "the regression fixture must exercise same-path/same-version ABA"
     );
+
+    // A fault at the same return boundary can lose an already-published
+    // result. It must not masquerade as an ordinary pre-effect refusal.
+    drop(return_rv);
+    let before_lost_receipt = branch_head_commit_id(dir.path(), "target").await.unwrap();
+    let lost = {
+        let _failure = catalog::BRANCH_MERGE_PRE_RETURN.fail_once_at(1);
+        reopened.branch_merge("source", "target").await.unwrap_err()
+    };
+    assert_eq!(
+        lost.completion_evidence(),
+        Some(CompletionEvidence::Uncertain),
+        "post-publication receipt failure must retain uncertainty: {lost}"
+    );
+    assert_ne!(
+        branch_head_commit_id(dir.path(), "target").await.unwrap(),
+        before_lost_receipt,
+        "the injected receipt failure must follow a real publication"
+    );
 }
 
 /// `sync_branch` replaces a handle's active coordinator. It must join the same
@@ -5491,7 +5697,7 @@ async fn branch_merge_fences_concurrent_sync_on_same_handle() {
     );
 
     assert_eq!(
-        merge_task.await.unwrap().unwrap(),
+        merge_task.await.unwrap().unwrap().outcome,
         omnigraph::db::MergeOutcome::Merged
     );
     sync_task.await.unwrap().unwrap();
@@ -5603,7 +5809,7 @@ async fn branch_merge_source_advance_keeps_captured_source_parent() {
     merge_rv.release();
 
     assert_eq!(
-        merge_task.await.unwrap().unwrap(),
+        merge_task.await.unwrap().unwrap().outcome,
         omnigraph::db::MergeOutcome::Merged
     );
     let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
@@ -5689,7 +5895,10 @@ async fn branch_merge_captured_source_survives_concurrent_cleanup() {
     eprintln!(
         "captured pin {captured}: present after cleanup={captured_survived}; merge={merged:?}"
     );
-    assert_eq!(merged.unwrap(), omnigraph::db::MergeOutcome::FastForward);
+    assert_eq!(
+        merged.unwrap().outcome,
+        omnigraph::db::MergeOutcome::FastForward
+    );
 
     let reader = helpers::session(Omnigraph::open(&uri).await.unwrap());
     let published = pinned_version(&reader, "target", "node:Person").await;
@@ -6426,7 +6635,8 @@ async fn assert_merge_onto_main_is_a_pointer_switch(seam: &'static omnigraph::se
         assert_eq!(
             with_merge_write_probes(probes.clone(), db.branch_merge("feature", "main"))
                 .await
-                .unwrap(),
+                .unwrap()
+                .outcome,
             omnigraph::db::MergeOutcome::FastForward,
             "a merge onto main never reaches {}",
             seam.name()
@@ -6567,7 +6777,7 @@ async fn assert_multichunk_merge_onto_main_is_a_pointer_switch(
     {
         let _fp = seam.fire_always();
         assert_eq!(
-            db.branch_merge("feature", "main").await.unwrap(),
+            db.branch_merge("feature", "main").await.unwrap().outcome,
             omnigraph::db::MergeOutcome::FastForward,
             "a merge onto main never reaches {}",
             seam.name()
@@ -6789,7 +6999,7 @@ async fn branch_merge_into_a_named_target_stages_on_the_inherited_table() {
     let inherited_pin = pinned_version(&db, "target", "node:Person").await;
     let (head_before, _) = person_versions(&db, "target").await;
     assert_eq!(
-        db.branch_merge("source", "target").await.unwrap(),
+        db.branch_merge("source", "target").await.unwrap().outcome,
         omnigraph::db::MergeOutcome::Merged,
         "a merge into a named target whose target advanced is a three-way merge"
     );
@@ -6843,7 +7053,7 @@ async fn branch_merge_pointer_adoption_carries_the_source_pin() {
     let source_pin = pinned_version(&db, "source", "node:Person").await;
 
     assert_eq!(
-        db.branch_merge("source", "target").await.unwrap(),
+        db.branch_merge("source", "target").await.unwrap().outcome,
         omnigraph::db::MergeOutcome::FastForward
     );
     assert!(sidecar_operation_ids(dir.path()).is_empty());
@@ -7498,9 +7708,9 @@ async fn live_handle_keeps_writing_after_persistent_ack_loss_stops() {
 /// family the failure-window matrix does not already cover with its
 /// same-handle actor, fail the family's driver once at the seam on a live
 /// handle, then prove the SAME handle's next ordinary write succeeds —
-/// without reopening. The driver's own outcome is recorded, not asserted
-/// (some seams absorb, some drivers may not reach an armed seam); the
-/// liveness insert is the contract.
+/// without reopening. Most driver outcomes are recorded (some seams absorb,
+/// some drivers may not reach an armed seam); the post-archive deletion row
+/// also owns its completion evidence. The liveness insert is the common contract.
 #[tokio::test]
 #[serial]
 async fn live_handle_writes_after_every_write_family_seam_failure() {
@@ -7647,9 +7857,19 @@ async fn live_handle_writes_after_every_write_family_seam_failure() {
             Driver::BranchDelete => {
                 let name = format!("lv_d{index}");
                 db.branch_create(&name).await.expect("delete-row setup");
-                db.branch_delete(&name)
-                    .await
-                    .map_err(|error| error.to_string())
+                let commits_before = db.list_commits(Some("main")).await.unwrap();
+                let result = db.branch_delete(&name).await;
+                if *seam == "branch_delete.post_archive" {
+                    let error = result.as_ref().expect_err("post-archive fault is reached");
+                    assert_eq!(
+                        error.completion_evidence(),
+                        Some(CompletionEvidence::Uncertain),
+                        "retirement published before completion failed: {error}"
+                    );
+                    assert!(!db.branch_list().await.unwrap().contains(&name));
+                    assert_eq!(db.list_commits(Some("main")).await.unwrap(), commits_before);
+                }
+                result.map_err(|error| error.to_string())
             }
             Driver::BranchMutate => {
                 let name = format!("lv_m{index}");
@@ -8443,7 +8663,11 @@ async fn cleanup_keeps_a_late_retired_merge_base_provider() {
     }
     let merger = helpers::session(Omnigraph::open(&uri).await.unwrap());
     assert_eq!(
-        merger.branch_merge("source", "target").await.unwrap(),
+        merger
+            .branch_merge("source", "target")
+            .await
+            .unwrap()
+            .outcome,
         omnigraph::db::MergeOutcome::Merged
     );
     let snapshot = helpers::snapshot_branch(&merger, "target").await.unwrap();

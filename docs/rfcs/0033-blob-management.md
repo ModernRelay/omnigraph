@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-08-09
-updated: 2026-09-29
+updated: 2026-09-30
 discussion: null
 supersedes: []
 superseded_by: []
@@ -341,8 +341,10 @@ boundaries, just like `cleanup`: Phase 1 adds
 no durable reader lease or cross-process live-reader registry. Callers that
 require an opened reader to finish must quiesce it before deleting that branch,
 running version GC, or performing an offline operation that removes a ref/path.
-The proposed [historical-read contract](2026-09-29-server-runtime-and-online-deployment.md#historical-reads)
-owns served-reader retention; ordinary detached writes need no compensation.
+The v0.12 [server runtime proposal](2026-09-29-server-runtime-and-online-deployment.md)
+drains affected reads during deployment. Independent historical availability
+and its stronger reader-retention protocol require a separate proposal; neither
+changes the quiescence rule above. Ordinary detached writes need no compensation.
 A reader never retargets, but if reclamation removes an immutable
 object it has not yet cached, a later range read may fail loudly with a
 storage/integrity error. It never switches to branch HEAD, another table version,
@@ -643,9 +645,9 @@ external redirect retain the capture through response completion; a managed GET
 retains it through body/scoped-producer EOF, error, or drop. Disconnect cancels
 the read normally and releases the permit only after producer settlement. A
 closed lane fails before target work with the shared lifecycle 503; a fresh
-schema-token mismatch returns the shared stale-generation outcome and wakes the
-supervisor. Middleware never reloads the registry and silently switches
-generations.
+schema-token mismatch returns the shared stale-generation outcome and notifies
+the designated owner. It neither retries the request nor initiates inline repair.
+Middleware never reloads the registry and silently switches generations.
 
 For managed content:
 
@@ -1128,7 +1130,7 @@ depends on typed code and fields, not an opaque Lance string.
 | Valid but unsatisfiable HTTP range | `BlobRangeNotSatisfiable { start, end, length }` details | 416 plus `Content-Range: bytes */N` and `blob_range` |
 | Blob write If-Match failed | `BlobWritePreconditionFailed { current_etag }` | 412 plus `blob_precondition_failure`; never graph `precondition_failure` |
 | Generation lane closed before operation | shared proposed lifecycle detail | 503, not started |
-| Captured generation schema token is stale | shared proposed stale-generation outcome | shared mapping and supervisor wake; no Blob-specific error |
+| Captured generation schema token is stale | shared proposed stale-generation outcome | shared refusal and designated-owner notification; no Blob-specific error or inline repair |
 | Publication or schema/control completion uncertain | exact engine outcome and retained publication evidence | existing mapping; never permission to replay |
 | Owned write panics or has no knowable terminal outcome | shared proposed unknown-outcome class | 500; never success or replay |
 | Persisted table/Blob integrity contradiction | `BlobIntegrity { reason }` | exhaustive server mapping is 5xx |
@@ -1148,8 +1150,9 @@ keyed/irreversible base identifier. Phase 2A deliberately does not add a new
 metrics backend merely to claim this box; the telemetry ships in a focused
 follow-up against the repository's eventual production observability owner.
 The [server runtime proposal](2026-09-29-server-runtime-and-online-deployment.md#availability-and-supervision)
-owns generic lifecycle metrics. This RFC adds only Blob
-classification, range, payload-byte, validator, and delivery timing dimensions.
+specifies bounded lifecycle status. Production telemetry stays with the
+observability owner above; this RFC adds Blob classification, range, payload-byte,
+validator, and delivery timing dimensions.
 
 ## 12. Test and acceptance plan
 
@@ -1235,14 +1238,20 @@ The implementation extends existing owners before creating new fixtures, per
   deduplication, chunk-bounded payload reuse, and pointer-only no-I/O adoption.
 - Existing schema-apply coverage gains an empty Blob and a neighboring non-empty
   Blob rather than adding a duplicate initialization fixture.
-- `failpoints.rs`: extend the existing Mutation publication matrix with Blob PUT
-  and clear cells stopped after detached effects but before publication, and
-  separately after publication with a lost acknowledgment. Reopen and prove the
-  exact old or published graph state from publication evidence, with no duplicate
-  commit. A published PUT has exact bytes and an ETag equal to a fresh read; a
-  published clear has null/NotFound, no ETag, and rejects the old ETag. The
-  injected call never invents a successful outcome; the proposed completion owner
-  preserves evidence and later progress.
+- `detached_commit_matrix.rs`: extend the existing writer × window × fault ×
+  recovery-actor matrix with Blob PUT and clear, stopped after detached effects
+  but before publication. Prove no visible Blob effect and the exact expected
+  graph state/publication census, accounting for an admitted competing writer.
+  Return-fault cells must resume writes on the same live handle
+  once faults stop, without reopening; fresh-handle/read-only actors retain
+  their independent state checks. Reuse the matrix's fixture and oracle.
+- `failpoints.rs`: extend the post-publication lost-acknowledgment owners with
+  Blob PUT and clear. Prove exact published state, no duplicate commit and
+  same-handle write progress once faults stop, as well as fresh-read agreement.
+  A published PUT has exact bytes and an ETag equal to a fresh read; a published
+  clear has null/NotFound, no ETag, and rejects the old ETag. The injected call
+  never invents a successful outcome; the proposed completion owner preserves
+  evidence and later progress.
 - Phase 3 registers new writes under Mutation in `forbidden_apis.rs`; no new
   durable call site appears.
 
@@ -1675,6 +1684,15 @@ publisher architecture.
 
 ## Decision log
 
+- 2026-09-30: Narrowed references to the proposed v0.12 server scope: independent
+  historical availability and stronger retention need a separate proposal;
+  stale-generation refusal notifies the designated owner, and lifecycle status
+  does not introduce a generic metrics owner. Accepted Blob behavior and current
+  reader-quiescence requirements are unchanged.
+- 2026-09-30: Phase 3 Blob pre-publication coverage extends the detached-commit
+  matrix, including its default same-handle liveness actor; post-publication
+  acknowledgment loss remains with the failpoint owners. This assigns proposed
+  coverage, not implementation evidence.
 - 2026-09-29: The server runtime proposal replaces the dependency on RFCs
   0034–0036 in the served lifecycle, authority, and Phase 3 prerequisites.
   The publication and failure-test paragraphs now follow detached Mutation

@@ -12,6 +12,61 @@ const MUTATE: &str = "--- mutate\nquery ins($n: String) {\n    insert Person { n
 const PARAMS: &str = "--- params\n{\"n\": \"bob\"}\n";
 const EXPECT_OK: &str = "--- expect ok\n";
 
+/// Exercise the public comparison door after successful v2 execution. Its
+/// source check must survive the compiler folding a named @type to a literal.
+#[tokio::test]
+async fn reference_comparison_refuses_named_type_access_in_every_read_position() {
+    for (clauses, returns, order, rows, shape) in [
+        (
+            "$a: Person $a $e:knows $b",
+            "$e.@type as kind",
+            "",
+            "{\"kind\":\"Knows\"}",
+            "kind: String",
+        ),
+        (
+            "$a: Person $a $e:knows $b $e.@type = \"Knows\"",
+            "$b.name as name",
+            "",
+            "{\"name\":\"bob\"}",
+            "name: String",
+        ),
+        (
+            "$a: Person $a $e:knows $b",
+            "count($e.@type) as n",
+            "",
+            "{\"n\":1}",
+            "n: I64",
+        ),
+        (
+            "$a: Person $a $e:knows $b",
+            "$b.name as name",
+            "order { $e.@type }",
+            "{\"name\":\"bob\"}",
+            "name: String",
+        ),
+        (
+            "$a: Person exists { $a $e:knows $b $e.@type = \"Knows\" }",
+            "$a.name as name",
+            "",
+            "{\"name\":\"alice\"}",
+            "name: String",
+        ),
+    ] {
+        let text = format!(
+            "{HDR}{TRAVERSAL_SCHEMA}{TRAVERSAL_SEED}--- query\nquery q() {{ match {{ {clauses} }} return {{ {returns} }} {order} }}\n--- expect unordered\n{rows}\n--- expect shape\n{shape}\n--- expect same as v1\n"
+        );
+        let case = parse_case("reference_type_admission", &text).unwrap();
+        let error = execute_case(&case, Path::new("unused.gqt"), false)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("reference engine does not support edge @type access"),
+            "{error}"
+        );
+    }
+}
+
 fn refusal(stem: &str, text: &str) -> String {
     parse_case(stem, text).expect_err("expected the case to be refused")
 }
