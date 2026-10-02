@@ -914,7 +914,8 @@ node Image { title: String @key content: Blob? note: String? }
         .unwrap(),
     ])
     .unwrap();
-    let graph_path = dir.path().join("graph");
+    let graph_dir = tempfile::tempdir().unwrap();
+    let graph_path = graph_dir.path().join("graph");
     let db = helpers::session(
         Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
             .await
@@ -997,7 +998,8 @@ node Image { title: String @key content: Blob? }
         .unwrap(),
     ])
     .unwrap();
-    let graph_path = dir.path().join("graph");
+    let graph_dir = tempfile::tempdir().unwrap();
+    let graph_path = graph_dir.path().join("graph");
     let db = helpers::session(
         Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
             .await
