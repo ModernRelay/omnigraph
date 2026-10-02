@@ -2001,7 +2001,7 @@ async fn run(cli: Cli) -> Result<()> {
                     print_json(&payload)?;
                 } else {
                     for entry in payload.graphs {
-                        println!("{}\t{}", entry.graph_id, entry.uri);
+                        println!("{}\t{}\t{}", entry.graph_id, entry.state, entry.uri);
                     }
                 }
             }

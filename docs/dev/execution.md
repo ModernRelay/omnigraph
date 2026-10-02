@@ -403,8 +403,11 @@ registration precedes each graph producer and blocking job. The registration
 outlives its captured future, resources and abandoned result, including on
 panic or cancellation. `QueryContext::run_owned` drops the completed execution
 future, closes new root registrations and joins these children before returning
-success or an error; successive search passes share the same scope. Dropping
-the caller closes registration while surviving children retain their leases.
+success, an error or the original panic payload. This includes a panic when
+dropping the completed execution future; successive search passes share the
+same scope. Dropping an embedded caller closes registration while surviving
+children retain their leases. HTTP/MCP read execution stays owned after caller
+disconnect or response timeout, allowing this join to finish.
 After closure a root registration (`QueryWorkScope::register`, which
 `WorkMemory::blocking` takes) is refused; a live child adds workers only through
 its own lease (`QueryWorkLease::child`, `WorkMemory::blocking_owned`).

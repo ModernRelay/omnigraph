@@ -6,6 +6,10 @@ use futures::TryStreamExt;
 const SCHEMA_BLOB_DESCRIPTOR_SCAN_ROWS: usize = 1024;
 const SCHEMA_BLOB_DESCRIPTOR_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 
+mod prepared;
+pub use prepared::{PreparedSchemaApply, SchemaApplyReconciliation, SchemaContractDigest};
+pub(super) use prepared::{prepare_schema_apply, reconcile_schema_apply};
+
 fn resolve_desired_schema_ir(
     accepted_ir: &SchemaIR,
     desired_schema_source: &str,
@@ -206,7 +210,26 @@ where
     let _export_exclusion = db.reserve_export_destructive_control()?;
 
     let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
-    apply_schema_with_lock(db, desired_schema_source, actor, validate_catalog).await
+    apply_schema_with_lock(db, desired_schema_source, actor, validate_catalog, None).await
+}
+
+pub(super) async fn apply_prepared_schema(
+    db: &Omnigraph,
+    prepared: &PreparedSchemaApply,
+    actor: Option<&str>,
+) -> Result<SchemaApplyResult> {
+    prepared::authorize(db, actor)?;
+    prepared.validate_envelope(db, actor)?;
+    let _export_exclusion = db.reserve_export_destructive_control()?;
+    let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
+    apply_schema_with_lock(
+        db,
+        &prepared.desired_source,
+        actor,
+        |_| Ok(()),
+        Some(prepared),
+    )
+    .await
 }
 
 pub(super) async fn apply_schema_with_lock<F>(
@@ -214,49 +237,72 @@ pub(super) async fn apply_schema_with_lock<F>(
     desired_schema_source: &str,
     actor: Option<&str>,
     validate_catalog: F,
+    prepared: Option<&PreparedSchemaApply>,
 ) -> Result<SchemaApplyResult>
 where
     F: FnOnce(&Catalog) -> Result<()>,
 {
-    db.refresh_coordinator_only()
+    prepared::authorize(db, actor)?;
+    let captured = prepared::capture(db, desired_schema_source, prepared)
         .await
         .map_err(OmniError::before_effect)?;
-    let (accepted_catalog, accepted_identity) = {
-        let snapshot = db.coordinator.read().await.snapshot();
-        db.accepted_catalog_for_snapshot(&snapshot)
-            .await
-            .map_err(OmniError::before_effect)?
+    let issued;
+    let prepared = if let Some(prepared) = prepared {
+        prepared.validate_capture(db, actor, &captured)?;
+        prepared
+    } else {
+        issued = captured.issue(db, desired_schema_source, actor)?;
+        &issued
     };
+    if let Some(commit_id) = prepared.graph_commit_id()
+        && db
+            .coordinator
+            .read()
+            .await
+            .captured_commit(commit_id)
+            .is_some()
+    {
+        return Err(OmniError::manifest_conflict(
+            "schema publication identity already exists",
+        ));
+    }
+    let prepared::CapturedSchemaApply {
+        planned,
+        accepted_catalog,
+        accepted_identity,
+        snapshot,
+        branch_identifier: base_branch_identifier,
+        graph_head: base_graph_head,
+        ..
+    } = captured;
     let accepted_ir = accepted_catalog.bound_schema_ir().cloned().ok_or_else(|| {
         OmniError::manifest_internal("accepted catalog carries no bound SchemaIR")
     })?;
-    let planned = plan_schema_for_apply_from_accepted(db, desired_schema_source, &accepted_ir)
-        .await
-        .map_err(OmniError::before_effect)?;
     validate_catalog(&planned.desired_catalog)?;
     let PlannedSchemaApply {
         plan,
         desired_ir,
         desired_catalog,
     } = planned;
-    if plan.steps.is_empty() {
+    if prepared.is_noop() {
+        db.store_schema_view(
+            desired_catalog,
+            desired_schema_source.to_string(),
+            &desired_ir,
+        )?;
         return Ok(SchemaApplyResult {
             supported: true,
             applied: false,
-            graph_manifest_version: db.version().await,
+            graph_manifest_version: snapshot.graph_manifest_version(),
             steps: plan.steps,
+            commit: None,
+            contract: prepared.desired_contract().clone(),
         });
     }
-
-    let (snapshot, base_branch_identifier, base_graph_head, lineage_intent) = {
-        let coordinator = db.coordinator.read().await;
-        (
-            coordinator.snapshot(),
-            coordinator.branch_identifier().await?,
-            coordinator.exact_graph_head(),
-            coordinator.new_lineage_intent(actor, None)?,
-        )
-    };
+    let lineage_intent = prepared
+        .lineage
+        .clone()
+        .expect("effectful intent has lineage");
     let mut added_tables = BTreeSet::new();
     // Resolve every rename before classifying dependent property steps. The
     // planner currently emits RenameType first, but correctness must not depend
@@ -493,8 +539,8 @@ where
 
     // The snapshot was captured before the branch/table waits. Revalidate the
     // complete authority token now, while those gates are held, so a stale
-    // plan never stages an effect. Physical-only __manifest compaction may
-    // change its numeric version without changing this logical authority.
+    // plan never stages an effect. This intent also binds the numeric version:
+    // physical-only manifest movement requires a fresh preparation.
     db.refresh_coordinator_only().await?;
     let (current_branch_identifier, current_graph_head) = {
         let coordinator = db.coordinator.read().await;
@@ -530,6 +576,13 @@ where
         ));
     }
     let current_snapshot = db.coordinator.read().await.snapshot();
+    if current_snapshot.graph_manifest_version() != snapshot.graph_manifest_version() {
+        return Err(OmniError::manifest_read_set_changed(
+            "prepared_schema_manifest_version",
+            Some(snapshot.graph_manifest_version().to_string()),
+            Some(current_snapshot.graph_manifest_version().to_string()),
+        ));
+    }
     let (current_catalog, current_identity) =
         db.accepted_catalog_for_snapshot(&current_snapshot).await?;
     validate_bound_catalog_against_snapshot(&current_catalog, &current_snapshot)?;
@@ -849,10 +902,7 @@ where
                 base_graph_head.clone(),
             ),
         );
-        let PublishedSnapshot {
-            graph_manifest_version,
-            ..
-        } = db
+        let published = db
             .coordinator
             .write()
             .await
@@ -875,12 +925,12 @@ where
             db.invalidate_graph_index().await;
         }
         fail(&SCHEMA_APPLY_AFTER_MANIFEST_COMMIT)?;
-        Ok::<u64, OmniError>(graph_manifest_version)
+        Ok::<PublishedSnapshot, OmniError>(published)
     }
     .await;
 
-    let manifest_version = match effects {
-        Ok(manifest_version) => manifest_version,
+    let published = match effects {
+        Ok(published) => published,
         Err(error) => {
             return Err(match published_commit {
                 Some(graph_commit_id) => {
@@ -894,8 +944,10 @@ where
     Ok(SchemaApplyResult {
         supported: true,
         applied: true,
-        graph_manifest_version: manifest_version,
+        graph_manifest_version: published.graph_manifest_version,
         steps: plan.steps,
+        commit: Some(published.commit),
+        contract: prepared.desired_contract().clone(),
     })
 }
 

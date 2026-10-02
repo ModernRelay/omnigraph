@@ -1882,6 +1882,7 @@ fn local_applied_empty_cluster_serves_exact_witness_and_empty_inventory() {
             .json()
             .unwrap();
         assert_eq!(ready["ready"], true, "{ready}");
+        assert_eq!(ready["status"], "serving");
         assert_eq!(
             ready["booted_serving_digest"],
             ledger["applied_revision"]["config_digest"]
@@ -1889,7 +1890,8 @@ fn local_applied_empty_cluster_serves_exact_witness_and_empty_inventory() {
         assert_eq!(ready["state_revision"], ledger["state_revision"]);
         assert_eq!(ready["state_cas"], state_cas);
         assert_eq!(ready["served_graph_count"], 0);
-        assert_eq!(ready["quarantined_graph_count"], 0);
+        assert_eq!(ready["ready_graph_count"], 0);
+        assert_eq!(ready["blocked_graph_count"], 0);
         let inventory = format!("{}/graphs", server.base_url);
         assert_eq!(
             client.get(&inventory).send().unwrap().status().as_u16(),

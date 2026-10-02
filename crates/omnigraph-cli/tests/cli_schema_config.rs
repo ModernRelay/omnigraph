@@ -302,6 +302,33 @@ fn schema_apply_human_reports_noop() {
     assert!(stdout.contains("applied: no"));
     assert!(stdout.contains("graph_manifest_version:"));
     assert!(stdout.contains("no schema changes"));
+
+    let source_only = temp.path().join("commented.pg");
+    fs::write(
+        &source_only,
+        format!(
+            "// Updated schema documentation.\n{}",
+            fs::read_to_string(&schema_path).unwrap()
+        ),
+    )
+    .unwrap();
+    let stdout = stdout_string(&output_success(
+        cli()
+            .args(["schema", "apply", "--schema"])
+            .arg(&source_only)
+            .arg(&graph),
+    ));
+    assert!(stdout.contains("applied: yes"), "{stdout}");
+    assert!(stdout.contains("schema source updated"), "{stdout}");
+    assert!(!stdout.contains("no schema changes"), "{stdout}");
+
+    let plan = stdout_string(&output_success(
+        cli()
+            .args(["schema", "plan", "--schema"])
+            .arg(&source_only)
+            .arg(&graph),
+    ));
+    assert!(plan.contains("no table migration steps"), "{plan}");
 }
 
 #[test]
@@ -630,24 +657,34 @@ fn explicit_graph_discovery_preserves_jwt_shaped_static_catalog_and_skips_contex
         "header.{}.signature",
         URL_SAFE_NO_PAD.encode(claims.to_string())
     );
-    for discovery in [false, true] {
+    for (discovery, json_output) in [(false, false), (false, true), (true, true)] {
         let reply = if discovery {
             serde_json::json!({"graphs":[{"graph_id":"alpha","display_name":"alpha"}]})
         } else {
-            serde_json::json!({"graphs":[{"graph_id":"alpha","uri":"file:///private/alpha"}]})
+            serde_json::json!({"graphs":[{"graph_id":"alpha","uri":"file:///private/alpha","state":"ready","read_available":true,"write_available":true,"action":"none"},{"graph_id":"beta","uri":"file:///private/beta","state":"blocked","read_available":false,"write_available":false,"failure":"open_failed","action":"restart_after_correction"}]})
         };
         let server = IntentApiFixture::graph(vec![IntentReply::json(200, reply.clone())]);
         let mut command = cli();
         command
             .current_dir(directory.path())
             .env("OMNIGRAPH_BEARER_TOKEN", &token)
-            .args(["graphs", "list", "--server", &server.origin, "--json"]);
+            .args(["graphs", "list", "--server", &server.origin]);
+        if json_output {
+            command.arg("--json");
+        }
         if discovery {
             command.arg("--discovery");
         }
         let output = output_success(&mut command);
-        let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(actual, reply);
+        if json_output {
+            let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(actual, reply);
+        } else {
+            assert_eq!(
+                stdout_string(&output),
+                "alpha\tready\tfile:///private/alpha\nbeta\tblocked\tfile:///private/beta\n"
+            );
+        }
         assert_eq!(
             server.workflow_requests()[0].path,
             if discovery {

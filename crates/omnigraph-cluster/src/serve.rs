@@ -35,6 +35,14 @@ pub struct ServingPolicy {
     pub applies_to: Vec<String>,
 }
 
+/// An applied graph refused by snapshot safety checks. Preserve its exact
+/// configured storage root without loading rejected policies or graph data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServingBlockedGraph {
+    pub graph_id: String,
+    pub root: PathBuf,
+}
+
 /// Everything a server needs to boot from the cluster catalog (RFC-005 §D2).
 #[derive(Debug, Clone)]
 pub struct ServingSnapshot {
@@ -54,7 +62,7 @@ pub struct ServingSnapshot {
     /// quarantined them, or their applied external Blob policy has a
     /// server-safe base overlapping the cluster storage root. A sidecar for a
     /// graph the revision does not name is not in this list.
-    pub quarantined_graphs: Vec<String>,
+    pub quarantined_graphs: Vec<ServingBlockedGraph>,
 }
 
 /// A serving snapshot paired with the canonical root of the same opened store.
@@ -593,6 +601,10 @@ pub(crate) async fn read_snapshot_with_store(
         quarantined_graphs: quarantined_graphs
             .into_iter()
             .filter(|graph_id| boot_applied_graphs.contains(graph_id))
+            .map(|graph_id| ServingBlockedGraph {
+                root: PathBuf::from(backend.graph_root(&graph_id)),
+                graph_id,
+            })
             .collect(),
         applied_graphs: boot_applied_graphs,
     })

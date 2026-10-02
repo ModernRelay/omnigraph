@@ -363,7 +363,49 @@ mod tests {
     /// still running; GQT cannot pause a worker or inspect an unreturned result.
     #[tokio::test(flavor = "current_thread")]
     async fn query_return_waits_for_owned_producers_on_success_and_error() {
-        for fail in [false, true] {
+        #[derive(Clone, Copy, Debug)]
+        enum Completion {
+            Success,
+            Error,
+            PollPanic,
+            DropPanic,
+        }
+
+        struct Execution {
+            stream: Option<SendableRecordBatchStream>,
+            completion: Completion,
+        }
+
+        impl Future for Execution {
+            type Output = std::result::Result<u32, &'static str>;
+
+            fn poll(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                drop(self.stream.take());
+                std::task::Poll::Ready(match self.completion {
+                    Completion::Error => Err("query error sentinel"),
+                    Completion::PollPanic => panic!("query poll panic sentinel"),
+                    _ => Ok(42),
+                })
+            }
+        }
+
+        impl Drop for Execution {
+            fn drop(&mut self) {
+                if matches!(self.completion, Completion::DropPanic) {
+                    panic!("query drop panic sentinel");
+                }
+            }
+        }
+
+        for completion in [
+            Completion::Success,
+            Completion::Error,
+            Completion::PollPanic,
+            Completion::DropPanic,
+        ] {
             let probes = QueryMemoryProbes::default();
             let pause = probes.pause_blocking_work();
             with_query_memory_probes(probes.clone(), async {
@@ -385,29 +427,39 @@ mod tests {
                 })
                 .await
                 .expect("producer must reach its charged checkpoint");
-                let expected = if fail {
-                    Err("query error sentinel")
-                } else {
-                    Ok(42)
-                };
-                let returned = context.run_owned(async move {
-                    drop(stream);
-                    expected
-                });
+                let returned = std::panic::AssertUnwindSafe(context.run_owned(Execution {
+                    stream: Some(stream),
+                    completion,
+                }))
+                .catch_unwind();
                 tokio::pin!(returned);
                 assert!(
                     futures::poll!(returned.as_mut()).is_pending(),
-                    "a completed execution must retain its result until the worker releases"
+                    "{completion:?} must retain its result or panic until the worker releases"
                 );
                 assert!(probes.active_blocking_work() > 0);
                 assert!(probes.reserved_bytes() >= 4_096);
                 pause.release();
-                assert_eq!(
-                    tokio::time::timeout(Duration::from_secs(3), returned)
-                        .await
-                        .unwrap(),
-                    expected,
-                );
+                let returned = tokio::time::timeout(Duration::from_secs(3), returned)
+                    .await
+                    .unwrap();
+                match completion {
+                    Completion::Success => assert_eq!(returned.unwrap(), Ok(42)),
+                    Completion::Error => {
+                        assert_eq!(returned.unwrap(), Err("query error sentinel"));
+                    }
+                    Completion::PollPanic | Completion::DropPanic => {
+                        let expected = if matches!(completion, Completion::PollPanic) {
+                            "query poll panic sentinel"
+                        } else {
+                            "query drop panic sentinel"
+                        };
+                        assert_eq!(
+                            returned.unwrap_err().downcast_ref::<&str>(),
+                            Some(&expected)
+                        );
+                    }
+                }
                 assert_eq!(probes.active_blocking_work(), 0);
                 assert_eq!(probes.reserved_bytes(), 0);
             })

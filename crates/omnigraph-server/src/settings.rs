@@ -73,13 +73,11 @@ fn settings_from_snapshot(
     }
     let env_require_all_graphs = env_flag("OMNIGRAPH_REQUIRE_ALL_GRAPHS");
     let require_all_graphs = cli_require_all_graphs || env_require_all_graphs;
-    // RFC 0049: what `/readyz` and `GET /graphs` report. Every graph the
-    // applied revision names, whether or not this process ends up serving it.
+    // Boot provenance is independent of the complete runtime graph inventory.
     let witness = BootWitness {
         booted_serving_digest: snapshot.config_digest.clone(),
         state_revision: snapshot.state_revision,
         state_cas: snapshot.state_cas.clone(),
-        applied_graphs: snapshot.applied_graphs.clone(),
     };
     if require_all_graphs && !snapshot.diagnostics.is_empty() {
         let details = snapshot
@@ -134,7 +132,20 @@ fn settings_from_snapshot(
 
     let mut graphs = Vec::new();
     let mut skipped_graphs = Vec::new();
+    for graph in &snapshot.quarantined_graphs {
+        graphs.push(GraphStartupConfig {
+            startup_failure: Some(StartupFailure::InvalidConfiguration),
+            graph_id: graph.graph_id.clone(),
+            uri: graph.root.to_string_lossy().into_owned(),
+            // The cluster refused this binding before loading its policy.
+            policy: None,
+            embedding: None,
+            external_blob_policy: omnigraph::ExternalBlobPolicy::Deny,
+            queries: QueryRegistry::default(),
+        });
+    }
     for graph in &snapshot.graphs {
+        let mut startup_failure = None;
         let specs: Vec<queries::RegistrySpec> = snapshot
             .queries
             .iter()
@@ -166,7 +177,8 @@ fn settings_from_snapshot(
                     "{}: stored queries failed to parse: {details}",
                     graph.graph_id
                 ));
-                continue;
+                startup_failure = Some(StartupFailure::InvalidStoredQueries);
+                QueryRegistry::default()
             }
         };
         let embedding = match graph
@@ -187,10 +199,12 @@ fn settings_from_snapshot(
                     "graph quarantined because embedding provider configuration failed"
                 );
                 skipped_graphs.push(format!("{}: {err}", graph.graph_id));
-                continue;
+                startup_failure = Some(StartupFailure::InvalidConfiguration);
+                None
             }
         };
         graphs.push(GraphStartupConfig {
+            startup_failure,
             graph_id: graph.graph_id.clone(),
             uri: graph.root.to_string_lossy().to_string(),
             policy: graph_policies.get(&graph.graph_id).cloned(),
@@ -199,7 +213,10 @@ fn settings_from_snapshot(
             queries: registry,
         });
     }
-    if graphs.is_empty() && !snapshot.applied_graphs.is_empty() {
+    graphs.sort_by(|a, b| a.graph_id.cmp(&b.graph_id));
+    if graphs.iter().all(|graph| graph.startup_failure.is_some())
+        && !snapshot.applied_graphs.is_empty()
+    {
         let skipped = skipped_graphs.join(", ");
         bail!(
             "the cluster at '{}' has no healthy graphs to serve{}",
@@ -485,9 +502,9 @@ mod tests {
         settings_from_snapshot,
     };
     use super::{
-        GraphStartupConfig, ServerConfig, ServerConfigMode, ServerRuntimeState,
-        classify_server_runtime_state, hash_bearer_token, normalize_bearer_token,
-        parse_bearer_tokens_json, serve, server_bearer_tokens_from_env,
+        GraphId, GraphKey, GraphStartupConfig, RegistryLookup, ServerConfig, ServerConfigMode,
+        ServerRuntimeState, StartupFailure, classify_server_runtime_state, hash_bearer_token,
+        normalize_bearer_token, parse_bearer_tokens_json, serve, server_bearer_tokens_from_env,
     };
     use serial_test::serial;
     use std::env;
@@ -757,6 +774,7 @@ mod tests {
         let config = ServerConfig {
             mode: ServerConfigMode::Multi {
                 graphs: vec![GraphStartupConfig {
+                    startup_failure: None,
                     graph_id: "alpha".to_string(),
                     uri: temp
                         .path()
@@ -813,6 +831,7 @@ mod tests {
         let config = ServerConfig {
             mode: ServerConfigMode::Multi {
                 graphs: vec![GraphStartupConfig {
+                    startup_failure: None,
                     graph_id: "default".to_string(),
                     uri: temp
                         .path()
@@ -1029,7 +1048,12 @@ graphs:
         )
         .await
         .unwrap();
-        assert_eq!(snapshot.quarantined_graphs, vec!["knowledge".to_string()]);
+        assert_eq!(snapshot.quarantined_graphs.len(), 1);
+        assert_eq!(snapshot.quarantined_graphs[0].graph_id, "knowledge");
+        assert_eq!(
+            snapshot.quarantined_graphs[0].root,
+            PathBuf::from("s3://assets/cluster/graphs/knowledge.omni"),
+        );
         assert!(snapshot.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "external_blob_base_overlaps_storage_root"
                 && diagnostic.path == "graph.knowledge"
@@ -1050,10 +1074,6 @@ graphs:
         // Ordinary boot serves the sibling and reports the quarantine.
         let config = settings_from_snapshot(dir.path(), None, true, false, snapshot).unwrap();
         assert!(!config.require_all_graphs);
-        assert_eq!(
-            config.witness.applied_graphs,
-            vec!["archive".to_string(), "knowledge".to_string()]
-        );
         let ServerConfigMode::Multi {
             mut graphs,
             config_path,
@@ -1064,7 +1084,11 @@ graphs:
                 .iter()
                 .map(|graph| graph.graph_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["archive"]
+            vec!["archive", "knowledge"]
+        );
+        assert_eq!(
+            graphs[1].startup_failure,
+            Some(StartupFailure::InvalidConfiguration)
         );
         assert_eq!(graphs[0].uri, "s3://assets/cluster/graphs/archive.omni");
         graphs[0].uri = dir
@@ -1096,8 +1120,79 @@ graphs:
                 .collect::<Vec<_>>(),
             vec!["archive".to_string()]
         );
-        assert_eq!(state.quarantined_graphs(), vec!["knowledge".to_string()]);
+        assert_eq!(state.routing.registry.len(), 2);
+        match state
+            .routing
+            .registry
+            .get(&GraphKey::cluster(GraphId::try_from("knowledge").unwrap()))
+        {
+            RegistryLookup::Blocked(graph) => {
+                assert_eq!(graph.failure, StartupFailure::InvalidConfiguration);
+                assert!(graph.policy.is_none());
+            }
+            _ => panic!("snapshot refusal must remain in the runtime inventory"),
+        }
         drop(state);
+
+        // Settings failures must retain the same complete inventory too.
+        // Point the rejected graph at a missing root: these failures must
+        // survive without attempting an engine open at that root.
+        let snapshot = omnigraph_cluster::read_serving_snapshot(dir.path())
+            .await
+            .unwrap();
+        for failure in [
+            StartupFailure::InvalidStoredQueries,
+            StartupFailure::InvalidConfiguration,
+        ] {
+            let mut snapshot = snapshot.clone();
+            let rejected = snapshot
+                .graphs
+                .iter_mut()
+                .find(|graph| graph.graph_id == "knowledge")
+                .unwrap();
+            rejected.root = dir.path().join("never-opened");
+            if failure == StartupFailure::InvalidStoredQueries {
+                snapshot.queries.push(omnigraph_cluster::ServingQuery {
+                    graph_id: "knowledge".to_string(),
+                    name: "broken".to_string(),
+                    source: "invalid query".to_string(),
+                });
+            } else {
+                rejected.embedding = Some(omnigraph_cluster::EmbeddingProviderConfig {
+                    kind: Some("openai".to_string()),
+                    base_url: None,
+                    model: None,
+                    api_key: None,
+                });
+            }
+            let config = settings_from_snapshot(dir.path(), None, true, false, snapshot).unwrap();
+            let ServerConfigMode::Multi {
+                graphs,
+                config_path,
+                server_policy,
+            } = config.mode;
+            assert_eq!(graphs.len(), 2);
+            let state = open_multi_graph_state(
+                graphs,
+                Vec::new(),
+                server_policy.as_ref(),
+                config_path,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(state.routing.registry.len(), 2);
+            assert_eq!(state.routing.registry.list().len(), 1);
+            match state
+                .routing
+                .registry
+                .get(&GraphKey::cluster(GraphId::try_from("knowledge").unwrap()))
+            {
+                RegistryLookup::Blocked(graph) => assert_eq!(graph.failure, failure),
+                _ => panic!("settings refusal must remain in the runtime inventory"),
+            }
+            assert!(!dir.path().join("never-opened").exists());
+        }
 
         assert_eq!(tree_bytes(dir.path()), before);
     }

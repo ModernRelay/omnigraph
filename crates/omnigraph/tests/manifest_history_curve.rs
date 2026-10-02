@@ -3,7 +3,9 @@
 //! data never changes size and any growth is history. Each record reports the
 //! Lance requests and bytes per stage and the retained size of `__manifest` on
 //! disk (every version's files), the space term version retention must bound.
-//! Both tests are `#[ignore]`d instruments, run explicitly.
+//! Schema-source and serialized-IR bytes vary independently in the contract
+//! curve. These are I/O/storage observations, not heap or RSS bounds. All tests
+//! are `#[ignore]`d instruments, run explicitly.
 #![recursion_limit = "512"]
 
 mod helpers;
@@ -15,9 +17,11 @@ use std::time::{Duration, Instant};
 use arrow_array::{Array, Int32Array, StringArray};
 use lance_io::utils::tracking_store::IOTracker;
 use omnigraph::instrumentation::with_query_io_probes;
+use omnigraph_compiler::schema_ir_pretty_json;
+use sha2::{Digest, Sha256};
 
-use helpers::cost::{drain_probed_io, local_graph, raw_io_probes};
-use helpers::{MUTATION_QUERIES, mixed_params};
+use helpers::cost::{drain_probed_io, raw_io_probes};
+use helpers::{MUTATION_QUERIES, TEST_SCHEMA, init_and_load_with_schema, mixed_params};
 
 async fn publication_curve_update(db: &omnigraph::Session, branch: &str, age: i64) {
     let result = db
@@ -68,7 +72,7 @@ fn retained_bytes(path: &Path) -> u64 {
         .sum()
 }
 
-async fn history_curve(depths: &[u64], branches: &[&str]) {
+async fn history_curve(depths: &[u64], branches: &[&str], schema: &str) {
     let repetitions = if cfg!(debug_assertions) { 1 } else { 3 };
     let measured_writes = if cfg!(debug_assertions) { 1u64 } else { 8u64 };
     for repetition in 1..=repetitions {
@@ -89,7 +93,15 @@ async fn history_curve(depths: &[u64], branches: &[&str]) {
                         let dir = tempfile::tempdir().unwrap();
                         let uri = dir.path().to_str().unwrap();
                         let manifest_dir = dir.path().join("__manifest");
-                        let db = local_graph(&dir).await;
+                        let db = init_and_load_with_schema(&dir, schema).await;
+                        let schema_source = db.schema_source();
+                        assert_eq!(schema_source.as_str(), schema);
+                        let schema_ir = schema_ir_pretty_json(
+                            db.catalog().bound_schema_ir().unwrap(),
+                        )
+                        .unwrap();
+                        let source_digest = format!("{:x}", Sha256::digest(schema_source.as_bytes()));
+                        let ir_digest = format!("{:x}", Sha256::digest(schema_ir.as_bytes()));
                         let main_head = helpers::snapshot_id(&db, "main").await.unwrap();
                         if branch != "main" {
                             db.branch_create(branch).await.unwrap();
@@ -117,6 +129,11 @@ async fn history_curve(depths: &[u64], branches: &[&str]) {
                                     "branch": branch,
                                     "measured_writes": measured_writes,
                                     "checkpoint_history": depth,
+                                    "schema_source_bytes": schema_source.len(),
+                                    "schema_ir_bytes": schema_ir.len(),
+                                    "schema_source_sha256": source_digest,
+                                    "schema_ir_sha256": ir_digest,
+                                    "live_person_rows": 4,
                                     "initial_graph_commits": initial_commits,
                                     "history_before": history_before,
                                     "stage": stage,
@@ -232,11 +249,68 @@ async fn history_curve(depths: &[u64], branches: &[&str]) {
 #[tokio::test]
 #[ignore = "instrument: fixed-live-row publication requests, bytes and retained bytes"]
 async fn manifest_history_curve() {
-    history_curve(&[1, 16, 64, 128], &["main", "cost-branch"]).await;
+    history_curve(&[1, 16, 64, 128], &["main", "cost-branch"], TEST_SCHEMA).await;
 }
 
 #[tokio::test]
 #[ignore = "instrument: the same curve at deep histories, main only"]
 async fn manifest_history_curve_deep() {
-    history_curve(&[256, 512, 1024], &["main"]).await;
+    history_curve(&[256, 512, 1024], &["main"], TEST_SCHEMA).await;
+}
+
+/// Keep rows, tables and physical column count fixed. Vary an unused nullable
+/// enum's domain to grow the IR, then pad source with a comment to an exact
+/// independent byte length. Source padding carries no compiled semantics.
+fn contract_curve_schema(source_bytes: usize, enum_values: usize) -> String {
+    let values = (0..enum_values)
+        .map(|i| format!("v{i:04}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut schema = TEST_SCHEMA.replace(
+        "age: I32?",
+        &format!("age: I32?\n    contract_marker: enum({values})?"),
+    );
+    schema.push_str("\n// ");
+    assert!(schema.len() < source_bytes);
+    schema.extend(std::iter::repeat_n('x', source_bytes - schema.len()));
+    assert_eq!(schema.len(), source_bytes);
+    schema
+}
+
+#[tokio::test]
+#[ignore = "instrument: independent schema-source/IR bytes across fixed-row manifest histories"]
+async fn manifest_contract_history_curve() {
+    // Compile every fixture first, so invalid or coupled dimensions cannot
+    // masquerade as measurement evidence. Identity-bearing IR is reported by
+    // history_curve after init; shape IR here excludes random stable IDs.
+    use omnigraph_compiler::schema::parser::parse_schema;
+    use omnigraph_compiler::{compile_schema_shape, schema_shape_json};
+
+    let mut fixtures = Vec::new();
+    let mut previous_shape_bytes = 0;
+    for enum_values in [4, 512] {
+        let mut shape = None;
+        for source_bytes in [16 * 1024, 1024 * 1024] {
+            let schema = contract_curve_schema(source_bytes, enum_values);
+            let shape_ir = compile_schema_shape(&parse_schema(&schema).unwrap()).unwrap();
+            let current_shape = schema_shape_json(&shape_ir).unwrap();
+            if let Some(expected) = &shape {
+                assert_eq!(
+                    expected, &current_shape,
+                    "source-only padding must preserve IR shape"
+                );
+            }
+            shape = Some(current_shape);
+            fixtures.push(schema);
+        }
+        let shape_bytes = shape.unwrap().len();
+        assert!(
+            shape_bytes > previous_shape_bytes,
+            "the enum dimension must increase serialized semantic IR bytes"
+        );
+        previous_shape_bytes = shape_bytes;
+    }
+    for schema in fixtures {
+        history_curve(&[1, 16], &["main", "cost-branch"], &schema).await;
+    }
 }

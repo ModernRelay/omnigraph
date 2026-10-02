@@ -50,10 +50,10 @@ use diff::{
 #[cfg(any(test, feature = "test-util"))]
 pub use serve::read_serving_snapshot_with_display_root;
 pub use serve::{
-    RootBoundServingSnapshot, ServingGraph, ServingPolicy, ServingQuery, ServingSnapshot,
-    cluster_graph_ids, cluster_root_for_graph_uri, read_root_bound_serving_snapshot,
-    read_root_bound_serving_snapshot_from_storage, read_serving_snapshot,
-    read_serving_snapshot_from_storage, resolve_graph_storage_uri,
+    RootBoundServingSnapshot, ServingBlockedGraph, ServingGraph, ServingPolicy, ServingQuery,
+    ServingSnapshot, cluster_graph_ids, cluster_root_for_graph_uri,
+    read_root_bound_serving_snapshot, read_root_bound_serving_snapshot_from_storage,
+    read_serving_snapshot, read_serving_snapshot_from_storage, resolve_graph_storage_uri,
 };
 use store::ClusterStore;
 use sweep::{

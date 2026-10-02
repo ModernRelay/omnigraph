@@ -74,7 +74,8 @@ fn legacy_public_struct_literals_and_destructuring_compile() {
     assert!(matches!(mode, ServerConfigMode::Multi { .. }));
     assert_eq!(bind, "127.0.0.1:0");
     assert!(allow_unauthenticated && !require_all_graphs);
-    assert!(witness.applied_graphs.is_empty());
+    assert!(witness.booted_serving_digest.is_none() && witness.state_cas.is_none());
+    assert_eq!(witness.state_revision, 0);
     assert_eq!(shutdown_grace, DEFAULT_SHUTDOWN_GRACE);
 
     let ServingSnapshot {
@@ -255,12 +256,12 @@ async fn managed_settings_bind_the_applied_store_not_the_config_directory() {
     let legacy = cluster_settings(&config_path).await.unwrap();
     assert_eq!(managed.canonical_root(), canonical_root);
     assert_eq!(managed.config().witness.state_cas, legacy.witness.state_cas);
-    assert_eq!(managed.config().witness.applied_graphs, vec!["knowledge"]);
     assert_eq!(
         managed.config().shutdown_grace,
         std::time::Duration::from_secs(7)
     );
     let omnigraph_server::ServerConfigMode::Multi { graphs, .. } = &managed.config().mode;
+    assert_eq!(graphs.len(), 1);
     assert_eq!(graphs[0].graph_id, "knowledge");
     assert!(graphs[0].uri.contains("/graphs/knowledge.omni"));
 
@@ -326,7 +327,6 @@ async fn applied_empty_cluster_still_requires_exact_data_trust_root() {
         settings.config().witness.booted_serving_digest,
         applied.desired_revision.config_digest
     );
-    assert!(settings.config().witness.applied_graphs.is_empty());
     let omnigraph_server::ServerConfigMode::Multi { graphs, .. } = &settings.config().mode;
     assert!(graphs.is_empty());
     assert!(!temp.path().join("graphs").exists());
@@ -340,6 +340,7 @@ mod multi_graph_startup {
 
     async fn build_multi_mode_state(
         graph_ids: &[&str],
+        blocked_ids: &[&str],
         policy: Option<omnigraph_policy::PolicyEngine>,
     ) -> (Vec<tempfile::TempDir>, AppState) {
         let mut dirs = Vec::with_capacity(graph_ids.len());
@@ -359,37 +360,45 @@ mod multi_graph_startup {
             dirs.push(dir);
         }
         let workload = omnigraph_server::workload::WorkloadController::from_env();
-        let state = AppState::new_multi(handles, Vec::new(), policy, workload, None).unwrap();
+        let mut entries: Vec<_> = handles
+            .into_iter()
+            .map(omnigraph_server::registry::GraphEntry::Ready)
+            .collect();
+        for id in blocked_ids {
+            let dir = tempfile::tempdir().unwrap();
+            entries.push(omnigraph_server::registry::GraphEntry::Blocked(Arc::new(
+                omnigraph_server::registry::BlockedGraph {
+                    key: GraphKey::cluster(GraphId::try_from(*id).unwrap()),
+                    uri: dir.path().join(id).to_string_lossy().into_owned(),
+                    policy: None,
+                    failure: omnigraph_server::api::GraphStartupFailure::OpenFailed,
+                },
+            )));
+            dirs.push(dir);
+        }
+        let state =
+            AppState::new_multi_entries(entries, Vec::new(), policy, workload, None).unwrap();
         (dirs, state)
     }
 
     async fn build_multi_mode_app(graph_ids: &[&str]) -> (Vec<tempfile::TempDir>, Router) {
-        let (dirs, state) = build_multi_mode_state(graph_ids, None).await;
+        let (dirs, state) = build_multi_mode_state(graph_ids, &[], None).await;
         (dirs, build_app(state))
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn signed_registry_lists_only_granted_served_and_quarantined_graphs() {
+    async fn signed_registry_lists_only_granted_ready_and_blocked_graphs() {
         let tokens = data_tokens::DataTokens::new();
         let policy = omnigraph_policy::PolicyEngine::load_server_from_source(&format!(
             "version: 1\ngroups:\n  viewers: [\"{}\"]\nrules:\n  - id: list\n    allow:\n      actors: {{group: viewers}}\n      actions: [graph_list]\n",tokens.actor
         )).unwrap();
-        let (_dirs, state) = build_multi_mode_state(&["alpha", "beta"], Some(policy)).await;
-        let state = state
-            .with_data_token_trust(tokens.trust.clone())
-            .with_boot_witness(
-                omnigraph_server::BootWitness {
-                    applied_graphs: vec![
-                        "alpha".into(),
-                        "beta".into(),
-                        "ghost-allowed".into(),
-                        "ghost-hidden".into(),
-                    ],
-                    ..Default::default()
-                },
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                omnigraph_server::DEFAULT_SHUTDOWN_GRACE,
-            );
+        let (_dirs, state) = build_multi_mode_state(
+            &["alpha", "beta"],
+            &["ghost-allowed", "ghost-hidden"],
+            Some(policy),
+        )
+        .await;
+        let state = state.with_data_token_trust(tokens.trust.clone());
         let app = build_app(state);
         let token = tokens.token(serde_json::json!([
             {"graph_id":"alpha","actions":["graph_list"]},
@@ -398,9 +407,20 @@ mod multi_graph_startup {
         ]));
         let (status, body) = json_response(&app, get_request("/graphs", &token)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["graphs"].as_array().unwrap().len(), 1);
+        assert_eq!(body["graphs"].as_array().unwrap().len(), 2);
         assert_eq!(body["graphs"][0]["graph_id"], "alpha");
-        assert_eq!(body["quarantined"], serde_json::json!(["ghost-allowed"]));
+        assert_eq!(body["graphs"][0]["state"], "ready");
+        assert_eq!(body["graphs"][1]["graph_id"], "ghost-allowed");
+        assert_eq!(body["graphs"][1]["state"], "blocked");
+        assert!(body.get("quarantined").is_none());
+        for (id, expected) in [
+            ("ghost-allowed", StatusCode::SERVICE_UNAVAILABLE),
+            ("ghost-hidden", StatusCode::FORBIDDEN),
+        ] {
+            let (status, _) =
+                json_response(&app, get_request(&format!("/graphs/{id}/snapshot"), &token)).await;
+            assert_eq!(status, expected);
+        }
         let read = tokens.token(serde_json::json!([{"graph_id":"alpha","actions":["read"]}]));
         let (status, _) = json_response(&app, get_request("/graphs", &read)).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
@@ -940,11 +960,10 @@ mod readiness_witness {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// `/readyz` reports the boot witness and counts only, turns off while
-    /// draining, and leaves `/healthz` alone; the quarantined ids are on the
-    /// gated `GET /graphs`, derived from the applied set minus the registry
-    /// (RFC 0049).
+    /// draining, and leaves `/healthz` alone. Both counts and gated graph
+    /// availability come from the startup registry, not boot-witness inference.
     #[tokio::test(flavor = "multi_thread")]
-    async fn readyz_reports_counts_and_graphs_names_the_quarantined() {
+    async fn readyz_and_inventory_report_ready_blocked_and_stopping() {
         let dir = tempfile::tempdir().unwrap();
         let graph_uri = dir.path().join("alpha").to_str().unwrap().to_string();
         let schema = fs::read_to_string(fixture("test.pg")).unwrap();
@@ -977,29 +996,41 @@ rules:
         let tokens = vec![("act-test".to_string(), "secret".to_string())];
         let workload = omnigraph_server::workload::WorkloadController::from_env();
         let draining = Arc::new(AtomicBool::new(false));
-        let state = AppState::new_multi(vec![handle], tokens, Some(server_policy), workload, None)
-            .unwrap()
-            .with_boot_witness(
-                BootWitness {
-                    booted_serving_digest: Some("digest-1".to_string()),
-                    state_revision: 42,
-                    state_cas: Some("sha256:abc".to_string()),
-                    applied_graphs: vec!["alpha".to_string(), "beta".to_string()],
-                },
-                Arc::clone(&draining),
-                std::time::Duration::from_secs(7),
-            );
+        let blocked = Arc::new(omnigraph_server::registry::BlockedGraph {
+            key: GraphKey::cluster(GraphId::try_from("beta").unwrap()),
+            uri: dir.path().join("beta").to_string_lossy().into_owned(),
+            policy: None,
+            failure: omnigraph_server::api::GraphStartupFailure::OpenFailed,
+        });
+        let entries = vec![
+            omnigraph_server::registry::GraphEntry::Ready(handle),
+            omnigraph_server::registry::GraphEntry::Blocked(Arc::clone(&blocked)),
+        ];
+        let state =
+            AppState::new_multi_entries(entries, tokens, Some(server_policy), workload, None)
+                .unwrap()
+                .with_boot_witness(
+                    BootWitness {
+                        booted_serving_digest: Some("digest-1".to_string()),
+                        state_revision: 42,
+                        state_cas: Some("sha256:abc".to_string()),
+                    },
+                    Arc::clone(&draining),
+                    std::time::Duration::from_secs(7),
+                );
         let app = build_app(state);
 
         let (status, body) = json_response(&app, get_request("/readyz", "")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["ready"], true);
-        assert_eq!(body["status"], "serving");
+        assert_eq!(body["status"], "degraded");
         assert_eq!(body["booted_serving_digest"], "digest-1");
         assert_eq!(body["state_revision"], 42);
         assert_eq!(body["state_cas"], "sha256:abc");
-        assert_eq!(body["served_graph_count"], 1);
-        assert_eq!(body["quarantined_graph_count"], 1);
+        assert_eq!(body["served_graph_count"], 2);
+        assert_eq!(body["ready_graph_count"], 1);
+        assert_eq!(body["blocked_graph_count"], 1);
+        assert!(body.get("quarantined_graph_count").is_none());
         assert_eq!(body["shutdown_grace_seconds"], 7);
         assert!(
             body.get("served_graphs").is_none() && body.get("quarantined_graphs").is_none(),
@@ -1012,20 +1043,62 @@ rules:
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let (status, body) = json_response(&app, get_request("/graphs", "secret")).await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["graphs"].as_array().unwrap().len(), 2);
         assert_eq!(body["graphs"][0]["graph_id"], "alpha");
-        assert_eq!(body["quarantined"], serde_json::json!(["beta"]));
+        assert_eq!(body["graphs"][0]["state"], "ready");
+        assert_eq!(body["graphs"][0]["action"], "none");
+        assert_eq!(body["graphs"][0]["read_available"], true);
+        assert_eq!(body["graphs"][0]["write_available"], true);
+        assert!(body["graphs"][0].get("failure").is_none());
+        assert_eq!(body["graphs"][1]["graph_id"], "beta");
+        assert_eq!(body["graphs"][1]["state"], "blocked");
+        assert_eq!(body["graphs"][1]["failure"], "open_failed");
+        assert_eq!(body["graphs"][1]["action"], "restart_after_correction");
+        assert_eq!(body["graphs"][1]["read_available"], false);
+        assert_eq!(body["graphs"][1]["write_available"], false);
+        assert!(body.get("quarantined").is_none());
 
         draining.store(true, Ordering::SeqCst);
         let (status, body) = json_response(&app, get_request("/readyz", "")).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["ready"], false);
         assert_eq!(body["status"], "draining");
+        let (_, inventory) = json_response(&app, get_request("/graphs", "secret")).await;
+        for graph in inventory["graphs"].as_array().unwrap() {
+            assert_eq!(graph["state"], "stopping");
+            assert_eq!(graph["action"], "wait_for_restart");
+            assert_eq!(graph["read_available"], false);
+            assert_eq!(graph["write_available"], false);
+        }
         let (status, _) = json_response(&app, get_request("/healthz", "")).await;
         assert_eq!(
             status,
             StatusCode::OK,
             "liveness is unchanged while draining"
         );
+        for (entries, expected, phase) in [
+            (vec![], StatusCode::OK, "serving"),
+            (
+                vec![omnigraph_server::registry::GraphEntry::Blocked(blocked)],
+                StatusCode::SERVICE_UNAVAILABLE,
+                "blocked",
+            ),
+        ] {
+            let app = build_app(
+                AppState::new_multi_entries(
+                    entries,
+                    vec![],
+                    None,
+                    omnigraph_server::workload::WorkloadController::with_defaults(),
+                    None,
+                )
+                .unwrap(),
+            );
+            let (status, body) = json_response(&app, get_request("/readyz", "")).await;
+            assert_eq!(status, expected);
+            assert_eq!(body["status"], phase);
+            assert_eq!(body["ready"], expected == StatusCode::OK);
+        }
     }
 }
 
@@ -1096,6 +1169,7 @@ mod owned_shutdown {
                     uri: graph.to_string_lossy().into_owned(),
                     policy: None,
                     embedding: None,
+                    startup_failure: None,
                     external_blob_policy: Default::default(),
                     queries: Default::default(),
                 }],

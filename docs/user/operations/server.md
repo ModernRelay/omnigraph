@@ -22,14 +22,13 @@ For object storage, replace `./company-brain` with the cluster root, for example
 `s3://company-data/omnigraph/company-brain`.
 
 The default bind address is `127.0.0.1:8080`. `--require-all-graphs` makes any
-graph startup failure fatal. Without it, an unhealthy graph is quarantined and
-healthy graphs continue to serve.
+graph startup failure fatal. Otherwise failed graphs remain in the authorized
+inventory as blocked while healthy graphs serve; see [readiness](../deployment.md).
 
-An applied empty cluster serves an empty authorized inventory; no default graph
-is created. `/readyz` reports its applied digest, ledger revision/CAS and zero
-served/quarantined counts. Missing or unapplied state, or a nonempty cluster whose
-graphs all fail, refuses startup. Authentication, policy and data-token root
-checks still apply.
+An applied empty cluster creates no default graph and serves an empty inventory.
+`/readyz` reports its applied digest, ledger revision/CAS and zero graph counts.
+Missing or unapplied state, or a nonempty cluster whose graphs all fail, refuses
+startup. Authentication, policy and data-token root checks still apply.
 
 Applied changes become active after restart. Add or remove graphs with
 `cluster.yaml` and `cluster apply`; there are no runtime graph-create/delete
@@ -116,7 +115,7 @@ two explicit profiles:
   `config_manage`, or `admin`.
 
 Every valid identity credential can call `GET /graphs/discovery` for applied
-graph IDs and names (currently identical), including quarantined graphs. It
+graph IDs and names (currently identical), including blocked graphs. It
 requires no policy membership and returns no locations, availability, schema,
 queries or data. Static/restricted credentials cannot use it. `GET /graphs`
 requires `graph_list` permission and, for restricted credentials, a signed
@@ -187,9 +186,10 @@ The initial MCP tools are `graphs` (IDs and names), `queries` (permitted stored
 read names for one graph), and `query` (a named stored read with parameters and
 an optional branch). Mutation definitions are excluded and cannot be invoked
 through a read tool. These tools use the same actor and Cedar checks as HTTP
-graph requests. A 30-second deadline, 16 concurrent tool calls, 64 KiB request
-body and 1 MiB complete tool result bound this interface. Client cancellation
-cancels the waiting tool call; it does not create a background operation.
+graph requests. Limits are 30 seconds to wait, 16 concurrent executions,
+64 KiB requests and 1 MiB results. Cancelled or expired callers stop waiting;
+execution retains its input and slot until it finishes, with no later result
+lookup. See [admission and shutdown](../deployment.md).
 
 `omnigraph_server::init_tracing()` limits `rmcp` and `rmcp::*` logging to warnings
 and errors even with `RUST_LOG=trace`: verbose SDK logs contain query arguments
@@ -337,8 +337,8 @@ pagination, checkpointing and recovery.
 ## Errors and retries
 
 Application errors preserve structured details. Admission limits use `429` with
-`Retry-After`; size limits use `413`, and closed admission or pending schema
-completion can use `503`. Admitted writes continue after disconnect. Only the
+`Retry-After`; size limits use `413`, and blocked graphs or closed admission use
+`503`. Admitted writes continue after disconnect. Only the
 CLI's qualified whole-command admission refusal permits exit 75 and caller retry;
 generic 409/503 and lost responses do not. See [failure outcomes](troubleshooting.md#failed-data-write-commands).
 

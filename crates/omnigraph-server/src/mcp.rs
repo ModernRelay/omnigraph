@@ -1,5 +1,6 @@
 //! Read-only MCP transport over the existing graph discovery and stored-query handlers.
 //! The official SDK owns protocol framing, negotiation and cancellation.
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,7 +25,7 @@ use tokio::sync::Semaphore;
 
 use crate::api::InvokeStoredQueryRequest;
 use crate::handlers::{self, QueryNamePath};
-use crate::registry::{GraphHandle, RegistryLookup};
+use crate::registry::GraphHandle;
 use crate::workload::IngressLease;
 use crate::{ApiError, AppState, AuthenticatedActor, GraphId, GraphKey};
 
@@ -200,30 +201,56 @@ impl ServerHandler for GraphTools {
         }) else {
             return Ok(failure("internal_error", "MCP admission context is missing.").into());
         };
-        let _observer = observer;
-        let _input = input.clone();
-        let Ok(_permit) = self.slots.try_acquire() else {
-            return Ok(failure(
+        let service = self.clone();
+        let execution_input = input.clone();
+        let result = self
+            .run_read(
+                observer,
+                input,
+                async move { service.execute(request, actor, execution_input).await },
+                context.ct.cancelled(),
+                READ_DEADLINE,
+            )
+            .await;
+        Ok(fit_result(result).into())
+    }
+}
+
+impl GraphTools {
+    /// MCP's timeout and cancellation bound the caller's observation. The
+    /// engine execution retains the SDK-independent observer, input and MCP
+    /// slot until it completes, including its owned query-worker joins.
+    async fn run_read<F, C>(
+        &self,
+        observer: crate::operations::ReadObserver,
+        input: IngressLease,
+        operation: F,
+        cancelled: C,
+        deadline: Duration,
+    ) -> CallToolResult
+    where
+        F: Future<Output = Result<CallToolResult, ApiError>> + Send + 'static,
+        C: Future<Output = ()>,
+    {
+        let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() else {
+            return failure(
                 "capacity_exceeded",
                 "The server is handling its maximum concurrent MCP reads.",
-            )
-            .into());
+            );
         };
-        let result = tokio::select! {
-            _ = context.ct.cancelled() => failure("cancelled", "The read was cancelled."),
-            result = tokio::time::timeout(READ_DEADLINE, self.execute(request, actor, input)) => {
+        let read = observer.spawn_read((input, permit), operation);
+        tokio::select! {
+            _ = cancelled => failure("cancelled", "The read was cancelled."),
+            result = tokio::time::timeout(deadline, read.result()) => {
                 match result {
                     Ok(Ok(result)) => result,
                     Ok(Err(error)) => api_failure(error).await,
                     Err(_) => failure("deadline_exceeded", "The read exceeded its 30 second deadline."),
                 }
             }
-        };
-        Ok(fit_result(result).into())
+        }
     }
-}
 
-impl GraphTools {
     async fn execute(
         &self,
         request: CallToolRequestParams,
@@ -289,10 +316,9 @@ impl GraphTools {
         if !actor.select_graph(&id) {
             return Err(ApiError::forbidden("credential does not permit this graph"));
         }
-        match self.state.routing().registry.get(&GraphKey::cluster(id)) {
-            RegistryLookup::Ready(handle) => Ok((handle, actor)),
-            RegistryLookup::Gone => Err(ApiError::not_found("graph not found")),
-        }
+        let handle =
+            handlers::resolve_registered_graph(&self.state, &GraphKey::cluster(id), Some(&actor))?;
+        Ok((handle, actor))
     }
 }
 
@@ -368,6 +394,91 @@ async fn api_failure(error: ApiError) -> CallToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_or_expired_mcp_read_retains_capacity_until_execution_finishes() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            use crate::operations::OperationRuntime;
+            use crate::workload::{WorkloadController, WorkloadSnapshot};
+
+            for cancelled in [false, true] {
+                let workload = WorkloadController::with_defaults();
+                let operations = OperationRuntime::with_read_limit(2);
+                let service = GraphTools {
+                    state: AppState::new_multi(
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        workload.clone(),
+                        None,
+                    )
+                    .unwrap()
+                    .with_operations(operations.clone()),
+                    slots: Arc::new(Semaphore::new(1)),
+                };
+                let (entered, started) = tokio::sync::oneshot::channel();
+                let (release, held) = tokio::sync::oneshot::channel();
+                let result = service
+                    .run_read(
+                        operations.try_observe().unwrap(),
+                        workload.try_read_ingress(17).unwrap(),
+                        async move {
+                            entered.send(()).unwrap();
+                            held.await.unwrap();
+                            bounded_result(&json!({"finished": true}))
+                        },
+                        async move {
+                            if !cancelled {
+                                std::future::pending::<()>().await;
+                            }
+                        },
+                        if cancelled {
+                            READ_DEADLINE
+                        } else {
+                            Duration::ZERO
+                        },
+                    )
+                    .await;
+                assert_eq!(
+                    result.structured_content.unwrap()["code"],
+                    if cancelled {
+                        "cancelled"
+                    } else {
+                        "deadline_exceeded"
+                    }
+                );
+                started.await.unwrap();
+                assert_eq!(operations.snapshot().active_reads, 1);
+                assert_eq!(workload.snapshot().read_ingress_bytes, 17);
+                assert_eq!(service.slots.available_permits(), 0);
+                let refused = service
+                    .run_read(
+                        operations.try_observe().unwrap(),
+                        workload.try_read_ingress(3).unwrap(),
+                        async { panic!("refused MCP read must not execute") },
+                        std::future::pending(),
+                        READ_DEADLINE,
+                    )
+                    .await;
+                assert_eq!(
+                    refused.structured_content.unwrap()["code"],
+                    "capacity_exceeded"
+                );
+                assert_eq!(operations.snapshot().active_reads, 1);
+                assert_eq!(workload.snapshot().read_ingress_bytes, 17);
+                operations.close();
+                let shutdown = operations.wait_logical_owners();
+                tokio::pin!(shutdown);
+                assert!(futures::poll!(&mut shutdown).is_pending());
+                release.send(()).unwrap();
+                assert!(shutdown.await);
+                assert_eq!(service.slots.available_permits(), 1);
+                assert_eq!(workload.snapshot(), WorkloadSnapshot::default());
+            }
+        })
+        .await
+        .expect("MCP read did not settle");
+    }
 
     #[test]
     fn complete_tool_result_including_legacy_text_has_one_byte_bound() {

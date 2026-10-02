@@ -279,6 +279,55 @@ pub struct ReadObserver {
     _life: Arc<ReadLife>,
 }
 
+impl ReadObserver {
+    /// Transfer an already admitted read to a process task. Losing the result
+    /// waiter cannot drop its engine future or release its input reservation.
+    /// Descendants of this observer may finish after admission closes; no new
+    /// observer or queue entry is acquired here. Native tails outside the
+    /// engine future remain outside this logical ownership boundary.
+    pub(crate) fn spawn_read<T, R, F>(self, reservation: R, operation: F) -> OwnedReadResponse<T>
+    where
+        T: Send + 'static,
+        R: Send + 'static,
+        F: Future<Output = Result<T, ApiError>> + Send + 'static,
+    {
+        let (sender, receiver) = oneshot::channel();
+        let response_observer = self.clone();
+        tokio::spawn(
+            async move {
+                let _observer = self;
+                let _reservation = reservation;
+                #[allow(clippy::redundant_async_block)] // Catch completed future Drop panics too.
+                let result = AssertUnwindSafe(async move { operation.await })
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| Err(ApiError::internal("owned read panicked")));
+                // No result history: an absent waiter drops the result here.
+                let _ = sender.send(result);
+            }
+            .in_current_span(),
+        );
+        OwnedReadResponse {
+            receiver,
+            _observer: response_observer,
+        }
+    }
+}
+
+pub(crate) struct OwnedReadResponse<T> {
+    receiver: oneshot::Receiver<Result<T, ApiError>>,
+    // The one completed result slot remains bounded even before it is polled.
+    _observer: ReadObserver,
+}
+
+impl<T> OwnedReadResponse<T> {
+    pub(crate) async fn result(self) -> Result<T, ApiError> {
+        self.receiver
+            .await
+            .unwrap_or_else(|_| Err(ApiError::internal("owned read result was lost")))
+    }
+}
+
 struct ReadLife {
     inner: Arc<Inner>,
     write: bool,
@@ -357,6 +406,62 @@ mod tests {
                 .submit((), async { Ok::<_, ApiError>(()).into() })
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn completed_read_result_remains_charged_until_delivery_or_abandonment() {
+        struct Finished(Option<oneshot::Sender<()>>);
+        impl Drop for Finished {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+
+        let runtime = OperationRuntime::with_read_limit(1);
+        let (finished, completed) = oneshot::channel();
+        let read = runtime
+            .try_observe()
+            .unwrap()
+            .spawn_read(Finished(Some(finished)), async { Ok(42) });
+        tokio::time::timeout(std::time::Duration::from_secs(2), completed)
+            .await
+            .expect("owned read did not complete")
+            .unwrap();
+        assert!(runtime.try_observe().is_err());
+        assert_eq!(runtime.snapshot().active_reads, 1);
+        drop(read);
+        assert_eq!(runtime.snapshot().active_reads, 0);
+        assert!(runtime.try_observe().is_ok());
+    }
+
+    #[tokio::test]
+    async fn read_completion_releases_capacity_without_poisoning_writes() {
+        for outcome in ["success", "error", "panic"] {
+            let runtime = OperationRuntime::with_read_limit(1);
+            let releases = Arc::new(AtomicUsize::new(0));
+            let read = runtime.try_observe().unwrap().spawn_read(
+                Reservation(Arc::clone(&releases)),
+                async move {
+                    match outcome {
+                        "success" => Ok(()),
+                        "error" => Err(ApiError::internal("ordinary read failure")),
+                        "panic" => panic!("read execution failed"),
+                        _ => unreachable!(),
+                    }
+                },
+            );
+            assert_eq!(read.result().await.is_ok(), outcome == "success");
+            assert!(runtime.wait_logical_owners().await);
+            assert_eq!(releases.load(Ordering::SeqCst), 1);
+            assert_eq!(runtime.snapshot().active_reads, 0);
+            assert!(!runtime.snapshot().closed);
+            runtime
+                .submit((), async { Ok::<_, ApiError>(()).into() })
+                .unwrap()
+                .result()
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -440,6 +545,16 @@ mod tests {
                                 Ok::<_, ApiError>(()).into()
                             })
                             .unwrap()
+                    };
+                    drop(response);
+                    assert_eq!(observed.await.unwrap(), Some(expected.clone()));
+                    let (sent, observed) = oneshot::channel();
+                    let response = {
+                        let _entered = span.enter();
+                        runtime.try_observe().unwrap().spawn_read((), async move {
+                            sent.send(tracing::Span::current().id()).unwrap();
+                            Ok::<_, ApiError>(())
+                        })
                     };
                     drop(response);
                     assert_eq!(observed.await.unwrap(), Some(expected));

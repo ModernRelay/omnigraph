@@ -52,6 +52,7 @@ pub use optimize::{CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeSta
 pub use repair::{
     DatasetRepairStats, RepairAction, RepairClassification, RepairOptions, RepairStats,
 };
+pub use schema_apply::{PreparedSchemaApply, SchemaApplyReconciliation, SchemaContractDigest};
 pub use system_column_upgrade::{
     SYSTEM_COLUMNS_PREFLIGHT, SystemColumnUpgradeFinding, SystemColumnUpgradeOptions,
     SystemColumnUpgradeOutcome, SystemColumnUpgradeReport,
@@ -92,6 +93,10 @@ pub struct SchemaApplyResult {
     pub applied: bool,
     pub graph_manifest_version: u64,
     pub steps: Vec<SchemaMigrationStep>,
+    /// The exact commit published by this invocation; absent for an exact no-op.
+    pub commit: Option<GraphCommit>,
+    /// Accepted source and stable schema identity of this invocation's result.
+    pub contract: SchemaContractDigest,
 }
 
 #[derive(Debug, Clone)]
@@ -1142,6 +1147,38 @@ impl Omnigraph {
         self.apply_schema_as(desired_schema_source, None).await
     }
 
+    /// Capture a serializable, exact-base schema intent without graph effects.
+    /// The caller must durably retain it before invoking effects if interrupted
+    /// outcomes must be reconciled. This does not reserve or fence the graph.
+    pub async fn prepare_schema_apply_as(
+        &self,
+        desired_schema_source: &str,
+        actor: Option<&str>,
+    ) -> Result<PreparedSchemaApply> {
+        schema_apply::prepare_schema_apply(self, desired_schema_source, actor).await
+    }
+
+    /// Execute an engine-issued intent against its exact captured authority.
+    /// A stale intent refuses before effects; it is never silently rebased.
+    pub async fn apply_prepared_schema_as(
+        &self,
+        prepared: &PreparedSchemaApply,
+        actor: Option<&str>,
+    ) -> Result<SchemaApplyResult> {
+        schema_apply::apply_prepared_schema(self, prepared, actor).await
+    }
+
+    /// Read exact retained publication evidence, or revalidate a no-op's live
+    /// authority. Missing evidence is unknown and never permits replay. This
+    /// performs no writes and may be used on an `open_read_only` handle.
+    pub async fn reconcile_schema_apply_as(
+        &self,
+        prepared: &PreparedSchemaApply,
+        actor: Option<&str>,
+    ) -> Result<SchemaApplyReconciliation> {
+        schema_apply::reconcile_schema_apply(self, prepared, actor).await
+    }
+
     /// Apply a schema migration with an explicit actor for engine-layer
     /// policy enforcement (MR-722). When a `PolicyChecker` is installed
     /// via [`Self::with_policy`], this method calls `enforce(SchemaApply,
@@ -1880,6 +1917,7 @@ impl Omnigraph {
         Ok(Snapshot::wrap(manifest.snapshot()))
     }
 
+    #[cfg(test)]
     pub(crate) async fn version(&self) -> u64 {
         self.coordinator.read().await.version()
     }

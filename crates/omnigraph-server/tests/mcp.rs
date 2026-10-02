@@ -89,6 +89,47 @@ async fn fixture_app() -> (tempfile::TempDir, Router, AppState) {
         queries,
     )
     .await
+    .unwrap();
+    let handle = state.routing().registry.list().pop().unwrap();
+    let mut entries = vec![omnigraph_server::registry::GraphEntry::Ready(Arc::clone(
+        &handle,
+    ))];
+    for (id, failure) in [
+        (
+            "blocked",
+            omnigraph_server::api::GraphStartupFailure::OpenFailed,
+        ),
+        (
+            "invalid-policy",
+            omnigraph_server::api::GraphStartupFailure::InvalidPolicy,
+        ),
+        (
+            "invalid-config",
+            omnigraph_server::api::GraphStartupFailure::InvalidConfiguration,
+        ),
+    ] {
+        entries.push(omnigraph_server::registry::GraphEntry::Blocked(Arc::new(
+            omnigraph_server::registry::BlockedGraph {
+                key: omnigraph_server::GraphKey::cluster(
+                    omnigraph_server::GraphId::try_from(id).unwrap(),
+                ),
+                uri: temp.path().join(id).to_string_lossy().into_owned(),
+                policy: if id == "blocked" {
+                    handle.policy.clone()
+                } else {
+                    None
+                },
+                failure,
+            },
+        )));
+    }
+    let state = AppState::new_multi_entries(
+        entries,
+        vec![],
+        None,
+        omnigraph_server::workload::WorkloadController::with_defaults(),
+        None,
+    )
     .unwrap()
     .with_oidc_identity_trust(trust(temp.path()));
     (temp, omnigraph_server::build_app(state.clone()), state)
@@ -153,8 +194,32 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
     let discovered = call(&app, &bob, "graphs", json!({})).await;
     assert_eq!(
         discovered["result"]["structuredContent"],
-        json!({"graphs":[{"graph_id":"default","display_name":"default"}]})
+        json!({"graphs":[{"graph_id":"blocked","display_name":"blocked"},{"graph_id":"default","display_name":"default"},{"graph_id":"invalid-config","display_name":"invalid-config"},{"graph_id":"invalid-policy","display_name":"invalid-policy"}]})
     );
+    for (credential, graph, expected) in [
+        (&alice, "blocked", 503),
+        (&bob, "blocked", 404),
+        (&alice, "invalid-policy", 404),
+        (&alice, "invalid-config", 404),
+        (&alice, "unknown", 404),
+    ] {
+        let result = call(&app, credential, "queries", json!({"graph":graph})).await;
+        assert_eq!(result["result"]["isError"], true);
+        assert_eq!(
+            result["result"]["structuredContent"]["status"], expected,
+            "{result}"
+        );
+        let (status, native) = json_response(
+            &app,
+            get_request(&format!("/graphs/{graph}/snapshot"), credential),
+        )
+        .await;
+        assert_eq!(status.as_u16(), expected);
+        if expected == 503 {
+            assert_eq!(native["code"], "graph_unavailable");
+            assert_eq!(result["result"]["structuredContent"]["error"], native);
+        }
+    }
     let catalog = call(&app, &alice, "queries", json!({"graph":"default"})).await;
     let queries = catalog["result"]["structuredContent"]["queries"]
         .as_array()
