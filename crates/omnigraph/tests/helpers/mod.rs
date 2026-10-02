@@ -373,8 +373,13 @@ pub fn with_traversal(db: &Session, mode: Traversal) -> Session {
 
 /// Init a graph and load the standard test data.
 pub async fn init_and_load(dir: &tempfile::TempDir) -> Session {
+    init_and_load_with_schema(dir, TEST_SCHEMA).await
+}
+
+/// The standard rows under a compatible schema, for schema-size instruments.
+pub async fn init_and_load_with_schema(dir: &tempfile::TempDir, schema: &str) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    let db = session(Omnigraph::init(uri, schema).await.unwrap());
     db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
     // Mutation/load publish only exact data effects; physical indexes are
     // reconciled separately as derived state.

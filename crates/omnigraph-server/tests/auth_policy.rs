@@ -35,16 +35,51 @@ async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() 
         vec![("breakglass".into(), "static-token".into())],
     )
     .await
-    .unwrap()
-    .with_data_token_trust(tokens.trust.clone())
-    .with_boot_witness(
-        omnigraph_server::BootWitness {
-            applied_graphs: vec!["default".into(), "unavailable".into()],
-            ..Default::default()
+    .unwrap();
+    let mut entries = state.routing().registry.entries();
+    entries.push(omnigraph_server::registry::GraphEntry::Blocked(Arc::new(
+        omnigraph_server::registry::BlockedGraph {
+            key: omnigraph_server::GraphKey::cluster(
+                omnigraph_server::GraphId::try_from("unavailable").unwrap(),
+            ),
+            uri: temp
+                .path()
+                .join("unavailable")
+                .to_string_lossy()
+                .into_owned(),
+            policy: None,
+            failure: omnigraph_server::api::GraphStartupFailure::InvalidConfiguration,
         },
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        std::time::Duration::from_secs(30),
+    )));
+    let state = AppState::new_multi_entries(
+        entries,
+        vec![("breakglass".into(), "static-token".into())],
+        None,
+        omnigraph_server::workload::WorkloadController::with_defaults(),
+        None,
+    )
+    .unwrap()
+    .with_data_token_trust(tokens.trust.clone());
+    // An unknown refused configuration cannot reveal its availability through
+    // open-mode read defaults, and does not disable healthy public graphs.
+    let open = build_app(
+        AppState::new_multi_entries(
+            state.routing().registry.entries(),
+            vec![],
+            None,
+            omnigraph_server::workload::WorkloadController::with_defaults(),
+            None,
+        )
+        .unwrap(),
     );
+    for (path, expected) in [
+        ("/graphs/default/snapshot", StatusCode::OK),
+        ("/graphs/unavailable/snapshot", StatusCode::NOT_FOUND),
+        ("/graphs", StatusCode::FORBIDDEN),
+    ] {
+        let (status, _) = json_response(&open, get_request(path, "")).await;
+        assert_eq!(status, expected);
+    }
     let app = build_app(state);
     let (status, catalog) = json_response(&app, get_request("/graphs/discovery", &identity)).await;
     assert_eq!(status, StatusCode::OK);
@@ -1986,7 +2021,9 @@ async fn engine_layer_policy_fires_via_direct_arc_omnigraph_from_new_single() {
     );
     let handle = match state.routing().registry.get(&key) {
         omnigraph_server::RegistryLookup::Ready(handle) => handle,
-        omnigraph_server::RegistryLookup::Gone => panic!("default graph must be registered"),
+        omnigraph_server::RegistryLookup::Gone | omnigraph_server::RegistryLookup::Blocked(_) => {
+            panic!("default graph must be registered")
+        }
     };
     let engine = omnigraph::Session::from_defaults(
         Arc::clone(&handle.engine),

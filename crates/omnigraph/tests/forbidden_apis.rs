@@ -246,7 +246,7 @@ write_surfaces! {
     "loader/mod.rs" => LOAD_V9 => ["load_jsonl", "load_jsonl_file", "load", "load_with_receipt", "load_file", "load_graph_batch"],
     "loader/mod.rs" => WriteProtocol::Composed("optional branch create, then Load v9") => ["load_as", "load_as_with_receipt", "load_file_as", "load_file_as_with_receipt", "load_graph_batch_as", "load_graph_batch_as_with_receipt"],
     "loader/mod.rs" => WriteProtocol::Composed("branch create when absent, then Load v9 alias") => ["ingest", "ingest_as", "ingest_file", "ingest_file_as"],
-    "db/omnigraph.rs" => SCHEMA_V9 => ["apply_schema", "apply_schema_as", "apply_schema_as_with_catalog_check"],
+    "db/omnigraph.rs" => SCHEMA_V9 => ["apply_schema", "apply_schema_as", "apply_schema_as_with_catalog_check", "apply_prepared_schema_as"],
     "db/omnigraph.rs" => SYSTEM_COLUMNS_V9 => ["upgrade_system_columns", "upgrade_system_columns_as"],
     "exec/merge.rs" => MERGE_V9 => ["branch_merge", "branch_merge_as"],
     "db/omnigraph.rs" => INDICES_V9 => [
@@ -281,6 +281,8 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ),
     ("db/omnigraph.rs", "plan_schema"),
     ("db/omnigraph.rs", "preview_schema_apply"),
+    ("db/omnigraph.rs", "prepare_schema_apply_as"),
+    ("db/omnigraph.rs", "reconcile_schema_apply_as"),
     ("db/omnigraph.rs", "snapshot_of"),
     ("db/omnigraph.rs", "graph_manifest_version_of"),
     ("db/omnigraph.rs", "internal_schema_version_of"),

@@ -18,11 +18,12 @@ pub use omnigraph::{
     CleanupPolicyOptions, CollectorCost, CollectorPathSnapshot, CollectorReport,
     CollectorRowSummary, DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats,
     EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult, InitOptions, MergeOutcome,
-    MergeResult, Omnigraph, OpenMode, PendingIndex, RebuiltFullTextIndex, RepairAction,
-    RepairClassification, RepairOptions, RepairStats, RetainedManifestVersions,
-    SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyResult, SkipReason, StagingVerdict,
-    SystemColumnUpgradeFinding, SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome,
-    SystemColumnUpgradeReport, TableCollectionPlan, UnpublishedManifest,
+    MergeResult, Omnigraph, OpenMode, PendingIndex, PreparedSchemaApply, RebuiltFullTextIndex,
+    RepairAction, RepairClassification, RepairOptions, RepairStats, RetainedManifestVersions,
+    SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyReconciliation, SchemaApplyResult, SchemaContractDigest,
+    SkipReason, StagingVerdict, SystemColumnUpgradeFinding, SystemColumnUpgradeOptions,
+    SystemColumnUpgradeOutcome, SystemColumnUpgradeReport, TableCollectionPlan,
+    UnpublishedManifest,
 };
 pub(crate) use omnigraph::{
     LogicalBlobValue, RangedExternalBlobs, export_blob_values, logical_row_image,

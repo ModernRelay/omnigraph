@@ -78,7 +78,7 @@ The current distributed support boundary is still one mutation-capable writer pr
 
 A directory lets the server resolve the storage root from `cluster.yaml`; a URI reads the applied deployment artifact directly. There is no single-graph positional boot, `--target`, or runtime graph add/remove API.
 
-Serving verifies ledger/resource digests, builds each graph's query registry and embedding provider, projects external-Blob policy to the server-safe subset, and binds at most one Cedar bundle per graph plus one cluster-level bundle. A graph-local open or registry failure quarantines that graph while healthy graphs may continue, and so does an applied server-safe external-Blob base that overlaps the cluster storage root (a ledger written before validation refused such bases). `--require-all-graphs` makes any quarantine a startup failure; zero healthy graphs always fails.
+Serving verifies ledger/resource digests, builds each graph's query registry and embedding provider, projects external-Blob policy to the server-safe subset, and binds at most one Cedar bundle per graph plus one cluster-level bundle. The registry retains actual startup outcomes as ready handles or blocked entries carrying sanitized failure categories and validated authorization context. Graph-local policy, open, external-Blob policy or query-registry failures block that graph while healthy graphs may continue. `--require-all-graphs` makes any blocked entry a startup failure; a nonempty inventory with zero healthy graphs always fails. The listener starts only after graph opening; no startup retry or online activation is implemented.
 
 Servers do not hot-reload applied graph configuration. Apply the new revision and restart every server that should serve it. Explicit OIDC public-admission snapshots have a separate bounded refresh contract below.
 
@@ -111,12 +111,20 @@ applied-policy ownership are described in
 [Identity credentials and applied policy authorization](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md).
 
 `GET /graphs/discovery` accepts only the verified identity profile and returns
-IDs and display names for the opened and quarantined graph inventory captured
+IDs and display names for the ready and blocked graph inventory captured
 at boot. It neither scans storage nor discloses availability, paths, policy,
 schema, or query definitions. It needs no policy membership. The separate
-`GET /graphs` metadata response and its `graph_list` gate are unchanged;
-version 1 filtering remains an additional restriction. Typed discovery
-responses are additive to the existing public catalog types.
+`GET /graphs` uses the same registry with a `graph_list` gate and returns one
+list containing runtime availability, sanitized failure and action. Version 1
+filtering remains an additional restriction. Neither inventory synthesizes graph
+entries from the boot witness. Discovery still discloses no availability.
+
+HTTP and MCP graph resolution apply credential graph scope before lookup. A
+blocked graph yields 503 only after graph `read` authorization on `main` or
+management `graph_list` authorization; otherwise it remains undisclosed as 404.
+An invalid graph policy or configuration cannot authorize the graph-read fallback.
+Availability booleans describe the runtime, not a policy grant; route
+authorization still applies to ready graphs.
 
 The CLI's versioned keychain cache records the issuance profile and verifies
 its endpoint and identity bindings before replacement. A legacy issuance
@@ -129,9 +137,13 @@ infers routing from an arbitrary bearer token's unverified shape.
 
 A replica reports what it booted from on `GET /readyz` (RFC 0049): the
 applied `config_digest` as `booted_serving_digest`, the ledger revision and
-CAS, and how many applied graphs it serves and does not; it answers 503 from
-the shutdown signal on. Graph IDs stay on the authenticated catalog routes,
-which include quarantined graphs under their respective disclosure contracts.
+CAS, and registry, ready and blocked graph counts. `served_graph_count` counts
+every registry entry. Status is `serving`, `degraded`, `blocked` or `draining`;
+readiness requires a ready graph or valid empty inventory and open admission.
+Graph IDs stay on the authenticated catalog routes under their respective
+disclosure contracts. Status reads registry snapshots without graph/storage I/O;
+shutdown makes every entry `stopping` and both availability flags false, retaining
+any startup failure category.
 Graceful shutdown is bounded by one deadline (`--shutdown-grace-seconds`,
 default 25), kept by a thread and armed
 by a listener installed before graphs open, after which the process exits 2
@@ -142,8 +154,14 @@ inputs, trusted actor, Session and capacity reservations survive a lost response
 waiter. Merge and optional source deletion share one owner. Registration and
 permanent admission closure have one synchronous ordering boundary; shutdown
 waits for admitted writes and registered read bodies/server producers after HTTP
-connections finish. Panic or explicitly indeterminate owned completion closes
-admission for every graph and signals the same bounded process shutdown, retaining
+connections finish. After bounded body collection, read handlers also run in
+owned tasks; losing the HTTP waiter leaves their engine future, read observer
+and input reservation alive. MCP tool execution retains its own concurrency
+permit after its caller cancels or reaches the response deadline. Completed
+results occupy one observed delivery slot until consumed or dropped. A read
+error or panic does not trigger write uncertainty. A write panic or explicitly
+indeterminate owned completion closes admission for every graph and signals the
+same bounded process shutdown, retaining
 unresolved reservations until exit. Proven engine pre-effect refusals remain
 nonfatal. Read/write body and response lanes have independent capacity; bodyless
 reads consume only read observers. Once HTTP connections and the remaining known

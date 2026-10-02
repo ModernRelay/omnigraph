@@ -109,7 +109,11 @@ pub(crate) fn print_schema_apply_human(output: &SchemaApplyOutput) {
     println!("applied: {}", if output.applied { "yes" } else { "no" });
     println!("graph_manifest_version: {}", output.graph_manifest_version);
     if output.steps.is_empty() {
-        println!("no schema changes");
+        if output.applied {
+            println!("schema source updated; no table migration steps");
+        } else {
+            println!("no schema changes");
+        }
         return;
     }
     for step in &output.steps {
@@ -596,7 +600,7 @@ pub(crate) fn print_schema_plan_human(uri: &str, plan: &SchemaMigrationPlan) {
     println!("schema plan for {}", uri);
     println!("supported: {}", if plan.supported { "yes" } else { "no" });
     if plan.steps.is_empty() {
-        println!("no schema changes");
+        println!("no table migration steps");
         return;
     }
     for step in &plan.steps {

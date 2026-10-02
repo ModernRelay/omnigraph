@@ -1568,7 +1568,13 @@ async fn serving_snapshot_quarantines_graph_whose_applied_base_overlaps_storage_
             .collect::<Vec<_>>(),
         vec!["archive"]
     );
-    assert_eq!(snapshot.quarantined_graphs, vec!["knowledge".to_string()]);
+    assert_eq!(
+        snapshot.quarantined_graphs,
+        vec![ServingBlockedGraph {
+            graph_id: "knowledge".to_string(),
+            root: PathBuf::from("s3://assets/cluster/graphs/knowledge.omni"),
+        }],
+    );
     assert_eq!(
         snapshot.applied_graphs,
         vec!["archive".to_string(), "knowledge".to_string()]
@@ -3242,6 +3248,23 @@ async fn apply_schema_update_and_dependent_query_in_one_run() {
                 .unwrap()
                 .next()
                 .is_none()
+    );
+
+    // An empty table-migration plan is not a source no-op. Cluster convergence
+    // must certify the exact schema bytes that reopening the graph accepts.
+    let source_only = format!("// Updated schema documentation.\n{SCHEMA_V2}");
+    fs::write(dir.path().join("people.pg"), &source_only).unwrap();
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(out.converged, "{out:?}");
+    let db = Omnigraph::open_read_only(&derived_graph_uri(dir.path(), "knowledge"))
+        .await
+        .unwrap();
+    assert_eq!(db.schema_source().as_str(), source_only);
+    let state = read_state_json(dir.path());
+    assert_eq!(
+        state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
+        sha256_hex(db.schema_source().as_bytes()),
     );
 }
 

@@ -101,7 +101,7 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
                     ),
                     (
                         "503",
-                        "Server operation admission is closed; reconcile any earlier write before retrying",
+                        "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
                     ),
                     (
                         "408",

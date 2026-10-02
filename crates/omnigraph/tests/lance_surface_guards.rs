@@ -213,6 +213,238 @@ fn dropped_local_multipart_upload_cleans_up_after_its_owner_returns() {
     });
 }
 
+/// Read-only native work needs its own retained-resource boundary too. The
+/// public CPU helper used by KNN searches returns a receiver, not a task join:
+/// dropping successive callers leaves all captured inputs owned by native jobs.
+/// Parking here models a slow computation; production CPU jobs must never wait.
+#[tokio::test]
+async fn dropped_native_cpu_futures_retain_each_captured_input_until_completion() {
+    use lance_core::utils::tokio::spawn_cpu;
+
+    const ATTEMPTS: usize = 3;
+    let mut releases = Vec::new();
+    let mut completions = Vec::new();
+    let mut inputs = Vec::new();
+    for _ in 0..ATTEMPTS {
+        let input = Arc::new(vec![17_u8; 4096]);
+        inputs.push(Arc::downgrade(&input));
+        let (release, released) = std::sync::mpsc::channel();
+        // Releasing on panic prevents this negative guard from stranding a
+        // native pool worker and blocking unrelated tests.
+        releases.push(NativeBlockingGate(Some(release)));
+        let (completed, completion) = tokio::sync::oneshot::channel();
+        completions.push(completion);
+        let result = spawn_cpu(move || {
+            let _ = released.recv();
+            assert_eq!(input[0], 17);
+            drop(input);
+            let _ = completed.send(());
+            Ok::<_, std::io::Error>(())
+        });
+        drop(result);
+    }
+
+    assert_eq!(
+        inputs
+            .iter()
+            .filter(|input| input.upgrade().is_some())
+            .count(),
+        ATTEMPTS,
+        "all callers are gone, but each submitted native job still owns its input"
+    );
+    drop(releases);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        for completion in completions {
+            completion.await.unwrap();
+        }
+    })
+    .await
+    .expect("released native jobs must finish");
+    assert!(inputs.iter().all(|input| input.upgrade().is_none()));
+}
+
+/// A dropped local read is harmless to graph contents, but is not resource
+/// settlement. Even with the engine/reader retained, native work can execute
+/// after all its caller futures have gone. `get_all` advances the shared file
+/// offset, giving an independent witness that the real native read ran late.
+#[test]
+fn dropped_local_read_futures_still_execute_on_the_native_pool() {
+    use lance_io::local::LocalObjectReader;
+    use object_store::path::Path;
+
+    let runtime = NativeIoProbeRuntime::new();
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("read-tail.lance");
+    let payload = b"read-only native work retains a file and allocates a buffer";
+    std::fs::write(&file, payload).unwrap();
+    let path = Path::from_absolute_path(&file).unwrap();
+
+    runtime.block_on(async {
+        // A future that never reaches native dispatch must not consume the
+        // offset. This control distinguishes abandonment from merely opening
+        // the same file or constructing a read future.
+        let untouched = LocalObjectReader::open(&path, 4096, Some(payload.len()))
+            .await
+            .unwrap();
+        drop(untouched.get_all());
+        let mut readers = Vec::new();
+        for _ in 0..3 {
+            readers.push(
+                LocalObjectReader::open(&path, 4096, Some(payload.len()))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let gate = NativeBlockingGate::occupy_only_worker();
+        for reader in &readers {
+            let mut read = reader.get_all();
+            assert!(futures::poll!(&mut read).is_pending());
+            drop(read);
+        }
+        assert_eq!(std::fs::read(&file).unwrap(), payload);
+
+        drop(gate);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(|| ()),
+        )
+        .await
+        .expect("the native read jobs must run before this one-worker barrier")
+        .unwrap();
+        assert_eq!(untouched.get_all().await.unwrap().as_ref(), payload);
+        for reader in readers {
+            assert!(
+                reader.get_all().await.unwrap().is_empty(),
+                "the abandoned read must have consumed this reader's file offset"
+            );
+        }
+        assert_eq!(std::fs::read(&file).unwrap(), payload);
+    });
+}
+
+/// Observes the first poll of a real local read without replacing its I/O.
+#[derive(Debug)]
+struct NativeReadPollWitness {
+    inner: Arc<dyn lance_io::traits::Reader>,
+    polled: Arc<tokio::sync::Notify>,
+}
+
+impl lance_core::deepsize::DeepSizeOf for NativeReadPollWitness {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.inner.deep_size_of_children(context)
+    }
+}
+
+impl lance_io::traits::Reader for NativeReadPollWitness {
+    fn path(&self) -> &object_store::path::Path {
+        self.inner.path()
+    }
+
+    fn block_size(&self) -> usize {
+        self.inner.block_size()
+    }
+
+    fn io_parallelism(&self) -> usize {
+        self.inner.io_parallelism()
+    }
+
+    fn size(&self) -> futures::future::BoxFuture<'_, object_store::Result<usize>> {
+        self.inner.size()
+    }
+
+    fn get_range(
+        &self,
+        range: std::ops::Range<usize>,
+    ) -> futures::future::BoxFuture<'static, object_store::Result<bytes::Bytes>> {
+        let mut read = self.inner.get_range(range);
+        let polled = Arc::clone(&self.polled);
+        Box::pin(futures::future::poll_fn(move |cx| {
+            let result = read.as_mut().poll(cx);
+            polled.notify_one();
+            result
+        }))
+    }
+
+    fn get_all(&self) -> futures::future::BoxFuture<'_, object_store::Result<bytes::Bytes>> {
+        self.inner.get_all()
+    }
+}
+
+/// Standard scheduler limits are per scan. After cancellation each old scan's
+/// read remains owned, while a fresh scan can reserve another complete budget.
+/// This is read-only and preserves contents, but cannot be accounted as zero
+/// retained work merely because the request and scheduler handles disappeared.
+#[test]
+fn dropped_scan_schedulers_retain_independent_native_read_budgets() {
+    use lance_io::local::LocalObjectReader;
+    use lance_io::object_store::ObjectStore;
+    use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+    use lance_io::traits::Reader;
+    use object_store::path::Path;
+
+    let runtime = NativeIoProbeRuntime::new();
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("scheduler-read-tail.lance");
+    let payload = vec![29_u8; 4096];
+    std::fs::write(&file, &payload).unwrap();
+    let path = Path::from_absolute_path(&file).unwrap();
+
+    runtime.block_on(async {
+        let mut readers = Vec::new();
+        for _ in 0..3 {
+            readers.push(
+                LocalObjectReader::open(&path, 4096, Some(payload.len()))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let gate = NativeBlockingGate::occupy_only_worker();
+        let mut retained_readers = Vec::new();
+        let store = Arc::new(ObjectStore::local());
+        for reader in readers {
+            let polled = Arc::new(tokio::sync::Notify::new());
+            let reader: Arc<dyn Reader> = Arc::new(NativeReadPollWitness {
+                inner: Arc::from(reader),
+                polled: Arc::clone(&polled),
+            });
+            retained_readers.push(Arc::downgrade(&reader));
+            let scheduler = ScanScheduler::new(
+                Arc::clone(&store),
+                SchedulerConfig {
+                    io_buffer_size_bytes: payload.len() as u64,
+                    use_lite_scheduler: Some(false),
+                },
+            );
+            let ranges = std::iter::once(0..payload.len() as u64).collect();
+            let read = scheduler.submit_request(reader, ranges, 0, false);
+            tokio::time::timeout(std::time::Duration::from_secs(5), polled.notified())
+                .await
+                .expect("the scheduler must dispatch and poll the real native read");
+            drop(read);
+            drop(scheduler);
+        }
+        assert!(
+            retained_readers
+                .iter()
+                .all(|reader| reader.upgrade().is_some())
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), payload);
+
+        drop(gate);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while retained_readers
+                .iter()
+                .any(|reader| reader.upgrade().is_some())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native scheduler owners must disappear after their reads finish");
+        assert_eq!(std::fs::read(&file).unwrap(), payload);
+    });
+}
+
 /// Public-hook candidate only. The alternate implementation keeps canonical
 /// `file:` addressing but does not establish ownership of every native task.
 /// Windows UNC construction is scheme-sensitive and is not qualified here.

@@ -616,6 +616,11 @@ impl GraphCoordinator {
         )))
     }
 
+    /// The captured branch projection only, with no branch fanout on a miss.
+    pub(crate) fn captured_commit(&self, commit_id: &str) -> Option<GraphCommit> {
+        self.commit_graph.get_commit(commit_id)
+    }
+
     /// Resolve both endpoints and classify direct first-parent adjacency from
     /// the child's persisted parent pointer.
     ///

@@ -6,6 +6,7 @@
 use std::fmt;
 use std::future::Future;
 use std::num::{NonZero, NonZeroU64};
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -18,6 +19,7 @@ use datafusion::execution::memory_pool::{
     FairSpillPool, MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation, TrackConsumersPool,
 };
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use futures::FutureExt;
 use tokio::sync::Notify;
 
 use super::operators::memory::{QueryResources, locked};
@@ -241,12 +243,21 @@ impl QueryContext {
     }
 
     /// Finish the complete execution future, then close registration and wait,
-    /// on success and on error: an early LIMIT or an error can leave a cancelled
-    /// producer's blocking poll running. An abandoned caller closes via Drop.
+    /// on success, error and panic: an early LIMIT or unwinding execution can
+    /// leave a cancelled producer's blocking poll running. Resume the original
+    /// panic only after those workers settle. An abandoned caller closes via Drop.
     pub(super) async fn run_owned<F: Future>(&self, future: F) -> F::Output {
-        let result = future.await;
+        // Await inside the unwind boundary so dropping a completed execution
+        // future is caught too, before worker registration closes.
+        #[allow(clippy::redundant_async_block)] // The wrapper catches future Drop panics.
+        let result = AssertUnwindSafe(async move { future.await })
+            .catch_unwind()
+            .await;
         self.wait_owned_workers().await;
-        result
+        match result {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     #[cfg(test)]

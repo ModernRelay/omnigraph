@@ -793,7 +793,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -1182,7 +1182,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -1347,7 +1347,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -1590,7 +1590,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -1856,7 +1856,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -2058,7 +2058,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -2324,7 +2324,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -2692,7 +2692,7 @@
             }
           },
           "503": {
-            "description": "Recovery required before changes can be read; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Recovery required before changes can be read; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -2958,7 +2958,7 @@
             }
           },
           "503": {
-            "description": "Recovery required; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Recovery required; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -3141,7 +3141,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -3343,7 +3343,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -3675,7 +3675,7 @@
             }
           },
           "503": {
-            "description": "Recovery required before changes can be read; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Recovery required before changes can be read; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -3958,7 +3958,7 @@
             }
           },
           "503": {
-            "description": "Recovery required; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Recovery required; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -4224,7 +4224,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -4491,7 +4491,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -4840,7 +4840,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -5127,7 +5127,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -5423,7 +5423,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -5595,7 +5595,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -5918,7 +5918,7 @@
             }
           },
           "503": {
-            "description": "A stored mutation is blocked by a durable recovery intent; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "A stored mutation is blocked by a durable recovery intent; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -6271,7 +6271,7 @@
             }
           },
           "503": {
-            "description": "A stored mutation is blocked by a durable recovery intent; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "A stored mutation is blocked by a durable recovery intent; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -6516,7 +6516,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -6761,7 +6761,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -6934,7 +6934,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -7179,7 +7179,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -7362,7 +7362,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -7469,7 +7469,7 @@
           "health"
         ],
         "summary": "Readiness witness (RFC 0049).",
-        "description": "Unauthenticated, and therefore minimal: it reports whether this replica\nis serving or draining, the applied `config_digest` it booted from, the\nledger revision and CAS it read, and how many graphs it serves and does\nnot serve. Graph ids stay behind authenticated catalog endpoints. Answers\n503 once shutdown has begun; `/healthz` stays 200 while the process is\nalive.",
+        "description": "Unauthenticated, and therefore minimal: it reports whether this replica\nis serving or draining, the applied `config_digest` it booted from, the\nledger revision and CAS it read, and registry/ready/blocked counts. Graph\nids stay behind authenticated catalog endpoints. Partial availability is\nready but degraded; no available graph or shutdown returns 503. A valid\nempty registry is ready. `/healthz` reports liveness independently.",
         "operationId": "readiness",
         "responses": {
           "200": {
@@ -7494,7 +7494,7 @@
             }
           },
           "503": {
-            "description": "Draining",
+            "description": "No graph available or stopping",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -8454,6 +8454,7 @@
           "conflict",
           "too_many_requests",
           "service_unavailable",
+          "graph_unavailable",
           "internal"
         ]
       },
@@ -8671,6 +8672,22 @@
           }
         }
       },
+      "GraphAvailability": {
+        "type": "string",
+        "enum": [
+          "ready",
+          "blocked",
+          "stopping"
+        ]
+      },
+      "GraphAvailabilityAction": {
+        "type": "string",
+        "enum": [
+          "none",
+          "restart_after_correction",
+          "wait_for_restart"
+        ]
+      },
       "GraphBatchDeclarationOutput": {
         "type": "object",
         "description": "One logical declaration touched by a graph-batch load.\n\nThis deliberately carries the accepted-schema name, not a backing dataset\nselector, path, or Lance identity.",
@@ -8791,14 +8808,41 @@
         "description": "One entry in the response from `GET /graphs`. Cluster operators\nconsume this list to discover which graphs the server is currently\nserving. This legacy metadata includes the storage `uri`; identity-only\nexistence discovery uses [`GraphDiscoveryEntry`] instead.",
         "required": [
           "graph_id",
-          "uri"
+          "uri",
+          "state",
+          "read_available",
+          "write_available",
+          "action"
         ],
         "properties": {
+          "action": {
+            "$ref": "#/components/schemas/GraphAvailabilityAction"
+          },
+          "failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GraphStartupFailure"
+              }
+            ]
+          },
           "graph_id": {
             "type": "string"
           },
+          "read_available": {
+            "type": "boolean",
+            "description": "Runtime availability; actor policy still gates every operation."
+          },
+          "state": {
+            "$ref": "#/components/schemas/GraphAvailability"
+          },
           "uri": {
             "type": "string"
+          },
+          "write_available": {
+            "type": "boolean"
           }
         }
       },
@@ -8814,15 +8858,19 @@
             "items": {
               "$ref": "#/components/schemas/GraphInfo"
             }
-          },
-          "quarantined": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "Graphs the applied revision names that this process does not serve,\nfor any reason, sorted (RFC 0049). Empty when every applied graph is\nserved."
           }
         }
+      },
+      "GraphStartupFailure": {
+        "type": "string",
+        "description": "Bounded startup classification, without storage paths or error text.",
+        "enum": [
+          "invalid_configuration",
+          "invalid_policy",
+          "invalid_external_blob_policy",
+          "open_failed",
+          "invalid_stored_queries"
+        ]
       },
       "HealthOutput": {
         "type": "object",
@@ -9458,10 +9506,16 @@
           "status",
           "state_revision",
           "served_graph_count",
-          "quarantined_graph_count",
+          "ready_graph_count",
+          "blocked_graph_count",
           "shutdown_grace_seconds"
         ],
         "properties": {
+          "blocked_graph_count": {
+            "type": "integer",
+            "description": "Registered graphs whose startup failed. `GET /graphs` names them.",
+            "minimum": 0
+          },
           "booted_serving_digest": {
             "type": [
               "string",
@@ -9469,18 +9523,18 @@
             ],
             "description": "The `config_digest` of the applied revision this process booted from.\nFixed for the life of the process: the server never reloads."
           },
-          "quarantined_graph_count": {
-            "type": "integer",
-            "description": "How many graphs the applied revision names that this process does\nnot serve, for any reason. `GET /graphs` names them.",
-            "minimum": 0
-          },
           "ready": {
             "type": "boolean",
-            "description": "False once shutdown has begun; the response is then 503."
+            "description": "False during shutdown or when a nonempty inventory has no ready graph."
+          },
+          "ready_graph_count": {
+            "type": "integer",
+            "description": "Registered graphs whose startup completed successfully.",
+            "minimum": 0
           },
           "served_graph_count": {
             "type": "integer",
-            "description": "How many graphs this process serves.",
+            "description": "Number of registered graphs, including blocked entries.",
             "minimum": 0
           },
           "shutdown_grace_seconds": {
@@ -9504,7 +9558,7 @@
           },
           "status": {
             "type": "string",
-            "description": "`serving` or `draining`."
+            "description": "`serving`, `degraded`, `blocked` or `draining`."
           }
         }
       },

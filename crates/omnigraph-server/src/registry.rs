@@ -1,22 +1,9 @@
 //! `GraphRegistry` — the multi-graph routing substrate (MR-668).
 //!
-//! Holds the open `Arc<GraphHandle>` for every graph the server is currently
-//! serving. Lock-free reads via `ArcSwap<RegistrySnapshot>`; mutations
-//! serialize through `mutate: Mutex<()>` for read-modify-write atomicity.
-//!
-//! **Deletion is deferred** in v0.6.0 (MR-668 scope cut). The registry has
-//! no `tombstones` field, no `RegistryLookup::Tombstoned` variant, no
-//! `tombstone()` / `clear_tombstone()` methods. When `DELETE /graphs/{id}`
-//! lands in a follow-up release, those return without breaking caller
-//! signatures (`Gone` is the closest semantic — the graph is no longer
-//! in the registry).
-//!
-//! Engine instance survival across registry mutations:
-//! a request that grabbed `Arc<GraphHandle>` before a registry swap keeps
-//! the engine alive via its own `Arc` clone (see `server_export` at
-//! `lib.rs:1019-1033` for the spawn-and-clone pattern). The engine drops
-//! when the last `Arc<Omnigraph>` clone drops, regardless of the
-//! registry's current state.
+//! Contains every configured graph, including graphs blocked during startup.
+//! Immutable snapshots keep identity, availability and policy together. Ready
+//! request handles retain their engine through their last owner; blocked entries
+//! retain only fixed bindings and a bounded public failure classification.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,6 +42,52 @@ pub struct GraphHandle {
     pub queries: Option<Arc<QueryRegistry>>,
 }
 
+pub use crate::api::GraphStartupFailure as StartupFailure;
+
+/// A configured graph whose startup failed. An invalid policy must not be
+/// interpreted as absence of a policy when authorizing status disclosure.
+pub struct BlockedGraph {
+    pub key: GraphKey,
+    pub uri: String,
+    pub policy: Option<Arc<PolicyEngine>>,
+    pub failure: StartupFailure,
+}
+
+/// One configured graph's identity, fixed bindings and serving availability.
+#[derive(Clone)]
+pub enum GraphEntry {
+    Ready(Arc<GraphHandle>),
+    Blocked(Arc<BlockedGraph>),
+}
+
+impl GraphEntry {
+    pub fn key(&self) -> &GraphKey {
+        match self {
+            Self::Ready(handle) => &handle.key,
+            Self::Blocked(graph) => &graph.key,
+        }
+    }
+
+    pub fn uri(&self) -> &str {
+        match self {
+            Self::Ready(handle) => &handle.uri,
+            Self::Blocked(graph) => &graph.uri,
+        }
+    }
+
+    pub fn policy(&self) -> Option<&Arc<PolicyEngine>> {
+        match self {
+            Self::Ready(handle) => handle.policy.as_ref(),
+            Self::Blocked(graph) => graph.policy.as_ref(),
+        }
+    }
+
+    fn requires_policy_auth(&self) -> bool {
+        self.policy().is_some()
+            || matches!(self, Self::Blocked(graph) if graph.failure == StartupFailure::InvalidPolicy)
+    }
+}
+
 /// Immutable snapshot of the registry's current state. Replaced atomically
 /// via `ArcSwap`; readers see a consistent view of all graphs without locking.
 ///
@@ -63,8 +96,8 @@ pub struct GraphHandle {
 /// graph map every call. Construct only via [`RegistrySnapshot::new`]
 /// (or `Default`) so the field stays in sync with `graphs`.
 pub struct RegistrySnapshot {
-    pub graphs: HashMap<GraphKey, Arc<GraphHandle>>,
-    /// `true` iff any registered graph has a per-graph policy installed.
+    pub graphs: HashMap<GraphKey, GraphEntry>,
+    /// `true` iff any configured graph has a valid or refused policy binding.
     /// Used by `AppState::requires_bearer_auth` to decide whether the
     /// auth middleware should challenge a request — a per-graph policy
     /// implies bearer auth is required even when no server-level tokens
@@ -76,8 +109,8 @@ impl RegistrySnapshot {
     /// Build a snapshot from a graph map, deriving cached fields.
     /// The only construction path — direct struct-literal use elsewhere
     /// would let derived state drift from `graphs`.
-    pub fn new(graphs: HashMap<GraphKey, Arc<GraphHandle>>) -> Self {
-        let any_per_graph_policy = graphs.values().any(|h| h.policy.is_some());
+    pub fn new(graphs: HashMap<GraphKey, GraphEntry>) -> Self {
+        let any_per_graph_policy = graphs.values().any(GraphEntry::requires_policy_auth);
         Self {
             graphs,
             any_per_graph_policy,
@@ -91,10 +124,12 @@ impl Default for RegistrySnapshot {
     }
 }
 
-/// Result of a registry lookup. Two-valued — `Tombstoned` deferred with DELETE.
+/// Availability and identity from one registry snapshot.
 pub enum RegistryLookup {
     /// Graph is open and ready to serve.
     Ready(Arc<GraphHandle>),
+    /// Graph is configured but unavailable after a startup failure.
+    Blocked(Arc<BlockedGraph>),
     /// Graph is not in the registry (never existed, or was unregistered in a
     /// future release). Handlers respond with 404.
     Gone,
@@ -139,18 +174,24 @@ impl GraphRegistry {
     /// Build a registry from a startup-time list of open handles.
     /// Rejects duplicate `GraphKey`s and duplicate URIs.
     pub fn from_handles(handles: Vec<Arc<GraphHandle>>) -> Result<Self, InsertError> {
-        let mut graphs: HashMap<GraphKey, Arc<GraphHandle>> = HashMap::with_capacity(handles.len());
-        let mut seen_uris: HashMap<String, GraphKey> = HashMap::with_capacity(handles.len());
-        for handle in handles {
-            let (canonical_uri, handle) = canonicalize_handle_uri(handle)?;
-            if graphs.contains_key(&handle.key) {
-                return Err(InsertError::DuplicateKey(handle.key.clone()));
+        Self::from_entries(handles.into_iter().map(GraphEntry::Ready).collect())
+    }
+
+    /// Build the complete startup inventory. Unavailable entries participate
+    /// in the same identity and URI uniqueness checks as ready handles.
+    pub fn from_entries(entries: Vec<GraphEntry>) -> Result<Self, InsertError> {
+        let mut graphs = HashMap::with_capacity(entries.len());
+        let mut seen_uris = HashMap::with_capacity(entries.len());
+        for entry in entries {
+            let entry = canonicalize_entry_uri(entry)?;
+            if graphs.contains_key(entry.key()) {
+                return Err(InsertError::DuplicateKey(entry.key().clone()));
             }
-            if seen_uris.contains_key(&canonical_uri) {
-                return Err(InsertError::DuplicateUri(handle.uri.clone()));
+            if seen_uris.contains_key(entry.uri()) {
+                return Err(InsertError::DuplicateUri(entry.uri().to_string()));
             }
-            seen_uris.insert(canonical_uri, handle.key.clone());
-            graphs.insert(handle.key.clone(), handle);
+            seen_uris.insert(entry.uri().to_string(), entry.key().clone());
+            graphs.insert(entry.key().clone(), entry);
         }
         Ok(Self {
             snapshot: ArcSwap::from_pointee(RegistrySnapshot::new(graphs)),
@@ -167,26 +208,38 @@ impl GraphRegistry {
         self.snapshot.load()
     }
 
-    /// Lock-free read. Returns `Ready` if the graph is in the current snapshot,
-    /// `Gone` otherwise.
+    /// Lock-free lookup preserving known unavailable graphs.
     pub fn get(&self, key: &GraphKey) -> RegistryLookup {
         let snapshot = self.snapshot.load();
         match snapshot.graphs.get(key) {
-            Some(handle) => RegistryLookup::Ready(Arc::clone(handle)),
+            Some(GraphEntry::Ready(handle)) => RegistryLookup::Ready(Arc::clone(handle)),
+            Some(GraphEntry::Blocked(graph)) => RegistryLookup::Blocked(Arc::clone(graph)),
             None => RegistryLookup::Gone,
         }
     }
 
-    /// Snapshot the full set of currently-registered handles. Ordering
+    /// Snapshot the ready handles, excluding blocked entries. Ordering
     /// matches the underlying `HashMap` iteration (intentionally
     /// non-deterministic — callers that need a stable order sort by
     /// `handle.key.graph_id`).
     pub fn list(&self) -> Vec<Arc<GraphHandle>> {
         let snapshot = self.snapshot.load();
-        snapshot.graphs.values().cloned().collect()
+        snapshot
+            .graphs
+            .values()
+            .filter_map(|entry| match entry {
+                GraphEntry::Ready(handle) => Some(Arc::clone(handle)),
+                GraphEntry::Blocked(_) => None,
+            })
+            .collect()
     }
 
-    /// Number of registered graphs (excluding any future tombstones).
+    /// One complete inventory snapshot, including unavailable graphs.
+    pub fn entries(&self) -> Vec<GraphEntry> {
+        self.snapshot.load().graphs.values().cloned().collect()
+    }
+
+    /// Number of configured graphs, including unavailable entries.
     pub fn len(&self) -> usize {
         self.snapshot.load().graphs.len()
     }
@@ -220,8 +273,8 @@ impl GraphRegistry {
         }
         for existing in current.graphs.values() {
             let existing_uri =
-                normalize_root_uri(&existing.uri).map_err(|err| InsertError::InvalidUri {
-                    uri: existing.uri.clone(),
+                normalize_root_uri(existing.uri()).map_err(|err| InsertError::InvalidUri {
+                    uri: existing.uri().to_string(),
                     message: err.to_string(),
                 })?;
             if existing_uri == canonical_uri {
@@ -229,10 +282,34 @@ impl GraphRegistry {
             }
         }
         let mut new_graphs = current.graphs.clone();
-        new_graphs.insert(handle.key.clone(), handle);
+        new_graphs.insert(handle.key.clone(), GraphEntry::Ready(handle));
         self.snapshot
             .store(Arc::new(RegistrySnapshot::new(new_graphs)));
         Ok(())
+    }
+}
+
+fn canonicalize_entry_uri(entry: GraphEntry) -> Result<GraphEntry, InsertError> {
+    match entry {
+        GraphEntry::Ready(handle) => {
+            canonicalize_handle_uri(handle).map(|(_, handle)| GraphEntry::Ready(handle))
+        }
+        GraphEntry::Blocked(graph) => {
+            let uri = normalize_root_uri(&graph.uri).map_err(|err| InsertError::InvalidUri {
+                uri: graph.uri.clone(),
+                message: err.to_string(),
+            })?;
+            if uri == graph.uri {
+                Ok(GraphEntry::Blocked(graph))
+            } else {
+                Ok(GraphEntry::Blocked(Arc::new(BlockedGraph {
+                    key: graph.key.clone(),
+                    uri,
+                    policy: graph.policy.clone(),
+                    failure: graph.failure,
+                })))
+            }
+        }
     }
 }
 
@@ -306,7 +383,7 @@ mod tests {
             RegistryLookup::Ready(found) => {
                 assert!(Arc::ptr_eq(&found, &handle));
             }
-            RegistryLookup::Gone => panic!("expected Ready, got Gone"),
+            RegistryLookup::Gone | RegistryLookup::Blocked(_) => panic!("expected Ready"),
         }
     }
 
@@ -316,7 +393,7 @@ mod tests {
         let key = GraphKey::cluster(GraphId::try_from("ghost").unwrap());
         match registry.get(&key) {
             RegistryLookup::Gone => {}
-            RegistryLookup::Ready(_) => panic!("expected Gone"),
+            RegistryLookup::Ready(_) | RegistryLookup::Blocked(_) => panic!("expected Gone"),
         }
     }
 
@@ -393,6 +470,49 @@ mod tests {
         ];
         let registry = GraphRegistry::from_handles(handles).unwrap();
         assert_eq!(registry.len(), 2);
+        assert!(!registry.snapshot_ref().any_per_graph_policy);
+
+        // Availability never removes configured identity. A refused policy
+        // must still require authentication even though no engine was opened.
+        let mut entries = registry.entries();
+        let blocked = Arc::new(BlockedGraph {
+            key: GraphKey::cluster(GraphId::try_from("blocked").unwrap()),
+            uri: dir.path().join("blocked").to_string_lossy().into_owned(),
+            policy: None,
+            failure: StartupFailure::InvalidPolicy,
+        });
+        entries.push(GraphEntry::Blocked(Arc::clone(&blocked)));
+        let registry = GraphRegistry::from_entries(entries).unwrap();
+        assert_eq!(registry.len(), 3);
+        assert_eq!(registry.entries().len(), 3);
+        assert_eq!(registry.list().len(), 2);
+        assert!(registry.snapshot_ref().any_per_graph_policy);
+        match registry.get(&blocked.key) {
+            RegistryLookup::Blocked(found) => {
+                assert_eq!(found.failure, StartupFailure::InvalidPolicy);
+                assert!(found.policy.is_none());
+                assert_eq!(found.uri, normalize_root_uri(&blocked.uri).unwrap());
+            }
+            RegistryLookup::Ready(_) | RegistryLookup::Gone => panic!("expected Blocked"),
+        }
+
+        let mut duplicate_key = registry.entries();
+        duplicate_key.push(GraphEntry::Blocked(Arc::clone(&blocked)));
+        assert!(matches!(
+            GraphRegistry::from_entries(duplicate_key),
+            Err(InsertError::DuplicateKey(_)),
+        ));
+        let mut duplicate_uri = registry.entries();
+        duplicate_uri.push(GraphEntry::Blocked(Arc::new(BlockedGraph {
+            key: GraphKey::cluster(GraphId::try_from("other").unwrap()),
+            uri: blocked.uri.clone(),
+            policy: None,
+            failure: StartupFailure::OpenFailed,
+        })));
+        assert!(matches!(
+            GraphRegistry::from_entries(duplicate_uri),
+            Err(InsertError::DuplicateUri(_)),
+        ));
     }
 
     #[tokio::test]
@@ -553,8 +673,8 @@ mod tests {
                         RegistryLookup::Ready(found) => {
                             assert!(Arc::ptr_eq(&found, handle));
                         }
-                        RegistryLookup::Gone => panic!(
-                            "snapshot listed key {} but get() returned Gone",
+                        RegistryLookup::Gone | RegistryLookup::Blocked(_) => panic!(
+                            "snapshot listed ready key {} but get() did not return Ready",
                             handle.key.graph_id
                         ),
                     }

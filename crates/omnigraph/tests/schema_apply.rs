@@ -4,11 +4,14 @@ use base64::Engine;
 #[cfg(feature = "failpoints")]
 use std::sync::Arc;
 
-use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
+use omnigraph::db::{
+    MergeOutcome, Omnigraph, PreparedSchemaApply, ReadTarget, SchemaApplyReconciliation,
+};
 use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::loader::LoadMode;
 use omnigraph::{BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
+use sha2::{Digest, Sha256};
 
 use helpers::*;
 
@@ -641,12 +644,544 @@ async fn plan_schema_on_unrefreshed_handle_plans_against_the_applied_contract() 
 async fn apply_schema_noop_returns_not_applied() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = init_and_load(&dir).await;
+    let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let before_commits = db.list_commits(None).await.unwrap();
+    let before_contract = omnigraph_catalog::ManifestCoordinator::read_schema_contract_at(
+        uri,
+        None,
+        before.graph_manifest_version(),
+    )
+    .await
+    .unwrap();
 
     let result = db.apply_schema(TEST_SCHEMA).await.unwrap();
     assert!(result.supported);
     assert!(!result.applied);
     assert!(result.steps.is_empty());
+    assert!(result.commit.is_none());
+    assert_eq!(
+        result.contract.source_hash,
+        format!("{:x}", Sha256::digest(TEST_SCHEMA.as_bytes()))
+    );
+    assert_eq!(
+        result.contract.schema_ir_hash,
+        before_contract.head.schema_ir_hash
+    );
+    assert_eq!(
+        result.graph_manifest_version,
+        before.graph_manifest_version()
+    );
+    assert_eq!(db.list_commits(None).await.unwrap(), before_commits);
+
+    // Source bytes are part of the accepted contract even when the typed schema
+    // has no migration steps. This Rust owner checks publication and table pins,
+    // which the query-level logic-test format does not expose.
+    let desired = format!("// Deployment source revision\n{TEST_SCHEMA}\n");
+    assert!(db.plan_schema(&desired).await.unwrap().steps.is_empty());
+    let changed = db.apply_schema(&desired).await.unwrap();
+    assert!(changed.supported && changed.applied);
+    assert!(changed.steps.is_empty());
+    assert_eq!(
+        changed.commit.as_ref().unwrap().parent_commit_id.as_deref(),
+        Some(before_commits[0].graph_commit_id.as_str())
+    );
+    assert_eq!(
+        changed.contract.source_hash,
+        format!("{:x}", Sha256::digest(desired.as_bytes()))
+    );
+    let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(
+        after.graph_manifest_version(),
+        before.graph_manifest_version() + 1
+    );
+    assert_eq!(
+        changed.graph_manifest_version,
+        after.graph_manifest_version()
+    );
+    assert_eq!(
+        db.list_commits(None).await.unwrap().len(),
+        before_commits.len() + 1
+    );
+    assert_eq!(after.datasets().count(), before.datasets().count());
+    for entry in before.datasets() {
+        assert!(entry.same_registration(after.dataset(&entry.type_key).unwrap()));
+    }
+    let after_contract = omnigraph_catalog::ManifestCoordinator::read_schema_contract_at(
+        uri,
+        None,
+        after.graph_manifest_version(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(after_contract.source, desired);
+    assert_eq!(after_contract.ir, before_contract.ir);
+    assert_eq!(after_contract.head, before_contract.head);
+    assert_eq!(
+        changed.contract.schema_ir_hash,
+        after_contract.head.schema_ir_hash
+    );
+    assert_eq!(
+        changed.contract.schema_identity_domain,
+        after_contract.head.schema_identity_domain
+    );
+    assert_eq!(
+        changed.contract.schema_identity_version,
+        after_contract.head.schema_identity_version
+    );
+    assert_eq!(db.schema_source().as_str(), desired);
+
+    let reopened = Omnigraph::open(uri).await.unwrap();
+    assert_eq!(reopened.schema_source().as_str(), desired);
+    let repeated = reopened.apply_schema(&desired).await.unwrap();
+    assert!(!repeated.applied);
+    assert!(repeated.commit.is_none());
+    assert_eq!(repeated.contract, changed.contract);
+    assert_eq!(
+        repeated.graph_manifest_version,
+        after.graph_manifest_version()
+    );
+    assert_eq!(
+        reopened.list_commits(None).await.unwrap(),
+        db.list_commits(None).await.unwrap()
+    );
+}
+
+fn schema_storage_bytes(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn visit(
+        root: &std::path::Path,
+        path: &std::path::Path,
+        files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                visit(root, &path, files);
+            } else {
+                files.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    std::fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    visit(root, root, &mut files);
+    files
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn prepared_schema_receipt_reconciles_its_own_publication_after_restart_and_later_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = init_and_load(&dir).await;
+    let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let predecessor = db.list_commits(None).await.unwrap()[0].clone();
+    let files_before = schema_storage_bytes(dir.path());
+    let desired = TEST_SCHEMA.replace("age: I32?", "age: I32?\n    nickname: String?");
+    let prepared = db
+        .prepare_schema_apply_as(&desired, Some("deployer"))
+        .await
+        .unwrap();
+    assert!(!prepared.is_noop());
+    assert_eq!(
+        prepared.base_manifest_version(),
+        before.graph_manifest_version()
+    );
+    let commit_id = prepared.graph_commit_id().unwrap().to_string();
+    let prepared: PreparedSchemaApply =
+        serde_json::from_slice(&serde_json::to_vec(&prepared).unwrap()).unwrap();
+    assert_eq!(
+        schema_storage_bytes(dir.path()),
+        files_before,
+        "preparation must not stage or publish anything"
+    );
+    assert!(matches!(
+        db.reconcile_schema_apply_as(&prepared, Some("deployer"))
+            .await
+            .unwrap(),
+        SchemaApplyReconciliation::Unknown
+    ));
+    assert_eq!(
+        schema_storage_bytes(dir.path()),
+        files_before,
+        "missing evidence must not trigger execution or cleanup"
+    );
+    drop(db);
+
+    let db = helpers::session(Omnigraph::open(uri).await.unwrap());
+    let result = db
+        .apply_prepared_schema_as(&prepared, Some("deployer"))
+        .await
+        .unwrap();
+    let commit = result.commit.as_ref().unwrap();
+    assert!(result.applied);
+    assert_eq!(commit.graph_commit_id, commit_id);
+    assert_eq!(
+        commit.parent_commit_id.as_deref(),
+        Some(predecessor.graph_commit_id.as_str())
+    );
+    assert_eq!(commit.actor_id.as_deref(), Some("deployer"));
+    assert_eq!(commit.graph_manifest_version, result.graph_manifest_version);
+    assert_eq!(&result.contract, prepared.desired_contract());
+    assert_eq!(db.get_commit(&commit_id).await.unwrap(), *commit);
+    db.load_jsonl(
+        r#"{"type":"Person","data":{"name":"After publication"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        db.list_commits(None).await.unwrap()[0].graph_commit_id,
+        commit_id
+    );
+    drop(db);
+
+    let files_after = schema_storage_bytes(dir.path());
+    let observer = Omnigraph::open_read_only(uri).await.unwrap();
+    match observer
+        .reconcile_schema_apply_as(&prepared, Some("deployer"))
+        .await
+        .unwrap()
+    {
+        SchemaApplyReconciliation::Committed {
+            commit: found,
+            contract,
+        } => {
+            assert_eq!(found, *commit);
+            assert_eq!(contract, result.contract);
+        }
+        other => panic!("expected exact committed evidence, got {other:?}"),
+    }
+    assert_eq!(observer.schema_source().as_str(), desired);
+    assert_eq!(
+        schema_storage_bytes(dir.path()),
+        files_after,
+        "read-only reconciliation must change no object bytes or inventory"
+    );
+    drop(observer);
+
+    // Model loss of the exact retained publication version. Current cleanup
+    // prunes table pins but keeps catalog manifests; deleting this precise
+    // metadata object makes the evidence loss explicit without changing HEAD.
+    let published = lance::Dataset::open(&format!("{uri}/__manifest"))
+        .await
+        .unwrap()
+        .checkout_version(commit.graph_manifest_version)
+        .await
+        .unwrap();
+    published
+        .object_store(None)
+        .await
+        .unwrap()
+        .delete(&published.manifest_location().path)
+        .await
+        .unwrap();
+    let db = Omnigraph::open_read_only(uri).await.unwrap();
+    let after_prune = schema_storage_bytes(dir.path());
+    assert!(matches!(
+        db.reconcile_schema_apply_as(&prepared, Some("deployer"))
+            .await
+            .unwrap(),
+        SchemaApplyReconciliation::Unknown
+    ));
+    assert_eq!(
+        schema_storage_bytes(dir.path()),
+        after_prune,
+        "pruned publication evidence must remain unknown without recreating it"
+    );
+}
+
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+#[serial_test::serial]
+async fn prepared_schema_reconciliation_distinguishes_unpublished_effects_from_lost_acknowledgement()
+ {
+    use omnigraph::seams::catalog;
+
+    // The crash matrix owns table durability; this test owns the prepared
+    // operation's identity and read-only positive-evidence classification.
+    for (seam, published) in [
+        (&catalog::SCHEMA_APPLY_POST_TABLE_COMMIT, false),
+        (&catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = init_and_load(&dir).await;
+        let before = db.list_commits(None).await.unwrap();
+        let desired = TEST_SCHEMA.replace("age: I32?", "age: I32?\n    nickname: String?");
+        let prepared = db.prepare_schema_apply_as(&desired, None).await.unwrap();
+        let error = {
+            let _failure = seam.fail_once_at(1);
+            db.apply_prepared_schema_as(&prepared, None)
+                .await
+                .unwrap_err()
+        };
+        assert!(
+            error.to_string().contains(seam.name()),
+            "expected reached fault {}, got {error}",
+            seam.name()
+        );
+        if published {
+            assert!(
+                matches!(&error, OmniError::RecoveryRequired { operation_id, .. } if Some(operation_id.as_str()) == prepared.graph_commit_id())
+            );
+        }
+        let files = schema_storage_bytes(dir.path());
+        let cold = Omnigraph::open_read_only(uri).await.unwrap();
+        for observer in [db.db().as_ref(), &cold] {
+            match observer
+                .reconcile_schema_apply_as(&prepared, None)
+                .await
+                .unwrap()
+            {
+                SchemaApplyReconciliation::Committed { commit, contract } if published => {
+                    assert_eq!(
+                        Some(commit.graph_commit_id.as_str()),
+                        prepared.graph_commit_id()
+                    );
+                    assert_eq!(
+                        commit.parent_commit_id.as_deref(),
+                        Some(before[0].graph_commit_id.as_str())
+                    );
+                    assert_eq!(&contract, prepared.desired_contract());
+                }
+                SchemaApplyReconciliation::Unknown if !published => {
+                    assert_eq!(observer.list_commits(None).await.unwrap(), before);
+                }
+                other => panic!("wrong reconciliation at {}: {other:?}", seam.name()),
+            }
+        }
+        assert_eq!(schema_storage_bytes(dir.path()), files);
+    }
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn prepared_schema_rejects_malformed_serialized_intents_before_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let desired = TEST_SCHEMA.replace("age: I32?", "age: I32?\n    nickname: String?");
+    let prepared = db
+        .prepare_schema_apply_as(&desired, Some("deployer"))
+        .await
+        .unwrap();
+    let before = schema_storage_bytes(dir.path());
+    let commits = db.list_commits(None).await.unwrap();
+    assert!(commits.len() >= 2);
+    for actor in [None, Some("different-deployer")] {
+        assert!(db.apply_prepared_schema_as(&prepared, actor).await.is_err());
+        assert!(
+            db.reconcile_schema_apply_as(&prepared, actor)
+                .await
+                .is_err()
+        );
+        assert_eq!(schema_storage_bytes(dir.path()), before);
+    }
+    for (pointer, replacement, actor) in [
+        (
+            "/desired_contract/source_hash",
+            serde_json::json!("00".repeat(32)),
+            "deployer",
+        ),
+        (
+            "/desired_contract/schema_ir_hash",
+            serde_json::json!("00".repeat(32)),
+            "deployer",
+        ),
+        ("/actor", serde_json::json!("substituted"), "substituted"),
+        (
+            "/lineage/graph_commit_id",
+            serde_json::json!(commits[0].graph_commit_id),
+            "deployer",
+        ),
+        (
+            "/lineage/graph_commit_id",
+            serde_json::json!(commits[1].graph_commit_id),
+            "deployer",
+        ),
+        (
+            "/lineage/graph_commit_id",
+            serde_json::json!("not-a-commit-id"),
+            "deployer",
+        ),
+    ] {
+        let mut encoded = serde_json::to_value(&prepared).unwrap();
+        *encoded
+            .pointer_mut(pointer)
+            .expect("intent field must exist") = replacement;
+        let altered: PreparedSchemaApply = serde_json::from_value(encoded).unwrap();
+        assert!(
+            db.apply_prepared_schema_as(&altered, Some(actor))
+                .await
+                .is_err(),
+            "tampering {pointer} must refuse execution"
+        );
+        assert_eq!(
+            schema_storage_bytes(dir.path()),
+            before,
+            "tampering {pointer} must have no effects"
+        );
+    }
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn prepared_schema_rejects_a_different_root_and_stale_predecessor_without_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let desired = TEST_SCHEMA.replace("age: I32?", "age: I32?\n    nickname: String?");
+    let prepared = db.prepare_schema_apply_as(&desired, None).await.unwrap();
+    let other_dir = tempfile::tempdir().unwrap();
+    // A byte-for-byte clone has the same schema domain, native ref identity and
+    // predecessor. Only the canonical root distinguishes it from this intent.
+    for (relative, bytes) in schema_storage_bytes(dir.path()) {
+        let path = other_dir.path().join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    let other = Omnigraph::open(other_dir.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let other_before = schema_storage_bytes(other_dir.path());
+    assert!(
+        other
+            .apply_prepared_schema_as(&prepared, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        other
+            .reconcile_schema_apply_as(&prepared, None)
+            .await
+            .is_err()
+    );
+    assert_eq!(schema_storage_bytes(other_dir.path()), other_before);
+
+    db.load_jsonl(
+        r#"{"type":"Person","data":{"name":"Intervening writer"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let winner = db.list_commits(None).await.unwrap();
+    let files_before = schema_storage_bytes(dir.path());
+    assert!(db.apply_prepared_schema_as(&prepared, None).await.is_err());
+    assert!(matches!(
+        db.reconcile_schema_apply_as(&prepared, None).await.unwrap(),
+        SchemaApplyReconciliation::Unknown
+    ));
+    assert_eq!(db.list_commits(None).await.unwrap(), winner);
+    assert_eq!(db.schema_source().as_str(), TEST_SCHEMA);
+    assert_eq!(
+        schema_storage_bytes(dir.path()),
+        files_before,
+        "stale intent cannot rebase, stage tables, or rewrite the winner"
+    );
+
+    // Foreign replacement at the same main version must invalidate the held
+    // engine's cached contract, even though the canonical root is unchanged.
+    let noop = db.prepare_schema_apply_as(TEST_SCHEMA, None).await.unwrap();
+    let replacement_dir = tempfile::tempdir().unwrap();
+    let replacement = init_and_load(&replacement_dir).await;
+    replacement
+        .load_jsonl(
+            r#"{"type":"Person","data":{"name":"Replacement graph"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        replacement
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .graph_manifest_version(),
+        noop.base_manifest_version()
+    );
+    let replacement_bytes = schema_storage_bytes(replacement_dir.path());
+    drop(replacement);
+    std::fs::remove_dir_all(dir.path()).unwrap();
+    std::fs::create_dir(dir.path()).unwrap();
+    for (relative, bytes) in &replacement_bytes {
+        let path = dir.path().join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    assert!(db.apply_prepared_schema_as(&noop, None).await.is_err());
+    assert!(matches!(
+        db.reconcile_schema_apply_as(&noop, None).await.unwrap(),
+        SchemaApplyReconciliation::Unknown
+    ));
+    assert_eq!(
+        schema_storage_bytes(dir.path()),
+        replacement_bytes,
+        "an old no-op intent cannot certify or modify a replacement graph at the same version"
+    );
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn prepared_schema_noop_is_bound_to_exact_source_and_live_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let prepared = db.prepare_schema_apply_as(TEST_SCHEMA, None).await.unwrap();
+    assert!(prepared.is_noop());
+    assert!(prepared.graph_commit_id().is_none());
+    let head = db.list_commits(None).await.unwrap()[0].clone();
+    let before = schema_storage_bytes(dir.path());
+    let result = db.apply_prepared_schema_as(&prepared, None).await.unwrap();
+    assert!(!result.applied);
+    assert!(result.commit.is_none());
+    assert_eq!(&result.contract, prepared.desired_contract());
+    match db.reconcile_schema_apply_as(&prepared, None).await.unwrap() {
+        SchemaApplyReconciliation::NoOp {
+            graph_manifest_version,
+            head_commit_id,
+            contract,
+        } => {
+            assert_eq!(graph_manifest_version, prepared.base_manifest_version());
+            assert_eq!(
+                head_commit_id.as_deref(),
+                Some(head.graph_commit_id.as_str())
+            );
+            assert_eq!(contract, result.contract);
+        }
+        other => panic!("expected no-op certificate, got {other:?}"),
+    }
+    assert_eq!(schema_storage_bytes(dir.path()), before);
+
+    // Native branch creation leaves main's version/head untouched. The
+    // single-live-branch restriction still must be rechecked for no-op proof.
+    db.branch_create("feature").await.unwrap();
+    let branched = schema_storage_bytes(dir.path());
+    assert!(matches!(
+        db.reconcile_schema_apply_as(&prepared, None).await.unwrap(),
+        SchemaApplyReconciliation::Unknown
+    ));
+    assert!(db.apply_prepared_schema_as(&prepared, None).await.is_err());
+    assert_eq!(schema_storage_bytes(dir.path()), branched);
+    db.branch_delete("feature").await.unwrap();
+
+    // The schema bytes still match after this write, but the captured authority
+    // does not. Reconciliation must not invent a fresh no-op certificate.
+    db.load_jsonl(
+        r#"{"type":"Person","data":{"name":"Later head"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let after = schema_storage_bytes(dir.path());
+    assert!(matches!(
+        db.reconcile_schema_apply_as(&prepared, None).await.unwrap(),
+        SchemaApplyReconciliation::Unknown
+    ));
+    assert!(db.apply_prepared_schema_as(&prepared, None).await.is_err());
+    assert_eq!(schema_storage_bytes(dir.path()), after);
 }
 
 #[tokio::test]

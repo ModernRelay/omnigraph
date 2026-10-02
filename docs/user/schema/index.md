@@ -154,6 +154,10 @@ nodes, edges, or properties with `@rename_from`, adding index declarations,
 widening an enum with new values, updating descriptions or instructions, and
 dropping node, edge, or property declarations.
 
+Applying changed schema text, including comments or formatting, records the new
+source in one graph commit even when no table changes are needed. Applying the
+same accepted source again leaves the graph unchanged.
+
 Changes such as adding a required property to existing entities, changing a property
 type (except enum widening), changing edge endpoints or cardinality, changing a
 node's implemented interfaces, and adding or removing most constraints are

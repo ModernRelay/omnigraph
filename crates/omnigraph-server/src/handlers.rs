@@ -3,7 +3,9 @@
 //! verbatim from lib.rs in the modularization).
 
 use super::*;
+use crate::api::{GraphAvailability, GraphAvailabilityAction};
 use crate::operations::OwnedResult;
+use crate::registry::{GraphEntry, StartupFailure};
 use crate::workload::{AdmissionGuard, IngressLease};
 use futures::StreamExt;
 use omnigraph::Session;
@@ -66,10 +68,10 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
 ///
 /// Unauthenticated, and therefore minimal: it reports whether this replica
 /// is serving or draining, the applied `config_digest` it booted from, the
-/// ledger revision and CAS it read, and how many graphs it serves and does
-/// not serve. Graph ids stay behind authenticated catalog endpoints. Answers
-/// 503 once shutdown has begun; `/healthz` stays 200 while the process is
-/// alive.
+/// ledger revision and CAS it read, and registry/ready/blocked counts. Graph
+/// ids stay behind authenticated catalog endpoints. Partial availability is
+/// ready but degraded; no available graph or shutdown returns 503. A valid
+/// empty registry is ready. `/healthz` reports liveness independently.
 #[utoipa::path(
     get,
     path = "/readyz",
@@ -77,7 +79,7 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
     operation_id = "readiness",
     responses(
         (status = 200, description = "Serving", body = ReadinessOutput),
-        (status = 503, description = "Draining", body = ReadinessOutput),
+        (status = 503, description = "No graph available or stopping", body = ReadinessOutput),
     ),
 )]
 pub(crate) async fn server_ready(
@@ -85,22 +87,38 @@ pub(crate) async fn server_ready(
 ) -> (StatusCode, Json<ReadinessOutput>) {
     let draining = state.draining.load(std::sync::atomic::Ordering::SeqCst)
         || state.operations.snapshot().closed;
-    let served_graph_count = state.routing().registry.list().len();
-    let quarantined_graph_count = state.quarantined_graphs().len();
+    let entries = state.routing().registry.entries();
+    let served_graph_count = entries.len();
+    let ready_graph_count = entries
+        .iter()
+        .filter(|entry| matches!(entry, GraphEntry::Ready(_)))
+        .count();
+    let blocked_graph_count = served_graph_count - ready_graph_count;
+    let ready = !draining && (served_graph_count == 0 || ready_graph_count > 0);
     let output = ReadinessOutput {
-        ready: !draining,
-        status: if draining { "draining" } else { "serving" }.to_string(),
+        ready,
+        status: if draining {
+            "draining"
+        } else if !ready {
+            "blocked"
+        } else if blocked_graph_count > 0 {
+            "degraded"
+        } else {
+            "serving"
+        }
+        .to_string(),
         booted_serving_digest: state.witness.booted_serving_digest.clone(),
         state_revision: state.witness.state_revision,
         state_cas: state.witness.state_cas.clone(),
         served_graph_count,
-        quarantined_graph_count,
+        ready_graph_count,
+        blocked_graph_count,
         shutdown_grace_seconds: state.shutdown_grace.as_secs(),
     };
-    let status = if draining {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else {
+    let status = if ready {
         StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
     };
     (status, Json(output))
 }
@@ -154,24 +172,43 @@ pub(crate) async fn server_graphs_list(
             .as_ref()
             .is_none_or(|actor| actor.0.permits_graph_listing(id))
     };
+    let stopping = state.draining.load(std::sync::atomic::Ordering::SeqCst)
+        || state.operations.snapshot().closed;
     let mut graphs: Vec<GraphInfo> = registry
-        .list()
+        .entries()
         .into_iter()
-        .filter(|handle| may_list(handle.key.graph_id.as_str()))
-        .map(|handle| GraphInfo {
-            graph_id: handle.key.graph_id.as_str().to_string(),
-            uri: handle.uri.clone(),
+        .filter(|entry| may_list(entry.key().graph_id.as_str()))
+        .map(|entry| {
+            let failure = match &entry {
+                GraphEntry::Ready(_) => None,
+                GraphEntry::Blocked(graph) => Some(graph.failure),
+            };
+            let available = !stopping && failure.is_none();
+            GraphInfo {
+                graph_id: entry.key().graph_id.as_str().to_string(),
+                uri: entry.uri().to_string(),
+                state: if stopping {
+                    GraphAvailability::Stopping
+                } else if available {
+                    GraphAvailability::Ready
+                } else {
+                    GraphAvailability::Blocked
+                },
+                read_available: available,
+                write_available: available,
+                failure,
+                action: if stopping {
+                    GraphAvailabilityAction::WaitForRestart
+                } else if available {
+                    GraphAvailabilityAction::None
+                } else {
+                    GraphAvailabilityAction::RestartAfterCorrection
+                },
+            }
         })
         .collect();
     graphs.sort_by(|a, b| a.graph_id.cmp(&b.graph_id));
-    Ok(Json(GraphListResponse {
-        graphs,
-        quarantined: state
-            .quarantined_graphs()
-            .into_iter()
-            .filter(|id| may_list(id))
-            .collect(),
-    }))
+    Ok(Json(GraphListResponse { graphs }))
 }
 
 #[utoipa::path(
@@ -196,15 +233,14 @@ pub(crate) async fn server_graphs_discovery(
             "graph discovery requires an admitted identity credential",
         ));
     }
-    // Both sets come from the accepted boot inventory. Never scan storage or
+    // Identity comes from the complete startup registry. Never scan storage or
     // include per-graph status, roots, diagnostics, schema, or policy contents.
     let ids: std::collections::BTreeSet<String> = state
         .routing()
         .registry
-        .list()
+        .entries()
         .into_iter()
-        .map(|handle| handle.key.graph_id.as_str().to_owned())
-        .chain(state.quarantined_graphs())
+        .map(|entry| entry.key().graph_id.as_str().to_owned())
         .collect();
     Ok(Json(GraphDiscoveryResponse {
         graphs: ids
@@ -394,7 +430,7 @@ pub(crate) async fn require_bearer_auth(
 ///
 /// Routes are always nested under `/graphs/{graph_id}/...`. The
 /// middleware extracts `{graph_id}` from the URI path and looks it up in
-/// the registry. Returns 404 if the graph is not registered.
+/// the registry. Unknown graphs return 404; authorized blocked graphs return 503.
 ///
 /// The middleware fires AFTER `require_bearer_auth`, so the actor is
 /// already in the request extensions (or auth was off entirely).
@@ -403,7 +439,6 @@ pub(crate) async fn resolve_graph_handle(
     mut request: Request,
     next: Next,
 ) -> std::result::Result<Response, ApiError> {
-    let registry = &state.routing.registry;
     // `Router::nest("/graphs/{graph_id}", inner)` rewrites
     // `request.uri().path()` to the inner suffix (e.g. `/snapshot`).
     // The pre-rewrite URI is preserved in the `OriginalUri`
@@ -431,12 +466,11 @@ pub(crate) async fn resolve_graph_handle(
         }
     }
     let key = GraphKey::cluster(graph_id.clone());
-    let handle = match registry.get(&key) {
-        RegistryLookup::Ready(handle) => handle,
-        RegistryLookup::Gone => {
-            return Err(ApiError::not_found(format!("graph '{graph_id}' not found")));
-        }
-    };
+    let handle = resolve_registered_graph(
+        &state,
+        &key,
+        request.extensions().get::<AuthenticatedActor>(),
+    )?;
 
     // Per-request observability. `Span::current().record` would silently
     // no-op here because no upstream `#[tracing::instrument(...)]` macro
@@ -446,6 +480,63 @@ pub(crate) async fn resolve_graph_handle(
 
     request.extensions_mut().insert(handle);
     ingress::admit(&state, request, next).await
+}
+
+/// HTTP and MCP share identity and unavailable-graph disclosure. Callers must
+/// first bind the credential to this graph with `select_graph`.
+pub(crate) fn resolve_registered_graph(
+    state: &AppState,
+    key: &GraphKey,
+    actor: Option<&AuthenticatedActor>,
+) -> std::result::Result<Arc<GraphHandle>, ApiError> {
+    match state.routing().registry.get(key) {
+        RegistryLookup::Ready(handle) => Ok(handle),
+        RegistryLookup::Gone => Err(ApiError::not_found("graph not found")),
+        RegistryLookup::Blocked(graph) => {
+            // Invalid policy is not equivalent to the operator choosing no
+            // policy. Only a valid management grant can disclose that failure.
+            let readable = !matches!(
+                graph.failure,
+                StartupFailure::InvalidPolicy | StartupFailure::InvalidConfiguration
+            ) && matches!(
+                authorize(
+                    actor,
+                    graph.policy.as_deref(),
+                    PolicyRequest {
+                        action: PolicyAction::Read,
+                        branch: Some("main".into()),
+                        target_branch: None,
+                    }
+                )?,
+                Authz::Allowed
+            );
+            let listable = readable
+                || matches!(
+                    authorize(
+                        actor,
+                        state.server_policy.as_deref(),
+                        PolicyRequest {
+                            action: PolicyAction::GraphList,
+                            branch: None,
+                            target_branch: None,
+                        }
+                    )?,
+                    Authz::Allowed
+                );
+            if !readable && !listable {
+                return Err(ApiError::not_found("graph not found"));
+            }
+            Err(ApiError {
+                completion_uncertain: false,
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: Some(ErrorCode::GraphUnavailable),
+                message:
+                    "graph is unavailable; an operator must correct its startup failure and restart"
+                        .into(),
+                details: None,
+            })
+        }
+    }
 }
 
 pub(crate) fn log_policy_decision(
