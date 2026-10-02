@@ -670,6 +670,386 @@ async fn mutation_keyed_write_row_cap_accepts_limit_and_rejects_one_over_pre_eff
     );
 }
 
+const OPERATION_BYTES: u64 = 32 * 1024 * 1024;
+const KEYED_BATCH_BYTES: &str = "retained keyed batch bytes per operation";
+const REMOVED_ID_BYTES: &str = "retained removed-id bytes per operation";
+
+fn operation_refusal(error: &OmniError, label: &str) -> bool {
+    matches!(
+        error,
+        OmniError::ResourceLimitExceeded { resource, limit: OPERATION_BYTES, actual }
+            if resource == label && *actual > OPERATION_BYTES
+    )
+}
+
+fn files_under(root: &std::path::Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+    let mut files = std::collections::BTreeSet::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.insert(path);
+            }
+        }
+    }
+    files
+}
+
+async fn native_heads(db: &Omnigraph, table_keys: &[&str]) -> Vec<u64> {
+    let snapshot = snapshot_main(db).await.unwrap();
+    let mut heads = Vec::with_capacity(table_keys.len());
+    for key in table_keys {
+        let entry = snapshot.dataset(key).unwrap();
+        let uri = format!(
+            "{}/{}",
+            db.uri().trim_end_matches('/'),
+            entry.dataset_path.trim_start_matches('/')
+        );
+        heads.push(Dataset::open(&uri).await.unwrap().version().version);
+    }
+    heads
+}
+
+/// Each table fits its own byte limit; the sum over tables is what refuses.
+/// Rust, not GQT: 17 MiB payloads and the stage-write probe are outside the case format.
+#[tokio::test]
+async fn keyed_bytes_summed_across_tables_refuse_mutation_and_every_load_door_before_staging() {
+    const SCHEMA: &str = "node Thing { key: String @key payload: String? }\nnode Other { key: String @key payload: String? }\n";
+    const TABLES: [&str; 2] = ["node:Thing", "node:Other"];
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let before_manifest = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let before_heads = native_heads(&db, &TABLES).await;
+
+    let payload = "x".repeat(17 * 1024 * 1024);
+    let probes = StageWriteProbes::rendezvous(1);
+    let error = with_stage_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            r#"query wide($payload: String) {
+                insert Thing { key: "one", payload: $payload }
+                insert Other { key: "two", payload: $payload }
+            }"#,
+            "wide",
+            &params(&[("$payload", &payload)]),
+        ),
+    )
+    .await
+    .expect_err("retained keyed batches must be bounded across tables");
+    assert_eq!(
+        probes.entered(),
+        0,
+        "aggregate admission must precede any table staging call"
+    );
+    assert!(
+        operation_refusal(&error, KEYED_BATCH_BYTES),
+        "unexpected aggregate refusal: {error:?}"
+    );
+    let input = format!(
+        "{}\n{}",
+        serde_json::json!({"type":"Thing","data":{"key":"one","payload":payload}}),
+        serde_json::json!({"type":"Other","data":{"key":"two","payload":payload}}),
+    );
+    drop(payload);
+    for mode in [LoadMode::Append, LoadMode::Merge] {
+        for strict in [false, true] {
+            let outcome = if strict {
+                with_stage_write_probes(probes.clone(), db.load_graph_batch("main", &input, mode))
+                    .await
+            } else {
+                with_stage_write_probes(probes.clone(), db.load_jsonl(&input, mode)).await
+            };
+            let error =
+                outcome.expect_err("every keyed load door must bound its complete parse spool");
+            assert!(
+                operation_refusal(&error, "keyed parsed entity bytes per operation"),
+                "unexpected load refusal (strict={strict}, mode={mode:?}): {error:?}"
+            );
+            assert_eq!(
+                probes.entered(),
+                0,
+                "load refusal must precede fragment staging"
+            );
+        }
+    }
+    drop(input);
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        before_manifest
+    );
+    assert_eq!(
+        native_heads(&db, &TABLES).await,
+        before_heads,
+        "an aggregate refusal must precede every Lance table effect"
+    );
+    assert_eq!(count_rows(&db, "node:Thing").await, 0);
+    assert_eq!(count_rows(&db, "node:Other").await, 0);
+    let recovery_dir = dir.path().join("__recovery");
+    assert!(
+        !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
+        "an aggregate refusal must precede the recovery sidecar"
+    );
+    let accepted = db
+        .mutate(
+            "main",
+            r#"query small() {
+            insert Thing { key: "one", payload: "fits" }
+            insert Other { key: "two", payload: "fits" }
+        }"#,
+            "small",
+            &params(&[]),
+        )
+        .await
+        .expect("a rejected wide request must not prevent a bounded multi-table write");
+    assert_eq!(accepted.affected_nodes, 2);
+    assert_eq!(count_rows(&db, "node:Thing").await, 1);
+    assert_eq!(count_rows(&db, "node:Other").await, 1);
+}
+
+/// The JSON estimate charges a null vector nothing; its Arrow column is ~8 KiB a row.
+/// Rust, not GQT: 4,400 generated rows per door and the stage-write probe are outside the case format.
+#[tokio::test]
+async fn prepared_arrow_bytes_summed_across_types_refuse_each_load_door_before_later_types_are_built()
+ {
+    const SCHEMA: &str = "\
+node WideA { key: String @key embedding: Vector(2048)? }
+node WideB { key: String @key embedding: Vector(2048)? }
+node Zed { key: String @key n: I32? }
+edge LinkA: Zed -> Zed { embedding: Vector(2048)? }
+edge LinkB: Zed -> Zed { embedding: Vector(2048)? }
+edge LinkZ: Zed -> Zed { n: I32? }
+";
+    const ROWS: usize = 2200;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let before_manifest = snapshot_main(&db).await.unwrap().graph_manifest_version();
+
+    let mut nodes = String::new();
+    let mut edges = String::new();
+    for row in 0..ROWS {
+        for wide in ["A", "B"] {
+            nodes.push_str(&format!(
+                "{{\"type\":\"Wide{wide}\",\"data\":{{\"key\":\"k{row}\"}}}}\n"
+            ));
+            edges.push_str(&format!(
+                "{{\"edge\":\"Link{wide}\",\"from\":\"a\",\"to\":\"b\"}}\n"
+            ));
+        }
+    }
+    nodes.push_str("{\"type\":\"Zed\",\"data\":{\"key\":\"z\",\"n\":4294967296}}\n");
+    edges
+        .push_str("{\"edge\":\"LinkZ\",\"from\":\"a\",\"to\":\"b\",\"data\":{\"n\":4294967296}}\n");
+
+    let probes = StageWriteProbes::rendezvous(1);
+    let mut refusals = Vec::new();
+    for input in [&nodes, &edges] {
+        for strict in [false, true] {
+            let error = if strict {
+                with_stage_write_probes(
+                    probes.clone(),
+                    db.load_graph_batch("main", input, LoadMode::Append),
+                )
+                .await
+                .err()
+            } else {
+                with_stage_write_probes(probes.clone(), db.load_jsonl(input, LoadMode::Append))
+                    .await
+                    .err()
+            };
+            refusals.push(match error {
+                Some(error) if operation_refusal(&error, KEYED_BATCH_BYTES) => {
+                    KEYED_BATCH_BYTES.to_string()
+                }
+                other => format!("{other:?}"),
+            });
+        }
+    }
+    assert_eq!(
+        refusals,
+        vec![KEYED_BATCH_BYTES; 4],
+        "doors are nodes/lenient, nodes/strict, edges/lenient, edges/strict; each must refuse \
+         at the second wide type, before the out-of-range I32 of the last type is converted"
+    );
+    assert_eq!(probes.entered(), 0, "refusal must precede fragment staging");
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        before_manifest
+    );
+}
+
+/// 24 MiB of external payload plus 10 MiB of retained rows fit per type, not together.
+/// Rust, not GQT: MiB-scale inputs and the payload-read probe are outside the case format.
+#[tokio::test]
+async fn external_blob_bytes_join_the_operation_allowance_before_any_payload_read() {
+    const SCHEMA: &str = "\
+node Document { title: String @key content: Blob? note: String? }
+node Image { title: String @key content: Blob? note: String? }
+";
+
+    let dir = tempfile::tempdir().unwrap();
+    let external_path = dir.path().join("payload.blob");
+    let file = std::fs::File::create(&external_path).unwrap();
+    file.set_len(12 * 1024 * 1024).unwrap();
+    drop(file);
+    let external_uri = format!("file://{}", external_path.display());
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(dir.path()).expect("external blob base is absolute"),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_dir = tempfile::tempdir().unwrap();
+    let graph_path = graph_dir.path().join("graph");
+    let db = helpers::session(
+        Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
+    let before_manifest = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let files = files_under(&graph_path);
+
+    let note = "x".repeat(5 * 1024 * 1024);
+    let stage_probes = StageWriteProbes::rendezvous(1);
+    let read_probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let error = with_stage_write_probes(
+        stage_probes.clone(),
+        omnigraph::instrumentation::with_merge_write_probes(
+            read_probes.clone(),
+            db.mutate(
+                "main",
+                r#"query wide($uri: String, $note: String) {
+                    insert Document { title: "one", content: $uri, note: $note }
+                    insert Image { title: "two", content: $uri, note: $note }
+                }"#,
+                "wide",
+                &params(&[("$uri", &external_uri), ("$note", &note)]),
+            ),
+        ),
+    )
+    .await
+    .expect_err("external payloads and retained rows must share one operation allowance");
+    assert!(
+        operation_refusal(&error, KEYED_BATCH_BYTES),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(
+        read_probes.blob_payload_read_calls(),
+        0,
+        "aggregate admission must precede every external payload read"
+    );
+    assert_eq!(stage_probes.entered(), 0);
+    assert_eq!(files_under(&graph_path), files);
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        before_manifest
+    );
+    let accepted = db
+        .mutate(
+            "main",
+            r#"query small($uri: String) {
+                insert Document { title: "one", content: $uri }
+            }"#,
+            "small",
+            &params(&[("$uri", &external_uri)]),
+        )
+        .await
+        .expect("one 12 MiB external payload fits after the refusal");
+    assert_eq!(accepted.affected_nodes, 1);
+}
+
+/// Three equal payloads leave a LargeBinary buffer at 4/3 of its content: predicted
+/// 24.4 MiB, materialized 32.5 MiB. Rust, not GQT: MiB-scale inputs, builder capacity.
+#[tokio::test]
+async fn materialized_blob_batches_are_rechecked_against_the_operation_allowance_before_staging() {
+    const SCHEMA: &str = "\
+node Document { title: String @key content: Blob? }
+node Image { title: String @key content: Blob? }
+";
+
+    let dir = tempfile::tempdir().unwrap();
+    let external_path = dir.path().join("payload.blob");
+    let file = std::fs::File::create(&external_path).unwrap();
+    file.set_len(4 * 1024 * 1024 + 64 * 1024).unwrap();
+    drop(file);
+    let external_uri = format!("file://{}", external_path.display());
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(dir.path()).expect("external blob base is absolute"),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_dir = tempfile::tempdir().unwrap();
+    let graph_path = graph_dir.path().join("graph");
+    let db = helpers::session(
+        Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
+    let before_manifest = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let files = files_under(&graph_path);
+
+    let stage_probes = StageWriteProbes::rendezvous(1);
+    let read_probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let error = with_stage_write_probes(
+        stage_probes.clone(),
+        omnigraph::instrumentation::with_merge_write_probes(
+            read_probes.clone(),
+            db.mutate(
+                "main",
+                r#"query thrice($uri: String) {
+                    insert Document { title: "a", content: $uri }
+                    insert Document { title: "b", content: $uri }
+                    insert Document { title: "c", content: $uri }
+                    insert Image { title: "a", content: $uri }
+                    insert Image { title: "b", content: $uri }
+                    insert Image { title: "c", content: $uri }
+                }"#,
+                "thrice",
+                &params(&[("$uri", &external_uri)]),
+            ),
+        ),
+    )
+    .await
+    .expect_err("materialized batches must be summed across tables before staging");
+    assert!(
+        operation_refusal(&error, KEYED_BATCH_BYTES),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(
+        read_probes.blob_payload_read_calls(),
+        2,
+        "the pre-read estimate admits this operation; only the re-check after reading refuses"
+    );
+    assert_eq!(stage_probes.entered(), 0);
+    assert_eq!(files_under(&graph_path), files);
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        before_manifest
+    );
+}
+
 /// Update predicate matching is itself a bounded allocation. The committed
 /// side must stream and charge rows before it is retained/concatenated, rather
 /// than first collecting an arbitrarily wide match set and relying on the
@@ -842,7 +1222,7 @@ query update_note($note: String) {
                 ref resource,
                 limit: LIMIT,
                 actual,
-            } if resource == "keyed entity bytes for node:Document" && actual > LIMIT
+            } if resource == "retained keyed batch bytes per operation" && actual > LIMIT
         ),
         "oversized update blob must be rejected before payload read, got {error:?}"
     );
@@ -970,6 +1350,194 @@ async fn overlapping_delete_predicates_do_not_double_count_affected() {
         1,
         "only Bob→Globex remains",
     );
+}
+
+/// Overwrite seeds the wide ids because bulk replacement has no keyed row or byte cap.
+/// Rust, not GQT: 16 MiB ids, the on-disk file listing and the stage-write probe.
+#[tokio::test]
+async fn removed_ids_summed_across_types_refuse_delete_and_overwrite_before_staging() {
+    const SCHEMA: &str = "node Person { name: String @key }\nnode Company { name: String @key }\n";
+    const TABLES: [&str; 2] = ["node:Person", "node:Company"];
+    const CLEAR: &str = r#"query clear() {
+        delete Person where name != ""
+        delete Company where name != ""
+    }"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let wide = "x".repeat(16 * 1024 * 1024);
+    let input = format!(
+        "{}\n{}",
+        serde_json::json!({"type":"Person","data":{"name":wide}}),
+        serde_json::json!({"type":"Company","data":{"name":wide}}),
+    );
+    db.load_jsonl(&input, LoadMode::Overwrite).await.unwrap();
+    drop(input);
+    drop(wide);
+    let before_manifest = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let before_heads = native_heads(&db, &TABLES).await;
+    let files = files_under(dir.path());
+
+    let error = db
+        .mutate("main", CLEAR, "clear", &params(&[]))
+        .await
+        .expect_err("delete ids must share an operation byte allowance");
+    assert!(
+        operation_refusal(&error, REMOVED_ID_BYTES),
+        "unexpected delete refusal: {error:?}"
+    );
+    assert_eq!(
+        files_under(dir.path()),
+        files,
+        "a refused delete must leave no staged deletion file"
+    );
+
+    let probes = StageWriteProbes::rendezvous(1);
+    let error = with_stage_write_probes(
+        probes.clone(),
+        db.load_jsonl(
+            "{\"type\":\"Person\",\"data\":{\"name\":\"small\"}}\n{\"type\":\"Company\",\"data\":{\"name\":\"small\"}}",
+            LoadMode::Overwrite,
+        ),
+    )
+    .await
+    .expect_err("overwrite removals must share the same bounded id scan");
+    assert!(
+        operation_refusal(&error, REMOVED_ID_BYTES),
+        "unexpected overwrite refusal: {error:?}"
+    );
+    assert_eq!(
+        probes.entered(),
+        0,
+        "a refused overwrite must precede every table staging call"
+    );
+    assert_eq!(
+        files_under(dir.path()),
+        files,
+        "a refused overwrite must leave no staged fragment"
+    );
+
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        before_manifest
+    );
+    assert_eq!(native_heads(&db, &TABLES).await, before_heads);
+    assert_eq!(count_rows(&db, "node:Person").await, 1);
+    assert_eq!(count_rows(&db, "node:Company").await, 1);
+
+    with_stage_write_probes(
+        probes.clone(),
+        db.load_jsonl(
+            "{\"type\":\"Person\",\"data\":{\"name\":\"small\"}}",
+            LoadMode::Append,
+        ),
+    )
+    .await
+    .expect("a small write must succeed after both refusals");
+    assert_eq!(
+        probes.entered(),
+        1,
+        "the same probe must observe the staging call of an accepted load"
+    );
+    assert_ne!(
+        files_under(dir.path()),
+        files,
+        "the file listing must observe an accepted write"
+    );
+    let removed = db
+        .mutate(
+            "main",
+            r#"query one() { delete Person where name = "small" }"#,
+            "one",
+            &params(&[]),
+        )
+        .await
+        .expect("a delete that fits the allowance must succeed after the refusals");
+    assert_eq!(removed.affected_nodes, 1);
+    assert_eq!(count_rows(&db, "node:Person").await, 1);
+}
+
+/// The node id costs 27 bytes; each cascaded edge id costs 17 MiB + 24 and fits alone.
+/// Rust, not GQT: two 17 MiB edge ids and the on-disk file listing are outside the case format.
+#[tokio::test]
+async fn cascaded_edge_ids_share_the_removed_id_allowance_with_the_deleted_node() {
+    const SCHEMA: &str = "\
+node Hub { name: String @key }
+node Leaf { name: String @key }
+edge Left: Hub -> Leaf
+edge Right: Hub -> Leaf
+";
+    const TABLES: [&str; 4] = ["node:Hub", "node:Leaf", "edge:Left", "edge:Right"];
+    const WIDE: usize = 17 * 1024 * 1024;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let wide = "x".repeat(WIDE);
+    let input = format!(
+        "{}\n{}\n{}\n{}",
+        serde_json::json!({"type":"Hub","data":{"name":"hub"}}),
+        serde_json::json!({"type":"Leaf","data":{"name":"leaf"}}),
+        serde_json::json!({"edge":"Left","id":wide,"from":"hub","to":"leaf"}),
+        serde_json::json!({"edge":"Right","id":wide,"from":"hub","to":"leaf"}),
+    );
+    db.load_jsonl(&input, LoadMode::Overwrite).await.unwrap();
+    drop(input);
+    drop(wide);
+    let before_manifest = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let before_heads = native_heads(&db, &TABLES).await;
+    let files = files_under(dir.path());
+
+    let error = db
+        .mutate(
+            "main",
+            r#"query drop_hub() { delete Hub where name = "hub" }"#,
+            "drop_hub",
+            &params(&[]),
+        )
+        .await
+        .expect_err("cascaded edge ids must be charged to the mutation's one allowance");
+    let charged = (2 * (WIDE + 24) + "hub".len() + 24) as u64;
+    assert!(
+        matches!(
+            error,
+            OmniError::ResourceLimitExceeded { ref resource, limit: OPERATION_BYTES, actual }
+                if resource == REMOVED_ID_BYTES && actual == charged
+        ),
+        "the refusal must count the node id and both edge ids ({charged} bytes): {error:?}"
+    );
+    assert_eq!(
+        files_under(dir.path()),
+        files,
+        "a refused cascade must leave no staged deletion file"
+    );
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        before_manifest
+    );
+    assert_eq!(native_heads(&db, &TABLES).await, before_heads);
+    for table in TABLES {
+        assert_eq!(count_rows(&db, table).await, 1, "{table}");
+    }
+
+    let accepted = db
+        .mutate(
+            "main",
+            r#"query add() { insert Leaf { name: "after" } }"#,
+            "add",
+            &params(&[]),
+        )
+        .await
+        .expect("a small write must succeed after the refused cascade");
+    assert_eq!(accepted.affected_nodes, 1);
+    assert_eq!(count_rows(&db, "node:Leaf").await, 2);
 }
 
 /// The overlap-exclusion filter must use SQL `IS NOT TRUE`, not `NOT`: a prior

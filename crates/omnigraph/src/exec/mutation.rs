@@ -5,8 +5,9 @@ use crate::engine::{
 };
 use crate::seams::{decide_seam, fail};
 use crate::session::Session;
-use crate::storage_layer::PendingScanBudget;
+use crate::storage_layer::{DeletedIdBudget, PendingScanBudget, SnapshotHandle};
 use datafusion::prelude::Expr;
+use futures::TryStreamExt;
 
 // ─── Mutation helpers ────────────────────────────────────────────────────────
 
@@ -1468,12 +1469,14 @@ impl Omnigraph {
 
         let scan_filter =
             dedup_delete_filter(&pred_expr, staging.recorded_delete_predicates(&table_key));
-        let batches = self
-            .storage()
-            .scan_filtered(&ds, Some(&[txn.catalog.system_columns.id]), scan_filter)
-            .await?;
-
-        let deleted_ids: Vec<String> = ids_from_batches(&batches);
+        let deleted_ids = scan_deleted_ids(
+            self,
+            &ds,
+            txn.catalog.system_columns.id,
+            scan_filter,
+            &mut staging.deleted_id_budget,
+        )
+        .await?;
 
         if deleted_ids.is_empty() {
             return Ok(MutationResult {
@@ -1492,7 +1495,6 @@ impl Omnigraph {
         // `open_table_for_mutation` above already captured the table's
         // path/version/op-kind via `ensure_path`.
         fail(&MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE)?;
-        staging.record_deleted_ids(&table_key, &deleted_ids);
         staging.record_delete(&table_key, pred_expr.clone());
 
         let mut affected_edges = 0usize;
@@ -1552,24 +1554,24 @@ impl Omnigraph {
             // Scan (not count) the cascade-removed edge ids so validation
             // recounts the OTHER endpoint's @card after the cascade; `len()` is
             // the affected count.
-            let matched_ids = ids_from_batches(
-                &self
-                    .storage()
-                    .scan_filtered(
-                        &edge_ds,
-                        Some(&[txn.catalog.system_columns.id]),
-                        count_filter,
-                    )
-                    .await?,
-            );
+            let matched_ids = scan_deleted_ids(
+                self,
+                &edge_ds,
+                txn.catalog.system_columns.id,
+                count_filter,
+                &mut staging.deleted_id_budget,
+            )
+            .await?;
             let matched = matched_ids.len();
             affected_edges += matched;
 
             if matched > 0 {
-                staging.record_deleted_ids(&edge_table_key, &matched_ids);
+                staging.record_deleted_ids(&edge_table_key, matched_ids);
                 staging.record_delete(&edge_table_key, cascade_filter);
             }
         }
+
+        staging.record_deleted_ids(&table_key, deleted_ids);
 
         if affected_edges > 0 {
             self.invalidate_graph_index().await;
@@ -1621,16 +1623,18 @@ impl Omnigraph {
         // a delete emptying a src below @card min is rejected; `len()` is the
         // affected count. One scan replaces the former count-here + resolve-at-
         // validation re-scan.
-        let deleted_ids = ids_from_batches(
-            &self
-                .storage()
-                .scan_filtered(&ds, Some(&[txn.catalog.system_columns.id]), count_filter)
-                .await?,
-        );
+        let deleted_ids = scan_deleted_ids(
+            self,
+            &ds,
+            txn.catalog.system_columns.id,
+            count_filter,
+            &mut staging.deleted_id_budget,
+        )
+        .await?;
         let affected = deleted_ids.len();
 
         if affected > 0 {
-            staging.record_deleted_ids(&table_key, &deleted_ids);
+            staging.record_deleted_ids(&table_key, deleted_ids);
             staging.record_delete(&table_key, pred_expr.clone());
             self.invalidate_graph_index().await;
         }
@@ -1642,23 +1646,33 @@ impl Omnigraph {
     }
 }
 
-/// Extract the `id` column (projection index 0) from scanned batches. Used by
-/// the delete paths to capture the rows they remove, so validation recounts a
-/// src a delete empties without re-resolving the predicate.
-fn ids_from_batches(batches: &[RecordBatch]) -> Vec<String> {
-    batches
-        .iter()
-        .flat_map(|batch| {
-            let ids = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            (0..ids.len())
-                .map(|i| ids.value(i).to_string())
-                .collect::<Vec<_>>()
-        })
-        .collect()
+/// Walk the exact typed predicate a batch at a time, admitting each id against
+/// `budget` before copying it.
+async fn scan_deleted_ids(
+    db: &Omnigraph,
+    snapshot: &SnapshotHandle,
+    id_column: &str,
+    filter: Expr,
+    budget: &mut DeletedIdBudget,
+) -> Result<Vec<String>> {
+    let mut stream = db
+        .storage()
+        .scan_filtered(snapshot, Some(&[id_column]), filter)
+        .await?;
+    let mut removed = Vec::new();
+    while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| OmniError::manifest_internal("delete id scan did not return Utf8"))?;
+        for i in 0..ids.len() {
+            let id = ids.value(i);
+            budget.retain(id)?;
+            removed.push(id.to_owned());
+        }
+    }
+    Ok(removed)
 }
 
 /// Concat the matched batches from `scan_with_pending` into a single batch.

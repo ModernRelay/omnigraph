@@ -291,7 +291,7 @@ fn pending_scan_budget_caps_are_inclusive_and_one_over_is_typed() {
             ref resource,
             limit: KEYED_WRITE_MAX_BYTES,
             actual,
-        } if resource == "keyed entity bytes for test:people"
+        } if resource == "retained keyed batch bytes per operation"
             && actual == KEYED_WRITE_MAX_BYTES + 1
     ));
 }
