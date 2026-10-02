@@ -56,6 +56,7 @@ aws-sdk-secretsmanager = { version = "1", optional = true, default-features = fa
 
 [dev-dependencies]
 omnigraph = { package = "omnigraph-engine", path = "../omnigraph", features = ["failpoints"] }
+omnigraph-cluster = { path = "../omnigraph-cluster", version = "0.11.0", features = ["test-util"] }
 tempfile = { workspace = true }
 tower = { workspace = true }
 serial_test = "3"

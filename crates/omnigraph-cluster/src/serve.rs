@@ -49,9 +49,10 @@ pub struct ServingSnapshot {
     pub state_cas: Option<String>,
     /// Every graph the applied revision names, sorted.
     pub applied_graphs: Vec<String>,
-    /// Applied graphs this snapshot does not serve because pending recovery
-    /// quarantined them, sorted. A sidecar for a graph the revision does not
-    /// name is not in this list.
+    /// Applied graphs this snapshot does not serve, sorted: pending recovery
+    /// quarantined them, or their applied external Blob policy has a
+    /// server-safe base overlapping the cluster storage root. A sidecar for a
+    /// graph the revision does not name is not in this list.
     pub quarantined_graphs: Vec<String>,
 }
 
@@ -126,6 +127,20 @@ pub async fn read_serving_snapshot_from_storage(
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
     let backend =
         ClusterStore::for_storage_root(storage_root).map_err(|diagnostic| vec![diagnostic])?;
+    read_snapshot_with_store(&backend).await
+}
+
+/// Test support: read a local cluster's serving snapshot through the
+/// production reader while its storage root reads as `display_root`. Serving
+/// compares applied server-safe external Blob bases, which are `s3://` only,
+/// with that root, so a test can reach the overlap quarantine without an
+/// object store. Graph roots in the snapshot derive from `display_root` too.
+#[cfg(any(test, feature = "test-util"))]
+pub async fn read_serving_snapshot_with_display_root(
+    config_dir: impl AsRef<Path>,
+    display_root: &str,
+) -> Result<ServingSnapshot, Vec<Diagnostic>> {
+    let backend = ClusterStore::for_config_dir(config_dir.as_ref()).with_display_root(display_root);
     read_snapshot_with_store(&backend).await
 }
 
@@ -279,7 +294,7 @@ fn cluster_root_of_graph_layout(graph_uri: &str) -> Option<String> {
     Some(root.to_string())
 }
 
-async fn read_snapshot_with_store(
+pub(crate) async fn read_snapshot_with_store(
     backend: &ClusterStore,
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
@@ -348,6 +363,18 @@ async fn read_snapshot_with_store(
     let boot_state_revision = state.state_revision;
     let boot_state_cas = observations.state_cas.clone();
     let boot_applied_graphs = applied_graph_ids(&state);
+    for (graph_id, reason) in
+        overlapping_served_external_blob_policies(&state, backend.display_root())
+    {
+        quarantined_graphs.insert(graph_id.clone());
+        startup_diagnostics.push(Diagnostic::warning(
+            "external_blob_base_overlaps_storage_root",
+            graph_address(&graph_id),
+            format!(
+                "graph `{graph_id}` is quarantined because its applied external Blob policy is unsafe to serve: {reason}; move the base to a prefix outside the cluster storage root, run `cluster apply`, and restart"
+            ),
+        ));
+    }
 
     let required_embedding_providers: BTreeSet<String> = state
         .applied_revision
@@ -555,6 +582,41 @@ async fn read_snapshot_with_store(
             .collect(),
         applied_graphs: boot_applied_graphs,
     })
+}
+
+/// Applied graphs whose served external Blob policy has a base overlapping the
+/// cluster storage root, with the refusal reason.
+///
+/// The policy is projected to the server-safe bases the server would install,
+/// then each base is compared with the one root that holds every graph and the
+/// cluster ledger. A config validated before this check existed can still
+/// carry such a base in the ledger; serving it would let any writer copy
+/// another graph's or the ledger's bytes into a readable Blob cell. A policy
+/// that does not project is left to the server's own install to refuse.
+pub(crate) fn overlapping_served_external_blob_policies(
+    state: &crate::types::ClusterState,
+    storage_root: &str,
+) -> Vec<(String, String)> {
+    state
+        .applied_revision
+        .resources
+        .iter()
+        .filter_map(|(address, entry)| {
+            let ResourceKind::Graph(graph_id) = resource_kind(address) else {
+                return None;
+            };
+            let policy = entry
+                .external_blob_policy
+                .clone()
+                .unwrap_or_default()
+                .server_safe_only()
+                .ok()?;
+            policy
+                .ensure_disjoint_from_storage_root(storage_root)
+                .err()
+                .map(|error| (graph_id, error.to_string()))
+        })
+        .collect()
 }
 
 #[cfg(test)]

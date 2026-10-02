@@ -892,6 +892,11 @@ impl Omnigraph {
     /// The default on every initialized or opened handle is deny. This
     /// consuming builder validates deserialized configuration before replacing
     /// that default, so no writer can observe a partially configured policy.
+    /// A policy with a base that overlaps this handle's own storage root is
+    /// refused: ingress would otherwise copy the graph's manifest and table
+    /// bytes into cells readable as ordinary Blob values. Bases overlapping
+    /// another graph's or the cluster's root are refused by cluster
+    /// validation and server boot, which know those roots.
     pub fn with_external_blob_policy(
         mut self,
         policy: crate::blob::ExternalBlobPolicy,

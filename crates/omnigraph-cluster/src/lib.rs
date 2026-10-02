@@ -47,6 +47,8 @@ use diff::{
     append_policy_binding_changes, approved_resources, classify_changes, compute_approvals,
     compute_blast_radius, demote_dependents_of_failed_graphs, diff_resources, resource_kind,
 };
+#[cfg(any(test, feature = "test-util"))]
+pub use serve::read_serving_snapshot_with_display_root;
 pub use serve::{
     RootBoundServingSnapshot, ServingGraph, ServingPolicy, ServingQuery, ServingSnapshot,
     cluster_graph_ids, cluster_root_for_graph_uri, read_root_bound_serving_snapshot,

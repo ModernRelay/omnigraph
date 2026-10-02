@@ -147,6 +147,16 @@ impl ClusterStore {
         &self.display_root
     }
 
+    /// A local store whose storage root reads as `display_root`. Serving
+    /// compares applied server-safe external Blob bases, which are `s3://`
+    /// only, with this root; a test can therefore reach that comparison
+    /// through the real snapshot reader without an object store.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) fn with_display_root(mut self, display_root: &str) -> Self {
+        self.display_root = display_root.to_string();
+        self
+    }
+
     /// Whether this root holds the cluster state ledger (`__cluster/state.json`)
     /// — i.e. is an actual cluster, not just any directory. Probed via the
     /// the backend (`file://`, `s3://`, or `az://`). Only a successful negative

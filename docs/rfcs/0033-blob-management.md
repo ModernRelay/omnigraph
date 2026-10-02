@@ -843,8 +843,13 @@ pub enum ExternalBlobPolicy {
 Cluster configuration exposes the same policy per graph. The default is
 `deny`. An allowed base contains an absolute URI prefix and an execution scope:
 server-safe or embedded-only. Configuration validation normalizes it once,
-rejects URI user-info and query/fragment credentials, and rejects overlapping or
-ambiguous encodings.
+rejects URI user-info and query/fragment credentials, rejects overlapping or
+ambiguous encodings, and rejects a base that overlaps OmniGraph storage: the
+cluster storage root, and with it every graph root and the cluster ledger, at
+config validation and serve boot, and the handle's own graph root at engine
+policy install. Ingress reads with the process's storage principal, so such a
+base would let an authorized writer copy graph or ledger bytes into a managed
+cell readable past Cedar.
 
 Every raw configured base and input URI is capped at 64 KiB inclusive before
 trimming, URL parsing, percent decoding, or filesystem resolution. This bounds
@@ -1091,6 +1096,7 @@ Physical row addresses never become public stable identity.
 | Risk | Required control |
 |---|---|
 | Server-side file/object read through URI input | Default-deny engine policy, exact normalized bases, no server `file://`, no per-request override |
+| Graph/ledger bytes copied through an ingress base | Base/root disjointness at config, serve and engine |
 | URI credential disclosure | Reject user-info/query/fragment credentials at config and input; return URI only to an authorized Blob reader |
 | URI parser amplification | Reject a raw configured or input URI above 64 KiB before trimming, parsing, decoding, or filesystem resolution |
 | External SSRF during read | Descriptor-first classification; redirect only; no proxy or validation on GET/HEAD |
@@ -1699,3 +1705,11 @@ publisher architecture.
   effects and final pins, superseding their recovery-v9 sidecar, compensation,
   and recovery-audit requirements. Blob behavior and this RFC's acceptance are
   unchanged; the replacement server contracts remain proposed.
+- 2026-09-29: External Blob bases must be disjoint from OmniGraph storage. A
+  base over a graph or cluster root let a keyed write copy manifest, table, or
+  ledger bytes into a managed cell served past Cedar. §7.1's sentence
+  "Configuration validation normalizes it once, rejects URI user-info and
+  query/fragment credentials, and rejects overlapping or ambiguous encodings."
+  is superseded by the version that also rejects a base overlapping the cluster
+  storage root (config validation, serve boot) or the handle's own graph root
+  (engine policy install); §10 gains the matching risk row.

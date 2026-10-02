@@ -1145,7 +1145,10 @@ fn external_blob_config_normalizes_once_and_defaults_to_deny() {
     assert_eq!(warning.path, "graphs.knowledge.external_blobs");
     assert_eq!(warning.severity, DiagnosticSeverity::Warning);
 
-    let embedded = dir.path().join("external-assets");
+    // External sources live outside the cluster storage root (here the
+    // config directory), never under it.
+    let external = tempdir().unwrap();
+    let embedded = external.path().join("external-assets");
     fs::create_dir(&embedded).unwrap();
     fs::write(
         dir.path().join(CLUSTER_CONFIG_FILE),
@@ -1243,6 +1246,339 @@ graphs:
         codes.contains("invalid_external_blob_policy"),
         "{:?}",
         out.diagnostics
+    );
+}
+
+fn overlap_diagnostic_paths(outcome: &LoadOutcome) -> Vec<String> {
+    outcome
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "external_blob_base_overlaps_storage_root")
+        .inspect(|diagnostic| {
+            assert_eq!(diagnostic.severity, DiagnosticSeverity::Error);
+            assert!(
+                diagnostic
+                    .message
+                    .contains("overlaps an OmniGraph storage root"),
+                "{diagnostic:?}"
+            );
+        })
+        .map(|diagnostic| diagnostic.path.clone())
+        .collect()
+}
+
+/// A base over the cluster storage root would let any writer copy another
+/// graph's tables or the cluster ledger into a readable Blob cell. Every
+/// scope is refused at validation, before plan or apply can record it.
+#[test]
+fn external_blob_config_rejects_bases_overlapping_storage_root() {
+    let dir = fixture();
+    let other_graph = dir.path().join(CLUSTER_GRAPHS_DIR).join("other.omni");
+    fs::create_dir_all(&other_graph).unwrap();
+    let file_base = |path: &Path| format!("file://{}/", path.display());
+    let local_config = |root_base: &str, graph_base: &str| {
+        format!(
+            r#"
+version: 1
+graphs:
+  knowledge:
+    schema: ./people.pg
+    external_blobs:
+      allow:
+        - base: {root_base}
+          scope: embedded_only
+  second:
+    schema: ./people.pg
+    external_blobs:
+      allow:
+        - base: {graph_base}
+          scope: embedded_only
+"#
+        )
+    };
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        local_config(&file_base(dir.path()), &file_base(&other_graph)),
+    )
+    .unwrap();
+    let outcome = load_desired(dir.path());
+    assert_eq!(
+        overlap_diagnostic_paths(&outcome),
+        vec![
+            "graphs.knowledge.external_blobs.allow[0].base".to_string(),
+            "graphs.second.external_blobs.allow[0].base".to_string(),
+        ],
+        "{:?}",
+        outcome.diagnostics
+    );
+
+    let validated = validate_config_dir(dir.path());
+    assert!(!validated.ok, "{:?}", validated.diagnostics);
+
+    // A declared object-store root is the one prefix every graph and the
+    // ledger live under; only a sibling prefix is admitted. This is pure
+    // validation and never reaches the bucket.
+    let s3_config = |base: &str| {
+        format!(
+            r#"
+version: 1
+storage: s3://assets/cluster
+graphs:
+  knowledge:
+    schema: ./people.pg
+    external_blobs:
+      allow:
+        - base: {base}
+          scope: server_safe
+"#
+        )
+    };
+    for base in [
+        "s3://assets/",
+        "s3://assets/cluster/graphs/knowledge.omni/",
+        "s3://ASSETS/cluster/__cluster/",
+    ] {
+        fs::write(dir.path().join(CLUSTER_CONFIG_FILE), s3_config(base)).unwrap();
+        let outcome = load_desired(dir.path());
+        assert_eq!(
+            overlap_diagnostic_paths(&outcome),
+            vec!["graphs.knowledge.external_blobs.allow[0].base".to_string()],
+            "{base}: {:?}",
+            outcome.diagnostics
+        );
+        let desired = outcome.desired.unwrap();
+        assert_eq!(
+            desired.graphs[0].external_blob_policy,
+            omnigraph::ExternalBlobPolicy::Deny
+        );
+    }
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        s3_config("s3://assets/cluster-external/"),
+    )
+    .unwrap();
+    let outcome = load_desired(dir.path());
+    assert!(
+        overlap_diagnostic_paths(&outcome).is_empty(),
+        "{:?}",
+        outcome.diagnostics
+    );
+    assert_eq!(
+        outcome.desired.unwrap().graphs[0]
+            .external_blob_policy
+            .bases()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn external_blob_base_overlapping_storage_root_refuses_apply_over_existing_state() {
+    let dir = fixture();
+    apply_identity_fixture(dir.path()).await;
+    let ledger = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let config = fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        config.replace(
+            "    schema: ./people.pg\n",
+            &format!(
+                "    schema: ./people.pg\n    external_blobs:\n      allow:\n        - base: {}\n          scope: embedded_only\n",
+                format!("file://{}/", dir.path().join(CLUSTER_GRAPHS_DIR).display())
+            ),
+        ),
+    )
+    .unwrap();
+
+    let refused = apply_config_dir(dir.path()).await;
+    assert!(!refused.ok, "{refused:?}");
+    assert!(
+        refused
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "external_blob_base_overlaps_storage_root"),
+        "{:?}",
+        refused.diagnostics
+    );
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger
+    );
+    let planned = plan_config_dir(dir.path()).await;
+    assert!(!planned.ok, "{:?}", planned.diagnostics);
+}
+
+#[test]
+fn serving_quarantines_applied_policies_overlapping_storage_root() {
+    let state: ClusterState = serde_json::from_value(json!({
+        "version": 1,
+        "state_revision": 1,
+        "applied_revision": {
+            "resources": {
+                "graph.knowledge": {
+                    "digest": "graph",
+                    "external_blob_policy": {
+                        "mode": "allow",
+                        "bases": [{ "uri": "s3://assets/", "scope": "server_safe" }]
+                    }
+                },
+                "graph.local": {
+                    "digest": "graph",
+                    "external_blob_policy": {
+                        "mode": "allow",
+                        "bases": [{
+                            "uri": "file:///definitely/not/present/omnigraph-blob-base/",
+                            "scope": "embedded_only"
+                        }]
+                    }
+                },
+                "graph.plain": { "digest": "graph" }
+            }
+        }
+    }))
+    .unwrap();
+    let quarantined =
+        serve::overlapping_served_external_blob_policies(&state, "s3://assets/cluster");
+    assert_eq!(
+        quarantined
+            .iter()
+            .map(|(graph_id, _)| graph_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["knowledge"]
+    );
+    assert!(
+        quarantined[0]
+            .1
+            .contains("overlaps an OmniGraph storage root")
+    );
+    // Embedded-only bases are never served, so they cannot quarantine a
+    // graph, and a disjoint root quarantines nothing.
+    assert!(
+        serve::overlapping_served_external_blob_policies(&state, "/definitely/not/present")
+            .is_empty()
+    );
+    assert!(
+        serve::overlapping_served_external_blob_policies(&state, "s3://other/cluster").is_empty()
+    );
+}
+
+/// The serving snapshot reader quarantines a graph whose applied server-safe
+/// base overlaps the storage root and keeps serving a healthy sibling; with no
+/// healthy graph left, it refuses. Server-safe bases are `s3://` only, so the
+/// ledger lives in a local directory and the store reports an `s3://` root
+/// through `ClusterStore::with_display_root`: the reader, the comparison and
+/// the quarantine are the production ones, only the root spelling is forged.
+#[tokio::test]
+async fn serving_snapshot_quarantines_graph_whose_applied_base_overlaps_storage_root() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n  archive:\n    schema: ./people.pg\n",
+    )
+    .unwrap();
+    let desired = validate_config_dir(dir.path());
+    assert!(desired.ok, "{:?}", desired.diagnostics);
+    let schema_digest = desired.resource_digests["schema.knowledge"].clone();
+    let empty_queries = BTreeMap::new();
+    let policy = omnigraph::ExternalBlobPolicy::allow(vec![
+        omnigraph::ExternalBlobBase::new(
+            "s3://assets/cluster/graphs/",
+            omnigraph::ExternalBlobExecutionScope::ServerSafe,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let knowledge_digest = graph_digest_with_external_blob_policy(
+        "knowledge",
+        Some(&schema_digest),
+        Some(&empty_queries),
+        None,
+        None,
+        &policy,
+    );
+    let archive_digest = graph_digest(
+        "archive",
+        Some(&schema_digest),
+        Some(&empty_queries),
+        None,
+        None,
+    );
+    let write_ledger = |with_archive: bool| {
+        let mut resources = vec![
+            ("graph.knowledge", knowledge_digest.as_str()),
+            ("schema.knowledge", schema_digest.as_str()),
+        ];
+        if with_archive {
+            resources.push(("graph.archive", archive_digest.as_str()));
+            resources.push(("schema.archive", schema_digest.as_str()));
+        }
+        write_state_resources(dir.path(), &resources);
+        let mut state = read_state_json(dir.path());
+        state["applied_revision"]["resources"]["graph.knowledge"]["external_blob_policy"] =
+            serde_json::to_value(&policy).unwrap();
+        fs::write(
+            dir.path().join(CLUSTER_STATE_FILE),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap()
+    };
+    let overlapping_root =
+        || store::ClusterStore::for_config_dir(dir.path()).with_display_root("s3://assets/cluster");
+
+    let ledger = write_ledger(true);
+    // Against the local root the base is disjoint, and the ledger's digests
+    // hold: both graphs serve.
+    let control = read_serving_snapshot(dir.path()).await.unwrap();
+    assert_eq!(control.graphs.len(), 2);
+    assert!(control.quarantined_graphs.is_empty());
+
+    let snapshot = serve::read_snapshot_with_store(&overlapping_root())
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .graphs
+            .iter()
+            .map(|graph| graph.graph_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["archive"]
+    );
+    assert_eq!(snapshot.quarantined_graphs, vec!["knowledge".to_string()]);
+    assert_eq!(
+        snapshot.applied_graphs,
+        vec!["archive".to_string(), "knowledge".to_string()]
+    );
+    assert!(snapshot.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "external_blob_base_overlaps_storage_root"
+            && diagnostic.path == "graph.knowledge"
+            && diagnostic.severity == DiagnosticSeverity::Warning
+    }));
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger
+    );
+
+    // With every applied graph quarantined the reader refuses to serve.
+    let ledger = write_ledger(false);
+    let refused = serve::read_snapshot_with_store(&overlapping_root())
+        .await
+        .unwrap_err();
+    assert!(
+        refused
+            .iter()
+            .any(|diagnostic| diagnostic.code == "cluster_no_healthy_graphs"),
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .iter()
+            .any(|diagnostic| diagnostic.code == "external_blob_base_overlaps_storage_root"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger
     );
 }
 
@@ -4803,7 +5139,8 @@ async fn serving_snapshot_uses_applied_embedding_provider_profile() {
 #[tokio::test]
 async fn serving_snapshot_uses_applied_server_safe_external_blob_policy() {
     let dir = fixture();
-    let embedded = dir.path().join("external-assets");
+    let external = tempdir().unwrap();
+    let embedded = external.path().join("external-assets");
     fs::create_dir(&embedded).unwrap();
     fs::write(
         dir.path().join(CLUSTER_CONFIG_FILE),

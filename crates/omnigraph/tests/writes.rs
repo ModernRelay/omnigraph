@@ -793,7 +793,9 @@ query update_note($note: String) {
     ])
     .unwrap();
 
-    let graph_path = dir.path().join("graph");
+    // The graph root must lie outside every external base.
+    let graph_dir = tempfile::tempdir().unwrap();
+    let graph_path = graph_dir.path().join("graph");
     let db = helpers::session(
         Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
             .await
@@ -1776,7 +1778,9 @@ query insert_then_replace_blob(
 "#;
 
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
+    // The graph root must lie outside every external base.
+    let graph_dir = tempfile::tempdir().unwrap();
+    let uri = graph_dir.path().to_str().unwrap();
     let allowed_path = dir.path().join("allowed-source.bin");
     std::fs::write(&allowed_path, b"last write wins").unwrap();
     let allowed_uri = url::Url::from_file_path(&allowed_path)
