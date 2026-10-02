@@ -604,7 +604,7 @@ effects remain unreachable; published pins are final, with no recovery sidecar
 or table promotion. See [the write contract](../dev/writes.md).
 
 The proposed [authority and completion contract](2026-09-29-server-runtime-and-online-deployment.md#authority-and-completion)
-owns the server's use of engine publication evidence and schema/control
+owns the server's use of engine publication evidence and control
 completion. A served Blob operation never heals inline or replays after an
 unknown outcome. It preserves exact evidence and notifies the designated owner;
 runtime candidates are built without completion effects.
@@ -615,8 +615,8 @@ checks its schema token before entering the engine. The engine write:
 
 1. normalizes and rejects internal branch names;
 2. enforces Cedar `change` for the supplied actor identity and branch;
-3. respects pending schema/control completion before effects, then captures one
-   fresh write base;
+3. respects remaining control obligations and captures one fresh write base
+   with its complete accepted schema contract;
 4. resolves stable schema/table/property identity and exact row ID;
 5. evaluates the precondition and prepares one-row replacement state under the
    normal row/byte ceilings;
@@ -1168,7 +1168,7 @@ depends on typed code and fields, not an opaque Lance string.
 | Blob write If-Match failed | `BlobWritePreconditionFailed { current_etag }` | 412 plus `blob_precondition_failure`; never graph `precondition_failure` |
 | Generation lane closed before operation | shared proposed lifecycle detail | 503, not started |
 | Captured generation schema token is stale | shared proposed stale-generation outcome | shared refusal and designated-owner notification; no Blob-specific error or inline repair |
-| Publication or schema/control completion uncertain | exact engine outcome and retained publication evidence | existing mapping; never permission to replay |
+| Publication or control completion uncertain | exact engine outcome and retained publication evidence | existing mapping; never permission to replay |
 | Owned write panics or has no knowable terminal outcome | shared proposed unknown-outcome class | 500; never success or replay |
 | Persisted table/Blob integrity contradiction | `BlobIntegrity { reason }` | exhaustive server mapping is 5xx |
 
@@ -1806,3 +1806,8 @@ publisher architecture.
   materializing rewrites." (§13) is superseded by the landed/remaining split. §10's
   rewrite-amplification row gains the schema-apply gap, and a compaction-memory
   row records optimize's derived batch bound.
+- 2026-10-02: §4.4 replaces "schema/control completion" and step 3's pending
+  schema-completion prerequisite with coherent capture of the manifest-resident
+  contract; §11's uncertainty row retains publication/control uncertainty without
+  the removed schema-installation phase. Blob behavior and serving-view
+  requirements are unchanged.

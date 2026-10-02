@@ -233,7 +233,7 @@ then dated RFCs by date.
 | [2026-09-21](2026-09-21-detached-only-tables.md) | Detached-only tables | maintainer | accepted | in-progress |
 | [2026-09-24](2026-09-24-shared-expression-model.md) | Shared expression model | maintainer | draft | in-progress |
 | [2026-09-26](2026-09-26-self-contained-server-testing.md) | Self-contained server testing with GQT and DST | maintainer | draft | not-started |
-| [2026-09-29](2026-09-29-server-runtime-and-online-deployment.md) | Server runtime and online deployment | maintainer | draft | in-progress |
+| [2026-09-29](2026-09-29-server-runtime-and-online-deployment.md) | Server runtime and online deployment | maintainer | accepted | in-progress |
 | [2026-09-30](2026-09-30-typed-edge-alternation.md) | Typed edge alternation and bounded wildcard traversal | maintainer | accepted | complete |
 | [2026-09-30](2026-09-30-v012-http-admission.md) | v0.12 HTTP admission | maintainer | accepted | complete |
 | [2026-09-30](2026-09-30-exact-merge-receipts.md) | Exact merge receipts | maintainer | accepted | complete |

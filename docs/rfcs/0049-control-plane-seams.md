@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-09-03
-updated: 2026-09-30
+updated: 2026-10-02
 discussion: null
 supersedes: []
 superseded_by: []
@@ -27,23 +27,23 @@ crate already does, and without bypassing it:
    cluster lock and without writing anything, and label their output
    `authority: observed` together with the exact `state_cas` they read.
 2. **Readiness witness.** `GET /readyz` reports, without authentication,
-   whether the server is serving or draining, the applied `config_digest` it
-   booted from, the ledger revision and CAS it read, and how many graphs it
-   serves and does not serve. The graph ids stay behind the existing
-   authenticated `GET /graphs`, which gains the quarantined list.
+   serving, degraded, blocked or draining status, the applied `config_digest`
+   it booted from, the ledger revision and CAS it read, and registry, ready and
+   blocked graph counts. Graph ids and per-graph availability stay behind the
+   authenticated `GET /graphs` in one registry-derived list.
 3. **Bounded shutdown.** `--shutdown-grace-seconds` (default 25) puts one
    deadline on graceful shutdown: readiness turns off at the signal, in-flight
    requests drain, and at the deadline an operating-system thread exits the
    process non-zero instead of waiting forever.
 
-Nothing here changes a storage format, the ledger's schema, the lock, the
-recovery protocol, or any existing route's success shape. The wider
+Nothing here changes a storage format, the ledger's schema, the lock or the
+recovery protocol. The v0.12 availability amendment replaces the readiness and
+inventory response shapes with coordinated in-tree consumer changes and no
+legacy aliases. The wider
 [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md)
-proposal stays independent. Its proposed v0.12 wire contract may replace the
-readiness and inventory shapes while retaining observe-only authority and the
-absolute shutdown deadline. This RFC's accepted wire shapes remain current until
-a replacement is accepted and implemented with its coordinated consumer
-transition. Restoring a ledger is deliberately not here:
+proposal stays independent: loading/deploying states, startup retry and online
+activation remain unimplemented. Observe-only authority and the absolute
+shutdown deadline remain unchanged. Restoring a ledger is deliberately not here:
 its real use arrives with coherent restore points, where the ledger and the graphs come back
 together, and it will be designed once, against those.
 
@@ -107,16 +107,24 @@ under the lock, and an approval still binds to the digests `apply` sees.
 GET /readyz
 200 {"ready": true, "status": "serving", "booted_serving_digest": "<sha256>",
      "state_revision": 42, "state_cas": "sha256:…",
-     "served_graph_count": 3, "quarantined_graph_count": 0,
+     "served_graph_count": 3, "ready_graph_count": 3, "blocked_graph_count": 0,
      "shutdown_grace_seconds": 25}
+200 {"ready": true, "status": "degraded", …same fields…}
+503 {"ready": false, "status": "blocked", …same fields…}
 503 {"ready": false, "status": "draining", …same fields…}
 ```
 
 Unauthenticated, like `/healthz`, and therefore minimal: graph ids are
 topology, which the existing `GET /graphs` deliberately puts behind bearer
 authentication and the Cedar `graph_list` action, so `/readyz` reports only
-counts. `GET /graphs` gains `quarantined`, the ids the applied revision names
-that this process does not serve, under the same gate. `booted_serving_digest`
+counts. `served_graph_count` is the complete registry size; ready and blocked
+counts distinguish actual startup outcomes. `GET /graphs` returns one `graphs`
+list including those outcomes under the same gate, with `state` (`ready`,
+`blocked`, `stopping`), `read_available`, `write_available`, optional sanitized
+`failure`, and `action` (`none`, `restart_after_correction`, `wait_for_restart`).
+These booleans describe runtime availability, not permission. Raw failures stay
+in server logs. The separate `quarantined` response field is removed.
+`booted_serving_digest`
 is the `applied_revision.config_digest` of the ledger the process booted
 from; it is fixed for the life of the process, because the server never
 reloads. The digest and CAS are hashes of configuration bytes: they say
@@ -124,11 +132,20 @@ whether two replicas booted the same revision and nothing else. `/healthz` is
 unchanged: it answers 200 while the process is alive, draining included.
 
 The accepted empty-cluster amendment in [RFC 0005](0005-server-cluster-boot.md)
-permits an actual applied zero-graph revision to report serving with both
+permits an actual applied zero-graph revision to report serving with all three
 counts zero. Its real digest, positive ledger revision and CAS remain required;
 canonical-root and configured public-trust validation remain internal boot
-checks. This changes no readiness fields or authentication gates and does not
-turn a nonempty, entirely failed graph set into a healthy empty deployment.
+checks. A nonempty inventory is ready while any graph is ready, with degraded
+status if some are blocked; all-blocked or draining is unready. The listener
+still starts after opening graphs, and a nonempty, entirely failed graph set
+still refuses startup. `--require-all-graphs` still refuses any blocked graph.
+
+Graph resolution checks credential scope before registry lookup. A known blocked
+graph returns 503 only to a caller authorized for graph `read` on `main` or
+management `graph_list`; otherwise the graph remains undisclosed as 404. An
+invalid graph policy or configuration cannot authorize the read fallback. Unknown
+graphs return 404. This applies to HTTP and MCP; identity-only discovery retains its smaller
+IDs/names response. No status response grants automatic write retry authority.
 
 ### Bounded shutdown
 
@@ -167,15 +184,18 @@ opens graphs read-only and never runs the recovery sweep, so no engine change
 is needed. `refresh` refuses with `state_revision_overflow` instead of
 saturating at `u64::MAX`.
 
-**Witness.** `ServingSnapshot` (the read-only loader the server boots from)
-gains `config_digest`, `state_revision`, `state_cas`, `applied_graphs` (the
-`graph.*` addresses of the applied revision), and `quarantined_graphs`
-(sidecar-attributed graphs intersected with `applied_graphs`, so a sidecar
-for a graph the revision does not name is never a phantom). `AppState` keeps
-them as a `BootWitness` with a `draining` flag. `/readyz` is a new always-flat
-route rendering `ReadinessOutput` from `omnigraph-api-types`; its counts are
-the registry size and `applied_graphs` minus the registry. `GET /graphs`
-renders the same difference as `quarantined`.
+**Witness.** `ServingSnapshot` supplies applied revision/digest/CAS boot facts
+and graph startup inputs, including graph-specific admission refusals. The
+server registry retains actual outcomes as a ready handle or blocked entry;
+blocked entries retain validated authorization context when available. Startup
+classifies invalid configuration, invalid policy, invalid external-Blob policy,
+open failure and invalid stored queries without exposing raw errors. `BootWitness`
+records revision facts, not a second availability inventory. `/readyz`, `GET /graphs` and minimal graph
+discovery derive their counts or entries from the registry; they do not infer
+missing entries by subtracting handles from the boot witness. Status requires
+no graph/storage I/O. Shutdown projects every entry as stopping and closes
+its availability, retaining any startup failure. No retry, loading listener or
+mutable runtime graph set is introduced by this amendment.
 
 **Shutdown.** `ServerConfig` gains `shutdown_grace`, resolved in the binary
 as flag, then environment, then default. `serve` spawns the signal listener
@@ -208,17 +228,20 @@ The one-mutation-process support boundary is unchanged.
 
 ## Compatibility and reversibility
 
-On the wire, additive: existing commands and routes keep their output
-shapes, `authority` and `quarantined` are new fields, `/readyz` and the flag
-are new, and `openapi.json` gains one path and one schema. For Rust
-consumers of `omnigraph-cluster` and `omnigraph-api-types` it is not:
-`StateSyncOperation` gains a variant, so an exhaustive `match` must add an
-arm; `PlanOutput`, `StateSyncOutput`, `ServingSnapshot`, `GraphListResponse`,
-and `ServerConfig` gain required fields, so a struct literal or an exhaustive
-destructuring must name them. Every in-tree consumer is updated in the same
-change; an out-of-tree consumer adds the arm and the fields. No persisted
-bytes change. Reverting removes one verb, one flag, one route, and the new
-fields.
+The original observe/readiness additions were additive on the wire. The v0.12
+availability amendment intentionally breaks that earlier inventory shape:
+`GraphListResponse` has only one `graphs` list, each entry carries availability,
+and readiness replaces `quarantined_graph_count` with ready/blocked counts while
+`served_graph_count` counts the whole registry. HTTP consumers must update
+together with the server; no deprecated aliases or dual-response mode remain.
+Known blocked graphs change from 404 to authorized 503, which is not automatic
+retry permission. OpenAPI, CLI and tests change with these fields.
+
+Rust consumers must update exhaustive matches and struct literals for changed
+API types. Observe retains `StateSyncOperation::Observe`, ledger authority and
+revision/CAS fields, and shutdown retains its configured absolute deadline.
+No persisted bytes change. Reverting availability changes requires reverting its
+wire consumers together; it does not require a storage migration.
 
 ## Alternatives
 
@@ -253,10 +276,12 @@ fields.
   drift and leaves the ledger bytes and revision unchanged; a bundle with
   `state.lock: false` is labeled `unlocked`; refresh refuses at `u64::MAX`.
 - `crates/omnigraph-server/tests/boot_settings.rs` and `multi_graph.rs`
-  (the existing owners of boot and quarantine): `/readyz` reports the boot
-  digest, revision, and counts and answers 503 while draining; `GET /graphs`
-  reports the quarantined ids; a sidecar for a graph the revision does not
-  name is not counted.
+  (the existing owners of boot and blocked graphs): `/readyz` reports boot
+  facts, registry/ready/blocked counts and degraded/blocked/draining status;
+  `GET /graphs` reports one authorized availability list. Real startup failures
+  retain entries, while witness-only names cannot create phantom entries.
+  Authorization owners prove scope-before-lookup, authorized 503, undisclosed
+  blocked graphs and invalid-policy refusal; MCP shares the resolution boundary.
 - The in-source `shutdown_signal_tests` subprocess owner: the watchdog exits
   2 at the deadline while the runtime thread is blocked; SIGTERM with no work
   exits 0; the flag wins over a malformed environment value.
@@ -277,6 +302,13 @@ RFC 0035 proposal; it is a default, not a contract.
 
 ## Decision log
 
+- 2026-10-02: Accepted the v0.12 availability amendment in Summary, Readiness,
+  Witness, Compatibility and Evidence. Actual startup outcomes own one
+  ready/blocked inventory, authorized 503 disclosure and aggregate readiness;
+  removed legacy quarantined fields and boot-witness-derived phantom entries.
+  Loading/deploying states, bounded startup retry and online activation remain
+  outside this implemented foundation. Observe and shutdown authority are unchanged.
+
 - 2026-09-03: drafted as 0048 with a fourth seam, ledger restore.
 - 2026-09-03: renumbered to 0049 (0047 and 0048 are allocated by PR #606).
   Ledger restore deferred to a restore-point design; readiness reduced to
@@ -296,3 +328,6 @@ RFC 0035 proposal; it is a default, not a contract.
   readiness and inventory wire shapes; observe-only authority and the absolute
   shutdown deadline remain its foundations. This clarification changes none of
   this RFC's accepted behavior or current wire shapes.
+- 2026-10-02: Witness replaces the sidecar-only definition of
+  `quarantined_graphs` with applied graphs refused for legacy sidecars or unsafe
+  server-safe external Blob bases. Counts, authority and wire shapes are unchanged.
