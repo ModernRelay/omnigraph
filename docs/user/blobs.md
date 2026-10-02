@@ -149,7 +149,7 @@ smaller operations and retry.
 | Limit | Applies to | Reported resource |
 |---|---|---|
 | 32 MiB of decoded `base64:` bytes | Each node or edge type in one load, in every mode, including `overwrite` | `decoded blob input bytes for <table>` |
-| 32 MiB per touched type, Blob bytes included | Incremental writes: `append` and `merge` loads, inserts and updates. External bytes copied in and Blob values carried unchanged by an update count | `keyed write bytes for <table>`, `keyed entity bytes for <table>` |
+| 32 MiB per touched type, and 32 MiB across all touched types, Blob bytes included | Incremental writes: `append` and `merge` loads, inserts and updates. External bytes copied in and Blob values carried unchanged by an update count | `keyed write bytes for <table>`, `keyed entity bytes for <table>`, `retained keyed batch bytes per operation` |
 | 32 MiB of external payload copied into managed storage | One incremental write operation across all its types, and each type within it: two types copying 20 MiB each exceed it although each fits its per-type limit | `materialized external blob payload bytes` |
 | 32 MiB of Blob payload | One branch merge that writes rows, across all types, managed and external bytes together | `materialized blob payload bytes` |
 | 8,192 external references | One write operation or merge | `external Blob reference cells` |
