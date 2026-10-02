@@ -2589,7 +2589,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(outcome, MergeOutcome::Merged);
+        assert_eq!(outcome.outcome, MergeOutcome::Merged);
         assert_eq!(probes.table_walk_interval_count(), 2);
         let route = MergeRouteObservation::from_probes(&probes);
         assert!(route.stage_known_present_update_calls >= 2);

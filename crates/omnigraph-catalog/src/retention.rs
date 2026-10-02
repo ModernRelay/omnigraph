@@ -235,6 +235,7 @@ impl ManifestCoordinator {
                 .await
             {
                 Ok(dataset) => dataset,
+                Err(lance::Error::DatasetNotFound { .. }) => continue,
                 Err(error) if error.is_not_found() => continue,
                 Err(error) => return Err(OmniError::storage(error)),
             };

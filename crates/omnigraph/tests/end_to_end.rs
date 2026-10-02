@@ -36,7 +36,7 @@ async fn init_creates_schema_file_and_manifest() {
 
     let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
-    assert!(dir.path().join("_schema.pg").exists());
+    assert!(!dir.path().join("_schema.pg").exists());
     assert!(dir.path().join("__manifest").exists());
     assert_eq!(db.catalog().node_types.len(), 2);
     assert_eq!(db.catalog().edge_types.len(), 2);
@@ -1499,13 +1499,7 @@ async fn blob_read_on_upgraded_unmarked_v6_table_fails_closed_for_old_snapshots(
         .unwrap()
         .published_dataset_version;
     drop(db);
-    let mut manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
-        .await
-        .unwrap();
-    omnigraph_catalog::migrations::restamp_flat_for_test(&mut manifest, 10)
-        .await
-        .unwrap();
-    drop(manifest);
+    helpers::make_legacy_flat_manifest_fixture(dir.path(), 10).await;
     let upgraded = upgrade_storage(uri, UpgradeOptions::default())
         .await
         .unwrap();

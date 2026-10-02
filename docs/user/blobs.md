@@ -96,8 +96,11 @@ Servers expose the same logical selector with GET and HEAD:
 
 ```http
 GET /graphs/knowledge/blob?entity=node&type=Document&id=manual&property=content&branch=main
+Omnigraph-Http-Api: 0.12
 ```
 
+Both methods follow the [HTTP contract](operations/server.md#http-contract),
+including checking the response header before consuming bytes.
 Use `snapshot=<commit-id>` instead of `branch` for an immutable historical read.
 
 For managed values:

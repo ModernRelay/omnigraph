@@ -9,29 +9,27 @@ version axes. Never derive one axis from another.
 | Axis | Policy | Guard |
 |---|---|---|
 | Release | Published workspace artifacts move in lockstep. | Workspace manifests, lockfile, generated metadata, release automation. |
-| CLI ↔ server wire | Prefer additive changes; documented breaking release boundaries require coordinated upgrades. No global version handshake. | Shared DTOs, OpenAPI drift tests, and release-specific migration guidance. |
+| CLI ↔ server wire | One v0.12 contract; coordinated client/server upgrades. Exact request admission and CLI discovery/response validation. | Shared contract header, DTOs, HTTP refusal tests and OpenAPI drift tests. |
 | Graph storage | Closed stamp range `[MIN_SUPPORTED, CURRENT]`, independent of system column vintage; explicit registered upgrades into the floor, otherwise rebuild; no open-time migration. | Main-manifest stamp guard on both bounds. |
 | Lance dependency and file format | One deliberately pinned Lance family and explicit stable file version. | Lockfile, write parameters, and Lance surface guards. |
 
 ## Current storage contract
 
-The current binary serves **internal manifest schema v11 and v12**:
-`MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION` is 11 and
-`INTERNAL_MANIFEST_SCHEMA_VERSION` is 12. v12 changes only how a `__manifest`
-row is stored (one packed `record` column, see the v12 bullet below); a v11
-graph opens as it is and each Lance branch of its `__manifest` converts on its
-next publish, with no command. v10 is the [RFC 0067](../rfcs/0067-detached-table-commits.md)
-stamp: a table registration may name a detached Lance version whose linear
-target is published before it exists, which an older binary would open as
-reclaimed history, so the stamp refuses it before any open. Both system
-column vintages of [RFC 0040](../rfcs/0040-system-column-namespace.md),
-`id`/`src`/`dst` and `__id`/`__src`/`__dst`, are supported within this range:
-the vintage is read from the schema IR's feature set, never from the stamp, and
-`omnigraph schema upgrade-system-columns` converts it on a supported standalone
-graph without a separate vintage-specific stamp. Its publication follows the
-ordinary format conversion rule, so a v11 main becomes v12. A v8, v9 or v10 graph
-needs one explicit `omnigraph upgrade`, a route that keeps its branches and its spellings,
-before this binary serves it.
+The current binary serves **internal manifest schema v13**. Both
+`MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION` and
+`INTERNAL_MANIFEST_SCHEMA_VERSION` are 13. Each live branch's `__manifest`
+carries one `schema_contract` row containing the accepted schema source,
+compiled IR and identity. Fresh initialization writes it in the genesis
+Create; schema apply and the system-column upgrade replace it in the same
+publication as their table references. Normal serving has no root-file
+fallback. See [Schema contract in the manifest](../rfcs/2026-09-30-schema-contract-in-manifest.md).
+
+Both system-column vintages of [RFC 0040](../rfcs/0040-system-column-namespace.md),
+`id`/`src`/`dst` and `__id`/`__src`/`__dst`, remain supported. The schema IR's
+feature set determines the vintage, never the storage stamp.
+`omnigraph schema upgrade-system-columns` converts the spellings on a
+supported standalone graph without changing its storage stamp. Admitted
+older formats require explicit storage conversion before normal open.
 
 - v4 was the last released pre-identity format, used by OmniGraph 0.8.x.
 - v5 was an unreleased development format that introduced SchemaIR v2,
@@ -58,8 +56,8 @@ before this binary serves it.
   `omnigraph schema upgrade-system-columns` converted it in place (RFC 0040
   Rollout step 3: stamp advance first, one rename-only commit per table,
   schema promotion last). Since v10 the vintage has no separate stamp and the
-  upgrade stages detached renames like schema apply (RFC 0067); its publication
-  follows the ordinary format conversion rule above.
+  upgrade stages detached renames like schema apply (RFC 0067). At v13 it
+  publishes the renamed table references and replacement contract row together.
 - v10 preserves v9's layout and lets a table registration carry
   `omnigraph.staged_version` and `omnigraph.transaction_uuid` (RFC 0067): the
   detached Lance version a pin was staged as and the transaction promotion
@@ -75,26 +73,35 @@ before this binary serves it.
   `detached-only-v10-to-v11`, which promotes every pending pin once, reaps the
   proven copies, records the key on every current registration of every live
   branch, and restamps.
-- v12 keeps v11's logical rows (`manifest_schema()`, ten fields: the unused
-  `base_objects` list is gone) and stores them as three columns: `object_id`,
+- v12 kept the ten logical fields present at v11 (the unused `base_objects`
+  list was removed) and stored them as three columns: `object_id`,
   `object_type` and `record`, a Lance packed struct (`lance-encoding:packed`)
   holding the eight remaining fields row-major plus a `present` bitmask, one
   bit per field that is null in the logical row (Lance 11 refuses a null
   value inside a packed struct child, so every child is declared non-null and
   a null is stored as `""` or `0` with its bit set). A scan reads one column's
   pages for the record instead of one per field, and always projects `record`
-  whole (Lance 11 cannot project a fixed-width child of a packed struct on
-  its own). Conversion is the branch's next publish: the copy-on-write
-  overwrite writes the packed shape and the v12 stamp in one commit; an idle
-  branch stays v11 and reads as v11; earlier versions keep their shape for
-  time travel. A graph holds v11 and v12 across its branches until every
-  branch has published, and every reader, `omnigraph upgrade` and
-  `omnigraph schema upgrade-system-columns` accept that state. `omnigraph
-  upgrade` has no v12 step and `--to-format 12` is an unsupported target; an
-  offline route that converts every branch at once is a separate change (see
-  §Changing an axis). A Lance directory-namespace client, which reads
-  `__manifest` by its own catalog column names, fails at `location` on a
-  stamp-12 manifest; it found no OmniGraph table at stamp 11 either.
+  whole. Lance 11's default filtered-scan materialization can split packed
+  children between early and late reads; the contract-row scan uses
+  `MaterializationStyle::AllEarly` to keep the projected record together.
+  Isolated packed-child projection remains unsupported. The original v12
+  transition converted a v11 branch on its next publish, so predecessor roots
+  can mix v11 and v12. These are now conversion inputs and retained-history
+  layouts, not served formats. `--to-format 12` remains unsupported. A Lance
+  directory-namespace client, which reads `__manifest` by its own catalog
+  column names, fails at `location` on a stamp-12 manifest; it found no
+  OmniGraph table at stamp 11 either.
+- v13 preserves the packed record and adds nullable `LargeUtf8` columns
+  `schema_source` and `schema_ir`. Only the `schema_contract` row carries
+  these texts; its `metadata` records `schema_ir_hash`,
+  `schema_identity_version` and `schema_identity_domain`. Serving scans capture
+  the texts, identity and table state together from the exact branch and
+  version. Contract acceptance validates the IR, source shape and captured
+  table identities; catalog reuse requires the same validated image or row
+  content. Historical and migration folds may read the identity alone.
+  Historical queries keep using the accepted
+  live contract, with aliases rebound by stable identity to the retained
+  table image; an older row does not add historical schema-language semantics.
 - the unreleased v7–v19 stamps of the rejected MemWAL experiment never shipped
   and are not supported migration inputs. Reuse of a numeric stamp by another
   design (RFC 0062, RFC 0042 or RFC 0040) does not make an experimental graph
@@ -102,22 +109,34 @@ before this binary serves it.
   rebuild at a fresh root.
 
 Normal open refuses lower and higher stamps before recovery or table decoding;
-neither served stamp is rewritten on open.
-`omnigraph upgrade` defaults to v11: qualified standalone v6 graphs run the
-registered v6 → v7 → v8 → v10 → v11 route, qualified v7 graphs run
-v7 → v8 → v10 → v11, v8 and v9 graphs run v10 → v11, and v10 graphs run the
-v11 step alone. The v10 step (`detached-pins-v8-v9-to-v10`) restamps main and
-every live branch under one intent and touches nothing else; retired
-ancestors keep their stamp. The v11 step (`detached-only-v10-to-v11`) is
-engine-backed: it needs every writer stopped and runs on standalone roots
-only. `--to-format 7`, `--to-format 8` and `--to-format 10` retain those
-intermediate targets for a compatible older executable; the current binary
-refuses normal open of each result, and v9 is not a target. The system-column respelling is a separate operation on
-a served graph, `omnigraph schema upgrade-system-columns`. Original retained
-snapshots remain unchanged; historical v6 registrations use an explicit
-legacy decoder after main-root admission. A pending upgrade marker refuses
-normal opens until every branch validates and main activation completes.
-See [RFC 0064](../rfcs/0064-explicit-storage-upgrades.md) for the offline protocol.
+it never migrates a graph. `omnigraph upgrade` defaults to v13 and composes
+`v6 → v7 → v8 → v10 → v11 → v13`; qualified v7 inputs start at v7,
+v8 and v9 inputs enter the v10 step, and v10 inputs enter the v11 step.
+The v10 step (`detached-pins-v8-v9-to-v10`) restamps main and every live
+branch under one intent; retired ancestors keep their stamp. The v11 step
+(`detached-only-v10-to-v11`) promotes every pending v10 pin once, reaps proven
+copies and records the last linear version. Both require the existing offline,
+standalone admission. Its upgrade-only v10 handle receives a validated legacy
+contract without relaxing ordinary-open admission.
+
+The final `schema-contract-v11-v12-to-v13` step accepts actual flat v11 and
+packed v12 sources, including either mixture across main and named branches.
+Protocol 5's intent pins the semantic contract identity and raw-text SHA-256
+digests of the source and IR. Each branch overwrite preserves its logical rows
+and writes the contract, target stamp and receipt together; it introduces no
+graph commit. All branches must validate before the three legacy contract
+files are deleted. Main retains its pending marker until cleanup finishes,
+then activates last. After all branches convert, retries read the contract
+from main's row and tolerate any subset of those files already being absent.
+
+Explicit targets 7, 8, 10 and 11 remain intermediate stops for compatible
+executables; the current binary refuses normal open of their results. Neither
+9 nor 12 is a target. Check mode has no effects and reports downstream
+preflights that require intermediate output as deferred. Original retained
+snapshots remain unchanged; historical v6 registrations use the explicit
+legacy decoder after main-root admission. See
+[RFC 0064](../rfcs/0064-explicit-storage-upgrades.md) for the offline protocol
+and [the upgrade guide](../user/operations/upgrade.md) for execution and retry.
 
 ## Recovery sidecars
 
@@ -169,14 +188,14 @@ see the [admission limits](../user/operations/upgrade.md).
 
 | Source executable / format | Normal open | Default explicit route | Required coverage owner |
 |---|---|---|---|
-| 0.9.0 / v6 | Refused | v6 → v7 → v8 → v10 → v11 (`--to-format 8` stops at v8; branches are kept) | `crossversion_upgrade.rs::genuine_v09_explicit_storage_upgrade_preserves_history` (v8 stop, then the default route on its branched fixture); `upgrade/tests.rs::storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v11` |
-| 0.10.0 / v6 | Refused | v6 → v7 → v8 → v10 → v11 | `crossversion_upgrade.rs::genuine_v010_explicit_storage_upgrade_preserves_history` |
-| Qualified development / v7 | Refused | v7 → v8 → v10 → v11 | Engine storage-upgrade tests: metadata-only conversion, history and retry (pinned to `--to-format 8`), plus the synthetic v6 default-route test above |
-| Legacy vintage / v8 | Refused | v8 → v10 → v11 (`detached-pins-v8-v9-to-v10`, then `detached-only-v10-to-v11`; `--to-format 8` is an already-current no-op) | `upgrade/tests.rs::storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v11`, `storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_name`; `tests/system_column_upgrade.rs` (the respelling on a served graph, refusals, crash points) |
-| 0.11.x / v9 | Refused | v9 → v10 → v11 | `upgrade/tests.rs::storage_upgrade_default_route_takes_a_v9_graph_to_v11` |
-| 0.11.x (detached table commits) / v10 | Refused | v10 → v11 (`detached-only-v10-to-v11`) | `upgrade/tests.rs::storage_upgrade_default_route_takes_a_v10_graph_to_v11` |
-| Current / v11 | Accepted; converts to v12 on each branch's next publish | Already current (also while the graph's branches mix v11 and v12); a lower target is refused; `--to-format 12` is an unsupported target, no route writes v12 | `omnigraph-catalog` `stamp_11_manifest_converts_on_its_next_publish` (no released binary wrote v11, so the synthetic conversion test is the predecessor evidence); `upgrade/tests.rs::storage_upgrade_accepts_a_graph_converting_branch_by_branch`; CLI `crossversion_upgrade.rs::genuine_v010_explicit_storage_upgrade_preserves_history` (a genuine 0.10.x graph upgraded to v11 converts branch by branch under the new binary's mutate and merge) |
-| Current / v12 | Accepted | Already current; a lower target is refused | `upgrade/tests.rs::storage_upgrade_current_vintage_is_already_current_without_a_route`; stamp tests in `migrations.rs` |
+| 0.9.0 / v6 | Refused | v6 → v7 → v8 → v10 → v11 → v13 (`--to-format 8` retains the intermediate stop) | `crossversion_upgrade.rs::genuine_v09_explicit_storage_upgrade_preserves_history`; default-route owners in `upgrade/tests.rs` |
+| 0.10.0 / v6 | Refused | v6 → v7 → v8 → v10 → v11 → v13 | `crossversion_upgrade.rs::genuine_v010_explicit_storage_upgrade_preserves_history` |
+| Qualified development / v7 | Refused | v7 → v8 → v10 → v11 → v13 | `upgrade/tests.rs`: metadata conversion, history, retry and route composition |
+| Legacy vintage / v8 | Refused | v8 → v10 → v11 → v13 (`--to-format 8` is an already-current no-op before conversion) | `upgrade/tests.rs`: default route and retained retired ancestry; `system_column_upgrade.rs`: subsequent respelling on the served graph |
+| 0.11.x / v9 | Refused | v9 → v10 → v11 → v13 | Default-route owners in `upgrade/tests.rs` |
+| 0.11.x (detached table commits) / v10 | Refused | v10 → v11 → v13 | `upgrade/tests.rs`: pending-pin promotion, reap interruption, last-linear-version preservation and cleanup |
+| Predecessor / v11, v12, or mixed branches | Refused | v11/v12 → v13 (`schema-contract-v11-v12-to-v13`) | `upgrade/tests.rs`: actual flat/packed layouts, both mixed directions, exact contract bytes, history, refusal and cleanup retry |
+| Current / v13 | Accepted | Already current for default or target 13; lower registered targets refuse | Current-format no-op owners in `upgrade/tests.rs` and CLI `crossversion_upgrade.rs`; stamp tests in `migrations.rs` |
 | Older, future or unqualified experimental format | Refused | No route; source-compatible export/rebuild | Existing format fences and engine refusal tests |
 
 Source v6/v7 admission rejects any reserved native-ref retirement metadata.
@@ -192,26 +211,35 @@ refusal expectations and this matrix together, with storage-maintainer review.
 
 ## Wire compatibility
 
-Prefer additive wire changes so compatible CLI and server releases can roll
-independently:
+The v0.12 HTTP boundary requires `Omnigraph-Http-Api: 0.12` exactly once on
+protected graph and registry requests. Authentication precedes contract admission;
+missing, duplicate or unsupported values return typed 400 `api_contract_mismatch`
+before graph resolution or body execution. Ordinary responses carry the same
+header. Public health, readiness and OpenAPI routes remain accessible without it.
+MCP and OAuth metadata retain their separate standard protocols.
 
-- new request fields are optional or have a server-side default;
-- new response fields do not change existing field meaning;
-- enum growth must be represented in a rolling-safe shape when old clients use
-  closed switches;
-- intentional API changes regenerate and commit `openapi.json`.
+The CLI checks the configured server's `HEAD /healthz` before each data request,
+without credentials and with a five-second discovery bound, then validates the
+actual response header before consuming its body. Discovery failure means that
+request was not sent; a response mismatch after dispatch leaves effects unknown.
+Graph HTTP requests follow no redirects and retry nothing automatically. See the
+[HTTP admission decision](../rfcs/2026-09-30-v012-http-admission.md) and
+[operator guidance](../user/operations/server.md).
 
-Do not infer wire compatibility from a shared graph-storage version. The
-v0.9/v0.10 boundary deliberately removes legacy graph-facing field names and
-public aliases; it is **not rolling-safe**. Upgrade CLI, server, and client
-integrations together according to the [v0.10 release notes](../releases/v0.10.0.md).
-The Lance 9/10 to 11 analyzer transition separately requires a quiesced fleet
-and explicit full-text rebuilds; see [the upgrade procedure](../user/operations/upgrade.md#full-text-index-upgrade).
+Upgrade CLI, server and integrations together. The shared contract identifier is
+independent of package and graph-storage versions; it establishes neither support
+for another server increment nor permission to replay a write. No old-client
+fallback or negotiation framework is supported. New wire changes update shared
+DTOs, the contract decision, OpenAPI and transport qualification together.
 
-Future incompatible wire changes must identify the affected release boundary,
-document the consumer migration, and test fail-closed behavior where an older
-server could otherwise ignore a new write precondition. There is no global
-wire-version handshake; storage strictness is not a reason to add one.
+Server URLs identify the service root, preserving any proxy prefix. Migrate
+graph-qualified URLs to that root plus `--graph`, `default_graph` or alias `graph`;
+the CLI does not infer a root by stripping path segments.
+
+Storage upgrades and the Lance analyzer boundary remain separately owned. The
+Lance 9/10 to 11 analyzer transition requires a quiesced fleet and explicit
+full-text rebuilds; see the
+[upgrade procedure](../user/operations/upgrade.md#full-text-index-upgrade).
 
 ## Registry publication status
 
@@ -248,10 +276,10 @@ change before the release that ships the stamp; for a stamp no released binary
 wrote, the synthetic conversion test is the predecessor evidence and the matrix
 row says so. Steps 3 and 5 apply unchanged.
 
-### Pins and staged contracts
+### Pins and schema contracts
 
-1. A change to what a pin or a staged schema contract records is a manifest
-   or contract format change: it takes a stamp or contract version and the
+1. A change to what a pin or a schema-contract row records is a manifest
+   format change: it takes a stamp or contract version and the
    graph-storage checklist above.
 2. A new detached transaction kind needs its twin-replay surface guard first.
 3. Never infer missing lifetime identity from aliases.

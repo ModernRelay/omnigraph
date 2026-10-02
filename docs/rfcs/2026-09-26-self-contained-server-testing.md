@@ -378,8 +378,9 @@ qualification work remain separate. This RFC introduces no remote testing mode.
 The server proposal owns the v0.12 wire contract: CLI, server and cluster tools
 upgrade together; unsupported or unidentified contracts refuse before admission.
 No mixed-version execution, fallback or legacy error alias is qualified here.
-The explicit contract discriminator is a product prerequisite, not an existing
-CLI/server handshake. `/healthz` reports package `version` and separate storage
+The exact contract discriminator and CLI discovery/response checks are owned by
+[the accepted HTTP admission decision](2026-09-30-v012-http-admission.md); qualifying
+that transport does not provide this runner's missing server controls. `/healthz` reports package `version` and separate storage
 `internal_schema_version`; neither proves the required wire behavior. v0.12 names
 the release/wire line, not manifest stamp 12; existing storage admission and
 explicit migration remain separately owned. The executed-type
@@ -640,3 +641,5 @@ the maintainer who confirms or reverses it and the event that forces that call.
 - 2026-09-29: production ownership moves to [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md); record the landed engine-DST concurrent subset, retain unqualified server controls, bind T9 to ledger revisions and distinguish E1 activation from E2 historical serving.
 - 2026-09-30: Link `RecoveryRequired` to current write failure outcomes; qualify submission-only deployment, cluster-root writer admission, achieved-result successor bases, unavailable-graph status and the distinct admission/supervision retry hints. These remain product and harness gates, not implemented server coverage.
 - 2026-09-30: Narrow server qualification to the v0.12 release/wire line, structured compound errors and one outstanding deployment per cluster. Remove mixed-version execution and supersession requirements; reserve T8.history/T8.retention and historical-overlap benchmarks for an accepted follow-up. Keep original-result reconciliation, bounded transient startup retry and one authorized inventory. Storage-version support is unchanged.
+
+- 2026-09-30: Compatibility now links to the accepted A1 HTTP admission decision for the exact discriminator and CLI checks; server-runner and remaining outcome prerequisites stay separate.

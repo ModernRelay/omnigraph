@@ -866,6 +866,7 @@ impl Omnigraph {
                     actor_id,
                     expected_head,
                     stage_write_concurrency,
+                    attempt == 0,
                     &mut retryable,
                 )
                 .await
@@ -881,7 +882,7 @@ impl Omnigraph {
                         "prepared mutation authority changed before effects; repreparing"
                     );
                     crate::instrumentation::record_mutation_reprepare();
-                    self.refresh_for_reprepare().await?;
+                    self.refresh_coordinator_only().await?;
                 }
                 result => return result,
             }
@@ -898,27 +899,26 @@ impl Omnigraph {
         actor_id: Option<&str>,
         expected_head: Option<&str>,
         stage_write_concurrency: usize,
+        first_attempt: bool,
         retryable: &mut bool,
     ) -> Result<crate::MutationReceipt> {
         let requested = Self::normalize_branch_name(branch)?;
-        // Reject internal `__run__*` / system-prefixed branches at the
-        // public write boundary. Direct-publish paths assert this
-        // explicitly so a caller can't write to legacy or system
-        // staging branches by passing the prefix verbatim.
-        if let Some(name) = requested.as_deref() {
-            crate::db::ensure_public_branch_ref(name, "mutate")?;
-        }
-        // Install this handle's published-but-uninstalled schema contract, if
-        // any. This MUST run before `open_write_txn`, which captures the
-        // accepted schema identity and catalog.
-        self.settle_pending_schema_install().await?;
         // Capture one branch-wide write authority: native branch identity,
         // exact optional graph head, accepted schema identity/catalog, and the
         // base table snapshot. Execution, validation, staging, and publication
         // all use this immutable attempt. `commit_all` revalidates the complete
         // token under the root-shared schema → branch → sorted-table gates
         // before its first detached commit.
-        let mut txn = self.open_write_txn(requested.as_deref()).await?;
+        let mut txn = self
+            .open_write_txn(requested.as_deref())
+            .await
+            .map_err(|error| {
+                if first_attempt {
+                    error.before_effect()
+                } else {
+                    error.without_pre_effect_evidence()
+                }
+            })?;
         // Caller CAS gate against the pinned view this attempt executes with —
         // a separate head lookup would reopen the race. Re-checked per
         // reprepare; not `ReadSetChanged`, so the retry loop never replays it.

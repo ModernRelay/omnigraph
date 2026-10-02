@@ -55,7 +55,7 @@ fn resolve_desired_schema_ir(
         .map_err(|error| OmniError::manifest(error.to_string()))?;
     if source_hash != resolved_hash {
         return Err(OmniError::manifest(
-            "desired schema source does not match its resolved schema; refusing before schema apply staging",
+            "desired schema source does not match its resolved schema; refusing before schema apply effects",
         ));
     }
     for diagnostic in &resolution.diagnostics {
@@ -109,13 +109,23 @@ pub(super) async fn plan_schema(
     desired_schema_source: &str,
     options: SchemaApplyOptions,
 ) -> Result<SchemaMigrationPlan> {
-    db.ensure_schema_state_valid().await?;
-    let accepted_ir = read_accepted_schema_ir(db.uri(), Arc::clone(&db.storage)).await?;
+    let accepted_ir = accepted_ir_for_planning(db).await?;
     let desired_ir = resolve_desired_schema_ir(&accepted_ir, desired_schema_source)?;
     let mut plan = plan_schema_migration(&accepted_ir, &desired_ir)
         .map_err(|err| OmniError::manifest(err.to_string()))?;
     promote_drops_to_hard(&mut plan, options.allow_data_loss);
     Ok(plan)
+}
+
+/// The accepted IR a plan is made against: the contract of the live view the
+/// handle resolves now (probe, refresh when the manifest moved), not the
+/// handle's warm ArcSwap catalog.
+async fn accepted_ir_for_planning(db: &Omnigraph) -> Result<SchemaIR> {
+    let (_, catalog) = db.capture_current_read_view().await?;
+    catalog
+        .bound_schema_ir()
+        .cloned()
+        .ok_or_else(|| OmniError::manifest_internal("accepted catalog carries no bound SchemaIR"))
 }
 
 struct PlannedSchemaApply {
@@ -129,21 +139,12 @@ async fn plan_schema_for_apply(
     desired_schema_source: &str,
     options: SchemaApplyOptions,
 ) -> Result<PlannedSchemaApply> {
-    db.ensure_schema_state_valid().await?;
-    let accepted_ir = read_accepted_schema_ir(db.uri(), Arc::clone(&db.storage)).await?;
+    let accepted_ir = accepted_ir_for_planning(db).await?;
     plan_schema_for_apply_from_accepted(db, desired_schema_source, options, &accepted_ir).await
 }
 
 decide_seam! {
     pub static SCHEMA_APPLY_AFTER_MANIFEST_COMMIT = ("schema_apply.after_manifest_commit", Unreachable, [Fail]);
-}
-
-decide_seam! {
-    pub static SCHEMA_APPLY_AFTER_STAGING_WRITE = ("schema_apply.after_staging_write", Unreachable, [Fail]);
-}
-
-decide_seam! {
-    pub static SCHEMA_APPLY_BEFORE_STAGING_WRITE = ("schema_apply.before_staging_write", Unreachable, [Fail]);
 }
 
 decide_seam! {
@@ -153,17 +154,8 @@ decide_seam! {
 }
 
 decide_seam! {
-    /// Under the schema-apply sentinel and every gate, before the first
-    /// table effect; shared by schema apply and the RFC 0040 system-column
-    /// upgrade, neither of which arms a sidecar (RFC 0067).
+    /// Under the schema, branch and table gates, before the first table effect.
     pub static SCHEMA_APPLY_POST_LOCK_PRE_EFFECT = ("schema_apply.post_lock_pre_effect", Unreachable, [Fail]);
-}
-
-decide_seam! {
-    /// Right after the durable sentinel lands, under the exclusive schema
-    /// permit and before any planning: the first crossing proves the apply
-    /// got past every shared holder.
-    pub static SCHEMA_APPLY_POST_SENTINEL = ("schema_apply.post_sentinel", Unreachable, [Fail]);
 }
 
 async fn plan_schema_for_apply_from_accepted(
@@ -173,14 +165,9 @@ async fn plan_schema_for_apply_from_accepted(
     accepted_ir: &SchemaIR,
 ) -> Result<PlannedSchemaApply> {
     let branches = db.coordinator.read().await.all_branches().await?;
-    // Skip `main` and internal system branches (the schema-apply lock branch,
-    // the cluster-wide schema-apply serializer). Legacy `__run__*` staging
-    // branches were swept off `__manifest` by the v2→v3 migration that runs in
-    // `Omnigraph::open(ReadWrite)` before this check (MR-770), so they no
-    // longer appear here.
     let blocking_branches = branches
         .into_iter()
-        .filter(|branch| branch != "main" && !is_internal_system_branch(branch))
+        .filter(|branch| branch != "main")
         .collect::<Vec<_>>();
     if !blocking_branches.is_empty() {
         return Err(OmniError::manifest_conflict(format!(
@@ -257,38 +244,8 @@ where
 
     let _export_exclusion = db.reserve_export_destructive_control()?;
 
-    // Install this handle's published-but-uninstalled schema contract, if any,
-    // before planning against the accepted contract.
-    db.settle_pending_schema_install().await?;
-
-    // Process-local schema gate, EXCLUSIVE side: schema apply is a
-    // contract-lifecycle pass, so it excludes every shared holder (writers,
-    // maintenance, branch control, read captures) and they exclude it. The
-    // permit is taken before the branch/table gates and before the durable
-    // sentinel, and retained through sentinel release, so no shared holder
-    // can revalidate against a contract this apply is about to replace.
-    // The native sentinel remains the cross-handle / crash-visible
-    // authority; this permit removes the avoidable same-handle race (RFC
-    // 2026-09-18-shared-schema-gate).
     let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
-    acquire_schema_apply_lock(db).await?;
-    let result = async {
-        fail(&SCHEMA_APPLY_POST_SENTINEL)?;
-        apply_schema_with_lock(db, desired_schema_source, options, actor, validate_catalog).await
-    }
-    .await;
-    let release_result = release_schema_apply_lock(db).await;
-    if release_result.is_err() {
-        // Liveness: the next write entry on this handle retries the release
-        // before the sentinel gate, so the failed delete never wedges it.
-        db.note_failed_sentinel_release();
-    }
-    match (result, release_result) {
-        (Ok(result), Ok(())) => Ok(result),
-        (Ok(_), Err(err)) => Err(err),
-        (Err(err), Ok(())) => Err(err),
-        (Err(err), Err(_)) => Err(err),
-    }
+    apply_schema_with_lock(db, desired_schema_source, options, actor, validate_catalog).await
 }
 
 pub(super) async fn apply_schema_with_lock<F>(
@@ -301,19 +258,22 @@ pub(super) async fn apply_schema_with_lock<F>(
 where
     F: FnOnce(&Catalog) -> Result<()>,
 {
-    // Capture the accepted contract, compiled catalog, manifest snapshot, and
-    // main authority as one operation-local view while the schema gate and
-    // durable SchemaApply sentinel are held. A long-lived handle's ArcSwap
-    // catalog may lag another handle, so it is never an authority here.
-    db.refresh_coordinator_only().await?;
-    let (accepted_ir, accepted_schema_state) =
-        load_validated_schema_contract(db.uri(), Arc::clone(&db.storage)).await?;
-    let mut accepted_catalog = build_catalog_from_ir(&accepted_ir)?;
-    fixup_physical_schemas(&mut accepted_catalog)?;
-    let accepted_catalog = Arc::new(accepted_catalog);
+    db.refresh_coordinator_only()
+        .await
+        .map_err(OmniError::before_effect)?;
+    let (accepted_catalog, accepted_identity) = {
+        let snapshot = db.coordinator.read().await.snapshot();
+        db.accepted_catalog_for_snapshot(&snapshot)
+            .await
+            .map_err(OmniError::before_effect)?
+    };
+    let accepted_ir = accepted_catalog.bound_schema_ir().cloned().ok_or_else(|| {
+        OmniError::manifest_internal("accepted catalog carries no bound SchemaIR")
+    })?;
     let planned =
         plan_schema_for_apply_from_accepted(db, desired_schema_source, options, &accepted_ir)
-            .await?;
+            .await
+            .map_err(OmniError::before_effect)?;
     validate_catalog(&planned.desired_catalog)?;
     let PlannedSchemaApply {
         plan,
@@ -539,12 +499,6 @@ where
     let mut table_tombstones =
         BTreeMap::<crate::db::manifest::TableIdentity, (String, u64, Option<String>)>::new();
 
-    // Preflight every existing-table participant against the captured
-    // snapshot. A rewrite advances the identity-owned dataset detached from
-    // its manifest pin (RFC 0067); a type rename is metadata-only and keeps
-    // identity, path, version and Lance history. Metadata/tombstone-only
-    // applies have no table effects: their only durable pre-publication state
-    // is the staged schema contract.
     for table_key in &rewritten_tables {
         if added_tables.contains(table_key) {
             continue;
@@ -626,12 +580,6 @@ where
         .datasets()
         .map(|entry| (entry.type_key.clone(), entry.native_dataset_branch.clone()))
         .collect();
-    // The outer `apply_schema` holds the exclusive schema permit from before
-    // sentinel creation through sentinel release. Per-table guards here
-    // therefore cover only the concrete table effects; re-acquiring either
-    // side of the schema gate on this task deadlocks — the gate is
-    // non-reentrant, and even a shared re-entry parks behind any queued
-    // writer under the plain-mode write-preferring lock.
     let _main_branch_guard = db.write_queue().acquire_branch(None).await;
     let _schema_apply_queue_guards = db
         .write_queue()
@@ -676,17 +624,20 @@ where
             current_graph_head,
         ));
     }
-    let current_schema_state = read_schema_state_identity(db.uri(), db.storage.as_ref()).await?;
-    if current_schema_state != accepted_schema_state {
+    let current_snapshot = db.coordinator.read().await.snapshot();
+    let (current_catalog, current_identity) =
+        db.accepted_catalog_for_snapshot(&current_snapshot).await?;
+    validate_bound_catalog_against_snapshot(&current_catalog, &current_snapshot)?;
+    if current_identity != accepted_identity {
         return Err(OmniError::manifest_read_set_changed(
             "schema_identity",
             Some(format!(
                 "{}:{}",
-                accepted_schema_state.schema_identity_version, accepted_schema_state.schema_ir_hash
+                accepted_identity.schema_identity_version, accepted_identity.schema_ir_hash
             )),
             Some(format!(
                 "{}:{}",
-                current_schema_state.schema_identity_version, current_schema_state.schema_ir_hash
+                current_identity.schema_identity_version, current_identity.schema_ir_hash
             )),
         ));
     }
@@ -696,28 +647,6 @@ where
         let dataset_uri = db.storage().dataset_uri(&entry.dataset_path);
         let head = db.open_pinned_for_write(&dataset_uri, entry).await?;
         existing_heads.insert(entry.type_key.clone(), head);
-    }
-
-    // Only added types are first-touch paths; rename targets reuse the
-    // existing identity-owned path. An added type's path is a deterministic
-    // function of the accepted identity allocator, so an attempt that died
-    // after creating the dataset left it exactly where the retry creates it.
-    // Nothing references an unregistered incarnation path (identities are
-    // never reused and registration is this apply's own publication), so
-    // under the schema sentinel such a leftover is garbage: reclaim it before
-    // the strict version-one create.
-    for table_key in &added_tables {
-        let identity = table_identity_for_schema_key(&desired_ir, table_key)?;
-        let table_path = crate::db::manifest::table_path_for_identity(table_key, identity)?;
-        let dataset_uri = db.storage().dataset_uri(&table_path);
-        if db.storage_adapter().exists(&dataset_uri).await? {
-            tracing::warn!(
-                table_key,
-                dataset_uri,
-                "reclaiming an unregistered dataset left at the added type's path by an abandoned schema apply"
-            );
-            db.storage_adapter().delete_prefix(&dataset_uri).await?;
-        }
     }
 
     // Lance's logical Blob rewrite input cannot represent an existing
@@ -746,13 +675,7 @@ where
         .await?;
     }
 
-    // The staged contract is bound to this apply's graph commit (RFC 0067):
-    // a read-write open installs it once that commit is in lineage and
-    // discards it otherwise.
-    let publication = crate::db::schema_state::SchemaPublication {
-        graph_commit_id: lineage_intent.graph_commit_id.clone(),
-        parent_commit_id: base_graph_head.clone(),
-    };
+    let graph_commit_id = lineage_intent.graph_commit_id.clone();
 
     let mut published_commit: Option<String> = None;
     let effects = async {
@@ -764,34 +687,77 @@ where
             let table_path = crate::db::manifest::table_path_for_identity(table_key, identity)?;
             let dataset_uri = db.storage().dataset_uri(&table_path);
             let schema = schema_for_table_key(&desired_catalog, table_key)?;
-            let batch = RecordBatch::new_empty(schema);
-            let staged = db.storage().stage_create(&dataset_uri, batch).await?;
-            let outcome = db
-                .storage()
-                .commit_staged_create_exact(&dataset_uri, staged)
-                .await?;
-            if !outcome.is_exact() {
-                return Err(OmniError::manifest_internal(format!(
-                    "SchemaApply first-touch '{}' committed outside its version-one create",
-                    table_key
-                )));
-            }
-            let ds = outcome.into_snapshot();
-            // Indexes for the new table are materialized off the critical path by
-            // ensure_indices/optimize (iss-848); a 0-row table is never trainable
-            // anyway. The @index intent is recorded in the persisted catalog/IR.
+            let existing = match db.storage().open_dataset_head(&dataset_uri, None).await {
+                Ok(existing) => Some(existing),
+                Err(error)
+                    if error.storage_failure().is_some_and(|failure| {
+                        failure.kind == crate::error::StorageFailureKind::NotFound
+                    }) =>
+                {
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            let (ds, detached_transaction) = if let Some(existing) = existing {
+                if db
+                    .storage()
+                    .validate_initial_empty_table(&existing, &schema)
+                    .await?
+                {
+                    (existing, None)
+                } else {
+                    let staged = db
+                        .storage()
+                        .stage_overwrite(&existing, RecordBatch::new_empty(schema))
+                        .await?;
+                    let witness = crate::table_store::StagingWitness::new(
+                        &base_branch_identifier,
+                        base_graph_head.as_deref(),
+                    )?;
+                    let (detached, transaction) = db
+                        .storage()
+                        .commit_staged_detached(existing, staged, &witness)
+                        .await?;
+                    (detached, Some(transaction))
+                }
+            } else {
+                let staged = db
+                    .storage()
+                    .stage_create(&dataset_uri, RecordBatch::new_empty(schema))
+                    .await?;
+                let outcome = db
+                    .storage()
+                    .commit_staged_create_exact(&dataset_uri, staged)
+                    .await?;
+                if !outcome.is_exact() {
+                    return Err(OmniError::manifest_internal(format!(
+                        "SchemaApply first-touch '{}' committed outside its version-one create",
+                        table_key
+                    )));
+                }
+                (outcome.into_snapshot(), None)
+            };
             let state = db.storage().table_state(&dataset_uri, &ds).await?;
+            let (published_dataset_version, version_metadata) =
+                if let Some(transaction) = detached_transaction {
+                    (
+                        2,
+                        state
+                            .version_metadata
+                            .with_staged(state.version, transaction.uuid)
+                            .with_last_linear_version(Some(1)),
+                    )
+                } else {
+                    (1, state.version_metadata.with_last_linear_version(Some(1)))
+                };
             expected_table_versions.insert(identity, 0);
             table_registrations.insert(table_key.clone(), (identity, table_path));
-            let version_metadata = state
-                .version_metadata
-                .with_last_linear_version(Some(state.version));
             table_updates.insert(
                 identity,
                 crate::db::DatasetUpdate {
                     identity,
                     type_key: table_key.clone(),
-                    published_dataset_version: state.version,
+                    published_dataset_version,
                     native_dataset_branch: None,
                     entity_count: state.row_count,
                     version_metadata,
@@ -966,33 +932,10 @@ where
             }));
         }
 
-        // Stage the schema contract bound to this apply's graph commit. The
-        // state file is written last, so a complete staging is exactly one
-        // whose state file exists; the install pass reads the marker from it.
-        fail(&SCHEMA_APPLY_BEFORE_STAGING_WRITE)?;
-        let (_, ir_json, state_json) = crate::db::schema_state::render_schema_contract(
+        manifest_changes.push(ManifestChange::SchemaContract(render_schema_contract(
             &desired_ir,
-            Some(publication.clone()),
-        )?;
-        db.storage
-            .write_text(
-                &schema_source_staging_uri(&db.root_uri),
-                desired_schema_source,
-            )
-            .await?;
-        db.storage
-            .write_text(
-                &crate::db::schema_state::schema_ir_staging_uri(&db.root_uri),
-                &ir_json,
-            )
-            .await?;
-        db.storage
-            .write_text(
-                &crate::db::schema_state::schema_state_staging_uri(&db.root_uri),
-                &state_json,
-            )
-            .await?;
-        fail(&SCHEMA_APPLY_AFTER_STAGING_WRITE)?;
+            desired_schema_source,
+        )?));
 
         let precondition = crate::db::manifest::PublishPrecondition::ExactGraphHead(
             crate::db::manifest::GraphHeadExpectation::new(
@@ -1015,38 +958,18 @@ where
                 &precondition,
             )
             .await?;
-        published_commit = Some(publication.graph_commit_id.clone());
-
-        fail(&SCHEMA_APPLY_AFTER_MANIFEST_COMMIT)?;
-        // Install the contract from memory rather than by renaming the
-        // staging (another process's open may have discarded it), then retire
-        // the staging. Every write is idempotent; a crash here leaves the
-        // staged copy for the next open to install the same way.
-        db.storage
-            .write_text(&schema_source_uri(&db.root_uri), desired_schema_source)
-            .await?;
-        write_schema_contract(
-            &db.root_uri,
-            db.storage.as_ref(),
-            &SchemaContractText {
-                source: desired_schema_source.to_string(),
-                ir_json,
-                state_json,
-            },
-        )
-        .await?;
-        crate::db::schema_state::cleanup_staging_files(&db.root_uri, db.storage.as_ref()).await?;
+        published_commit = Some(graph_commit_id);
 
         db.store_schema_view(
             desired_catalog,
             desired_schema_source.to_string(),
             &desired_ir,
         )?;
-        db.coordinator.write().await.refresh().await?;
         db.runtime_cache.invalidate_all().await;
         if changed_edge_tables {
             db.invalidate_graph_index().await;
         }
+        fail(&SCHEMA_APPLY_AFTER_MANIFEST_COMMIT)?;
         Ok::<u64, OmniError>(graph_manifest_version)
     }
     .await;
@@ -1054,16 +977,8 @@ where
     let manifest_version = match effects {
         Ok(manifest_version) => manifest_version,
         Err(error) => {
-            // Before publication nothing referenced is durable: detached
-            // versions, a created dataset and the staged contract are garbage
-            // that the next open and cleanup retire. After publication the
-            // manifest is authoritative and only the contract installation
-            // is pending, which the next read-write open or this handle's next
-            // write entry completes from the staged copy.
             return Err(match published_commit {
                 Some(graph_commit_id) => {
-                    db.pending_schema_install
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
                     OmniError::recovery_required(graph_commit_id, error.to_string())
                 }
                 None => error,
@@ -1135,95 +1050,6 @@ async fn cleanup_dataset_old_versions(db: &Omnigraph, full_uri: &str) -> Result<
         .await
         .map_err(OmniError::storage)?;
     let _ = db;
-    Ok(())
-}
-
-pub(super) async fn ensure_schema_apply_idle(db: &Omnigraph, operation: &str) -> Result<()> {
-    db.refresh_coordinator_only().await?;
-    ensure_schema_apply_not_locked(db, operation).await
-}
-
-pub(super) async fn acquire_schema_apply_lock(db: &Omnigraph) -> Result<()> {
-    db.ensure_schema_state_valid().await?;
-    db.refresh_coordinator_only().await?;
-    let branches = db.coordinator.read().await.all_branches().await?;
-    if branches
-        .iter()
-        .any(|branch| is_schema_apply_lock_branch(branch))
-    {
-        return Err(OmniError::manifest_conflict(
-            "schema apply is already in progress".to_string(),
-        ));
-    }
-
-    db.coordinator
-        .write()
-        .await
-        .branch_create(SCHEMA_APPLY_LOCK_BRANCH)
-        .await?;
-    db.refresh_coordinator_only().await?;
-
-    let blocking_branches = db
-        .coordinator
-        .read()
-        .await
-        .all_branches()
-        .await?
-        .into_iter()
-        .filter(|branch| branch != "main" && !is_internal_system_branch(branch))
-        .collect::<Vec<_>>();
-    if !blocking_branches.is_empty() {
-        // Best-effort release of the sentinel we just took; a failure arms the
-        // handle-local retry (liveness contract), so the next write entry on
-        // this handle releases it before the sentinel gate instead of staying
-        // wedged until a read-write open.
-        if let Err(release_error) = release_schema_apply_lock(db).await {
-            db.note_failed_sentinel_release();
-            tracing::warn!(
-                error = %release_error,
-                "failed to release the schema-apply sentinel after a mono-branch refusal; \
-                 the next write entry on this handle retries the release"
-            );
-        }
-        return Err(OmniError::manifest_conflict(format!(
-            "schema apply requires a graph with only main; found non-main branches: {}",
-            blocking_branches.join(", ")
-        )));
-    }
-
-    Ok(())
-}
-
-pub(super) async fn release_schema_apply_lock(db: &Omnigraph) -> Result<()> {
-    // Idempotent: an open or a `refresh` that installed this apply's
-    // published staging may already have reclaimed the sentinel (RFC 0067).
-    let mut coordinator = db.coordinator.write().await;
-    if coordinator
-        .all_branches()
-        .await?
-        .iter()
-        .any(|branch| is_schema_apply_lock_branch(branch))
-    {
-        coordinator.branch_delete(SCHEMA_APPLY_LOCK_BRANCH).await?;
-    }
-    drop(coordinator);
-    db.refresh_coordinator_only().await
-}
-
-/// Whether a schema apply's durable sentinel stands on this graph: the
-/// cross-handle and cross-process signal that a contract-lifecycle pass is
-/// in flight.
-pub(super) async fn schema_apply_sentinel_present(db: &Omnigraph) -> Result<bool> {
-    db.coordinator.read().await.schema_apply_locked().await
-}
-
-pub(super) async fn ensure_schema_apply_not_locked(db: &Omnigraph, operation: &str) -> Result<()> {
-    if schema_apply_sentinel_present(db).await? {
-        return Err(OmniError::manifest_conflict(format!(
-            "{} is unavailable while schema apply is in progress",
-            operation
-        )));
-    }
     Ok(())
 }
 

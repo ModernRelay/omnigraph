@@ -290,11 +290,5 @@ pub fn classify(uri: &str) -> &'static str {
     if uri.contains("_refs/") || uri.contains("_branches/") {
         return "branch-ref";
     }
-    // Exact shapes only: a broad substring here would silently swallow
-    // the UNKNOWN red for a future artifact whose name merely contains
-    // the word (under-matching is safe, over-matching defeats the map).
-    if uri.contains("_schema.pg") || uri.contains("_schema.ir") || uri.contains("__schema_state") {
-        return "schema-artifact";
-    }
     "UNKNOWN"
 }

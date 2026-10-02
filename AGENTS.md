@@ -104,8 +104,8 @@ working memory:
    fresh rather than mixing old and new authority.
 3. A mutation, load, schema apply, merge, or maintenance batch publishes once.
 4. Pre-publication durable effects stay unreachable (detached commits, staged
-   files); what is published carries the identity that finishes it (pins,
-   the staged contract's publishing commit); ambiguity fails closed.
+   files). Table pins and the accepted schema contract are complete in one
+   manifest publication; ambiguity fails closed.
 5. Stable schema identity survives supported renames, not drop/re-add. Never
    infer identity from names, paths, versions, field IDs, or branch refs.
 6. Indexes, caches, topology, fragment layout, and compaction are derived
@@ -142,6 +142,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- \
   -D warnings -W clippy::dbg_macro
 
+# Activate the documentation environment first; see docs/dev/documentation.md.
 bash scripts/check-agents-md.sh
 python3 scripts/check-docs.py
 python3 scripts/check-workflow-action-pins.py
@@ -202,8 +203,9 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   schema construct, behavior, or limit.
 - Update current developer guides when architecture or support boundaries
   change. Put rationale/history in one RFC, not a copied design note.
-- Add release notes for user-visible release changes; keep private tickets and
-  planning shorthand out of public history.
+- Add a permanent `changelog.d/<slug>.<category>.md` note for user-visible changes;
+  follow [release-note authoring](docs/dev/documentation.md#release-notes).
+  Keep private tickets and planning shorthand out of public history.
 - Recheck exact flags, environment variables, routes, and constants in source
   before documenting them.
 - Keep this file a map. New deep content goes in its audience-owned guide.

@@ -11,7 +11,7 @@ use lance_index::is_system_index;
 
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
-use omnigraph::error::{ManifestErrorKind, MergeConflictKind, OmniError};
+use omnigraph::error::{CompletionEvidence, ManifestErrorKind, MergeConflictKind, OmniError};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
 use omnigraph::{
@@ -442,7 +442,7 @@ async fn branch_merge_updates_main_traversal() {
     assert_eq!(main_before.num_rows(), 2);
 
     let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
 
     let merged = query_main(
         &main,
@@ -603,7 +603,7 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(outcome.outcome, MergeOutcome::Merged);
     assert_eq!(
         probes.table_walk_interval_count(),
         1,
@@ -1269,7 +1269,7 @@ async fn branch_merge_with_external_blob_uri_materializes_payload_body() {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(outcome.outcome, MergeOutcome::Merged);
     assert_eq!(
         probes.external_blob_probe_inputs(),
         2,
@@ -1401,7 +1401,7 @@ async fn branch_merge_pointer_only_external_blob_needs_no_source_io_body() {
 
     let deny = helpers::session(Omnigraph::open(uri).await.unwrap());
     let outcome = deny.branch_merge("main", "pointer-target").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     let target_entry = snapshot_branch(&deny, "pointer-target")
         .await
         .unwrap()
@@ -1533,7 +1533,7 @@ async fn branch_merge_onto_main_switches_oversized_external_blob_pointers_body()
         let outcome = with_merge_write_probes(probes.clone(), db.branch_merge("feature", "main"))
             .await
             .unwrap();
-        assert_eq!(outcome, MergeOutcome::FastForward, "{case}");
+        assert_eq!(outcome.outcome, MergeOutcome::FastForward, "{case}");
         assert_pointer_switch_onto_main(&db, &probes, before_tables, case).await;
         assert_eq!(count_rows(&db, "node:Document").await, 2);
         assert_eq!(
@@ -1664,7 +1664,7 @@ async fn branch_merge_onto_main_switches_managed_blob_pointers_body() {
     let outcome = with_merge_write_probes(probes.clone(), db.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     assert_pointer_switch_onto_main(&db, &probes, before_tables, "managed").await;
     assert_eq!(count_rows(&db, "node:Document").await, 3);
     for index in 0..2 {
@@ -1777,7 +1777,7 @@ async fn branch_merge_onto_main_switches_external_blob_reference_cells_body() {
     let outcome = with_merge_write_probes(merge_probes.clone(), db.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     assert_pointer_switch_onto_main(&db, &merge_probes, before_tables, "reference cells").await;
     assert_eq!(count_rows(&db, "node:Document").await, REFERENCE_LIMIT / 2);
     assert_eq!(count_rows(&db, "node:Asset").await, REFERENCE_LIMIT / 2 + 1);
@@ -1834,7 +1834,7 @@ async fn branch_merge_applies_node_insert_to_main() {
     .unwrap();
 
     let outcome = feature.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
 
     let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
     let qr = query_main(
@@ -1898,7 +1898,7 @@ fn assert_native_version_case(
             .await
             .unwrap();
             assert_eq!(
-                main.branch_merge("main", "feature").await.unwrap(),
+                main.branch_merge("main", "feature").await.unwrap().outcome,
                 MergeOutcome::Merged
             );
             main.mutate(
@@ -1915,7 +1915,7 @@ fn assert_native_version_case(
             ("feature", "child")
         } else {
             assert_eq!(
-                main.branch_merge("feature", "main").await.unwrap(),
+                main.branch_merge("feature", "main").await.unwrap().outcome,
                 MergeOutcome::FastForward
             );
             main.mutate(
@@ -1950,7 +1950,7 @@ fn assert_native_version_case(
         assert_eq!(source_entry.native_dataset_branch, None);
         assert_eq!(target_entry.native_dataset_branch, None);
         assert_eq!(
-            main.branch_merge(source, target).await.unwrap(),
+            main.branch_merge(source, target).await.unwrap().outcome,
             MergeOutcome::FastForward
         );
         assert_eq!(
@@ -2010,7 +2010,7 @@ fn assert_native_version_case(
         .await
         .unwrap();
         assert_eq!(
-            main.branch_merge(target, "main").await.unwrap(),
+            main.branch_merge(target, "main").await.unwrap().outcome,
             MergeOutcome::FastForward
         );
         let result = main
@@ -2050,7 +2050,7 @@ fn assert_native_version_case(
                 .version()
                 .version;
         assert_eq!(
-            main.branch_merge("main", target).await.unwrap(),
+            main.branch_merge("main", target).await.unwrap().outcome,
             MergeOutcome::FastForward
         );
         let reopened = Omnigraph::open(uri).await.unwrap();
@@ -2170,7 +2170,7 @@ async fn branch_write_after_adoption_keeps_borrowers_and_stages_fresh_pins() {
     let borrowed_pin = pinned_version(&db, "child", "node:Company").await;
     assert!(is_detached_version(borrowed_pin), "{borrowed_pin}");
     assert_eq!(
-        db.branch_merge("feature", "main").await.unwrap(),
+        db.branch_merge("feature", "main").await.unwrap().outcome,
         MergeOutcome::FastForward
     );
     db.load_as(
@@ -2183,7 +2183,7 @@ async fn branch_write_after_adoption_keeps_borrowers_and_stages_fresh_pins() {
     .await
     .unwrap();
     assert_eq!(
-        db.branch_merge("main", "feature").await.unwrap(),
+        db.branch_merge("main", "feature").await.unwrap().outcome,
         MergeOutcome::FastForward
     );
     let owner_before = snapshot_branch(&db, "feature").await.unwrap();
@@ -2241,7 +2241,10 @@ async fn branch_write_after_adoption_keeps_borrowers_and_stages_fresh_pins() {
     let replacement_entry = replacement.dataset("node:Company").unwrap();
     let replacement_pin = pinned_version(&db, "replacement", "node:Company").await;
     assert_eq!(
-        db.branch_merge("replacement", "feature").await.unwrap(),
+        db.branch_merge("replacement", "feature")
+            .await
+            .unwrap()
+            .outcome,
         MergeOutcome::FastForward
     );
     assert_eq!(
@@ -2369,10 +2372,11 @@ async fn branch_merge_records_single_latest_commit_with_two_parents() {
         .unwrap();
 
     let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
 
     let commit_graph = CommitGraph::open(uri).await.unwrap();
     let head = commit_graph.head_commit().await.unwrap().unwrap();
+    assert_eq!(outcome.commit.as_ref(), Some(&head));
     let commits = commit_graph.load_commits().await.unwrap();
     let latest_manifest_version = commits
         .iter()
@@ -2601,7 +2605,7 @@ async fn branch_merge_records_actor_on_latest_commit() {
         .branch_merge_as("feature", "main", Some("act-ragnor"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
 
     let head = CommitGraph::open(uri)
         .await
@@ -2611,6 +2615,27 @@ async fn branch_merge_records_actor_on_latest_commit() {
         .unwrap()
         .unwrap();
     assert_eq!(head.actor_id.as_deref(), Some("act-ragnor"));
+    assert_eq!(outcome.commit.as_ref(), Some(&head));
+
+    // A different handle can publish before the caller consumes the receipt.
+    // The merge's returned identity must remain the exact earlier publication.
+    let later_writer = helpers::session(Omnigraph::open(uri).await.unwrap());
+    mutate_main(
+        &later_writer,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Later")], &[("$age", 23)]),
+    )
+    .await
+    .unwrap();
+    let commits = CommitGraph::open(uri).await.unwrap();
+    let later_head = commits.head_commit().await.unwrap().unwrap();
+    assert_ne!(later_head.graph_commit_id, head.graph_commit_id);
+    assert_eq!(
+        later_head.parent_commit_id.as_deref(),
+        Some(head.graph_commit_id.as_str())
+    );
+    assert_eq!(outcome.commit, commits.get_commit(&head.graph_commit_id));
 }
 
 #[tokio::test]
@@ -2640,7 +2665,8 @@ async fn already_up_to_date_branch_merge_returns_without_new_commit() {
     );
 
     let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::AlreadyUpToDate);
+    assert_eq!(outcome.outcome, MergeOutcome::AlreadyUpToDate);
+    assert_eq!(outcome.commit, None);
 
     let commit_graph = CommitGraph::open(uri).await.unwrap();
     let head = commit_graph.head_commit().await.unwrap().unwrap();
@@ -2681,8 +2707,40 @@ async fn branch_merge_returns_merged_for_non_fast_forward_auto_merge() {
     .await
     .unwrap();
 
+    let target_before = CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .unwrap();
+    let source_before = CommitGraph::open_at_branch(uri, "feature")
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .unwrap();
     let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(outcome.outcome, MergeOutcome::Merged);
+    let commit = outcome.commit.expect("three-way merge publishes a commit");
+    let target_after = CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(commit, target_after);
+    assert_eq!(commit.graph_branch, None);
+    assert_eq!(
+        commit.parent_commit_id.as_deref(),
+        Some(target_before.graph_commit_id.as_str())
+    );
+    assert_eq!(
+        commit.merged_parent_commit_id.as_deref(),
+        Some(source_before.graph_commit_id.as_str())
+    );
 
     let bob = query_main(
         &main,
@@ -2751,7 +2809,7 @@ async fn branch_merge_detects_nested_list_value_change() {
     .unwrap();
 
     let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(outcome.outcome, MergeOutcome::Merged);
 
     // `["a","b"]` contains the element "b"; `["a, b"]` does not. So `x` is
     // returned only if feature's change survived the merge.
@@ -2806,7 +2864,7 @@ async fn branch_merge_allows_identical_updates_on_both_sides() {
     .unwrap();
 
     let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(outcome.outcome, MergeOutcome::Merged);
 
     let alice = query_main(
         &main,
@@ -2855,7 +2913,7 @@ async fn merged_rewritten_indexed_table_is_searchable_immediately() {
     .unwrap();
 
     let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(outcome.outcome, MergeOutcome::Merged);
 
     let result = query_main(
         &main,
@@ -3217,7 +3275,18 @@ async fn branch_merge_into_non_main_target_works() {
     let source_before = snapshot_branch(&feature, "feature").await.unwrap();
     let source_entry = source_before.dataset("node:Person").unwrap();
     let outcome = main.branch_merge("feature", "experiment").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
+    let commit = outcome.commit.expect("non-main merge publishes a commit");
+    assert_eq!(commit.graph_branch.as_deref(), Some("experiment"));
+    assert_eq!(
+        Some(commit),
+        CommitGraph::open_at_branch(uri, "experiment")
+            .await
+            .unwrap()
+            .head_commit()
+            .await
+            .unwrap()
+    );
     assert_eq!(
         main.list_commits(None)
             .await
@@ -3895,6 +3964,11 @@ async fn branch_delete_retires_native_parent_and_cleanup_preserves_live_child() 
     let refused = main.branch_delete("feature").await.expect_err(
         "native graph tags retain the deletion fence until graph-wide tagged table pins exist",
     );
+    assert_eq!(
+        refused.completion_evidence(),
+        Some(CompletionEvidence::BeforeEffect),
+        "a native-tag refusal precedes retirement publication: {refused}"
+    );
     assert!(
         refused.to_string().contains("native manifest tag"),
         "{refused}"
@@ -4106,7 +4180,7 @@ async fn merged_table_preserves_row_version_for_unchanged_rows() {
     .unwrap();
 
     let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(outcome.outcome, MergeOutcome::Merged);
 
     // After merge: scan node:Person with _row_created_at_version
     let snap = snapshot_main(&main).await.unwrap();
@@ -4211,7 +4285,7 @@ async fn merge_delta_only_bumps_changed_rows() {
     .unwrap();
 
     let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(outcome.outcome, MergeOutcome::Merged);
 
     // Scan all persons with _row_last_updated_at_version
     let snap = snapshot_main(&main).await.unwrap();

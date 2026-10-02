@@ -2,6 +2,6 @@
 
 pub(crate) use omnigraph_core::error::*;
 pub use omnigraph_core::error::{
-    ManifestConflictDetails, ManifestError, ManifestErrorKind, MergeConflict, MergeConflictKind,
-    OmniError, Result, StorageFailure, StorageFailureKind,
+    CompletionEvidence, ManifestConflictDetails, ManifestError, ManifestErrorKind, MergeConflict,
+    MergeConflictKind, OmniError, Result, StorageFailure, StorageFailureKind,
 };

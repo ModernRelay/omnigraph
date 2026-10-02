@@ -2,10 +2,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::catalog::Catalog;
 use crate::catalog::schema_ir::{SYSTEM_COLUMNS_META, SystemColumns};
-use crate::error::Result;
+use crate::error::{CompilerError, Result};
 use crate::query::ast::*;
 use crate::query::typecheck::{BoundVariable, TypeContext};
-use crate::types::{Direction, PropType, ScalarType};
+use crate::traversal::{EDGE_TYPE_COLUMN, EDGE_TYPE_META, common_edge_property};
+use crate::types::{PropType, ScalarType};
 
 use super::*;
 
@@ -44,13 +45,8 @@ struct LowerCtx<'a> {
 
 /// The binding a variable names.
 enum Bindings<'a> {
-    /// A read: the clause list's own bindings and traversal endpoints first
-    /// (a negation's inner clauses are typechecked into a discarded context
-    /// clone, so the outer `TypeContext` never sees them), then the query's.
-    Read {
-        local: &'a HashMap<&'a str, BoundVariable>,
-        type_ctx: &'a TypeContext,
-    },
+    /// Bindings visible in this lexical read scope.
+    Read(&'a HashMap<String, BoundVariable>),
     /// A mutation: the target type, whose bare name stands where a read has
     /// a binding variable (`Expr::mutation_property`).
     Mutation(BoundVariable),
@@ -63,13 +59,13 @@ impl LowerCtx<'_> {
 
     fn binding(&self, variable: &str) -> Option<&BoundVariable> {
         match &self.bindings {
-            Bindings::Read { local, type_ctx } => local
-                .get(variable)
-                .or_else(|| type_ctx.bindings.get(variable)),
+            Bindings::Read(bindings) => bindings.get(variable),
             Bindings::Mutation(target) => match target {
-                BoundVariable::Node { type_name } | BoundVariable::Edge { type_name } => {
-                    (variable == type_name).then_some(target)
-                }
+                BoundVariable::Node { type_name } => (variable == type_name).then_some(target),
+                BoundVariable::Edge { type_names } => type_names
+                    .iter()
+                    .any(|name| variable == name)
+                    .then_some(target),
             },
         }
     }
@@ -102,8 +98,13 @@ impl LowerCtx<'_> {
             IRExpr::Param(name) => self.param_types.get(name).is_some_and(scalar_string),
             IRExpr::PropAccess { variable, property } => {
                 let system_columns = self.system_columns();
-                if [system_columns.id, system_columns.src, system_columns.dst]
-                    .contains(&property.as_str())
+                if [
+                    system_columns.id,
+                    system_columns.src,
+                    system_columns.dst,
+                    EDGE_TYPE_COLUMN,
+                ]
+                .contains(&property.as_str())
                 {
                     return true;
                 }
@@ -113,10 +114,11 @@ impl LowerCtx<'_> {
                         .node_types
                         .get(type_name)
                         .and_then(|node_type| node_type.properties.get(property)),
-                    Some(BoundVariable::Edge { type_name }) => self
-                        .catalog
-                        .lookup_edge_by_name(type_name)
-                        .and_then(|edge_type| edge_type.properties.get(property)),
+                    Some(BoundVariable::Edge { type_names }) => {
+                        return common_edge_property(self.catalog, type_names, property)
+                            .as_ref()
+                            .is_some_and(scalar_string);
+                    }
                     None => None,
                 };
                 declared.is_some_and(scalar_string)
@@ -162,20 +164,17 @@ pub fn lower_query(
         type_ctx,
         &mut pipeline,
         &mut bound_vars,
+        &HashSet::new(),
         &param_names,
         &param_types,
         &mut fresh,
     )?;
 
-    let no_local_bindings = HashMap::new();
     let ctx = LowerCtx {
         catalog,
         param_names: &param_names,
         param_types: &param_types,
-        bindings: Bindings::Read {
-            local: &no_local_bindings,
-            type_ctx,
-        },
+        bindings: Bindings::Read(&type_ctx.bindings),
     };
     let return_exprs: Vec<IRProjection> = query
         .return_clause
@@ -275,7 +274,7 @@ fn lower_single_mutation(
         }
     } else {
         BoundVariable::Edge {
-            type_name: type_name.clone(),
+            type_names: vec![type_name.clone()],
         }
     };
     let ctx = LowerCtx {
@@ -316,63 +315,39 @@ fn lower_clauses(
     type_ctx: &TypeContext,
     pipeline: &mut Vec<IROp>,
     bound_vars: &mut HashSet<String>,
+    outer_physical_names: &HashSet<String>,
     param_names: &HashSet<String>,
     param_types: &HashMap<String, PropType>,
     fresh: &mut FreshNames,
 ) -> Result<()> {
-    // Separate clause types for ordering: bindings first, then traversals, then filters
     let mut bindings = Vec::new();
-    let mut traversals = Vec::new();
+    let traversals = &type_ctx.traversals;
     let mut filters = Vec::new();
-    let mut subqueries: Vec<&Subquery> = Vec::new();
+    let mut subqueries = Vec::new();
+    let mut checked_subqueries = type_ctx.subqueries.iter();
 
     for clause in clauses {
         match clause {
-            Clause::Binding(b) => bindings.push(b),
-            Clause::Traversal(t) => traversals.push(t),
-            Clause::Filter(f) => filters.push(f),
-            Clause::Subquery(subquery) => subqueries.push(subquery),
+            Clause::Binding(binding) => bindings.push(binding),
+            Clause::Traversal(_) => {}
+            Clause::Filter(filter) => filters.push(filter),
+            Clause::Subquery(subquery) => subqueries.push((
+                subquery,
+                checked_subqueries
+                    .next()
+                    .expect("invariant: each subquery has a checked scope"),
+            )),
         }
     }
-
-    let mut local_bindings: HashMap<&str, BoundVariable> = HashMap::new();
-    for t in &traversals {
-        if let Some(edge) = catalog.lookup_edge_by_name(&t.edge_name) {
-            local_bindings
-                .entry(t.src.as_str())
-                .or_insert_with(|| BoundVariable::Node {
-                    type_name: edge.from_type.clone(),
-                });
-            local_bindings
-                .entry(t.dst.as_str())
-                .or_insert_with(|| BoundVariable::Node {
-                    type_name: edge.to_type.clone(),
-                });
-            if let Some(eb) = &t.edge_binding {
-                local_bindings
-                    .entry(eb.as_str())
-                    .or_insert_with(|| BoundVariable::Edge {
-                        type_name: edge.name.clone(),
-                    });
-            }
-        }
-    }
-    for b in &bindings {
-        local_bindings.insert(
-            b.variable.as_str(),
-            BoundVariable::Node {
-                type_name: b.type_name.clone(),
-            },
-        );
-    }
+    assert!(
+        checked_subqueries.next().is_none(),
+        "invariant: checked scopes match the query blocks"
+    );
     let ctx = LowerCtx {
         catalog,
         param_names,
         param_types,
-        bindings: Bindings::Read {
-            local: &local_bindings,
-            type_ctx,
-        },
+        bindings: Bindings::Read(&type_ctx.bindings),
     };
 
     // ── Determine which bindings are "deferred" ─────────────────────────
@@ -395,7 +370,7 @@ fn lower_clauses(
     // Exclude the anonymous wildcard "_" so it cannot falsely bridge
     // otherwise-independent components.
     let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
-    for t in &traversals {
+    for t in traversals {
         let src = t.src.as_str();
         let dst = t.dst.as_str();
         if src != "_" && dst != "_" {
@@ -508,52 +483,16 @@ fn lower_clauses(
     // bound until a prior traversal introduces it.  Each pass processes
     // every traversal that has at least one bound endpoint; this repeats
     // until all traversals are consumed.
-    let mut remaining: Vec<&Traversal> = traversals.to_vec();
+    let mut remaining: Vec<_> = traversals.iter().collect();
     while !remaining.is_empty() {
         let mut next_remaining = Vec::new();
         for traversal in &remaining {
-            let src_bound = bound_vars.contains(&traversal.src);
-            let dst_bound = bound_vars.contains(&traversal.dst);
+            let src_bound = traversal.src != "_" && bound_vars.contains(&traversal.src);
+            let dst_bound = traversal.dst != "_" && bound_vars.contains(&traversal.dst);
             if !src_bound && !dst_bound {
                 next_remaining.push(*traversal);
                 continue;
             }
-
-            let edge = catalog
-                .lookup_edge_by_name(&traversal.edge_name)
-                .ok_or_else(|| {
-                    crate::error::CompilerError::Plan(format!(
-                        "lowering traversal referenced missing edge '{}' after typecheck",
-                        traversal.edge_name
-                    ))
-                })?;
-
-            // Undirected is carried on the AST node itself — negation inners
-            // are typechecked into a discarded context clone, so the
-            // ResolvedTraversal lookup below cannot see their direction; the
-            // syntax is the source of truth for Both.
-            let direction = if traversal.undirected {
-                Direction::Both
-            } else {
-                type_ctx
-                    .traversals
-                    .iter()
-                    .find(|rt| {
-                        rt.src == traversal.src
-                            && rt.dst == traversal.dst
-                            && rt.edge_type == edge.name
-                    })
-                    .map(|rt| rt.direction)
-                    .unwrap_or(Direction::Out)
-            };
-
-            let dst_type = match direction {
-                Direction::Out => edge.to_type.clone(),
-                Direction::In => edge.from_type.clone(),
-                // Undirected requires from_type == to_type (typecheck rule),
-                // so either endpoint type is correct.
-                Direction::Both => edge.to_type.clone(),
-            };
 
             if src_bound && dst_bound {
                 // Cycle closing: expand to a temp var, then filter temp.id = dst.id
@@ -562,9 +501,9 @@ fn lower_clauses(
                 pipeline.push(IROp::Expand {
                     src_var: traversal.src.clone(),
                     dst_var: temp_var.clone(),
-                    edge_type: edge.name.clone(),
-                    direction,
-                    dst_type,
+                    edges: traversal.edges.clone(),
+                    src_type: traversal.src_type.clone(),
+                    dst_type: traversal.dst_type.clone(),
                     min_hops: traversal.min_hops,
                     max_hops: traversal.max_hops,
                     dst_filters: vec![],
@@ -587,17 +526,6 @@ fn lower_clauses(
                 )));
             } else if !src_bound && dst_bound {
                 // Reverse expand: dst is bound, src is not.
-                let reverse_dir = match direction {
-                    Direction::Out => Direction::In,
-                    Direction::In => Direction::Out,
-                    // Symmetric: reversing an undirected expand is a no-op.
-                    Direction::Both => Direction::Both,
-                };
-                let src_type = match direction {
-                    Direction::Out => edge.from_type.clone(),
-                    Direction::In => edge.to_type.clone(),
-                    Direction::Both => edge.from_type.clone(),
-                };
                 let introduced_filters =
                     deferred_filters.remove(&traversal.src).unwrap_or_default();
                 let dst_var = if traversal.src == "_" {
@@ -608,9 +536,9 @@ fn lower_clauses(
                 pipeline.push(IROp::Expand {
                     src_var: traversal.dst.clone(),
                     dst_var,
-                    edge_type: edge.name.clone(),
-                    direction: reverse_dir,
-                    dst_type: src_type,
+                    edges: traversal.edges.reversed(),
+                    src_type: traversal.dst_type.clone(),
+                    dst_type: traversal.src_type.clone(),
                     min_hops: traversal.min_hops,
                     max_hops: traversal.max_hops,
                     dst_filters: introduced_filters,
@@ -636,9 +564,9 @@ fn lower_clauses(
                 pipeline.push(IROp::Expand {
                     src_var: traversal.src.clone(),
                     dst_var,
-                    edge_type: edge.name.clone(),
-                    direction,
-                    dst_type,
+                    edges: traversal.edges.clone(),
+                    src_type: traversal.src_type.clone(),
+                    dst_type: traversal.dst_type.clone(),
                     min_hops: traversal.min_hops,
                     max_hops: traversal.max_hops,
                     dst_filters: introduced_filters,
@@ -654,7 +582,9 @@ fn lower_clauses(
             }
         }
         if next_remaining.len() == remaining.len() {
-            break;
+            return Err(CompilerError::Plan(
+                "typechecked traversal has no executable endpoint binding".to_string(),
+            ));
         }
         remaining = next_remaining;
     }
@@ -672,28 +602,97 @@ fn lower_clauses(
         )));
     }
 
-    for subquery in subqueries {
-        let block_clauses = subquery.clauses.as_slice();
-        let predicate = SubqueryPredicate {
-            func: subquery.func,
-            arg: subquery_argument(subquery, &ctx),
-            op: subquery.op,
-            right: lower_expr(&subquery.right, &ctx),
-        };
-        let outer_var = find_outer_var(block_clauses, bound_vars);
+    if subqueries.is_empty() {
+        return Ok(());
+    }
+    let mut physical_names = outer_physical_names.clone();
+    for op in pipeline.iter() {
+        match op {
+            IROp::NodeScan {
+                variable,
+                type_name: _,
+                filters: _,
+            } => {
+                physical_names.insert(variable.clone());
+            }
+            IROp::Expand {
+                src_var: _,
+                dst_var,
+                edges: _,
+                src_type: _,
+                dst_type: _,
+                min_hops: _,
+                max_hops: _,
+                dst_filters: _,
+                edge_binding,
+            } => {
+                physical_names.insert(dst_var.clone());
+                physical_names.extend(edge_binding.iter().cloned());
+            }
+            IROp::Filter(_)
+            | IROp::AntiJoin {
+                outer_var: _,
+                inner: _,
+                predicate: _,
+            } => {}
+        }
+    }
 
+    for (subquery, checked) in subqueries {
+        let block_clauses = subquery.clauses.as_slice();
+        let visible_outer: HashSet<_> = bound_vars
+            .iter()
+            .filter(|name| checked.outer_bindings.contains_key(*name))
+            .cloned()
+            .collect();
+        let outer_var = find_outer_var(block_clauses, &visible_outer);
+        let mut collisions: Vec<_> = checked
+            .inner
+            .bindings
+            .keys()
+            .filter(|name| {
+                !checked.outer_bindings.contains_key(*name) && physical_names.contains(*name)
+            })
+            .collect();
+        collisions.sort();
+        let renames: HashMap<_, _> = collisions
+            .into_iter()
+            .map(|name| (name.clone(), fresh.temp(name)))
+            .collect();
         let mut inner_pipeline = Vec::new();
-        let mut inner_bound = bound_vars.clone();
+        let mut inner_bound = visible_outer;
         lower_clauses(
             catalog,
             block_clauses,
-            type_ctx,
+            &checked.inner,
             &mut inner_pipeline,
             &mut inner_bound,
+            &physical_names,
             param_names,
             param_types,
             fresh,
         )?;
+
+        let inner_ctx = LowerCtx {
+            catalog,
+            param_names,
+            param_types,
+            bindings: Bindings::Read(&checked.inner.bindings),
+        };
+        let outer_ctx = LowerCtx {
+            catalog,
+            param_names,
+            param_types,
+            bindings: Bindings::Read(&checked.outer_bindings),
+        };
+        let mut argument = subquery_argument(subquery, &inner_ctx);
+        rename_inner_bindings(&mut inner_pipeline, argument.as_mut(), &renames);
+        let predicate = SubqueryPredicate {
+            func: subquery.func,
+            arg: argument,
+            op: subquery.op,
+            right: lower_expr(&subquery.right, &outer_ctx),
+        };
 
         pipeline.push(IROp::AntiJoin {
             outer_var: outer_var.unwrap_or_default(),
@@ -703,6 +702,110 @@ fn lower_clauses(
     }
 
     Ok(())
+}
+
+fn rename_inner_bindings<'a>(
+    pipeline: &'a mut [IROp],
+    argument: Option<&'a mut IRExpr>,
+    renames: &HashMap<String, String>,
+) {
+    if renames.is_empty() {
+        return;
+    }
+    let rename = |variable: &mut String| {
+        if let Some(name) = renames.get(variable) {
+            *variable = name.clone();
+        }
+    };
+    let mut expressions: Vec<&mut IRExpr> = argument.into_iter().collect();
+    let mut pending: Vec<_> = pipeline.iter_mut().collect();
+    while let Some(op) = pending.pop() {
+        match op {
+            IROp::NodeScan {
+                variable,
+                type_name: _,
+                filters,
+            } => {
+                rename(variable);
+                expressions.extend(filters);
+            }
+            IROp::Expand {
+                src_var,
+                dst_var,
+                edges: _,
+                src_type: _,
+                dst_type: _,
+                min_hops: _,
+                max_hops: _,
+                dst_filters,
+                edge_binding,
+            } => {
+                rename(src_var);
+                rename(dst_var);
+                if let Some(binding) = edge_binding {
+                    rename(binding);
+                }
+                expressions.extend(dst_filters);
+            }
+            IROp::Filter(expr) => expressions.push(expr),
+            IROp::AntiJoin {
+                outer_var,
+                inner,
+                predicate,
+            } => {
+                rename(outer_var);
+                expressions.extend(predicate.arg.as_mut());
+                expressions.push(&mut predicate.right);
+                pending.extend(inner);
+            }
+        }
+    }
+    while let Some(expr) = expressions.pop() {
+        match expr {
+            IRExpr::PropAccess {
+                variable,
+                property: _,
+            }
+            | IRExpr::Variable(variable) => rename(variable),
+            IRExpr::Nearest {
+                variable,
+                property: _,
+                query,
+            } => {
+                rename(variable);
+                expressions.push(query);
+            }
+            IRExpr::Search { field, query }
+            | IRExpr::MatchText { field, query }
+            | IRExpr::Bm25 { field, query } => expressions.extend([field.as_mut(), query.as_mut()]),
+            IRExpr::Fuzzy {
+                field,
+                query,
+                max_edits,
+            } => {
+                expressions.extend([field.as_mut(), query.as_mut()]);
+                expressions.extend(max_edits.as_deref_mut());
+            }
+            IRExpr::Rrf {
+                primary,
+                secondary,
+                k,
+            } => {
+                expressions.extend([primary.as_mut(), secondary.as_mut()]);
+                expressions.extend(k.as_deref_mut());
+            }
+            IRExpr::Aggregate { func: _, arg }
+            | IRExpr::Not(arg)
+            | IRExpr::IsNull {
+                expr: arg,
+                negated: _,
+            } => expressions.push(arg),
+            IRExpr::Binary { left, op: _, right } => {
+                expressions.extend([left.as_mut(), right.as_mut()])
+            }
+            IRExpr::Literal(_) | IRExpr::Param(_) | IRExpr::AliasRef(_) => {}
+        }
+    }
 }
 
 /// Build IR filters from a binding's inline property matches.
@@ -889,6 +992,7 @@ fn lower_projection(expr: &Expr, ctx: &LowerCtx<'_>) -> IRExpr {
 /// Bare names remain user properties.
 fn physical_property(property: &str, system_columns: SystemColumns) -> String {
     match property {
+        EDGE_TYPE_META => EDGE_TYPE_COLUMN.to_string(),
         name if name == SYSTEM_COLUMNS_META.id => system_columns.id.to_string(),
         name if name == SYSTEM_COLUMNS_META.src => system_columns.src.to_string(),
         name if name == SYSTEM_COLUMNS_META.dst => system_columns.dst.to_string(),
@@ -916,10 +1020,18 @@ fn lower_expr(expr: &Expr, ctx: &LowerCtx<'_>) -> IRExpr {
     let lower = |expr: &Expr| lower_expr(expr, ctx);
     match expr {
         Expr::Now => IRExpr::Param(NOW_PARAM_NAME.to_string()),
-        Expr::PropAccess { variable, property } => IRExpr::PropAccess {
-            variable: variable.clone(),
-            property: ctx.physical_column(variable, property),
-        },
+        Expr::PropAccess { variable, property } => {
+            if property == EDGE_TYPE_META
+                && let Some(BoundVariable::Edge { type_names }) = ctx.binding(variable)
+                && let [name] = type_names.as_slice()
+            {
+                return IRExpr::Literal(Literal::String(name.clone()));
+            }
+            IRExpr::PropAccess {
+                variable: variable.clone(),
+                property: ctx.physical_column(variable, property),
+            }
+        }
         Expr::Nearest {
             variable,
             property,

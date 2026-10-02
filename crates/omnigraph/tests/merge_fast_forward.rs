@@ -180,7 +180,7 @@ async fn append_only_fast_forward_merge_is_a_pointer_switch() {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
 
     assert_eq!(
         probes.table_walk_interval_count(),
@@ -257,7 +257,7 @@ async fn lazy_target_pointer_fast_forward_uses_pin_after_main_advances() {
     let outcome = with_merge_write_probes(probes.clone(), merger.branch_merge("source", "target"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     assert_eq!(
         probes.stage_fenced_insert_calls(),
         0,
@@ -379,7 +379,7 @@ node Person {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     assert_pointer_switch_onto_main(&main, &probes, pins).await;
     assert!(
         probes.validation_scan_batches() > 0,
@@ -442,7 +442,7 @@ node Person {
         with_merge_write_probes(first_probes.clone(), source.branch_merge("leaf", "source"))
             .await
             .unwrap();
-    assert_eq!(first, MergeOutcome::FastForward);
+    assert_eq!(first.outcome, MergeOutcome::FastForward);
     assert_eq!(first_probes.stage_fenced_insert_rows(), 0);
     assert_eq!(first_probes.stage_merge_insert_calls(), 0);
     assert_eq!(first_probes.stage_append_calls(), 0);
@@ -479,7 +479,7 @@ node Person {
         with_merge_write_probes(final_probes.clone(), main.branch_merge("source", "main"))
             .await
             .unwrap();
-    assert_eq!(final_outcome, MergeOutcome::FastForward);
+    assert_eq!(final_outcome.outcome, MergeOutcome::FastForward);
     assert_pointer_switch_onto_main(&main, &final_probes, pins).await;
     assert_eq!(
         final_probes.proven_insert_history_read_calls(),
@@ -541,7 +541,7 @@ async fn append_only_fast_forward_merge_of_a_commit_chain_is_a_pointer_switch() 
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     assert_pointer_switch_onto_main(&main, &probes, pins).await;
     assert_eq!(
         probes.proven_insert_history_read_calls(),
@@ -605,7 +605,7 @@ async fn nested_source_lineage_merges_without_false_read_set_conflict() {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("experiment", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     assert_pointer_switch_onto_main(&main, &probes, pins).await;
     assert_eq!(count_rows(&main, "node:Person").await, base_count + 2);
     let names = collect_column_strings(&read_table(&main, "node:Person").await, "name");
@@ -701,7 +701,7 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
         let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
             .await
             .unwrap();
-        assert_eq!(outcome, MergeOutcome::FastForward);
+        assert_eq!(outcome.outcome, MergeOutcome::FastForward);
         assert!(
             probes.ordered_cursor_scan_calls() >= 2,
             "missing provenance must enter the ordered base/source fallback"
@@ -765,7 +765,7 @@ async fn changed_only_adopt_onto_main_is_a_pointer_switch() {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     assert_pointer_switch_onto_main(&main, &probes, pins).await;
     assert_eq!(probes.stage_known_present_update_rows(), 0);
     assert_single_physical_publish(&probes);
@@ -864,7 +864,7 @@ async fn three_way_merge_detects_empty_string_to_null_change() {
     .unwrap();
 
     let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(outcome.outcome, MergeOutcome::Merged);
 
     assert_eq!(
         node_string_value(&main, "Doc", "x", "body").await,
@@ -913,7 +913,7 @@ async fn three_way_merge_detects_row_prefix_named_property_change() {
     .unwrap();
 
     let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(outcome.outcome, MergeOutcome::Merged);
 
     assert_eq!(
         node_string_value(&main, "Doc", "x", "row_notes").await,
@@ -1114,7 +1114,7 @@ async fn small_adopt_merge_succeeds_despite_unrelated_wide_row() {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     assert!(
         probes.ordered_cursor_scan_calls() >= 2,
         "the adopt fallback must walk base and source"
@@ -1171,7 +1171,7 @@ async fn divergent_merge_succeeds_despite_unrelated_wide_row() {
     .unwrap();
 
     let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(outcome.outcome, MergeOutcome::Merged);
     assert_eq!(
         node_string_value(&main, "Doc", "small-1", "payload").await,
         Some(Some("edited".to_string()))
@@ -1223,7 +1223,7 @@ async fn run_bounded_hydration_case(rows: String, expected_rows: usize, edited_k
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     let max_chunk = probes.ordered_cursor_hydration_max_chunk_bytes();
     assert!(
         max_chunk <= MAX_CHUNK_BYTES,
@@ -1333,7 +1333,7 @@ async fn fast_forward_merge_yields_source_state() {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     assert_pointer_switch_onto_main(&main, &probes, pins).await;
     assert_single_physical_publish(&probes);
 
@@ -1389,7 +1389,7 @@ async fn fast_forward_merge_defers_vector_index_to_reconciler() {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
 
     assert_eq!(
         probes.stage_vector_index_calls(),
@@ -1437,7 +1437,7 @@ async fn merged_outcome_defers_vector_index_to_reconciler() {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(outcome.outcome, MergeOutcome::Merged);
     assert_eq!(
         probes.table_walk_interval_count(),
         1,
@@ -1498,7 +1498,7 @@ async fn fast_forward_merge_switches_blob_table_pin() {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     assert_eq!(
         probes.table_walk_interval_count(),
         0,
@@ -1634,7 +1634,7 @@ query set_note($title: String, $note: String) {
                     .unwrap();
             }
             assert_eq!(
-                main.branch_merge("feature", "main").await.unwrap(),
+                main.branch_merge("feature", "main").await.unwrap().outcome,
                 MergeOutcome::FastForward
             );
             ("main", "feature")
@@ -1663,7 +1663,7 @@ query set_note($title: String, $note: String) {
         let outcome = with_merge_write_probes(probes.clone(), merger.branch_merge(source, target))
             .await
             .unwrap();
-        assert_eq!(outcome, MergeOutcome::FastForward);
+        assert_eq!(outcome.outcome, MergeOutcome::FastForward);
         assert_eq!(
             probes.stage_known_present_update_calls(),
             0,

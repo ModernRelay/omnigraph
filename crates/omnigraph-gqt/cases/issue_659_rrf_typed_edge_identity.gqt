@@ -1,0 +1,87 @@
+# issue: 659
+# red_on: 7f1233bb
+# notes: RRF retains concrete edge multiplicity and orders equal IDs by type before applying a row limit.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    text: String @index
+}
+edge Knows: Person -> Person
+edge Likes: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"a","text":"needle"}}
+{"type":"Person","data":{"name":"b","text":"hay"}}
+{"edge":"Likes","id":"shared","from":"a","to":"b"}
+{"edge":"Knows","id":"shared","from":"a","to":"b"}
+
+--- query
+query fused_types() {
+    match {
+        $p: Person
+        $p $e:(likes | knows) $q
+    }
+    return { $e.@type as edge_type, $e.@id as edge_id }
+    order { rrf(bm25($p.text, "needle"), bm25($p.text, "needle")) }
+    limit 2
+}
+
+--- expect unordered
+{"edge_type":"Knows","edge_id":"shared"}
+{"edge_type":"Likes","edge_id":"shared"}
+
+--- expect shape
+edge_type: String
+edge_id: String
+
+--- expect plan
+expand $p $q: selection alternation [Knows out, Likes out]
+rank fuse row tiebreak [$e.@type, $e.@id, $q.@id]
+
+--- query
+query fused_type_page() {
+    match {
+        $p: Person
+        $p $e:(likes | knows) $q
+    }
+    return { $e.@type as edge_type, $e.@id as edge_id }
+    order { rrf(bm25($p.text, "needle"), bm25($p.text, "needle")) }
+    limit 1
+}
+
+--- expect unordered
+{"edge_type":"Knows","edge_id":"shared"}
+
+--- expect shape
+edge_type: String
+edge_id: String
+
+--- query
+query fused_wildcard_type_page() {
+    match {
+        $p: Person
+        $q: Person
+        $p $e:* $q
+    }
+    return { $e.@type as edge_type, $e.@id as edge_id }
+    order { rrf(bm25($p.text, "needle"), bm25($p.text, "needle")) }
+    limit 1
+}
+
+--- expect unordered
+{"edge_type":"Knows","edge_id":"shared"}
+
+--- expect shape
+edge_type: String
+edge_id: String
+
+--- expect plan
+expand $p $q: selection wildcard [Knows out, Likes out]
+rank fuse row tiebreak [$e.@type, $e.@id, $q.@id]

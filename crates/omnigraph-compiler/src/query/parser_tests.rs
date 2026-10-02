@@ -100,7 +100,7 @@ return { $f.name }
     let q = qf.single_decl();
     match &q.match_clause[1] {
         Clause::Traversal(t) => {
-            assert_eq!(t.edge_name, "knows");
+            assert_eq!(t.selector, EdgeSelector::Named("knows".to_string()));
             assert!(t.undirected, "bare undirected form");
             assert_eq!((t.min_hops, t.max_hops), (1, Some(1)));
         }
@@ -139,7 +139,7 @@ return { $f.name, $f.age }
     match &q.match_clause[1] {
         Clause::Traversal(t) => {
             assert_eq!(t.src, "p");
-            assert_eq!(t.edge_name, "knows");
+            assert_eq!(t.selector, EdgeSelector::Named("knows".to_string()));
             assert_eq!(t.dst, "f");
             assert_eq!(t.min_hops, 1);
             assert_eq!(t.max_hops, Some(1));
@@ -170,7 +170,7 @@ return { $p.name }
             match &block.clauses[0] {
                 Clause::Traversal(t) => {
                     assert_eq!(t.src, "p");
-                    assert_eq!(t.edge_name, "worksAt");
+                    assert_eq!(t.selector, EdgeSelector::Named("worksAt".to_string()));
                     assert_eq!(t.dst, "_");
                     assert_eq!(t.min_hops, 1);
                     assert_eq!(t.max_hops, Some(1));
@@ -245,7 +245,7 @@ return { $p.name }
     match &q.match_clause[1] {
         Clause::Traversal(t) => {
             assert_eq!(t.src, "p");
-            assert_eq!(t.edge_name, "worksAt");
+            assert_eq!(t.selector, EdgeSelector::Named("worksAt".to_string()));
             assert_eq!(t.dst, "c");
             assert_eq!(t.min_hops, 1);
             assert_eq!(t.max_hops, Some(1));
@@ -665,7 +665,7 @@ fn test_parse_boolean_words_are_word_bounded_and_reserved_words_never_edge_names
         parse_query("query q() { match { $p: Person  $p andy $f } return { $p.name } }").unwrap();
     assert!(matches!(
         &qf.single_decl().match_clause[1],
-        Clause::Traversal(traversal) if traversal.edge_name == "andy"
+        Clause::Traversal(traversal) if traversal.selector == EdgeSelector::Named("andy".to_string())
     ));
     for (clause, edge, undirected, binding) in [
         (r#"$p "in" $f"#, "in", false, None),
@@ -679,7 +679,11 @@ fn test_parse_boolean_words_are_word_bounded_and_reserved_words_never_edge_names
         let Clause::Traversal(traversal) = &qf.single_decl().match_clause[1] else {
             panic!("expected a traversal: {source}");
         };
-        assert_eq!(traversal.edge_name, edge, "{source}");
+        assert_eq!(
+            traversal.selector,
+            EdgeSelector::Named(edge.to_string()),
+            "{source}"
+        );
         assert_eq!(traversal.undirected, undirected, "{source}");
         assert_eq!(traversal.edge_binding.as_deref(), binding, "{source}");
     }
@@ -1444,7 +1448,7 @@ return { $f.name }
     match &q.match_clause[1] {
         Clause::Traversal(t) => {
             assert_eq!(t.src, "p");
-            assert_eq!(t.edge_name, "knows");
+            assert_eq!(t.selector, EdgeSelector::Named("knows".to_string()));
             assert_eq!(t.dst, "f");
             assert!(!t.undirected);
             assert_eq!(t.edge_binding.as_deref(), Some("w"));
@@ -1949,6 +1953,60 @@ return { $p.set, $q.traversal as all }
     assert_eq!(file.single_decl().name, "q");
     assert_eq!(parse_branch("branch create set"), create("set", None));
     assert_eq!(parse_branch("branch create all"), create("all", None));
+}
+
+#[test]
+fn test_parse_edge_selectors_issue_659() {
+    for (spelling, selector, undirected) in [
+        (
+            "(knows | likes)",
+            EdgeSelector::Alternation(vec!["knows".into(), "likes".into()]),
+            false,
+        ),
+        (
+            "<knows | likes>",
+            EdgeSelector::Alternation(vec!["knows".into(), "likes".into()]),
+            true,
+        ),
+        ("*", EdgeSelector::Wildcard, false),
+        ("<*>", EdgeSelector::Wildcard, true),
+        (
+            "(knows | \"in\")",
+            EdgeSelector::Alternation(vec!["knows".into(), "in".into()]),
+            false,
+        ),
+    ] {
+        for bounds in ["", "{1,1}"] {
+            let source = format!(
+                "query q() {{ match {{ $a $e:{spelling}{bounds} $b }} return {{ $e.@type }} }}"
+            );
+            let parsed = parse_query(&source).unwrap();
+            let Clause::Traversal(traversal) = &parsed.single_decl().match_clause[0] else {
+                panic!("expected traversal");
+            };
+            assert_eq!(traversal.selector, selector, "{source}");
+            assert_eq!(traversal.undirected, undirected, "{source}");
+            assert_eq!((traversal.min_hops, traversal.max_hops), (1, Some(1)));
+            assert_eq!(traversal.edge_binding.as_deref(), Some("e"));
+        }
+    }
+    for selector in [
+        "(knows |)",
+        "(| knows)",
+        "(knows | \"bad name\")",
+        "(knows | *)",
+    ] {
+        let source = format!("query q() {{ match {{ $a {selector} $b }} return {{ $a }} }}");
+        assert!(parse_query(&source).is_err(), "{source}");
+    }
+    let parsed = parse_query("query q() { match { $a (knows) $b } return { $a } }").unwrap();
+    assert!(
+        parsed
+            .single_decl()
+            .match_clause
+            .iter()
+            .all(|clause| !matches!(clause, Clause::Traversal(_)))
+    );
 }
 
 #[test]

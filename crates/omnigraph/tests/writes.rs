@@ -498,43 +498,15 @@ async fn repeated_loads_do_not_accumulate_branches() {
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
 }
 
-/// After MR-770, `__run__*` is an ordinary branch name — the Run state machine
-/// and its `is_internal_run_branch` guard are gone. The surviving internal-ref
-/// guard still rejects the active `__schema_apply_lock__` branch on the public
-/// create/merge APIs.
 #[tokio::test]
-async fn public_branch_apis_reject_internal_system_refs() {
+async fn public_branch_apis_accept_former_system_names() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
-
-    // `__run__*` is no longer reserved — creating it now succeeds.
-    db.branch_create("__run__formerly_reserved")
-        .await
-        .expect("__run__ prefix is a normal branch name post-MR-770");
-
-    // The schema-apply lock branch is still rejected on public branch APIs.
-    let create_err = db.branch_create("__schema_apply_lock__").await.unwrap_err();
-    let OmniError::Manifest(err) = create_err else {
-        panic!("expected Manifest error");
-    };
-    assert!(
-        err.message.contains("internal system ref"),
-        "unexpected error: {}",
-        err.message
-    );
-
-    let merge_err = db
-        .branch_merge("__schema_apply_lock__", "main")
-        .await
-        .unwrap_err();
-    let OmniError::Manifest(err) = merge_err else {
-        panic!("expected Manifest error");
-    };
-    assert!(
-        err.message.contains("internal system refs"),
-        "unexpected error: {}",
-        err.message
-    );
+    for name in ["__run__formerly_reserved", "__schema_apply_lock__"] {
+        db.branch_create(name).await.unwrap();
+        db.branch_merge(name, "main").await.unwrap();
+        db.branch_delete(name).await.unwrap();
+    }
 }
 
 // ─── Staged-write rewire — additional contract tests ───────────────────────

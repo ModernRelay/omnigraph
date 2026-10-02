@@ -19,10 +19,10 @@ blocked_on: []
 > A term set in ***bold italics*** is being defined at that exact spot; it is plain text everywhere after.
 
 The mixed-version HTTP behavior proposed below remains an unaccepted alternative
-to the v0.12 scope of [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md).
+to [the accepted v0.12 HTTP admission decision](2026-09-30-v012-http-admission.md).
 Missing-header admission, warning and continuing with older peers, and the
 previous-release CLI interoperability suite are neither prerequisites nor support
-promises for that server proposal. This scope note leaves the independent
+promises for v0.12 serving. This scope note leaves the independent
 surface/hash proposal and its proposed mechanism unchanged; it establishes no
 implemented runtime behavior.
 
@@ -205,6 +205,8 @@ Decided by the maintainers on this PR, before acceptance:
 2. The admission refusal has no bypass, where Polars' hash refusal has `POLARS_SKIP_DSL_HASH_VERIFICATION`. Keep lockstep as the contract (CLI and server majors always match in a supported deployment), or add an operator bypass for emergencies.
 
 ## Decision log
+
+- 2026-09-30: The HTTP scope note now points to the accepted A1 admission decision; this draft's broader surface/hash framework remains an independent proposal.
 
 - 2026-09-30: Scoped the proposed mixed-version HTTP behavior and previous-release
   interoperability suite as an unaccepted alternative outside the v0.12 server

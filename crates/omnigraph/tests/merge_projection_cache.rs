@@ -1,6 +1,6 @@
 //! Structural gates for the incremental merge-authority projection cache: a
 //! repeated merge reuses acknowledged local publication views and refreshes
-//! foreign changes through an incremental projection fold, retains at most
+//! foreign changes through a checked projection refresh, retains at most
 //! one non-bound branch's complete authority, and a
 //! delete/recreate of a cached branch must be fenced to a full re-read, never
 //! a stale reuse. The explicit fold-vs-full correctness oracle lives with the
@@ -106,10 +106,10 @@ async fn diverge(db: &Session, round: i64) {
 }
 
 /// Acknowledged local publishes retain exact projections; an external publish
-/// still requires the physical-address incremental fold. Both paths avoid a
-/// full history rebuild and must preserve the merged payload.
+/// still requires a refresh of the replaced manifest fragment. The local path
+/// performs no projection rebuild; both paths must preserve the merged payload.
 #[test]
-fn repeated_merge_refreshes_projection_incrementally() {
+fn repeated_merge_reuses_local_projection_and_refreshes_foreign() {
     on_big_stack(|| async {
         cost_harness(async {
             let dir = tempfile::tempdir().unwrap();
@@ -118,20 +118,17 @@ fn repeated_merge_refreshes_projection_incrementally() {
 
             diverge(&db, 0).await;
             let outcome = db.branch_merge("feature", "main").await.unwrap();
-            assert_eq!(outcome, MergeOutcome::Merged);
+            assert_eq!(outcome.outcome, MergeOutcome::Merged);
 
             // Both writes use this handle. Publication returns the acknowledged
             // exact projections, so no deleted head row needs reconstructing.
             diverge(&db, 1).await;
 
             let (outcome, io) = measure(db.branch_merge("feature", "main")).await;
-            assert_eq!(outcome.unwrap(), MergeOutcome::Merged);
-            assert!(
-                io.projection_incremental_refreshes >= 1,
-                "the repeated merge must refresh at least one cached branch authority \
-                 through the incremental projection fold (incremental {}, full {})",
-                io.projection_incremental_refreshes,
-                io.projection_full_refreshes,
+            assert_eq!(outcome.unwrap().outcome, MergeOutcome::Merged);
+            assert_eq!(
+                io.projection_incremental_refreshes, 0,
+                "acknowledged local publication needs only an incarnation probe, not a projection fold",
             );
             eprintln!("local publication reuse: {io:?}");
             assert_eq!(
@@ -151,7 +148,7 @@ fn repeated_merge_refreshes_projection_incrementally() {
                 "the ground-truth object-store tracker must measure returned bytes"
             );
             eprintln!(
-                "incremental repeated merge: manifest_reads={} manifest_read_bytes={}",
+                "local projection reuse: manifest_reads={} manifest_read_bytes={}",
                 io.manifest_reads, io.manifest_read_bytes,
             );
             // Keep a fixed ground-truth request ceiling alongside the
@@ -160,7 +157,7 @@ fn repeated_merge_refreshes_projection_incrementally() {
             // full coordinator reopen to multiply the measured reads.
             assert!(
                 io.manifest_reads <= 32,
-                "incremental repeated merge used {} manifest object reads; hidden full scans must not ride the measured path",
+                "local projection reuse used {} manifest object reads; hidden full scans must not ride the measured path",
                 io.manifest_reads,
             );
 
@@ -174,7 +171,7 @@ fn repeated_merge_refreshes_projection_incrementally() {
                 &mixed_params(&[("$name", "Bob")], &[("$age", 28)]),
             ).await.unwrap();
             let (outcome, foreign_io) = measure(db.branch_merge("feature", "main")).await;
-            assert_eq!(outcome.unwrap(), MergeOutcome::Merged);
+            assert_eq!(outcome.unwrap().outcome, MergeOutcome::Merged);
             eprintln!("foreign publication refresh: {foreign_io:?}");
             assert_eq!(
                 (foreign_io.projection_full_refreshes, foreign_io.projection_identity_rows),
@@ -185,7 +182,7 @@ fn repeated_merge_refreshes_projection_incrementally() {
             assert!(foreign_io.manifest_reads > 0 && foreign_io.manifest_read_bytes > 0);
             assert!(
                 foreign_io.manifest_reads <= 40,
-                "foreign-source merge input protection and incremental refresh used {} manifest reads",
+                "foreign-source merge input protection and projection refresh used {} manifest reads",
                 foreign_io.manifest_reads,
             );
 
@@ -221,16 +218,16 @@ async fn merge_authority_cache_retains_only_one_non_bound_branch() {
     db.branch_create("feature-b").await.unwrap();
 
     assert_eq!(
-        db.branch_merge("feature-a", "main").await.unwrap(),
+        db.branch_merge("feature-a", "main").await.unwrap().outcome,
         MergeOutcome::AlreadyUpToDate
     );
     assert_eq!(
-        db.branch_merge("feature-b", "main").await.unwrap(),
+        db.branch_merge("feature-b", "main").await.unwrap().outcome,
         MergeOutcome::AlreadyUpToDate
     );
 
     let (outcome, io) = measure(db.branch_merge("feature-a", "main")).await;
-    assert_eq!(outcome.unwrap(), MergeOutcome::AlreadyUpToDate);
+    assert_eq!(outcome.unwrap().outcome, MergeOutcome::AlreadyUpToDate);
     assert!(
         io.internal_open_count >= 1,
         "feature-a must have been evicted when feature-b became the one hot authority"
@@ -250,7 +247,7 @@ async fn branch_recreate_is_fenced_from_the_cached_projection() {
 
     diverge(&db, 0).await;
     assert_eq!(
-        db.branch_merge("feature", "main").await.unwrap(),
+        db.branch_merge("feature", "main").await.unwrap().outcome,
         MergeOutcome::Merged
     );
 
@@ -262,7 +259,7 @@ async fn branch_recreate_is_fenced_from_the_cached_projection() {
     // commits) would instead present divergence.
     let outcome = db.branch_merge("feature", "main").await.unwrap();
     assert_eq!(
-        outcome,
+        outcome.outcome,
         MergeOutcome::AlreadyUpToDate,
         "a recreated branch must be re-read from its new lifetime, never \
          served from the deleted lifetime's cached projection"

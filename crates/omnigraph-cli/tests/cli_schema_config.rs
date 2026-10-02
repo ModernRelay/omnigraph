@@ -130,7 +130,7 @@ fn init_creates_graph_successfully_on_missing_local_directory() {
     let stdout = stdout_string(&output);
 
     assert!(stdout.contains("initialized"));
-    assert!(graph.join("_schema.pg").exists());
+    assert!(!graph.join("_schema.pg").exists());
     assert!(graph.join("__manifest").exists());
     // RFC-008 stage 3: init no longer scaffolds the legacy config file.
     assert!(!temp.path().join("omnigraph.yaml").exists());
@@ -654,7 +654,7 @@ fn explicit_graph_discovery_preserves_jwt_shaped_static_catalog_and_skips_contex
         } else {
             serde_json::json!({"graphs":[{"graph_id":"alpha","uri":"file:///private/alpha"}]})
         };
-        let server = IntentApiFixture::new(vec![IntentReply::json(200, reply.clone())]);
+        let server = IntentApiFixture::graph(vec![IntentReply::json(200, reply.clone())]);
         let mut command = cli();
         command
             .current_dir(directory.path())
@@ -667,7 +667,7 @@ fn explicit_graph_discovery_preserves_jwt_shaped_static_catalog_and_skips_contex
         let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(actual, reply);
         assert_eq!(
-            server.requests()[0].path,
+            server.workflow_requests()[0].path,
             if discovery {
                 "/graphs/discovery"
             } else {
@@ -675,7 +675,7 @@ fn explicit_graph_discovery_preserves_jwt_shaped_static_catalog_and_skips_contex
             }
         );
         assert_eq!(
-            server.requests()[0].headers["authorization"],
+            server.workflow_requests()[0].headers["authorization"],
             format!("Bearer {token}")
         );
         server.assert_complete();

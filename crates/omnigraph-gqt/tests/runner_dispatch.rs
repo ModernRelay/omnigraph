@@ -154,21 +154,16 @@ fn explicit_environment_selection_and_lifetime_evidence() {
             .unwrap()
             .iter()
             .filter(|event| event["kind"] == "engine_lifetime")
+            .map(|event| event["value"].clone())
             .collect::<Vec<_>>();
-        assert_eq!(lifetimes.len(), 3);
-        let mut opens = 0;
-        for event in lifetimes {
-            let before = event["value"]["before"].as_array().unwrap();
-            let after = event["value"]["after"].as_array().unwrap();
-            assert_eq!(
-                before[0], after[0],
-                "ordinary steps cannot initialize a graph"
-            );
-            opens += after[1].as_u64().unwrap() - before[1].as_u64().unwrap();
-        }
         assert_eq!(
-            opens, 1,
-            "the engine's real open hook must fire only for restart"
+            lifetimes,
+            vec![
+                serde_json::json!({"before": [1, 0], "after": [1, 0]}),
+                serde_json::json!({"before": [1, 0], "after": [1, 1]}),
+                serde_json::json!({"before": [1, 1], "after": [1, 1]}),
+            ],
+            "the engine must initialize once and reopen only at the restart step"
         );
         assert_eq!(
             events
@@ -500,4 +495,102 @@ fn selecting_engine_does_not_allow_blessing_a_shared_case() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("bless requires"));
     assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+/// The measured counts are report output, not case evidence: the case format
+/// has no expect mode for them.
+#[cfg(tokio_unstable)]
+#[test]
+fn measure_counts_schema_contract_requests_issue_817() {
+    const CASE: &str = "# issue: none\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n--- schema\nnode Person { name: String @key }\n--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}\n--- mutate\nquery add_bob() { insert Person { name: \"bob\" } }\n--- expect affected: nodes=1 edges=0\n--- mutate\nquery add_carol() { insert Person { name: \"carol\" } }\n--- expect affected: nodes=1 edges=0\n--- query\nquery all() { match { $p: Person } return { $p.name } }\n--- expect unordered\n{\"p.name\":\"alice\"}\n{\"p.name\":\"bob\"}\n{\"p.name\":\"carol\"}\n--- expect shape\np.name: String\n";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("two_inserts_on_main.gqt");
+    std::fs::write(&path, CASE).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(&path)
+        .arg("--measure")
+        .arg("--artifacts")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (_, summary) = report(&output);
+    let measurements = summary["attempts"][0]["outcome"]["Ok"]["measurements"]
+        .as_array()
+        .expect("the first attempt is measured");
+    let contract_files = |slot: &str, step: u64| -> Vec<String> {
+        let group = measurements
+            .iter()
+            .find(|group| group["slot"] == slot && group["step"] == step)
+            .expect("a measured group");
+        let mut files: Vec<String> = group["value"]["log"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|request| request["path"].as_str()?.rsplit('/').next())
+            .filter(|name| {
+                matches!(
+                    *name,
+                    "_schema.pg" | "_schema.ir.json" | "__schema_state.json"
+                )
+            })
+            .map(str::to_string)
+            .collect();
+        files.sort();
+        files
+    };
+    assert!(contract_files("setup", 0).is_empty());
+    for step in [1, 2, 3] {
+        assert!(
+            contract_files("step", step).is_empty(),
+            "step {step}: the schema contract is inline in the catalog"
+        );
+    }
+    let io_counts = |slot: &str, step: u64| -> serde_json::Value {
+        summary["attempts"][0]["outcome"]["Ok"]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| {
+                row["kind"] == "io" && row["value"]["slot"] == slot && row["value"]["step"] == step
+            })
+            .expect("an io evidence row")["value"]
+            .clone()
+    };
+    let control_classes = |counts: &serde_json::Value| -> Vec<(String, u64)> {
+        counts["by_class"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(class, _)| class.starts_with("control_"))
+            .map(|(class, count)| (class.clone(), count.as_u64().unwrap()))
+            .collect()
+    };
+    assert_eq!(
+        control_classes(&io_counts("setup", 0)),
+        [
+            ("control_claim.delete".to_string(), 1),
+            ("control_claim.put".to_string(), 1),
+            ("control_manifest.head_failed".to_string(), 2),
+            ("control_manifest.list".to_string(), 2),
+            ("control_probe.delete".to_string(), 1),
+            ("control_probe.put".to_string(), 1),
+        ],
+        "setup measures the init claim, capability probe and two manifest preflights"
+    );
+    for step in [1, 2, 3] {
+        let counts = io_counts("step", step);
+        assert!(
+            control_classes(&counts).is_empty(),
+            "step {step}: the inline contract needs no control-adapter requests"
+        );
+        assert_eq!(
+            counts["repeat_reads"], 0,
+            "step {step}: neither the inline contract nor table data needs repeated reads"
+        );
+    }
 }

@@ -1,4 +1,4 @@
-//! Stored shape (internal-schema stamp 12). A row is three columns: `object_id`,
+//! Stored shape (internal-schema stamps 12 and 13). A row is `object_id`,
 //! `object_type`, and `record`, a Lance packed struct holding every other field
 //! of [`manifest_schema`] row-major in one column, so a scan reads one column's
 //! pages for the record instead of one per field. Lance's packed struct has no
@@ -6,10 +6,13 @@
 //! child), so every child is declared non-null and the ninth child, `present`,
 //! carries one bit per field that is null in the logical row; the child under
 //! a set bit holds the filler (`""` or `0`), which a reader checks and refuses
-//! anything else. [`compact_to_storage`] and [`expand_from_storage`] are the
-//! two boundaries; everything above them keeps the logical [`manifest_schema`].
-//! A scan projects `record` whole: Lance 11 cannot project a fixed-width child
-//! of a packed struct on its own.
+//! anything else. Stamp 13 adds the two schema-contract content columns of
+//! [`SCHEMA_CONTENT_COLUMNS`] beside `record`, nullable and null on every row
+//! but the `schema_contract` row, so a scan that does not project them never
+//! reads the contract's bytes. [`compact_to_storage`] and
+//! [`expand_from_storage`] are the two boundaries; everything above them keeps
+//! the logical [`manifest_schema`]. A scan projects `record` whole: Lance 11
+//! cannot project a fixed-width child of a packed struct on its own.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,23 +27,25 @@ use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 
 use crate::error::{OmniError, Result};
 use crate::migrations::{
-    INTERNAL_MANIFEST_SCHEMA_VERSION, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, PACKED_RECORD_STAMP,
+    INTERNAL_MANIFEST_SCHEMA_VERSION, LAST_FLAT_STAMP, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+    PACKED_RECORD_STAMP,
 };
 
 /// The logical `__manifest` row schema, what every reader and writer above the
 /// storage boundary sees. `object_id` keeps Lance's unenforced primary-key
 /// marker: every existing `__manifest` carries it and Lance treats the marker
 /// as fixed once set, so an overwrite must present it too. The stored shape is
-/// [`manifest_storage_schema`] (stamp 12: the fields after `object_type`
-/// packed into one `record` struct) or [`flat_manifest_schema`] (stamps 5 to
-/// 11). The publish CAS itself is the version commit of `commit::overwrite`.
+/// [`manifest_storage_schema`] (stamps 12 and 13: the fields after
+/// `object_type` packed into one `record` struct, the content columns beside
+/// it) or [`flat_manifest_schema`] (stamps 5 to 11). The publish CAS itself is
+/// the version commit of `commit::overwrite`.
 pub fn manifest_schema() -> SchemaRef {
     let object_id_metadata: HashMap<String, String> =
         [("lance-schema:unenforced-primary-key", "true")]
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-    Arc::new(Schema::new(vec![
+    let mut fields = vec![
         Field::new("object_id", DataType::Utf8, false).with_metadata(object_id_metadata),
         Field::new("object_type", DataType::Utf8, false),
         Field::new("location", DataType::Utf8, true),
@@ -51,17 +56,37 @@ pub fn manifest_schema() -> SchemaRef {
         Field::new("table_version", DataType::UInt64, true),
         Field::new("table_branch", DataType::Utf8, true),
         Field::new("row_count", DataType::UInt64, true),
-    ]))
+    ];
+    fields.extend(SCHEMA_CONTENT_COLUMNS.map(schema_content_field));
+    Arc::new(Schema::new(fields))
+}
+
+/// The two top-level columns holding the schema contract's texts on the
+/// `schema_contract` row: the `.pg` source and the IR JSON, byte-exact. Null on
+/// every other row; absent from the flat shape and from stamp 12.
+pub const SCHEMA_CONTENT_COLUMNS: [&str; 2] = ["schema_source", "schema_ir"];
+
+fn schema_content_field(name: &str) -> Field {
+    Field::new(name, DataType::LargeUtf8, true)
+}
+
+fn is_schema_content_column(name: &str) -> bool {
+    SCHEMA_CONTENT_COLUMNS.contains(&name)
 }
 
 /// The stored shape of stamps 5 to 11: the logical columns as flat columns,
-/// plus `base_objects`, a list column no path ever wrote a value into or read
-/// (dropped from the logical schema at stamp 12). Readers of a stamp-11
-/// manifest project the logical columns out of it; the upgrade command
-/// validates a conversion source against it.
+/// less the stamp-13 content columns, plus `base_objects`, a list column no
+/// path ever wrote a value into or read (dropped from the logical schema at
+/// stamp 12). Readers of a stamp-11 manifest project the logical columns out
+/// of it; the upgrade command validates a conversion source against it.
 pub fn flat_manifest_schema() -> SchemaRef {
     let logical = manifest_schema();
-    let mut fields: Vec<Arc<Field>> = logical.fields().iter().cloned().collect();
+    let mut fields: Vec<Arc<Field>> = logical
+        .fields()
+        .iter()
+        .filter(|field| !is_schema_content_column(field.name()))
+        .cloned()
+        .collect();
     fields.insert(
         4,
         Arc::new(Field::new(
@@ -71,6 +96,17 @@ pub fn flat_manifest_schema() -> SchemaRef {
         )),
     );
     Arc::new(Schema::new(fields))
+}
+
+/// The logical columns a flat-shape scan projects: every field of
+/// [`flat_manifest_schema`] but `base_objects`.
+pub(crate) fn flat_projection() -> Vec<String> {
+    flat_manifest_schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .filter(|name| name != "base_objects")
+        .collect()
 }
 
 /// The stored column holding every record field of a row as one packed struct.
@@ -110,29 +146,30 @@ pub(crate) fn stored_shape(stamp: Option<u32>) -> StoredShape {
     }
 }
 
-/// The shape a publish writes at `stamp`: packed for every served stamp (so a
-/// stamp-11 manifest converts on its next publish), flat below the served floor.
+/// The shape a publish writes at `stamp`: packed from [`LAST_FLAT_STAMP`] up
+/// (a stamp-11 manifest converts on its next publish, the storage upgrade's
+/// rewrite included), flat below it.
 pub(crate) fn written_shape(stamp: Option<u32>) -> StoredShape {
-    if stamp.is_some_and(|stamp| stamp >= MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION) {
+    if stamp.is_some_and(|stamp| stamp >= LAST_FLAT_STAMP) {
         StoredShape::Packed
     } else {
         StoredShape::Flat
     }
 }
-/// A flat write lands only below the served floor and every served stamp reads packed from
-/// [`PACKED_RECORD_STAMP`] up, so [`stored_shape`] and [`written_shape`] agree only while the
-/// packed stamp sits inside the served range.
+/// Every served stamp reads packed, a publish converts exactly the last flat
+/// stamp, and a flat write lands only below the served floor.
 const _: () = assert!(
-    MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION <= PACKED_RECORD_STAMP
-        && PACKED_RECORD_STAMP <= INTERNAL_MANIFEST_SCHEMA_VERSION
+    LAST_FLAT_STAMP + 1 == PACKED_RECORD_STAMP
+        && PACKED_RECORD_STAMP <= MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION
+        && MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION <= INTERNAL_MANIFEST_SCHEMA_VERSION
 );
 
-/// The stored schema at stamp 12: `object_id` (with Lance's unenforced
-/// primary-key marker), `object_type`, and the packed `record` struct; the
-/// dataset's schema metadata (where the stamp lives) is `metadata`. The only
-/// error is a `RECORD_FIELDS` name missing from `manifest_schema`, two
-/// constants of this file, so the `Result` is never `Err`; it stays for the
-/// crate's no-panic rule.
+/// The stored schema at stamp 13: `object_id` (with Lance's unenforced
+/// primary-key marker), `object_type`, the packed `record` struct, and the two
+/// nullable content columns; the dataset's schema metadata (where the stamp
+/// lives) is `metadata`. The only error is a `RECORD_FIELDS` name missing
+/// from `manifest_schema`, two constants of this file, so the `Result` is
+/// never `Err`; it stays for the crate's no-panic rule.
 pub(crate) fn manifest_storage_schema(metadata: HashMap<String, String>) -> Result<SchemaRef> {
     let logical = manifest_schema();
     let mut children = Vec::with_capacity(RECORD_FIELDS.len() + 1);
@@ -154,10 +191,42 @@ pub(crate) fn manifest_storage_schema(metadata: HashMap<String, String>) -> Resu
         PACKED_STRUCT_KEY.to_string(),
         "true".to_string(),
     )]));
-    Ok(Arc::new(Schema::new_with_metadata(
-        vec![logical.field(0).clone(), logical.field(1).clone(), record],
-        metadata,
-    )))
+    let mut fields = vec![logical.field(0).clone(), logical.field(1).clone(), record];
+    fields.extend(SCHEMA_CONTENT_COLUMNS.map(schema_content_field));
+    Ok(Arc::new(Schema::new_with_metadata(fields, metadata)))
+}
+
+/// The stored columns a packed-shape scan projects: the record whole, plus the
+/// content columns when `with_content` and the dataset carries them (a stamp-12
+/// version inside a stamp-13 graph has none; its scan expands them null).
+pub(crate) fn packed_projection(dataset: &lance::Dataset, with_content: bool) -> Vec<String> {
+    let mut projection: Vec<String> = ["object_id", "object_type", RECORD_COLUMN]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if with_content {
+        projection.extend(
+            SCHEMA_CONTENT_COLUMNS
+                .into_iter()
+                .filter(|name| dataset.schema().field(name).is_some())
+                .map(str::to_string),
+        );
+    }
+    projection
+}
+
+/// The content column `name` of `batch` in the stored shape: the batch's own
+/// column when it carries one, else all null (a logical batch read from a
+/// version without the columns, or one that never projected them).
+fn stored_content_column(batch: &RecordBatch, name: &str) -> Result<ArrayRef> {
+    match batch.column_by_name(name) {
+        None => Ok(new_null_array(&DataType::LargeUtf8, batch.num_rows())),
+        Some(column) if column.data_type() == &DataType::LargeUtf8 => Ok(column.clone()),
+        Some(column) => Err(OmniError::manifest_internal(format!(
+            "manifest column '{name}' is {}, expected LargeUtf8",
+            column.data_type()
+        ))),
+    }
 }
 
 fn record_fields_of(schema: &SchemaRef) -> Result<Fields> {
@@ -250,23 +319,24 @@ pub(crate) fn compact_to_storage(batch: &RecordBatch, schema: &SchemaRef) -> Res
     children.push(Arc::new(UInt8Array::from(present)));
     let record = StructArray::try_new(record_fields_of(schema)?, children, None)
         .map_err(OmniError::arrow_internal)?;
-    RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            named_column(batch, "object_id")?,
-            named_column(batch, "object_type")?,
-            Arc::new(record),
-        ],
-    )
-    .map_err(OmniError::arrow_internal)
+    let mut columns = vec![
+        named_column(batch, "object_id")?,
+        named_column(batch, "object_type")?,
+        Arc::new(record) as ArrayRef,
+    ];
+    for name in SCHEMA_CONTENT_COLUMNS {
+        columns.push(stored_content_column(batch, name)?);
+    }
+    RecordBatch::try_new(schema.clone(), columns).map_err(OmniError::arrow_internal)
 }
 
 /// Spread a stored batch back into the logical [`manifest_schema`] columns, restoring each null
 /// from its `present` bit. Every child keeps its value buffers: a logical column is the child's
 /// buffers under a null bitmap built from `present`, and only the rows marked null are read, to
-/// check that the filler is what the child holds there. Any other projected column (a Lance
-/// row-metadata column) passes through unchanged after the logical columns, so the boundary is
-/// total over projections.
+/// check that the filler is what the child holds there. A content column the scan did not
+/// project, or that the stored version does not carry, expands all null. Any other projected
+/// column (a Lance row-metadata column) passes through unchanged after the logical columns, so
+/// the boundary is total over projections.
 pub(crate) fn expand_from_storage(batch: &RecordBatch) -> Result<RecordBatch> {
     let record = named_column(batch, RECORD_COLUMN)?;
     let record = record
@@ -344,11 +414,16 @@ pub(crate) fn expand_from_storage(batch: &RecordBatch) -> Result<RecordBatch> {
         };
         columns.push(column);
     }
+    for name in SCHEMA_CONTENT_COLUMNS {
+        fields.push(Arc::new(schema_content_field(name)));
+        columns.push(stored_content_column(batch, name)?);
+    }
     for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
         if !matches!(
             field.name().as_str(),
             "object_id" | "object_type" | RECORD_COLUMN
-        ) {
+        ) && !is_schema_content_column(field.name())
+        {
             fields.push(field.clone());
             columns.push(column.clone());
         }
@@ -378,6 +453,16 @@ fn filler_mismatch(name: &str, row: usize) -> OmniError {
 /// conversion may hold open; every supported manifest converts to the packed
 /// shape on its next publish.
 pub(crate) fn flat_to_storage(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
+    for name in SCHEMA_CONTENT_COLUMNS {
+        if batch
+            .column_by_name(name)
+            .is_some_and(|column| column.null_count() < column.len())
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "manifest column '{name}' carries a value, which the flat shape cannot store"
+            )));
+        }
+    }
     let columns = schema
         .fields()
         .iter()

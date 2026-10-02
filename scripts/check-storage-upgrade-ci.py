@@ -13,12 +13,24 @@ ROOT = Path(__file__).resolve().parents[1]
 CONTEXT = "Storage Upgrade Compatibility"
 FEATURES = "omnigraph-engine/failpoints,omnigraph-cluster/failpoints"
 CASES = (
+    "storage_upgrade_current_binary_reports_already_current_on_a_fresh_graph",
     "genuine_v09_explicit_storage_upgrade_preserves_history",
     "genuine_v010_explicit_storage_upgrade_preserves_history",
     "storage_upgrade_refuses_cluster_path_aliases",
     "genuine_v09_storage_upgrade_refuses_ambiguous_branch_names",
 )
 ENGINE_CASES = (
+    "storage_upgrade_schema_contract_converts_mixed_branch_formats",
+    "storage_upgrade_schema_contract_cleanup_retries_after_each_delete",
+    "storage_upgrade_schema_contract_resumes_every_partial_cleanup_state",
+    "storage_upgrade_schema_contract_refuses_forged_historical_fence",
+    "storage_upgrade_refuses_restamped_current_layout_and_injected_legacy_contract",
+    "storage_upgrade_current_contract_ignores_legacy_orphans_and_former_sentinel_name",
+    "storage_upgrade_schema_contract_interruption_boundaries_retry",
+    "storage_upgrade_schema_contract_refuses_contract_drift_on_retry",
+    "storage_upgrade_schema_contract_refuses_invalid_contract_without_effects",
+    "storage_upgrade_schema_contract_refuses_legacy_artifacts_without_effects",
+    "storage_upgrade_legacy_constructor_does_not_admit_ordinary_opens",
     "storage_upgrade_check_has_no_local_store_effects",
     "storage_upgrade_interruption_boundaries_retry_without_mixed_visibility",
     "storage_upgrade_recovery_refuses_foreign_head_movement",
