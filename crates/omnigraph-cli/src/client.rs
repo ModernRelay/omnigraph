@@ -580,9 +580,7 @@ impl GraphClient {
             GraphClient::Embedded { uri, .. } => {
                 let db = Self::open_embedded(uri).await?;
                 let snapshot = db.snapshot_of(ReadTarget::branch(branch)).await?;
-                let internal_schema_version = db
-                    .internal_schema_version_of(ReadTarget::branch(branch))
-                    .await?;
+                let internal_schema_version = db.internal_schema_version_at(&snapshot).await?;
                 snapshot_payload(branch, &snapshot, internal_schema_version)
                     .map_err(|error| eyre!(error))
             }

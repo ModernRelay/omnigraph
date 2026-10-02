@@ -1286,13 +1286,44 @@ impl ManifestCoordinator {
         {
             return Ok((**row).clone());
         }
+        let dataset =
+            Self::snapshot_manifest_dataset(root_uri, snapshot, "schema-contract").await?;
+        read_schema_contract_row(&dataset, snapshot.schema_contract()).await
+    }
+
+    /// The internal-schema stamp of the `__manifest` version a live snapshot
+    /// captured (see [`internal_schema_stamp_at`]): read from the snapshot's
+    /// own manifest dataset, so it describes the same version as the rest of
+    /// the snapshot and costs no request when the snapshot carries it.
+    pub async fn internal_schema_stamp_for_snapshot(
+        root_uri: &str,
+        snapshot: &Snapshot,
+    ) -> Result<Option<u32>> {
+        if root_uri.trim_end_matches('/') != snapshot.root_uri {
+            return Err(OmniError::manifest(
+                "stamp snapshot belongs to another root",
+            ));
+        }
+        let dataset = Self::snapshot_manifest_dataset(root_uri, snapshot, "stamp").await?;
+        Ok(migrations::read_stamp(&dataset))
+    }
+
+    /// The `__manifest` dataset at the exact native branch and version a live
+    /// snapshot captured: the one it carries, or a fresh open checked out at
+    /// that version. A named snapshot without native provenance fails rather
+    /// than reading another branch.
+    async fn snapshot_manifest_dataset(
+        root_uri: &str,
+        snapshot: &Snapshot,
+        purpose: &str,
+    ) -> Result<Dataset> {
         if let Some(dataset) = &snapshot.manifest_dataset {
-            return read_schema_contract_row(dataset, snapshot.schema_contract()).await;
+            return Ok(dataset.clone());
         }
         if snapshot.graph_branch().is_some() && snapshot.native_branch().is_none() {
-            return Err(OmniError::manifest(
-                "named schema-contract snapshot lacks native branch provenance",
-            ));
+            return Err(OmniError::manifest(format!(
+                "named {purpose} snapshot lacks native branch provenance"
+            )));
         }
         let control_session = crate::lance_access::control_session();
         let dataset = open_manifest_dataset_native_with_session(
@@ -1301,11 +1332,10 @@ impl ManifestCoordinator {
             &control_session,
         )
         .await?;
-        let dataset = dataset
+        dataset
             .checkout_version(snapshot.graph_manifest_version())
             .await
-            .map_err(OmniError::storage)?;
-        read_schema_contract_row(&dataset, snapshot.schema_contract()).await
+            .map_err(OmniError::storage)
     }
 
     /// The `schema_contract` row of `branch` (main when `None`) at `version`,
