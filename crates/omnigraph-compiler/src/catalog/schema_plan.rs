@@ -471,10 +471,8 @@ fn plan_nodes(
         .filter(|node| !consumed.contains(&node.type_id))
     {
         // Node type removed from the desired schema. Apply removes the
-        // table's entry from the current __manifest version and keeps its
-        // data files; previous manifest versions still reference the table,
-        // so older snapshots read it until `omnigraph cleanup` stops
-        // retaining those __manifest versions.
+        // table's entry from the current __manifest version; retention is
+        // stated on `SchemaMigrationStep::DropType`.
         steps.push(SchemaMigrationStep::DropType {
             type_kind: SchemaTypeKind::Node,
             name: leftover.name.clone(),
@@ -564,8 +562,7 @@ fn plan_edges(
         .filter(|edge| !consumed.contains(&edge.type_id))
     {
         // Edge type removed from the desired schema. The mechanics match
-        // node-type drops: the manifest entry tombstoned, data files
-        // retained, older snapshots readable until cleanup.
+        // node-type drops.
         steps.push(SchemaMigrationStep::DropType {
             type_kind: SchemaTypeKind::Edge,
             name: leftover.name.clone(),
@@ -722,10 +719,9 @@ fn plan_properties(
         // Property removed from the desired schema. Apply reuses the
         // stage_overwrite rewrite path — batch_for_schema_apply_rewrite
         // iterates target_schema.fields(), so the dropped column is
-        // naturally projected away. The prior table version retains
-        // the column until `omnigraph cleanup` stops retaining the commits
-        // that pin it, matching the OG-DS-104 destructive-tier expectation
-        // that data remains recoverable via time travel until cleanup.
+        // naturally projected away. Retention, which the OG-DS-104
+        // destructive tier expects, is stated on
+        // `SchemaMigrationStep::DropProperty`.
         steps.push(SchemaMigrationStep::DropProperty {
             type_kind,
             type_name: type_name.to_string(),
@@ -1793,33 +1789,57 @@ node Pair {
     #[test]
     fn drop_steps_round_trip_through_serde() {
         // Plans reach callers as JSON (CLI `--json`, the HTTP schema-apply
-        // response, the cluster plan preview). Pin the drop steps' wire
-        // shape so it round-trips.
+        // response, the cluster plan preview). Pin the drop steps' literal
+        // wire shape, and that it round-trips.
         let steps = vec![
-            SchemaMigrationStep::DropType {
-                type_kind: SchemaTypeKind::Node,
-                name: "Person".to_string(),
-            },
-            SchemaMigrationStep::DropType {
-                type_kind: SchemaTypeKind::Edge,
-                name: "Knows".to_string(),
-            },
-            SchemaMigrationStep::DropProperty {
-                type_kind: SchemaTypeKind::Node,
-                type_name: "Person".to_string(),
-                property_name: "age".to_string(),
-            },
-            SchemaMigrationStep::DropProperty {
-                type_kind: SchemaTypeKind::Interface,
-                type_name: "Named".to_string(),
-                property_name: "alias".to_string(),
-            },
+            (
+                SchemaMigrationStep::DropType {
+                    type_kind: SchemaTypeKind::Node,
+                    name: "Person".to_string(),
+                },
+                serde_json::json!({"kind": "drop_type", "type_kind": "node", "name": "Person"}),
+            ),
+            (
+                SchemaMigrationStep::DropType {
+                    type_kind: SchemaTypeKind::Edge,
+                    name: "Knows".to_string(),
+                },
+                serde_json::json!({"kind": "drop_type", "type_kind": "edge", "name": "Knows"}),
+            ),
+            (
+                SchemaMigrationStep::DropProperty {
+                    type_kind: SchemaTypeKind::Node,
+                    type_name: "Person".to_string(),
+                    property_name: "age".to_string(),
+                },
+                serde_json::json!({
+                    "kind": "drop_property",
+                    "type_kind": "node",
+                    "type_name": "Person",
+                    "property_name": "age",
+                }),
+            ),
+            (
+                SchemaMigrationStep::DropProperty {
+                    type_kind: SchemaTypeKind::Interface,
+                    type_name: "Named".to_string(),
+                    property_name: "alias".to_string(),
+                },
+                serde_json::json!({
+                    "kind": "drop_property",
+                    "type_kind": "interface",
+                    "type_name": "Named",
+                    "property_name": "alias",
+                }),
+            ),
         ];
 
-        for step in steps {
-            let json = serde_json::to_string(&step).expect("serialize");
-            let round_trip: SchemaMigrationStep = serde_json::from_str(&json).expect("deserialize");
-            assert_eq!(step, round_trip, "round-trip mismatch on {json}");
+        for (step, wire) in steps {
+            let json = serde_json::to_value(&step).expect("serialize");
+            assert_eq!(json, wire);
+            let round_trip: SchemaMigrationStep =
+                serde_json::from_value(json).expect("deserialize");
+            assert_eq!(step, round_trip, "round-trip mismatch on {wire}");
         }
     }
 }

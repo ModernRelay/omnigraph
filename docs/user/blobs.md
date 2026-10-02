@@ -143,12 +143,15 @@ fails loudly instead of redirecting to a wider value.
 Blob limits bound the memory one operation needs. An operation over a limit
 fails before it changes the graph. Over HTTP it returns `413` with a
 `resource_limit` detail naming the `resource`, its `limit` and the `actual`
-value observed; the CLI reports the same three fields. Split the work into
-smaller operations and retry.
+value observed. For a write, the CLI reports the same three fields; the
+`omnigraph blob` commands report an over-limit range read as
+`Blob read range exceeds the limit`. Split the work into smaller operations
+and retry.
 
 | Limit | Applies to | Reported resource |
 |---|---|---|
 | 32 MiB of decoded `base64:` bytes | Each node or edge type in one load, in every mode, including `overwrite` | `decoded blob input bytes for <table>` |
+| 32 MiB of decoded `base64:` bytes | One `base64:` value, in a load or in an insert or update mutation | `decoded blob input bytes` |
 | 32 MiB per touched type, and 32 MiB across all touched types, Blob bytes included | Incremental writes: `append` and `merge` loads, inserts and updates. External bytes copied in and Blob values carried unchanged by an update count | `keyed write bytes for <table>`, `keyed entity bytes for <table>`, `retained keyed batch bytes per operation` |
 | 32 MiB of external payload copied into managed storage | One incremental write operation across all its types, and each type within it: two types copying 20 MiB each exceed it although each fits its per-type limit | `materialized external blob payload bytes` |
 | 32 MiB of Blob payload | One branch merge that writes rows, across all types, managed and external bytes together | `materialized blob payload bytes` |
@@ -162,7 +165,9 @@ smaller operations and retry.
 
 The HTTP load request body is also capped at 32 MiB. That cap counts the
 encoded request, so one request carries about 24 MiB of decoded `base64:`
-data.
+data. Every HTTP request other than a load (`/load`, `/load/ndjson`,
+`/ingest`) is bounded by the default 1 MiB request body limit, so a `base64:`
+literal in an HTTP mutation hits that limit first.
 
 Values larger than these limits stay readable. The CLI and the HTTP server
 read managed values in 4 MiB ranges, so a large value streams without a

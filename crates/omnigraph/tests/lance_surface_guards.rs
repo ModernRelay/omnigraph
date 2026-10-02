@@ -2414,8 +2414,9 @@ async fn explicit_scanner_batch_size_beats_lance_default_batch_size_env_process(
 // `id`, several fragments, a deletion, and an unindexed appended tail, so the
 // filter runs through `ScalarIndexQuery` plus a scan of the uncovered
 // fragment. The guard also pins the original report's shape (a predicate on
-// the Blob column itself under a full projection) for every `BlobHandling`,
-// and repeats everything after compaction.
+// the Blob column itself under a full projection) for every `BlobHandling`
+// and the proven-insert shape (a descriptor scan restricted with
+// `with_fragments`, no filter), and repeats everything after compaction.
 #[tokio::test]
 async fn filtered_scan_projects_blob_descriptors_on_indexed_multi_fragment_table() {
     use arrow_array::types::{UInt8Type, UInt32Type, UInt64Type};
@@ -2591,6 +2592,65 @@ async fn filtered_scan_projects_blob_descriptors_on_indexed_multi_fragment_table
                 "{case}: deleted or absent id '{id}' must match no row"
             );
         }
+
+        // The proven-insert shape: a scan restricted with `with_fragments`
+        // and no filter returns each live row's descriptor and stable row id.
+        let mut restricted_rows = 0;
+        for fragment in ds.fragments().iter() {
+            let mut scanner = ds.scan();
+            scanner.project(&["id", "content"]).unwrap();
+            scanner.with_fragments(vec![fragment.clone()]);
+            scanner.blob_handling(BlobHandling::BlobsDescriptions);
+            scanner.with_row_id();
+            let batches: Vec<RecordBatch> = scanner
+                .try_into_stream()
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{case}: fragment-restricted scan must plan: {error}")
+                })
+                .try_collect()
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{case}: fragment-restricted scan must execute: {error}")
+                });
+            for batch in &batches {
+                let ids = batch.column_by_name("id").unwrap().as_string::<i32>();
+                let descriptor = batch.column_by_name("content").unwrap().as_struct();
+                assert_eq!(
+                    descriptor.num_columns(),
+                    5,
+                    "{case}: a fragment-restricted scan must keep all five descriptor children"
+                );
+                let row_ids = batch
+                    .column_by_name(ROW_ID)
+                    .unwrap()
+                    .as_primitive::<UInt64Type>();
+                for row in 0..batch.num_rows() {
+                    let id = ids.value(row);
+                    let (_, value) = live
+                        .iter()
+                        .find(|(live_id, _)| *live_id == id)
+                        .unwrap_or_else(|| panic!("{case}: fragment scan returned dead id '{id}'"));
+                    assert_eq!(
+                        descriptor.is_valid(row),
+                        !matches!(value, BlobValue::Null),
+                        "{case}: '{id}' descriptor validity in the fragment-restricted scan"
+                    );
+                    let (filtered_row_id, ..) = read_blob_at_scan(ds, id).await.unwrap();
+                    assert_eq!(
+                        row_ids.value(row),
+                        filtered_row_id,
+                        "{case}: '{id}' stable row id in the fragment-restricted scan"
+                    );
+                    restricted_rows += 1;
+                }
+            }
+        }
+        assert_eq!(
+            restricted_rows,
+            live.len(),
+            "{case}: fragment-restricted scans must cover every live row"
+        );
 
         // The original report's shape: a predicate on the Blob column itself
         // under a full projection, for every Blob handling mode.

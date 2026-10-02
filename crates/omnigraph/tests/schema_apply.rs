@@ -697,12 +697,10 @@ async fn apply_schema_unsupported_plan_does_not_advance_manifest() {
 // Schema migration v1 accepts:
 // - Additive change: add type, add nullable property, add index, rename.
 // - DropProperty via the schema-lint v1 chassis (commit #3 of MR-694)
-//   — the dropped column is removed from the current manifest version but
-//   remains reachable via Lance time travel at the prior version, until
-//   `omnigraph cleanup` stops retaining it. Apply reclaims nothing; see the
-//   cleanup tests below.
+//   and DropType: retention is stated on `SchemaMigrationStep::DropType`
+//   and `DropProperty`; see the cleanup tests below.
 //
-// Every other destructive shape (drop type, narrow type, add required without
+// Every other destructive shape (narrow type, add required without
 // backfill, remove constraint) still returns an `UnsupportedChange` step that
 // surfaces as an error from `apply_schema`. These tests pin the current
 // contract so a regression in the planner can't silently change behavior.
@@ -1813,6 +1811,9 @@ node Anchor { name: String @key }
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_property_drop_is_reclaimed_by_cleanup_not_apply() {
+    use arrow_array::Array;
+    use futures::TryStreamExt;
+
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     let before_version = db
@@ -1821,9 +1822,7 @@ async fn apply_schema_property_drop_is_reclaimed_by_cleanup_not_apply() {
         .unwrap()
         .graph_manifest_version();
 
-    // Drop the `age` column. Apply rewrites the table without it and
-    // reclaims nothing; the prior version stays pinned by the pre-drop
-    // `__manifest` version until cleanup stops retaining it.
+    // Drop the `age` column. Apply rewrites the table without it.
     let desired = TEST_SCHEMA.replace("    age: I32?\n", "");
     let result = db.apply_schema(&desired).await.unwrap();
     assert!(result.applied);
@@ -1842,16 +1841,41 @@ async fn apply_schema_property_drop_is_reclaimed_by_cleanup_not_apply() {
         "current Person schema must not include 'age' after the drop; got {current_fields:?}",
     );
 
-    // Before cleanup the pre-drop snapshot still reads the dropped column:
-    // a drop reclaims nothing at apply.
+    // Before cleanup the pre-drop snapshot still reads the dropped column's
+    // values from its data files.
     let pre_drop = db
         .snapshot_at_graph_manifest_version(before_version)
         .await
         .unwrap();
     let pre_drop_ds = pre_drop.open_dataset("node:Person").await.unwrap();
-    assert!(
-        pre_drop_ds.schema().field("age").is_some(),
-        "before cleanup, the pre-drop snapshot must still carry 'age'"
+    let mut scanner = pre_drop_ds.scan();
+    scanner.project(&["age"]).unwrap();
+    let batches: Vec<arrow_array::RecordBatch> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut ages = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("age")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .unwrap()
+                .iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    ages.sort_unstable();
+    assert_eq!(
+        ages,
+        [25, 28, 30, 35],
+        "before cleanup, the pre-drop snapshot must still read the dropped 'age' values"
     );
 
     // After `cleanup --keep 1` the pre-drop manifest version is no longer

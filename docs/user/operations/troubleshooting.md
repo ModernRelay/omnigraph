@@ -32,8 +32,17 @@ means the data request was not sent. HTTP discovery refusals retain their status
 | 416 | Blob byte range is outside the value | Use the returned length to choose a valid range |
 | 424 | An allowed external Blob source could not be read | Restore source availability or correct its URI/credentials |
 | 429 | Server or per-actor admission limit reached | Use the whole-command outcome below before retrying; preserve `Retry-After` |
-| 500 | Server or stored-data integrity failure | Check server logs; do not assume partial success. A Blob delivery failure logs its error class (`error_variant`, and `storage_kind` for a storage failure), never its storage path |
+| 500 | Server or stored-data integrity failure | Check server logs; do not assume partial success. A Blob delivery failure logs its error class (`error_variant`, and `storage_kind` for a storage failure), never its storage path; see below |
 | 503 | Admission is closed, or a published schema change requires completion | Inspect the structured error; generic 503 is not permission to repeat a write |
+
+A `GET` or `HEAD /blob` 500 logs `error_kind="blob_pre_header_internal"` with a
+`stage`. `target` is a failure resolving a snapshot target for a policy-gated
+request. `cell` is any failure of the engine's Blob read, including the branch
+or snapshot resolution the engine does itself. `transport` is the server's own
+refusal before headers, logged with `error_variant="unclassified"`. A managed
+Blob body that fails after the headers logs the byte range under one of
+`blob_payload_read` (with the error class), `blob_payload_short_read` (with
+the returned and expected byte counts) or `blob_payload_permit_closed`.
 
 A graph-head `412` includes `precondition_failure` with `expected` and, when
 available, `actual`. A change-feed `410` includes `change_feed_gap`; retrying

@@ -872,7 +872,7 @@ pub(crate) async fn server_blob_get(
     let query = parse_blob_read_query(query)?;
     let read = read_blob_for_delivery(&handle, actor.as_ref().map(|Extension(actor)| actor), query)
         .await?;
-    blob_transport::serve_blob_get(read, &headers)
+    blob_transport::serve_blob_get(read, &headers).inspect_err(log_blob_transport_internal)
 }
 
 #[utoipa::path(
@@ -936,7 +936,7 @@ pub(crate) async fn server_blob_head(
     let query = parse_blob_read_query(query)?;
     let read = read_blob_for_delivery(&handle, actor.as_ref().map(|Extension(actor)| actor), query)
         .await?;
-    blob_transport::serve_blob_head(read, &headers)
+    blob_transport::serve_blob_head(read, &headers).inspect_err(log_blob_transport_internal)
 }
 
 fn parse_blob_read_query(
@@ -956,7 +956,7 @@ async fn read_blob_for_delivery(
     query: BlobReadQuery,
 ) -> std::result::Result<omnigraph::BlobRead, ApiError> {
     let target =
-        resolve_authorized_read_target_classified(handle, actor, query.branch, query.snapshot)
+        resolve_authorized_read_target_with_cause(handle, actor, query.branch, query.snapshot)
             .await
             .map_err(|(mapped, cause)| redact_blob_api_error(mapped, "target", cause))?;
     let entity = match query.entity {
@@ -982,8 +982,22 @@ async fn read_blob_for_delivery(
 /// graph-level Blob surface. Selector/auth/not-found failures retain their
 /// typed client disposition; every pre-header internal failure is redacted.
 fn map_blob_read_error(error: OmniError) -> ApiError {
-    let cause = blob_transport::RedactedCause::of(&error);
-    redact_blob_api_error(ApiError::from_omni(error), "cell", Some(cause))
+    let (mapped, cause) = engine_error_with_cause(error);
+    redact_blob_api_error(mapped, "cell", cause)
+}
+
+/// Log a 500 the transport built itself before response headers. Its message
+/// describes the server's own refusal and holds no engine text, so the
+/// response is returned as built.
+fn log_blob_transport_internal(refused: &ApiError) {
+    if refused.status == StatusCode::INTERNAL_SERVER_ERROR {
+        error!(
+            error_kind = "blob_pre_header_internal",
+            stage = "transport",
+            error_variant = "unclassified",
+            "Blob delivery failed before response headers"
+        );
+    }
 }
 
 /// Redact a pre-header internal failure. The log carries the stage and the
@@ -1395,7 +1409,7 @@ pub(crate) async fn resolve_authorized_read_target(
     branch: Option<String>,
     snapshot: Option<String>,
 ) -> std::result::Result<ReadTarget, ApiError> {
-    resolve_authorized_read_target_classified(handle, actor, branch, snapshot)
+    resolve_authorized_read_target_with_cause(handle, actor, branch, snapshot)
         .await
         .map_err(|(mapped, _)| mapped)
 }
@@ -1404,7 +1418,7 @@ pub(crate) async fn resolve_authorized_read_target(
 /// an engine failure beside the mapped error, so a redacting caller can log
 /// the class the mapping discards. Refusals that are not engine failures
 /// carry no class.
-async fn resolve_authorized_read_target_classified(
+async fn resolve_authorized_read_target_with_cause(
     handle: &GraphHandle,
     actor: Option<&AuthenticatedActor>,
     branch: Option<String>,
@@ -1425,7 +1439,7 @@ async fn resolve_authorized_read_target_classified(
             .resolved_branch_of(target.clone())
             .await
             .map(|branch| branch.or_else(|| Some("main".to_string())))
-            .map_err(classified_engine_error)?,
+            .map_err(engine_error_with_cause)?,
         ReadTarget::Snapshot(_) => None,
     };
     authorize_request(
@@ -1441,7 +1455,7 @@ async fn resolve_authorized_read_target_classified(
     Ok(target)
 }
 
-fn classified_engine_error(error: OmniError) -> (ApiError, Option<blob_transport::RedactedCause>) {
+fn engine_error_with_cause(error: OmniError) -> (ApiError, Option<blob_transport::RedactedCause>) {
     let cause = blob_transport::RedactedCause::of(&error);
     (ApiError::from_omni(error), Some(cause))
 }
@@ -3251,6 +3265,18 @@ mod blob_error_tests {
             manifest_wrapper: Some(Arc::new(CatalogReadFault)),
             ..Default::default()
         };
+        // Positive control: the engine error text names the bucket, so the
+        // absence checks below test the redaction, not an already-clean error.
+        let raw = omnigraph::instrumentation::with_query_io_probes(
+            probes.clone(),
+            handle.engine.resolved_branch_of(read_target_from_request(
+                None,
+                Some(snapshot.as_str().to_string()),
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert!(raw.to_string().contains("private-bucket"), "{raw}");
         let response = omnigraph::instrumentation::with_query_io_probes(
             probes,
             read_blob_for_delivery(&handle, Some(&actor), query()),

@@ -542,19 +542,23 @@ async fn read_chunk(
     permits: Arc<Semaphore>,
     range: Range<u64>,
 ) -> Result<Bytes, io::Error> {
-    let permit = permits
-        .acquire_owned()
-        .await
-        .map_err(|_| io::Error::other("managed Blob response byte budget closed unexpectedly"))?;
     let start = range.start;
     let end = range.end;
+    let permit = permits.acquire_owned().await.map_err(|_| {
+        tracing::error!(
+            error_kind = "blob_payload_permit_closed",
+            range_start = start,
+            range_end = end,
+            "managed Blob response byte budget closed unexpectedly"
+        );
+        io::Error::other("managed Blob response byte budget closed unexpectedly")
+    })?;
     let expected = end - start;
     let bytes = reader.read_range(range).await.map_err(|error| {
         // Engine/storage errors can contain physical object paths or
         // credentials. Neither logs nor the HTTP body may expose them: log
-        // only the error's class, then drop the error unread.
+        // only the error's class, never its text.
         let cause = RedactedCause::of(&error);
-        drop(error);
         tracing::error!(
             error_kind = "blob_payload_read",
             error_variant = cause.variant,
@@ -568,6 +572,14 @@ async fn read_chunk(
     })?;
     let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     if actual != expected {
+        tracing::error!(
+            error_kind = "blob_payload_short_read",
+            range_start = start,
+            range_end = end,
+            returned_bytes = actual,
+            expected_bytes = expected,
+            "managed Blob range returned an unexpected byte count"
+        );
         return Err(io::Error::other(format!(
             "managed Blob range returned {actual} bytes; expected {expected}"
         )));
@@ -1065,6 +1077,61 @@ mod tests {
         for leaked in ["private-bucket", "physical/object", "s3://"] {
             assert!(!logs.contains(leaked), "log leaked {leaked}: {logs}");
         }
+    }
+
+    #[derive(Clone)]
+    struct ShortReader;
+
+    impl RangeReader for ShortReader {
+        fn read_range(&self, _range: Range<u64>) -> BoxFuture<'static, Result<Bytes, OmniError>> {
+            Box::pin(async { Ok(Bytes::from_static(b"x")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn short_read_logs_the_range_and_both_byte_counts() {
+        let capture = crate::test_log_capture::Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("info"));
+        let error = read_chunk(
+            Arc::new(ShortReader),
+            Arc::new(Semaphore::new(BLOB_BODY_MAX_RETAINED_CHUNKS)),
+            4..7,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "managed Blob range returned 1 bytes; expected 3"
+        );
+
+        let logs = capture.output();
+        for expected in [
+            r#"error_kind="blob_payload_short_read""#,
+            "range_start=4",
+            "range_end=7",
+            "returned_bytes=1",
+            "expected_bytes=3",
+        ] {
+            assert!(logs.contains(expected), "missing {expected}: {logs}");
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_permit_semaphore_logs_its_kind() {
+        let capture = crate::test_log_capture::Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("info"));
+        let permits = Arc::new(Semaphore::new(BLOB_BODY_MAX_RETAINED_CHUNKS));
+        permits.close();
+        let reader = FakeReader::default();
+        let calls = Arc::clone(&reader.calls);
+        read_chunk(Arc::new(reader), permits, 0..1)
+            .await
+            .unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let logs = capture.output();
+        let expected = r#"error_kind="blob_payload_permit_closed""#;
+        assert!(logs.contains(expected), "missing {expected}: {logs}");
     }
 
     #[test]

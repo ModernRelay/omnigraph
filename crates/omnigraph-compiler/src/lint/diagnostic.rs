@@ -58,7 +58,7 @@ impl Family {
 /// Tier classification for a schema-lint rule. Plan output shows it beside
 /// the code of an `UnsupportedChange` step
 /// (`SchemaMigrationStep::diagnostic`); apply refuses those steps whatever
-/// their tier, and no flag or option unlocks one:
+/// their tier:
 /// - `Safe`: would apply without a scan.
 /// - `Validated`: would require a single-pass scan of existing entities.
 /// - `Destructive`: would lose data or narrow values.

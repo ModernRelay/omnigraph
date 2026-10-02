@@ -209,8 +209,11 @@ Prefer relative paths; they are what keep a bundle portable and hermetic.
 | `import` | state only | Adopt existing declared resources |
 | `force-unlock` | yes | Remove one proven-stale lock by exact ID |
 
-`apply` can create graphs, apply supported soft schema changes, publish query
+`apply` can create graphs, apply supported schema changes, publish query
 and policy resources, and execute approved graph deletion. It does not load
-graph data, start servers, or perform hard schema drops.
+graph data or start servers. A schema drop removes the data from the branch
+head and reclaims nothing at apply; `omnigraph cleanup` is the step that makes
+it unrecoverable. The plan shows such a step as `drop_property` or `drop_type`,
+with no mode.
 
 See [Operating a cluster](index.md) for the end-to-end workflow.

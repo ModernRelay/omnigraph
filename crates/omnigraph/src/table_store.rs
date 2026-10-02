@@ -3373,7 +3373,7 @@ impl TableStore {
         // ids, then take and materialize each exact matched row. The per-row
         // `take_rows` is a redundant second read, not a substrate
         // requirement: Lance 11 returns Blob-v2 descriptors with stable row
-        // ids from one filtered scan (pinned by the lance_surface_guards test
+        // ids from a fragment-restricted scan (pinned by the lance_surface_guards test
         // `filtered_scan_projects_blob_descriptors_on_indexed_multi_fragment_table`).
         // It is kept because the one-row materialization bounds payload
         // allocation and accounting per row; the stream normalizer below then
@@ -3461,8 +3461,8 @@ impl TableStore {
     /// and defeat the certified path. Stable row ids are selected through
     /// ordinary columns, then one exact descriptor row is taken at a time.
     /// That second read is redundant, not a substrate requirement: Lance 11
-    /// returns Blob-v2 descriptors with stable row ids from one filtered scan
-    /// (pinned by the lance_surface_guards test
+    /// returns Blob-v2 descriptors with stable row ids from a
+    /// fragment-restricted scan (pinned by the lance_surface_guards test
     /// `filtered_scan_projects_blob_descriptors_on_indexed_multi_fragment_table`).
     /// The one-row shape is kept for bounded accounting: URI limits are
     /// charged before the selection retains a copy, and no payload or

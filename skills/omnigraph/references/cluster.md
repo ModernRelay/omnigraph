@@ -64,9 +64,10 @@ omnigraph-server --cluster . --bind 127.0.0.1:8080 --unauthenticated  # serve (l
 - **`apply` creates graphs** at `graphs/<id>.omni` — there is no separate
   `omnigraph init` in cluster mode.
 - **Schema changes**: edit the `.pg`, `plan` shows the engine's real migration
-  steps (`add_property`, `drop_property [soft]`, `unsupported: …`), `apply`
-  migrates the live graph. **Soft drops only** — data-loss migrations are not
-  reachable from cluster apply (prior versions retain dropped columns).
+  steps (`add_property`, `drop_property`, `unsupported: …`), `apply`
+  migrates the live graph. **Drops reclaim nothing at apply** — a drop removes
+  the data from the branch head; older commits still read it until
+  `omnigraph cleanup` stops retaining them, and only then is it gone for good.
 - **Applied = serving on the next server restart.** No hot reload.
 - **`storage: s3://bucket/prefix`** (optional) puts the entire cluster — state
   ledger, lock, content-addressed catalog, recovery sidecars, approval

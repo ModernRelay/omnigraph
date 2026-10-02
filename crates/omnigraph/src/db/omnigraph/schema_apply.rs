@@ -72,10 +72,7 @@ fn table_identity_for_schema_key(
 }
 
 /// Plan a migration to `desired_schema_source`. A drop step reclaims nothing
-/// at apply: the prior table versions stay pinned by retained `__manifest`
-/// versions, so older graph commits still read the dropped data until
-/// `omnigraph cleanup` stops retaining them and the engine collector
-/// reclaims their files.
+/// at apply; see `SchemaMigrationStep::DropType` and `DropProperty`.
 pub(super) async fn plan_schema(
     db: &Omnigraph,
     desired_schema_source: &str,
@@ -263,8 +260,8 @@ where
     let mut added_tables = BTreeSet::new();
     // Resolve every rename before classifying dependent property steps. The
     // planner currently emits RenameType first, but correctness must not depend
-    // on step ordering: a same-apply rename + property drop still cleans
-    // the source incarnation captured under its old alias.
+    // on step ordering: a same-apply rename + property drop still routes the
+    // rewrite to the source table captured under its old alias.
     let renamed_tables = plan
         .steps
         .iter()
@@ -371,32 +368,22 @@ where
                 // stage_overwrite rewrite path. batch_for_schema_apply_rewrite
                 // iterates the *target* schema fields, so a property
                 // absent from desired_catalog is naturally projected
-                // away in the rebuilt batch.
-                //
-                // Nothing is reclaimed after the publish: the
-                // prior table version keeps the dropped column and stays
-                // pinned by the older `__manifest` versions, so reads at
-                // snapshot_at_graph_manifest_version(pre_drop) still see it
-                // until `omnigraph cleanup` stops retaining those commits.
+                // away in the rebuilt batch. Nothing is reclaimed after the
+                // publish; see `SchemaMigrationStep::DropProperty`.
                 let table_key = schema_table_key(*type_kind, type_name);
                 if table_key.starts_with("edge:") {
                     changed_edge_tables = true;
                 }
                 rewritten_tables.insert(table_key);
             }
-            SchemaMigrationStep::DropType {
-                type_kind, name, ..
-            } => {
+            SchemaMigrationStep::DropType { type_kind, name } => {
                 if matches!(type_kind, SchemaTypeKind::Interface) {
                     continue;
                 }
                 // A type drop tombstones the table's entry in
                 // the current __manifest version (no per-table write).
-                // Nothing is reclaimed after the publish: prior
-                // __manifest versions still pin the dataset's versions, so
-                // snapshots and branch-from-snapshot read the dropped table
-                // until `omnigraph cleanup` stops retaining those commits
-                // and the engine collector reclaims the files.
+                // Nothing is reclaimed after the publish; see
+                // `SchemaMigrationStep::DropType`.
                 let table_key = schema_table_key(*type_kind, name);
                 if table_key.starts_with("edge:") {
                     changed_edge_tables = true;
@@ -473,9 +460,7 @@ where
         }
     }
     // A DropType tombstones the table's manifest entry at
-    // version+1 with no per-table write. The dataset files stay reachable
-    // through older manifest versions until `omnigraph cleanup` stops
-    // retaining them.
+    // version+1 with no per-table write.
     for dropped_table_key in &dropped_tables {
         let entry = snapshot.dataset(dropped_table_key).ok_or_else(|| {
             OmniError::manifest(format!("missing table '{}' for drop", dropped_table_key))

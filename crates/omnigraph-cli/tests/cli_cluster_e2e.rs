@@ -283,11 +283,12 @@ node Person {
             .as_array()
             .unwrap()
             .iter()
-            .any(|step| step["kind"] == "drop_property" && step["mode"] == "soft"),
+            .any(|step| step["kind"] == "drop_property"),
         "{plan}"
     );
     // ...and apply converges the live schema back (axiom 8: drift correction
-    // is gated like any change; a soft migration is the recoverable tier).
+    // is gated like any change; a drop reclaims nothing at apply, so it is the
+    // recoverable tier).
     let converge = cluster_json(temp.path(), "apply");
     assert_eq!(converge["ok"], true, "{converge}");
     assert_eq!(converge["converged"], true, "{converge}");
@@ -299,7 +300,7 @@ node Person {
     );
     assert!(
         !stdout_string(&schema_show).contains("bio"),
-        "out-of-band field soft-dropped back to desired"
+        "out-of-band field dropped back to desired"
     );
     let replan = cluster_json(temp.path(), "plan");
     assert!(replan["changes"].as_array().unwrap().is_empty(), "{replan}");

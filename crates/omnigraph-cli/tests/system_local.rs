@@ -2184,7 +2184,7 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
     );
     assert!(
         !shown.contains("rogue"),
-        "drift must be soft-dropped back to the declared schema: {shown}"
+        "drift must be dropped back to the declared schema: {shown}"
     );
 
     // Retire engineering: gated delete, then the server serves the survivor.
