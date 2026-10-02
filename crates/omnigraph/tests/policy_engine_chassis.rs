@@ -23,7 +23,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use omnigraph::Session;
-use omnigraph::db::{Omnigraph, ReadTarget, SchemaApplyOptions};
+use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::loader::LoadMode;
 use omnigraph_policy::{PolicyChecker, PolicyEngine};
@@ -130,9 +130,7 @@ async fn apply_schema_as_denies_when_policy_rejects_actor() {
     let (db, _engine) = init_with_policy(&dir).await;
 
     let desired = additive_schema();
-    let result = db
-        .apply_schema_as(&desired, SchemaApplyOptions::default(), Some("act-denied"))
-        .await;
+    let result = db.apply_schema_as(&desired, Some("act-denied")).await;
 
     match result {
         Err(OmniError::Policy(msg)) => {
@@ -153,7 +151,7 @@ async fn apply_schema_as_allows_when_policy_permits_actor() {
 
     let desired = additive_schema();
     let result = db
-        .apply_schema_as(&desired, SchemaApplyOptions::default(), Some("act-allowed"))
+        .apply_schema_as(&desired, Some("act-allowed"))
         .await
         .expect("act-allowed should be able to SchemaApply");
     assert!(result.applied);

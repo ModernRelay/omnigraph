@@ -1221,13 +1221,6 @@ pub struct SchemaApplyRequest {
         example = "node Person {\n    name: String @key\n    age: I32?\n}\n\nedge Knows: Person -> Person"
     )]
     pub schema_source: String,
-    /// When true, promote every `DropMode::Soft` step in the plan to
-    /// `DropMode::Hard`, recording destructive intent in the plan.
-    /// Neither mode reclaims storage at apply: older commits still read
-    /// the dropped data until `omnigraph cleanup` stops retaining them.
-    /// Matches the CLI's `--allow-data-loss` flag. Defaults to `false`.
-    #[serde(default)]
-    pub allow_data_loss: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

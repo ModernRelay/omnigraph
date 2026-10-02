@@ -3014,7 +3014,7 @@ async fn cleanup_reclaims_dead_incarnation_fork_of_live_branch() {
     .unwrap();
     assert!(
         old_tree.exists(),
-        "soft drop must preserve the old physical incarnation"
+        "a type drop must preserve the old physical incarnation"
     );
     db.apply_schema(TEST_SCHEMA).await.unwrap();
     let replacement_uri = node_table_uri(&db, "Company").await;

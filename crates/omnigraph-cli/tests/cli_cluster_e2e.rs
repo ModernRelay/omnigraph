@@ -274,7 +274,7 @@ node Person {
         "drifted"
     );
     // ...the plan proposes converging back to desired, with a migration
-    // preview (a soft drop of the out-of-band field)...
+    // preview (a drop of the out-of-band field)...
     let plan = cluster_json(temp.path(), "plan");
     let schema_change = change_for(&plan, "schema.knowledge");
     assert_eq!(schema_change["disposition"], "applied", "{plan}");

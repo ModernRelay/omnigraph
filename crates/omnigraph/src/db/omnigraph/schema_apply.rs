@@ -6,42 +6,6 @@ use futures::TryStreamExt;
 const SCHEMA_BLOB_DESCRIPTOR_SCAN_ROWS: usize = 1024;
 const SCHEMA_BLOB_DESCRIPTOR_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Operator-supplied options that gate schema-apply behavior.
-///
-/// Today the only knob is `allow_data_loss`. Drops plan as
-/// `DropMode::Soft` by default; `allow_data_loss` promotes them to
-/// `DropMode::Hard`, recording the operator's intent in the plan. Apply
-/// executes both modes the same way, and neither reclaims storage:
-/// the prior table versions stay pinned by retained `__manifest` versions,
-/// so older graph commits still read the dropped data, until
-/// `omnigraph cleanup` stops retaining them (for example `--keep 1`) and
-/// the engine collector reclaims their files.
-#[derive(Debug, Clone, Default)]
-pub struct SchemaApplyOptions {
-    /// Allow destructive (data-loss) schema changes: the planner promotes
-    /// every `DropMode::Soft` step to `DropMode::Hard`. Apply reclaims
-    /// nothing; `omnigraph cleanup` does once it stops retaining the
-    /// commits before the drop.
-    pub allow_data_loss: bool,
-}
-
-/// Promote every `Soft` drop variant in the plan to `Hard` when
-/// `allow_data_loss` is set. Idempotent on non-drop steps.
-fn promote_drops_to_hard(plan: &mut SchemaMigrationPlan, allow_data_loss: bool) {
-    if !allow_data_loss {
-        return;
-    }
-    for step in &mut plan.steps {
-        match step {
-            SchemaMigrationStep::DropType { mode, .. }
-            | SchemaMigrationStep::DropProperty { mode, .. } => {
-                *mode = DropMode::Hard;
-            }
-            _ => {}
-        }
-    }
-}
-
 fn resolve_desired_schema_ir(
     accepted_ir: &SchemaIR,
     desired_schema_source: &str,
@@ -107,17 +71,19 @@ fn table_identity_for_schema_key(
     crate::db::manifest::TableIdentity::new(type_id, incarnation_id)
 }
 
+/// Plan a migration to `desired_schema_source`. A drop step reclaims nothing
+/// at apply: the prior table versions stay pinned by retained `__manifest`
+/// versions, so older graph commits still read the dropped data until
+/// `omnigraph cleanup` stops retaining them and the engine collector
+/// reclaims their files.
 pub(super) async fn plan_schema(
     db: &Omnigraph,
     desired_schema_source: &str,
-    options: SchemaApplyOptions,
 ) -> Result<SchemaMigrationPlan> {
     let accepted_ir = accepted_ir_for_planning(db).await?;
     let desired_ir = resolve_desired_schema_ir(&accepted_ir, desired_schema_source)?;
-    let mut plan = plan_schema_migration(&accepted_ir, &desired_ir)
-        .map_err(|err| OmniError::manifest(err.to_string()))?;
-    promote_drops_to_hard(&mut plan, options.allow_data_loss);
-    Ok(plan)
+    plan_schema_migration(&accepted_ir, &desired_ir)
+        .map_err(|err| OmniError::manifest(err.to_string()))
 }
 
 /// The accepted IR a plan is made against: the contract of the live view the
@@ -140,10 +106,9 @@ struct PlannedSchemaApply {
 async fn plan_schema_for_apply(
     db: &Omnigraph,
     desired_schema_source: &str,
-    options: SchemaApplyOptions,
 ) -> Result<PlannedSchemaApply> {
     let accepted_ir = accepted_ir_for_planning(db).await?;
-    plan_schema_for_apply_from_accepted(db, desired_schema_source, options, &accepted_ir).await
+    plan_schema_for_apply_from_accepted(db, desired_schema_source, &accepted_ir).await
 }
 
 decide_seam! {
@@ -164,7 +129,6 @@ decide_seam! {
 async fn plan_schema_for_apply_from_accepted(
     db: &Omnigraph,
     desired_schema_source: &str,
-    options: SchemaApplyOptions,
     accepted_ir: &SchemaIR,
 ) -> Result<PlannedSchemaApply> {
     let branches = db.coordinator.read().await.all_branches().await?;
@@ -180,9 +144,8 @@ async fn plan_schema_for_apply_from_accepted(
     }
 
     let desired_ir = resolve_desired_schema_ir(accepted_ir, desired_schema_source)?;
-    let mut plan = plan_schema_migration(accepted_ir, &desired_ir)
+    let plan = plan_schema_migration(accepted_ir, &desired_ir)
         .map_err(|err| OmniError::manifest(err.to_string()))?;
-    promote_drops_to_hard(&mut plan, options.allow_data_loss);
     if !plan.supported {
         let message = plan
             .steps
@@ -204,9 +167,8 @@ async fn plan_schema_for_apply_from_accepted(
 pub(super) async fn preview_schema_apply(
     db: &Omnigraph,
     desired_schema_source: &str,
-    options: SchemaApplyOptions,
 ) -> Result<SchemaApplyPreview> {
-    let planned = plan_schema_for_apply(db, desired_schema_source, options).await?;
+    let planned = plan_schema_for_apply(db, desired_schema_source).await?;
     Ok(SchemaApplyPreview {
         plan: planned.plan,
         catalog: planned.desired_catalog,
@@ -216,7 +178,6 @@ pub(super) async fn preview_schema_apply(
 pub(super) async fn apply_schema<F>(
     db: &Omnigraph,
     desired_schema_source: &str,
-    options: SchemaApplyOptions,
     actor: Option<&str>,
     validate_catalog: F,
 ) -> Result<SchemaApplyResult>
@@ -248,13 +209,12 @@ where
     let _export_exclusion = db.reserve_export_destructive_control()?;
 
     let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
-    apply_schema_with_lock(db, desired_schema_source, options, actor, validate_catalog).await
+    apply_schema_with_lock(db, desired_schema_source, actor, validate_catalog).await
 }
 
 pub(super) async fn apply_schema_with_lock<F>(
     db: &Omnigraph,
     desired_schema_source: &str,
-    options: SchemaApplyOptions,
     actor: Option<&str>,
     validate_catalog: F,
 ) -> Result<SchemaApplyResult>
@@ -273,10 +233,9 @@ where
     let accepted_ir = accepted_catalog.bound_schema_ir().cloned().ok_or_else(|| {
         OmniError::manifest_internal("accepted catalog carries no bound SchemaIR")
     })?;
-    let planned =
-        plan_schema_for_apply_from_accepted(db, desired_schema_source, options, &accepted_ir)
-            .await
-            .map_err(OmniError::before_effect)?;
+    let planned = plan_schema_for_apply_from_accepted(db, desired_schema_source, &accepted_ir)
+        .await
+        .map_err(OmniError::before_effect)?;
     validate_catalog(&planned.desired_catalog)?;
     let PlannedSchemaApply {
         plan,
@@ -304,7 +263,7 @@ where
     let mut added_tables = BTreeSet::new();
     // Resolve every rename before classifying dependent property steps. The
     // planner currently emits RenameType first, but correctness must not depend
-    // on step ordering: a same-apply rename + hard property drop still cleans
+    // on step ordering: a same-apply rename + property drop still cleans
     // the source incarnation captured under its old alias.
     let renamed_tables = plan
         .steps
@@ -408,13 +367,13 @@ where
                 if matches!(type_kind, SchemaTypeKind::Interface) {
                     continue;
                 }
-                // Both Soft and Hard route through the existing
+                // A property drop routes through the existing
                 // stage_overwrite rewrite path. batch_for_schema_apply_rewrite
                 // iterates the *target* schema fields, so a property
                 // absent from desired_catalog is naturally projected
                 // away in the rebuilt batch.
                 //
-                // Neither mode reclaims anything after the publish: the
+                // Nothing is reclaimed after the publish: the
                 // prior table version keeps the dropped column and stays
                 // pinned by the older `__manifest` versions, so reads at
                 // snapshot_at_graph_manifest_version(pre_drop) still see it
@@ -431,9 +390,9 @@ where
                 if matches!(type_kind, SchemaTypeKind::Interface) {
                     continue;
                 }
-                // Both Soft and Hard tombstone the table's entry in
+                // A type drop tombstones the table's entry in
                 // the current __manifest version (no per-table write).
-                // Neither reclaims anything after the publish: prior
+                // Nothing is reclaimed after the publish: prior
                 // __manifest versions still pin the dataset's versions, so
                 // snapshots and branch-from-snapshot read the dropped table
                 // until `omnigraph cleanup` stops retaining those commits
@@ -513,7 +472,7 @@ where
             )));
         }
     }
-    // Soft and hard DropType tombstone the table's manifest entry at
+    // A DropType tombstones the table's manifest entry at
     // version+1 with no per-table write. The dataset files stay reachable
     // through older manifest versions until `omnigraph cleanup` stops
     // retaining them.
@@ -535,7 +494,7 @@ where
     // Complete effect envelope: the outer `apply_schema` already holds the
     // graph-wide schema gate, so add main's branch gate and every live table
     // gate in the shared schema -> branch -> sorted-table order. Schema apply
-    // is graph-global (including metadata-only changes and hard drops), so a
+    // is graph-global (including metadata-only changes and type drops), so a
     // rewrite-only subset is not a sufficient envelope.
     let schema_apply_queue_keys: Vec<(String, Option<String>)> = snapshot
         .datasets()

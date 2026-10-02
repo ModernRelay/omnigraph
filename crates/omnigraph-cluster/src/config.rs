@@ -551,7 +551,7 @@ pub(crate) async fn preview_schema_migration(
         .await
         .map_err(|err| err.to_string())?;
     let preview = db
-        .preview_schema_apply_with_options(&source, SchemaApplyOptions::default())
+        .preview_schema_apply(&source)
         .await
         .map_err(|err| err.to_string())?;
     Ok(preview.plan)

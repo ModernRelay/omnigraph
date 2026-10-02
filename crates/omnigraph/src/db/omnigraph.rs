@@ -13,8 +13,8 @@ use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::types::{PropType, ScalarType};
 use omnigraph_compiler::{
-    DropMode, SchemaIR, SchemaIdentityDomain, SchemaMigrationPlan, SchemaMigrationStep,
-    SchemaShape, SchemaTypeKind, SystemColumns, build_catalog_from_ir, compile_schema_shape,
+    SchemaIR, SchemaIdentityDomain, SchemaMigrationPlan, SchemaMigrationStep, SchemaShape,
+    SchemaTypeKind, SystemColumns, build_catalog_from_ir, compile_schema_shape,
     initialize_schema_ir, plan_schema_migration,
 };
 
@@ -52,7 +52,6 @@ pub use optimize::{CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeSta
 pub use repair::{
     DatasetRepairStats, RepairAction, RepairClassification, RepairOptions, RepairStats,
 };
-pub use schema_apply::SchemaApplyOptions;
 pub use system_column_upgrade::{
     SYSTEM_COLUMNS_PREFLIGHT, SystemColumnUpgradeFinding, SystemColumnUpgradeOptions,
     SystemColumnUpgradeOutcome, SystemColumnUpgradeReport,
@@ -1129,38 +1128,18 @@ impl Omnigraph {
     }
 
     pub async fn plan_schema(&self, desired_schema_source: &str) -> Result<SchemaMigrationPlan> {
-        self.plan_schema_with_options(desired_schema_source, SchemaApplyOptions::default())
-            .await
+        schema_apply::plan_schema(self, desired_schema_source).await
     }
 
-    pub async fn plan_schema_with_options(
+    pub async fn preview_schema_apply(
         &self,
         desired_schema_source: &str,
-        options: SchemaApplyOptions,
-    ) -> Result<SchemaMigrationPlan> {
-        schema_apply::plan_schema(self, desired_schema_source, options).await
-    }
-
-    pub async fn preview_schema_apply_with_options(
-        &self,
-        desired_schema_source: &str,
-        options: SchemaApplyOptions,
     ) -> Result<SchemaApplyPreview> {
-        schema_apply::preview_schema_apply(self, desired_schema_source, options).await
+        schema_apply::preview_schema_apply(self, desired_schema_source).await
     }
 
     pub async fn apply_schema(&self, desired_schema_source: &str) -> Result<SchemaApplyResult> {
-        self.apply_schema_as(desired_schema_source, SchemaApplyOptions::default(), None)
-            .await
-    }
-
-    pub async fn apply_schema_with_options(
-        &self,
-        desired_schema_source: &str,
-        options: SchemaApplyOptions,
-    ) -> Result<SchemaApplyResult> {
-        self.apply_schema_as(desired_schema_source, options, None)
-            .await
+        self.apply_schema_as(desired_schema_source, None).await
     }
 
     /// Apply a schema migration with an explicit actor for engine-layer
@@ -1169,17 +1148,16 @@ impl Omnigraph {
     /// Branch("main"), actor)` before any apply work happens. Denial
     /// returns `OmniError::Policy` and leaves the manifest untouched.
     ///
-    /// The no-actor variants (`apply_schema`, `apply_schema_with_options`)
-    /// pass `None` here. They work fine without a policy; if a policy IS
-    /// installed and actor is None, enforcement intentionally fails to
-    /// prevent silent-bypass-via-forgetting-the-actor footguns.
+    /// The no-actor variant (`apply_schema`) passes `None` here. It works
+    /// without a policy; if a policy IS installed and actor is None,
+    /// enforcement intentionally fails to prevent
+    /// silent-bypass-via-forgetting-the-actor footguns.
     pub async fn apply_schema_as(
         &self,
         desired_schema_source: &str,
-        options: SchemaApplyOptions,
         actor: Option<&str>,
     ) -> Result<SchemaApplyResult> {
-        self.apply_schema_as_with_catalog_check(desired_schema_source, options, actor, |_| Ok(()))
+        self.apply_schema_as_with_catalog_check(desired_schema_source, actor, |_| Ok(()))
             .await
     }
 
@@ -1203,21 +1181,13 @@ impl Omnigraph {
     pub async fn apply_schema_as_with_catalog_check<F>(
         &self,
         desired_schema_source: &str,
-        options: SchemaApplyOptions,
         actor: Option<&str>,
         validate_catalog: F,
     ) -> Result<SchemaApplyResult>
     where
         F: FnOnce(&Catalog) -> Result<()>,
     {
-        schema_apply::apply_schema(
-            self,
-            desired_schema_source,
-            options,
-            actor,
-            validate_catalog,
-        )
-        .await
+        schema_apply::apply_schema(self, desired_schema_source, actor, validate_catalog).await
     }
 
     /// Engine-facing trait surface around `TableStore`.

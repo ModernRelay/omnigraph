@@ -94,10 +94,10 @@ in `Location`; it does not fetch, sign, authorize, or proxy the object.
 ## Lifecycle
 
 A reader stays pinned to the snapshot selected when it opens. Explicit
-`cleanup` (including table forks left by a deleted branch) and
-`schema apply --allow-data-loss` can reclaim bytes needed by a long read, so
-quiesce such readers first; branch deletion alone defers reclamation to
-`cleanup`. Blob-aware compaction is supported.
+`cleanup` (including table forks left by a deleted branch) can reclaim bytes
+needed by a long read, so quiesce such readers first; branch deletion and
+schema drops alone defer reclamation to `cleanup`. Blob-aware compaction is
+supported.
 
 Historical identity fails closed: if a rename, drop/re-add, or branch lifetime
 does not prove that a historical property is the same logical Blob property,

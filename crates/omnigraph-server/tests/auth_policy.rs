@@ -117,7 +117,6 @@ async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() 
             .body(Body::from(
                 serde_json::to_vec(&SchemaApplyRequest {
                     schema_source: fs::read_to_string(fixture("test.pg")).unwrap(),
-                    ..Default::default()
                 })
                 .unwrap(),
             ))
@@ -2110,7 +2109,6 @@ async fn default_deny_mode_rejects_schema_apply_with_forbidden() {
 
     let req = SchemaApplyRequest {
         schema_source: additive_schema_with_nickname(),
-        ..Default::default()
     };
     let (status, body) = json_response(
         &app,

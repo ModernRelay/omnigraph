@@ -1992,8 +1992,10 @@ pub(crate) async fn server_schema_get(
 ///
 /// Diffs `schema_source` against the current schema and applies the resulting
 /// migration steps (add/drop type, add/drop property, etc.). **Destructive**:
-/// some steps drop data. Returns the list of steps applied; if `applied` is
-/// false the diff was unsupported and no changes were made.
+/// a drop removes data from the branch head; older commits keep reading it
+/// until `omnigraph cleanup` stops retaining them. Returns the list of steps
+/// applied; if `applied` is false the diff was unsupported and no changes
+/// were made.
 pub(crate) async fn server_schema_apply(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
@@ -2047,9 +2049,6 @@ pub(crate) async fn server_schema_apply(
             // the redundancy.
             db.apply_schema_as_with_catalog_check(
                 &request.schema_source,
-                omnigraph::db::SchemaApplyOptions {
-                    allow_data_loss: request.allow_data_loss,
-                },
                 actor_id.as_deref(),
                 |catalog| {
                     if let Some(registry) = registry {

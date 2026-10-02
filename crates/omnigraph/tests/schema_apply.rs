@@ -85,10 +85,7 @@ async fn plan_schema_reports_supported_additive_change() {
         } if type_name == "Person" && property_name == "nickname"
     )));
 
-    let preview = db
-        .preview_schema_apply_with_options(&desired, omnigraph::db::SchemaApplyOptions::default())
-        .await
-        .unwrap();
+    let preview = db.preview_schema_apply(&desired).await.unwrap();
     assert_eq!(preview.catalog.node_types.len(), 2);
 }
 
@@ -699,11 +696,11 @@ async fn apply_schema_unsupported_plan_does_not_advance_manifest() {
 //
 // Schema migration v1 accepts:
 // - Additive change: add type, add nullable property, add index, rename.
-// - DropProperty { Soft } via the schema-lint v1 chassis (commit #3 of MR-694)
+// - DropProperty via the schema-lint v1 chassis (commit #3 of MR-694)
 //   — the dropped column is removed from the current manifest version but
 //   remains reachable via Lance time travel at the prior version, until
-//   `omnigraph cleanup` stops retaining it. Hard mode (`--allow-data-loss`)
-//   is executed the same way; see the hard-mode tests below.
+//   `omnigraph cleanup` stops retaining it. Apply reclaims nothing; see the
+//   cleanup tests below.
 //
 // Every other destructive shape (drop type, narrow type, add required without
 // backfill, remove constraint) still returns an `UnsupportedChange` step that
@@ -712,7 +709,7 @@ async fn apply_schema_unsupported_plan_does_not_advance_manifest() {
 
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
-async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version() {
+async fn apply_schema_drops_a_nullable_property_and_preserves_prior_version() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let external_dir = tempfile::tempdir().unwrap();
@@ -806,13 +803,13 @@ node Document {
         .graph_manifest_version();
 
     // Drop `note` from Document. v1 + chassis commit #3 emit
-    // `DropProperty { Soft }`; the rewrite path projects to the
+    // `DropProperty`; the rewrite path projects to the
     // target schema (no `note`), commits via stage_overwrite. Row
     // counts are unchanged — only the column is dropped from the
     // current schema view.
     let desired = initial.replace("    note: String?\n", "");
 
-    // Confirm the plan emits DropProperty { Soft } (not UnsupportedChange).
+    // Confirm the plan emits DropProperty (not UnsupportedChange).
     let plan = db.plan_schema(&desired).await.unwrap();
     assert!(plan.supported, "drop-property plan must be supported");
     assert!(
@@ -822,11 +819,9 @@ node Document {
                 type_kind: SchemaTypeKind::Node,
                 type_name,
                 property_name,
-                mode: omnigraph_compiler::DropMode::Soft,
-                ..
             } if type_name == "Document" && property_name == "note"
         )),
-        "expected DropProperty {{ type=Document, property=note, mode=Soft }} in plan; got {plan:?}",
+        "expected DropProperty {{ type=Document, property=note }} in plan; got {plan:?}",
     );
 
     // An unrelated schema rewrite carries the descriptor, not the external
@@ -856,7 +851,7 @@ node Document {
         .graph_manifest_version();
     assert!(
         after_version > before_version,
-        "manifest version should advance after soft drop; before={before_version}, after={after_version}",
+        "manifest version should advance after the drop; before={before_version}, after={after_version}",
     );
     assert_eq!(count_rows(&db, "node:Document").await, documents_before);
 
@@ -924,11 +919,11 @@ node Document {
         .collect::<Vec<_>>();
     assert!(
         !current_fields.iter().any(|f| f == "note"),
-        "current Document dataset schema must not include 'note' after soft drop; got fields {current_fields:?}",
+        "current Document dataset schema must not include 'note' after the drop; got fields {current_fields:?}",
     );
 
     // (b) Time travel: at the pre-drop manifest version, the prior
-    // Document dataset version still has `note`. Soft drop is reversible
+    // Document dataset version still has `note`. The drop is reversible
     // via Lance's version graph until `omnigraph cleanup` runs.
     let pre_drop_snapshot = db
         .snapshot_at_graph_manifest_version(before_version)
@@ -974,7 +969,7 @@ node Document {
         "after reopen, Document dataset schema must still lack 'note'; got fields {reopened_fields:?}",
     );
 
-    // A soft drop followed by a same-name add mints a new stable property and
+    // A drop followed by a same-name add mints a new stable property and
     // a new Lance field id.  The current selector must not reinterpret the old
     // snapshot's identically-spelled Blob as that new property lifetime.
     let retired_content_snapshot = reopened.resolve_snapshot("main").await.unwrap();
@@ -1074,7 +1069,7 @@ node Document {
 
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
-async fn apply_schema_drops_node_and_referencing_edge_softly() {
+async fn apply_schema_drops_node_and_referencing_edge() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     let before_version = db
@@ -1085,7 +1080,7 @@ async fn apply_schema_drops_node_and_referencing_edge_softly() {
 
     // Drop the `Company` node type and the `WorksAt` edge that references it.
     // Per schema-lint v1 chassis commit #4 (MR-694), this emits two
-    // `DropType { Soft }` steps; apply tombstones both manifest entries.
+    // `DropType` steps; apply tombstones both manifest entries.
     // Lance dataset files are retained, so time-travel back to the
     // pre-drop manifest version still resolves both tables.
     let desired = r#"
@@ -1099,7 +1094,7 @@ edge Knows: Person -> Person {
 }
 "#;
 
-    // Confirm the plan emits both DropType { Soft } steps.
+    // Confirm the plan emits both DropType steps.
     let plan = db.plan_schema(desired).await.unwrap();
     assert!(plan.supported, "drop-type plan must be supported");
     assert!(
@@ -1108,10 +1103,9 @@ edge Knows: Person -> Person {
             SchemaMigrationStep::DropType {
                 type_kind: SchemaTypeKind::Node,
                 name,
-                mode: omnigraph_compiler::DropMode::Soft,
             } if name == "Company"
         )),
-        "expected DropType {{ Node, Company, Soft }} in plan: {plan:?}",
+        "expected DropType {{ Node, Company }} in plan: {plan:?}",
     );
     assert!(
         plan.steps.iter().any(|step| matches!(
@@ -1119,10 +1113,9 @@ edge Knows: Person -> Person {
             SchemaMigrationStep::DropType {
                 type_kind: SchemaTypeKind::Edge,
                 name,
-                mode: omnigraph_compiler::DropMode::Soft,
             } if name == "WorksAt"
         )),
-        "expected DropType {{ Edge, WorksAt, Soft }} in plan: {plan:?}",
+        "expected DropType {{ Edge, WorksAt }} in plan: {plan:?}",
     );
 
     let result = db.apply_schema(desired).await.unwrap();
@@ -1136,18 +1129,18 @@ edge Knows: Person -> Person {
         .graph_manifest_version();
     assert!(
         after_version > before_version,
-        "manifest version should advance after soft type drop; before={before_version}, after={after_version}",
+        "manifest version should advance after the type drop; before={before_version}, after={after_version}",
     );
 
     // (a) Current snapshot: both manifest entries are gone.
     let current_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     assert!(
         current_snapshot.dataset("node:Company").is_none(),
-        "current manifest must not list node:Company after soft drop",
+        "current manifest must not list node:Company after the drop",
     );
     assert!(
         current_snapshot.dataset("edge:WorksAt").is_none(),
-        "current manifest must not list edge:WorksAt after soft drop",
+        "current manifest must not list edge:WorksAt after the drop",
     );
     // Person + Knows still present (Person wasn't dropped; Knows is in desired).
     assert!(
@@ -1156,7 +1149,7 @@ edge Knows: Person -> Person {
     );
 
     // (b) Time travel: at the pre-drop manifest version, both dropped
-    // tables are still listed. Soft drop is reversible via Lance's
+    // tables are still listed. The drop is reversible via Lance's
     // version graph until `omnigraph cleanup` runs.
     let pre_drop_snapshot = db
         .snapshot_at_graph_manifest_version(before_version)
@@ -1191,7 +1184,7 @@ edge Knows: Person -> Person {
 
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
-async fn apply_schema_drops_an_edge_type_softly() {
+async fn apply_schema_drops_an_edge_type() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     let before_version = db
@@ -1201,7 +1194,7 @@ async fn apply_schema_drops_an_edge_type_softly() {
         .graph_manifest_version();
 
     // Drop only the `WorksAt` edge. Per chassis v1 commit #4, this
-    // emits `DropType { Edge, WorksAt, Soft }`; apply tombstones the
+    // emits `DropType { Edge, WorksAt }`; apply tombstones the
     // edge:WorksAt manifest entry. The Company node and Person node
     // remain intact.
     let desired = TEST_SCHEMA.replace("\nedge WorksAt: Person -> Company", "");
@@ -1214,10 +1207,9 @@ async fn apply_schema_drops_an_edge_type_softly() {
             SchemaMigrationStep::DropType {
                 type_kind: SchemaTypeKind::Edge,
                 name,
-                mode: omnigraph_compiler::DropMode::Soft,
             } if name == "WorksAt"
         )),
-        "expected DropType {{ Edge, WorksAt, Soft }} in plan: {plan:?}",
+        "expected DropType {{ Edge, WorksAt }} in plan: {plan:?}",
     );
 
     let result = db.apply_schema(&desired).await.unwrap();
@@ -1463,7 +1455,7 @@ edge WorksAt: Human -> Company
 
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
-async fn apply_schema_rename_and_hard_property_drop_cleans_source_incarnation() {
+async fn apply_schema_rename_and_property_drop_then_cleanup_reclaims_source_incarnation() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     let before_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
@@ -1485,23 +1477,11 @@ edge Knows: Human -> Human {
 
 edge WorksAt: Human -> Company
 "#;
-    let result = db
-        .apply_schema_with_options(
-            desired,
-            omnigraph::db::SchemaApplyOptions {
-                allow_data_loss: true,
-            },
-        )
-        .await
-        .unwrap();
+    let result = db.apply_schema(desired).await.unwrap();
     assert!(result.applied);
     assert!(result.steps.iter().any(|step| matches!(
         step,
-        SchemaMigrationStep::DropProperty {
-            type_name,
-            mode: omnigraph_compiler::DropMode::Hard,
-            ..
-        } if type_name == "Human"
+        SchemaMigrationStep::DropProperty { type_name, .. } if type_name == "Human"
     )));
 
     let after_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
@@ -1509,7 +1489,7 @@ edge WorksAt: Human -> Company
     assert_eq!(after.dataset_path, before.dataset_path);
     assert!(after.published_dataset_version > before.published_dataset_version);
     assert!(after_snapshot.dataset("node:Person").is_none());
-    reclaim_hard_dropped_history(&db).await;
+    reclaim_dropped_history(&db).await;
     assert!(
         db.snapshot_at_graph_manifest_version(before_manifest_version)
             .await
@@ -1517,13 +1497,13 @@ edge WorksAt: Human -> Company
             .open_dataset("node:Person")
             .await
             .is_err(),
-        "hard cleanup must reclaim the renamed source incarnation's prior version"
+        "cleanup must reclaim the renamed source incarnation's prior version"
     );
 }
 
-/// A hard drop's prior version is a pin that `cleanup` reclaims once `--keep`
+/// A drop's prior version is a pin that `cleanup` reclaims once `--keep`
 /// prunes the `__manifest` version naming it.
-async fn reclaim_hard_dropped_history(db: &Session) {
+async fn reclaim_dropped_history(db: &Session) {
     let stats = db
         .cleanup(omnigraph::db::CleanupPolicyOptions {
             keep_versions: Some(1),
@@ -1822,85 +1802,17 @@ node Anchor { name: String @key }
     assert_eq!(after.published_dataset_version, 1);
 }
 
-// ─── Hard-mode drops (--allow-data-loss) ─────────────────────────────────────
+// ─── Drops reclaim at cleanup, never at apply ────────────────────────────────
 //
-// `--allow-data-loss` promotes every `DropMode::Soft` step to `DropMode::Hard`.
-// Apply executes both modes the same way and reclaims nothing: the prior table
-// version (where a dropped column lived) stays pinned by the older
-// `__manifest` versions, so `snapshot_at_graph_manifest_version(pre_drop)`
-// still reads it. It becomes unreachable once `omnigraph cleanup --keep 1`
-// stops retaining those versions and the collector reclaims its files.
+// Apply reclaims nothing: the prior table version (where a dropped column
+// lived) stays pinned by the older `__manifest` versions, so
+// `snapshot_at_graph_manifest_version(pre_drop)` still reads it. It becomes
+// unreachable once `omnigraph cleanup --keep 1` stops retaining those versions
+// and the collector reclaims its files.
 
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
-async fn apply_schema_with_allow_data_loss_promotes_drops_to_hard() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
-
-    let desired = TEST_SCHEMA.replace("    age: I32?\n", "");
-
-    // Default plan (no flag) → Soft.
-    let plan_soft = db.plan_schema(&desired).await.unwrap();
-    assert!(plan_soft.steps.iter().any(|step| matches!(
-        step,
-        SchemaMigrationStep::DropProperty {
-            mode: omnigraph_compiler::DropMode::Soft,
-            ..
-        }
-    )));
-
-    // With --allow-data-loss → Hard.
-    let plan_hard = db
-        .plan_schema_with_options(
-            &desired,
-            omnigraph::db::SchemaApplyOptions {
-                allow_data_loss: true,
-            },
-        )
-        .await
-        .unwrap();
-    assert!(plan_hard.supported);
-    assert!(
-        plan_hard.steps.iter().any(|step| matches!(
-            step,
-            SchemaMigrationStep::DropProperty {
-                mode: omnigraph_compiler::DropMode::Hard,
-                ..
-            }
-        )),
-        "with --allow-data-loss, DropProperty should be promoted to Hard: {plan_hard:?}",
-    );
-    // Negative: no remaining Soft drops in the promoted plan.
-    assert!(
-        !plan_hard.steps.iter().any(|step| matches!(
-            step,
-            SchemaMigrationStep::DropProperty {
-                mode: omnigraph_compiler::DropMode::Soft,
-                ..
-            } | SchemaMigrationStep::DropType {
-                mode: omnigraph_compiler::DropMode::Soft,
-                ..
-            }
-        )),
-        "promoted plan should have no Soft drops left: {plan_hard:?}",
-    );
-
-    // Apply with flag succeeds.
-    let result = db
-        .apply_schema_with_options(
-            &desired,
-            omnigraph::db::SchemaApplyOptions {
-                allow_data_loss: true,
-            },
-        )
-        .await
-        .unwrap();
-    assert!(result.applied);
-}
-
-#[tokio::test]
-#[cfg_attr(feature = "failpoints", serial_test::parallel)]
-async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
+async fn apply_schema_property_drop_is_reclaimed_by_cleanup_not_apply() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     let before_version = db
@@ -1909,19 +1821,11 @@ async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
         .unwrap()
         .graph_manifest_version();
 
-    // Hard drop the `age` column. Apply rewrites the table without it and
+    // Drop the `age` column. Apply rewrites the table without it and
     // reclaims nothing; the prior version stays pinned by the pre-drop
     // `__manifest` version until cleanup stops retaining it.
     let desired = TEST_SCHEMA.replace("    age: I32?\n", "");
-    let result = db
-        .apply_schema_with_options(
-            &desired,
-            omnigraph::db::SchemaApplyOptions {
-                allow_data_loss: true,
-            },
-        )
-        .await
-        .unwrap();
+    let result = db.apply_schema(&desired).await.unwrap();
     assert!(result.applied);
 
     // Current snapshot: column gone from the dataset schema.
@@ -1935,11 +1839,11 @@ async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
         .collect::<Vec<_>>();
     assert!(
         !current_fields.iter().any(|f| f == "age"),
-        "current Person schema must not include 'age' after hard drop; got {current_fields:?}",
+        "current Person schema must not include 'age' after the drop; got {current_fields:?}",
     );
 
     // Before cleanup the pre-drop snapshot still reads the dropped column:
-    // a hard drop reclaims nothing at apply.
+    // a drop reclaims nothing at apply.
     let pre_drop = db
         .snapshot_at_graph_manifest_version(before_version)
         .await
@@ -1953,7 +1857,7 @@ async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
     // After `cleanup --keep 1` the pre-drop manifest version is no longer
     // retained, so its table version is reclaimed and the snapshot's
     // entry points at a version that no longer opens.
-    reclaim_hard_dropped_history(&db).await;
+    reclaim_dropped_history(&db).await;
     let pre_drop = db
         .snapshot_at_graph_manifest_version(before_version)
         .await
@@ -1961,92 +1865,8 @@ async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
     let open_result = pre_drop.open_dataset("node:Person").await;
     assert!(
         open_result.is_err(),
-        "after hard drop + cleanup, pre-drop snapshot.open_dataset() must fail (prior version was reclaimed); got {open_result:?}",
+        "after the drop + cleanup, pre-drop snapshot.open_dataset() must fail (prior version was reclaimed); got {open_result:?}",
     );
-}
-
-#[tokio::test]
-#[cfg_attr(feature = "failpoints", serial_test::parallel)]
-async fn apply_schema_hard_drops_node_and_edge_with_flag_succeeds() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
-    let before_version = db
-        .snapshot_of(ReadTarget::branch("main"))
-        .await
-        .unwrap()
-        .graph_manifest_version();
-
-    let desired = r#"
-node Person {
-    name: String @key
-    age: I32?
-}
-
-edge Knows: Person -> Person {
-    since: Date?
-}
-"#;
-
-    let plan = db
-        .plan_schema_with_options(
-            desired,
-            omnigraph::db::SchemaApplyOptions {
-                allow_data_loss: true,
-            },
-        )
-        .await
-        .unwrap();
-    assert!(plan.supported);
-    assert!(
-        plan.steps.iter().any(|step| matches!(
-            step,
-            SchemaMigrationStep::DropType {
-                type_kind: SchemaTypeKind::Node,
-                mode: omnigraph_compiler::DropMode::Hard,
-                ..
-            }
-        )),
-        "with --allow-data-loss, DropType {{ Node }} should be Hard: {plan:?}",
-    );
-    assert!(
-        plan.steps.iter().any(|step| matches!(
-            step,
-            SchemaMigrationStep::DropType {
-                type_kind: SchemaTypeKind::Edge,
-                mode: omnigraph_compiler::DropMode::Hard,
-                ..
-            }
-        )),
-        "with --allow-data-loss, DropType {{ Edge }} should be Hard: {plan:?}",
-    );
-
-    let result = db
-        .apply_schema_with_options(
-            desired,
-            omnigraph::db::SchemaApplyOptions {
-                allow_data_loss: true,
-            },
-        )
-        .await
-        .unwrap();
-    assert!(result.applied);
-
-    let after_version = db
-        .snapshot_of(ReadTarget::branch("main"))
-        .await
-        .unwrap()
-        .graph_manifest_version();
-    assert!(after_version > before_version);
-
-    // Current manifest: both dropped entries gone.
-    let current = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    assert!(current.dataset("node:Company").is_none());
-    assert!(current.dataset("edge:WorksAt").is_none());
-
-    // The dropped tables' versions stay pinned by the pre-drop `__manifest`
-    // versions; `omnigraph cleanup` reclaims them once it stops retaining
-    // those versions. Through the current manifest the data is already
-    // unreachable (no manifest entry).
 }
 
 // Regression (bug 3 / dev-graph iss-848): schema apply records index intent but

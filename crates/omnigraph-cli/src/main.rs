@@ -1018,12 +1018,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         },
         Command::Schema { command } => match command {
-            SchemaCommand::Plan {
-                uri,
-                schema,
-                json,
-                allow_data_loss,
-            } => {
+            SchemaCommand::Plan { uri, schema, json } => {
                 let uri = resolve_maintenance_uri(
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
@@ -1035,12 +1030,7 @@ async fn run(cli: Cli) -> Result<()> {
                 .await?;
                 let schema_source = fs::read_to_string(&schema)?;
                 let db = Omnigraph::open(&uri).await?;
-                let plan = db
-                    .plan_schema_with_options(
-                        &schema_source,
-                        omnigraph::db::SchemaApplyOptions { allow_data_loss },
-                    )
-                    .await?;
+                let plan = db.plan_schema(&schema_source).await?;
                 let output = SchemaPlanOutput {
                     uri: &uri,
                     supported: plan.supported,
@@ -1053,12 +1043,7 @@ async fn run(cli: Cli) -> Result<()> {
                     print_schema_plan_human(&uri, &plan);
                 }
             }
-            SchemaCommand::Apply {
-                uri,
-                schema,
-                json,
-                allow_data_loss,
-            } => {
+            SchemaCommand::Apply { uri, schema, json } => {
                 let client = client::GraphClient::resolve_with_policy(
                     capability,
                     cli.server.as_deref(),
@@ -1102,7 +1087,7 @@ async fn run(cli: Cli) -> Result<()> {
                 // no-op here on both arms.
                 echo_write_target(cli.quiet, "schema apply", client.uri(), client.is_remote());
                 let output = client
-                    .apply_schema(&schema_source, allow_data_loss, |_catalog| Ok(()))
+                    .apply_schema(&schema_source, |_catalog| Ok(()))
                     .await?;
                 if json {
                     print_json(&output)?;

@@ -20,27 +20,6 @@ pub enum SchemaTypeKind {
     Edge,
 }
 
-/// The operator's declared intent for a drop step's data.
-///
-/// - **`Soft`** — the default the planner emits.
-/// - **`Hard`** — the caller passed `--allow-data-loss`, which promotes
-///   every drop to `Hard`.
-///
-/// Apply executes both modes the same way: the type is tombstoned or the
-/// property is rewritten out of the current table version, and nothing is
-/// reclaimed at apply. Older graph commits keep reading the dropped data
-/// until `omnigraph cleanup` stops retaining them; after that it cannot
-/// be recovered. This is the dimension orthogonal to
-/// `SafetyTier` from the schema-lint chassis (`crate::lint`): tier
-/// describes the rule's class; mode describes the operator's intent for
-/// data treatment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DropMode {
-    Soft,
-    Hard,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SchemaMigrationPlan {
     pub supported: bool,
@@ -111,20 +90,20 @@ pub enum SchemaMigrationStep {
     },
     /// Remove a node or edge type by tombstoning its table in the catalog.
     ///
-    /// The planner emits Soft mode; apply promotes it to Hard mode when
-    /// the caller explicitly allows data loss. See [`DropMode`].
+    /// Apply reclaims nothing: older graph commits keep reading the dropped
+    /// type until `omnigraph cleanup` stops retaining them, and after that
+    /// its data cannot be recovered.
     DropType {
         type_kind: SchemaTypeKind,
         name: String,
-        mode: DropMode,
     },
     /// Remove a property from an existing type: the table is rewritten
-    /// without the column. Older table versions keep it. See [`DropMode`].
+    /// without the column. Older table versions keep it, and older graph
+    /// commits read it until `omnigraph cleanup` stops retaining them.
     DropProperty {
         type_kind: SchemaTypeKind,
         type_name: String,
         property_name: String,
-        mode: DropMode,
     },
     UnsupportedChange {
         entity: String,
@@ -491,17 +470,14 @@ fn plan_nodes(
         .iter()
         .filter(|node| !consumed.contains(&node.type_id))
     {
-        // Node type removed from the desired schema: emit Soft mode.
-        // Soft removes the table's entry from the current
-        // __manifest version; data files retained; previous manifest
-        // versions still reference the table, so older snapshots read it
-        // until `omnigraph cleanup` stops retaining those __manifest
-        // versions. Apply promotes the step to Hard mode when
-        // --allow-data-loss is set.
+        // Node type removed from the desired schema. Apply removes the
+        // table's entry from the current __manifest version and keeps its
+        // data files; previous manifest versions still reference the table,
+        // so older snapshots read it until `omnigraph cleanup` stops
+        // retaining those __manifest versions.
         steps.push(SchemaMigrationStep::DropType {
             type_kind: SchemaTypeKind::Node,
             name: leftover.name.clone(),
-            mode: DropMode::Soft,
         });
     }
 }
@@ -587,14 +563,12 @@ fn plan_edges(
         .iter()
         .filter(|edge| !consumed.contains(&edge.type_id))
     {
-        // Edge type removed from the desired schema: emit Soft mode.
-        // The mechanics match node-type drops: the manifest
-        // entry tombstoned, data files retained, reversible via Lance
-        // time travel until cleanup.
+        // Edge type removed from the desired schema. The mechanics match
+        // node-type drops: the manifest entry tombstoned, data files
+        // retained, older snapshots readable until cleanup.
         steps.push(SchemaMigrationStep::DropType {
             type_kind: SchemaTypeKind::Edge,
             name: leftover.name.clone(),
-            mode: DropMode::Soft,
         });
     }
 }
@@ -745,21 +719,17 @@ fn plan_properties(
         .iter()
         .filter(|property| !consumed.contains(&property.property_id))
     {
-        // Property removed from the desired schema: emit Soft mode.
-        // Soft mode reuses the existing
+        // Property removed from the desired schema. Apply reuses the
         // stage_overwrite rewrite path — batch_for_schema_apply_rewrite
         // iterates target_schema.fields(), so the dropped column is
         // naturally projected away. The prior table version retains
         // the column until `omnigraph cleanup` stops retaining the commits
         // that pin it, matching the OG-DS-104 destructive-tier expectation
         // that data remains recoverable via time travel until cleanup.
-        // Apply promotes the
-        // step to Hard mode when --allow-data-loss is set.
         steps.push(SchemaMigrationStep::DropProperty {
             type_kind,
             type_name: type_name.to_string(),
             property_name: leftover.name.clone(),
-            mode: DropMode::Soft,
         });
     }
 }
@@ -1473,13 +1443,13 @@ node Account @rename_from("User") {
     }
 
     #[test]
-    fn plan_emits_soft_drop_for_removed_nullable_property() {
+    fn plan_emits_drop_for_removed_nullable_property() {
         // Removing a property from the desired schema emits
-        // DropProperty { Soft } (schema-lint v1 chassis commit #3,
+        // DropProperty (schema-lint v1 chassis commit #3,
         // MR-694). The plan is `supported = true` — the apply path
-        // handles soft drop via the existing stage_overwrite rewrite
+        // handles the drop via the existing stage_overwrite rewrite
         // projection. Verified at the integration level by
-        // `apply_schema_drops_a_nullable_property_softly_preserves_prior_version`
+        // `apply_schema_drops_a_nullable_property_and_preserves_prior_version`
         // in `crates/omnigraph/tests/schema_apply.rs`.
         let accepted = ir(r#"
 node Person {
@@ -1508,11 +1478,9 @@ node Person {
                     type_kind: SchemaTypeKind::Node,
                     type_name,
                     property_name,
-                    mode: DropMode::Soft,
-                    ..
                 } if type_name == "Person" && property_name == "age"
             )),
-            "expected DropProperty {{ Soft }} step in plan: {plan:?}",
+            "expected a DropProperty step in plan: {plan:?}",
         );
         // Negative: no UnsupportedChange anywhere in the plan.
         assert!(
@@ -1520,18 +1488,18 @@ node Person {
                 .steps
                 .iter()
                 .any(|step| matches!(step, UnsupportedChange { .. })),
-            "soft drop must not emit UnsupportedChange: {plan:?}",
+            "a property drop must not emit UnsupportedChange: {plan:?}",
         );
     }
 
     #[test]
-    fn plan_emits_soft_drop_for_removed_node_and_edge_types() {
+    fn plan_emits_drops_for_removed_node_and_edge_types() {
         // Removing a node type + the edge type that references it
-        // emits two DropType { Soft } steps (chassis v1 commit #4,
+        // emits two DropType steps (chassis v1 commit #4,
         // MR-694). The plan is `supported = true` — apply tombstones
         // both manifest entries. Time-travel reversibility is verified
         // at the integration level by
-        // `apply_schema_drops_node_and_referencing_edge_softly`
+        // `apply_schema_drops_node_and_referencing_edge`
         // in `crates/omnigraph/tests/schema_apply.rs`.
         let accepted = ir(r#"
 node Person {
@@ -1561,10 +1529,9 @@ node Person {
                 SchemaMigrationStep::DropType {
                     type_kind: SchemaTypeKind::Node,
                     name,
-                    mode: DropMode::Soft,
                 } if name == "Company"
             )),
-            "expected DropType {{ Node, Company, Soft }} in plan: {plan:?}",
+            "expected DropType {{ Node, Company }} in plan: {plan:?}",
         );
         assert!(
             plan.steps.iter().any(|step| matches!(
@@ -1572,10 +1539,9 @@ node Person {
                 SchemaMigrationStep::DropType {
                     type_kind: SchemaTypeKind::Edge,
                     name,
-                    mode: DropMode::Soft,
                 } if name == "WorksAt"
             )),
-            "expected DropType {{ Edge, WorksAt, Soft }} in plan: {plan:?}",
+            "expected DropType {{ Edge, WorksAt }} in plan: {plan:?}",
         );
         // Negative: no UnsupportedChange anywhere in the plan.
         assert!(
@@ -1583,7 +1549,7 @@ node Person {
                 .steps
                 .iter()
                 .any(|step| matches!(step, UnsupportedChange { .. })),
-            "soft type drop must not emit UnsupportedChange: {plan:?}",
+            "a type drop must not emit UnsupportedChange: {plan:?}",
         );
     }
 
@@ -1826,35 +1792,27 @@ node Pair {
 
     #[test]
     fn drop_steps_round_trip_through_serde() {
-        // The DropType / DropProperty variants are dormant in this
-        // commit — the planner doesn't emit them yet — but their
-        // serde shape needs to be stable from day one. A future
-        // SchemaIR JSON containing one of these must deserialize
-        // back to the same value. This test pins the wire format
-        // so a v0 schema-ir consumer never sees a surprise variant
-        // shape after v1 ships.
+        // Plans reach callers as JSON (CLI `--json`, the HTTP schema-apply
+        // response, the cluster plan preview). Pin the drop steps' wire
+        // shape so it round-trips.
         let steps = vec![
             SchemaMigrationStep::DropType {
                 type_kind: SchemaTypeKind::Node,
                 name: "Person".to_string(),
-                mode: DropMode::Soft,
             },
             SchemaMigrationStep::DropType {
                 type_kind: SchemaTypeKind::Edge,
                 name: "Knows".to_string(),
-                mode: DropMode::Hard,
             },
             SchemaMigrationStep::DropProperty {
                 type_kind: SchemaTypeKind::Node,
                 type_name: "Person".to_string(),
                 property_name: "age".to_string(),
-                mode: DropMode::Soft,
             },
             SchemaMigrationStep::DropProperty {
                 type_kind: SchemaTypeKind::Interface,
                 type_name: "Named".to_string(),
                 property_name: "alias".to_string(),
-                mode: DropMode::Hard,
             },
         ];
 
@@ -1863,15 +1821,5 @@ node Pair {
             let round_trip: SchemaMigrationStep = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(step, round_trip, "round-trip mismatch on {json}");
         }
-    }
-
-    #[test]
-    fn drop_mode_serde_uses_snake_case() {
-        // External tools may write SchemaIR JSON by hand. Pin the
-        // wire form so we don't silently break them later.
-        assert_eq!(serde_json::to_string(&DropMode::Soft).unwrap(), "\"soft\"");
-        assert_eq!(serde_json::to_string(&DropMode::Hard).unwrap(), "\"hard\"");
-        let soft: DropMode = serde_json::from_str("\"soft\"").unwrap();
-        assert_eq!(soft, DropMode::Soft);
     }
 }

@@ -1564,7 +1564,6 @@ impl GraphClient {
     pub(crate) async fn apply_schema<F>(
         &self,
         schema_source: &str,
-        allow_data_loss: bool,
         validate: F,
     ) -> Result<SchemaApplyOutput>
     where
@@ -1577,17 +1576,14 @@ impl GraphClient {
                 token,
                 ..
             } => {
-                // MR-694 PR B: SchemaApplyRequest carries allow_data_loss so
-                // Hard-mode drops are no longer CLI-only; the server's
-                // `server_schema_apply` honors it (and runs its own catalog
-                // check, so `validate` does not apply here).
+                // The server's `server_schema_apply` runs its own catalog
+                // check, so `validate` does not apply here.
                 remote_json::<SchemaApplyOutput>(
                     http,
                     Method::POST,
                     remote_url(base_url, &["schema", "apply"], &[])?,
                     Some(serde_json::to_value(SchemaApplyRequest {
                         schema_source: schema_source.to_string(),
-                        allow_data_loss,
                     })?),
                     token.as_deref(),
                 )
@@ -1596,12 +1592,7 @@ impl GraphClient {
             GraphClient::Embedded { uri, actor } => {
                 let db = Self::open_embedded(uri).await?;
                 let result = db
-                    .apply_schema_as_with_catalog_check(
-                        schema_source,
-                        omnigraph::db::SchemaApplyOptions { allow_data_loss },
-                        actor.as_deref(),
-                        validate,
-                    )
+                    .apply_schema_as_with_catalog_check(schema_source, actor.as_deref(), validate)
                     .await?;
                 Ok(schema_apply_output(uri, result))
             }

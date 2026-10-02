@@ -152,20 +152,19 @@ omnigraph schema apply --schema next.pg graph.omni
 Supported changes include adding types, adding nullable properties, renaming
 nodes, edges, or properties with `@rename_from`, adding index declarations,
 widening an enum with new values, updating descriptions or instructions, and
-soft-dropping node, edge, or property declarations.
+dropping node, edge, or property declarations.
 
 Changes such as adding a required property to existing entities, changing a property
 type (except enum widening), changing edge endpoints or cardinality, changing a
 node's implemented interfaces, and adding or removing most constraints are
 rejected. The plan reports the exact unsupported step before anything changes.
 
-A drop removes the declaration from the current schema. Older commits still
-read the dropped data until `omnigraph cleanup` stops retaining them; after
-that, the dropped data cannot be recovered. `schema apply --allow-data-loss`
-marks drops as hard (destructive) in the plan, but it does not remove storage
-at apply either. Review the plan carefully, and treat the cleanup that follows
-as the step that cannot be undone. See
-[cleanup](../operations/maintenance.md#cleanup).
+A drop removes the declaration from the current schema and reclaims no storage
+at apply. Older commits still read the dropped data until `omnigraph cleanup`
+stops retaining them; after that, the dropped data cannot be recovered. Review
+the plan carefully, and treat the cleanup that follows as the step that cannot
+be undone. To reclaim the space, run cleanup with a retention that excludes
+the commits before the drop. See [cleanup](../operations/maintenance.md#cleanup).
 
 Cluster-managed graphs change schema through `omnigraph cluster apply`. Direct
 schema apply and the server schema-apply endpoint refuse cluster-managed graphs.
