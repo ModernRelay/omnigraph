@@ -1165,11 +1165,13 @@ async fn change_feed_detects_same_length_blob_only_update() {
 /// object (`s3://bucket/object` does not exist), and the cursor advances past
 /// it to the next commit. The same holds for a range-only update of the same
 /// URI, whose before and after images carry the two exact ranges, and for its
-/// delete, whose before image carries the last range.
+/// delete, whose before image carries the last range. A baseline taken while
+/// the row exists describes it the same way, where export refuses it, and its
+/// cursor resumes at the next commit.
 #[tokio::test]
 #[cfg(feature = "failpoints")]
 async fn change_feed_describes_ranged_external_blob_and_advances_past_it() {
-    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedStart, ChangeOpKind};
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedScope, ChangeFeedStart, ChangeOpKind};
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -1189,6 +1191,36 @@ async fn change_feed_describes_ranged_external_blob_and_advances_past_it() {
     let (cursor, _) = boundary_cursor(&now);
 
     helpers::seed_ranged_external_blob_row(&db, uri).await;
+
+    // The baseline is the exact state its consumer starts from. Refusing the
+    // ranged row would leave the graph with no baseline at all, so the
+    // snapshot describes it as the change images do.
+    let mut snapshot = Vec::new();
+    let baseline = db
+        .capture_change_baseline("main", &ChangeFeedScope::default(), &mut snapshot)
+        .await
+        .expect("a ranged external descriptor must not refuse the baseline");
+    let snapshot = String::from_utf8(snapshot)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        snapshot,
+        [serde_json::json!({
+            "type": "Document",
+            "id": "ranged",
+            "data": {
+                "title": "ranged",
+                "content": {"uri": "s3://bucket/object", "offset": 4, "length": 8},
+            },
+        })]
+    );
+    assert!(
+        db.export_jsonl("main", &[]).await.is_err(),
+        "export, whose output reloads, still refuses the ranged row"
+    );
+
     helpers::replace_ranged_external_blob_range(&db, uri, 16, 3).await;
     let db = helpers::session(db);
     db.mutate(
@@ -1249,6 +1281,25 @@ async fn change_feed_describes_ranged_external_blob_and_advances_past_it() {
     );
     let (cursor, caught_up) = boundary_cursor(&update_page);
     assert!(!caught_up);
+
+    // The baseline's cursor resumes at the first commit after its snapshot.
+    let resumed = db
+        .poll_change_feed(one_commit(baseline.resume_cursor))
+        .await
+        .unwrap();
+    assert_eq!(resumed.blocks.len(), 1);
+    assert_eq!(
+        resumed.blocks[0].cause.graph_commit_id,
+        update_page.blocks[0].cause.graph_commit_id
+    );
+    assert_eq!(
+        resumed.blocks[0].changes[0]
+            .after
+            .as_ref()
+            .unwrap()
+            .properties["content"],
+        second_range
+    );
 
     let delete_page = db
         .poll_change_feed(one_commit(cursor))

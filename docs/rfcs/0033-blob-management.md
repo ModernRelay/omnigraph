@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-08-09
-updated: 2026-09-30
+updated: 2026-10-02
 discussion: null
 supersedes: []
 superseded_by: []
@@ -1001,10 +1001,13 @@ Export uses the central decoder. Null emits JSON null, managed zero bytes emits
 `base64:` with an empty payload, non-empty managed content emits base64, and an
 external reference that names its whole object emits its URI. A ranged
 external descriptor is refused: a bare URI reloads as the whole object, so
-emitting it would widen the cell. Change-feed images and entity reads, which
-are not reloaded, share the decoder but describe a ranged descriptor exactly
-as `{"uri", "offset", "length"}` without reading the object, so a feed cursor
-passes its commit. Export's current one-row indivisible Blob
+emitting it would widen the cell. Change-feed images, entity reads and the
+change-feed baseline share the decoder but describe a ranged descriptor
+exactly as `{"uri", "offset", "length"}` without reading the object. Images and
+entity reads are not reloaded, so a feed cursor passes the commit that holds
+one. The baseline is the exact state a feed consumer starts from, so a
+refusal there would leave the graph with no baseline; a baseline holding a
+ranged descriptor does not reload with `load`. Export's current one-row indivisible Blob
 scratch and chunked transport limits remain documented; the Blob GET endpoint is
 the preferred way to move a single large payload without base64 expansion.
 
@@ -1695,6 +1698,22 @@ publisher architecture.
 
 ## Decision log
 
+- 2026-10-02: §8.3's change-feed baseline describes a ranged external
+  descriptor as `{"uri", "offset", "length"}`, as change images do, instead
+  of refusing it. The consumer starts from exactly the baseline's state and
+  already reads that object in images; a refusal left a graph holding such a
+  row with no baseline, and a bare URI would be wrong data. Plain export still
+  refuses, because its output is a reloadable backup. §8.3's "Change-feed
+  images and entity reads, which are not reloaded, share the decoder but
+  describe a ranged descriptor exactly as `{"uri", "offset", "length"}`
+  without reading the object, so a feed cursor passes its commit." and the
+  2026-09-30 entry's "the change-feed baseline, an export, still refuses." are
+  superseded.
+- 2026-09-30: §8.3 adds that change-feed images and entity reads describe a
+  ranged external descriptor as `{"uri", "offset", "length"}` instead of
+  refusing it. Refusing there made a feed page holding such a row fail on
+  every poll, so its cursor could never pass the commit. No earlier sentence
+  is superseded; the change-feed baseline, an export, still refuses.
 - 2026-09-30: Narrowed references to the proposed v0.12 server scope: independent
   historical availability and stronger retention need a separate proposal;
   stale-generation refusal notifies the designated owner, and lifecycle status
@@ -1722,8 +1741,3 @@ publisher architecture.
   superseding "an external reference emits its URI", which widened the range
   to the whole object on reload. The redirect, CLI delivery and schema rewrite
   already refused it; export now shares their whole-object check.
-- 2026-09-30: §8.3 adds that change-feed images and entity reads describe a
-  ranged external descriptor as `{"uri", "offset", "length"}` instead of
-  refusing it. Refusing there made a feed page holding such a row fail on
-  every poll, so its cursor could never pass the commit. No earlier sentence
-  is superseded; the change-feed baseline, an export, still refuses.

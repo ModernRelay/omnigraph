@@ -2616,6 +2616,12 @@ impl Omnigraph {
     /// return that head's commit id plus the cursor that resumes the feed
     /// immediately after it. A failed export returns `Err` — a usable cursor
     /// never outlives a broken snapshot.
+    ///
+    /// The snapshot uses export's line format, except that a ranged external
+    /// Blob reference, which export refuses, is described as
+    /// `{"uri", "offset", "length"}` as in change images: the consumer starts
+    /// from exactly this state, and refusing would leave the graph with no
+    /// baseline at all.
     pub async fn capture_change_baseline<W: Write>(
         &self,
         branch: &str,

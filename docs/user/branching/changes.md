@@ -106,6 +106,12 @@ one terminal record:
 {"baseline":{"snapshot_commit_id":"...","resume_cursor":"..."}}
 ```
 
+Snapshot records use the export line format, and a Blob property holds the
+same value shapes as a change image. That includes the
+`{"uri", "offset", "length"}` object for a stored reference to a byte range of
+an object, which export refuses; a snapshot holding one does not reload with
+`load` (see [Blobs](../blobs.md)).
+
 An interrupted stream has no terminal record and therefore no usable cursor.
 Install the complete snapshot durably before saving `resume_cursor`; the
 resumed feed begins with commits after the captured snapshot.
