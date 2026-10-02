@@ -1,4 +1,5 @@
 use super::*;
+use crate::blob::ExternalBlobRef;
 use crate::seams::{decide_seam, fail};
 use futures::TryStreamExt;
 
@@ -1299,7 +1300,7 @@ fn whole_external_uri_for_schema_rewrite(
     offset: u64,
     length: Option<u64>,
 ) -> Result<String> {
-    let reference = crate::blob::ExternalBlobRef {
+    let reference = ExternalBlobRef {
         uri,
         offset,
         length,

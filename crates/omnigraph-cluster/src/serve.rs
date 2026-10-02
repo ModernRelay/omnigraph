@@ -2,6 +2,7 @@
 //! boots from (moved verbatim from lib.rs in the modularization).
 
 use super::*;
+use crate::config::storage_root_conflict_code;
 
 /// One graph in a serving snapshot: its id and on-disk root.
 #[derive(Debug, Clone)]
@@ -131,10 +132,8 @@ pub async fn read_serving_snapshot_from_storage(
 }
 
 /// Test support: read a local cluster's serving snapshot through the
-/// production reader while its storage root reads as `display_root`. Serving
-/// compares applied server-safe external Blob bases, which are `s3://` only,
-/// with that root, so a test can reach the overlap quarantine without an
-/// object store. Graph roots in the snapshot derive from `display_root` too.
+/// production reader while its storage root reads as `display_root` (see
+/// `ClusterStore::with_display_root`). Graph roots derive from it too.
 #[cfg(any(test, feature = "test-util"))]
 pub async fn read_serving_snapshot_with_display_root(
     config_dir: impl AsRef<Path>,
@@ -363,15 +362,26 @@ pub(crate) async fn read_snapshot_with_store(
     let boot_state_revision = state.state_revision;
     let boot_state_cas = observations.state_cas.clone();
     let boot_applied_graphs = applied_graph_ids(&state);
-    for (graph_id, reason) in
+    let recovery_pending = boot_applied_graphs
+        .iter()
+        .any(|graph_id| quarantined_graphs.contains(graph_id));
+    for (graph_id, conflict) in
         overlapping_served_external_blob_policies(&state, backend.display_root())
     {
         quarantined_graphs.insert(graph_id.clone());
+        let remedy = match conflict {
+            omnigraph::StorageRootConflict::UncomparableRoot { .. } => {
+                "serving cannot prove the base lies outside the cluster storage root; remove the graph's server-safe bases with `cluster apply`, or serve from a storage root without empty, dot or percent-encoded path components, and restart"
+            }
+            _ => {
+                "move the base to a prefix outside the cluster storage root, run `cluster apply`, and restart"
+            }
+        };
         startup_diagnostics.push(Diagnostic::warning(
-            "external_blob_base_overlaps_storage_root",
+            storage_root_conflict_code(&conflict),
             graph_address(&graph_id),
             format!(
-                "graph `{graph_id}` is quarantined because its applied external Blob policy is unsafe to serve: {reason}; move the base to a prefix outside the cluster storage root, run `cluster apply`, and restart"
+                "graph `{graph_id}` is quarantined because its applied external Blob policy is unsafe to serve: {conflict}; {remedy}"
             ),
         ));
     }
@@ -541,7 +551,11 @@ pub(crate) async fn read_snapshot_with_store(
         if saw_applied_graph {
             diagnostics.push(Diagnostic::error(
                 "cluster_no_healthy_graphs",
-                CLUSTER_RECOVERIES_DIR,
+                if recovery_pending {
+                    CLUSTER_RECOVERIES_DIR
+                } else {
+                    CLUSTER_STATE_FILE
+                },
                 "all applied graphs are quarantined by startup safety checks; resolve the graph-specific diagnostics, then retry",
             ));
         } else if boot_state_revision == 0
@@ -584,19 +598,16 @@ pub(crate) async fn read_snapshot_with_store(
     })
 }
 
-/// Applied graphs whose served external Blob policy has a base overlapping the
-/// cluster storage root, with the refusal reason.
-///
-/// The policy is projected to the server-safe bases the server would install,
-/// then each base is compared with the one root that holds every graph and the
-/// cluster ledger. A config validated before this check existed can still
-/// carry such a base in the ledger; serving it would let any writer copy
-/// another graph's or the ledger's bytes into a readable Blob cell. A policy
-/// that does not project is left to the server's own install to refuse.
+/// Applied graphs whose server-safe external Blob bases overlap, or cannot be
+/// compared with, the cluster storage root, with the conflict. The ledger is
+/// checked as read, not trusted to have passed `cluster validate`. A policy
+/// that does not project or validate is left to the server's install to
+/// refuse, and an entry whose composite digest does not bind its policy to the
+/// boot-fatal `external_blob_policy_digest_mismatch` check.
 pub(crate) fn overlapping_served_external_blob_policies(
-    state: &crate::types::ClusterState,
+    state: &ClusterState,
     storage_root: &str,
-) -> Vec<(String, String)> {
+) -> Vec<(String, omnigraph::StorageRootConflict)> {
     state
         .applied_revision
         .resources
@@ -605,16 +616,19 @@ pub(crate) fn overlapping_served_external_blob_policies(
             let ResourceKind::Graph(graph_id) = resource_kind(address) else {
                 return None;
             };
+            if expected_state_graph_resource_digest(state, &graph_id, entry) != entry.digest {
+                return None;
+            }
             let policy = entry
                 .external_blob_policy
                 .clone()
                 .unwrap_or_default()
                 .server_safe_only()
                 .ok()?;
-            policy
-                .ensure_disjoint_from_storage_root(storage_root)
-                .err()
-                .map(|error| (graph_id, error.to_string()))
+            match policy.ensure_disjoint_from_storage_root(storage_root) {
+                Ok(()) | Err(omnigraph::StorageRootConflict::InvalidPolicy(_)) => None,
+                Err(conflict) => Some((graph_id, conflict)),
+            }
         })
         .collect()
 }

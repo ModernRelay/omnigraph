@@ -124,6 +124,13 @@ between graph roots.
   to start with `cluster_no_healthy_graphs` if every applied graph is
   quarantined. See
   [External Blob references](../clusters/config.md#external-blob-references).
+- `external_blob_storage_root_uncomparable`: the cluster storage root is
+  spelled with a path component an external Blob base cannot express (an empty
+  component, or a percent sign in a local path), so a base of the same storage
+  kind cannot be proven to lie outside it. Moving the base does not help:
+  use a storage root without such a component, or remove the graph's bases of
+  that kind with `cluster apply`. Validation refuses the base, and the server
+  quarantines the graph, as for an overlap.
 
 See [Operating a cluster](../clusters/index.md).
 

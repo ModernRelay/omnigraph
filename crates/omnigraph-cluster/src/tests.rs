@@ -1410,29 +1410,45 @@ async fn external_blob_base_overlapping_storage_root_refuses_apply_over_existing
 
 #[test]
 fn serving_quarantines_applied_policies_overlapping_storage_root() {
+    let overlapping = json!({
+        "mode": "allow",
+        "bases": [{ "uri": "s3://assets/", "scope": "server_safe" }]
+    });
+    let embedded = json!({
+        "mode": "allow",
+        "bases": [{
+            "uri": "file:///definitely/not/present/omnigraph-blob-base/",
+            "scope": "embedded_only"
+        }]
+    });
+    let bound_digest = |graph_id: &str, policy: &serde_json::Value| {
+        graph_digest_with_external_blob_policy(
+            graph_id,
+            None,
+            Some(&BTreeMap::new()),
+            None,
+            None,
+            &serde_json::from_value(policy.clone()).unwrap(),
+        )
+    };
     let state: ClusterState = serde_json::from_value(json!({
         "version": 1,
         "state_revision": 1,
         "applied_revision": {
             "resources": {
                 "graph.knowledge": {
-                    "digest": "graph",
-                    "external_blob_policy": {
-                        "mode": "allow",
-                        "bases": [{ "uri": "s3://assets/", "scope": "server_safe" }]
-                    }
+                    "digest": bound_digest("knowledge", &overlapping),
+                    "external_blob_policy": overlapping
                 },
                 "graph.local": {
-                    "digest": "graph",
-                    "external_blob_policy": {
-                        "mode": "allow",
-                        "bases": [{
-                            "uri": "file:///definitely/not/present/omnigraph-blob-base/",
-                            "scope": "embedded_only"
-                        }]
-                    }
+                    "digest": bound_digest("local", &embedded),
+                    "external_blob_policy": embedded
                 },
-                "graph.plain": { "digest": "graph" }
+                "graph.plain": { "digest": graph_digest("plain", None, Some(&BTreeMap::new()), None, None) },
+                "graph.unbound": {
+                    "digest": graph_digest("unbound", None, Some(&BTreeMap::new()), None, None),
+                    "external_blob_policy": overlapping
+                }
             }
         }
     }))
@@ -1444,13 +1460,21 @@ fn serving_quarantines_applied_policies_overlapping_storage_root() {
             .iter()
             .map(|(graph_id, _)| graph_id.as_str())
             .collect::<Vec<_>>(),
-        vec!["knowledge"]
+        vec!["knowledge"],
+        "`unbound` carries the overlapping policy under a digest that does not bind it, so the digest check owns it"
     );
-    assert!(
-        quarantined[0]
-            .1
-            .contains("overlaps an OmniGraph storage root")
-    );
+    assert!(matches!(
+        quarantined[0].1,
+        omnigraph::StorageRootConflict::Overlap { .. }
+    ));
+    let uncomparable =
+        serve::overlapping_served_external_blob_policies(&state, "s3://assets/a//cluster");
+    assert_eq!(uncomparable.len(), 1);
+    assert_eq!(uncomparable[0].0, "knowledge");
+    assert!(matches!(
+        uncomparable[0].1,
+        omnigraph::StorageRootConflict::UncomparableRoot { .. }
+    ));
     // Embedded-only bases are never served, so they cannot quarantine a
     // graph, and a disjoint root quarantines nothing.
     assert!(
@@ -1565,9 +1589,9 @@ async fn serving_snapshot_quarantines_graph_whose_applied_base_overlaps_storage_
         .await
         .unwrap_err();
     assert!(
-        refused
-            .iter()
-            .any(|diagnostic| diagnostic.code == "cluster_no_healthy_graphs"),
+        refused.iter().any(|diagnostic| {
+            diagnostic.code == "cluster_no_healthy_graphs" && diagnostic.path == CLUSTER_STATE_FILE
+        }),
         "{refused:?}"
     );
     assert!(
@@ -1579,6 +1603,172 @@ async fn serving_snapshot_quarantines_graph_whose_applied_base_overlaps_storage_
     assert_eq!(
         fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
         ledger
+    );
+
+    let refused = serve::read_snapshot_with_store(
+        &store::ClusterStore::for_config_dir(dir.path())
+            .with_display_root("s3://assets/a//cluster"),
+    )
+    .await
+    .unwrap_err();
+    let uncomparable = refused
+        .iter()
+        .find(|diagnostic| diagnostic.code == "external_blob_storage_root_uncomparable")
+        .unwrap_or_else(|| panic!("{refused:?}"));
+    assert_eq!(uncomparable.path, "graph.knowledge");
+    assert!(
+        uncomparable
+            .message
+            .contains("storage root cannot be compared")
+            && !uncomparable.message.contains("move the base"),
+        "{uncomparable:?}"
+    );
+    assert!(
+        refused
+            .iter()
+            .all(|diagnostic| diagnostic.code != "external_blob_base_overlaps_storage_root"),
+        "{refused:?}"
+    );
+}
+
+/// A ledger whose policy field names an overlapping server-safe base under a
+/// digest that does not bind it is refused at boot, healthy sibling or not:
+/// the quarantine acts only on a policy the ledger vouches for.
+#[tokio::test]
+async fn serving_snapshot_refuses_overlapping_policy_its_digest_does_not_bind() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n  archive:\n    schema: ./people.pg\n",
+    )
+    .unwrap();
+    let desired = validate_config_dir(dir.path());
+    assert!(desired.ok, "{:?}", desired.diagnostics);
+    let schema_digest = desired.resource_digests["schema.knowledge"].clone();
+    let empty_queries = BTreeMap::new();
+    let deny_digest = |graph_id: &str| {
+        graph_digest(
+            graph_id,
+            Some(&schema_digest),
+            Some(&empty_queries),
+            None,
+            None,
+        )
+    };
+    write_state_resources(
+        dir.path(),
+        &[
+            ("graph.knowledge", deny_digest("knowledge").as_str()),
+            ("schema.knowledge", schema_digest.as_str()),
+            ("graph.archive", deny_digest("archive").as_str()),
+            ("schema.archive", schema_digest.as_str()),
+        ],
+    );
+    let mut state = read_state_json(dir.path());
+    state["applied_revision"]["resources"]["graph.knowledge"]["external_blob_policy"] = json!({
+        "mode": "allow",
+        "bases": [{ "uri": "s3://assets/cluster/graphs/", "scope": "server_safe" }]
+    });
+    fs::write(
+        dir.path().join(CLUSTER_STATE_FILE),
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .unwrap();
+    let ledger = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+
+    let refused = serve::read_snapshot_with_store(
+        &store::ClusterStore::for_config_dir(dir.path()).with_display_root("s3://assets/cluster"),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused.iter().any(|diagnostic| {
+            diagnostic.code == "external_blob_policy_digest_mismatch"
+                && diagnostic.path == "graph.knowledge"
+                && diagnostic.severity == DiagnosticSeverity::Error
+        }),
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .iter()
+            .all(|diagnostic| diagnostic.code != "external_blob_base_overlaps_storage_root"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger
+    );
+}
+
+/// A storage root that cannot be rendered for comparison refuses a same-kind
+/// base under its own code; a base in a scheme that cannot name the root's
+/// storage kind is admitted without the root being rendered.
+#[test]
+fn external_blob_config_reports_uncomparable_storage_root_under_its_own_code() {
+    let dir = fixture();
+    let config = |storage: &str| {
+        format!(
+            r#"
+version: 1
+storage: {storage}
+graphs:
+  knowledge:
+    schema: ./people.pg
+    external_blobs:
+      allow:
+        - base: s3://elsewhere/assets/
+          scope: server_safe
+"#
+        )
+    };
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        config("s3://assets/a//cluster"),
+    )
+    .unwrap();
+    let outcome = load_desired(dir.path());
+    let uncomparable = outcome
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "external_blob_storage_root_uncomparable")
+        .unwrap_or_else(|| panic!("{:?}", outcome.diagnostics));
+    assert_eq!(uncomparable.severity, DiagnosticSeverity::Error);
+    assert_eq!(
+        uncomparable.path,
+        "graphs.knowledge.external_blobs.allow[0].base"
+    );
+    assert!(
+        uncomparable
+            .message
+            .contains("storage root cannot be compared")
+            && !uncomparable.message.contains("overlaps"),
+        "{uncomparable:?}"
+    );
+    assert!(overlap_diagnostic_paths(&outcome).is_empty());
+    assert!(!validate_config_dir(dir.path()).ok);
+
+    let percent_root = dir.path().join("a%b");
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        config(percent_root.to_str().unwrap()),
+    )
+    .unwrap();
+    let outcome = load_desired(dir.path());
+    assert!(
+        outcome.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != "external_blob_storage_root_uncomparable"
+                && diagnostic.code != "external_blob_base_overlaps_storage_root"
+        }),
+        "{:?}",
+        outcome.diagnostics
+    );
+    assert_eq!(
+        outcome.desired.unwrap().graphs[0]
+            .external_blob_policy
+            .bases()
+            .len(),
+        1
     );
 }
 
@@ -5366,8 +5556,10 @@ async fn serving_snapshot_refuses_pending_recovery() {
 
     let err = read_serving_snapshot(dir.path()).await.unwrap_err();
     assert!(
-        err.iter()
-            .any(|diagnostic| diagnostic.code == "cluster_no_healthy_graphs"),
+        err.iter().any(|diagnostic| {
+            diagnostic.code == "cluster_no_healthy_graphs"
+                && diagnostic.path == CLUSTER_RECOVERIES_DIR
+        }),
         "{err:?}"
     );
     assert!(

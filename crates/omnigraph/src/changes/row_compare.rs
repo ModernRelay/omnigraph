@@ -619,9 +619,9 @@ async fn rows_equal_by_column(
     Ok(left_values == right_values)
 }
 
-/// Logical Blob values (managed bytes, external reference, or null) for one
-/// row's selected columns, read through the same helper export uses. A ranged
-/// external reference is compared exactly, never refused.
+/// Managed Blob bytes for one row's selected columns, read through the same
+/// helper export uses. Only columns managed on both sides reach this: external
+/// and null cells are decided by descriptor identity in [`rows_equal_by_column`].
 async fn blob_values_for(
     dataset: &Dataset,
     slice: &RecordBatch,

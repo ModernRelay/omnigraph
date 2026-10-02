@@ -3,6 +3,8 @@ use super::*;
 use crate::engine::{
     check_param_date_literals, evaluate_constant, id_in_list_expr, ir_expr_to_df_expr,
 };
+use crate::instrumentation::record_mutation_table_open;
+use crate::loader::append_blob_value;
 use crate::seams::{decide_seam, fail};
 use crate::session::Session;
 use crate::storage_layer::{DeletedIdBudget, PendingScanBudget, SnapshotHandle};
@@ -341,7 +343,7 @@ fn typed_list_literal_to_array(
 /// Build a single-element blob array from a URI or base64 value string.
 fn build_blob_array_from_value(value: &str) -> Result<ArrayRef> {
     let mut builder = BlobArrayBuilder::new(1);
-    crate::loader::append_blob_value(&mut builder, value)?;
+    append_blob_value(&mut builder, value)?;
     builder.finish().map_err(OmniError::lance_internal)
 }
 
@@ -434,16 +436,9 @@ fn first_unbound_param<'a>(expr: &'a IRExpr, params: &ParamMap) -> Option<&'a st
     }
 }
 
-/// Replace specific columns in a RecordBatch with new literal values.
-///
-/// A Blob-bearing update arrives with every column except the Blobs it
-/// assigns, whose old cells the scan never read. Committed blob payloads were
-/// materialized by the caller and rebuilt as logical `Struct<data,uri>`
-/// arrays; pending batches already have that shape. An unassigned blob is
-/// copied through, an assigned string URI is rebuilt with the same blob writer
-/// used by inserts, and an assigned null becomes a null cell. Consequently
-/// every update batch has the catalog schema and can safely share one pending
-/// merge stream with inserts and earlier updates.
+/// Rebuild a matched batch, which lacks the Blobs it assigns, on `full_schema`
+/// with the assigned values, so every update batch shares one pending merge
+/// stream with inserts and earlier updates.
 fn apply_assignments(
     full_schema: &SchemaRef,
     batch: &RecordBatch,
@@ -455,15 +450,12 @@ fn apply_assignments(
         if blob_properties.contains(field.name()) {
             let column = match assignments.get(field.name()) {
                 Some(Literal::String(uri)) => {
-                    // Assigned: build a single blob column from the URI.
                     let mut builder = BlobArrayBuilder::new(batch.num_rows());
                     for _ in 0..batch.num_rows() {
-                        crate::loader::append_blob_value(&mut builder, uri)?;
+                        append_blob_value(&mut builder, uri)?;
                     }
                     builder.finish().map_err(OmniError::lance_internal)?
                 }
-                // Assigned null clears the cell; `resolve_assignments` already
-                // refused null on a non-nullable Blob.
                 Some(Literal::Null) => build_null_blob_array(batch.num_rows())?,
                 Some(other) => {
                     return Err(OmniError::manifest_internal(format!(
@@ -540,7 +532,7 @@ async fn open_table_for_mutation(
     op_kind: crate::db::MutationOpKind,
     txn: Option<&crate::db::WriteTxn>,
 ) -> Result<(Option<SnapshotHandle>, String, Option<String>)> {
-    crate::instrumentation::record_mutation_table_open();
+    record_mutation_table_open();
     // `open_for_mutation_on_branch` returns the expected version even when it
     // skips the open (collapse #1, the non-strict insert/merge path): the version
     // is the pinned base's, identical to the opened handle's `.version()`. Use it
@@ -1344,13 +1336,11 @@ impl Omnigraph {
 
         let schema = catalog.node_types[type_name].arrow_schema.clone();
         let pred_expr = mutation_predicate_expr(predicate, params, &schema)?;
-        // Resolved before any I/O, so a null on a non-nullable property is
-        // refused before the table is opened or scanned.
+        // Resolved before the table is opened, so a null on a non-nullable
+        // property is refused even when the predicate matches no row.
         let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
         let blob_props = catalog.node_types[type_name].blob_properties.clone();
-        // An assigned Blob replaces every matched cell, so the scan never
-        // takes, authorizes or reads its old value. The scan schema keeps
-        // catalog order: the concat below binds batches by position.
+        // Catalog order is kept: `concat_match_batches_to_schema` binds by position.
         let assigned_blobs = schema
             .fields()
             .iter()
@@ -1443,10 +1433,6 @@ impl Omnigraph {
             });
         }
 
-        // Concat the matched batches (committed + pending) into one. The
-        // helper binds both sides to the catalog's logical schema less the
-        // assigned Blobs. Any divergence here is an internal scan/staging
-        // contract violation.
         let matched = concat_match_batches_to_schema(&scan_schema, batches)?;
 
         let affected_count = matched.num_rows();

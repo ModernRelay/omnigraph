@@ -555,14 +555,9 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>>;
 
-    /// Full-schema blob-aware sibling of `scan_with_pending` for mutation
-    /// updates. The committed predicate scan retains row ids without projecting
-    /// blobs; only matched rows are then taken and rebuilt as Lance's logical
-    /// blob input arrays before unioning the in-memory pending view. This keeps
-    /// the eventual merge source schema independent of scalar-index state.
-    /// `omit_blob_columns` names Blob columns the caller replaces: their old
-    /// cells are never read, and both sides return the schema without them.
-    #[allow(clippy::too_many_arguments)]
+    /// Blob-aware sibling of `scan_with_pending` for mutation updates; see
+    /// `TableStore::scan_with_pending_materialized_blobs`. `omit_blob_columns`
+    /// names the Blobs the caller replaces, which are never read or returned.
     async fn scan_with_pending_materialized_blobs(
         &self,
         snapshot: &SnapshotHandle,

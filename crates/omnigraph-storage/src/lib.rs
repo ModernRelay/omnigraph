@@ -2311,7 +2311,8 @@ fn is_windows_drive_path(value: &str) -> bool {
 /// filesystem. Required because `object_store::path::Path` rejects
 /// relative and dot segments, while callers (the CLI in particular) pass
 /// paths like `./graph.omni` verbatim.
-fn absolutize_lexically(path: PathBuf) -> Result<PathBuf> {
+#[doc(hidden)]
+pub fn absolutize_lexically(path: PathBuf) -> Result<PathBuf> {
     let joined = if path.is_absolute() {
         path
     } else {

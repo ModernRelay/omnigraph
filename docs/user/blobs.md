@@ -36,8 +36,9 @@ Write mode determines ownership:
   reference;
 - incremental inserts, upserts, updates, append/merge loads, and branch merges
   that write entities copy allowed source bytes into graph-managed storage;
-- an existing external reference remains readable and exportable even when new
-  external ingress is disabled.
+- an existing external reference remains readable even when new external
+  ingress is disabled, and exportable when it names its whole object (see
+  below).
 
 An `update` never reads the old value of a Blob it assigns. It carries every
 other Blob cell of a matched row: it reads the cell and rewrites it as managed

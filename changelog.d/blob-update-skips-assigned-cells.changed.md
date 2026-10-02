@@ -6,5 +6,4 @@
   it does not assign fails with the new typed
   `OmniError::StoredExternalBlobDenied` (HTTP 400), naming the type, id and
   property, where it earlier failed with the misleading `ExternalBlobPolicy`
-  message about new URI ingress. Exhaustive Rust matches on `OmniError` must
-  add the variant.
+  message about new URI ingress.

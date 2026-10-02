@@ -992,13 +992,11 @@ node Document {
         "ranged export must be a BadRequest refusal, got {error:?}"
     );
     assert!(
-        message.contains("ranged external Blob descriptor (offset 4, length Some(8))"),
+        message.contains("ranged external Blob descriptor (offset 4, length 8) in 'content'"),
         "{message}"
     );
     assert!(!message.contains("s3://bucket"), "{message}");
 
-    // An entity read is not reloadable input, so it describes the exact
-    // reference instead of refusing, and never contacts the object.
     let entity = db
         .entity_at_target(ReadTarget::branch("main"), "node:Document", "ranged")
         .await

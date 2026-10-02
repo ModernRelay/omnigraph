@@ -144,6 +144,14 @@ others; if no applied graph is left to serve, startup fails with
 `cluster_no_healthy_graphs`. An embedded handle refuses a policy whose base
 overlaps its own graph root.
 
+A base is compared only with a storage root of its own kind: an `s3://` base
+with an `s3://` root, a `file://` base with a local root. When the root is
+spelled with a path component a base URI cannot express (an empty component
+such as `s3://bucket/a//cluster`, or a percent sign in a local path), a
+same-kind base is refused with `external_blob_storage_root_uncomparable`,
+because disjointness cannot be proven. Moving the base does not clear that
+code; the storage root spelling does.
+
 The allow-list controls which external objects an authorized writer may cause
 the process to inspect. Cedar policy separately decides who may write. See
 [Blob values](../blobs.md).

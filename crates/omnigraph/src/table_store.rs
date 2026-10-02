@@ -63,6 +63,7 @@ use std::{num::NonZero, sync::Arc};
 
 use crate::blob::{
     BlobDescriptor, BlobDescriptorDecoder, ExternalBlobPolicy, NormalizedExternalBlobUri,
+    StorageRootConflict,
 };
 use crate::dataset_index::{
     has_btree_index_on, has_fts_index_on, has_vector_index_on, is_full_text_index,
@@ -1193,7 +1194,9 @@ impl TableStore {
 
     pub(crate) fn with_external_blob_policy(mut self, policy: ExternalBlobPolicy) -> Result<Self> {
         let policy = policy.validated()?;
-        policy.ensure_disjoint_from_storage_root(&self.root_uri)?;
+        policy
+            .ensure_disjoint_from_storage_root(&self.root_uri)
+            .map_err(StorageRootConflict::into_error)?;
         self.external_blob_policy = Arc::new(policy);
         Ok(self)
     }
@@ -1766,18 +1769,9 @@ impl TableStore {
         .await
     }
 
-    /// Rebuild the blob columns in `batch` using explicit stable row ids.
-    ///
-    /// Most rewrite callers scan with `_rowid` and use
-    /// [`Self::materialize_blob_batch`]. A predicate-filtered blob mutation
-    /// cannot include blob descriptors in that scan on the pinned Lance
-    /// revision (the filter projection panics), so it first scans only
-    /// non-blob columns + `_rowid`, takes the full descriptor rows by id, and
-    /// calls this sibling with the ids captured by the safe scan.
-    ///
-    /// `carried` is the projection of `ds`'s schema that `batch` holds and the
-    /// output carries: the full schema for every caller except an update that
-    /// assigns some Blob columns, which never reads those columns' old cells.
+    /// Rebuild the Blob columns of `batch`, the `carried` projection of `ds`'s
+    /// schema, from explicit stable `row_ids`: the sibling of
+    /// [`Self::materialize_blob_batch`] for a predicate scan that omits Blobs.
     async fn materialize_blob_batch_with_row_ids(
         &self,
         ds: &Dataset,
@@ -1927,10 +1921,9 @@ impl TableStore {
         Ok(total)
     }
 
-    /// Name the carried cell behind an update scan's policy refusal. The walk
-    /// follows the preflight's order (columns, then rows), so the first cell
-    /// the policy refuses is the one that failed the scan. `None` when no
-    /// carried stored reference is refused, and the caller keeps its error.
+    /// Name the carried cell behind an update scan's policy refusal: the first
+    /// refused stored reference in the preflight's order (columns, then rows).
+    /// `None` when none is refused, and the caller keeps its error.
     fn stored_external_blob_denial(
         &self,
         carried: &LanceSchema,
@@ -4653,7 +4646,6 @@ impl TableStore {
     /// them, in schema order. Every other Blob column is carried: a stored
     /// external reference there must pass the graph's external Blob policy,
     /// and a refusal names the row as [`OmniError::StoredExternalBlobDenied`].
-    #[allow(clippy::too_many_arguments)]
     pub async fn scan_with_pending_materialized_blobs(
         &self,
         committed_ds: &Dataset,
@@ -4712,8 +4704,6 @@ impl TableStore {
             Some(key_col) => collect_string_column_values(pending_batches, key_col)?,
             None => std::collections::HashSet::new(),
         };
-        // The carried projection keeps schema order, so committed and pending
-        // batches bind to the caller's schema by position.
         let (carried, pending_projection) = if omit_blob_columns.is_empty() {
             (committed_ds.schema().clone(), None)
         } else {
@@ -4735,8 +4725,6 @@ impl TableStore {
         } else {
             scan_pending_batches(pending_batches, pending_schema, None, filter.clone()).await?
         };
-        // Pending rows already hold logical Blob arrays; dropping the omitted
-        // columns by index leaves every carried column's field metadata as is.
         let pending = match &pending_projection {
             None => pending,
             Some(kept) => pending
@@ -4758,6 +4746,9 @@ impl TableStore {
         };
         let mut account = PendingScanAccount::new(budget)?;
         account.add_batches(&pending)?;
+        let carried_without_blobs: Option<SchemaRef> =
+            (!carried.fields.iter().any(|field| field.is_blob()))
+                .then(|| Arc::new((&carried).into()));
 
         let scan_rows = account.next_scan_rows();
         let scan_bytes = account.next_scan_bytes();
@@ -4803,6 +4794,13 @@ impl TableStore {
             // `take_rows` performs the second full-row read.
             let non_blob_bytes = non_blob_column_bytes(committed_ds, &batch)?;
             let payload_budget = account.remaining_bytes_after(non_blob_bytes)?;
+
+            if let Some(schema) = &carried_without_blobs {
+                let carried_rows = predicate_rows_as(schema, &batch)?;
+                account.add_batch(&carried_rows)?;
+                committed.push(carried_rows);
+                continue;
+            }
 
             let row_ids = batch
                 .column_by_name("_rowid")
@@ -5253,6 +5251,22 @@ fn non_blob_column_bytes(ds: &Dataset, batch: &RecordBatch) -> Result<u64> {
                 OmniError::manifest_internal("non-blob pending scan byte count overflow")
             })
         })
+}
+
+/// The predicate scan's rows as a batch of `carried`, a projection that holds
+/// no Blob column: every carried column is already in `batch`, bound here by
+/// name, so the scan needs no second read of the matched rows.
+fn predicate_rows_as(carried: &SchemaRef, batch: &RecordBatch) -> Result<RecordBatch> {
+    let columns = carried
+        .fields()
+        .iter()
+        .map(|field| {
+            batch.column_by_name(field.name()).cloned().ok_or_else(|| {
+                OmniError::manifest_internal(format!("batch missing column '{}'", field.name()))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new(carried.clone(), columns).map_err(OmniError::arrow_internal)
 }
 
 /// Collect the set of values in a Utf8 column across multiple batches.

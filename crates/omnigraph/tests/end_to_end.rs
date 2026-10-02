@@ -2214,7 +2214,6 @@ async fn blob_update_null_round_trip() {
     .await;
     assert_eq!(&bytes[..], &[1, 2, 3]);
 
-    // non-null → null: a null parameter clears the cell and publishes once.
     let before = snapshot_main(&db).await.unwrap().graph_manifest_version();
     let result = mutate_main(
         &db,
@@ -2227,7 +2226,8 @@ async fn blob_update_null_round_trip() {
     assert_eq!(result.affected_nodes, 1);
     assert_eq!(
         snapshot_main(&db).await.unwrap().graph_manifest_version(),
-        before + 1
+        before + 1,
+        "a null parameter clears the cell and publishes once"
     );
     let assert_null = |error: OmniError| {
         assert!(
@@ -2249,8 +2249,6 @@ async fn blob_update_null_round_trip() {
         .unwrap_err(),
     );
 
-    // An update to null in the same mutation as the insert clears the
-    // pending row, too.
     let mut insert_then_clear = null_blob_params("ok-computer", &["cleared"]);
     insert_then_clear.insert(
         "content".to_string(),
@@ -2275,10 +2273,8 @@ async fn blob_update_null_round_trip() {
     );
 }
 
-/// A null assigned to a non-nullable Blob is refused while the update's
-/// assignments resolve, before the statement opens its table, so the table is
-/// never scanned and nothing is published. The control, the same update with a
-/// value, opens the table, so the zero count is the refusal's.
+/// The control, the same update with a value, opens the table, so the zero
+/// open count belongs to the refusal and not to a skipped scan.
 #[tokio::test]
 async fn blob_null_on_non_nullable_refuses_before_table_open_or_scan() {
     let dir = tempfile::tempdir().unwrap();
@@ -2337,7 +2333,6 @@ async fn blob_null_on_non_nullable_refuses_before_table_open_or_scan() {
     );
     assert_eq!(head().await, head_before);
 
-    // Control: a value where the null was opens the table to scan it.
     let probes = MergeWriteProbes::default();
     let matched = with_merge_write_probes(
         probes.clone(),
@@ -2350,7 +2345,11 @@ async fn blob_null_on_non_nullable_refuses_before_table_open_or_scan() {
     )
     .await;
     assert_eq!(matched.unwrap().affected_nodes, 0);
-    assert_eq!(probes.mutation_table_open_calls(), 1);
+    assert_eq!(
+        probes.mutation_table_open_calls(),
+        1,
+        "the control update with a value opens the table to scan it"
+    );
 }
 
 // ─── External Blob bases stay outside the graph's own storage ────────────────
@@ -2703,8 +2702,6 @@ async fn blob_load_external_file_uri() {
     assert_eq!(read_probes.external_blob_payload_read_calls(), 0);
     assert_eq!(read_probes.blob_payload_read_calls(), 0);
 
-    // Clearing the cell after its source disappeared never reads the old
-    // reference: an assigned Blob replaces the cell without carrying it.
     let clear_probes = MergeWriteProbes::default();
     let result = with_merge_write_probes(
         clear_probes.clone(),
@@ -2718,7 +2715,11 @@ async fn blob_load_external_file_uri() {
     .await
     .unwrap();
     assert_eq!(result.affected_nodes, 1);
-    assert_eq!(clear_probes.external_blob_probe_calls(), 0);
+    assert_eq!(
+        clear_probes.external_blob_probe_calls(),
+        0,
+        "clearing a cell whose source vanished never reads the old reference"
+    );
     assert_eq!(clear_probes.external_blob_payload_read_calls(), 0);
     assert_eq!(clear_probes.blob_payload_read_calls(), 0);
     let cleared = db

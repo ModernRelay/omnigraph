@@ -8,7 +8,11 @@
   serves its healthy siblings; startup fails with `--require-all-graphs`, and
   with `cluster_no_healthy_graphs` when every applied graph is quarantined.
   `Omnigraph::with_external_blob_policy` refuses a policy whose base overlaps
-  the handle's own graph root. To upgrade, move the base to a sibling prefix
+  the handle's own graph root. A base is compared only with a storage root of
+  its own kind (`s3://` with `s3://`, `file://` with a local root); a
+  same-kind root spelled with an empty path component or a percent sign
+  cannot be compared and is refused with
+  `external_blob_storage_root_uncomparable` instead. To upgrade, move the base to a sibling prefix
   outside the storage root, run `cluster apply`, and restart. The new checks
   do not rewrite values written earlier under an overlapping base.
   Incremental writes copied those bytes into managed storage;

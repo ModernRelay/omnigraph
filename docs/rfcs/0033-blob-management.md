@@ -221,6 +221,11 @@ The following rules are normative:
   unknown persisted length). The descriptor model carries a range so existing
   or future Lance values can be represented without changing the facade, but no
   public V1 command accepts an external offset/length.
+- An external descriptor with `offset > 0` and a persisted size of 0 is not a
+  valid `External` state. The central decoder refuses it as a Blob integrity
+  error: Lance's external reader substitutes the object size for a size of 0
+  but keeps the position, so reading it would run past the object's end. Only
+  a writer outside OmniGraph can persist it.
 
 Null detection uses only the parent struct's Arrow validity. A non-null struct
 with a zero length is a non-null empty value. Field-value heuristics are
@@ -533,6 +538,9 @@ as `NotFound`, null, or an opaque Lance display string.
 `put_blob_at_as` replaces exactly one cell with managed bytes. `clear_blob_at_as`
 sets exactly one nullable cell to null. Both require an existing entity row; they
 never insert a row. Clear on a non-nullable property is `BadRequest`.
+A `.gq` `update` that assigns null to a nullable Blob clears the cell the same
+way, and an `update` never reads the old value of a Blob it assigns. A null
+assigned to a non-nullable Blob is refused before the update opens its table.
 
 These methods require an exact-ID, update-only preparation path; they are not
 implemented by synthesizing a `.gq` update. The implementation may be a focused
@@ -952,8 +960,9 @@ and parity cost.
 ### 7.3 Existing references and disclosure
 
 The new ingress policy does not make existing graphs unreadable. Stored external
-references can be opened, exported, inspected, and redirected even when new
-ingress is denied. This separation permits an operator to freeze reference
+references can be opened and inspected even when new ingress is denied, and a
+reference that names its whole object can also be exported and redirected; a
+ranged descriptor is refused by those surfaces (§5.1, §8.3). This separation permits an operator to freeze reference
 creation without losing access to historical data.
 
 Read authorization permits observing the selected Blob cell, including its
@@ -1138,6 +1147,7 @@ depends on typed code and fields, not an opaque Lance string.
 | Non-Blob property, invalid selector, non-nullable clear | `bad_request` | 400 |
 | Branch and snapshot together / snapshot on write | `bad_request` | 400 |
 | Disallowed or malformed external URI | `bad_request` with policy reason | 400 |
+| Update must carry a stored external reference the graph's policy refuses | `StoredExternalBlobDenied`, naming type, id, and property | 400 |
 | External source missing/unreadable | typed external source error | 424 Failed Dependency; never generic 500 |
 | Upload/rewrite budget exceeded | `resource_limit` with limit/observed | 413 |
 | Managed HTTP range exceeds 4 MiB | consecutive bounded engine reads | 200/206; the 4 MiB ceiling bounds each payload read, not the requested representation |
@@ -1709,6 +1719,24 @@ publisher architecture.
   without reading the object, so a feed cursor passes its commit." and the
   2026-09-30 entry's "the change-feed baseline, an export, still refuses." are
   superseded.
+- 2026-10-02: §7.3's sentence "Stored external references can be opened,
+  exported, inspected, and redirected even when new ingress is denied." is
+  superseded by the version that limits export and redirect to a reference
+  naming its whole object, as §5.1 and §8.3 already require.
+- 2026-10-02: §3.1 adds that an external descriptor with an offset and a
+  persisted size of 0 is refused by the decoder as a Blob integrity error,
+  because Lance's external reader substitutes the object size for size 0 but
+  keeps the position. No earlier sentence is superseded; the rule narrows the
+  `External` state.
+- 2026-10-02: §11 gains the `StoredExternalBlobDenied` row (HTTP 400, naming
+  type, id, and property): an update that must carry a stored external
+  reference the graph's policy refuses, kept apart from the policy refusal of
+  caller input. No earlier sentence is superseded.
+- 2026-10-02: §4.3 adds that a `.gq` `update` assigning null to a nullable Blob
+  clears it, that an update never reads the old value of a Blob it assigns,
+  and that a null on a non-nullable Blob is refused before the table opens.
+  No sentence of this RFC is superseded; an update that kept the old value on
+  null was a defect outside it.
 - 2026-09-30: §8.3 adds that change-feed images and entity reads describe a
   ranged external descriptor as `{"uri", "offset", "length"}` instead of
   refusing it. Refusing there made a feed page holding such a row fail on

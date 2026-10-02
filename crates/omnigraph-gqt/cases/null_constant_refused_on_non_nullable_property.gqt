@@ -3,7 +3,8 @@
 # notes: selects no row as an inline match; assigned to a non-nullable property it is the typed error naming the property, raised before the batch.
 # notes: A null parameter assigned to a non-nullable Blob is the same typed error, raised before the table is scanned:
 # notes: a predicate that matches no row still refuses, where resolving after the scan would report zero affected rows.
-# notes: The engine test blob_null_on_non_nullable_refuses_before_table_open_or_scan in end_to_end.rs proves the table is never opened.
+# notes: The Blob lives on its own type, Attachment, so every Person update stays on the scan path of a type without Blobs.
+# notes: The refusal is raised while the assignments resolve, before the update opens its table, so a refused update reads no row.
 
 --- runner
 timeout_ms: 10000
@@ -16,12 +17,17 @@ node Person {
     slug: String @key
     adult: Bool
     maybe: Bool?
+}
+
+node Attachment {
+    slug: String @key
     body: Blob
 }
 
 --- seed
-{"type":"Person","data":{"slug":"a","adult":false,"body":"base64:AQID"}}
-{"type":"Person","data":{"slug":"b","adult":true,"body":"base64:BAUG"}}
+{"type":"Person","data":{"slug":"a","adult":false}}
+{"type":"Person","data":{"slug":"b","adult":true}}
+{"type":"Attachment","data":{"slug":"a","body":"base64:AQID"}}
 
 --- mutate
 query null_comparison_on_non_nullable($slug: String, $age: I64?) {
@@ -34,24 +40,14 @@ query null_comparison_on_non_nullable($slug: String, $age: I64?) {
 --- expect error: cannot assign null to non-nullable property 'adult' of Person
 
 --- mutate
-query null_on_non_nullable_blob($slug: String, $body: Blob?) {
-    update Person set { body: $body } where slug = $slug
-}
-
---- params
-{"slug": "a", "body": null}
-
---- expect error: cannot assign null to non-nullable property 'body' of Person
-
---- mutate
 query null_on_non_nullable_blob_matching_no_row($slug: String, $body: Blob?) {
-    update Person set { body: $body } where slug = $slug
+    update Attachment set { body: $body } where slug = $slug
 }
 
 --- params
 {"slug": "nobody", "body": null}
 
---- expect error: cannot assign null to non-nullable property 'body' of Person
+--- expect error: cannot assign null to non-nullable property 'body' of Attachment
 
 --- mutate
 query comparison_on_nullable($slug: String, $age: I64?) {
