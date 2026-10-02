@@ -7,6 +7,7 @@ pub mod expand_projection;
 pub mod failpoint;
 pub mod recovery;
 pub mod transfer_aggregation;
+pub mod wide_rows;
 
 use std::sync::Arc;
 

@@ -37,6 +37,7 @@ pub mod instrumentation;
 pub(crate) use omnigraph_core::lance_access;
 pub(crate) use omnigraph_core::{dataset_index, staging};
 pub mod loader;
+pub(crate) mod ordered_cursor;
 pub(crate) mod runtime_cache;
 pub mod seams;
 pub mod session;

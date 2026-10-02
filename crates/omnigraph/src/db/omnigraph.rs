@@ -7,7 +7,6 @@ use arrow_array::{Array, RecordBatch, StringArray, StructArray, UInt64Array, new
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::blob::{BlobArrayBuilder, blob_field};
-use lance::dataset::scanner::ColumnOrdering;
 use lance::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;

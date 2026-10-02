@@ -1861,6 +1861,114 @@ node Document {
     assert!(physical_only.next_page_token.is_none());
 }
 
+/// A one-row update whose before-images come from a parent fragment that also
+/// holds a row wider than the ordered-scan sort cap. The candidate path walks
+/// that whole fragment in id order; sorting its complete rows failed with
+/// `ordered_scan_input_batch_bytes` although the wide row is untouched. The
+/// diff and the feed must both read the commit, carrying one update.
+#[tokio::test]
+async fn commit_changes_and_feed_read_past_a_row_wider_than_the_sort_cap_issue_705() {
+    use helpers::wide_rows::*;
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedScope, ChangeFeedStart};
+
+    let dir = tempfile::tempdir().unwrap();
+    let main = init_wide_row_graph(&dir, WIDE_PAYLOAD_BYTES).await;
+    let loaded = head_commit_id(dir.path().to_str().unwrap(), None).await;
+    let updated = main
+        .mutate_with_receipt(
+            "main",
+            WIDE_ROW_SET_PAYLOAD,
+            "set_payload",
+            &mixed_params(&[("$key", "small-1"), ("$payload", "edited")], &[]),
+        )
+        .await
+        .unwrap()
+        .commit
+        .expect("the update publishes one commit")
+        .graph_commit_id;
+
+    let page = main
+        .commit_changes_page(&updated, &ChangeFeedScope::default(), None, None, None)
+        .await
+        .expect("a commit beside a wide row must be readable");
+    assert_eq!(
+        page.block
+            .changes
+            .iter()
+            .map(|change| (change.id.as_str(), change.op))
+            .collect::<Vec<_>>(),
+        vec![("small-1", omnigraph::changes::ChangeOpKind::Update)]
+    );
+    let change = &page.block.changes[0];
+    assert_eq!(
+        change.before.as_ref().unwrap().properties["payload"],
+        serde_json::json!("tiny")
+    );
+    assert_eq!(
+        change.after.as_ref().unwrap().properties["payload"],
+        serde_json::json!("edited")
+    );
+
+    let feed = main
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::AfterCommit(loaded)),
+        ))
+        .await
+        .expect("the feed must cross a commit beside a wide row");
+    assert_eq!(feed.blocks.len(), 1);
+    assert_eq!(feed.blocks[0].cause.graph_commit_id, updated);
+    assert_eq!(feed.blocks[0].changes.len(), 1);
+    assert_eq!(feed.blocks[0].changes[0].id, "small-1");
+}
+
+/// The production shape: no row is near the sort cap, yet a full
+/// ordered walk of one fragment of ordinary rows failed. Lance's
+/// byte-targeted scan slices a decoded batch without copying and re-slices
+/// the tail until a one-row slice reaches the sort, whose hard cap measures
+/// the whole shared parent buffer. A compaction commit takes the exact full
+/// walk of both versions and must read as an empty block.
+#[tokio::test]
+async fn physical_only_commit_over_a_large_fragment_reads_as_empty_issue_705() {
+    use helpers::wide_rows::*;
+    use omnigraph::changes::ChangeFeedScope;
+
+    let dir = tempfile::tempdir().unwrap();
+    let main = init_sliced_parent_graph(&dir).await;
+    main.load(
+        "main",
+        r#"{"type":"Doc","data":{"key":"row-tail","payload":"tail"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let stats = main.optimize().await.unwrap();
+    assert!(
+        stats
+            .iter()
+            .any(|table| table.fragments_removed > 0 && table.committed),
+        "the fixture must actually compact: {stats:?}"
+    );
+    let optimize_commit = head_commit_id(dir.path().to_str().unwrap(), None).await;
+
+    let page = main
+        .commit_changes_page(
+            &optimize_commit,
+            &ChangeFeedScope::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("a compaction over ordinary rows must be readable");
+    assert!(
+        page.block.changes.is_empty(),
+        "a physical-only commit is an empty block: {:?}",
+        page.block.changes
+    );
+    assert!(page.next_page_token.is_none());
+}
+
 #[tokio::test]
 async fn commit_changes_update_carries_exact_before_and_after_images_including_null_vs_empty() {
     use omnigraph::changes::{ChangeEntityKind, ChangeFeedScope, ChangeOpKind};
