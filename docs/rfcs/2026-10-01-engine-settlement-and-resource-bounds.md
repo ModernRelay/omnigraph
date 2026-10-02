@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-10-01
-updated: 2026-10-01
+updated: 2026-10-03
 discussion: null
 supersedes: []
 superseded_by: []
@@ -38,23 +38,29 @@ acceptance does not enable online deployment or weaken the existing
 
 `QueryContext::run_owned` runs the complete query, including successive search
 passes, drops its completed execution future, then waits for registered graph
-producers and blocking workers before returning success or an error. Each child
+producers and blocking workers before returning success, an error or a panic. Each child
 registers before dispatch. Its future, captured resources and abandoned result
 remain ahead of its registration in destruction order. Dropping the query closes
 new root registrations; existing children retain their ownership and add
 descendants only through their own registration (`QueryWorkLease::child`), so a
 nested root registration such as `WorkMemory::blocking` is refused after
-closure. A panic follows the existing worker-error path. This joins
+closure. Worker panics follow the existing worker-error path. Execution panics,
+including a completed future's destructor panic, wait for the registered
+workers before resuming the original panic payload. The server now keeps read
+execution alive after disconnect or MCP response expiry so these joins finish;
+embedded callers that drop the query still only close registration. This joins
 OmniGraph's workers, not opaque DataFusion tasks or Lance/storage I/O, and grants
-no engine-reuse capability.
+no engine-reuse capability. Early termination, including `LIMIT`, and errors can
+still wait for a running blocking worker. Ownership does not establish a finite
+cancellation or early-completion latency; that cost remains to be measured.
 
 Named mutations and keyed loads share a 32 MiB retained-batch allowance across
 their touched tables, in addition to the existing per-table keyed limits.
 Keyed parsing and removed-ID collection have their own 32 MiB operation-wide
 allowances. The latter covers deletes, cascades and Overwrite replacement;
 Overwrite's bulk input keeps its existing separate checks. Refusal precedes this
-operation's table effects and publication, but earlier schema completion or an
-implicitly created load branch may already have effects. These fixed allowances
+operation's table effects and publication, but an implicitly created load branch
+may already have effects. These fixed allowances
 preserve conservative accounting; they do not track every shared allocation or
 form a combined memory/RSS cap.
 Exact ownership and admission points are documented in
@@ -79,9 +85,11 @@ The remaining full-B contract requires:
 | Effect or settlement cannot be established | Keep admission closed and retain uncertainty; the existing bounded process shutdown remains the containment path. |
 | Drain succeeds | A root- and epoch-bound capability permits the next validated exclusive transition. It does not itself prove successful publication or authorize retry. |
 
-The complete decision touches engine/core/storage integration and the server. The supported
-wire line remains v0.12. Same-PID schema activation still needs E1's deployment
-ledger, authorization and activation protocol after this foundation qualifies.
+The complete decision touches engine/core/storage integration and the server.
+The supported wire line remains v0.12. The accepted umbrella specifies a narrower E1
+transition that retains the same engine and resource owners. It needs its own
+transition, resource and deployment-protocol qualification; this decision
+neither qualifies it nor requires generic engine disposal/reuse as its mechanism.
 
 ## Required settlement mechanism
 
@@ -109,7 +117,8 @@ bounded by admitted scopes and child limits; this is no durable work queue.
 Keep two facts separate:
 
 - **Effect outcome:** the existing exact publication/no-op evidence, proved
-  absence of effects, or unknown outcome. Schema installation may remain owed.
+  absence of effects, or unknown outcome. A schema publication contains both the
+  accepted contract and table references; no contract installation remains owed.
 - **Settlement:** no remaining worker or accepted request can change this
   operation's storage state or use its retained resources.
 
@@ -137,9 +146,10 @@ such proof. Unsupported ambiguous cases retain fail-stop; startup reconciliation
 must also respect unresolved remote effects. This proposal does not invent a
 remote cancellation API or a distributed writer fence.
 
-### Reuse and schema completion
+### General reuse and schema activation
 
-Closing one serving epoch prevents new root operations. Every in-process handle
+General engine disposal/reuse requires closing one serving epoch to prevent new
+root operations. Every in-process handle
 for the same canonical root must participate in that admission boundary;
 otherwise reuse refuses. The shared schema gate alone does not establish this.
 External writer exclusion remains the separate deployment responsibility.
@@ -159,13 +169,25 @@ owner. Proposed private API shape: `seal(reason, absolute_deadline)` returns a
 `DrainAttempt`; `wait(&mut self)` returns a non-cloneable `SettledEpoch` only on
 success. No public constructor or unchecked boolean can manufacture that proof.
 
-Published schema installation and sentinel release use the existing engine
-completion protocol under an explicitly owned exclusive continuation. Acquiring
-that continuation consumes the reuse capability and its protected resources;
-it does not open normal admission. A further successful settlement and matching
-schema/catalog validation are required before producing a successor capability.
-Writable open and `refresh` are effectful and cannot be candidate-validation
-probes. These rules preserve the single mutation-process boundary.
+Current schema apply publishes its contract and table references atomically in
+`__manifest`, as described in
+[Schema contract in the manifest](2026-09-30-schema-contract-in-manifest.md).
+There is no durable contract-file installation or schema-sentinel release to
+continue. An error after proven publication can still report `RecoveryRequired`
+with the committed outcome; coherent in-memory schema/catalog adoption must be
+validated without replaying that publication. Engine `refresh` reads the
+published contract and updates the in-memory view. It does not complete durable
+schema work. Read-write local open still writes a capability probe, so it is not
+an effect-free candidate-validation operation.
+
+The umbrella's separately gated E1 transition finishes affected admitted requests and
+registered query workers before applying on the same engine. It does not permit
+old requests to resume with old query bindings against a new contract. Any
+remaining native read tail needs separate proof that it cannot interfere with
+the transition and remains owned and charged under finite limits; unclassified
+tails refuse activation. That narrower qualification does not mint a
+`SettledEpoch`, permit engine disposal or weaken this decision's generic native
+settlement and resource guarantees. Uncertain writes retain process containment.
 
 ## Required resource contract
 
@@ -192,6 +214,12 @@ charged independently to every caller or assumed isolated. Merge has separate
 validation, hydration and staged-file ownership. The implementation must join
 these existing owners to the hierarchy instead of adding their nominal limits
 to a request-size counter.
+
+The inline schema source and serialized IR are independent byte dimensions in
+catalog publication and retained manifest history. Measure both across history
+depth, branch and participant counts, including cold reads and publication
+copies. The publisher's 8 MiB retained-row cache threshold does not bound those
+allocations; the small-file prefetch policy does not bound decoded memory.
 
 First admit effect-free preparation under a finite preparation allowance. It
 must bound metadata reads and decoding before materializing the participant and
@@ -251,6 +279,27 @@ that a hook exists in the pinned release.
   `LanceExecutionOptions` accepts numeric limits but no injected shared pool.
   `Session::with_spill_store` does not govern DataFusion's disk manager or merge
   temporary datasets. These are concrete integration gaps, not missing counters.
+- The 2026-10-02 `lance_surface_guards.rs` read probes extend this evidence:
+  dropped local reads still execute, separate standard scan schedulers retain
+  independent read budgets, and dropped `spawn_cpu` receivers retain their
+  captured inputs until the native jobs finish. The pinned helper submits
+  eagerly to a private runtime; production KNN uses it. Owning GET futures and
+  payloads through the public store wrapper would not own subsequent native
+  CPU/decode producers. These are read-only resource-lifetime gaps, not evidence
+  of graph corruption; the umbrella's narrower same-engine E1 remains unqualified.
+
+The 2026-10-02 upstream audit also examined released
+[Lance 12.0.0](https://github.com/lance-format/lance/releases/tag/v12.0.0)
+and main `b0fa4f76cd8dde3b9a8e4076558f585a7688ebdc`. Neither supplies the missing
+ownership boundary. The newer
+[`spawn_cpu`](https://github.com/lance-format/lance/blob/v12.0.0/rust/lance-core/src/utils/tokio.rs)
+preserves panic payloads, but abandoned callers still leave native work running;
+the [scan scheduler](https://github.com/lance-format/lance/blob/v12.0.0/rust/lance-io/src/scheduler.rs)
+still has no public asynchronous drain. `FragReadConfig::with_scan_scheduler`
+already exists in Lance 11, but ordinary scans/search and internal execution
+construct other schedulers and CPU workers. That fragment-level hook and numeric
+execution limits do not establish operation-wide ownership. An upgrade alone
+does not pass this gate.
 
 ## Qualification and rollout
 
@@ -266,9 +315,9 @@ controls; an engine-DST pass cannot certify native local blocking work.
 | Native limitation probes | `lance_surface_guards`: park the real blocking executor, drop native writer/upload/cleanup owners, observe persistence/cleanup occur after release through independent filesystem state. The public alternate-provider guard establishes addressing interchange only. These do not qualify reuse. |
 | T6 settlement | Native/engine guards and server `boot_settings`/`data_routes`: hold actual accepted I/O or a child after its caller returns; no reuse capability or early capacity release; release and prove completion. Cover success, error, panic and remote response loss separately. |
 | T10 resources | `engine_v2_memory`, loader/merge/catalog owners and server workload suites: saturate ordinary capacity while completion and status actually run; compare counters with independent buffer, worker and file lifetimes. Include multi-table inputs, preparation refusal before excess catalog allocation, cache eviction with a live borrower, and Arrow/JSON overlap. |
-| Schema continuation | `schema_apply`, `failpoints`, `detached_commit_matrix`: complete only the original published contract, retain authority on failure, then perform a same-handle sentinel write without stale schema or duplicate publication. |
+| Atomic schema publication | `schema_apply`, `failpoints`, `detached_commit_matrix`: faults before/after publication leave the complete old/new contract and table references together. Verify exact committed outcomes, coherent same-handle and previously opened-handle queries/writes, and no duplicate publication or durable installation step. |
 | Sensitivity | Deliberately release an owner early, omit one reserve charge or declare settlement while I/O is held; the corresponding test must fail. A timer alone is no reached-fault witness. |
-| Cost | Existing benchmark owners for B1/B2/B5: history/participant widths, mixed traffic and fault settlement; record offered/admitted/refused/completed/unknown work, latency, peak RSS, scratch, I/O bytes and requests. No CI wall-time threshold. |
+| Cost | Existing benchmark owners for B1/B2/B5: independent schema-source/IR bytes across retained history and branch/participant widths, mixed traffic, early query termination, cancellation and fault settlement; record offered/admitted/refused/completed/unknown work, latency, peak RSS, scratch, I/O bytes and requests. No CI wall-time threshold. |
 
 On 2026-10-01 the full `lance_surface_guards` owner passed 56 tests, including
 the native-lifetime probes and alternate-provider addressing check; its existing
@@ -289,10 +338,20 @@ small write. This evidence supplies no full-B or performance claim.
    Extend the existing substrate guards; preserve local/S3 semantics and Azure's
    separate admission-wrapper and qualification boundary. A forced wrapper lane
    alone does not pass this gate.
+   The first upstream target can be a read-only operation scope propagated
+   through ordinary scans, search, take, Blob reads and cached loaders. It must
+   register I/O and CPU/decode children before dispatch, retain abandoned outputs
+   through destruction, close root admission and expose a joinable completion
+   boundary with shared finite admission. Cached sessions cannot capture the
+   first caller's scope. Qualifying that boundary can discharge E1's read-tail
+   obligation; persistence and multipart cleanup remain separate full-B work.
 3. Complete scope propagation, the remaining aggregate envelopes and protected
-   completion together. Pass T6/T10 and schema-continuation gates before exposing reuse.
-4. E1 consumes the capability under its separately specified ledger and
-   activation protocol. There is no deployment endpoint or alternate job store.
+   completion together. Pass T6/T10 and atomic-schema/coherent-view validation
+   before exposing generic engine reuse.
+4. Qualify E1's same-engine transition separately under the umbrella's
+   serving-view and deployment protocol. It cannot assume a reuse capability or
+   advertise general native settlement. There is no deployment endpoint or
+   alternate job store in this decision.
 
 ## Compatibility, invariants and alternatives
 
@@ -324,10 +383,32 @@ create parallel ownership and remains outside this decision.
   qualifying route through the existing integration.
 - Measure and fix the initial workload profile, process totals, per-operation
   envelope and minimum completion reserve, including history-dependent catalog
-  work and native execution contexts. Reject unsupported dimensions explicitly.
+  work with independent source/IR sizes and native execution contexts. Measure
+  early-completion and cancellation latency as well as retained resources;
+  joining graph workers alone bounds neither duration. Reject unsupported
+  dimensions explicitly.
 
 ## Decision log
 
+- 2026-10-03: The umbrella acceptance replaces the draft/proposal descriptions
+  in Motivation and observable behavior, General reuse and schema activation,
+  and Qualification and rollout with an accepted,
+  separately gated E1 decision. Native settlement, resource bounds and engine
+  reuse remain unqualified; this amendment grants no new reuse capability.
+
+- 2026-10-02: Audited released Lance 12 and current upstream main; a dependency
+  upgrade does not provide native settlement. Identified ordinary-read scope
+  propagation as the first upstream integration target, without qualifying E1
+  or weakening full B's write and remote-outcome requirements.
+
+- 2026-10-02: Extended Implemented boundary and the existing producer test to
+  join graph workers before propagating execution/destructor panics. Server
+  read ownership keeps the execution alive after caller loss; the native
+  limitation and runtime-reuse gates remain unchanged.
+
+- 2026-10-02: Added read/CPU limitation probes to Substrate evidence. They
+  extend the existing native-lifetime finding to read-only work without
+  changing the accepted contract or asserting that E1 requires generic reuse.
 - 2026-10-01: Initially drafted on the maintainer's instruction to proceed
   with full B. The source audit found missing native settlement/resource hooks;
   the first draft and its limitation probes kept runtime reuse unavailable.
@@ -336,3 +417,15 @@ create parallel ownership and remains outside this decision.
   representations. The native probes and public-provider experiment establish
   remaining qualification gaps; they do not provide a reusable drain or change
   storage routing. Implementation is partial until the full-B gates pass.
+- 2026-10-02: Amended after atomic schema contracts landed. Replaced the
+  implemented-boundary caveat about earlier schema completion, the effect-outcome
+  statement that schema installation may remain owed, and the reuse section's
+  contract-installation/sentinel continuation and successor-capability rules.
+  Replaced its claim that engine `refresh` is effectful with read/adopt behavior,
+  retaining the local writable-open probe boundary. Replaced the schema-
+  continuation evidence gate and the rollout statements requiring it and making
+  E1 consume the generic reuse capability. The motivation and activation section
+  now distinguish the umbrella draft's separately unqualified same-engine E1
+  transition. Generic settlement/resource guarantees remain accepted and partial;
+  added independent source/IR-history costs and cancellation/early-completion
+  latency to their qualification work.

@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-08-09
-updated: 2026-10-02
+updated: 2026-10-03
 discussion: null
 supersedes: []
 superseded_by: []
@@ -19,7 +19,7 @@ blocked_on: []
 **Depends on:** RFC 0022 unified writes, RFC 0023 exact `id` fencing,
 RFC 0028 stable schema identity, internal manifest schema v6, and Lance 10.0.0
 blob-v2 (`lance.blob.v2`) on file format V2_2.
-Phase 3 and the served-route lifecycle additionally depend on the proposed
+Phase 3 and the served-route lifecycle additionally depend on the accepted
 [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md)
 contracts for operation ownership, coherent serving views, and completion.
 **Surveyed:** OmniGraph `db23f58a5d97`; Lance 9.0.0 as the defect baseline;
@@ -250,7 +250,7 @@ pub struct BlobCell {
 ```
 
 `type_name` and `property` are public graph vocabulary. They are resolved through
-the accepted catalog captured with the read view; under the proposed
+the accepted catalog captured with the read view; under the accepted
 [serving-view contract](2026-09-29-server-runtime-and-online-deployment.md#serving-views)
 that catalog, the schema token, Cedar policy, and external-Blob policy all come from the same
 immutable runtime generation. The engine then carries stable table identity,
@@ -346,7 +346,7 @@ boundaries, just like `cleanup`: Phase 1 adds
 no durable reader lease or cross-process live-reader registry. Callers that
 require an opened reader to finish must quiesce it before deleting that branch,
 running version GC, or performing an offline operation that removes a ref/path.
-The v0.12 [server runtime proposal](2026-09-29-server-runtime-and-online-deployment.md)
+The v0.12 [server runtime decision](2026-09-29-server-runtime-and-online-deployment.md)
 drains affected reads during deployment. Independent historical availability
 and its stronger reader-retention protocol require a separate proposal; neither
 changes the quiescence rule above. Ordinary detached writes need no compensation.
@@ -603,8 +603,8 @@ manifest CAS. The shared publish tail remains one call site. Unpublished table
 effects remain unreachable; published pins are final, with no recovery sidecar
 or table promotion. See [the write contract](../dev/writes.md).
 
-The proposed [authority and completion contract](2026-09-29-server-runtime-and-online-deployment.md#authority-and-completion)
-owns the server's use of engine publication evidence and schema/control
+The accepted [authority and completion contract](2026-09-29-server-runtime-and-online-deployment.md#authority-and-completion)
+owns the server's use of engine publication evidence and control
 completion. A served Blob operation never heals inline or replays after an
 unknown outcome. It preserves exact evidence and notifies the designated owner;
 runtime candidates are built without completion effects.
@@ -615,8 +615,8 @@ checks its schema token before entering the engine. The engine write:
 
 1. normalizes and rejects internal branch names;
 2. enforces Cedar `change` for the supplied actor identity and branch;
-3. respects pending schema/control completion before effects, then captures one
-   fresh write base;
+3. respects remaining control obligations and captures one fresh write base
+   with its complete accepted schema contract;
 4. resolves stable schema/table/property identity and exact row ID;
 5. evaluates the precondition and prepares one-row replacement state under the
    normal row/byte ceilings;
@@ -650,7 +650,7 @@ Reads additionally accept `branch=<name>` or `snapshot=<commit>`, never both;
 the transport default is `branch=main`. Authorization uses the existing `read`
 action and the same snapshot-to-policy-branch resolution as `/read`.
 
-Under the proposed [operation ownership contract](2026-09-29-server-runtime-and-online-deployment.md#operation-ownership)
+Under the accepted [operation ownership contract](2026-09-29-server-runtime-and-online-deployment.md#operation-ownership)
 the route first captures one exact served generation and a read-lifetime permit
 before target observation. The generation supplies the engine, catalog, policy,
 external-Blob policy, and cache namespace. HEAD and an
@@ -1168,7 +1168,7 @@ depends on typed code and fields, not an opaque Lance string.
 | Blob write If-Match failed | `BlobWritePreconditionFailed { current_etag }` | 412 plus `blob_precondition_failure`; never graph `precondition_failure` |
 | Generation lane closed before operation | shared proposed lifecycle detail | 503, not started |
 | Captured generation schema token is stale | shared proposed stale-generation outcome | shared refusal and designated-owner notification; no Blob-specific error or inline repair |
-| Publication or schema/control completion uncertain | exact engine outcome and retained publication evidence | existing mapping; never permission to replay |
+| Publication or control completion uncertain | exact engine outcome and retained publication evidence | existing mapping; never permission to replay |
 | Owned write panics or has no knowable terminal outcome | shared proposed unknown-outcome class | 500; never success or replay |
 | Persisted table/Blob integrity contradiction | `BlobIntegrity { reason }` | exhaustive server mapping is 5xx |
 
@@ -1186,7 +1186,7 @@ credentials, or complete sensitive URIs. URI metrics use scheme plus a
 keyed/irreversible base identifier. Phase 2A deliberately does not add a new
 metrics backend merely to claim this box; the telemetry ships in a focused
 follow-up against the repository's eventual production observability owner.
-The [server runtime proposal](2026-09-29-server-runtime-and-online-deployment.md#availability-and-supervision)
+The [server runtime decision](2026-09-29-server-runtime-and-online-deployment.md#availability-and-supervision)
 specifies bounded lifecycle status. Production telemetry stays with the
 observability owner above; this RFC adds Blob classification, range, payload-byte,
 validator, and delivery timing dimensions.
@@ -1320,12 +1320,12 @@ The implementation extends existing owners before creating new fixtures, per
   conditionals; external 302 with zero external I/O; branch/snapshot validation;
   node and edge selectors; and authorization. A payload-read probe remains at
   zero for managed HEAD on both empty and near-limit values. The server runtime
-  proposal extends the same route owner with exact-generation read ownership and shared
+  decision extends the same route owner with exact-generation read ownership and shared
   lifecycle 503s. Phase 3 extends it with owned PUT/DELETE, exact receipts,
   no-op clear `commit: null`, distinct Blob 412 details, 413, and actor
   attribution.
 - `openapi.rs`: regenerate and compare each phase's binary request/response
-  surface. The server runtime proposal adds GET/HEAD lifecycle responses;
+  surface. The server runtime decision adds GET/HEAD lifecycle responses;
   Phase 3 pins write lifecycle, the exact receipt, and the distinct Blob precondition without
   exposing storage identity.
 - Phase 2B's pure `crates/omnigraph-cli/src/blob_cli.rs` units own range
@@ -1723,6 +1723,10 @@ publisher architecture.
 
 ## Decision log
 
+- 2026-10-03: Current server-runtime cross-references now name the accepted
+  decision; implementation and qualification gates remain with that owner.
+
+
 - 2026-10-02: §8.3's change-feed baseline describes a ranged external
   descriptor as `{"uri", "offset", "length"}`, as change images do, instead
   of refusing it. The consumer starts from exactly the baseline's state and
@@ -1806,3 +1810,8 @@ publisher architecture.
   materializing rewrites." (§13) is superseded by the landed/remaining split. §10's
   rewrite-amplification row gains the schema-apply gap, and a compaction-memory
   row records optimize's derived batch bound.
+- 2026-10-02: §4.4 replaces "schema/control completion" and step 3's pending
+  schema-completion prerequisite with coherent capture of the manifest-resident
+  contract; §11's uncertainty row retains publication/control uncertainty without
+  the removed schema-installation phase. Blob behavior and serving-view
+  requirements are unchanged.
