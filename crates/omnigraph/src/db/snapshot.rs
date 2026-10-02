@@ -224,6 +224,16 @@ impl Snapshot {
         .await
     }
 
+    /// The internal-schema (storage-format) stamp of this snapshot's own
+    /// `__manifest` version.
+    pub(crate) async fn internal_schema_stamp(&self, root_uri: &str) -> Result<Option<u32>> {
+        omnigraph_catalog::ManifestCoordinator::internal_schema_stamp_for_snapshot(
+            root_uri,
+            &self.inner,
+        )
+        .await
+    }
+
     pub(crate) fn graph_branch(&self) -> Option<&str> {
         self.inner.graph_branch()
     }

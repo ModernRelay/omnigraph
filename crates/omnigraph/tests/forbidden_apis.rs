@@ -296,6 +296,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "snapshot_of"),
     ("db/omnigraph.rs", "graph_manifest_version_of"),
     ("db/omnigraph.rs", "internal_schema_version_of"),
+    ("db/omnigraph.rs", "internal_schema_version_at"),
     ("db/omnigraph.rs", "resolved_branch_of"),
     ("db/omnigraph.rs", "sync_branch"),
     ("db/omnigraph.rs", "resolve_snapshot"),
@@ -367,6 +368,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
         "read_schema_contract_for_snapshot",
+    ),
+    (
+        "omnigraph-catalog/lib.rs",
+        "ManifestCoordinator",
+        "internal_schema_stamp_for_snapshot",
     ),
     (
         "db/graph_coordinator.rs",
