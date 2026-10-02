@@ -740,7 +740,7 @@ gateway_surfaces! {
         "prepare_overwrite_blob_references_with_preflight",
         "prepare_keyed_write_batch", "validate_keyed_write_batch", "first_existing_id",
         "predicted_materialized_blob_batch_bytes",
-        "materialize_blob_batch_bounded_with_preflight_cache",
+        "materialize_blob_batch_bounded_with_preflight_cache", "managed_blob_payloads",
         "can_fold_index", "has_foldable_unindexed_fragments", "index_is_vector",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::StageOnly => [
@@ -2044,15 +2044,9 @@ fn callable_storage_and_manifest_gateway_surfaces_are_registered() {
     );
 }
 
-/// RFC-023 closes the keyed-Append side door at the source boundary. The raw
-/// append primitive `stage_append` is test-only behind the sealed storage
-/// adapter; every production graph writer must select the exact-id fenced
-/// adapter.
-///
-/// This walks syntax rather than text, so comments and test-only fixtures do
-/// not weaken the guard. A future call from mutation, load, branch merge, or a
-/// newly-added production module fails here even if it is added to another
-/// protocol allow-list.
+/// RFC-023: the raw `stage_append` is test-only behind the sealed storage
+/// adapter, and every production graph writer selects the exact-id fenced
+/// adapter. The walk is syntactic, so comments and test fixtures cannot weaken it.
 #[test]
 fn graph_visible_keyed_writes_cannot_reach_unfenced_append() {
     let src = engine_src_root();
@@ -3554,6 +3548,43 @@ fn lance_ordering_stays_behind_bounded_scan_executor() {
     assert!(
         !tuning_exposes_order_by,
         "ScanTuning must not expose order_by after executor routing"
+    );
+}
+
+/// Pins the per-file call counts of `read_blobs`, `read_blob_ranges` and
+/// `with_io_buffer_size_bytes` in the production sources of the engine crate and the
+/// `GUARDED_CRATES`.
+#[test]
+fn lance_batched_blob_read_call_counts_are_pinned() {
+    let src = engine_src_root();
+    let mut sites = Vec::new();
+    for (relative, file) in labeled_scan_files(&src, true) {
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let ast = parse_rust_source(&contents, &relative);
+        let inventory = call_inventory(&ast);
+        for method in [
+            "read_blobs",
+            "read_blob_ranges",
+            "with_io_buffer_size_bytes",
+        ] {
+            let count = inventory.counts.get(method).copied().unwrap_or(0);
+            if count > 0 {
+                sites.push((method, relative.clone(), count));
+            }
+        }
+    }
+    sites.sort();
+    assert_eq!(
+        sites,
+        vec![
+            ("read_blob_ranges", "db/upgrade.rs".to_string(), 1),
+            ("read_blobs", "table_store.rs".to_string(), 1),
+            ("with_io_buffer_size_bytes", "db/upgrade.rs".to_string(), 1),
+            ("with_io_buffer_size_bytes", "table_store.rs".to_string(), 1),
+        ],
+        "the per-file call counts of read_blobs, read_blob_ranges and \
+         with_io_buffer_size_bytes changed"
     );
 }
 

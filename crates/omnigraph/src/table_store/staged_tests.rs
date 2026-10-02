@@ -2652,15 +2652,18 @@ async fn commit_staged_skips_auto_cleanup_so_pinned_versions_survive() {
 
 #[test]
 fn compaction_blob_batch_rows_bounds_one_batch() {
-    use crate::table_store::compaction_blob_batch_rows;
-    const MIB: u64 = 1024 * 1024;
-    // No Blob bytes, or rows too small to reach the budget: Lance's fallback.
-    assert_eq!(compaction_blob_batch_rows(0), 8192);
-    assert_eq!(compaction_blob_batch_rows(1), 8192);
-    assert_eq!(compaction_blob_batch_rows(4 * 1024), 8192);
-    // Large rows: as many as fit the 32 MiB budget, never fewer than one.
-    assert_eq!(compaction_blob_batch_rows(MIB), 32);
-    assert_eq!(compaction_blob_batch_rows(32 * MIB), 1);
-    assert_eq!(compaction_blob_batch_rows(100 * MIB), 1);
-    assert_eq!(compaction_blob_batch_rows(u64::MAX), 1);
+    use crate::table_store::{
+        COMPACTION_BLOB_BATCH_BYTES as BUDGET, COMPACTION_MAX_BATCH_ROWS as MAX_ROWS,
+        compaction_blob_batch_rows,
+    };
+    assert_eq!(compaction_blob_batch_rows(0), MAX_ROWS, "no Blob bytes");
+    assert_eq!(compaction_blob_batch_rows(1), MAX_ROWS, "clamped high");
+    assert_eq!(compaction_blob_batch_rows(BUDGET / 32), 32, "the quotient");
+    assert_eq!(compaction_blob_batch_rows(BUDGET + 1), 1, "clamped low");
+    assert_eq!((BUDGET, MAX_ROWS), (32 << 20, 8192));
+    assert_eq!(compaction_blob_batch_rows(4096), 8192);
+    assert_eq!(compaction_blob_batch_rows(4097), 8190);
+    assert_eq!(compaction_blob_batch_rows(BUDGET), 1);
+    assert_eq!(compaction_blob_batch_rows(BUDGET / 2 + 1), 1);
+    assert_eq!(compaction_blob_batch_rows(BUDGET / 2), 2);
 }

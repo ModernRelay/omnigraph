@@ -20,6 +20,7 @@ use omnigraph::db::{
     RepairOptions,
 };
 use omnigraph::loader::LoadMode;
+use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 
 use helpers::collector::{
     detached_versions, insert_person, insert_scored, keep_one, main_plan, merge_three_chunk_chain,
@@ -630,10 +631,18 @@ node Tag {\n    slug: String @key\n}\n";
         .graph_commit_id
         .clone();
 
-    let stats = db
-        .optimize()
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let stats = omnigraph::instrumentation::with_merge_write_probes(probes.clone(), db.optimize())
         .await
         .expect("optimize must not crash on a graph with a Blob table");
+    assert_eq!(
+        (
+            probes.compaction_blob_batch_calls(),
+            probes.compaction_blob_batch_rows()
+        ),
+        (1, 8192),
+        "a small-value Blob table still gets the row ceiling set explicitly"
+    );
 
     let doc = stats
         .iter()
@@ -686,19 +695,14 @@ node Tag {\n    slug: String @key\n}\n";
     );
 }
 
-/// A Blob table whose rows are large compacts in batches derived from its
-/// largest row (32 rows of 1 MiB under the 32 MiB budget), not Lance's
-/// default batch. The widest fragment is wider than that batch, so the
-/// compaction reads it in several batches; every value, the null and the
-/// valid empty survive, and the fragments coalesce under one graph commit.
-/// `compaction_memory.rs` measures the allocation bound.
+/// A Blob table of 1 MiB rows compacts in 32-row batches derived from its
+/// largest row, across a fragment wider than one batch; every value, the null
+/// and the valid empty survive, under one graph commit.
 #[tokio::test]
 async fn optimize_compacts_large_blob_rows_in_bounded_batches() {
     const MIB: usize = 1024 * 1024;
-    // (1 MiB rows, 16-byte rows) per load. A load decodes at most 32 MiB of
-    // Blob input, so only a fragment mixing large and small rows can be wider
-    // than the derived batch: the first load's is 52 rows against 32.
-    const LOADS: [(usize, usize); 3] = [(20, 30), (10, 2), (10, 2)];
+    // A load decodes at most 32 MiB of Blob input: small rows widen a fragment.
+    const LOADS: [(usize, usize); 3] = [(1, 40), (1, 2), (1, 2)];
     let payload = |row: usize, len: usize| vec![u8::try_from(row).unwrap(); len];
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -768,12 +772,12 @@ async fn optimize_compacts_large_blob_rows_in_bounded_batches() {
     assert_eq!(
         probes.compaction_blob_batch_calls(),
         1,
-        "one Blob table compacts"
+        "the Blob table compacts in one task"
     );
     assert_eq!(
         probes.compaction_blob_batch_rows(),
         32,
-        "the compaction passes the batch derived from its largest row"
+        "the task runs with the batch derived from its largest row"
     );
     let doc = stats
         .iter()
@@ -837,6 +841,327 @@ async fn optimize_compacts_large_blob_rows_in_bounded_batches() {
             actual.1.as_ref().map(Vec::len),
         );
     }
+}
+
+/// Every `Doc` row's slug and the bytes of the named Blob columns, by slug.
+async fn doc_blob_values(db: &Omnigraph, columns: &[&str]) -> Vec<(String, Vec<Option<Vec<u8>>>)> {
+    let snapshot = snapshot_main(db).await.unwrap();
+    let table = snapshot.open_dataset("node:Doc").await.unwrap();
+    let mut scanner = table.scan();
+    scanner.project(&[&["slug"], columns].concat()).unwrap();
+    scanner.blob_handling(BlobHandling::AllBinary);
+    let mut stream = scanner.try_into_stream().await.unwrap();
+    let mut rows = Vec::new();
+    while let Some(batch) = stream.try_next().await.unwrap() {
+        let slugs = batch
+            .column_by_name("slug")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            let values = columns
+                .iter()
+                .map(|column| {
+                    let values = batch
+                        .column_by_name(column)
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<LargeBinaryArray>()
+                        .unwrap();
+                    values.is_valid(row).then(|| values.value(row).to_vec())
+                })
+                .collect();
+            rows.push((slugs.value(row).to_owned(), values));
+        }
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    rows
+}
+
+fn base64_blob(bytes: &[u8]) -> String {
+    format!(
+        "base64:{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
+}
+
+/// A row's Blob columns are summed when sizing the batch: two 1 MiB values on
+/// one row derive 16 rows, where the larger column alone would derive 32.
+#[tokio::test]
+async fn optimize_sizes_a_blob_batch_by_the_sum_of_a_rows_blob_columns() {
+    const MIB: usize = 1024 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let schema = "node Doc {\n    slug: String @key\n    content: Blob?\n    preview: Blob?\n}\n";
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), schema)
+            .await
+            .unwrap(),
+    );
+    let rows = [
+        ("small", vec![b'c'; 16], vec![b'p'; 16]),
+        ("wide", vec![b'C'; MIB], vec![b'P'; MIB]),
+    ];
+    for (load, (slug, content, preview)) in rows.iter().enumerate() {
+        let line = serde_json::json!({
+            "type": "Doc",
+            "data": {
+                "slug": slug,
+                "content": base64_blob(content),
+                "preview": base64_blob(preview),
+            },
+        })
+        .to_string();
+        let mode = if load == 0 {
+            LoadMode::Overwrite
+        } else {
+            LoadMode::Merge
+        };
+        db.load_jsonl(&line, mode).await.unwrap();
+    }
+
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let stats = omnigraph::instrumentation::with_merge_write_probes(probes.clone(), db.optimize())
+        .await
+        .unwrap();
+    assert_eq!(probes.compaction_blob_batch_calls(), 1);
+    assert_eq!(
+        probes.compaction_blob_batch_rows(),
+        16,
+        "the batch is derived from the row's 2 MiB, not from its largest 1 MiB column"
+    );
+    let doc = stats
+        .iter()
+        .find(|stat| stat.type_key == "node:Doc")
+        .expect("Doc stat present");
+    assert!(doc.committed, "the Blob table compaction must be published");
+    assert_eq!(doc.fragments_removed, 2);
+    let expected = rows
+        .into_iter()
+        .map(|(slug, content, preview)| (slug.to_string(), vec![Some(content), Some(preview)]))
+        .collect::<Vec<_>>();
+    assert!(
+        doc_blob_values(&db, &["content", "preview"]).await == expected,
+        "both Blob columns must survive compaction byte for byte"
+    );
+}
+
+/// Blob fragments carrying deletion vectors compact: the deleted rows stay
+/// gone and every surviving value, the null and the valid empty included, is
+/// byte-identical.
+#[tokio::test]
+async fn optimize_compacts_blob_fragments_with_deleted_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = "node Doc {\n    slug: String @key\n    content: Blob?\n}\n";
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), schema)
+            .await
+            .unwrap(),
+    );
+    type Row = (&'static str, Option<Vec<u8>>);
+    let loads: [Vec<Row>; 2] = [
+        vec![
+            ("a0", Some(b"inline".to_vec())),
+            ("a1", None),
+            ("a2", Some(b"deleted inline".to_vec())),
+        ],
+        vec![
+            ("b0", Some(Vec::new())),
+            ("b1", Some(vec![b'd'; 96 * 1024])),
+            ("b2", Some(vec![b'p'; 96 * 1024])),
+        ],
+    ];
+    for (load, rows) in loads.iter().enumerate() {
+        let lines = rows
+            .iter()
+            .map(|(slug, content)| {
+                serde_json::json!({
+                    "type": "Doc",
+                    "data": {"slug": slug, "content": content.as_deref().map(base64_blob)},
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>();
+        let mode = if load == 0 {
+            LoadMode::Overwrite
+        } else {
+            LoadMode::Merge
+        };
+        db.load_jsonl(&lines.join("\n"), mode).await.unwrap();
+    }
+    for slug in ["a2", "b1"] {
+        mutate_main(
+            &db,
+            "query drop($slug: String) {\n    delete Doc where slug = $slug\n}",
+            "drop",
+            &mixed_params(&[("$slug", slug)], &[]),
+        )
+        .await
+        .unwrap();
+    }
+    let deletion_files = helpers::open_pinned_dataset_for_test(&db, "main", "node:Doc")
+        .await
+        .get_fragments()
+        .iter()
+        .filter(|fragment| fragment.metadata().deletion_file.is_some())
+        .count();
+    assert_eq!(
+        deletion_files, 2,
+        "test precondition: both fragments carry a deletion vector"
+    );
+
+    let stats = db.optimize().await.unwrap();
+    let doc = stats
+        .iter()
+        .find(|stat| stat.type_key == "node:Doc")
+        .expect("Doc stat present");
+    assert!(doc.committed, "the Blob table compaction must be published");
+    assert_eq!(doc.fragments_removed, 2);
+    let compacted = helpers::open_pinned_dataset_for_test(&db, "main", "node:Doc").await;
+    let fragments = compacted.get_fragments();
+    assert_eq!(fragments.len(), 1);
+    assert!(fragments[0].metadata().deletion_file.is_none());
+    let expected = loads
+        .into_iter()
+        .flatten()
+        .filter(|(slug, _)| !["a2", "b1"].contains(slug))
+        .map(|(slug, content)| (slug.to_string(), vec![content]))
+        .collect::<Vec<_>>();
+    assert!(
+        doc_blob_values(&db, &["content"]).await == expected,
+        "surviving Blob values must be byte-identical after compaction"
+    );
+}
+
+/// Each compaction task derives its own batch: fragments the id index covers
+/// and fragments appended after it plan as two sized tasks, and the last one
+/// records 512 rows, where plan-wide sizing would record 32.
+#[tokio::test]
+async fn optimize_sizes_each_compaction_task_from_its_own_fragments() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = "node Doc {\n    slug: String @key\n    content: Blob?\n}\n";
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), schema)
+            .await
+            .unwrap(),
+    );
+    let rows = [
+        ("a0", vec![b'a'; 1024 * 1024]),
+        ("a1", vec![b'b'; 16]),
+        ("b0", vec![b'c'; 64 * 1024]),
+        ("b1", vec![b'd'; 16]),
+    ];
+    for (load, (slug, content)) in rows.iter().enumerate() {
+        let line = serde_json::json!({
+            "type": "Doc",
+            "data": {"slug": slug, "content": base64_blob(content)},
+        })
+        .to_string();
+        let mode = if load == 0 {
+            LoadMode::Overwrite
+        } else {
+            LoadMode::Merge
+        };
+        db.load_jsonl(&line, mode).await.unwrap();
+        if load == 1 {
+            db.ensure_indices().await.unwrap();
+        }
+    }
+
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let stats = omnigraph::instrumentation::with_merge_write_probes(probes.clone(), db.optimize())
+        .await
+        .unwrap();
+    assert_eq!(
+        probes.compaction_blob_batch_calls(),
+        2,
+        "test precondition: indexed and unindexed fragments plan as two tasks"
+    );
+    assert_eq!(
+        probes.compaction_blob_batch_rows(),
+        512,
+        "the second task is sized by its own 64 KiB row, not the first task's 1 MiB row"
+    );
+    let doc = stats
+        .iter()
+        .find(|stat| stat.type_key == "node:Doc")
+        .expect("Doc stat present");
+    assert!(doc.committed, "the Blob table compaction must be published");
+    let expected = rows
+        .into_iter()
+        .map(|(slug, content)| (slug.to_string(), vec![Some(content)]))
+        .collect::<Vec<_>>();
+    assert!(
+        doc_blob_values(&db, &["content"]).await == expected,
+        "every Blob value must survive compaction byte for byte"
+    );
+}
+
+/// External references count nothing toward the batch: a table whose only
+/// large Blob cell is a 1 MiB external reference compacts at the row ceiling.
+#[tokio::test]
+async fn optimize_does_not_size_a_blob_batch_by_external_references() {
+    let sources = tempfile::tempdir().unwrap();
+    let external_path = sources.path().join("external.bin");
+    std::fs::write(&external_path, vec![b'e'; 1024 * 1024]).unwrap();
+    let external_uri = url::Url::from_file_path(&external_path)
+        .unwrap()
+        .to_string();
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(sources.path()).unwrap(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let schema = "node Doc {\n    slug: String @key\n    content: Blob?\n}\n";
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), schema)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
+    let lines = [
+        serde_json::json!({"type": "Doc", "data": {"slug": "external", "content": external_uri}}),
+        serde_json::json!({"type": "Doc", "data": {"slug": "small", "content": "base64:AQID"}}),
+    ];
+    db.load_jsonl(&lines[0].to_string(), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db.load_jsonl(&lines[1].to_string(), LoadMode::Merge)
+        .await
+        .unwrap();
+    let external = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            helpers::node_blob_cell("Doc", "external", "content"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(external.content, omnigraph::BlobContent::External(_)),
+        "test precondition: the load keeps the external reference as a descriptor"
+    );
+
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let stats = omnigraph::instrumentation::with_merge_write_probes(probes.clone(), db.optimize())
+        .await
+        .unwrap();
+    assert_eq!(probes.compaction_blob_batch_calls(), 1);
+    assert_eq!(
+        probes.compaction_blob_batch_rows(),
+        8192,
+        "a 1 MiB external reference must not lower the batch to 32 rows"
+    );
+    let doc = stats
+        .iter()
+        .find(|stat| stat.type_key == "node:Doc")
+        .expect("Doc stat present");
+    assert!(doc.committed, "the Blob table compaction must be published");
+    assert_eq!(doc.fragments_removed, 2);
 }
 
 /// `optimize` publishes its compaction to `__manifest` as a detached pin with

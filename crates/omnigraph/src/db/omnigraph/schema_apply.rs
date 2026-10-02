@@ -1,5 +1,5 @@
 use super::*;
-use crate::blob::ExternalBlobRef;
+use crate::blob::{BlobDescriptor, BlobDescriptorDecoder, ExternalBlobRef};
 use crate::seams::{decide_seam, fail};
 use futures::TryStreamExt;
 
@@ -1195,9 +1195,9 @@ async fn validate_schema_rewrite_external_ranges(
                         source_table_key, source_name
                     ))
                 })?;
-            let decoder = crate::blob::BlobDescriptorDecoder::try_new(descriptions)?;
+            let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
             for row in 0..descriptions.len() {
-                if let crate::blob::BlobDescriptor::External {
+                if let BlobDescriptor::External {
                     uri,
                     offset,
                     length,
@@ -1218,45 +1218,27 @@ async fn rebuild_blob_column(
     descriptions: &StructArray,
     row_ids: &[u64],
 ) -> Result<Arc<dyn Array>> {
-    let decoder = crate::blob::BlobDescriptorDecoder::try_new(descriptions)?;
+    let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
     let mut builder = BlobArrayBuilder::new(row_ids.len());
     let mut managed_row_ids = Vec::new();
     let mut row_descriptors = Vec::with_capacity(row_ids.len());
 
     for (row, row_id) in row_ids.iter().enumerate() {
         let descriptor = decoder.classify(row)?;
-        if matches!(descriptor, crate::blob::BlobDescriptor::Managed { .. }) {
+        if matches!(descriptor, BlobDescriptor::Managed { .. }) {
             managed_row_ids.push(*row_id);
         }
         row_descriptors.push(descriptor);
     }
 
-    // Only managed rows are selected: given an external row, Lance would
-    // resolve and read the referenced object, which a schema rewrite carries
-    // as its URI without touching.
-    let mut managed_blobs = if managed_row_ids.is_empty() {
-        None
-    } else {
-        crate::instrumentation::record_blob_managed_batch_read();
-        Some(
-            Arc::new(source_ds.dataset().clone())
-                .read_blobs(column_name)
-                .map_err(OmniError::storage)?
-                .with_row_ids(managed_row_ids)
-                .preserve_order(true)
-                .with_io_buffer_size_bytes(crate::storage_layer::BLOB_REBUILD_IO_BUFFER_BYTES)
-                .try_into_stream()
-                .await
-                .map_err(OmniError::storage)?,
-        )
-    };
+    let mut managed_blobs =
+        TableStore::managed_blob_payloads(source_ds.dataset(), column_name, managed_row_ids)
+            .await?;
 
     for descriptor in row_descriptors {
         match descriptor {
-            crate::blob::BlobDescriptor::Null => {
-                builder.push_null().map_err(OmniError::lance_internal)?
-            }
-            crate::blob::BlobDescriptor::External {
+            BlobDescriptor::Null => builder.push_null().map_err(OmniError::lance_internal)?,
+            BlobDescriptor::External {
                 uri,
                 offset,
                 length,
@@ -1264,52 +1246,15 @@ async fn rebuild_blob_column(
                 let uri = whole_external_uri_for_schema_rewrite(uri, offset, length)?;
                 builder.push_uri(uri).map_err(OmniError::lance_internal)?;
             }
-            crate::blob::BlobDescriptor::Managed { length } => {
-                let next = match managed_blobs.as_mut() {
-                    Some(stream) => stream.try_next().await.map_err(OmniError::storage)?,
-                    None => None,
-                };
-                let data = next
-                    .ok_or_else(|| {
-                        OmniError::blob_integrity(format!(
-                            "blob rewrite for '{}' lost alignment with managed source rows",
-                            column_name
-                        ))
-                    })?
-                    .data
-                    .ok_or_else(|| {
-                        OmniError::blob_integrity(format!(
-                            "blob rewrite for '{}' returned null for a managed description",
-                            column_name
-                        ))
-                    })?;
-                if data.len() as u64 != length {
-                    return Err(OmniError::blob_integrity(format!(
-                        "blob rewrite for '{}' observed managed length {}, descriptor recorded {length}",
-                        column_name,
-                        data.len()
-                    )));
-                }
-                crate::instrumentation::record_blob_payload_read();
+            BlobDescriptor::Managed { length } => {
                 builder
-                    .push_bytes(data)
+                    .push_bytes(managed_blobs.next(length).await?)
                     .map_err(OmniError::lance_internal)?;
             }
         }
     }
 
-    if let Some(stream) = managed_blobs.as_mut()
-        && stream
-            .try_next()
-            .await
-            .map_err(OmniError::storage)?
-            .is_some()
-    {
-        return Err(OmniError::blob_integrity(format!(
-            "blob rewrite for '{}' produced extra source blobs",
-            column_name
-        )));
-    }
+    managed_blobs.finish().await?;
 
     builder.finish().map_err(OmniError::lance_internal)
 }

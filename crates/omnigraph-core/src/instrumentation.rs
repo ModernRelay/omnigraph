@@ -1214,22 +1214,23 @@ pub struct MergeWriteProbes {
     /// statement that reaches `open_table_for_mutation`). A statement refused
     /// while its assignments resolve must leave this at zero.
     pub mutation_table_open_calls: Arc<AtomicU64>,
-    /// Blob payload values materialized while descriptor rows are rebuilt
-    /// into a logical rewrite source (a keyed write or a schema rewrite): one
-    /// per managed value taken from the batched managed read, and one per
-    /// external object read. Resource-limit tests use this to prove an
-    /// oversized descriptor is rejected from its recorded length before any
-    /// payload is read.
+    /// Blob payload values a rewrite consumed while rebuilding descriptor rows
+    /// into a logical source (a keyed write or a schema rewrite): one per
+    /// managed value, counted after the batched managed read returned it and
+    /// its length matched, and one per external object read. Zero does not
+    /// prove that no payload I/O ran: `blob_managed_batch_read_calls` counts
+    /// the managed reads issued, before any byte arrives.
     pub blob_payload_read_calls: Arc<AtomicU64>,
     /// Batched managed Blob reads (`Dataset::read_blobs`) a materializing
     /// rewrite issued: one per rewritten batch column holding a managed cell,
-    /// however many managed values it carries. Distinguishes the batched read
-    /// from one read per value, which `blob_payload_read_calls` cannot.
+    /// however many managed values it carries, recorded before the read is
+    /// issued. Distinguishes the batched read from one read per value, which
+    /// `blob_payload_read_calls` cannot.
     pub blob_managed_batch_read_calls: Arc<AtomicU64>,
-    /// Blob-table compactions planned and the row batch the last one passed to
-    /// Lance (0 when it passed none), so the derived batch is a structural
-    /// assertion rather than an inferred memory claim.
+    /// Compaction tasks executed over a table with a Blob field.
     pub compaction_blob_batch_calls: Arc<AtomicU64>,
+    /// The scanner batch size the last such task ran with: the engine's
+    /// derived bound, or a smaller caller value.
     pub compaction_blob_batch_rows: Arc<AtomicU64>,
     /// Payload reads issued against external sources specifically. Unlike the
     /// aggregate Blob counter, this excludes managed values, so
@@ -1567,10 +1568,10 @@ pub fn record_mutation_table_open() {
     });
 }
 
-/// Record one Blob payload value materialized while logical Blob arrays are
-/// rebuilt: a managed value as the rewrite consumes it from the batched
-/// managed read, or an external object read. No-op in production (no probes
-/// installed).
+/// Record one Blob payload value a rewrite consumed: a managed value after the
+/// batched managed read returned it, or an external object read. It trails the
+/// managed I/O, which `record_blob_managed_batch_read` marks. No-op in
+/// production (no probes installed).
 pub fn record_blob_payload_read() {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
         p.blob_payload_read_calls.fetch_add(1, Ordering::Relaxed);
@@ -1586,14 +1587,14 @@ pub fn record_blob_managed_batch_read() {
     });
 }
 
-/// Record one Blob-table compaction and the row batch it passes to Lance
-/// (`None` when it passes none). No-op in production (no probes installed).
-pub fn record_compaction_blob_batch(batch_rows: Option<usize>) {
+/// Record one compaction task of a Blob table and the scanner batch size set
+/// on it. No-op in production (no probes installed).
+pub fn record_compaction_blob_batch(batch_rows: usize) {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
         p.compaction_blob_batch_calls
             .fetch_add(1, Ordering::Relaxed);
         p.compaction_blob_batch_rows
-            .store(batch_rows.unwrap_or(0) as u64, Ordering::Relaxed);
+            .store(batch_rows as u64, Ordering::Relaxed);
     });
 }
 

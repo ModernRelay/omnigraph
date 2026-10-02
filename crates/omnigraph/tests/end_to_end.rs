@@ -2323,6 +2323,7 @@ async fn blob_null_on_non_nullable_refuses_before_table_open_or_scan() {
         "the refusal must precede the table open and its scan"
     );
     assert_eq!(probes.blob_payload_read_calls(), 0);
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0);
     assert_eq!(
         snapshot_main(&db).await.unwrap().graph_manifest_version(),
         manifest_before
@@ -2701,6 +2702,7 @@ async fn blob_load_external_file_uri() {
     assert_eq!(read_probes.external_blob_probe_calls(), 0);
     assert_eq!(read_probes.external_blob_payload_read_calls(), 0);
     assert_eq!(read_probes.blob_payload_read_calls(), 0);
+    assert_eq!(read_probes.blob_managed_batch_read_calls(), 0);
 
     let clear_probes = MergeWriteProbes::default();
     let result = with_merge_write_probes(
@@ -2722,6 +2724,7 @@ async fn blob_load_external_file_uri() {
     );
     assert_eq!(clear_probes.external_blob_payload_read_calls(), 0);
     assert_eq!(clear_probes.blob_payload_read_calls(), 0);
+    assert_eq!(clear_probes.blob_managed_batch_read_calls(), 0);
     let cleared = db
         .read_blob_at(
             ReadTarget::branch("main"),

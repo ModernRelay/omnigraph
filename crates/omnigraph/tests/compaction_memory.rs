@@ -2,13 +2,16 @@
 //!
 //! Lance 11 compaction materializes every managed Blob payload of one scanner
 //! batch, and a batch reads up to a whole fragment by default. `optimize`
-//! derives the compaction batch size from the table's largest row so one
-//! batch holds about 32 MiB of payload. This instrument counts heap bytes
-//! with a global allocator and reports the peak of a stock Lance compaction
-//! at the default and at the derived batch size, then asserts the engine's
-//! `optimize` stays within the budget on fragments twice as wide as the
-//! derived batch. It is ignored by default: the allocator counts the whole
-//! process, so the measurement needs the test binary to itself.
+//! derives each compaction task's batch size from that task's largest row,
+//! its managed Blob bytes summed over the Blob columns, so one batch holds at
+//! most 32 MiB of managed payload unless a single row exceeds it. This
+//! instrument counts heap bytes with a global allocator and reports the peak
+//! of a stock Lance compaction at the default and at the derived batch size,
+//! then asserts the engine's `optimize` peaks within the budget plus the two
+//! named allowances on fragments twice as wide as the derived batch. Every
+//! value is 1 MiB, a packed placement. It is ignored by default: the
+//! allocator counts the whole process, so the measurement needs the test
+//! binary to itself.
 
 mod helpers;
 
@@ -71,6 +74,12 @@ const BUDGET: usize = 32 * MIB;
 const DERIVED_ROWS: usize = 32;
 /// Rows in the widest fragment each measurement compacts.
 const WIDE_FRAGMENT_ROWS: usize = 2 * DERIVED_ROWS;
+/// One 1 MiB value in flight beside a full batch: its read buffer and its
+/// copy into the batch.
+const IN_FLIGHT_VALUE_ALLOWANCE: usize = 2 * MIB;
+/// Everything `optimize` allocates that is not Blob payload: scan, writer,
+/// index and manifest state. An allowance, not a derived figure.
+const NON_PAYLOAD_ALLOWANCE: usize = 8 * MIB;
 
 /// Heap bytes allocated above the level at entry, at the peak of `run`.
 async fn peak_above_baseline<T>(run: impl std::future::Future<Output = T>) -> (T, usize) {
@@ -144,7 +153,6 @@ async fn load_rows(db: &omnigraph::Session, rows: std::ops::Range<usize>, mode: 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "instrument: compaction peak allocation on Blob tables"]
 async fn compaction_peak_allocation_on_blob_tables() {
-    // Stock Lance at its default batch and at the derived one.
     let dir = tempfile::tempdir().unwrap();
     let mut peaks = Vec::new();
     for (label, batch_size) in [("default", None), ("derived", Some(DERIVED_ROWS))] {
@@ -172,12 +180,8 @@ async fn compaction_peak_allocation_on_blob_tables() {
         "the derived batch must lower the stock compaction peak: {peaks:?}"
     );
 
-    // The engine's optimize. A load decodes at most 32 MiB, and Lance never
-    // compacts a fragment together with one whose index coverage differs, so
-    // the wide fragments come from earlier optimizes: each coalesces four
-    // unindexed 16-row loads into one 64-row fragment and rebuilds the
-    // key index over it. The measured optimize compacts the two 64-row
-    // fragments once they share their index coverage.
+    // A load decodes at most 32 MiB and Lance compacts only fragments of equal
+    // index coverage, so earlier optimizes build the two wide fragments.
     let graph = tempfile::tempdir().unwrap();
     let uri = graph.path().to_str().unwrap();
     let db = helpers::session(
@@ -211,9 +215,7 @@ async fn compaction_peak_allocation_on_blob_tables() {
         vec![WIDE_FRAGMENT_ROWS; 2],
         "test precondition"
     );
-    // Optimize folds the key index over the new fragment but leaves the
-    // full-text index to its explicit rebuild; rebuilding it gives both wide
-    // fragments the same index coverage.
+    // Optimize leaves the new fragment outside the full-text index; the rebuild evens coverage.
     db.rebuild_full_text_indices_on("main").await.unwrap();
 
     let (stats, peak) = peak_above_baseline(db.optimize()).await;
@@ -224,7 +226,7 @@ async fn compaction_peak_allocation_on_blob_tables() {
         .unwrap();
     assert!(doc.committed);
     assert_eq!(doc.fragments_removed, 2, "the measured optimize compacts");
-    let bound = BUDGET + 2 * MIB + 8 * MIB;
+    let bound = BUDGET + IN_FLIGHT_VALUE_ALLOWANCE + NON_PAYLOAD_ALLOWANCE;
     eprintln!(
         "engine optimize, 2 x {WIDE_FRAGMENT_ROWS} rows of 1 MiB: \
          peak {:.1} MiB (bound {:.1} MiB)",

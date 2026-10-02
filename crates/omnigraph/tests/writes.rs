@@ -955,6 +955,7 @@ node Image { title: String @key content: Blob? note: String? }
         0,
         "aggregate admission must precede every external payload read"
     );
+    assert_eq!(read_probes.blob_managed_batch_read_calls(), 0);
     assert_eq!(stage_probes.entered(), 0);
     assert_eq!(files_under(&graph_path), files);
     assert_eq!(
@@ -1231,6 +1232,7 @@ query update_note($note: String) {
         0,
         "BlobFile::size must reject the update before BlobFile::read"
     );
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0);
     let after = snapshot_main(&db).await.unwrap();
     assert_eq!(after.graph_manifest_version(), before_manifest);
     assert_eq!(
@@ -1276,6 +1278,7 @@ query replace_content($c: Blob) {
         0,
         "assigning the oversized Blob never reads its old cell"
     );
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0);
     let bytes = read_managed_blob_bytes(
         &db,
         ReadTarget::branch("main"),
@@ -1285,13 +1288,9 @@ query replace_content($c: Blob) {
     assert_eq!(&bytes[..], &[1, 2, 3]);
 }
 
-/// A predicate update that carries the Blob cells of many rows reads the
-/// managed ones through one batched read and the external one through the
-/// admitted object, and rewrites each exactly: inline, packed (above 64 KiB)
-/// and valid-empty managed values keep their bytes, the null stays null, and
-/// the external reference is copied into a managed value. The payload probe
-/// counts one read per managed value plus the one external read, and the
-/// batched-read probe counts one read for all managed values.
+/// A predicate update carrying many rows' Blob cells reads the managed ones in
+/// one batched read and the external one through its admitted object, and
+/// rewrites each exactly; the null stays null and the external becomes managed.
 #[tokio::test]
 async fn mutation_update_carries_mixed_blob_rows_through_batched_managed_read() {
     use base64::Engine;

@@ -37,8 +37,15 @@ for physical layouts and retained-history decoding.
    its handler has effects; a passing check does not pre-approve them.
    Resolve source recovery with the compatible source executable before retrying.
    Shared Lance files outside the root refuse.
-   `work.external_blob_exclusions` lists retained external Blob URIs, read from
-   descriptors without contacting their stores; their bytes are outside the guarantee.
+   `work.external_blob_exclusions` lists the URI of each retained external Blob
+   reference as its stored descriptor spells it, without any byte range, read
+   without contacting its store; the referenced bytes are outside the migration
+   guarantee. Blob validation refuses a Blob field nested inside another field,
+   a top-level Blob column not in the Blob-v2 encoding, and a Blob descriptor
+   that fails the engine's integrity checks; a check reports each as a
+   `preflight_failed` finding, and the validation itself writes nothing. The
+   nested-field and encoding findings name the field or column, and the
+   source graph stays readable with the source-compatible executable.
    `work.historical_blob_identity_limits` lists pre-0.10 Blob fields without
    stable property IDs. Their bytes are preserved, but existing historical
    delivery restrictions remain after their current physical entry changes;

@@ -46,18 +46,24 @@ coverage was uneven before a run may coalesce fully only on the next run,
 after the rebuilt coverage is in place.
 
 Compacting a table with Blob properties reads each managed Blob value into
-memory to rewrite it. Optimize sizes each compaction read batch from the
-largest row of the fragments it compacts, summing that row's Blob columns, so
-one batch materializes at most 32 MiB of managed Blob payload whatever the
-fragment sizes. A single row whose Blob values together exceed 32 MiB is
-compacted in a batch of its own and materialized whole. This bounds the
-payload of a batch, not the process heap: Lance's writer copies each inline
-payload into the arrays it prepares while it still holds the batch, so memory
-use exceeds the payload. External Blob references are carried without reading
-the referenced object. Optimize works on
-up to `OMNIGRAPH_MAINTENANCE_CONCURRENCY` tables at once (default 8), so budget
-for that many Blob tables compacting together. `LANCE_DEFAULT_BATCH_SIZE` does
-not change this bound.
+memory to rewrite it. Optimize sizes the read batches of each compaction task
+(a group of neighbouring fragments compacted together) from the task's largest
+row, summing that row's managed Blob values, so one batch materializes at most
+32 MiB of managed Blob payload whatever the fragment sizes. External Blob
+references are carried without reading the referenced object and count
+nothing. A task holding a row over 16 MiB compacts one row per batch, and a
+single row over 32 MiB is materialized whole. This bounds the payload of a
+batch, not the process heap: Lance's writer copies each inline payload into
+the arrays it prepares while it still holds the batch, so memory use exceeds
+the payload. Every task of a Blob table gets this batch size explicitly, 1 to
+8192 rows, so it takes precedence over `LANCE_DEFAULT_BATCH_SIZE` there,
+including when the variable is smaller. When a fragment being compacted holds
+a Blob descriptor the engine's decoder rejects, sizing can refuse the
+compaction with a Blob integrity error before that table is rewritten, and
+nothing is committed; a table with nothing to compact is not scanned.
+Optimize works on up to
+`OMNIGRAPH_MAINTENANCE_CONCURRENCY` tables at once (default 8), so budget for
+that many Blob tables compacting together.
 
 Optimize also persists the traversal-adjacency artifact
 (`__graph_index/csr-current.bin`), which cold traversal builds load instead of

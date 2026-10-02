@@ -2071,13 +2071,9 @@ async fn compact_files_succeeds_on_blob_columns() {
     assert_batched_blob_reads_cover_every_placement(dir.path()).await;
 }
 
-/// Guard 10, continued: the batched managed-payload read the engine's
-/// materializing rewrites use. Every managed placement (inline, packed above
-/// 64 KiB, dedicated above 4 MiB), null and valid empty survive compaction,
-/// and `read_blobs` streamed under a small I/O buffer yields exactly what
-/// `execute()` collects, in request order and with duplicates. Given an
-/// external row, `read_blobs` resolves and reads the referenced object, which
-/// is why the engine passes it managed row ids only.
+/// Guard 10, continued: every managed placement, null and valid empty survive
+/// compaction, a small-buffer `read_blobs` stream equals `execute()` in request
+/// order with duplicates, and an external row is resolved and read.
 async fn assert_batched_blob_reads_cover_every_placement(dir: &std::path::Path) {
     use arrow_array::types::UInt64Type;
 
@@ -2163,7 +2159,6 @@ async fn assert_batched_blob_reads_cover_every_placement(dir: &std::path::Path) 
         .to_vec();
     assert_eq!(row_ids.len(), rows);
 
-    // Scrambled, with duplicates, over every managed placement and null.
     let request_order = [4_usize, 1, 3, 4, 0, 2, 5, 1];
     let requested = request_order
         .iter()
@@ -2202,7 +2197,6 @@ async fn assert_batched_blob_reads_cover_every_placement(dir: &std::path::Path) 
         );
     }
 
-    // An external row is resolved and read, not returned as a descriptor.
     let external = ds
         .read_blobs("content")
         .unwrap()
@@ -2218,21 +2212,12 @@ async fn assert_batched_blob_reads_cover_every_placement(dir: &std::path::Path) 
 }
 
 // --- Guard 10b: an explicit scanner batch size beats LANCE_DEFAULT_BATCH_SIZE --
-//
-// Blob compaction materializes every managed payload of one scanner batch, and
-// `TableStore::stage_compaction` bounds that batch by setting
-// `CompactionOptions::batch_size`, which Lance hands to the compaction scanner.
-// The bounded rewrite stream likewise sets `Scanner::batch_size(1)`. Both rely
-// on the V2.x filtered read taking an explicit batch size over the
-// `LANCE_DEFAULT_BATCH_SIZE` environment value (the environment is only its
-// fallback; Lance's legacy `get_batch_size` reads it first). The environment
-// is read once per process, so the guard runs its body in a child process of
-// this test binary with the variable set.
+// Lance reads the variable once per process, hence the child process.
 
 const BATCH_SIZE_ENV_GUARD_CHILD: &str = "OMNIGRAPH_BATCH_SIZE_ENV_GUARD_CHILD";
 
-#[test]
-fn explicit_scanner_batch_size_beats_lance_default_batch_size_env() {
+/// Runs the guard body in a child of this test binary with the variable set.
+fn run_batch_size_env_guard_child() {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -2252,10 +2237,19 @@ fn explicit_scanner_batch_size_beats_lance_default_batch_size_env() {
     );
 }
 
+#[test]
+fn explicit_scanner_batch_size_beats_lance_default_batch_size_env() {
+    run_batch_size_env_guard_child();
+}
+
 #[tokio::test]
 #[ignore = "subprocess helper; exercised by explicit_scanner_batch_size_beats_lance_default_batch_size_env"]
 async fn explicit_scanner_batch_size_beats_lance_default_batch_size_env_process() {
+    // An ignored-tests run reaches this without the marker: run the guard then.
     if std::env::var_os(BATCH_SIZE_ENV_GUARD_CHILD).is_none() {
+        tokio::task::spawn_blocking(run_batch_size_env_guard_child)
+            .await
+            .unwrap();
         return;
     }
     assert_eq!(std::env::var("LANCE_DEFAULT_BATCH_SIZE").unwrap(), "4");
@@ -2299,6 +2293,32 @@ async fn explicit_scanner_batch_size_beats_lance_default_batch_size_env_process(
             .unwrap()
     }
 
+    /// Batch row counts of the compaction scanner's shape (`prepare_reader`:
+    /// Blob descriptors, row addresses, the task's fragments in order) plus
+    /// row ids.
+    async fn compaction_scan_batch_rows(
+        dataset: &Dataset,
+        batch_size: Option<usize>,
+    ) -> Vec<usize> {
+        let mut scanner = dataset.scan();
+        scanner.with_row_address();
+        if let Some(batch_size) = batch_size {
+            scanner.batch_size(batch_size);
+        }
+        scanner
+            .with_fragments(dataset.fragments().as_ref().clone())
+            .scan_in_order(true);
+        scanner.with_row_id();
+        scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .map_ok(|batch| batch.num_rows())
+            .try_collect()
+            .await
+            .unwrap()
+    }
+
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().join("batch-size-env.lance");
     let uri = uri.to_str().unwrap();
@@ -2318,22 +2338,18 @@ async fn explicit_scanner_batch_size_beats_lance_default_batch_size_env_process(
     .unwrap();
     assert_eq!(ds.get_fragments().len(), 1);
 
-    // The environment is live in this process: without an explicit size the
-    // six-row fragment is read in batches of at most four rows.
     let unset = batch_rows(&ds, None).await;
     assert_eq!(unset.iter().sum::<usize>(), 6);
     assert!(
         unset.iter().all(|&rows| rows <= 4) && unset.len() >= 2,
         "LANCE_DEFAULT_BATCH_SIZE=4 must shape an unconfigured scan, got {unset:?}"
     );
-    // An explicit batch size wins over the environment.
     assert_eq!(
         batch_rows(&ds, Some(1)).await,
         vec![1; 6],
         "an explicit Scanner::batch_size must beat LANCE_DEFAULT_BATCH_SIZE"
     );
 
-    // Compaction under an explicit batch size rewrites every payload exactly.
     let (schema, batch) = blob_batch(6..8);
     ds.append(
         RecordBatchIterator::new(vec![Ok(batch)], schema),
@@ -2342,6 +2358,18 @@ async fn explicit_scanner_batch_size_beats_lance_default_batch_size_env_process(
     .await
     .unwrap();
     assert_eq!(ds.get_fragments().len(), 2);
+    let unset = compaction_scan_batch_rows(&ds, None).await;
+    assert_eq!(unset.iter().sum::<usize>(), 8);
+    assert!(
+        unset.iter().all(|&rows| rows <= 4) && unset.contains(&4),
+        "LANCE_DEFAULT_BATCH_SIZE=4 must shape an unconfigured compaction scan, got {unset:?}"
+    );
+    assert_eq!(
+        compaction_scan_batch_rows(&ds, Some(1)).await,
+        vec![1; 8],
+        "a scanner of the compaction shape must honor an explicit Scanner::batch_size \
+         over LANCE_DEFAULT_BATCH_SIZE"
+    );
     let metrics = compact_files(
         &mut ds,
         CompactionOptions {
