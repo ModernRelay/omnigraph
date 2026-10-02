@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-09-03
-updated: 2026-10-02
+updated: 2026-10-03
 discussion: null
 supersedes: []
 superseded_by: []
@@ -41,7 +41,7 @@ recovery protocol. The v0.12 availability amendment replaces the readiness and
 inventory response shapes with coordinated in-tree consumer changes and no
 legacy aliases. The wider
 [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md)
-proposal stays independent: loading/deploying states, startup retry and online
+decision stays independent: loading/deploying states, startup retry and online
 activation remain unimplemented. Observe-only authority and the absolute
 shutdown deadline remain unchanged. Restoring a ledger is deliberately not here:
 its real use arrives with coherent restore points, where the ledger and the graphs come back
@@ -70,7 +70,7 @@ one. On the way down, axum's graceful shutdown has no bound, so a stalled
 connection keeps a replica alive past any orchestration grace period, and the
 orchestrator's kill is indistinguishable from a crash.
 
-Both gaps are small and local. Neither requires the wider server proposal's
+Both gaps are small and local. Neither requires the wider server decision's
 operation ownership or completion supervision to close; this RFC does not
 preempt those contracts.
 
@@ -201,11 +201,11 @@ mutable runtime graph set is introduced by this amendment.
 as flag, then environment, then default. `serve` spawns the signal listener
 first; on the signal it sets `draining`, starts a `std::thread` that sleeps
 for the grace and calls `std::process::exit(2)`, and releases the graceful
-shutdown. The clean path is unchanged. This supplies the proposed server
+shutdown. The clean path is unchanged. This supplies the accepted server
 [operation-ownership contract's](2026-09-29-server-runtime-and-online-deployment.md#operation-ownership)
 deadline boundary without its participants: one absolute deadline created at
 signal receipt, no participant-local timeouts, a hard non-zero exit that never
-claims success and never depends on the runtime. The server runtime proposal may
+claims success and never depends on the runtime. The server runtime decision may
 replace the thread with its coordinator; the flag and the readiness change stay.
 
 ## Invariants
@@ -301,6 +301,10 @@ None that block acceptance. The default grace of 25 seconds matched the earlier
 RFC 0035 proposal; it is a default, not a contract.
 
 ## Decision log
+
+- 2026-10-03: Current server-runtime cross-references now name the accepted
+  decision; implementation and qualification gates remain with that owner.
+
 
 - 2026-10-02: Accepted the v0.12 availability amendment in Summary, Readiness,
   Witness, Compatibility and Evidence. Actual startup outcomes own one

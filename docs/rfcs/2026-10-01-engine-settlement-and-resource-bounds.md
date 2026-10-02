@@ -391,7 +391,8 @@ create parallel ownership and remains outside this decision.
 ## Decision log
 
 - 2026-10-03: The umbrella acceptance replaces the draft/proposal descriptions
-  in Motivation, Same-engine transitions and Implementation with an accepted,
+  in Motivation and observable behavior, General reuse and schema activation,
+  and Qualification and rollout with an accepted,
   separately gated E1 decision. Native settlement, resource bounds and engine
   reuse remain unqualified; this amendment grants no new reuse capability.
 

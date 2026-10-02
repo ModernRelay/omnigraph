@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - azimafroozeh
 created: 2026-09-26
-updated: 2026-10-02
+updated: 2026-10-03
 discussion: null
 supersedes: []
 superseded_by: []
@@ -379,7 +379,7 @@ then, and T4.progress's handle reopen carries scope E + D.
 The local server combination requires no connection profile and cannot attach
 to an ambient service. Existing external-backend profile proposals and
 qualification work remain separate. This RFC introduces no remote testing mode.
-The server proposal owns the v0.12 wire contract: CLI, server and cluster tools
+The server decision owns the v0.12 wire contract: CLI, server and cluster tools
 upgrade together; unsupported or unidentified contracts refuse before admission.
 No mixed-version execution, fallback or legacy error alias is qualified here.
 The exact contract discriminator and CLI discovery/response checks are owned by
@@ -662,6 +662,10 @@ the maintainer who confirms or reverses it and the event that forces that call.
   Sequential-lifecycle-steps phase, before that syntax is enabled.
 
 ## Decision log
+
+- 2026-10-03: Current server-runtime cross-references now name the accepted
+  decision; implementation and qualification gates remain with that owner.
+
 
 - 2026-09-26: drafted at `52ae6391`; amends RFC 0045 the same day.
 - 2026-09-29: production ownership moves to [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md); record the landed engine-DST concurrent subset, retain unqualified server controls, bind T9 to ledger revisions and distinguish E1 activation from E2 historical serving.
