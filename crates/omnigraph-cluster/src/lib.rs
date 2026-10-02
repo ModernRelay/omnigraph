@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self};
 use std::path::{Path, PathBuf};
 
-use omnigraph::db::{Omnigraph, ReadTarget, SchemaApplyOptions};
+use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph_compiler::SchemaMigrationPlan;
 use omnigraph_compiler::build_catalog;
 use omnigraph_compiler::query::ast::QueryFile;
@@ -950,10 +950,7 @@ async fn apply_config_dir_impl(
                 continue;
             }
         };
-        if let Err(err) = db
-            .preview_schema_apply_with_options(&schema_source, SchemaApplyOptions::default())
-            .await
-        {
+        if let Err(err) = db.preview_schema_apply(&schema_source).await {
             diagnostics.push(Diagnostic::error(
                 "schema_apply_failed",
                 schema_address(graph_id),
@@ -1003,14 +1000,8 @@ async fn apply_config_dir_impl(
             graph_moving_aborted = true;
             continue;
         }
-        // Soft drops only: allow_data_loss stays false until the approval
-        // artifacts of stage 4C exist (RFC-004 §D4).
         match db
-            .apply_schema_as(
-                &schema_source,
-                SchemaApplyOptions::default(),
-                options.actor.as_deref(),
-            )
+            .apply_schema_as(&schema_source, options.actor.as_deref())
             .await
         {
             Ok(result) => {

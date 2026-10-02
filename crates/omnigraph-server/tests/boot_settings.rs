@@ -497,7 +497,7 @@ mod multi_graph_startup {
             (
                 Method::POST,
                 "/graphs/alpha/schema/apply",
-                Some(r#"{"schema_source":"","allow_data_loss":false}"#),
+                Some(r#"{"schema_source":""}"#),
             ),
             (Method::POST, "/graphs/alpha/ingest", Some(r#"{"data":""}"#)),
             (

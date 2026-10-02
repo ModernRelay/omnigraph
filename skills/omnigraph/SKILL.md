@@ -165,7 +165,7 @@ Notation: `<x>` required · `[x]` optional · `<a|b>` choice · `…` repeatable
 - `branch <create <name> [--from <base>] | list | delete <name> | merge <source> [--into <target>] [--delete-branch]> [--json]` (`--from`/`--into` default to `main`; also available as GQ statements via `mutate -e`/`query -e`)
 - `commit <list [--branch <b>] | show <commit_id> | changes <commit_id> [filters…]> [--json]`
 - `changes <poll [--start now|beginning|after:<id> | --cursor <c>] | baseline --out <snapshot.jsonl>> [filters…] [--json]`
-- `schema apply --schema <f.pg> [--allow-data-loss] [--json]` · `schema show` (alias `get`) — `apply` **refuses a cluster-managed graph** (evolve those via `cluster apply`)
+- `schema apply --schema <f.pg> [--json]` · `schema show` (alias `get`) — `apply` **refuses a cluster-managed graph** (evolve those via `cluster apply`)
 
 Every read query runs on engine v2, the planned execution route and the only
 `engine` value. `query -e 'explain query q() { … }'`
@@ -178,7 +178,7 @@ executing the query. It uses the ordinary query target and parameter flags.
 `schema plan` uses a positional URI or `--store`; lint and maintenance also
 accept `--cluster <dir|file://|s3://|az://> --graph <id>`:
 - `init --schema <f.pg> <uri> [--force]`
-- `schema plan --schema <f.pg> [--allow-data-loss] [--json]`
+- `schema plan --schema <f.pg> [--json]`
 - `upgrade <uri> [--check] [--to-format <7|8|9>] [--json]` — offline standalone
   conversion; defaults to v9. `schema upgrade-system-columns <uri> [--check]
   [--json]` is the v8→v9 step. Read [migration preconditions](references/migrations.md)
@@ -335,7 +335,7 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | Adding non-nullable property without backfill | unsupported migration | Make optional → backfill; keep it optional (tightening `T?` → `T` is refused, OG-MF-106) |
 | `omnigraph init --json` | `unexpected argument '--json' found` | `init` doesn't support `--json`; drop the flag |
 | `omnigraph init` on an already-initialized URI | `graph already initialized or initialization metadata exists at '<uri>'` | Never overwrite it. `--force` only replaces orphan schema artifacts after proving there is no graph manifest |
-| `schema apply` dropping a property/type | soft-dropped by default (no physical data loss) | use `--allow-data-loss` on both plan and apply to preview and execute a hard drop |
+| `schema apply` dropping a property/type | nothing is reclaimed at apply; older commits still read the dropped data | to reclaim the space, run `cleanup` with a retention that excludes the pre-drop commits; the data is then unrecoverable |
 | Committing `.env.omni` | credential leak | Add `.env*` to `.gitignore` |
 | Non-parameterized query values | typecheck surprise, injection risk | Declare `$param: Type` and pass via `--params` |
 | Missing required field in `insert` | ``T12: insert for `X` must provide non-nullable property `Y` `` | Accept the param in the mutation signature |

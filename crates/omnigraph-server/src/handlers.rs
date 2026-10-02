@@ -872,7 +872,7 @@ pub(crate) async fn server_blob_get(
     let query = parse_blob_read_query(query)?;
     let read = read_blob_for_delivery(&handle, actor.as_ref().map(|Extension(actor)| actor), query)
         .await?;
-    blob_transport::serve_blob_get(read, &headers)
+    blob_transport::serve_blob_get(read, &headers).inspect_err(log_blob_transport_internal)
 }
 
 #[utoipa::path(
@@ -936,7 +936,7 @@ pub(crate) async fn server_blob_head(
     let query = parse_blob_read_query(query)?;
     let read = read_blob_for_delivery(&handle, actor.as_ref().map(|Extension(actor)| actor), query)
         .await?;
-    blob_transport::serve_blob_head(read, &headers)
+    blob_transport::serve_blob_head(read, &headers).inspect_err(log_blob_transport_internal)
 }
 
 fn parse_blob_read_query(
@@ -955,9 +955,10 @@ async fn read_blob_for_delivery(
     actor: Option<&AuthenticatedActor>,
     query: BlobReadQuery,
 ) -> std::result::Result<omnigraph::BlobRead, ApiError> {
-    let target = resolve_authorized_read_target(handle, actor, query.branch, query.snapshot)
-        .await
-        .map_err(redact_blob_api_error)?;
+    let target =
+        resolve_authorized_read_target_with_cause(handle, actor, query.branch, query.snapshot)
+            .await
+            .map_err(|(mapped, cause)| redact_blob_api_error(mapped, "target", cause))?;
     let entity = match query.entity {
         api::BlobEntityKind::Node => omnigraph::EntityKind::Node,
         api::BlobEntityKind::Edge => omnigraph::EntityKind::Edge,
@@ -981,13 +982,39 @@ async fn read_blob_for_delivery(
 /// graph-level Blob surface. Selector/auth/not-found failures retain their
 /// typed client disposition; every pre-header internal failure is redacted.
 fn map_blob_read_error(error: OmniError) -> ApiError {
-    redact_blob_api_error(ApiError::from_omni(error))
+    let (mapped, cause) = engine_error_with_cause(error);
+    redact_blob_api_error(mapped, "cell", cause)
 }
 
-fn redact_blob_api_error(mapped: ApiError) -> ApiError {
+/// Log a 500 the transport built itself before response headers. Its message
+/// describes the server's own refusal and holds no engine text, so the
+/// response is returned as built.
+fn log_blob_transport_internal(refused: &ApiError) {
+    if refused.status == StatusCode::INTERNAL_SERVER_ERROR {
+        error!(
+            error_kind = "blob_pre_header_internal",
+            stage = "transport",
+            error_variant = "unclassified",
+            "Blob delivery failed before response headers"
+        );
+    }
+}
+
+/// Redact a pre-header internal failure. The log carries the stage and the
+/// error's class (never its message, which can hold object URIs or
+/// credentials); the response carries a constant.
+fn redact_blob_api_error(
+    mapped: ApiError,
+    stage: &'static str,
+    cause: Option<blob_transport::RedactedCause>,
+) -> ApiError {
     if mapped.status == StatusCode::INTERNAL_SERVER_ERROR {
         error!(
             error_kind = "blob_pre_header_internal",
+            stage,
+            error_variant = cause.map_or("unclassified", |cause| cause.variant),
+            storage_kind = ?cause.and_then(|cause| cause.storage_kind),
+            manifest_kind = ?cause.and_then(|cause| cause.manifest_kind),
             "Blob delivery failed before response headers"
         );
         ApiError::internal("Blob delivery failed before response headers")
@@ -1382,9 +1409,25 @@ pub(crate) async fn resolve_authorized_read_target(
     branch: Option<String>,
     snapshot: Option<String>,
 ) -> std::result::Result<ReadTarget, ApiError> {
+    resolve_authorized_read_target_with_cause(handle, actor, branch, snapshot)
+        .await
+        .map_err(|(mapped, _)| mapped)
+}
+
+/// [`resolve_authorized_read_target`], also returning the log-safe class of
+/// an engine failure beside the mapped error, so a redacting caller can log
+/// the class the mapping discards. Refusals that are not engine failures
+/// carry no class.
+async fn resolve_authorized_read_target_with_cause(
+    handle: &GraphHandle,
+    actor: Option<&AuthenticatedActor>,
+    branch: Option<String>,
+    snapshot: Option<String>,
+) -> std::result::Result<ReadTarget, (ApiError, Option<blob_transport::RedactedCause>)> {
     if branch.is_some() && snapshot.is_some() {
-        return Err(ApiError::bad_request(
-            "request may specify branch or snapshot, not both",
+        return Err((
+            ApiError::bad_request("request may specify branch or snapshot, not both"),
+            None,
         ));
     }
 
@@ -1396,7 +1439,7 @@ pub(crate) async fn resolve_authorized_read_target(
             .resolved_branch_of(target.clone())
             .await
             .map(|branch| branch.or_else(|| Some("main".to_string())))
-            .map_err(ApiError::from_omni)?,
+            .map_err(engine_error_with_cause)?,
         ReadTarget::Snapshot(_) => None,
     };
     authorize_request(
@@ -1407,8 +1450,14 @@ pub(crate) async fn resolve_authorized_read_target(
             branch: policy_branch,
             target_branch: None,
         },
-    )?;
+    )
+    .map_err(|refused| (refused, None))?;
     Ok(target)
+}
+
+fn engine_error_with_cause(error: OmniError) -> (ApiError, Option<blob_transport::RedactedCause>) {
+    let cause = blob_transport::RedactedCause::of(&error);
+    (ApiError::from_omni(error), Some(cause))
 }
 
 #[utoipa::path(
@@ -1957,8 +2006,10 @@ pub(crate) async fn server_schema_get(
 ///
 /// Diffs `schema_source` against the current schema and applies the resulting
 /// migration steps (add/drop type, add/drop property, etc.). **Destructive**:
-/// some steps drop data. Returns the list of steps applied; if `applied` is
-/// false the diff was unsupported and no changes were made.
+/// a drop removes data from the branch head; older commits keep reading it
+/// until `omnigraph cleanup` stops retaining them. Returns the list of steps
+/// applied; if `applied` is false the diff was unsupported and no changes
+/// were made.
 pub(crate) async fn server_schema_apply(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
@@ -2012,9 +2063,6 @@ pub(crate) async fn server_schema_apply(
             // the redundancy.
             db.apply_schema_as_with_catalog_check(
                 &request.schema_source,
-                omnigraph::db::SchemaApplyOptions {
-                    allow_data_loss: request.allow_data_loss,
-                },
                 actor_id.as_deref(),
                 |catalog| {
                     if let Some(registry) = registry {
@@ -3062,9 +3110,205 @@ mod change_route_error_tests {
 #[cfg(test)]
 mod blob_error_tests {
     use super::*;
+    use std::fmt;
+
+    use futures::stream::BoxStream;
+    use object_store::path::Path as ObjectPath;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
+
+    /// Wraps every graph-catalog store a probed task opens so that each read
+    /// fails as an object store would, with a physical URI in its message.
+    /// Resolving a snapshot target reopens the graph catalog at the
+    /// snapshot's version, so this is a storage failure inside target
+    /// resolution.
+    #[derive(Debug)]
+    struct CatalogReadFault;
+
+    impl lance::io::WrappingObjectStore for CatalogReadFault {
+        fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+            Arc::new(CatalogReadFaultStore { target })
+        }
+    }
+
+    #[derive(Debug)]
+    struct CatalogReadFaultStore {
+        target: Arc<dyn ObjectStore>,
+    }
+
+    impl fmt::Display for CatalogReadFaultStore {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "CatalogReadFaultStore({})", self.target)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CatalogReadFaultStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.target.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.target.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            _options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            Err(object_store::Error::PermissionDenied {
+                path: format!("s3://private-bucket/{location}"),
+                source: "GET denied".into(),
+            })
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.target.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.target.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&ObjectPath>,
+            offset: &ObjectPath,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.target.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<ListResult> {
+            self.target.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.target.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A storage failure while the Blob route resolves a snapshot target for
+    /// a policy-gated actor reaches the log with its class through the
+    /// delivery path itself, and the client sees only the redacted 500.
+    #[tokio::test]
+    async fn blob_delivery_logs_the_class_of_a_target_resolution_storage_failure() {
+        let capture = crate::test_log_capture::Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("info"));
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        Omnigraph::init(
+            uri,
+            "node Document {\n    title: String @key\n    content: Blob?\n}\n",
+        )
+        .await
+        .unwrap();
+        let engine = Omnigraph::open(uri).await.unwrap();
+        let snapshot = engine.resolve_snapshot("main").await.unwrap();
+        let policy: PolicyConfig = serde_yaml::from_str(
+            "version: 1\n\
+             groups:\n  team: [act-alice]\n\
+             rules:\n  - id: team-read\n    allow:\n      actors: { group: team }\n      actions: [read]\n      branch_scope: any\n",
+        )
+        .unwrap();
+        let handle = GraphHandle {
+            key: GraphKey::cluster(GraphId::try_from("graph").unwrap()),
+            uri: uri.to_string(),
+            engine: Arc::new(engine),
+            policy: Some(Arc::new(PolicyCompiler::compile(&policy, "graph").unwrap())),
+            queries: None,
+        };
+        let actor = AuthenticatedActor::cluster_static(Arc::from("act-alice"));
+        let query = || api::BlobReadQuery {
+            entity: api::BlobEntityKind::Node,
+            r#type: "Document".to_string(),
+            id: "missing".to_string(),
+            property: "content".to_string(),
+            branch: None,
+            snapshot: Some(snapshot.as_str().to_string()),
+        };
+
+        // Unarmed, the same request resolves its target and reaches the cell.
+        let unarmed = read_blob_for_delivery(&handle, Some(&actor), query())
+            .await
+            .unwrap_err();
+        assert_ne!(unarmed.status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        // With the fault installed on this task, reopening the graph catalog
+        // at the snapshot's version fails in the object store.
+        let probes = omnigraph::instrumentation::QueryIoProbes {
+            manifest_wrapper: Some(Arc::new(CatalogReadFault)),
+            ..Default::default()
+        };
+        // Positive control: the engine error text names the bucket, so the
+        // absence checks below test the redaction, not an already-clean error.
+        let raw = omnigraph::instrumentation::with_query_io_probes(
+            probes.clone(),
+            handle.engine.resolved_branch_of(read_target_from_request(
+                None,
+                Some(snapshot.as_str().to_string()),
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert!(raw.to_string().contains("private-bucket"), "{raw}");
+        let response = omnigraph::instrumentation::with_query_io_probes(
+            probes,
+            read_blob_for_delivery(&handle, Some(&actor), query()),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let output: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(output.error, "Blob delivery failed before response headers");
+        assert!(!String::from_utf8_lossy(&body).contains("private-bucket"));
+
+        let logs = capture.output();
+        for expected in [
+            r#"error_kind="blob_pre_header_internal""#,
+            r#"stage="target" error_variant="Storage""#,
+            "storage_kind=Some(",
+        ] {
+            assert!(logs.contains(expected), "missing {expected}: {logs}");
+        }
+        for absent in ["unclassified", "private-bucket", "denied"] {
+            assert!(!logs.contains(absent), "log carries {absent}: {logs}");
+        }
+    }
 
     #[tokio::test]
     async fn pre_header_internal_errors_do_not_expose_physical_storage_or_identity() {
+        let capture = crate::test_log_capture::Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("info"));
         for (error, secret) in [
             (
                 OmniError::Storage(omnigraph::error::StorageFailure::new(
@@ -3090,9 +3334,11 @@ mod blob_error_tests {
             assert!(!String::from_utf8_lossy(&body).contains(secret));
         }
 
-        let response = redact_blob_api_error(ApiError::internal(
-            "snapshot manifest at s3://private-bucket/graph/__manifest",
-        ))
+        let response = redact_blob_api_error(
+            ApiError::internal("snapshot manifest at s3://private-bucket/graph/__manifest"),
+            "target",
+            None,
+        )
         .into_response();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -3100,6 +3346,31 @@ mod blob_error_tests {
         let output: ErrorOutput = serde_json::from_slice(&body).unwrap();
         assert_eq!(output.error, "Blob delivery failed before response headers");
         assert!(!String::from_utf8_lossy(&body).contains("private-bucket"));
+
+        // The server log names each failure's class and stage, never its text.
+        let logs = capture.output();
+        for expected in [
+            r#"error_kind="blob_pre_header_internal""#,
+            r#"stage="cell""#,
+            r#"error_variant="Storage""#,
+            "storage_kind=Some(Unknown)",
+            r#"error_variant="BlobIntegrity""#,
+            r#"stage="target""#,
+            r#"error_variant="unclassified""#,
+        ] {
+            assert!(logs.contains(expected), "missing {expected}: {logs}");
+        }
+        for leaked in [
+            "private-bucket",
+            "tenant-a",
+            "token",
+            "secret",
+            "node:Secret",
+            "incarnation",
+            "__manifest",
+        ] {
+            assert!(!logs.contains(leaked), "log leaked {leaked}: {logs}");
+        }
     }
 }
 

@@ -322,7 +322,8 @@ modes.
 
 `GET`/`HEAD /graphs/{id}/blob` select a cell by `entity`, `type`, `id` and
 `property`. They support managed ranges/ETag conditions and report external
-references without fetching them. See [Blob values](../blobs.md) for details.
+references without fetching them. See [Blob values](../blobs.md) for details
+and [Blob limits](../blobs.md#limits).
 
 ## Changes and baselines
 

@@ -6968,7 +6968,7 @@
           "mutations"
         ],
         "summary": "Apply a schema migration.",
-        "description": "Cluster-backed servers reject this route with `409 Conflict`; operators\nmust apply schema changes through `omnigraph cluster apply` and restart.\n\nDiffs `schema_source` against the current schema and applies the resulting\nmigration steps (add/drop type, add/drop property, etc.). **Destructive**:\nsome steps drop data. Returns the list of steps applied; if `applied` is\nfalse the diff was unsupported and no changes were made.",
+        "description": "Cluster-backed servers reject this route with `409 Conflict`; operators\nmust apply schema changes through `omnigraph cluster apply` and restart.\n\nDiffs `schema_source` against the current schema and applies the resulting\nmigration steps (add/drop type, add/drop property, etc.). **Destructive**:\na drop removes data from the branch head; older commits keep reading it\nuntil `omnigraph cleanup` stops retaining them. Returns the list of steps\napplied; if `applied` is false the diff was unsupported and no changes\nwere made.",
         "operationId": "cluster_applySchema",
         "parameters": [
           {
@@ -9584,10 +9584,6 @@
           "schema_source"
         ],
         "properties": {
-          "allow_data_loss": {
-            "type": "boolean",
-            "description": "When true, promote every `DropMode::Soft` step in the plan to\n`DropMode::Hard`, making the prior property data unreachable\nafter the apply. Matches the CLI's `--allow-data-loss` flag.\nDefaults to `false` (drops remain reversible via time travel)."
-          },
           "schema_source": {
             "type": "string",
             "description": "Project schema in `.pg` source form. The diff against the current\nschema produces the migration steps that will be applied.",

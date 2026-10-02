@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-06-10
-updated: 2026-08-23
+updated: 2026-10-02
 discussion: null
 supersedes: []
 superseded_by: []
@@ -27,7 +27,7 @@ Extend `cluster apply` from config-only resources (stored queries, policy bundle
 Three design commitments make the phase tractable:
 
 1. **Cluster recovery is roll-forward-only.** The engine's recovery sidecars (`__recovery/{ulid}.json`, the open-time sweep in `db/manifest/recovery.rs`) already make every graph-level operation atomic *within the graph* — a schema apply either fully published or fully recovers at the next open. The cluster therefore never rolls a graph back. Cluster sidecars exist to **classify and record**: after a crash, the sweep observes the live graph, decides "moved / didn't move / moved unexpectedly," and either rolls the *cluster state* forward to match observable reality (axiom 5) or surfaces a loud pending-repair condition. The cluster holds no second transaction log and no rollback hammer — that would duplicate substrate behavior the engine already owns (invariant: respect the substrate).
-2. **Irreversible operations require a digest-bound approval artifact.** Graph delete and `allow_data_loss` schema applies consume an explicit `__cluster/approvals/{ulid}.json` record bound to the exact change digests, written by a new `cluster approve` command and retired into the state ledger's `approval_records` (the durable audit reference of axiom 11).
+2. **Irreversible operations require a digest-bound approval artifact.** Graph delete consumes an explicit `__cluster/approvals/{ulid}.json` record bound to the exact change digests, written by a new `cluster approve` command and retired into the state ledger's `approval_records` (the durable audit reference of axiom 11). Schema apply is not irreversible: a drop reclaims nothing at apply.
 3. **The operator identity becomes explicit.** `cluster apply` gains an actor, threaded to the engine's `apply_schema_as` so Cedar enforcement and commit attribution work unchanged. The cluster control plane adds no policy engine of its own (transport/auth stay at the boundary).
 
 ## Motivation
@@ -122,7 +122,7 @@ Rows 3, 4 and 7b are the only mutations the sweep performs, and each is an ordin
 
 ### D4. Approval artifacts (exit criteria 1-partial and 6-partial; axioms 8 and 11)
 
-The irreversible tier — graph delete, `allow_data_loss` schema apply (hard drops) — requires a recorded human decision that survives any reconstruction of state. `plan` already emits `approvals_required`; Phase 4 adds the consumption side.
+The irreversible tier — graph delete — requires a recorded human decision that survives any reconstruction of state. `plan` already emits `approvals_required`; Phase 4 adds the consumption side.
 
 **Artifact** (`__cluster/approvals/{approval_id}.json`, written by the new command, never by apply):
 
@@ -143,7 +143,7 @@ The irreversible tier — graph delete, `allow_data_loss` schema apply (hard dro
 
 **Flow.** `cluster approve <resource-address> --config <dir> --by <operator>` re-runs the plan under the lock, locates the pending gated change for that address, prints it, and writes the artifact bound to the exact digests. `cluster apply` executes a gated change only when a pending artifact matches **all** bound digests — a stale approval (config moved since) matches nothing, is reported (`approval_stale` warning), and the change stays `blocked` with condition `approval_required`. On successful execution the artifact file is moved into `state.approval_records[approval_id]` in the same state CAS that records the outcome (the state references the audit fact; losing state does not lose the approval, which is also why `import` preserves `approval_records` it finds — see D7).
 
-`allow_data_loss` is **never** a CLI flag on `cluster apply`; destructive promotion is expressed only through an approval artifact for the specific schema change. The default schema apply path runs with `allow_data_loss: false` (soft drops), which the spec's tier table classes as a recoverable definition rewrite — plan warning, no artifact.
+Schema apply has no destructive mode to gate. A drop removes the declaration from the branch head and reclaims nothing at apply: older commits keep reading the dropped data until `omnigraph cleanup` stops retaining them. The spec's tier table classes this as a recoverable definition rewrite — plan warning, no artifact.
 
 ### D5. Actor, ordering, and apply groups (exit criterion 4)
 
@@ -166,7 +166,7 @@ With no engine primitive, delete is cluster-orchestrated prefix removal: verify 
 
 ### D7. Plan and import integration
 
-- **Plan** gains real data impact for schema updates: where Stage 3A showed only a digest diff, Phase 4 calls `preview_schema_apply_with_options` against the live graph (read-only) and embeds the migration steps + drop warnings in the change record — the "data-aware provider peek" from the high-level spec, bounded to graphs the plan already observes. Failure to preview (graph unreachable) degrades to the digest diff with a warning, never blocks planning.
+- **Plan** gains real data impact for schema updates: where Stage 3A showed only a digest diff, Phase 4 calls `preview_schema_apply` against the live graph (read-only) and embeds the migration steps + drop warnings in the change record — the "data-aware provider peek" from the high-level spec, bounded to graphs the plan already observes. Failure to preview (graph unreachable) degrades to the digest diff with a warning, never blocks planning.
 - **Import/refresh** already observe live graphs; Phase 4 makes `import` preserve `approval_records` and pending `recoveries/` it finds (state reconstruction must not orphan audit facts or pending repairs).
 
 ### D8. Invariants and axioms check
@@ -189,10 +189,10 @@ Additive. Stage 3A/3B behavior is unchanged for catalog-only configs; existing s
 | Stage | Scope | Gate |
 |---|---|---|
 | **4A graph create** | `Omnigraph::init` at derived roots; create-intent sidecar; D3 rows 1/2/4/5; dependents unblock in-run | Failpoint tests for crash-before/after-init; e2e: declare graph → apply → import-less convergence |
-| **4B schema apply** | Full sidecar lifecycle; roll-forward sweep (D3 rows 3/6); actor threading; plan data-impact preview; soft-drop default | Failpoint tests per matrix row; e2e: schema evolution fully cluster-driven (replaces the Stage 3A defer→manual→refresh loop) |
+| **4B schema apply** | Full sidecar lifecycle; roll-forward sweep (D3 rows 3/6); actor threading; plan data-impact preview; drops reclaim nothing at apply | Failpoint tests per matrix row; e2e: schema evolution fully cluster-driven (replaces the Stage 3A defer→manual→refresh loop) |
 | **4C graph delete** | `cluster approve` + artifact consumption; prefix removal; tombstones; D3 rows 7/7b/8 | Failpoint tests incl. partial-removal; e2e: gated delete refused without artifact, executed with it, stale artifact rejected |
 
-Each stage is a separate PR with boundary-matched tests (the Stage 1–3B discipline). 4A ships first because it moves no existing manifest; 4B is the heart; 4C last because it is the only irreversible-tier executor and consumes the approval machinery 4B's hard-drop path also needs.
+Each stage is a separate PR with boundary-matched tests (the Stage 1–3B discipline). 4A ships first because it moves no existing manifest; 4B is the heart; 4C last because it is the only irreversible-tier executor and consumes the approval machinery.
 
 ## Exit-criteria coverage (implementation spec)
 
@@ -221,3 +221,22 @@ Each stage is a separate PR with boundary-matched tests (the Stage 1–3B discip
 - [Cluster control plane](../dev/control-plane.md) — current authority, durable layout, lifecycle, concurrency, and serving contract
 - `crates/omnigraph/src/db/manifest/recovery.rs` — the engine sidecar + classifier this design mirrors in vocabulary and deliberately does not duplicate in mechanics
 - [writes.md](../dev/writes.md), [invariants.md](../dev/invariants.md) — engine recovery protocol and the deny-list this design is checked against
+
+## Decision log
+
+- 2026-10-02: The engine's `allow_data_loss` option and the
+  `--allow-data-loss` flag are removed. Since detached table commits a hard
+  drop executed like a soft one and reclaimed nothing at apply, so no schema
+  apply is irreversible and none needs an approval artifact; reclaiming a
+  drop's data is `omnigraph cleanup`'s job. Superseded: the Summary's "Graph
+  delete and `allow_data_loss` schema applies consume an explicit
+  `__cluster/approvals/{ulid}.json` record"; D4's "The irreversible tier —
+  graph delete, `allow_data_loss` schema apply (hard drops) — requires a
+  recorded human decision"; D4's "`allow_data_loss` is **never** a CLI flag on
+  `cluster apply`; destructive promotion is expressed only through an approval
+  artifact for the specific schema change. The default schema apply path runs
+  with `allow_data_loss: false` (soft drops)"; D7's
+  "`preview_schema_apply_with_options`", now `preview_schema_apply`; the
+  Sequencing table's "soft-drop default"; and "consumes the approval machinery
+  4B's hard-drop path also needs". The Background section's description of the
+  engine surface is history and is not rewritten.

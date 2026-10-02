@@ -484,12 +484,17 @@ escape hatch.
 
 An implementation may wrap Lance `read_blob_ranges`, `read_blobs`, or
 `take_blobs`, but Lance types do not appear in public signatures.
-Complete-payload internal work uses Lance's batched `read_blobs` API. It and
-`read_blob_ranges` already shipped in Lance 9.0.0 with row-id, row-index, and
-row-address selectors; Lance 10.0.0 is required for their null-preserving,
-request-cardinality behavior. The hard rule is the anti-pattern: it must not
-build a thread pool around one `BlobFile::read()` per row. Range work prefers
-`read_blob_ranges` when it supports the needed selector.
+Materializing rewrites use Lance's batched `read_blobs` API on managed rows
+with an explicit I/O buffer: a carried update or merge cell, the bounded rewrite
+stream and the schema-apply rewrite each pass one batch's managed stable row ids
+to one streamed call. Upgrade validation reads managed bytes through
+`read_blob_ranges` in bounded windows. Both APIs shipped in Lance 9.0.0 with
+row-id, row-index, and row-address selectors; Lance 10.0.0 is required for their
+null-preserving, request-cardinality behavior. Export and change-feed images
+still read one row at a time through `take_blobs` and `BlobFile::read`, and the
+single-cell read facade uses `take_blobs`; moving export and change images onto
+batched reads is Phase 4 work. The hard rule is the anti-pattern: it must not
+build a thread pool around one `BlobFile::read()` per row.
 
 ### 4.1 Descriptor-first classification
 
@@ -1038,8 +1043,12 @@ ranged descriptor before recovery arm or table movement; it never silently
 widens the cell to the whole object. Supporting descriptor-preserving ranged
 schema rewrites remains part of the future ownership-proof optimization below.
 
-The current materializing rewrite is accepted as a bounded V1 implementation,
-not as an ideal physical plan. A future optimization may carry immutable
+The current materializing rewrite is a V1 implementation, not an ideal
+physical plan, and the schema-apply rewrite is not bounded: it scans the whole
+table into one batch and holds every managed payload of a rewritten Blob column
+in memory before staging. Mutation and merge carries stay under their operation
+budget (§10). A bounded, streamed schema-apply rewrite is required future work.
+A future optimization may carry immutable
 prepared descriptors for unchanged cells only after a Lance surface guard proves
 that references cannot escape their source dataset/incarnation and recovery can
 account for every file. Correctness and ownership proof come before avoiding the
@@ -1079,9 +1088,11 @@ duplicated descriptor heuristics. Those still misclassify inline
 `0/0/empty-uri` as null, so the §4.1 central Arrow-validity decoder work remains
 required in full.
 
-Cleanup remains Lance-owned version GC under OmniGraph's manifest/ref/recovery
-floors. It can remove managed Blob sidecars only when Lance proves they are no
-longer reachable from retained dataset versions. It never interprets or deletes
+Cleanup is OmniGraph's tracing collector under the manifest/ref/recovery
+floors; stock `cleanup_old_versions` is never called on a graph table. The
+collector marks every file reachable from retained graph snapshots, tags and
+selected merge bases, Blob sidecars included, so a managed sidecar is kept or
+reclaimed with the data file that references it. It never interprets or deletes
 external URIs.
 
 ## 9. Physical layout and Lance alignment
@@ -1103,9 +1114,10 @@ evidence that users need the control. If production metrics later show placement
 as a material cost term, a follow-up RFC can propose an annotation with migration
 semantics and a comparative benchmark.
 
-Batch complete reads use `Dataset::read_blobs`; batch range reads use
-`Dataset::read_blob_ranges`; lazy single-cell reads may use `take_blobs` behind
-the engine facade. Logical row IDs are preferred within an exact snapshot.
+Materializing rewrites read complete managed payloads with
+`Dataset::read_blobs` and upgrade validation reads ranges with
+`Dataset::read_blob_ranges` (§4); export, change images and lazy single-cell
+reads use `take_blobs` behind the engine facade. Logical row IDs are preferred within an exact snapshot.
 Physical row addresses never become public stable identity.
 
 ## 10. Security and resource model
@@ -1118,7 +1130,8 @@ Physical row addresses never become public stable identity.
 | URI parser amplification | Reject a raw configured or input URI above 64 KiB before trimming, parsing, decoding, or filesystem resolution |
 | External SSRF during read | Descriptor-first classification; redirect only; no proxy or validation on GET/HEAD |
 | Oversize upload | Route and engine 32 MiB inclusive limits; refusal before effect |
-| Rewrite amplification | New logical input and row-writing branch merge pre-size all carried Blob payloads under one 32 MiB operation budget before read; predicate mutation carry applies the same cumulative byte ceiling while materializing bounded scan batches |
+| Rewrite amplification | New logical input and row-writing branch merge pre-size all carried Blob payloads under one 32 MiB operation budget before read; predicate mutation carry applies the same cumulative byte ceiling while materializing bounded scan batches. The schema-apply rewrite has no byte ceiling yet (§8.4) |
+| Compaction memory | Optimize sets the compaction scanner batch from the planned fragments' largest row, summing that row's Blob columns: as many rows (1 to 8,192) as fit 32 MiB of managed payload at that row's size, so one batch materializes at most 32 MiB of managed payload. A row whose Blob values together exceed 32 MiB is compacted in a batch of its own and materialized whole. This bounds payload per batch, not heap: Lance's writer copies inline payloads into its prepared arrays while it holds the batch (see the operator guide's optimize section). External descriptors are carried unread |
 | External-source planning | Row-writing branch merge admits at most 8,192 external-reference cells and 32 MiB of retained URI metadata before HEAD; probes are bounded and normalized aliases deduplicate within the applicable operation or scan-batch envelope |
 | Engine read memory | `BlobReader::read_range` returns at most `BLOB_READ_RANGE_MAX_BYTES` (4 MiB); larger values require consecutive calls and there is no unbounded full-read method |
 | Delivery memory | Phase 2A adds a two-chunk queue, backpressure, and prompt cancellation without weakening the engine's 4 MiB per-call bound |
@@ -1230,8 +1243,8 @@ The implementation extends existing owners before creating new fixtures, per
   as a different stable-property lifetime.
 - Phase 1 migrates `export.rs`'s four-way null/empty/non-empty/external fixture to
   the facade. External classification stays descriptor-first while the target is
-  unavailable; bulk export itself retains its batched reader and must not loop
-  over the single-cell API.
+  unavailable; bulk export keeps its own `take_blobs` selection and must not
+  loop over the single-cell API.
 - `forbidden_apis.rs` removes the old `read_blob -> BlobFile` surface, classifies
   `read_blob_at` as read-only, and proves no durable call site was added.
 - The canonical-input owner presents Lance's prepared four-child Blob struct to
@@ -1475,9 +1488,11 @@ correctness gate.
 
 ### Phase 4 — measured optimization
 
-- Benchmark and tune the already-required batched complete/range reads in export
-  and materializing rewrites. Tuning is optional and may not weaken the batched
-  contract or change logical behavior.
+- Batched reads landed for materializing rewrites (`read_blobs`) and upgrade
+  validation (`read_blob_ranges`). Remaining: move export and change images onto
+  batched reads and make the schema-apply rewrite bounded and streamed (§8.4),
+  then benchmark. Tuning is optional and may not weaken the batched contract or
+  change logical behavior.
 - Retain the exact empty/null/neighbor compaction guard across every future Lance
   dependency bump.
 - Consider descriptor-preserving unchanged-cell updates only with an ownership
@@ -1769,3 +1784,25 @@ publisher architecture.
   superseding "an external reference emits its URI", which widened the range
   to the whole object on reload. The redirect, CLI delivery and schema rewrite
   already refused it; export now shares their whole-object check.
+- 2026-09-29: Factual corrections to match the code. §4's "Complete-payload
+  internal work uses Lance's batched `read_blobs` API." and "Range work prefers
+  `read_blob_ranges` when it supports the needed selector." are superseded by
+  the account of which paths batch (materializing rewrites, upgrade validation)
+  and which still read one row at a time (export, change images, single-cell
+  reads). §8.4's "The current materializing rewrite is accepted as a bounded V1
+  implementation, not as an ideal physical plan." is superseded: the
+  schema-apply rewrite holds a whole Blob column in memory, and a bounded
+  streamed rewrite is required future work. §8.5's "Cleanup remains
+  Lance-owned version GC under OmniGraph's manifest/ref/recovery floors. It can
+  remove managed Blob sidecars only when Lance proves they are no longer
+  reachable from retained dataset versions." is superseded by the engine
+  collector, which never calls stock `cleanup_old_versions`. §9's "Batch
+  complete reads use `Dataset::read_blobs`; batch range reads use
+  `Dataset::read_blob_ranges`; lazy single-cell reads may use `take_blobs`
+  behind the engine facade." is superseded by the version aligned with §4.
+  §12.2's "bulk export itself retains its batched reader" is superseded by
+  "bulk export keeps its own `take_blobs` selection". Phase 4's "Benchmark and
+  tune the already-required batched complete/range reads in export and
+  materializing rewrites." (§13) is superseded by the landed/remaining split. §10's
+  rewrite-amplification row gains the schema-apply gap, and a compaction-memory
+  row records optimize's derived batch bound.

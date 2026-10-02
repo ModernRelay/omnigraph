@@ -20,7 +20,7 @@ pub use omnigraph::{
     EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult, InitOptions, MergeOutcome,
     MergeResult, Omnigraph, OpenMode, PendingIndex, RebuiltFullTextIndex, RepairAction,
     RepairClassification, RepairOptions, RepairStats, RetainedManifestVersions,
-    SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyOptions, SchemaApplyResult, SkipReason, StagingVerdict,
+    SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyResult, SkipReason, StagingVerdict,
     SystemColumnUpgradeFinding, SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome,
     SystemColumnUpgradeReport, TableCollectionPlan, UnpublishedManifest,
 };

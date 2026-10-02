@@ -63,6 +63,7 @@ serial_test = "3"
 rsa = "0.9"
 lance = { workspace = true }
 lance-index = { workspace = true }
+object_store = { workspace = true }
 
 [lints]
 workspace = true

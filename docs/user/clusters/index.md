@@ -87,8 +87,11 @@ omnigraph cluster apply --config ./company-brain --as act-alice
 # restart each server using this cluster
 ```
 
-Schema drops applied through the cluster are soft. Destructive graph deletion
-is blocked until an actor approves the exact planned change:
+A schema drop applied through the cluster removes the data from the branch head
+and reclaims no storage at apply. Older commits still read the dropped data
+until `omnigraph cleanup` stops retaining them; after that it cannot be
+recovered. Destructive graph deletion is blocked until an actor approves the
+exact planned change:
 
 ```bash
 omnigraph cluster plan --config ./company-brain

@@ -5930,6 +5930,7 @@ dependencies = [
  "lance",
  "lance-index",
  "libc",
+ "object_store",
  "omnigraph-api-types",
  "omnigraph-cluster",
  "omnigraph-compiler",

@@ -2134,13 +2134,49 @@ pub fn init_tracing() {
     let _ = server_log_subscriber(filter, io::stdout).try_init();
 }
 
+/// Captures what the server's log subscriber writes, for tests that assert
+/// what a log line carries and what it must never carry.
 #[cfg(test)]
-mod log_filter_tests {
-    use super::*;
-    use std::sync::Mutex;
+pub(crate) mod test_log_capture {
+    use std::io;
+    use std::sync::{Arc, Mutex};
 
-    #[derive(Clone)]
-    struct Capture(Arc<Mutex<Vec<u8>>>);
+    use tracing_subscriber::EnvFilter;
+
+    #[derive(Clone, Default)]
+    pub(crate) struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Capture {
+        /// The server subscriber under `directives`, writing into this capture.
+        pub(crate) fn subscriber(
+            &self,
+            directives: &str,
+        ) -> impl tracing::Subscriber + Send + Sync {
+            let writer = self.clone();
+            super::server_log_subscriber(EnvFilter::new(directives), move || writer.clone())
+        }
+
+        /// Everything written so far, with ANSI styling removed so a test can
+        /// match `field="value"` spellings.
+        pub(crate) fn output(&self) -> String {
+            let raw = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
+            let mut plain = String::with_capacity(raw.len());
+            let mut chars = raw.chars();
+            while let Some(c) = chars.next() {
+                if c == '\u{1b}' {
+                    // CSI sequences: ESC '[' parameters, ending at a letter.
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                } else {
+                    plain.push(c);
+                }
+            }
+            plain
+        }
+    }
 
     impl io::Write for Capture {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -2152,14 +2188,17 @@ mod log_filter_tests {
             Ok(())
         }
     }
+}
+
+#[cfg(test)]
+mod log_filter_tests {
+    use super::test_log_capture::Capture;
 
     #[test]
     fn verbose_sdk_payloads_remain_filtered_under_specific_directives() {
         for directives in ["trace", "debug,rmcp::service=trace"] {
-            let captured = Capture(Arc::new(Mutex::new(Vec::new())));
-            let writer = captured.clone();
-            let subscriber =
-                server_log_subscriber(EnvFilter::new(directives), move || writer.clone());
+            let captured = Capture::default();
+            let subscriber = captured.subscriber(directives);
             tracing::subscriber::with_default(subscriber, || {
                 tracing::debug!(target: "rmcp::service", request = "PRIVATE_REQUEST_MARKER", "received request");
                 tracing::trace!(target: "rmcp::transport::streamable_http_server::tower", message = "PRIVATE_RESULT_MARKER");
@@ -2169,7 +2208,7 @@ mod log_filter_tests {
                 tracing::debug!(target: "omnigraph_server", "NATIVE_DEBUG_MARKER");
                 tracing::debug!(target: "rmcp_extension", "UNRELATED_DEBUG_MARKER");
             });
-            let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            let output = captured.output();
             for private in [
                 "PRIVATE_REQUEST_MARKER",
                 "PRIVATE_RESULT_MARKER",

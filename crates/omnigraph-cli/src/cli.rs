@@ -652,8 +652,8 @@ pub(crate) enum ClusterCommand {
         #[command(flatten)]
         managed: ManagedRunArgs,
     },
-    /// Converge the cluster to its config: create graphs, apply schema updates
-    /// (soft drops), write stored-query/policy catalog resources, and execute
+    /// Converge the cluster to its config: create graphs, apply schema updates,
+    /// write stored-query/policy catalog resources, and execute
     /// approved graph deletes, in one ordered run. Serving picks up the applied
     /// revision after an `omnigraph-server --cluster` restart.
     Apply {
@@ -862,13 +862,13 @@ pub(crate) enum SchemaCommand {
         schema: PathBuf,
         #[arg(long)]
         json: bool,
-        /// Show the plan as it would execute with `--allow-data-loss`.
-        /// Promotes every `DropMode::Soft` step to `DropMode::Hard`
-        /// so the plan output reflects the destructive intent.
-        #[arg(long, default_value_t = false)]
-        allow_data_loss: bool,
     },
-    /// Apply a supported schema migration
+    /// Apply a supported schema migration.
+    ///
+    /// A drop removes the property or type from the current graph-manifest
+    /// version and reclaims nothing at apply: older commits still read the
+    /// dropped data until `omnigraph cleanup` stops retaining them, after
+    /// which it cannot be recovered.
     Apply {
         /// Graph URI
         uri: Option<String>,
@@ -876,17 +876,6 @@ pub(crate) enum SchemaCommand {
         schema: PathBuf,
         #[arg(long)]
         json: bool,
-        /// Allow destructive (data-loss) schema changes.
-        ///
-        /// Without this flag, drops are "soft": the property or type
-        /// is removed from the current graph-manifest version but prior
-        /// versions are retained, so `snapshot_at_graph_manifest_version(pre_drop)`
-        /// can still read the dropped data until `omnigraph cleanup`
-        /// runs. With this flag, drops are "hard": `cleanup_old_versions`
-        /// runs on the affected datasets immediately after the apply,
-        /// making the prior data unreachable.
-        #[arg(long, default_value_t = false)]
-        allow_data_loss: bool,
     },
     /// Show the current accepted schema source
     #[command(alias = "get")]

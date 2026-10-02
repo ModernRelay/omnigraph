@@ -144,7 +144,8 @@ entities and 32 MiB per touched type, plus 32 MiB of retained Arrow batches
 across all touched types in one operation. Keyed loads also have a separate
 32 MiB parsed-payload estimate across types. External Blob payloads that require
 copying count toward the aggregate allowance. Every strict load retains its
-projected in-memory size check.
+projected in-memory size check. Blob values have further limits; see
+[Blob limits](../blobs.md#limits).
 
 Deletes, including cascades, and overwrite loads collecting replaced IDs have
 a separate 32 MiB allowance per operation for those IDs, summed over all
@@ -183,7 +184,7 @@ the graph read-write or restart the server, then retry from a fresh branch head.
 Blob assignments accept managed `base64:` data and, when allowed by graph
 policy, external URI references. Ownership differs by load mode, and Blob bytes
 count toward write limits. See the canonical [Blob guide](../blobs.md) before
-loading them.
+loading them, and its [limits](../blobs.md#limits) for the bounds that apply.
 
 ## Conditional mutations
 
