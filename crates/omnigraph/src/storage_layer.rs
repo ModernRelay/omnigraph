@@ -126,6 +126,11 @@ impl DeletedIdBudget {
     }
 }
 
+/// Scheduler I/O buffer of every batched managed Blob read; Lance's default is
+/// 32 MiB times the store's I/O parallelism. It caps read-ahead, not what a
+/// caller holds: 64 contiguous 1 MiB validation windows may arrive as one buffer.
+pub(crate) const BLOB_REBUILD_IO_BUFFER_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Resource budget for a pending-aware keyed scan that will feed one mutation
 /// table transaction.
 ///
@@ -524,9 +529,6 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
     async fn scan_batches(&self, snapshot: &SnapshotHandle) -> Result<Vec<RecordBatch>>;
 
-    async fn scan_batches_for_rewrite(&self, snapshot: &SnapshotHandle)
-    -> Result<Vec<RecordBatch>>;
-
     async fn count_rows(&self, snapshot: &SnapshotHandle, filter: Option<String>) -> Result<usize>;
 
     async fn count_rows_with_staged(
@@ -676,16 +678,6 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         prior_stages: &[StagedHandle],
     ) -> Result<StagedHandle>;
 
-    /// Append `source`'s rows into `snapshot`'s table, streaming so the whole
-    /// row set is never materialized in memory (see `TableStore::stage_append_stream`).
-    #[cfg(test)]
-    async fn stage_append_stream(
-        &self,
-        snapshot: &SnapshotHandle,
-        source: &SnapshotHandle,
-        prior_stages: &[StagedHandle],
-    ) -> Result<StagedHandle>;
-
     /// Stage one RFC-023 fenced keyed write from an in-memory batch.
     ///
     /// This production adapter accepts only the graph `id` key and checks that
@@ -712,23 +704,6 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: SnapshotHandle,
         chunk: ProvenInsertChunk,
-        system_columns: SystemColumns,
-    ) -> Result<StagedHandle>;
-
-    /// Test-only streaming-source sibling of [`Self::stage_keyed_write`].
-    ///
-    /// `source` must be a trusted graph dataset with the same exact-id PK
-    /// contract. It is scanned twice: once in bounded id-only batches for
-    /// validation / strict preflight, then through the existing blob-aware
-    /// rewrite stream. Neither ordinary nor blob rows are collected into one
-    /// delta-wide batch.
-    #[cfg(test)]
-    async fn stage_keyed_write_stream(
-        &self,
-        snapshot: SnapshotHandle,
-        table_key: &str,
-        source: &SnapshotHandle,
-        semantics: KeyedWriteSemantics,
         system_columns: SystemColumns,
     ) -> Result<StagedHandle>;
 
@@ -1006,13 +981,6 @@ impl TableStorage for TableStore {
         TableStore::scan_batches(self, snapshot.dataset()).await
     }
 
-    async fn scan_batches_for_rewrite(
-        &self,
-        snapshot: &SnapshotHandle,
-    ) -> Result<Vec<RecordBatch>> {
-        TableStore::scan_batches_for_rewrite(self, snapshot.dataset()).await
-    }
-
     async fn count_rows(&self, snapshot: &SnapshotHandle, filter: Option<String>) -> Result<usize> {
         TableStore::count_rows(self, snapshot.dataset(), filter).await
     }
@@ -1220,19 +1188,6 @@ impl TableStorage for TableStore {
             .map(StagedHandle::new)
     }
 
-    #[cfg(test)]
-    async fn stage_append_stream(
-        &self,
-        snapshot: &SnapshotHandle,
-        source: &SnapshotHandle,
-        prior_stages: &[StagedHandle],
-    ) -> Result<StagedHandle> {
-        let staged_writes = staged_handles_as_writes(prior_stages);
-        TableStore::stage_append_stream(self, snapshot.dataset(), source.dataset(), &staged_writes)
-            .await
-            .map(StagedHandle::new)
-    }
-
     async fn stage_keyed_write(
         &self,
         snapshot: SnapshotHandle,
@@ -1257,28 +1212,6 @@ impl TableStorage for TableStore {
         TableStore::stage_proven_strict_insert(self, ds, chunk, system_columns)
             .await
             .map(StagedHandle::new)
-    }
-
-    #[cfg(test)]
-    async fn stage_keyed_write_stream(
-        &self,
-        snapshot: SnapshotHandle,
-        table_key: &str,
-        source: &SnapshotHandle,
-        semantics: KeyedWriteSemantics,
-        system_columns: SystemColumns,
-    ) -> Result<StagedHandle> {
-        let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
-        TableStore::stage_keyed_write_stream(
-            self,
-            ds,
-            table_key,
-            source.dataset(),
-            semantics,
-            system_columns,
-        )
-        .await
-        .map(StagedHandle::new)
     }
 
     async fn scan_stream_for_rewrite_bounded(

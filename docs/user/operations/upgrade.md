@@ -33,12 +33,12 @@ for physical layouts and retained-history decoding.
 
 4. Inspect `outcome`, `findings`, `route` and `work`. A passing check is advisory;
    execution repeats validation. `work.deferred_checks` identifies downstream
-   preflights that need intermediate output. Execution validates each before
-   its handler has effects; a passing check does not pre-approve them.
+   preflights that need intermediate output; a passing check does not pre-approve them.
    Resolve source recovery with the compatible source executable before retrying.
    Shared Lance files outside the root refuse.
-   `work.external_blob_exclusions` lists external URI bytes whose immutability
-   and backup are outside the migration guarantee; their descriptors are retained.
+   `work.external_blob_exclusions` lists each retained external Blob URI as stored (no
+   byte range, store not contacted); those bytes are outside the migration guarantee.
+   Nested or non-Blob-v2 Blob fields and bad descriptors are `preflight_failed` findings.
    `work.historical_blob_identity_limits` lists pre-0.10 Blob fields without
    stable property IDs. Their bytes are preserved, but existing historical
    delivery restrictions remain after their current physical entry changes;

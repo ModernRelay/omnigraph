@@ -382,6 +382,7 @@ query set_note($title: String, $note: String) {
         0,
         "suppressing the inherited managed row must avoid Blob selection/materialization"
     );
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0);
     assert_eq!(
         helpers::pinned_version(&main, "main", "node:Document").await,
         source_pin,

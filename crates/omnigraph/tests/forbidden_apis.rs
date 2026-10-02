@@ -686,7 +686,7 @@ gateway_surfaces! {
         "open_snapshot_at_entry", "open_snapshot_at_table", "open_dataset_head",
         "branch_identifier", "list_native_branches",
         "ensure_expected_version", "scan", "scan_with_row_id", "scan_filtered", "scan_batches",
-        "scan_batches_for_rewrite", "count_rows", "count_rows_with_staged",
+        "count_rows", "count_rows_with_staged",
         "scan_with_staged", "scan_with_pending", "scan_with_pending_materialized_blobs",
         "first_row_id_for_filter", "table_state", "has_btree_index",
         "has_fts_index", "has_vector_index", "root_uri", "dataset_uri", "scan_stream",
@@ -725,10 +725,9 @@ gateway_surfaces! {
         "new", "root_uri", "dataset_uri", "open_snapshot_table", "open_at_entry",
         "open_at_entry_verified", "open_dataset_head", "list_native_branches",
         "named_fork_is_absent", "ensure_expected_version",
-        "scan_batches", "scan_batches_for_rewrite",
-        "scan_stream_for_rewrite", "scan_stream_for_rewrite_bounded",
+        "scan_batches", "scan_stream_for_rewrite_bounded",
         "scan_proven_insert_delta_bounded", "include_proven_insert_blob_selection",
-        "materialize_blob_batch", "scan_stream", "scan_stream_bounded",
+        "scan_stream", "scan_stream_bounded",
         "scan_stream_with", "scan_plan_with", "ordered_scan_error", "scan", "scan_with",
         "fts_covers_all_fragments",
         "count_rows",
@@ -741,7 +740,7 @@ gateway_surfaces! {
         "prepare_overwrite_blob_references_with_preflight",
         "prepare_keyed_write_batch", "validate_keyed_write_batch", "first_existing_id",
         "predicted_materialized_blob_batch_bytes",
-        "materialize_blob_batch_bounded_with_preflight_cache",
+        "materialize_blob_batch_bounded_with_preflight_cache", "managed_blob_payloads",
         "can_fold_index", "has_foldable_unindexed_fragments", "index_is_vector",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::StageOnly => [
@@ -868,7 +867,7 @@ durable_calls! {
     ("storage_layer.rs", ".promote_detached(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("db/omnigraph/promotion.rs", ".promote_detached(", 1, WriteProtocol::Exact("RFC 0067 promotion replay")),
     ("db/omnigraph/promotion.rs", "SnapshotHandle::new(", 1, WriteProtocol::ReadOnlyAccess),
-    ("storage_layer.rs", ".dataset()", 32, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".dataset()", 31, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".into_arc()", 6, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", "SnapshotHandle::new(", 4, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("table_store.rs", ".raw_dataset_append(", 1, WriteProtocol::EphemeralScratch),
@@ -2045,14 +2044,9 @@ fn callable_storage_and_manifest_gateway_surfaces_are_registered() {
     );
 }
 
-/// RFC-023 closes the keyed-Append side door at the source boundary. The raw
-/// append primitives are test-only behind the sealed storage adapter; every
-/// production graph writer must select the exact-id fenced adapter.
-///
-/// This walks syntax rather than text, so comments and test-only fixtures do
-/// not weaken the guard. A future call from mutation, load, branch merge, or a
-/// newly-added production module fails here even if it is added to another
-/// protocol allow-list.
+/// RFC-023: the raw `stage_append` is test-only behind the sealed storage
+/// adapter, and every production graph writer selects the exact-id fenced
+/// adapter. The walk is syntactic, so comments and test fixtures cannot weaken it.
 #[test]
 fn graph_visible_keyed_writes_cannot_reach_unfenced_append() {
     let src = engine_src_root();
@@ -2068,11 +2062,9 @@ fn graph_visible_keyed_writes_cannot_reach_unfenced_append() {
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
         let ast = parse_rust_source(&contents, &relative);
         let inventory = call_inventory(&ast);
-        for primitive in ["stage_append", "stage_append_stream"] {
-            let count = inventory.counts.get(primitive).copied().unwrap_or(0);
-            if count > 0 {
-                violations.push(format!("{relative}: {primitive} called {count} time(s)"));
-            }
+        let count = inventory.counts.get("stage_append").copied().unwrap_or(0);
+        if count > 0 {
+            violations.push(format!("{relative}: stage_append called {count} time(s)"));
         }
     }
 
@@ -3556,6 +3548,43 @@ fn lance_ordering_stays_behind_bounded_scan_executor() {
     assert!(
         !tuning_exposes_order_by,
         "ScanTuning must not expose order_by after executor routing"
+    );
+}
+
+/// Pins the per-file call counts of `read_blobs`, `read_blob_ranges` and
+/// `with_io_buffer_size_bytes` in the production sources of the engine crate and the
+/// `GUARDED_CRATES`.
+#[test]
+fn lance_batched_blob_read_call_counts_are_pinned() {
+    let src = engine_src_root();
+    let mut sites = Vec::new();
+    for (relative, file) in labeled_scan_files(&src, true) {
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let ast = parse_rust_source(&contents, &relative);
+        let inventory = call_inventory(&ast);
+        for method in [
+            "read_blobs",
+            "read_blob_ranges",
+            "with_io_buffer_size_bytes",
+        ] {
+            let count = inventory.counts.get(method).copied().unwrap_or(0);
+            if count > 0 {
+                sites.push((method, relative.clone(), count));
+            }
+        }
+    }
+    sites.sort();
+    assert_eq!(
+        sites,
+        vec![
+            ("read_blob_ranges", "db/upgrade.rs".to_string(), 1),
+            ("read_blobs", "table_store.rs".to_string(), 1),
+            ("with_io_buffer_size_bytes", "db/upgrade.rs".to_string(), 1),
+            ("with_io_buffer_size_bytes", "table_store.rs".to_string(), 1),
+        ],
+        "the per-file call counts of read_blobs, read_blob_ranges and \
+         with_io_buffer_size_bytes changed"
     );
 }
 

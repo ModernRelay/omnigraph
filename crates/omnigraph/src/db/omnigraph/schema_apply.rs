@@ -1,5 +1,5 @@
 use super::*;
-use crate::blob::ExternalBlobRef;
+use crate::blob::{BlobDescriptor, BlobDescriptorDecoder, ExternalBlobRef};
 use crate::seams::{decide_seam, fail};
 use futures::TryStreamExt;
 
@@ -1195,9 +1195,9 @@ async fn validate_schema_rewrite_external_ranges(
                         source_table_key, source_name
                     ))
                 })?;
-            let decoder = crate::blob::BlobDescriptorDecoder::try_new(descriptions)?;
+            let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
             for row in 0..descriptions.len() {
-                if let crate::blob::BlobDescriptor::External {
+                if let BlobDescriptor::External {
                     uri,
                     offset,
                     length,
@@ -1218,35 +1218,27 @@ async fn rebuild_blob_column(
     descriptions: &StructArray,
     row_ids: &[u64],
 ) -> Result<Arc<dyn Array>> {
-    let decoder = crate::blob::BlobDescriptorDecoder::try_new(descriptions)?;
+    let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
     let mut builder = BlobArrayBuilder::new(row_ids.len());
     let mut managed_row_ids = Vec::new();
     let mut row_descriptors = Vec::with_capacity(row_ids.len());
 
     for (row, row_id) in row_ids.iter().enumerate() {
         let descriptor = decoder.classify(row)?;
-        if matches!(descriptor, crate::blob::BlobDescriptor::Managed { .. }) {
+        if matches!(descriptor, BlobDescriptor::Managed { .. }) {
             managed_row_ids.push(*row_id);
         }
         row_descriptors.push(descriptor);
     }
 
-    let blob_files = if managed_row_ids.is_empty() {
-        Vec::new()
-    } else {
-        Arc::new(source_ds.dataset().clone())
-            .take_blobs(&managed_row_ids, column_name)
-            .await
-            .map_err(OmniError::storage)?
-    };
+    let mut managed_blobs =
+        TableStore::managed_blob_payloads(source_ds.dataset(), column_name, managed_row_ids)
+            .await?;
 
-    let mut files = blob_files.into_iter();
     for descriptor in row_descriptors {
         match descriptor {
-            crate::blob::BlobDescriptor::Null => {
-                builder.push_null().map_err(OmniError::lance_internal)?
-            }
-            crate::blob::BlobDescriptor::External {
+            BlobDescriptor::Null => builder.push_null().map_err(OmniError::lance_internal)?,
+            BlobDescriptor::External {
                 uri,
                 offset,
                 length,
@@ -1254,40 +1246,15 @@ async fn rebuild_blob_column(
                 let uri = whole_external_uri_for_schema_rewrite(uri, offset, length)?;
                 builder.push_uri(uri).map_err(OmniError::lance_internal)?;
             }
-            crate::blob::BlobDescriptor::Managed { .. } => {
-                let blob = files
-                    .next()
-                    .ok_or_else(|| {
-                        OmniError::blob_integrity(format!(
-                            "blob rewrite for '{}' lost alignment with managed source rows",
-                            column_name
-                        ))
-                    })?
-                    .ok_or_else(|| {
-                        OmniError::blob_integrity(format!(
-                            "blob rewrite for '{}' returned a null accessor for a managed description",
-                            column_name
-                        ))
-                    })?;
-                if blob.uri().is_some() {
-                    return Err(OmniError::blob_integrity(format!(
-                        "blob rewrite for '{}' resolved a managed description as external",
-                        column_name
-                    )));
-                }
+            BlobDescriptor::Managed { length } => {
                 builder
-                    .push_bytes(blob.read().await.map_err(OmniError::storage)?)
+                    .push_bytes(managed_blobs.next(length).await?)
                     .map_err(OmniError::lance_internal)?;
             }
         }
     }
 
-    if files.next().is_some() {
-        return Err(OmniError::blob_integrity(format!(
-            "blob rewrite for '{}' produced extra source blobs",
-            column_name
-        )));
-    }
+    managed_blobs.finish().await?;
 
     builder.finish().map_err(OmniError::lance_internal)
 }

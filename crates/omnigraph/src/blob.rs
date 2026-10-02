@@ -18,7 +18,7 @@ use datafusion::prelude::{col, lit};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::BlobFile;
-use lance::datatypes::BlobHandling;
+use lance::datatypes::{BlobHandling, Field};
 use lance_core::datatypes::BlobKind;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -918,6 +918,21 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+/// The first Blob field of `schema` below the top level, if any. Such a field
+/// has no top-level descriptor column, so a descriptor scan cannot see it.
+pub(crate) fn nested_blob_field(schema: &lance::datatypes::Schema) -> Option<&Field> {
+    fn below(field: &Field) -> Option<&Field> {
+        field.children.iter().find_map(|child| {
+            if child.is_blob() {
+                Some(child)
+            } else {
+                below(child)
+            }
+        })
+    }
+    schema.fields.iter().find_map(below)
 }
 
 /// Logical state decoded from one persisted Blob-v2 descriptor.

@@ -1600,6 +1600,7 @@ async fn assert_pointer_switch_onto_main(
     assert_eq!(probes.external_blob_probe_calls(), 0, "{case}");
     assert_eq!(probes.external_blob_payload_read_calls(), 0, "{case}");
     assert_eq!(probes.blob_payload_read_calls(), 0, "{case}");
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0, "{case}");
     assert_eq!(probes.stage_append_calls(), 0, "{case}");
     assert_eq!(probes.stage_merge_insert_calls(), 0, "{case}");
     assert_eq!(probes.stage_fenced_insert_calls(), 0, "{case}");

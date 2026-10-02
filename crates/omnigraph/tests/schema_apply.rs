@@ -1,5 +1,6 @@
 mod helpers;
 
+use base64::Engine;
 #[cfg(feature = "failpoints")]
 use std::sync::Arc;
 
@@ -770,6 +771,21 @@ node Document {
                 "note": "drop me three",
             },
         }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "null", "content": null, "note": "drop me four"},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {
+                "title": "packed",
+                "content": format!(
+                    "base64:{}",
+                    base64::engine::general_purpose::STANDARD.encode(vec![b'p'; 96 * 1024])
+                ),
+                "note": "drop me five",
+            },
+        }),
     ]
     .into_iter()
     .map(|row| row.to_string())
@@ -817,9 +833,19 @@ node Document {
     // payload. The caller-owned target may be unavailable without blocking
     // schema evolution.
     std::fs::remove_file(&external_path).unwrap();
-    let result = db.apply_schema(&desired).await.unwrap();
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let result = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.apply_schema(&desired),
+    )
+    .await
+    .unwrap();
     assert!(result.supported);
     assert!(result.applied);
+    // Three managed values (valid empty, inline, packed) in one batched read.
+    assert_eq!(probes.blob_managed_batch_read_calls(), 1);
+    assert_eq!(probes.blob_payload_read_calls(), 3);
+    assert_eq!(probes.external_blob_payload_read_calls(), 0);
     assert_exact_id_primary_key(&db, "node:Document").await;
 
     // Manifest advanced; row count unchanged.
@@ -848,6 +874,24 @@ node Document {
     )
     .await;
     assert_eq!(&neighbor[..], b"Neighbor");
+    let packed = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "packed", "content"),
+    )
+    .await;
+    assert!(packed == vec![b'p'; 96 * 1024], "the packed value changed");
+    let null = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "null", "content"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(null, OmniError::Manifest(ref error) if error.kind == ManifestErrorKind::NotFound),
+        "the null cell stays null, got {null:?}"
+    );
     let external = db
         .read_blob_at(
             ReadTarget::branch("main"),

@@ -33,8 +33,8 @@ use lance::dataset::write::merge_insert::{
     MergeStats, SourceDedupeBehavior, UncommittedMergeInsert,
 };
 use lance::dataset::{
-    CommitBuilder, DeleteBuilder, InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched,
-    WriteMode, WriteParams,
+    CommitBuilder, DeleteBuilder, InsertBuilder, MergeInsertBuilder, ReadBlobsStream, WhenMatched,
+    WhenNotMatched, WriteMode, WriteParams,
 };
 use lance::datatypes::Schema as LanceSchema;
 use lance::index::DatasetIndexExt;
@@ -63,7 +63,7 @@ use std::{num::NonZero, sync::Arc};
 
 use crate::blob::{
     BlobDescriptor, BlobDescriptorDecoder, ExternalBlobPolicy, NormalizedExternalBlobUri,
-    StorageRootConflict,
+    StorageRootConflict, nested_blob_field,
 };
 use crate::dataset_index::{
     has_btree_index_on, has_fts_index_on, has_vector_index_on, is_full_text_index,
@@ -74,8 +74,8 @@ use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::seams::{decide_seam, skip};
 use crate::storage_layer::{
-    IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics,
-    PendingScanBudget, ProvenInsertChunk,
+    BLOB_REBUILD_IO_BUFFER_BYTES, IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS,
+    KeyedWriteSemantics, PendingScanBudget, ProvenInsertChunk,
 };
 
 pub(crate) use crate::error::is_scratch_exhaustion;
@@ -965,6 +965,62 @@ pub(crate) struct ExternalBlobPreflight {
 
 pub(crate) type ExternalBlobPayloadCache = HashMap<(String, u64, Option<u64>), Arc<[u8]>>;
 
+/// The managed payloads of one Blob column, in the order of the row ids given
+/// to [`TableStore::managed_blob_payloads`]. The rewrite takes one per managed
+/// descriptor and then calls `finish`.
+pub(crate) struct ManagedBlobPayloads<'a> {
+    column_name: &'a str,
+    stream: Option<ReadBlobsStream>,
+}
+
+impl ManagedBlobPayloads<'_> {
+    /// The next managed payload, which must be `length` bytes long.
+    pub(crate) async fn next(&mut self, length: u64) -> Result<bytes::Bytes> {
+        let column_name = self.column_name;
+        let next = match self.stream.as_mut() {
+            Some(stream) => stream.try_next().await.map_err(OmniError::storage)?,
+            None => None,
+        };
+        let data = next
+            .ok_or_else(|| {
+                OmniError::blob_integrity(format!(
+                    "Blob rewrite for '{column_name}' lost alignment with managed source rows"
+                ))
+            })?
+            .data
+            .ok_or_else(|| {
+                OmniError::blob_integrity(format!(
+                    "Blob rewrite for '{column_name}' returned null for a managed descriptor"
+                ))
+            })?;
+        if data.len() as u64 != length {
+            return Err(OmniError::blob_integrity(format!(
+                "Blob rewrite for '{column_name}' observed managed length {}, descriptor recorded {length}",
+                data.len()
+            )));
+        }
+        crate::instrumentation::record_blob_payload_read();
+        Ok(data)
+    }
+
+    /// Refuse a read that returned more payloads than managed descriptors.
+    pub(crate) async fn finish(mut self) -> Result<()> {
+        if let Some(stream) = self.stream.as_mut()
+            && stream
+                .try_next()
+                .await
+                .map_err(OmniError::storage)?
+                .is_some()
+        {
+            return Err(OmniError::blob_integrity(format!(
+                "Blob rewrite for '{}' produced extra managed source blobs",
+                self.column_name
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ExternalBlobRangeRequest {
     uri: String,
@@ -1550,46 +1606,6 @@ impl TableStore {
         self.scan(ds, None, None, None).await
     }
 
-    // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; no
-    #[allow(dead_code)]
-    pub async fn scan_batches_for_rewrite(&self, ds: &Dataset) -> Result<Vec<RecordBatch>> {
-        let has_blob_columns = ds.schema().fields_pre_order().any(|field| field.is_blob());
-        if !has_blob_columns {
-            return self.scan_batches(ds).await;
-        }
-
-        let batches = Self::scan_stream(ds, None, None, None, true)
-            .await?
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .map_err(OmniError::storage)?;
-        let mut materialized = Vec::with_capacity(batches.len());
-        for batch in batches {
-            materialized.push(self.materialize_blob_batch(ds, batch).await?);
-        }
-        Ok(materialized)
-    }
-
-    /// Streaming, blob-aware sibling of [`Self::scan_batches_for_rewrite`].
-    /// Yields the dataset's rows lazily as a `SendableRecordBatchStream` so a
-    /// downstream writer never materializes the whole table in memory. Blob
-    /// columns are rebuilt asynchronously one scanner batch at a time; ordinary
-    /// columns pass through the native lazy scan.
-    // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; no
-    #[allow(dead_code)]
-    pub async fn scan_stream_for_rewrite(&self, ds: &Dataset) -> Result<SendableRecordBatchStream> {
-        let has_blob_columns = ds.schema().fields_pre_order().any(|field| field.is_blob());
-        if has_blob_columns {
-            let arrow_schema: SchemaRef = Arc::new(ds.schema().into());
-            let raw: SendableRecordBatchStream =
-                Self::scan_stream(ds, None, None, None, true).await?.into();
-            return Ok(self.materialize_blob_stream(ds.clone(), arrow_schema, raw, None));
-        }
-        // Non-blob: a true lazy scan. `DatasetRecordBatchStream` converts to the
-        // `SendableRecordBatchStream` that `execute_uncommitted_stream` consumes.
-        Ok(Self::scan_stream(ds, None, None, None, false).await?.into())
-    }
-
     /// Explicitly batch-bounded variant used by RFC-023's branch-adopt chain.
     /// Unlike the environment-controlled default scanner size, this ceiling is
     /// part of the chunk plan: one emitted batch becomes one strict keyed
@@ -1619,12 +1635,7 @@ impl TableStore {
                 })
                 .await?
                 .into();
-            return Ok(self.materialize_blob_stream(
-                ds.clone(),
-                arrow_schema,
-                raw,
-                Some(batch_bytes),
-            ));
+            return Ok(self.materialize_blob_stream(ds.clone(), arrow_schema, raw, batch_bytes));
         }
         Ok(
             Self::scan_stream_with(ds, None, None, None, false, |scanner| {
@@ -1642,67 +1653,37 @@ impl TableStore {
         ds: Dataset,
         schema: SchemaRef,
         raw: SendableRecordBatchStream,
-        max_blob_bytes: Option<u64>,
+        max_blob_bytes: u64,
     ) -> SendableRecordBatchStream {
-        if let Some(limit) = max_blob_bytes {
-            // `LANCE_DEFAULT_BATCH_SIZE` overrides Scanner::batch_size on the
-            // pinned Lance revision. Split descriptor batches ourselves so an
-            // environment setting cannot make one materialization read across
-            // writer-defined transaction chunks. `try_unfold` is sequential: at
-            // most one row's blob payload is read before downstream consumes it.
-            let materialized = futures::stream::try_unfold(
-                (raw, None::<RecordBatch>, 0_usize, ds, self.clone()),
-                move |(mut raw, mut current, mut offset, ds, store)| async move {
-                    loop {
-                        if let Some(batch) = current.as_ref()
-                            && offset < batch.num_rows()
-                        {
-                            let row = batch.slice(offset, 1);
-                            offset += 1;
-                            let materialized = store
-                                .materialize_blob_batch_with_limit(&ds, row, Some(limit))
-                                .await
-                                .map_err(OmniError::into_datafusion_external)?;
-                            return Ok(Some((materialized, (raw, current, offset, ds, store))));
-                        }
-
-                        match raw.try_next().await? {
-                            Some(batch) => {
-                                current = Some(batch);
-                                offset = 0;
-                            }
-                            None => return Ok(None),
-                        }
+        // Split to one row although the caller set `Scanner::batch_size(1)`:
+        // the bound must not depend on which scan path Lance takes.
+        let materialized = futures::stream::try_unfold(
+            (raw, None::<RecordBatch>, 0_usize, ds, self.clone()),
+            move |(mut raw, mut current, mut offset, ds, store)| async move {
+                loop {
+                    if let Some(batch) = current.as_ref()
+                        && offset < batch.num_rows()
+                    {
+                        let row = batch.slice(offset, 1);
+                        offset += 1;
+                        let materialized = store
+                            .materialize_blob_batch_with_limit(&ds, row, max_blob_bytes)
+                            .await
+                            .map_err(OmniError::into_datafusion_external)?;
+                        return Ok(Some((materialized, (raw, current, offset, ds, store))));
                     }
-                },
-            );
-            return Box::pin(RecordBatchStreamAdapter::new(schema, materialized));
-        }
 
-        let store = self.clone();
-        let materialized = raw.and_then(move |batch| {
-            let ds = ds.clone();
-            let store = store.clone();
-            async move {
-                store
-                    .materialize_blob_batch_with_limit(&ds, batch, None)
-                    .await
-                    .map_err(OmniError::into_datafusion_external)
-            }
-        });
+                    match raw.try_next().await? {
+                        Some(batch) => {
+                            current = Some(batch);
+                            offset = 0;
+                        }
+                        None => return Ok(None),
+                    }
+                }
+            },
+        );
         Box::pin(RecordBatchStreamAdapter::new(schema, materialized))
-    }
-
-    // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; its
-    // only caller is the equally-unused `scan_batches_for_rewrite`.
-    #[allow(dead_code)]
-    pub(crate) async fn materialize_blob_batch(
-        &self,
-        ds: &Dataset,
-        batch: RecordBatch,
-    ) -> Result<RecordBatch> {
-        self.materialize_blob_batch_with_limit(ds, batch, None)
-            .await
     }
 
     /// Branch-merge sibling that reuses normalized external payloads only
@@ -1739,13 +1720,8 @@ impl TableStore {
         &self,
         ds: &Dataset,
         batch: RecordBatch,
-        max_blob_bytes: Option<u64>,
+        max_blob_bytes: u64,
     ) -> Result<RecordBatch> {
-        let has_blob_columns = ds.schema().fields_pre_order().any(|field| field.is_blob());
-        if !has_blob_columns {
-            return Ok(batch);
-        }
-
         let row_ids = batch
             .column_by_name("_rowid")
             .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
@@ -1762,7 +1738,7 @@ impl TableStore {
             ds.schema(),
             batch,
             &row_ids,
-            max_blob_bytes,
+            Some(max_blob_bytes),
             None,
             None,
         )
@@ -1771,7 +1747,7 @@ impl TableStore {
 
     /// Rebuild the Blob columns of `batch`, the `carried` projection of `ds`'s
     /// schema, from explicit stable `row_ids`: the sibling of
-    /// [`Self::materialize_blob_batch`] for a predicate scan that omits Blobs.
+    /// `materialize_blob_batch_with_limit` for a predicate scan that omits Blobs.
     async fn materialize_blob_batch_with_row_ids(
         &self,
         ds: &Dataset,
@@ -2015,41 +1991,15 @@ impl TableStore {
             descriptors.push(descriptor);
         }
 
-        let blob_files = if managed_row_ids.is_empty() {
-            Vec::new()
-        } else {
-            Arc::new(ds.clone())
-                .take_blobs(&managed_row_ids, column_name)
-                .await
-                .map_err(OmniError::storage)?
-        };
+        let mut managed_blobs =
+            Self::managed_blob_payloads(ds, column_name, managed_row_ids).await?;
 
-        let mut managed_files = blob_files.into_iter();
         for descriptor in descriptors {
             match descriptor {
                 BlobDescriptor::Null => builder.push_null().map_err(OmniError::lance_internal)?,
                 BlobDescriptor::Managed { length } => {
-                    let blob = managed_files
-                        .next()
-                        .ok_or_else(|| {
-                            OmniError::blob_integrity(format!(
-                                "Blob rewrite for '{column_name}' lost alignment with source rows"
-                            ))
-                        })?
-                        .ok_or_else(|| {
-                            OmniError::blob_integrity(format!(
-                                "Blob rewrite for '{column_name}' returned null for a managed descriptor"
-                            ))
-                        })?;
-                    if blob.size() != length {
-                        return Err(OmniError::blob_integrity(format!(
-                            "Blob rewrite for '{column_name}' observed managed length {}, descriptor recorded {length}",
-                            blob.size()
-                        )));
-                    }
-                    crate::instrumentation::record_blob_payload_read();
                     builder
-                        .push_bytes(blob.read().await.map_err(OmniError::storage)?)
+                        .push_bytes(managed_blobs.next(length).await?)
                         .map_err(OmniError::lance_internal)?;
                 }
                 BlobDescriptor::External {
@@ -2074,14 +2024,39 @@ impl TableStore {
             }
         }
 
-        if managed_files.next().is_some() {
-            return Err(OmniError::blob_integrity(format!(
-                "Blob rewrite for '{}' produced extra managed source blobs",
-                column_name
-            )));
-        }
+        managed_blobs.finish().await?;
 
         builder.finish().map_err(OmniError::lance_internal)
+    }
+
+    /// The one batched managed Blob read (`Dataset::read_blobs`): ordered,
+    /// streamed, with the explicit rewrite I/O buffer. `managed_row_ids` must
+    /// name managed rows only; Lance would resolve and read an external row.
+    pub(crate) async fn managed_blob_payloads<'a>(
+        ds: &Dataset,
+        column_name: &'a str,
+        managed_row_ids: Vec<u64>,
+    ) -> Result<ManagedBlobPayloads<'a>> {
+        let stream = if managed_row_ids.is_empty() {
+            None
+        } else {
+            crate::instrumentation::record_blob_managed_batch_read();
+            Some(
+                Arc::new(ds.clone())
+                    .read_blobs(column_name)
+                    .map_err(OmniError::storage)?
+                    .with_row_ids(managed_row_ids)
+                    .preserve_order(true)
+                    .with_io_buffer_size_bytes(BLOB_REBUILD_IO_BUFFER_BYTES)
+                    .try_into_stream()
+                    .await
+                    .map_err(OmniError::storage)?,
+            )
+        };
+        Ok(ManagedBlobPayloads {
+            column_name,
+            stream,
+        })
     }
 
     pub async fn scan_stream(
@@ -2759,8 +2734,7 @@ impl TableStore {
             .execute_uncommitted(vec![batch])
             .await
             .map_err(OmniError::storage)?;
-        // Record only after the staging write succeeds, so a failed write does
-        // not inflate the probe (matches `stage_append_stream`'s ordering).
+        // After the write succeeds, so a failed write never inflates the probe.
         crate::instrumentation::record_stage_append(appended_rows);
         let mut new_fragments = match &transaction.operation {
             Operation::Append { fragments } => fragments.clone(),
@@ -2800,59 +2774,6 @@ impl TableStore {
             // Append never supersedes existing fragments.
             Vec::new(),
         ))
-    }
-
-    /// Test-only streaming variant of [`Self::stage_append`]. It retains the old
-    /// substrate primitive for direct Lance-shape coverage, but production graph
-    /// writes cannot select it: RFC-023 branch adoption consumes a bounded rewrite
-    /// stream as exact-`id` keyed chunks instead.
-    #[cfg(test)]
-    pub async fn stage_append_stream(
-        &self,
-        ds: &Dataset,
-        source: &Dataset,
-        prior_stages: &[StagedWrite],
-    ) -> Result<StagedWrite> {
-        let stream = self.scan_stream_for_rewrite(source).await?;
-        let params = WriteParams {
-            mode: WriteMode::Append,
-            allow_external_blob_outside_bases: true,
-            auto_cleanup: None,
-            skip_auto_cleanup: true,
-            ..Default::default()
-        };
-        let transaction = InsertBuilder::new(Arc::new(ds.clone()))
-            .with_params(&params)
-            .execute_uncommitted_stream(stream)
-            .await
-            .map_err(OmniError::lance_stream)?;
-        let mut new_fragments = match &transaction.operation {
-            Operation::Append { fragments } => fragments.clone(),
-            Operation::Overwrite { fragments, .. } => fragments.clone(),
-            other => {
-                return Err(OmniError::manifest_internal(format!(
-                    "stage_append_stream: unexpected Lance operation {:?}",
-                    std::mem::discriminant(other)
-                )));
-            }
-        };
-        let appended_rows: u64 = new_fragments
-            .iter()
-            .filter_map(|f| f.physical_rows)
-            .map(|r| r as u64)
-            .sum();
-        crate::instrumentation::record_stage_append(appended_rows);
-        // Same commit-time fragment-id / row-id renumbering as `stage_append`.
-        let next_id_base = ds.manifest.max_fragment_id.unwrap_or(0) as u64
-            + 1
-            + prior_stages_fragment_count(prior_stages);
-        assign_fragment_ids(&mut new_fragments, next_id_base);
-        if ds.manifest.uses_stable_row_ids() {
-            let prior_rows = prior_stages_row_count(prior_stages)?;
-            let start_row_id = ds.manifest.next_row_id + prior_rows;
-            assign_row_id_meta(&mut new_fragments, start_row_id)?;
-        }
-        Ok(StagedWrite::new(transaction, new_fragments, Vec::new()))
     }
 
     /// Stage one RFC-023 keyed write from an in-memory batch.
@@ -3268,71 +3189,6 @@ impl TableStore {
             "prepare keyed write batch",
         )?;
         Ok(())
-    }
-
-    /// Test-only streaming-source sibling of [`Self::stage_keyed_write`].
-    ///
-    /// The source must itself be an already-valid keyed graph table with exact
-    /// `id` PK metadata.  Its narrow `id` projection is walked one record batch
-    /// at a time; strict inserts probe the pinned target with a structured
-    /// batch-sized `IN` predicate.  A non-blob full source is then scanned lazily
-    /// into Lance's merge job, so vectors and other wide ordinary columns remain
-    /// bounded by record-batch width rather than delta width. Blob tables are
-    /// materialized one scanner batch at a time by `scan_stream_for_rewrite`.
-    /// Cross-batch source uniqueness comes from the trusted keyed graph-table
-    /// invariant; this sealed primitive does not accept an arbitrary external
-    /// dataset as its source.
-    #[cfg(test)]
-    pub async fn stage_keyed_write_stream(
-        &self,
-        ds: Dataset,
-        type_key: &str,
-        source: &Dataset,
-        semantics: KeyedWriteSemantics,
-        system_columns: SystemColumns,
-    ) -> Result<StagedWrite> {
-        let id_field_id =
-            exact_id_primary_key_field_id(&ds, system_columns, "stage_keyed_write_stream")?;
-        exact_id_primary_key_field_id(source, system_columns, "stage_keyed_write_stream source")?;
-        let mut id_stream =
-            Self::scan_stream(source, Some(&[system_columns.id]), None, None, false).await?;
-        let mut merged_rows = 0_u64;
-        while let Some(batch) = id_stream.try_next().await.map_err(OmniError::storage)? {
-            merged_rows = merged_rows
-                .checked_add(batch.num_rows() as u64)
-                .ok_or_else(|| {
-                    OmniError::manifest_internal(
-                        "stage_keyed_write_stream source row count overflow",
-                    )
-                })?;
-            let source_ids = validate_keyed_write_batch_ids(
-                &batch,
-                system_columns,
-                type_key,
-                "stage_keyed_write_stream",
-            )?;
-            if semantics == KeyedWriteSemantics::StrictInsert {
-                Self::preflight_strict_insert_ids(&ds, type_key, &source_ids, system_columns)
-                    .await?;
-            }
-        }
-        if merged_rows == 0 {
-            return Err(OmniError::manifest_internal(
-                "stage_keyed_write_stream called with empty source dataset",
-            ));
-        }
-        let stream = self.scan_stream_for_rewrite(source).await?;
-        self.stage_keyed_write_from_stream(
-            ds,
-            stream,
-            merged_rows,
-            semantics,
-            id_field_id,
-            system_columns,
-            "stage_keyed_write_stream",
-        )
-        .await
-        .map(|(staged, _stats)| staged)
     }
 
     /// Exact existing-id check for one bounded source batch.  This probes the
@@ -3766,8 +3622,7 @@ impl TableStore {
             .execute_uncommitted(stream)
             .await
             .map_err(OmniError::lance_stream)?;
-        // Record only after the staging write succeeds, so a failed write does
-        // not inflate the probe (matches `stage_append`/`stage_append_stream`).
+        // After the write succeeds, so a failed write never inflates the probe.
         crate::instrumentation::record_stage_merge_insert(merged_rows);
         // Operation::Update { removed_fragment_ids, updated_fragments, new_fragments, .. } —
         // `new_fragments` are the freshly inserted rows; `updated_fragments`
@@ -4069,6 +3924,8 @@ impl TableStore {
     /// `ReserveFragments` (whose replay would not conflict with its twin). A
     /// stable-row-id rewrite carries every index's coverage over to the new
     /// fragments when Lance applies it. `None` when the plan has no task.
+    /// Every task of a Blob table is sized before any executes, so a sizing
+    /// refusal leaves no rewritten file behind.
     pub async fn stage_compaction(
         &self,
         ds: &Dataset,
@@ -4080,8 +3937,27 @@ impl TableStore {
         if plan.num_tasks() == 0 {
             return Ok(None);
         }
-        let mut results = Vec::with_capacity(plan.num_tasks());
-        for task in plan.compaction_tasks() {
+        let has_blob_columns = ds.schema().fields_pre_order().any(|field| field.is_blob());
+        let mut tasks = plan.compaction_tasks().collect::<Vec<_>>();
+        if has_blob_columns {
+            for task in &mut tasks {
+                let derived =
+                    match Self::max_row_blob_bytes(ds, task.task.fragments.clone()).await? {
+                        Some(bytes) => compaction_blob_batch_rows(bytes),
+                        None => 1,
+                    };
+                let rows = task
+                    .options
+                    .batch_size
+                    .map_or(derived, |set| set.min(derived));
+                task.options.batch_size = Some(rows);
+            }
+        }
+        let mut results = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            if let (true, Some(rows)) = (has_blob_columns, task.options.batch_size) {
+                crate::instrumentation::record_compaction_blob_batch(rows);
+            }
             results.push(task.execute(ds).await.map_err(OmniError::storage)?);
         }
         if results.iter().any(|result| result.row_addrs.is_some()) {
@@ -4122,6 +3998,61 @@ impl TableStore {
             staged: StagedWrite::new(transaction, new_fragments, removed_fragment_ids),
             metrics,
         }))
+    }
+
+    /// Most managed Blob bytes in one row of `fragments`, from descriptors (externals count
+    /// nothing); after an early stop, a lower bound that already derives one-row batches.
+    /// `None` when a nested or non-Blob-v2 Blob field cannot be sized.
+    async fn max_row_blob_bytes(ds: &Dataset, fragments: Vec<Fragment>) -> Result<Option<u64>> {
+        if nested_blob_field(ds.schema()).is_some()
+            || ds
+                .schema()
+                .fields
+                .iter()
+                .any(|field| field.is_blob() && !field.is_blob_v2())
+        {
+            return Ok(None);
+        }
+        let blob_columns = ds
+            .schema()
+            .fields
+            .iter()
+            .filter(|field| field.is_blob())
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        let mut stream =
+            Self::scan_stream_with(ds, Some(&blob_columns), None, None, false, |scanner| {
+                scanner.with_fragments(fragments);
+                Ok(())
+            })
+            .await?;
+        let mut max = 0_u64;
+        while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+            let mut row_bytes = vec![0_u64; batch.num_rows()];
+            for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+                let descriptions =
+                    column
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .ok_or_else(|| {
+                            OmniError::blob_integrity(format!(
+                                "expected Blob descriptions for '{}'",
+                                field.name()
+                            ))
+                        })?;
+                let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
+                for (row, total) in row_bytes.iter_mut().enumerate() {
+                    if let BlobDescriptor::Managed { length } = decoder.classify(row)? {
+                        *total = total.saturating_add(length);
+                    }
+                }
+            }
+            max = row_bytes.into_iter().fold(max, u64::max);
+            if compaction_blob_batch_rows(max) == 1 {
+                break;
+            }
+        }
+        Ok(Some(max))
     }
 
     /// Stage creation of a new dataset without publishing its first manifest.
@@ -5731,6 +5662,27 @@ fn ensure_proven_insert_blobs_are_materialized(batch: &RecordBatch, table_key: &
         }
     }
     Ok(())
+}
+
+/// Managed Blob bytes one compaction scanner batch may materialize: Lance 11
+/// rewrites a Blob table through a scanner that reads every managed payload of
+/// a batch, so `stage_compaction` sizes each task's batches against this.
+const COMPACTION_BLOB_BATCH_BYTES: u64 = KEYED_WRITE_MAX_BYTES;
+/// Most rows a Blob table's compaction batch may hold: Lance's own fallback
+/// default. `stage_compaction` always sets the derived size on a Blob table,
+/// so it takes precedence over `LANCE_DEFAULT_BATCH_SIZE` there.
+const COMPACTION_MAX_BATCH_ROWS: usize = lance::dataset::scanner::BATCH_SIZE_FALLBACK;
+
+/// Scanner rows per compaction batch for fragments whose largest row carries
+/// `max_row_blob_bytes` Blob bytes: as many rows as fit the byte budget, at
+/// least one, at most Lance's fallback batch size.
+pub(crate) fn compaction_blob_batch_rows(max_row_blob_bytes: u64) -> usize {
+    if max_row_blob_bytes == 0 {
+        return COMPACTION_MAX_BATCH_ROWS;
+    }
+    usize::try_from(COMPACTION_BLOB_BATCH_BYTES / max_row_blob_bytes)
+        .unwrap_or(1)
+        .clamp(1, COMPACTION_MAX_BATCH_ROWS)
 }
 
 pub(crate) fn exact_id_primary_key_field_id(

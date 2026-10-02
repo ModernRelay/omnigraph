@@ -1493,20 +1493,40 @@ fn convert_batch(
 #[path = "upgrade/tests.rs"]
 mod tests;
 
+/// Bytes of one managed Blob read per range request while validating.
+const BLOB_VALIDATION_WINDOW_BYTES: u64 = 1024 * 1024;
+
+/// Range requests planned and read together while validating: at most 64
+/// windows, 64 MiB, whatever the descriptors claim.
+const BLOB_VALIDATION_REQUESTS_PER_READ: usize = 64;
+
+/// Validate a source table's Blob dependencies without contacting an external
+/// store: externals are recorded by URI, managed values read back in bounded
+/// windows, and any other Blob encoding or descriptor fails closed.
 async fn validate_blobs(table: &Dataset, work: &mut UpgradeWork) -> Result<()> {
-    let columns: Vec<_> = table
-        .schema()
-        .fields
-        .iter()
-        .filter(|field| field.is_blob())
-        .map(|field| field.name.clone())
-        .collect();
+    let mut columns = Vec::new();
+    for field in table.schema().fields.iter().filter(|field| field.is_blob()) {
+        if !field.is_blob_v2() {
+            return Err(invalid(format!(
+                "Blob column '{}' is not a Blob-v2 column; this upgrade route validates Blob-v2 descriptors only",
+                field.name
+            )));
+        }
+        columns.push(field.name.clone());
+    }
+    if let Some(nested) = crate::blob::nested_blob_field(table.schema()) {
+        return Err(invalid(format!(
+            "nested Blob field '{}'; this upgrade route validates top-level Blob columns only",
+            nested.name
+        )));
+    }
     if columns.is_empty() {
         return Ok(());
     }
     let table = Arc::new(table.clone());
     let mut scan = table.scan();
-    scan.project::<&str>(&[]).map_err(OmniError::storage)?;
+    let projection = columns.iter().map(String::as_str).collect::<Vec<_>>();
+    scan.project(&projection).map_err(OmniError::storage)?;
     scan.with_row_id();
     scan.batch_size(1024);
     let mut stream = scan.try_into_stream().await.map_err(OmniError::storage)?;
@@ -1519,34 +1539,132 @@ async fn validate_blobs(table: &Dataset, work: &mut UpgradeWork) -> Result<()> {
             return Err(invalid("null stable row ID in Blob dependency scan"));
         }
         for column in &columns {
-            for blob in table
-                .take_blobs(ids.values(), column)
-                .await
-                .map_err(OmniError::storage)?
-                .into_iter()
-                .flatten()
-            {
-                if let Some(uri) = blob.uri() {
-                    if work.external_blob_exclusions.len() >= MAX_ROWS {
-                        return Err(invalid("external Blob dependency limit exceeded"));
-                    }
-                    work.external_blob_exclusions.insert(uri.to_string());
-                } else {
-                    let mut offset: u64 = 0;
-                    while offset < blob.size() {
-                        let end = offset.saturating_add(1024 * 1024).min(blob.size());
-                        let bytes = blob
-                            .read_range(offset..end)
-                            .await
-                            .map_err(OmniError::storage)?;
-                        if bytes.len() as u64 != end - offset {
-                            return Err(invalid("truncated managed Blob dependency"));
+            let descriptions = batch
+                .column_by_name(column)
+                .and_then(|column| column.as_any().downcast_ref::<arrow_array::StructArray>())
+                .ok_or_else(|| invalid(format!("missing Blob descriptors for '{column}'")))?;
+            let decoder = crate::blob::BlobDescriptorDecoder::try_new(descriptions)?;
+            let mut managed = Vec::new();
+            for (row, row_id) in ids.values().iter().enumerate() {
+                match decoder.classify(row)? {
+                    crate::blob::BlobDescriptor::Null => {}
+                    crate::blob::BlobDescriptor::External { uri, .. } => {
+                        if !work.external_blob_exclusions.contains(&uri)
+                            && work.external_blob_exclusions.len() >= MAX_ROWS
+                        {
+                            return Err(invalid("external Blob dependency limit exceeded"));
                         }
-                        offset = end;
+                        work.external_blob_exclusions.insert(uri);
+                    }
+                    crate::blob::BlobDescriptor::Managed { length } => {
+                        managed.push(ManagedBlob {
+                            row_id: *row_id,
+                            length,
+                        });
                     }
                 }
             }
+            drain_blob_validation_windows(managed, |requests| {
+                read_blob_validation_windows(&table, column, requests)
+            })
+            .await?;
         }
+    }
+    Ok(())
+}
+
+/// One managed Blob value to validate: its stable row id and the byte length
+/// its descriptor records.
+struct ManagedBlob {
+    row_id: u64,
+    length: u64,
+}
+
+/// The validation windows of `managed` values in order, planned lazily so a
+/// descriptor's length never sizes an allocation: a corrupt `u64::MAX` costs one
+/// chunk of requests, whose read Lance refuses or returns short, failing the preflight.
+fn blob_validation_windows(
+    managed: Vec<ManagedBlob>,
+) -> impl Iterator<Item = lance::dataset::BlobRangeRequest> {
+    managed
+        .into_iter()
+        .flat_map(|ManagedBlob { row_id, length }| {
+            (0..length.div_ceil(BLOB_VALIDATION_WINDOW_BYTES)).map(move |window| {
+                let offset = window * BLOB_VALIDATION_WINDOW_BYTES;
+                lance::dataset::BlobRangeRequest::new(
+                    row_id,
+                    offset,
+                    (length - offset).min(BLOB_VALIDATION_WINDOW_BYTES),
+                )
+            })
+        })
+}
+
+/// Plan and read the windows of `managed` in chunks of at most
+/// [`BLOB_VALIDATION_REQUESTS_PER_READ`], in order, stopping at the first
+/// refusal.
+async fn drain_blob_validation_windows<Read, ReadFuture>(
+    managed: Vec<ManagedBlob>,
+    mut read: Read,
+) -> Result<()>
+where
+    Read: FnMut(Vec<lance::dataset::BlobRangeRequest>) -> ReadFuture,
+    ReadFuture: std::future::Future<Output = Result<()>>,
+{
+    let mut windows = blob_validation_windows(managed);
+    loop {
+        let requests = windows
+            .by_ref()
+            .take(BLOB_VALIDATION_REQUESTS_PER_READ)
+            .collect::<Vec<_>>();
+        if requests.is_empty() {
+            return Ok(());
+        }
+        read(requests).await?;
+    }
+}
+
+/// Read one chunk of validation windows and require every window whole.
+async fn read_blob_validation_windows(
+    table: &Arc<Dataset>,
+    column: &str,
+    requests: Vec<lance::dataset::BlobRangeRequest>,
+) -> Result<()> {
+    let cardinality = |read: usize| {
+        invalid(format!(
+            "managed Blob validation of '{column}' requested {} windows, read {read}",
+            requests.len()
+        ))
+    };
+    let mut ranges = table
+        .read_blob_ranges(column)
+        .map_err(OmniError::storage)?
+        .with_row_ids(requests.iter().copied())
+        .preserve_order(true)
+        .with_io_buffer_size_bytes(crate::storage_layer::BLOB_REBUILD_IO_BUFFER_BYTES)
+        .try_into_stream()
+        .await
+        .map_err(OmniError::storage)?;
+    let mut read = 0_usize;
+    while let Some(range) = ranges.try_next().await.map_err(OmniError::storage)? {
+        read += 1;
+        let request = requests.get(range.request_index).ok_or_else(|| {
+            invalid(format!(
+                "managed Blob validation of '{column}' requested {} windows, window {read} read answers request index {}",
+                requests.len(),
+                range.request_index
+            ))
+        })?;
+        let observed = range.data.as_ref().map_or(0, |bytes| bytes.len() as u64);
+        if range.data.is_none() || observed != request.range.length {
+            return Err(invalid(format!(
+                "truncated managed Blob dependency in '{column}': row id {} holds {observed} of the {} bytes expected at offset {}",
+                request.row, request.range.length, request.range.offset
+            )));
+        }
+    }
+    if read != requests.len() {
+        return Err(cardinality(read));
     }
     Ok(())
 }

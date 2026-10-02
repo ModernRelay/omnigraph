@@ -955,6 +955,7 @@ node Image { title: String @key content: Blob? note: String? }
         0,
         "aggregate admission must precede every external payload read"
     );
+    assert_eq!(read_probes.blob_managed_batch_read_calls(), 0);
     assert_eq!(stage_probes.entered(), 0);
     assert_eq!(files_under(&graph_path), files);
     assert_eq!(
@@ -1231,6 +1232,7 @@ query update_note($note: String) {
         0,
         "BlobFile::size must reject the update before BlobFile::read"
     );
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0);
     let after = snapshot_main(&db).await.unwrap();
     assert_eq!(after.graph_manifest_version(), before_manifest);
     assert_eq!(
@@ -1276,6 +1278,7 @@ query replace_content($c: Blob) {
         0,
         "assigning the oversized Blob never reads its old cell"
     );
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0);
     let bytes = read_managed_blob_bytes(
         &db,
         ReadTarget::branch("main"),
@@ -1283,6 +1286,148 @@ query replace_content($c: Blob) {
     )
     .await;
     assert_eq!(&bytes[..], &[1, 2, 3]);
+}
+
+/// A predicate update carrying many rows' Blob cells reads the managed ones in
+/// one batched read and the external one through its admitted object, and
+/// rewrites each exactly; the null stays null and the external becomes managed.
+#[tokio::test]
+async fn mutation_update_carries_mixed_blob_rows_through_batched_managed_read() {
+    use base64::Engine;
+
+    const SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    shelf: String
+    content: Blob?
+    note: String?
+}
+"#;
+    const UPDATE: &str = r#"
+query update_shelf($note: String) {
+    update Document set { note: $note } where shelf = "a"
+}
+"#;
+
+    let sources = tempfile::tempdir().unwrap();
+    let external_path = sources.path().join("carried.bin");
+    std::fs::write(&external_path, b"carried external bytes").unwrap();
+    let external_uri = url::Url::from_file_path(&external_path)
+        .unwrap()
+        .to_string();
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(sources.path()).unwrap(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    // The graph root must lie outside every external base.
+    let graph_dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(graph_dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
+
+    let managed: Vec<(&str, Vec<u8>)> = vec![
+        ("inline", b"inline bytes".to_vec()),
+        ("packed", vec![b'p'; 96 * 1024]),
+        ("empty", Vec::new()),
+        ("packed-two", vec![b'q'; 70 * 1024]),
+    ];
+    let mut lines = managed
+        .iter()
+        .map(|(title, bytes)| {
+            serde_json::json!({
+                "type": "Document",
+                "data": {
+                    "title": title,
+                    "shelf": "a",
+                    "content": format!(
+                        "base64:{}",
+                        base64::engine::general_purpose::STANDARD.encode(bytes)
+                    ),
+                },
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>();
+    lines.push(
+        serde_json::json!({"type": "Document", "data": {"title": "null", "shelf": "a", "content": null}})
+            .to_string(),
+    );
+    lines.push(
+        serde_json::json!({"type": "Document", "data": {"title": "external", "shelf": "a", "content": external_uri}})
+            .to_string(),
+    );
+    lines.push(
+        serde_json::json!({"type": "Document", "data": {"title": "other-shelf", "shelf": "b", "content": "base64:AQID"}})
+            .to_string(),
+    );
+    // A full-table overwrite keeps the admitted external reference as a descriptor.
+    db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let result = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            UPDATE,
+            "update_shelf",
+            &params(&[("$note", "moved")]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.affected_nodes, 6);
+    assert_eq!(probes.external_blob_payload_read_calls(), 1);
+    assert_eq!(
+        probes.blob_payload_read_calls() - probes.external_blob_payload_read_calls(),
+        managed.len() as u64,
+        "one payload read per carried managed value"
+    );
+    assert_eq!(
+        probes.blob_managed_batch_read_calls(),
+        1,
+        "the managed values are read through one batched read, not one read per value"
+    );
+
+    for (title, bytes) in &managed {
+        let actual = read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", *title, "content"),
+        )
+        .await;
+        assert!(actual == *bytes, "{title} changed through the update");
+    }
+    assert_eq!(
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "external", "content"),
+        )
+        .await,
+        b"carried external bytes",
+        "the carried external reference is copied into a managed value"
+    );
+    let null = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "null", "content"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(null, OmniError::Manifest(ref error) if error.kind == omnigraph::error::ManifestErrorKind::NotFound),
+        "the null cell stays null, got {null:?}"
+    );
 }
 
 /// Carrying an unassigned stored external reference needs the graph's policy
