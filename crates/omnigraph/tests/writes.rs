@@ -1250,6 +1250,206 @@ query update_note($note: String) {
         !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
         "oversized update must fail before writing a recovery sidecar"
     );
+
+    const REPLACE: &str = r#"
+query replace_content($c: Blob) {
+    update Document set { content: $c } where title = "wide"
+}
+"#;
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let result = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            REPLACE,
+            "replace_content",
+            &params(&[("$c", "base64:AQID")]),
+        ),
+    )
+    .await
+    .expect("assigning the oversized Blob is not charged for its old bytes");
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(probes.external_blob_probe_calls(), 0);
+    assert_eq!(probes.external_blob_payload_read_calls(), 0);
+    assert_eq!(
+        probes.blob_payload_read_calls(),
+        0,
+        "assigning the oversized Blob never reads its old cell"
+    );
+    let bytes = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "wide", "content"),
+    )
+    .await;
+    assert_eq!(&bytes[..], &[1, 2, 3]);
+}
+
+/// Carrying an unassigned stored external reference needs the graph's policy
+/// to admit its source; under Deny the refusal names the row and property, and
+/// assigning the property (a new value or null) replaces it without reading it.
+#[tokio::test]
+async fn mutation_update_replaces_stored_external_reference_under_deny() {
+    const SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    note: String?
+}
+"#;
+    const MUTATIONS: &str = r#"
+query update_note($note: String) {
+    update Document set { note: $note } where title = "doc"
+}
+
+query set_content($c: Blob?) {
+    update Document set { content: $c } where title = "doc"
+}
+"#;
+
+    let root = tempfile::tempdir().unwrap();
+    let source_dir = root.path().join("sources");
+    std::fs::create_dir(&source_dir).unwrap();
+    let source = source_dir.join("stored.bin");
+    std::fs::write(&source, b"stored external bytes").unwrap();
+    let source_uri = url::Url::from_file_path(&source).unwrap().to_string();
+    let allow = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(&source_dir).unwrap(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_path = root.path().join("graph");
+    let uri = graph_path.to_str().unwrap().to_string();
+    {
+        let seeding = helpers::session(
+            Omnigraph::init(&uri, SCHEMA)
+                .await
+                .unwrap()
+                .with_external_blob_policy(allow)
+                .unwrap(),
+        );
+        let row = serde_json::json!({
+            "type": "Document",
+            "data": {"title": "doc", "content": source_uri, "note": "before"},
+        });
+        seeding
+            .load_jsonl(&row.to_string(), LoadMode::Overwrite)
+            .await
+            .unwrap();
+    }
+
+    let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    let cell = || node_blob_cell("Document", "doc", "content");
+    let stored = db
+        .read_blob_at(ReadTarget::branch("main"), cell())
+        .await
+        .unwrap();
+    let omnigraph::BlobContent::External(stored) = stored.content else {
+        panic!("overwrite load must retain the external descriptor");
+    };
+    let before = snapshot_main(&db).await.unwrap();
+    let before_manifest = before.graph_manifest_version();
+    let before_table = before
+        .dataset("node:Document")
+        .unwrap()
+        .published_dataset_version;
+    let before_head = head_commit_id(&uri).await;
+
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let error = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            MUTATIONS,
+            "update_note",
+            &params(&[("$note", "after")]),
+        ),
+    )
+    .await
+    .unwrap_err();
+    match &error {
+        OmniError::StoredExternalBlobDenied {
+            type_key,
+            entity_id,
+            property,
+            uri,
+            ..
+        } => {
+            assert_eq!(type_key, "node:Document");
+            assert_eq!(entity_id, "doc");
+            assert_eq!(property, "content");
+            assert_eq!(uri, &stored.uri);
+        }
+        other => panic!("expected StoredExternalBlobDenied, got {other:?}"),
+    }
+    assert!(error.to_string().contains("assign 'content'"), "{error}");
+    assert_eq!(probes.external_blob_probe_calls(), 0);
+    assert_eq!(probes.external_blob_payload_read_calls(), 0);
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(after.graph_manifest_version(), before_manifest);
+    assert_eq!(
+        after
+            .dataset("node:Document")
+            .unwrap()
+            .published_dataset_version,
+        before_table
+    );
+    assert_eq!(head_commit_id(&uri).await, before_head);
+
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let result = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            MUTATIONS,
+            "set_content",
+            &params(&[("$c", "base64:AQID")]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(
+        probes.external_blob_probe_calls(),
+        0,
+        "assigning managed bytes replaces the reference without reading it"
+    );
+    assert_eq!(probes.external_blob_payload_read_calls(), 0);
+    let bytes = read_managed_blob_bytes(&db, ReadTarget::branch("main"), cell()).await;
+    assert_eq!(&bytes[..], &[1, 2, 3]);
+
+    let mut null_params = omnigraph_compiler::ir::ParamMap::new();
+    null_params.insert(
+        "c".to_string(),
+        omnigraph_compiler::query::ast::Literal::Null,
+    );
+    let result = db
+        .mutate("main", MUTATIONS, "set_content", &null_params)
+        .await
+        .unwrap();
+    assert_eq!(result.affected_nodes, 1);
+    let cleared = db
+        .read_blob_at(ReadTarget::branch("main"), cell())
+        .await
+        .unwrap_err();
+    assert!(cleared.to_string().contains("is null"), "{cleared}");
+
+    let error = db
+        .mutate(
+            "main",
+            MUTATIONS,
+            "set_content",
+            &params(&[("$c", url::Url::from_file_path(&source).unwrap().as_str())]),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, OmniError::ExternalBlobPolicy { .. }),
+        "new external input stays a policy refusal, got {error:?}"
+    );
 }
 
 /// D₂: a query mixing inserts/updates with deletes is rejected at parse
@@ -2458,6 +2658,126 @@ query insert_then_replace_blob(
     )
     .await;
     assert_eq!(&blob[..], b"last write wins");
+}
+
+/// Two Blob properties interleaved with scalars: an update assigns one Blob and
+/// carries the other, on a committed row and on a row the same mutation
+/// inserted. Carried bytes and scalars keep their values on both rows.
+#[tokio::test]
+async fn update_assigning_one_of_two_blobs_carries_the_other_byte_identical() {
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    first: Blob?
+    title: String
+    second: Blob?
+    rank: I64
+}
+"#;
+    const MUTATIONS: &str = r#"
+query insert_then_set_first(
+    $slug: String, $a: Blob, $title: String, $b: Blob, $rank: I64, $first: Blob
+) {
+    insert Doc { slug: $slug, first: $a, title: $title, second: $b, rank: $rank }
+    update Doc set { first: $first } where rank > 0
+}
+
+query clear_second($second: Blob?) {
+    update Doc set { second: $second } where rank > 0
+}
+"#;
+    const SCALARS: &str = r#"
+query scalars() {
+    match { $d: Doc }
+    return { $d.slug, $d.title, $d.rank }
+    order { $d.slug asc }
+}
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"kept","first":"base64:AQID","title":"kept title","second":"base64:BAUG","rank":3}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+
+    let result = db
+        .mutate(
+            "main",
+            MUTATIONS,
+            "insert_then_set_first",
+            &mixed_params(
+                &[
+                    ("$slug", "fresh"),
+                    ("$a", "base64:BwgJ"),
+                    ("$title", "fresh title"),
+                    ("$b", "base64:CgsM"),
+                    ("$first", "base64:DQ4P"),
+                ],
+                &[("$rank", 7)],
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.affected_nodes, 3,
+        "one insert, then the committed row and the inserted row updated"
+    );
+
+    let blob = async |slug: &str, property: &str| {
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Doc", slug, property),
+        )
+        .await
+    };
+    let scalars = async || {
+        db.query(ReadTarget::branch("main"), SCALARS, "scalars", &params(&[]))
+            .await
+            .unwrap()
+            .to_rust_json()
+            .unwrap()
+    };
+    let unchanged_scalars = serde_json::json!([
+        {"d.slug": "fresh", "d.title": "fresh title", "d.rank": 7},
+        {"d.slug": "kept", "d.title": "kept title", "d.rank": 3},
+    ]);
+
+    assert_eq!(blob("kept", "first").await, [13, 14, 15]);
+    assert_eq!(blob("kept", "second").await, [4, 5, 6]);
+    assert_eq!(blob("fresh", "first").await, [13, 14, 15]);
+    assert_eq!(blob("fresh", "second").await, [10, 11, 12]);
+    assert_eq!(scalars().await, unchanged_scalars);
+
+    let mut null_second = omnigraph_compiler::ir::ParamMap::new();
+    null_second.insert(
+        "second".to_string(),
+        omnigraph_compiler::query::ast::Literal::Null,
+    );
+    let result = db
+        .mutate("main", MUTATIONS, "clear_second", &null_second)
+        .await
+        .unwrap();
+    assert_eq!(result.affected_nodes, 2);
+    for slug in ["kept", "fresh"] {
+        assert_eq!(blob(slug, "first").await, [13, 14, 15], "{slug}");
+        let cleared = db
+            .read_blob_at(
+                ReadTarget::branch("main"),
+                node_blob_cell("Doc", slug, "second"),
+            )
+            .await
+            .unwrap_err();
+        assert!(cleared.to_string().contains("is null"), "{slug}: {cleared}");
+    }
+    assert_eq!(scalars().await, unchanged_scalars);
 }
 
 /// MR-920 regression: two sequential `update T set {f:v} where x=y`

@@ -63,6 +63,7 @@ use std::{num::NonZero, sync::Arc};
 
 use crate::blob::{
     BlobDescriptor, BlobDescriptorDecoder, ExternalBlobPolicy, NormalizedExternalBlobUri,
+    StorageRootConflict,
 };
 use crate::dataset_index::{
     has_btree_index_on, has_fts_index_on, has_vector_index_on, is_full_text_index,
@@ -1193,7 +1194,9 @@ impl TableStore {
 
     pub(crate) fn with_external_blob_policy(mut self, policy: ExternalBlobPolicy) -> Result<Self> {
         let policy = policy.validated()?;
-        policy.ensure_disjoint_from_storage_root(&self.root_uri)?;
+        policy
+            .ensure_disjoint_from_storage_root(&self.root_uri)
+            .map_err(StorageRootConflict::into_error)?;
         self.external_blob_policy = Arc::new(policy);
         Ok(self)
     }
@@ -1722,6 +1725,7 @@ impl TableStore {
             .to_vec();
         self.materialize_blob_batch_with_row_ids(
             ds,
+            ds.schema(),
             batch,
             &row_ids,
             Some(max_blob_bytes),
@@ -1753,21 +1757,25 @@ impl TableStore {
             .copied()
             .collect::<Vec<_>>();
 
-        self.materialize_blob_batch_with_row_ids(ds, batch, &row_ids, max_blob_bytes, None, None)
-            .await
+        self.materialize_blob_batch_with_row_ids(
+            ds,
+            ds.schema(),
+            batch,
+            &row_ids,
+            max_blob_bytes,
+            None,
+            None,
+        )
+        .await
     }
 
-    /// Rebuild the blob columns in `batch` using explicit stable row ids.
-    ///
-    /// Most rewrite callers scan with `_rowid` and use
-    /// [`Self::materialize_blob_batch`]. A predicate-filtered blob mutation
-    /// cannot include blob descriptors in that scan on the pinned Lance
-    /// revision (the filter projection panics), so it first scans only
-    /// non-blob columns + `_rowid`, takes the full descriptor rows by id, and
-    /// calls this sibling with the ids captured by the safe scan.
+    /// Rebuild the Blob columns of `batch`, the `carried` projection of `ds`'s
+    /// schema, from explicit stable `row_ids`: the sibling of
+    /// [`Self::materialize_blob_batch`] for a predicate scan that omits Blobs.
     async fn materialize_blob_batch_with_row_ids(
         &self,
         ds: &Dataset,
+        carried: &LanceSchema,
         batch: RecordBatch,
         row_ids: &[u64],
         max_blob_bytes: Option<u64>,
@@ -1782,12 +1790,12 @@ impl TableStore {
             )));
         }
 
-        let schema: SchemaRef = Arc::new(ds.schema().into());
+        let schema: SchemaRef = Arc::new(carried.into());
         let owned_external_preflight;
         let external_preflight = match supplied_external_preflight {
             Some(preflight) => {
                 self.validate_persisted_blob_batch_preflight(
-                    ds,
+                    carried,
                     &batch,
                     max_blob_bytes,
                     preflight,
@@ -1796,7 +1804,7 @@ impl TableStore {
             }
             None => {
                 owned_external_preflight = self
-                    .preflight_persisted_blob_batch(ds, &batch, max_blob_bytes)
+                    .preflight_persisted_blob_batch(carried, &batch, max_blob_bytes)
                     .await?;
                 &owned_external_preflight
             }
@@ -1846,25 +1854,25 @@ impl TableStore {
 
     async fn preflight_persisted_blob_batch(
         &self,
-        ds: &Dataset,
+        carried: &LanceSchema,
         batch: &RecordBatch,
         max_blob_bytes: Option<u64>,
     ) -> Result<ExternalBlobPreflight> {
         let mut selection = PersistedBlobSelection::default();
         selection.include_batch(batch)?;
         let external = self.preflight_persisted_blob_selection(&selection).await?;
-        self.validate_persisted_blob_batch_preflight(ds, batch, max_blob_bytes, &external)?;
+        self.validate_persisted_blob_batch_preflight(carried, batch, max_blob_bytes, &external)?;
         Ok(external)
     }
 
     fn validate_persisted_blob_batch_preflight(
         &self,
-        ds: &Dataset,
+        carried: &LanceSchema,
         batch: &RecordBatch,
         max_blob_bytes: Option<u64>,
         external: &ExternalBlobPreflight,
     ) -> Result<()> {
-        let total = self.persisted_blob_payload_bytes(ds, batch, external)?;
+        let total = self.persisted_blob_payload_bytes(carried, batch, external)?;
         if let Some(limit) = max_blob_bytes
             && total > limit
         {
@@ -1879,16 +1887,12 @@ impl TableStore {
 
     fn persisted_blob_payload_bytes(
         &self,
-        ds: &Dataset,
+        carried: &LanceSchema,
         batch: &RecordBatch,
         external: &ExternalBlobPreflight,
     ) -> Result<u64> {
         let mut total = 0_u64;
-        for field in ds
-            .schema()
-            .fields_pre_order()
-            .filter(|field| field.is_blob())
-        {
+        for field in carried.fields_pre_order().filter(|field| field.is_blob()) {
             let descriptions = batch
                 .column_by_name(&field.name)
                 .and_then(|column| column.as_any().downcast_ref::<StructArray>())
@@ -1917,6 +1921,52 @@ impl TableStore {
         Ok(total)
     }
 
+    /// Name the carried cell behind an update scan's policy refusal: the first
+    /// refused stored reference in the preflight's order (columns, then rows).
+    /// `None` when none is refused, and the caller keeps its error.
+    fn stored_external_blob_denial(
+        &self,
+        carried: &LanceSchema,
+        batch: &RecordBatch,
+        key_column: Option<&str>,
+        table_key: &str,
+    ) -> Option<OmniError> {
+        let ids = batch
+            .column_by_name(key_column?)?
+            .as_any()
+            .downcast_ref::<StringArray>()?;
+        for field in carried.fields_pre_order().filter(|field| field.is_blob()) {
+            let descriptions = batch
+                .column_by_name(&field.name)?
+                .as_any()
+                .downcast_ref::<StructArray>()?;
+            let decoder = BlobDescriptorDecoder::try_new(descriptions).ok()?;
+            for row in 0..descriptions.len() {
+                let BlobDescriptor::External { uri, .. } = decoder.classify(row).ok()? else {
+                    continue;
+                };
+                if let Err(OmniError::ExternalBlobPolicy { uri, reason }) =
+                    self.external_blob_policy.authorize(&uri)
+                {
+                    let reason = match self.external_blob_policy.as_ref() {
+                        ExternalBlobPolicy::Deny => {
+                            "the graph's external Blob policy admits no source".to_string()
+                        }
+                        ExternalBlobPolicy::Allow { .. } => reason,
+                    };
+                    return Some(OmniError::StoredExternalBlobDenied {
+                        type_key: table_key.to_string(),
+                        entity_id: ids.is_valid(row).then(|| ids.value(row))?.to_string(),
+                        property: field.name.clone(),
+                        uri,
+                        reason,
+                    });
+                }
+            }
+        }
+        None
+    }
+
     /// Conservative pre-read size for a persisted descriptor batch. The raw
     /// one-row Arrow allocation already accounts every ordinary column and
     /// descriptor buffer; adding logical payload bytes may overestimate the
@@ -1928,7 +1978,7 @@ impl TableStore {
         external: &ExternalBlobPreflight,
         max_blob_bytes: u64,
     ) -> Result<u64> {
-        let payload = self.persisted_blob_payload_bytes(ds, batch, external)?;
+        let payload = self.persisted_blob_payload_bytes(ds.schema(), batch, external)?;
         if payload > max_blob_bytes {
             return Err(OmniError::resource_limit(
                 "materialized blob payload bytes",
@@ -3507,6 +3557,7 @@ impl TableStore {
                         let materialized = store
                             .materialize_blob_batch_with_row_ids(
                                 &source,
+                                source.schema(),
                                 descriptors,
                                 &[row_id],
                                 Some(KEYED_WRITE_MAX_BYTES),
@@ -4588,6 +4639,13 @@ impl TableStore {
     /// existing shadow union. The resulting batch is therefore valid for either
     /// of Lance's merge plans, making physical index presence a performance
     /// detail rather than a correctness precondition.
+    ///
+    /// `omit_blob_columns` names Blob columns the caller replaces wholesale
+    /// (an update's assigned Blobs). Their old cells are never taken, probed,
+    /// authorized or read, and both sides return the dataset's schema without
+    /// them, in schema order. Every other Blob column is carried: a stored
+    /// external reference there must pass the graph's external Blob policy,
+    /// and a refusal names the row as [`OmniError::StoredExternalBlobDenied`].
     pub async fn scan_with_pending_materialized_blobs(
         &self,
         committed_ds: &Dataset,
@@ -4595,6 +4653,7 @@ impl TableStore {
         pending_schema: Option<SchemaRef>,
         filter: Option<Expr>,
         key_column: Option<&str>,
+        omit_blob_columns: &[&str],
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>> {
         let blob_columns = committed_ds
@@ -4604,6 +4663,14 @@ impl TableStore {
             .filter(|field| field.is_blob())
             .map(|field| field.name.clone())
             .collect::<Vec<_>>();
+        if let Some(unknown) = omit_blob_columns
+            .iter()
+            .find(|name| !blob_columns.iter().any(|blob| blob == *name))
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "cannot omit '{unknown}' from a Blob-materializing scan: it is not a Blob column"
+            )));
+        }
         if blob_columns.is_empty() {
             return self
                 .scan_with_pending(
@@ -4637,13 +4704,51 @@ impl TableStore {
             Some(key_col) => collect_string_column_values(pending_batches, key_col)?,
             None => std::collections::HashSet::new(),
         };
+        let (carried, pending_projection) = if omit_blob_columns.is_empty() {
+            (committed_ds.schema().clone(), None)
+        } else {
+            let kept = committed_ds
+                .schema()
+                .fields
+                .iter()
+                .filter(|field| !omit_blob_columns.contains(&field.name.as_str()))
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>();
+            let carried = committed_ds
+                .schema()
+                .project(&kept)
+                .map_err(OmniError::lance_internal)?;
+            (carried, Some(kept))
+        };
         let pending = if pending_batches.is_empty() {
             Vec::new()
         } else {
             scan_pending_batches(pending_batches, pending_schema, None, filter.clone()).await?
         };
+        let pending = match &pending_projection {
+            None => pending,
+            Some(kept) => pending
+                .into_iter()
+                .map(|batch| {
+                    let indices = kept
+                        .iter()
+                        .map(|name| {
+                            batch.schema().index_of(name).map_err(|_| {
+                                OmniError::manifest_internal(format!(
+                                    "pending batch missing column '{name}'"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    batch.project(&indices).map_err(OmniError::arrow_internal)
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
         let mut account = PendingScanAccount::new(budget)?;
         account.add_batches(&pending)?;
+        let carried_without_blobs: Option<SchemaRef> =
+            (!carried.fields.iter().any(|field| field.is_blob()))
+                .then(|| Arc::new((&carried).into()));
 
         let scan_rows = account.next_scan_rows();
         let scan_bytes = account.next_scan_bytes();
@@ -4690,6 +4795,13 @@ impl TableStore {
             let non_blob_bytes = non_blob_column_bytes(committed_ds, &batch)?;
             let payload_budget = account.remaining_bytes_after(non_blob_bytes)?;
 
+            if let Some(schema) = &carried_without_blobs {
+                let carried_rows = predicate_rows_as(schema, &batch)?;
+                account.add_batch(&carried_rows)?;
+                committed.push(carried_rows);
+                continue;
+            }
+
             let row_ids = batch
                 .column_by_name("_rowid")
                 .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
@@ -4702,13 +4814,14 @@ impl TableStore {
                 continue;
             }
             let descriptors = committed_ds
-                .take_rows(&row_ids, committed_ds.schema().clone())
+                .take_rows(&row_ids, carried.clone())
                 .await
                 .map_err(OmniError::storage)?;
             let materialized = match self
                 .materialize_blob_batch_with_row_ids(
                     committed_ds,
-                    descriptors,
+                    &carried,
+                    descriptors.clone(),
                     &row_ids,
                     Some(payload_budget),
                     None,
@@ -4716,6 +4829,16 @@ impl TableStore {
                 )
                 .await
             {
+                Err(error @ OmniError::ExternalBlobPolicy { .. }) => {
+                    return Err(self
+                        .stored_external_blob_denial(
+                            &carried,
+                            &descriptors,
+                            key_column,
+                            account.table_key(),
+                        )
+                        .unwrap_or(error));
+                }
                 Err(OmniError::ResourceLimitExceeded { actual, .. }) => {
                     let actual = account
                         .bytes_with(non_blob_bytes)?
@@ -5015,6 +5138,10 @@ impl PendingScanAccount {
         Ok(account)
     }
 
+    fn table_key(&self) -> &str {
+        &self.table_key
+    }
+
     fn add_batches(&mut self, batches: &[RecordBatch]) -> Result<()> {
         for batch in batches {
             self.add_batch(batch)?;
@@ -5124,6 +5251,22 @@ fn non_blob_column_bytes(ds: &Dataset, batch: &RecordBatch) -> Result<u64> {
                 OmniError::manifest_internal("non-blob pending scan byte count overflow")
             })
         })
+}
+
+/// The predicate scan's rows as a batch of `carried`, a projection that holds
+/// no Blob column: every carried column is already in `batch`, bound here by
+/// name, so the scan needs no second read of the matched rows.
+fn predicate_rows_as(carried: &SchemaRef, batch: &RecordBatch) -> Result<RecordBatch> {
+    let columns = carried
+        .fields()
+        .iter()
+        .map(|field| {
+            batch.column_by_name(field.name()).cloned().ok_or_else(|| {
+                OmniError::manifest_internal(format!("batch missing column '{}'", field.name()))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new(carried.clone(), columns).map_err(OmniError::arrow_internal)
 }
 
 /// Collect the set of values in a Utf8 column across multiple batches.

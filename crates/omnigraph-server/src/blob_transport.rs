@@ -241,16 +241,14 @@ fn serve_external(reference: &ExternalBlobRef, snapshot_id: &str) -> Result<Resp
     // Sending the bare URI for a ranged descriptor would silently return
     // bytes outside the logical Blob cell, while proxying or translating the
     // range is deliberately outside V1. Fail before headers instead.
-    if reference.offset != 0 || reference.length.is_some() {
-        return Err(ApiError::internal(
-            "ranged external Blob descriptors cannot be redirected safely",
-        ));
-    }
+    let uri = reference.whole_object_uri().map_err(|_| {
+        ApiError::internal("ranged external Blob descriptors cannot be redirected safely")
+    })?;
     let mut response = empty_response(StatusCode::FOUND);
     insert_header(
         response.headers_mut(),
         LOCATION,
-        &reference.uri,
+        uri,
         "external Blob redirect URI",
     )?;
     response

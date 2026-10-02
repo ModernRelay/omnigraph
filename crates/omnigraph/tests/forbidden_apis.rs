@@ -4442,6 +4442,7 @@ fn test_util_violations(manifests: &[(String, String)]) -> Vec<String> {
 
     let mut crates = SPLIT_CRATE_PACKAGES
         .iter()
+        .chain(TEST_UTIL_SEAM_PACKAGES)
         .map(|name| name.to_string())
         .collect::<BTreeSet<_>>();
     loop {
@@ -4545,6 +4546,41 @@ fn test_util_pin_follows_local_features_and_inherited_aliases() {
 }
 
 const SPLIT_CRATE_PACKAGES: &[&str] = &["omnigraph-core", "omnigraph-catalog"];
+
+/// Crates outside the split whose own `test-util` gates a test seam
+/// (`omnigraph-cluster`: `read_serving_snapshot_with_display_root`).
+const TEST_UTIL_SEAM_PACKAGES: &[&str] = &["omnigraph-cluster"];
+
+#[test]
+fn test_util_pin_covers_the_cluster_seam() {
+    let manifest = |label: &str, text: &str| (label.to_string(), text.to_string());
+    let cluster = manifest(
+        "cluster/Cargo.toml",
+        "[package]\nname = \"omnigraph-cluster\"\n[features]\ntest-util = []\n",
+    );
+    let tests_only = manifest(
+        "server/Cargo.toml",
+        "[package]\nname = \"omnigraph-server\"\n[dev-dependencies]\n\
+         omnigraph-cluster = { path = \"../cluster\", features = [\"test-util\"] }\n",
+    );
+    assert_eq!(
+        test_util_violations(&[cluster.clone(), tests_only]),
+        Vec::<String>::new()
+    );
+    let production = manifest(
+        "server/Cargo.toml",
+        "[package]\nname = \"omnigraph-server\"\n[features]\n\
+         helpers = [\"omnigraph-cluster/test-util\"]\n[dependencies]\n\
+         omnigraph-cluster = { path = \"../cluster\", features = [\"test-util\"] }\n",
+    );
+    assert_eq!(
+        test_util_violations(&[cluster, production]),
+        [
+            "server/Cargo.toml: [dependencies] `omnigraph-cluster` enables test-util",
+            "server/Cargo.toml: [features] `helpers` enables `omnigraph-cluster/test-util`",
+        ]
+    );
+}
 
 /// The only regular `test-util` enables, `(enabler, enabled)`: both enablers are
 /// unpublished test crates, and `reference_engine_is_a_dependency_of_gqt_only`

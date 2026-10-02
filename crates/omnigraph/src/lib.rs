@@ -48,7 +48,7 @@ pub(crate) mod validate;
 pub use blob::{
     BLOB_READ_RANGE_MAX_BYTES, BlobCell, BlobContent, BlobEtag, BlobRead, BlobReader,
     EXTERNAL_BLOB_URI_MAX_BYTES, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy,
-    ExternalBlobRef,
+    ExternalBlobRef, RangedExternalBlob, StorageRootConflict,
 };
 pub use changes::EntityKind;
 pub use omnigraph_compiler::settings;

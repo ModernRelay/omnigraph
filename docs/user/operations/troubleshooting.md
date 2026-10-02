@@ -21,7 +21,7 @@ means the data request was not sent. HTTP discovery refusals retain their status
 
 | Status | Meaning | Usual action |
 |---:|---|---|
-| 400 | Invalid request, query, schema, configuration, or external-Blob policy | Correct the request; retrying unchanged will fail again |
+| 400 | Invalid request, query, schema, configuration, or external-Blob policy, including an update that must carry a stored external Blob reference the policy does not admit | Correct the request; retrying unchanged will fail again. For a stored reference, assign that property in the same update (a new value or null), or admit its base in the policy |
 | 401 | Missing or invalid bearer token | Supply a token configured by the server |
 | 403 | The resolved actor is not authorized | Change policy or use an authorized identity |
 | 404 | Graph, query, branch, entity, or route is unavailable | Check the name and applied cluster revision; stored-query denials may also appear as 404 |
@@ -124,6 +124,13 @@ between graph roots.
   to start with `cluster_no_healthy_graphs` if every applied graph is
   quarantined. See
   [External Blob references](../clusters/config.md#external-blob-references).
+- `external_blob_storage_root_uncomparable`: the cluster storage root is
+  spelled with a path component an external Blob base cannot express (an empty
+  component, or a percent sign in a local path), so a base of the same storage
+  kind cannot be proven to lie outside it. Moving the base does not help:
+  use a storage root without such a component, or remove the graph's bases of
+  that kind with `cluster apply`. Validation refuses the base, and the server
+  quarantines the graph, as for an overlap.
 
 See [Operating a cluster](../clusters/index.md).
 

@@ -3,6 +3,8 @@ use super::*;
 use crate::engine::{
     check_param_date_literals, evaluate_constant, id_in_list_expr, ir_expr_to_df_expr,
 };
+use crate::instrumentation::record_mutation_table_open;
+use crate::loader::append_blob_value;
 use crate::seams::{decide_seam, fail};
 use crate::session::Session;
 use crate::storage_layer::{DeletedIdBudget, PendingScanBudget, SnapshotHandle};
@@ -341,14 +343,16 @@ fn typed_list_literal_to_array(
 /// Build a single-element blob array from a URI or base64 value string.
 fn build_blob_array_from_value(value: &str) -> Result<ArrayRef> {
     let mut builder = BlobArrayBuilder::new(1);
-    crate::loader::append_blob_value(&mut builder, value)?;
+    append_blob_value(&mut builder, value)?;
     builder.finish().map_err(OmniError::lance_internal)
 }
 
-/// Build a null blob array with one element.
-fn build_null_blob_array() -> Result<ArrayRef> {
-    let mut builder = BlobArrayBuilder::new(1);
-    builder.push_null().map_err(OmniError::lance_internal)?;
+/// Build a null blob array with `num_rows` elements.
+fn build_null_blob_array(num_rows: usize) -> Result<ArrayRef> {
+    let mut builder = BlobArrayBuilder::new(num_rows);
+    for _ in 0..num_rows {
+        builder.push_null().map_err(OmniError::lance_internal)?;
+    }
     builder.finish().map_err(OmniError::lance_internal)
 }
 
@@ -369,7 +373,7 @@ fn build_insert_batch(
             if let Some(Literal::String(uri)) = assignments.get(field.name()) {
                 columns.push(build_blob_array_from_value(uri)?);
             } else if field.is_nullable() {
-                columns.push(build_null_blob_array()?);
+                columns.push(build_null_blob_array(1)?);
             } else {
                 return Err(OmniError::manifest(format!(
                     "missing required blob property '{}'",
@@ -432,15 +436,9 @@ fn first_unbound_param<'a>(expr: &'a IRExpr, params: &ParamMap) -> Option<&'a st
     }
 }
 
-/// Replace specific columns in a RecordBatch with new literal values.
-///
-/// Blob-bearing updates always arrive with the full logical schema. Committed
-/// blob payloads were materialized by the caller and rebuilt as logical
-/// `Struct<data,uri>` arrays; pending batches already have that shape. An
-/// unassigned blob is copied through, while an assigned string URI is rebuilt
-/// with the same blob writer used by inserts. Consequently every update batch
-/// has the catalog schema and can safely share one pending merge stream with
-/// inserts and earlier updates.
+/// Rebuild a matched batch, which lacks the Blobs it assigns, on `full_schema`
+/// with the assigned values, so every update batch shares one pending merge
+/// stream with inserts and earlier updates.
 fn apply_assignments(
     full_schema: &SchemaRef,
     batch: &RecordBatch,
@@ -450,26 +448,36 @@ fn apply_assignments(
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(full_schema.fields().len());
     for field in full_schema.fields().iter() {
         if blob_properties.contains(field.name()) {
-            if let Some(Literal::String(uri)) = assignments.get(field.name()) {
-                // Assigned: build a single blob column from the URI.
-                let mut builder = BlobArrayBuilder::new(batch.num_rows());
-                for _ in 0..batch.num_rows() {
-                    crate::loader::append_blob_value(&mut builder, uri)?;
+            let column = match assignments.get(field.name()) {
+                Some(Literal::String(uri)) => {
+                    let mut builder = BlobArrayBuilder::new(batch.num_rows());
+                    for _ in 0..batch.num_rows() {
+                        append_blob_value(&mut builder, uri)?;
+                    }
+                    builder.finish().map_err(OmniError::lance_internal)?
                 }
-                columns.push(builder.finish().map_err(OmniError::lance_internal)?);
-            } else {
+                Some(Literal::Null) => build_null_blob_array(batch.num_rows())?,
+                Some(other) => {
+                    return Err(OmniError::manifest_internal(format!(
+                        "Blob property '{}' assigned non-string constant {other:?}",
+                        field.name()
+                    )));
+                }
                 // Unassigned: the materializing scan must have normalized the
                 // committed value (or pending value) to the logical blob
                 // schema, so copying it preserves both bytes and full-schema
                 // merge compatibility.
-                let col = batch.column_by_name(field.name()).ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "blob column '{}' not found in full-schema mutation scan",
-                        field.name()
-                    ))
-                })?;
-                columns.push(col.clone());
-            }
+                None => batch
+                    .column_by_name(field.name())
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "blob column '{}' not found in full-schema mutation scan",
+                            field.name()
+                        ))
+                    })?
+                    .clone(),
+            };
+            columns.push(column);
         } else if let Some(lit) = assignments.get(field.name()) {
             columns.push(literal_to_typed_array(
                 lit,
@@ -524,6 +532,7 @@ async fn open_table_for_mutation(
     op_kind: crate::db::MutationOpKind,
     txn: Option<&crate::db::WriteTxn>,
 ) -> Result<(Option<SnapshotHandle>, String, Option<String>)> {
+    record_mutation_table_open();
     // `open_for_mutation_on_branch` returns the expected version even when it
     // skips the open (collapse #1, the non-strict insert/merge path): the version
     // is the pinned base's, identical to the opened handle's `.version()`. Use it
@@ -1327,7 +1336,35 @@ impl Omnigraph {
 
         let schema = catalog.node_types[type_name].arrow_schema.clone();
         let pred_expr = mutation_predicate_expr(predicate, params, &schema)?;
+        // Resolved before the table is opened, so a null on a non-nullable
+        // property is refused even when the predicate matches no row.
+        let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
         let blob_props = catalog.node_types[type_name].blob_properties.clone();
+        // Catalog order is kept: `concat_match_batches_to_schema` binds by position.
+        let assigned_blobs = schema
+            .fields()
+            .iter()
+            .filter(|field| {
+                blob_props.contains(field.name()) && resolved.contains_key(field.name())
+            })
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        let scan_schema: SchemaRef = if assigned_blobs.is_empty() {
+            schema.clone()
+        } else {
+            let indices = schema
+                .fields()
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| !assigned_blobs.contains(&field.name().as_str()))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            Arc::new(
+                schema
+                    .project(&indices)
+                    .map_err(OmniError::arrow_internal)?,
+            )
+        };
 
         let table_key = format!("node:{}", type_name);
         let (handle, _full_path, _table_branch) = open_table_for_mutation(
@@ -1383,6 +1420,7 @@ impl Omnigraph {
                     pending_schema,
                     Some(pred_expr),
                     Some(catalog.system_columns.id),
+                    &assigned_blobs,
                     scan_budget,
                 )
                 .await?
@@ -1395,14 +1433,10 @@ impl Omnigraph {
             });
         }
 
-        // Concat the matched batches (committed + pending) into one. The
-        // helper binds both sides to the catalog's full logical schema. Any
-        // divergence here is an internal scan/staging contract violation.
-        let matched = concat_match_batches_to_schema(&schema, batches)?;
+        let matched = concat_match_batches_to_schema(&scan_schema, batches)?;
 
         let affected_count = matched.num_rows();
 
-        let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
         let updated = apply_assignments(&schema, &matched, &resolved, &blob_props)?;
         // Validation (value/enum/unique) runs end-of-query via the evaluator.
 

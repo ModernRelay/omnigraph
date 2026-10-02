@@ -375,7 +375,9 @@ Overwrite can preserve an allowed external descriptor through Lance
 `WriteParams`. Keyed writes and row-writing merge paths materialize selected
 external bytes under the operation's 32 MiB budget because Lance's MergeInsert
 surface has no equivalent reference-preservation hook. A pointer-only branch
-adoption does no source I/O. See [blob.md](blob.md).
+adoption does no source I/O. An update never reads the Blobs it assigns; a
+carried stored external reference the policy refuses fails as
+`StoredExternalBlobDenied` before effects. See [blob.md](blob.md).
 
 ## Failure outcomes
 

@@ -36,8 +36,27 @@ Write mode determines ownership:
   reference;
 - incremental inserts, upserts, updates, append/merge loads, and branch merges
   that write entities copy allowed source bytes into graph-managed storage;
-- an existing external reference remains readable and exportable even when new
-  external ingress is disabled.
+- an existing external reference remains readable even when new external
+  ingress is disabled, and exportable when it names its whole object (see
+  below).
+
+An `update` never reads the old value of a Blob it assigns. It carries every
+other Blob cell of a matched row: it reads the cell and rewrites it as managed
+bytes. Carrying a stored external reference therefore needs the graph's
+external Blob policy to admit the reference's source. Otherwise the update
+fails with a 400 that names the type, id, and property; assign that property in
+the same update, to a new value or to null, to replace or clear the reference
+without reading it.
+
+Only a graph written outside OmniGraph can hold a stored reference to a byte
+range of an object. Export writes an external reference as a bare URI, which
+reloads as the whole object, so export refuses a ranged reference instead of
+widening it. Change-feed images, the change-feed baseline and entity reads by
+id describe it exactly, as `{"uri": …, "offset": …, "length": …}` with a
+positive `length`, without reading the object. The feed passes the commit that
+holds it like any other, and a baseline taken while the row exists succeeds;
+that baseline does not reload with `load`. A stored descriptor with an offset
+but no length is refused as a Blob integrity error.
 
 OmniGraph never deletes the object named by an external reference.
 

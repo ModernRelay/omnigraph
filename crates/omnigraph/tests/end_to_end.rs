@@ -1016,7 +1016,29 @@ query insert_doc($title: String, $content: Blob) {
 query update_doc_content($title: String, $content: Blob) {
     update Document set { content: $content } where title = $title
 }
+
+query clear_doc_content($title: String, $content: Blob?) {
+    update Document set { content: $content } where title = $title
+}
+
+query insert_then_clear_doc_content($title: String, $content: Blob, $cleared: Blob?) {
+    insert Document { title: $title, content: $content }
+    update Document set { content: $cleared } where title = $title
+}
 "#;
+
+/// Parameters binding `$content` (and `$cleared`, when present) to null: `null`
+/// is a reserved word in `.gq`, so a null reaches a Blob only as a parameter.
+fn null_blob_params(title: &str, names: &[&str]) -> ParamMap {
+    let mut map = params(&[("$title", title)]);
+    for name in names {
+        map.insert(
+            name.to_string(),
+            omnigraph_compiler::query::ast::Literal::Null,
+        );
+    }
+    map
+}
 
 #[tokio::test]
 async fn blob_schema_parses_and_init_succeeds() {
@@ -2156,10 +2178,10 @@ query get_article($slug: String) {
     assert!(attachment.is_empty());
 }
 
-// ─── Regression: blob update null → non-null ─────────────────────────────────
+// ─── Regression: blob update null → non-null → null ──────────────────────────
 
 #[tokio::test]
-async fn blob_update_null_to_non_null() {
+async fn blob_update_null_round_trip() {
     // Regression: updating a blob column that was previously all-null panicked
     // with assertion `left: 0, right: 1` in lance-table stream.rs because the
     // two-phase blob update sent a blob-only batch to merge_insert on a dataset
@@ -2191,6 +2213,143 @@ async fn blob_update_null_to_non_null() {
     )
     .await;
     assert_eq!(&bytes[..], &[1, 2, 3]);
+
+    let before = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let result = mutate_main(
+        &db,
+        BLOB_MUTATIONS,
+        "clear_doc_content",
+        &null_blob_params("kid-a", &["content"]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        before + 1,
+        "a null parameter clears the cell and publishes once"
+    );
+    let assert_null = |error: OmniError| {
+        assert!(
+            matches!(
+                &error,
+                OmniError::Manifest(manifest)
+                    if manifest.kind == ManifestErrorKind::NotFound
+                        && manifest.message.contains("is null")
+            ),
+            "cleared Blob must read as null, got {error:?}"
+        );
+    };
+    assert_null(
+        db.read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "kid-a", "content"),
+        )
+        .await
+        .unwrap_err(),
+    );
+
+    let mut insert_then_clear = null_blob_params("ok-computer", &["cleared"]);
+    insert_then_clear.insert(
+        "content".to_string(),
+        omnigraph_compiler::query::ast::Literal::String("base64:AQID".to_string()),
+    );
+    let result = mutate_main(
+        &db,
+        BLOB_MUTATIONS,
+        "insert_then_clear_doc_content",
+        &insert_then_clear,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.affected_nodes, 2);
+    assert_null(
+        db.read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "ok-computer", "content"),
+        )
+        .await
+        .unwrap_err(),
+    );
+}
+
+/// The control, the same update with a value, opens the table, so the zero
+/// open count belongs to the refusal and not to a skipped scan.
+#[tokio::test]
+async fn blob_null_on_non_nullable_refuses_before_table_open_or_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = "node Document {\n    title: String @key\n    content: Blob\n}\n";
+    let db = helpers::session(Omnigraph::init(uri, schema).await.unwrap());
+    db.load_jsonl(
+        r#"{"type": "Document", "data": {"title": "kid-a", "content": "base64:AQID"}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let head = || async {
+        omnigraph::db::commit_graph::CommitGraph::open(uri)
+            .await
+            .unwrap()
+            .head_commit()
+            .await
+            .unwrap()
+            .expect("loaded graph has a commit")
+            .graph_commit_id
+    };
+    let manifest_before = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let pin_before = pinned_version(&db, "main", "node:Document").await;
+    let head_before = head().await;
+
+    let probes = MergeWriteProbes::default();
+    let refused = with_merge_write_probes(
+        probes.clone(),
+        mutate_main(
+            &db,
+            BLOB_MUTATIONS,
+            "clear_doc_content",
+            &null_blob_params("kid-a", &["content"]),
+        ),
+    )
+    .await;
+    let error = refused.unwrap_err().to_string();
+    assert!(
+        error.contains("cannot assign null to non-nullable property 'content' of Document"),
+        "{error}"
+    );
+    assert_eq!(
+        probes.mutation_table_open_calls(),
+        0,
+        "the refusal must precede the table open and its scan"
+    );
+    assert_eq!(probes.blob_payload_read_calls(), 0);
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        manifest_before
+    );
+    assert_eq!(
+        pinned_version(&db, "main", "node:Document").await,
+        pin_before
+    );
+    assert_eq!(head().await, head_before);
+
+    let probes = MergeWriteProbes::default();
+    let matched = with_merge_write_probes(
+        probes.clone(),
+        mutate_main(
+            &db,
+            BLOB_MUTATIONS,
+            "update_doc_content",
+            &params(&[("$title", "nobody"), ("$content", "base64:BAUG")]),
+        ),
+    )
+    .await;
+    assert_eq!(matched.unwrap().affected_nodes, 0);
+    assert_eq!(
+        probes.mutation_table_open_calls(),
+        1,
+        "the control update with a value opens the table to scan it"
+    );
 }
 
 // ─── External Blob bases stay outside the graph's own storage ────────────────
@@ -2542,6 +2701,35 @@ async fn blob_load_external_file_uri() {
     assert_eq!(read_probes.external_blob_probe_calls(), 0);
     assert_eq!(read_probes.external_blob_payload_read_calls(), 0);
     assert_eq!(read_probes.blob_payload_read_calls(), 0);
+
+    let clear_probes = MergeWriteProbes::default();
+    let result = with_merge_write_probes(
+        clear_probes.clone(),
+        db.mutate(
+            "main",
+            BLOB_MUTATIONS,
+            "clear_doc_content",
+            &null_blob_params("from-file", &["content"]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(
+        clear_probes.external_blob_probe_calls(),
+        0,
+        "clearing a cell whose source vanished never reads the old reference"
+    );
+    assert_eq!(clear_probes.external_blob_payload_read_calls(), 0);
+    assert_eq!(clear_probes.blob_payload_read_calls(), 0);
+    let cleared = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "from-file", "content"),
+        )
+        .await
+        .unwrap_err();
+    assert!(cleared.to_string().contains("is null"), "{cleared}");
 }
 
 // ─── Regression: execute_update on edge type ─────────────────────────────────

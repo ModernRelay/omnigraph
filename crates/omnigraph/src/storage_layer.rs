@@ -555,11 +555,9 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>>;
 
-    /// Full-schema blob-aware sibling of `scan_with_pending` for mutation
-    /// updates. The committed predicate scan retains row ids without projecting
-    /// blobs; only matched rows are then taken and rebuilt as Lance's logical
-    /// blob input arrays before unioning the in-memory pending view. This keeps
-    /// the eventual merge source schema independent of scalar-index state.
+    /// Blob-aware sibling of `scan_with_pending` for mutation updates; see
+    /// `TableStore::scan_with_pending_materialized_blobs`. `omit_blob_columns`
+    /// names the Blobs the caller replaces, which are never read or returned.
     async fn scan_with_pending_materialized_blobs(
         &self,
         snapshot: &SnapshotHandle,
@@ -567,6 +565,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         pending_schema: Option<SchemaRef>,
         filter: Option<Expr>,
         key_column: Option<&str>,
+        omit_blob_columns: &[&str],
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>>;
 
@@ -1070,6 +1069,7 @@ impl TableStorage for TableStore {
         pending_schema: Option<SchemaRef>,
         filter: Option<Expr>,
         key_column: Option<&str>,
+        omit_blob_columns: &[&str],
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>> {
         TableStore::scan_with_pending_materialized_blobs(
@@ -1079,6 +1079,7 @@ impl TableStorage for TableStore {
             pending_schema,
             filter,
             key_column,
+            omit_blob_columns,
             budget,
         )
         .await

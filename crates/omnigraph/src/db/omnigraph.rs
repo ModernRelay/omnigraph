@@ -45,7 +45,9 @@ pub use collector::{
 };
 #[doc(hidden)]
 pub use export::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
-pub(crate) use export::{export_blob_values, logical_row_image};
+pub(crate) use export::{
+    LogicalBlobValue, RangedExternalBlobs, export_blob_values, logical_row_image,
+};
 pub use optimize::{CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, SkipReason};
 pub use repair::{
     DatasetRepairStats, RepairAction, RepairClassification, RepairOptions, RepairStats,
@@ -892,11 +894,14 @@ impl Omnigraph {
     /// The default on every initialized or opened handle is deny. This
     /// consuming builder validates deserialized configuration before replacing
     /// that default, so no writer can observe a partially configured policy.
-    /// A policy with a base that overlaps this handle's own storage root is
-    /// refused: ingress would otherwise copy the graph's manifest and table
-    /// bytes into cells readable as ordinary Blob values. Bases overlapping
-    /// another graph's or the cluster's root are refused by cluster
-    /// validation and server boot, which know those roots.
+    /// A policy with a base that overlaps this handle's own graph root is
+    /// refused at install: ingress would otherwise copy the graph's manifest
+    /// and table bytes into cells readable as ordinary Blob values. This
+    /// install checks no other root. Cluster `validate`, `plan` and `apply`
+    /// compare every base in every scope with the cluster storage root, which
+    /// holds every graph and the ledger. Serve boot compares only the
+    /// server-safe projection of each applied policy with that root, so an
+    /// applied `embedded_only` base is not checked at boot.
     pub fn with_external_blob_policy(
         mut self,
         policy: crate::blob::ExternalBlobPolicy,
@@ -2614,6 +2619,12 @@ impl Omnigraph {
     /// return that head's commit id plus the cursor that resumes the feed
     /// immediately after it. A failed export returns `Err` — a usable cursor
     /// never outlives a broken snapshot.
+    ///
+    /// The snapshot uses export's line format, except that a ranged external
+    /// Blob reference, which export refuses, is described as
+    /// `{"uri", "offset", "length"}` as in change images: the consumer starts
+    /// from exactly this state, and refusing would leave the graph with no
+    /// baseline at all.
     pub async fn capture_change_baseline<W: Write>(
         &self,
         branch: &str,

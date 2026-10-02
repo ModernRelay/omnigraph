@@ -1074,14 +1074,14 @@ fn validate_external_blob_policy(
         let path = format!("graphs.{graph_id}.external_blobs.allow[{index}].base");
         match omnigraph::ExternalBlobBase::new(&configured.base, configured.scope.into()) {
             Ok(base) => {
-                if let Some(Err(error)) =
+                if let Some(Err(conflict)) =
                     storage_root.map(|root| base.ensure_disjoint_from_storage_root(root))
                 {
                     invalid = true;
                     diagnostics.push(Diagnostic::error(
-                        "external_blob_base_overlaps_storage_root",
+                        storage_root_conflict_code(&conflict),
                         path,
-                        error.to_string(),
+                        conflict.to_string(),
                     ));
                 } else {
                     bases.push(base);
@@ -1111,6 +1111,20 @@ fn validate_external_blob_policy(
             ));
             omnigraph::ExternalBlobPolicy::Deny
         }
+    }
+}
+
+pub(crate) fn storage_root_conflict_code(
+    conflict: &omnigraph::StorageRootConflict,
+) -> &'static str {
+    match conflict {
+        omnigraph::StorageRootConflict::Overlap { .. } => {
+            "external_blob_base_overlaps_storage_root"
+        }
+        omnigraph::StorageRootConflict::UncomparableRoot { .. } => {
+            "external_blob_storage_root_uncomparable"
+        }
+        omnigraph::StorageRootConflict::InvalidPolicy(_) => "invalid_external_blob_base",
     }
 }
 
