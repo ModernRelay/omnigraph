@@ -20,7 +20,7 @@ use datafusion::execution::memory_pool::{
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use tokio::sync::Notify;
 
-use super::operators::memory::QueryResources;
+use super::operators::memory::{QueryResources, locked};
 use crate::error::{OmniError, Result};
 use crate::table_store::{
     ORDERED_SCAN_EXECUTION_BATCH_ROWS, ORDERED_SCAN_MEMORY_BYTES, ORDERED_SCAN_SCRATCH_BYTES,
@@ -41,10 +41,9 @@ pub(super) struct QueryContext {
     work: QueryWorkScope,
 }
 
-/// Ownership of graph-operator producers and blocking workers for one query.
-/// This does not observe opaque DataFusion tasks or native storage I/O and
-/// cannot authorize engine reuse. Closing refuses new root registrations;
-/// an already registered child may finish by registering its own workers.
+/// Owns one query's graph-operator producers and blocking workers, not opaque
+/// DataFusion tasks or native storage I/O, so it cannot authorize engine reuse.
+/// Closing refuses `register`; a live lease still adds workers through `child`.
 #[derive(Clone, Debug, Default)]
 pub(in crate::engine) struct QueryWorkScope(Arc<QueryWorkState>);
 
@@ -69,13 +68,9 @@ pub(in crate::engine) struct QueryWorkSettlement(Arc<QueryWorkState>);
 
 impl QueryWorkScope {
     pub(in crate::engine) fn register(&self) -> DfResult<QueryWorkLease> {
-        let mut state = self
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = locked(&self.0.state);
         if state.closed {
-            return Err(DataFusionError::Execution(
+            return Err(DataFusionError::Internal(
                 "query work admission is closed".into(),
             ));
         }
@@ -87,11 +82,7 @@ impl QueryWorkScope {
     }
 
     fn close(&self) {
-        self.0
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .closed = true;
+        locked(&self.0.state).closed = true;
         self.0.changed.notify_waiters();
     }
 
@@ -102,11 +93,7 @@ impl QueryWorkScope {
 
 impl QueryWorkLease {
     pub(in crate::engine) fn child(&self) -> Self {
-        let mut state = self
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = locked(&self.0.state);
         state.active = state
             .active
             .checked_add(1)
@@ -126,11 +113,7 @@ impl QueryWorkLease {
 
 impl Drop for QueryWorkLease {
     fn drop(&mut self) {
-        let mut state = self
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = locked(&self.0.state);
         state.active -= 1;
         let settled = state.closed && state.active == 0;
         drop(state);
@@ -146,8 +129,8 @@ pub(in crate::engine) struct OwnedQueryWork<T> {
 }
 
 impl<T> OwnedQueryWork<T> {
-    /// A completed poll's output can own resources too. Keep it ahead of the
-    /// same lease when a cancelled JoinHandle abandons the returned value.
+    /// A completed poll's output can own resources too, and a cancelled
+    /// JoinHandle abandons it: the output joins `value` under the same lease.
     pub(in crate::engine) fn with_output<U>(self, output: U) -> OwnedQueryWork<(T, U)> {
         OwnedQueryWork {
             value: (self.value, output),
@@ -175,11 +158,7 @@ impl QueryWorkSettlement {
             tokio::pin!(changed);
             changed.as_mut().enable();
             {
-                let state = self
-                    .0
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let state = locked(&self.0.state);
                 if state.closed && state.active == 0 {
                     return;
                 }
@@ -254,16 +233,16 @@ impl QueryContext {
     }
 
     /// Call once, after the complete query has dropped its execution streams
-    /// and plans. A search's successive passes share this context, so a pass
-    /// boundary must not close it. This waits only for our registered workers.
-    pub(super) async fn wait_owned_workers(&self) {
+    /// and plans: a search's successive passes share this context, so a pass
+    /// boundary must not close it.
+    async fn wait_owned_workers(&self) {
         self.work.close();
         self.work.settlement().wait().await;
     }
 
-    /// Finish the complete execution future before closing registration. Both
-    /// ordinary and error results wait for actual graph-worker ownership; an
-    /// abandoned caller instead closes via Drop and leaves its children owned.
+    /// Finish the complete execution future, then close registration and wait,
+    /// on success and on error: an early LIMIT or an error can leave a cancelled
+    /// producer's blocking poll running. An abandoned caller closes via Drop.
     pub(super) async fn run_owned<F: Future>(&self, future: F) -> F::Output {
         let result = future.await;
         self.wait_owned_workers().await;

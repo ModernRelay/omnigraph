@@ -59,14 +59,17 @@ use omnigraph_compiler::SystemColumns;
 use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::table_store::{
-    ExternalBlobPreflight, StagedTransactionIdentity, StagedWrite, TableState, TableStore,
+    ExternalBlobPreflight, ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, StagedTransactionIdentity,
+    StagedWrite, TableState, TableStore,
 };
 
 /// One fenced merge chunk is bounded in both rows and materialized Arrow
 /// bytes. The byte ceiling bounds the staging adapter; the row ceiling
 /// prevents pathological tiny-row filter expressions and keeps evidence
 /// repeatable. Callers must also bound parsing/materialization before this
-/// final Arrow-sized check.
+/// final Arrow-sized check. The byte ceiling is also the size of three separate
+/// operation-wide allowances: retained keyed batches across tables, the keyed
+/// parse estimate, and the removed-ID collection.
 pub(crate) const KEYED_WRITE_MAX_ROWS: usize = 8192;
 pub(crate) const KEYED_WRITE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -74,12 +77,12 @@ pub(crate) const KEYED_WRITE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// existing Arrow accounting (including its conservative shared-buffer count),
 /// not a second allocator or a claim about native execution/RSS.
 pub(crate) fn retained_keyed_bytes(current: u64, additional: u64) -> Result<u64> {
-    let actual = current.checked_add(additional).ok_or_else(|| {
-        OmniError::manifest_internal("retained mutation batch byte count overflow")
-    })?;
+    let actual = current
+        .checked_add(additional)
+        .ok_or_else(|| OmniError::manifest_internal("retained keyed batch byte count overflow"))?;
     if actual > KEYED_WRITE_MAX_BYTES {
         return Err(OmniError::resource_limit(
-            "retained mutation batch bytes",
+            "retained keyed batch bytes per operation",
             KEYED_WRITE_MAX_BYTES,
             actual,
         ));
@@ -89,14 +92,13 @@ pub(crate) fn retained_keyed_bytes(current: u64, additional: u64) -> Result<u64>
 
 pub(crate) fn retain_keyed_batch(current: u64, batch: &RecordBatch) -> Result<u64> {
     let bytes = u64::try_from(batch.get_array_memory_size())
-        .map_err(|_| OmniError::manifest_internal("retained mutation batch bytes exceed u64"))?;
+        .map_err(|_| OmniError::manifest_internal("retained keyed batch bytes exceed u64"))?;
     retained_keyed_bytes(current, bytes)
 }
 
-/// One allowance for the logical removed-ID collection, shared across all
-/// tables/cascades in a mutation or all replacement removals in a load. Charge
-/// UTF-8 bytes plus one String slot before copying a scanned id. This does not
-/// bound native scan batches, predicate copies or validation's derived state.
+/// One allowance per mutation (all tables and cascades) or load (all replacement
+/// removals): each removed id is charged its UTF-8 bytes plus one String slot before
+/// the copy. Native scan batches, predicate copies and validation state are outside it.
 #[derive(Default)]
 pub(crate) struct DeletedIdBudget {
     bytes: u64,
@@ -110,11 +112,11 @@ impl DeletedIdBudget {
             .and_then(|bytes| u64::try_from(bytes).ok())
             .and_then(|bytes| self.bytes.checked_add(bytes))
             .ok_or_else(|| {
-                OmniError::manifest_internal("retained deleted-id byte count overflow")
+                OmniError::manifest_internal("retained removed-id byte count overflow")
             })?;
         if bytes > KEYED_WRITE_MAX_BYTES {
             return Err(OmniError::resource_limit(
-                "retained deleted-id bytes",
+                "retained removed-id bytes per operation",
                 KEYED_WRITE_MAX_BYTES,
                 bytes,
             ));
@@ -993,8 +995,8 @@ impl TableStorage for TableStore {
             false,
             |scanner| {
                 scanner.filter_expr(filter);
-                scanner.batch_size(1024);
-                scanner.batch_size_bytes(1024 * 1024);
+                scanner.batch_size(ID_SCAN_BATCH_ROWS);
+                scanner.batch_size_bytes(ID_SCAN_BATCH_BYTES);
                 Ok(())
             },
         )

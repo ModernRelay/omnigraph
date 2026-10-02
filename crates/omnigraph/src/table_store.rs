@@ -119,6 +119,10 @@ pub(crate) const ORDERED_SCAN_EXECUTION_BATCH_ROWS: usize = 8_192;
 // bookkeeping. Tests with smaller pools derive the same fraction dynamically.
 pub(crate) const ORDERED_SCAN_MAX_INPUT_BATCH_BYTES: u64 = ORDERED_SCAN_MEMORY_BYTES / 4;
 
+/// Soft scanner hints of the streamed id scans behind delete and Overwrite removal.
+pub(crate) const ID_SCAN_BATCH_ROWS: usize = 1024;
+pub(crate) const ID_SCAN_BATCH_BYTES: u64 = 1024 * 1024;
+
 /// The byte cap of one batch entering a `SortExec` under a pool of `memory_limit` bytes.
 pub(crate) fn sort_input_batch_bytes(memory_limit: u64) -> usize {
     (memory_limit / 4).clamp(1, ORDERED_SCAN_MAX_INPUT_BATCH_BYTES) as usize
@@ -4720,7 +4724,7 @@ impl TableStore {
                             OmniError::manifest_internal("pending scan byte count overflow")
                         })?;
                     return Err(OmniError::resource_limit(
-                        format!("keyed entity bytes for {}", account.table_key()),
+                        "retained keyed batch bytes per operation",
                         KEYED_WRITE_MAX_BYTES,
                         actual,
                     ));
@@ -5011,10 +5015,6 @@ impl PendingScanAccount {
         Ok(account)
     }
 
-    fn table_key(&self) -> &str {
-        &self.table_key
-    }
-
     fn add_batches(&mut self, batches: &[RecordBatch]) -> Result<()> {
         for batch in batches {
             self.add_batch(batch)?;
@@ -5048,7 +5048,7 @@ impl PendingScanAccount {
             .ok_or_else(|| OmniError::manifest_internal("pending scan byte count overflow"))?;
         if next_bytes > KEYED_WRITE_MAX_BYTES {
             return Err(OmniError::resource_limit(
-                format!("keyed entity bytes for {}", self.table_key),
+                "retained keyed batch bytes per operation",
                 KEYED_WRITE_MAX_BYTES,
                 next_bytes,
             ));
@@ -5085,7 +5085,7 @@ impl PendingScanAccount {
         let actual = self.bytes_with(bytes)?;
         if actual > KEYED_WRITE_MAX_BYTES {
             return Err(OmniError::resource_limit(
-                format!("keyed entity bytes for {}", self.table_key),
+                "retained keyed batch bytes per operation",
                 KEYED_WRITE_MAX_BYTES,
                 actual,
             ));

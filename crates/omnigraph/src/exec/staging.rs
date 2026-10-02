@@ -261,11 +261,7 @@ impl MutationStaging {
         }
         let batch_bytes = u64::try_from(batch.get_array_memory_size())
             .map_err(|_| OmniError::manifest_internal("pending keyed batch bytes exceed u64"))?;
-        let pending_bytes = self
-            .pending_bytes
-            .checked_add(batch_bytes)
-            .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))?;
-        if matches!(mode, PendingMode::StrictInsert | PendingMode::Upsert) {
+        let pending_bytes = if matches!(mode, PendingMode::StrictInsert | PendingMode::Upsert) {
             let existing_rows = self
                 .pending
                 .get(table_key)
@@ -295,8 +291,12 @@ impl MutationStaging {
                     bytes,
                 ));
             }
-            retained_keyed_bytes(self.pending_bytes, batch_bytes)?;
-        }
+            retained_keyed_bytes(self.pending_bytes, batch_bytes)?
+        } else {
+            self.pending_bytes
+                .checked_add(batch_bytes)
+                .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))?
+        };
         let entry = self
             .pending
             .entry(table_key.to_string())
@@ -526,8 +526,6 @@ impl MutationStaging {
                 retain_keyed_batch(bytes, &table.batch)
             }
         })?;
-        // Payloads expand descriptors and coexist with the other tables. Refuse
-        // the aggregate before reading even the first external payload.
         retained_keyed_bytes(retained_batch_bytes, copied_external_blob_bytes)?;
 
         // Only after the complete operation has passed policy, source, and

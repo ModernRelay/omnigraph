@@ -405,8 +405,23 @@ panic or cancellation. `QueryContext::run_owned` drops the completed execution
 future, closes new root registrations and joins these children before returning
 success or an error; successive search passes share the same scope. Dropping
 the caller closes registration while surviving children retain their leases.
+After closure a root registration (`QueryWorkScope::register`, which
+`WorkMemory::blocking` takes) is refused; a live child adds workers only through
+its own lease (`QueryWorkLease::child`, `WorkMemory::blocking_owned`).
 This covers OmniGraph's graph workers, not opaque DataFusion tasks or native
-Lance/storage I/O, and cannot authorize engine reuse. Custom operators
+Lance/storage I/O, and cannot authorize engine reuse.
+
+The wait in `run_owned` has no deadline. It ends when every registered worker
+has dropped its lease: a running blocking poll drops it when the poll returns,
+and a cancelled worker stops at its next cooperative `memory.check()`.
+`GraphIndex::build`, the whole-input `lexsort_to_indices` call in the sort
+operator and the hash-join build loop run without a check, so a cancelled
+worker inside one of them finishes that stretch first. An aborted blocking job
+that is still queued holds its lease until the blocking pool dequeues it. The
+`/query` and `/read` routes have no route timeout. No benchmark or timing test
+measures the latency this wait adds to a query that errors or stops early.
+
+Custom operators
 publish output-row and elapsed-compute metrics, with `output_batches` for
 every `ExpandExec` and scan metrics for ANN
 probe/search outcomes. `engine::execute_query` keeps the nearest prefilter

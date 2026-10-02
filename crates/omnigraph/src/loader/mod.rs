@@ -903,7 +903,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
                 &table_key,
                 changeset.get(&table_key).expect("key from this changeset"),
                 catalog.system_columns,
-                &mut removed_id_budget,
+                |id| removed_id_budget.retain(id),
             )
             .await?;
             if !removed.is_empty() {
@@ -1412,36 +1412,35 @@ fn take_object_or_empty(
 
 #[derive(Default)]
 struct KeyedInputBudget {
-    tables: HashMap<String, (usize, u64)>,
+    tables: HashMap<String, KeyedTableInput>,
     bytes: u64,
 }
 
-/// Account a keyed JSON record before retaining it in the per-table parse
-/// spool. This is a conservative lower bound on the Arrow payload (string and
-/// decoded blob bytes, scalar widths, and list offsets); the exact accumulated
-/// Arrow check in `MutationStaging::append_batch` remains the final authority.
-/// The early counter bounds the decoded payload estimate across all tables and
-/// catches base64 before a second copy is decoded. It is not a JSON DOM bound:
-/// property names, container overhead and conversion copies are separate.
+#[derive(Default)]
+struct KeyedTableInput {
+    rows: usize,
+    bytes: u64,
+}
+
+/// Charge a keyed JSON record before the parse spool retains it: a lower bound
+/// on its Arrow payload per table and across tables, taken before base64 is
+/// decoded. Not a JSON DOM bound; `MutationStaging::append_batch` is the authority.
 fn account_keyed_json_row(
     table_key: &str,
     data: &JsonValue,
     structural_string_bytes: usize,
     budgets: &mut KeyedInputBudget,
 ) -> Result<()> {
-    let entry = budgets
-        .tables
-        .entry(table_key.to_string())
-        .or_insert((0, 0));
-    entry.0 = entry
-        .0
+    let entry = budgets.tables.entry(table_key.to_string()).or_default();
+    entry.rows = entry
+        .rows
         .checked_add(1)
         .ok_or_else(|| OmniError::manifest_internal("keyed input entity count overflow"))?;
-    if entry.0 > crate::storage_layer::KEYED_WRITE_MAX_ROWS {
+    if entry.rows > crate::storage_layer::KEYED_WRITE_MAX_ROWS {
         return Err(OmniError::resource_limit(
             format!("keyed entities for {table_key}"),
             crate::storage_layer::KEYED_WRITE_MAX_ROWS as u64,
-            entry.0 as u64,
+            entry.rows as u64,
         ));
     }
     let row_bytes = estimate_json_arrow_bytes(data)?
@@ -1450,15 +1449,15 @@ fn account_keyed_json_row(
                 .map_err(|_| OmniError::manifest_internal("keyed string bytes exceed u64"))?,
         )
         .ok_or_else(|| OmniError::manifest_internal("keyed input entity bytes overflow"))?;
-    entry.1 = entry
-        .1
+    entry.bytes = entry
+        .bytes
         .checked_add(row_bytes)
         .ok_or_else(|| OmniError::manifest_internal("keyed parsed byte count overflow"))?;
-    if entry.1 > KEYED_WRITE_MAX_BYTES {
+    if entry.bytes > KEYED_WRITE_MAX_BYTES {
         return Err(OmniError::resource_limit(
             format!("keyed parsed entity bytes for {table_key}"),
             KEYED_WRITE_MAX_BYTES,
-            entry.1,
+            entry.bytes,
         ));
     }
     let total = budgets.bytes.checked_add(row_bytes).ok_or_else(|| {
@@ -3879,9 +3878,10 @@ edge WorksAt: Person -> Company
             } if resource == "graph_batch_json_structural_slots"
                 && actual == GRAPH_BATCH_JSON_MAX_STRUCTURAL_SLOTS + 1
         ));
+    }
 
-        // The parse spool is one operation: using more graph types must not
-        // obtain another 32 MiB allowance for every table.
+    #[test]
+    fn operation_byte_allowances_span_graph_types_and_include_their_ceiling() {
         let row = serde_json::json!({"payload": "x".repeat(17 * 1024 * 1024)});
         let mut budget = KeyedInputBudget::default();
         account_keyed_json_row("node:Person", &row, 0, &mut budget).unwrap();

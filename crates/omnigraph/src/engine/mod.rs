@@ -413,10 +413,6 @@ pub(crate) async fn execute(bound: BoundPlan, context: &EngineContext<'_>) -> Re
         .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
     let ctx =
         QueryContext::with_traversal_limit(bound.plan.assumptions().memory_limit, traversal_limit)?;
-    // The execution future has dropped its streams before sealing registration.
-    // An early LIMIT or error may have cancelled a producer whose blocking poll
-    // is still running. Its real owner, rather than the dropped waiter, releases
-    // the query's resources. This covers our workers, not native Lance I/O.
     ctx.run_owned(execute_with_context(bound, context, &ctx))
         .await
 }

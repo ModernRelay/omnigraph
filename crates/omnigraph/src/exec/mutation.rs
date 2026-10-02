@@ -1571,8 +1571,6 @@ impl Omnigraph {
             }
         }
 
-        // Cascades borrow the admitted node IDs; transfer them once rather
-        // than retaining another String copy throughout every cascade scan.
         staging.record_deleted_ids(&table_key, deleted_ids);
 
         if affected_edges > 0 {
@@ -1648,9 +1646,8 @@ impl Omnigraph {
     }
 }
 
-/// Walk the exact typed predicate a batch at a time and admit IDs before
-/// copying them. Collecting the scan first would allocate the entire match
-/// set before discovering that the operation cannot retain it.
+/// Walk the exact typed predicate a batch at a time, admitting each id against
+/// `budget` before copying it.
 async fn scan_deleted_ids(
     db: &Omnigraph,
     snapshot: &SnapshotHandle,

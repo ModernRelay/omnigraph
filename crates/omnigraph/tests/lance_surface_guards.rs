@@ -156,13 +156,12 @@ fn dropped_local_writer_can_persist_after_its_owner_returns() {
         );
 
         drop(gate);
-        // One blocking worker makes this barrier follow the queued persist.
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             tokio::task::spawn_blocking(|| ()),
         )
         .await
-        .expect("queued native persistence must settle")
+        .expect("the one blocking worker must run the queued native persist before this barrier")
         .unwrap();
         assert_eq!(std::fs::read(&final_path).unwrap(), payload);
     });
@@ -239,13 +238,14 @@ fn file_object_store_registry() -> Arc<ObjectStoreRegistry> {
             let prefix = self
                 .canonical
                 .calculate_object_store_prefix(&uri, params.storage_options())?;
-            // Url::set_scheme rejects switching from the special `file`
-            // scheme to a non-special scheme. Keep the encoded suffix intact.
             let alternate_uri = Url::parse(&format!(
                 "file-object-store:{}",
                 uri.as_str().strip_prefix("file:").unwrap()
             ))
-            .unwrap();
+            .expect(
+                "the scheme is swapped textually (Url::set_scheme refuses file -> non-special), \
+                 so the encoded suffix must still parse",
+            );
             let mut store = self.alternate.new_store(alternate_uri, params).await?;
             store.store_prefix = prefix;
             Ok(store)

@@ -147,10 +147,18 @@ copying count toward the aggregate allowance. Every strict load retains its
 projected in-memory size check.
 
 Deletes, including cascades, and overwrite loads collecting replaced IDs have
-a separate 32 MiB allowance for those IDs across all touched types. Oversized
-work returns a resource-limit error before its data is staged or published.
-These checks do not bound total engine memory. Split larger work into explicit
-commits; overwrite keeps its bulk-input behavior and remains subject to its
+a separate 32 MiB allowance per operation for those IDs, summed over all
+touched types. Each removed ID is charged its UTF-8 length plus 24 bytes, so
+the allowance holds 671,088 IDs of 26 bytes, the length of a generated ID. A
+delete and the edges it cascades to draw on the same allowance. An overwrite of
+entities loaded without a `@key` and without an explicit `id` removes every
+committed ID of that type, because those IDs are generated again on each load.
+
+Oversized work returns a resource-limit error before its data is staged or
+published. These checks do not bound total engine memory, and no setting
+changes them. Split larger inserts, updates, keyed loads and deletes into
+explicit commits. An overwrite replaces each represented type as one image and
+cannot be split: it keeps its bulk-input behavior and remains subject to its
 separate input and removed-ID checks.
 
 Independent existing constructive datasets stage concurrently. The

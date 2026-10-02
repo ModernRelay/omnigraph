@@ -25,7 +25,7 @@ blocked_on:
 This decision extends B of
 [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md)
 with ownership of graph-query producers and blocking workers, and operation-wide
-limits on retained mutation batches, keyed parse estimates and removed IDs.
+limits on retained keyed batches, keyed parse estimates and removed IDs.
 These implemented boundaries close specific lifetime and admission gaps.
 
 Full B still requires ownership of accepted native I/O and protected completion
@@ -41,8 +41,10 @@ passes, drops its completed execution future, then waits for registered graph
 producers and blocking workers before returning success or an error. Each child
 registers before dispatch. Its future, captured resources and abandoned result
 remain ahead of its registration in destruction order. Dropping the query closes
-new root registrations; existing children retain their ownership and may finish
-their descendants. A panic follows the existing worker-error path. This joins
+new root registrations; existing children retain their ownership and add
+descendants only through their own registration (`QueryWorkLease::child`), so a
+nested root registration such as `WorkMemory::blocking` is refused after
+closure. A panic follows the existing worker-error path. This joins
 OmniGraph's workers, not opaque DataFusion tasks or Lance/storage I/O, and grants
 no engine-reuse capability.
 
@@ -296,9 +298,14 @@ small write. This evidence supplies no full-B or performance claim.
 
 This decision adds no persistent graph format, graph reset, publication door,
 request idempotency store or older-client adapter. Graph data, identities,
-branches and retained history are preserved. Multi-table writes and large
-deletes that previously fit individual table limits can now receive
+branches and retained history are preserved. Multi-table writes, large deletes
+and Overwrite loads that previously succeeded can now receive
 `ResourceLimitExceeded` (HTTP 413 with structured `resource_limit` details).
+The removed-ID allowance charges each ID its UTF-8 length plus 24 bytes, so it
+holds 671,088 IDs of 26 bytes summed over the touched tables. An Overwrite of a
+type whose IDs are generated per load removes every committed ID, and a delete
+shares the allowance with its cascaded edges. A delete can be split into several
+commits; an Overwrite cannot.
 These limits add no environment variable or session setting. Query success and error wait for registered
 graph workers; cancelling a caller does not free a running worker's resources.
 Full native settlement, completion reserves and runtime reuse remain unavailable.

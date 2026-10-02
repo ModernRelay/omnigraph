@@ -103,7 +103,7 @@ their final owner releases it. Bodyless reads consume only a read observer; slow
 reads cannot exhaust write-body or write-response capacity. Status routes bypass
 ordinary admission so they remain callable during saturation.
 
-The engine separately limits retained mutation batches, keyed parse estimates
+The engine separately limits retained keyed batches, keyed parse estimates
 and removed-ID collections across each operation's tables; see
 [mutation limits](mutations/index.md#limits-and-conflicts). These fixed limits
 return HTTP 413 with structured `resource_limit` details before the operation's

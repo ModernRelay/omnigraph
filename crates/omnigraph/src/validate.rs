@@ -38,8 +38,7 @@ use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};
 use crate::loader::{
     composite_unique_key, format_tuple, validate_enum_constraints, validate_value_constraints,
 };
-use crate::storage_layer::DeletedIdBudget;
-use crate::table_store::TableStore;
+use crate::table_store::{ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, TableStore};
 
 /// A single integrity violation, surface-neutral. Maps to the merge path's
 /// [`MergeConflict`] today via [`Violation::into_merge_conflict`]; a write-path
@@ -614,7 +613,7 @@ pub(crate) async fn overwrite_removed_ids(
     table_key: &str,
     change: &TableChange,
     system_columns: SystemColumns,
-    budget: &mut DeletedIdBudget,
+    mut admit: impl FnMut(&str) -> Result<()>,
 ) -> Result<Vec<String>> {
     if base.dataset(table_key).is_none() {
         return Ok(Vec::new());
@@ -636,15 +635,15 @@ pub(crate) async fn overwrite_removed_ids(
         None,
         None,
         false,
-        1024,
-        1024 * 1024,
+        ID_SCAN_BATCH_ROWS,
+        ID_SCAN_BATCH_BYTES,
     )
     .await?;
     while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
         let column = string_col(&batch, system_columns.id)?;
         for i in 0..column.len() {
             if !column.is_null(i) && !new_ids.contains(column.value(i)) {
-                budget.retain(column.value(i))?;
+                admit(column.value(i))?;
                 removed.push(column.value(i).to_string());
             }
         }

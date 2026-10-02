@@ -27,7 +27,7 @@ use crate::engine::context::{QueryWorkLease, QueryWorkScope};
 use crate::error::OmniError;
 use datafusion::physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder};
 
-fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(in crate::engine) fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -356,8 +356,6 @@ impl WorkMemory {
             let owned = owner.child().own((work, memory));
             let span = tracing::Span::current();
             let job = tokio::task::spawn_blocking(move || {
-                // Keep the future and memory ahead of the lease in drop order,
-                // including unwind and an abandoned JoinHandle's output.
                 let mut owned = owned;
                 let _span = span.enter();
                 let (work, memory) = &mut owned.value;
@@ -1272,6 +1270,7 @@ mod tests {
 
     /// A cancelled blocking job can finish with a value that itself owns
     /// resources; settlement must follow destruction of that abandoned output.
+    /// Its destructor tolerates a closed channel so a failed assertion cannot panic twice.
     #[tokio::test(flavor = "current_thread")]
     async fn cancelled_worker_retains_ownership_through_output_destruction() {
         struct HeldOutput {
@@ -1282,8 +1281,6 @@ mod tests {
         impl Drop for HeldOutput {
             fn drop(&mut self) {
                 let _ = self.dropping.take().unwrap().send(());
-                // A failed assertion drops the sender and must release this
-                // destructor too, without causing another panic on unwind.
                 let _ = self.release.recv_timeout(std::time::Duration::from_secs(5));
             }
         }

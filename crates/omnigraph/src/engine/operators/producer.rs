@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use tracing::Instrument;
 
 use super::memory::WorkMemory;
+use crate::instrumentation::{with_query_io_probes, with_query_memory_probes};
 
 /// A single producer sends each batch and its reservation in the same order.
 pub(super) struct BatchSender {
@@ -115,16 +116,12 @@ where
                 let work = async move {
                     let work = memory.blocking_owned(worker, move |memory| body(memory, sender));
                     match io {
-                        Some(probes) => {
-                            crate::instrumentation::with_query_io_probes(probes, work).await
-                        }
+                        Some(probes) => with_query_io_probes(probes, work).await,
                         None => work.await,
                     }
                 };
                 match probes {
-                    Some(probes) => {
-                        crate::instrumentation::with_query_memory_probes(probes, work).await
-                    }
+                    Some(probes) => with_query_memory_probes(probes, work).await,
                     None => work.await,
                 }
             }
