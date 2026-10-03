@@ -221,6 +221,12 @@ async fn parked_stored_invocation_requires_a_serving_transition_barrier() {
             .await
             .expect("released invocation must finish")
             .unwrap();
+        // Result delivery can precede the producer's final observer drop.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), operations.wait_logical_owners())
+                .await
+                .expect("released invocation's logical owners must settle")
+        );
         assert_eq!(operations.snapshot().active_reads, 0);
         if finish_before_apply {
             assert_eq!(status, StatusCode::OK, "{output}");
