@@ -247,6 +247,7 @@ write_surfaces! {
     "loader/mod.rs" => WriteProtocol::Composed("optional branch create, then Load v9") => ["load_as", "load_as_with_receipt", "load_file_as", "load_file_as_with_receipt", "load_graph_batch_as", "load_graph_batch_as_with_receipt"],
     "loader/mod.rs" => WriteProtocol::Composed("branch create when absent, then Load v9 alias") => ["ingest", "ingest_as", "ingest_file", "ingest_file_as"],
     "db/omnigraph.rs" => SCHEMA_V9 => ["apply_schema", "apply_schema_as", "apply_schema_as_with_catalog_check", "apply_prepared_schema_as"],
+    "db/omnigraph.rs" => WriteProtocol::Exact("schema settlement: strict numeric neutral lineage publication") => ["settle_prepared_schema_as"],
     "db/omnigraph.rs" => SYSTEM_COLUMNS_V9 => ["upgrade_system_columns", "upgrade_system_columns_as"],
     "exec/merge.rs" => MERGE_V9 => ["branch_merge", "branch_merge_as"],
     "db/omnigraph.rs" => INDICES_V9 => [
@@ -282,6 +283,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "plan_schema"),
     ("db/omnigraph.rs", "preview_schema_apply"),
     ("db/omnigraph.rs", "prepare_schema_apply_as"),
+    ("db/omnigraph.rs", "prepare_schema_settlement_as"),
     ("db/omnigraph.rs", "reconcile_schema_apply_as"),
     ("db/omnigraph.rs", "snapshot_of"),
     ("db/omnigraph.rs", "graph_manifest_version_of"),
@@ -674,7 +676,7 @@ gateway_surfaces! {
     ],
     "omnigraph-storage/lib.rs" => "StorageAdapter" => GatewayDisposition::ReadOrPure => [
         "read_text", "read_text_if_exists", "read_text_if_exists_bounded",
-        "read_bytes_if_exists_bounded", "exists",
+        "read_bytes_if_exists_bounded", "read_text_versioned_if_exists_bounded", "exists",
         "list_dir", "list_dir_bounded", "read_text_versioned",
     ],
     "omnigraph-storage/lib.rs" => "StorageAdapter" => GatewayDisposition::Durable(WriteProtocol::Composed("shared object storage primitive")) => [
@@ -897,6 +899,7 @@ durable_calls! {
     ("db/omnigraph/table_ops.rs", "commit_updates_on_branch_with_expected(", 1, WriteProtocol::Exact("shared publisher")),
     ("db/omnigraph/table_ops.rs", ".commit_changes_with_intent_and_expected(", 2, WriteProtocol::Exact("shared publisher")),
     ("db/omnigraph/schema_apply.rs", ".commit_changes_with_intent_and_expected(", 1, SCHEMA_V9),
+    ("db/omnigraph/schema_apply/settlement.rs", ".commit_changes_with_intent_and_expected(", 1, WriteProtocol::Exact("schema settlement: strict numeric neutral lineage publication")),
     ("db/omnigraph/repair.rs", ".commit_updates_with_actor_with_expected(", 1, WriteProtocol::ManifestAdoption),
     ("db/upgrade/detached_only.rs", ".commit_updates_with_actor_with_expected(", 1, WriteProtocol::Exact("v11 upgrade step: one publication per live branch recording `omnigraph.last_linear_version` on every current row under exact expected table versions, before the fence and the restamp")),
     ("db/upgrade/detached_only.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),

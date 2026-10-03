@@ -19,7 +19,10 @@ pub mod commit_graph;
 mod commit;
 mod record;
 mod schema_publication;
-pub use schema_publication::{SchemaPublicationEvidence, read_schema_publication_at};
+pub use schema_publication::{
+    SchemaPublicationCandidate, SchemaPublicationEvidence, read_schema_publication_at,
+    read_schema_publication_candidate_at,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

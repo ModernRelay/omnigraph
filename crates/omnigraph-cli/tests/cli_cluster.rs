@@ -2666,6 +2666,104 @@ fn optimize_resolves_a_cluster_graph_by_id() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v2_root_admission_blocks_cli_read_write_and_native_control_doors() {
+    let temp = applied_knowledge_cluster();
+    let root = format!("file://{}", temp.path().display());
+    omnigraph_cluster::upgrade_deployment_ledger(
+        &root,
+        true,
+        &omnigraph_cluster::DeploymentCaller::storage_owner(Some("act-cluster-test".into())),
+    )
+    .await
+    .unwrap();
+    let owner = omnigraph_cluster::acquire_cluster_admission(
+        &root,
+        omnigraph_cluster::ClusterAdmissionPurpose::Serve,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let graph = temp.path().join("graphs/knowledge.omni");
+    let before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+    for args in [
+        vec!["schema", "show"],
+        vec!["optimize", "--json"],
+        vec!["cleanup", "--keep", "1", "--confirm", "--json"],
+        vec!["branch", "create", "must-not-exist"],
+    ] {
+        let output = output_failure(cli().args(&args).arg("--store").arg(&graph).arg("--yes"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("state_lock_held"),
+            "{args:?}: {output:?}"
+        );
+    }
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        before
+    );
+    owner.release_after_settlement().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn successful_v2_cli_read_retains_actionable_admission() {
+    let temp = applied_knowledge_cluster();
+    let root = format!("file://{}", temp.path().display());
+    omnigraph_cluster::upgrade_deployment_ledger(
+        &root,
+        true,
+        &omnigraph_cluster::DeploymentCaller::storage_owner(Some("act-cluster-test".into())),
+    )
+    .await
+    .unwrap();
+    let graph = temp.path().join("graphs/knowledge.omni");
+    let output = output_success(cli().args(["schema", "show"]).arg(&graph));
+    let lock: serde_json::Value =
+        serde_json::from_slice(&fs::read(temp.path().join("__cluster/lock.json")).unwrap())
+            .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cluster admission retained"), "{stderr}");
+    assert!(
+        stderr.contains(lock["lock_id"].as_str().unwrap()),
+        "{stderr}"
+    );
+    assert!(stderr.contains("force-unlock"), "{stderr}");
+    assert!(stdout_string(&output).contains("Person"));
+
+    let blocked = output_failure(cli().args(["optimize", "--json"]).arg(&graph));
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("state_lock_held"));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v2_graph_alias_cannot_bypass_server_admission() {
+    let temp = applied_knowledge_cluster();
+    let root = format!("file://{}", temp.path().display());
+    omnigraph_cluster::upgrade_deployment_ledger(
+        &root,
+        true,
+        &omnigraph_cluster::DeploymentCaller::storage_owner(Some("act-cluster-test".into())),
+    )
+    .await
+    .unwrap();
+    let owner = omnigraph_cluster::acquire_cluster_admission(
+        &root,
+        omnigraph_cluster::ClusterAdmissionPurpose::Serve,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let alias_dir = tempdir().unwrap();
+    let alias = alias_dir.path().join("arbitrary-name");
+    std::os::unix::fs::symlink(temp.path().join("graphs/knowledge.omni"), &alias).unwrap();
+    let output = output_failure(cli().args(["schema", "show"]).arg(&alias));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("state_lock_held"),
+        "{output:?}"
+    );
+    owner.release_after_settlement().await.unwrap();
+}
+
 #[test]
 fn optimize_unknown_cluster_graph_id_errors() {
     let temp = applied_knowledge_cluster();

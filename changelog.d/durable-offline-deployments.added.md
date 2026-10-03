@@ -1,0 +1,4 @@
+- Existing clusters can explicitly convert their ledger under stopped writers to durable offline schema and stored-query deployments without resetting graph data or history. Deployments capture immutable input, retain an original identity for root-only status and reconciliation, and allow corrective successors after a terminal partial result; online activation remains unavailable. Converted clusters share exclusive admission across servers and supported CLI operations, retaining their lock even on success until operator-established quiescence and exact-ID unlock; see the [deployment workflow][durable-offline-deployment-guide] and [limits][durable-offline-deployment-limits].
+
+[durable-offline-deployment-guide]: ../docs/user/clusters/index.md#durable-offline-deployments
+[durable-offline-deployment-limits]: ../docs/user/clusters/config.md#limits

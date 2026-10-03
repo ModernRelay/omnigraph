@@ -513,6 +513,7 @@ fn managed_flags(command: &ClusterCommand) -> bool {
 
 fn config_and_json(command: &ClusterCommand) -> (&Path, bool) {
     match command {
+        ClusterCommand::UpgradeLedger { json, .. } => (Path::new("."), *json),
         ClusterCommand::Validate { config, json }
         | ClusterCommand::Plan { config, json, .. }
         | ClusterCommand::Apply { config, json, .. }
@@ -565,6 +566,24 @@ async fn cluster_command(
             .map(|body| (body, 0));
     }
     reject_scope(cli)?;
+    if matches!(
+        command,
+        ClusterCommand::Apply {
+            deployment_id: Some(_),
+            ..
+        } | ClusterCommand::Apply {
+            writers_stopped: true,
+            ..
+        } | ClusterCommand::Status {
+            deployment_id: Some(_),
+            ..
+        }
+    ) {
+        return Err(Failure::refused(
+            "managed_command_unsupported",
+            "Core deployment flags do not apply to managed API runs",
+        ));
+    }
     // Reject unsupported verbs and invalid requests before accessing credentials.
     match command {
         ClusterCommand::Plan { observe: true, .. } => {
@@ -762,6 +781,29 @@ pub(crate) async fn dispatch(cli: &Cli) -> Option<Output> {
             Some(Output::from_result(result, *json, 0))
         }
         Command::Cluster { command } => {
+            // Explicit root-addressed Core operations never discover or load
+            // mutable folder context, including managed credentials.
+            if cli.cluster.is_some()
+                && matches!(
+                    command,
+                    ClusterCommand::Apply { .. }
+                        | ClusterCommand::Status { .. }
+                        | ClusterCommand::ForceUnlock { .. }
+                        | ClusterCommand::UpgradeLedger { .. }
+                )
+            {
+                if managed_flags(command) {
+                    return Some(Output::from_result(
+                        Err(Failure::refused(
+                            "managed_scope_conflict",
+                            "root-addressed Core operations do not accept managed run arguments",
+                        )),
+                        config_and_json(command).1,
+                        2,
+                    ));
+                }
+                return None;
+            }
             let (config, json) = config_and_json(command);
             if lifecycle::handles(command) {
                 return Some(match lifecycle::dispatch(cli, command).await {

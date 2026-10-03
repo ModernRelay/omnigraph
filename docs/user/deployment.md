@@ -8,6 +8,10 @@ and exposes its ready applied graphs under `/graphs/{id}/…`; use
 Start with [Operating a cluster](clusters/index.md) to create and apply the
 deployment bundle.
 
+Servers use the v0.12 HTTP contract and open graph storage format v13. The
+cluster ledger has a separate version: explicitly converting it to v2 preserves
+graph data and history. See [offline deployments](clusters/index.md#durable-offline-deployments).
+
 ## Binary
 
 ```bash
@@ -86,6 +90,8 @@ status or a transient storage category alone does not establish that proof.
 A clean drain exits 0. Set the orchestrator's own
 termination grace longer than this value; a cutoff is crash-equivalent for the
 work it interrupts, and the next open recovers it as after any crash.
+For a v2 cluster, even a clean exit retains its cluster lock. Follow the
+[ownership-transfer procedure](#writer-topology) before starting the next owner.
 
 ## Admission limits
 
@@ -205,21 +211,44 @@ OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-service":"secret"}' \
       --bind 0.0.0.0:8080
 ```
 
-Use the same wrapper for bootstrap/apply jobs, direct graph writers, and
-maintenance. The container entrypoint wraps an `az://` cluster automatically.
+Use the same wrapper with `--mode job` and the same canonical `--root` for
+bootstrap/apply jobs, `cluster upgrade-ledger`, root-addressed reconciliation,
+`cluster force-unlock`, direct graph writers, and maintenance. Root-addressed
+deployment status is read-only and does not need the lease. A v2 cluster's persisted
+lock is additional admission; it does not replace the Azure lease or its
+qualification boundary. The container entrypoint wraps an `az://` cluster automatically.
 Replica-count settings are not a correctness fence: the admission lease is.
 
 The checked-in [Azure reference deployment](../../deploy/azure/README.md)
 contains the supported Container Apps topology, validation command, and
-stuck-lease runbook. Do not break a lease until the owner has been identified
-and stopped.
+stuck-lease runbook. A stranded Azure lease and a retained v2 cluster lock are
+separate: complete the lease recovery procedure before starting a wrapped
+cluster-unlock or reconciliation job. Do not break a lease until the owner has
+been identified and stopped.
 
 ## Writer topology
 
-Run one mutation-capable writer process per cluster unless an external system
-provides equivalent writer ownership. This includes servers, direct CLI writes,
-`cluster apply`, and maintenance. A cluster state lock serializes control-plane
-operations but does not by itself fence graph writers.
+Run one mutation-capable writer process per cluster. This includes servers,
+direct CLI writes, deployments, branch controls, and maintenance. On a v2
+cluster, supported server and direct CLI paths acquire the same exclusive
+cluster admission before graph work and recheck the applied inventory. An
+outstanding deployment admits only reconciliation of its exact original ID.
+Keep older binaries, raw storage tools and embedded writers outside this
+cooperating boundary stopped; the lock cannot fence their native storage I/O.
+
+Admission remains held after ordinary command success, a completed deployment,
+server shutdown, failure or abandonment. A finished response, zero active HTTP
+requests, lock age or a stopped PID alone does not prove that previously
+accepted storage writes have settled. Before transferring ownership, stop the
+prior owner and establish that its graph work and control-store I/O are terminal.
+Exclude new admissions and other unlock attempts until the exact-ID unlock
+finishes. Then start the next owner. Use the root-addressed
+[status and recovery commands](clusters/index.md#inspect-and-recover-a-deployment)
+to obtain the lock ID; unlocking never resolves an uncertain deployment.
+
+On a v1 cluster, the state lock still serializes control operations only;
+operators provide graph-writer exclusion. Convert explicitly before relying on
+the v2 admission behavior.
 
 Read replicas and zero-downtime overlapping writer replicas are not currently a
 supported topology. Prefer stop-then-start replacement for a mutation-capable
@@ -248,6 +277,6 @@ Back up the whole cluster root, not selected physical files. Before a release:
 4. upgrade the fleet together;
 5. restart and run representative reads and writes.
 
-When a release changes the storage format, follow the
-[export/rebuild guide](operations/upgrade.md) instead of attempting an in-place
-migration.
+Graph-format upgrades and cluster-ledger conversion are separate operations.
+Follow the [storage upgrade guide](operations/upgrade.md) for qualified format
+routes; `cluster upgrade-ledger` never resets or rewrites graph history.

@@ -208,12 +208,43 @@ Prefer relative paths; they are what keep a bundle portable and hermetic.
 | `refresh` | state only | Refresh observations for declared graphs |
 | `import` | state only | Adopt existing declared resources |
 | `force-unlock` | yes | Remove one proven-stale lock by exact ID |
+| `upgrade-ledger` | state only | Convert an applied, stopped cluster to durable offline deployments |
 
-`apply` can create graphs, apply supported schema changes, publish query
+On a v1 ledger, `apply` can create graphs, apply supported schema changes, publish query
 and policy resources, and execute approved graph deletion. It does not load
 graph data or start servers. A schema drop removes the data from the branch
 head and reclaims nothing at apply; `omnigraph cleanup` is the step that makes
 it unrecoverable. The plan shows such a step as `drop_property` or `drop_type`,
 with no mode.
+
+After explicit conversion to a v2 ledger, apply supports only schema and stored
+query changes on existing graphs, and requires `state.lock: true`. Other
+bindings and inventory remain fixed. Root-addressed status, reconciliation and
+conversion do not use `cluster.yaml`; see [the deployment workflow](index.md#durable-offline-deployments).
+
+## Limits
+
+Configuration loading refuses limits before schema effects. Shared files with
+identical bytes count once toward the aggregate source limit.
+
+| Resource | Limit |
+|---|---:|
+| Each `cluster.yaml`, schema, query or policy source | 1 MiB |
+| Distinct source bytes in one captured bundle | 8 MiB |
+| Declared resources (each graph and schema count separately) | 4096 |
+| Query discovery paths plus directory entries, including ignored files | 4096 |
+| Encoded immutable deployment bundle | 16 MiB |
+| Encoded cluster ledger | 16 MiB |
+| Lock metadata read | 64 KiB |
+| Outstanding deployments | 1 |
+| Retained deployment results | 32 records, 4 MiB total, 1 MiB each |
+| Deployment actor / resource address / canonical root | 256 / 512 / 4096 UTF-8 bytes |
+
+Deployment admission checks the actual encoded prepared intents and reserves
+ledger/result space to record completion before accepting schema effects.
+JSON escaping and prepared state can make a deployment exceed its encoded limit
+even when raw source bytes fit. Result history may evict older completed records
+to admit a new deployment; outstanding authority is retained. These bounds do
+not cap graph data, native manifest-history scans or total process memory.
 
 See [Operating a cluster](index.md) for the end-to-end workflow.

@@ -214,6 +214,10 @@ pub struct ServerConfig {
     /// in-flight requests drain, and at this deadline the process exits 2
     /// (RFC 0049). Resolved by [`resolve_shutdown_grace`]; default 25 s.
     pub shutdown_grace: std::time::Duration,
+    /// Root-wide v2 admission captured before the serving snapshot. It is
+    /// retained through startup and serving, including failed startup/shutdown;
+    /// dropping settings never removes the persisted lock.
+    pub cluster_admission: Option<omnigraph_cluster::ClusterAdmission>,
 }
 
 /// Applied server settings paired with already validated offline token trust.
@@ -373,6 +377,9 @@ pub struct GraphRouting {
 
 #[derive(Clone)]
 pub struct AppState {
+    // All router/state clones retain the same root ownership. Normal HTTP
+    // drain is not qualified native settlement, so the server never unlocks.
+    cluster_admission: Option<omnigraph_cluster::ClusterAdmission>,
     /// Runtime routing and availability for every configured graph.
     /// Middleware injects a ready `Arc<GraphHandle>` or refuses a blocked
     /// graph before collecting its request body.
@@ -614,8 +621,13 @@ impl AppState {
         bearer_tokens: Vec<(String, String)>,
     ) -> Result<Self> {
         let uri = normalize_root_uri(&uri.into()).wrap_err("normalize graph URI")?;
+        let admission = acquire_server_graph_admission(&uri).await?;
+        let expected = expected_server_schema_contract(admission.as_ref(), &uri)?;
         let db = Omnigraph::open(&uri).await?;
-        Ok(Self::new_with_bearer_tokens(uri, db, bearer_tokens))
+        verify_server_schema_contract(&db, expected.as_ref())?;
+        let mut state = Self::new_with_bearer_tokens(uri, db, bearer_tokens);
+        state.cluster_admission = admission;
+        Ok(state)
     }
 
     pub async fn open_with_bearer_tokens_and_policy(
@@ -658,24 +670,29 @@ impl AppState {
         // already been rejected — no second bail needed.
         let uri = normalize_root_uri(&uri.into()).wrap_err("normalize graph URI")?;
         let graph_id = graph_id.unwrap_or_else(|| uri.clone());
+        let admission = acquire_server_graph_admission(&uri).await?;
+        let expected = expected_server_schema_contract(admission.as_ref(), &uri)?;
+        let policy_engine = match policy_file {
+            Some(path) => Some(PolicyEngine::load_graph(path, &graph_id)?),
+            None => None,
+        };
         let db = Omnigraph::open(&uri).await?;
+        verify_server_schema_contract(&db, expected.as_ref())?;
 
         // Validate the registry against the live schema and resolve it to
         // an attachable handle (refuse boot on breakage).
         let registry = validate_and_attach(queries, &db.catalog(), &graph_id)?;
 
-        let policy_engine = match policy_file {
-            Some(path) => Some(PolicyEngine::load_graph(path, &graph_id)?),
-            None => None,
-        };
-        Ok(Self::new_single_with_queries(
+        let mut state = Self::new_single_with_queries(
             uri,
             db,
             bearer_tokens,
             policy_engine,
             workload::WorkloadController::from_env(),
             registry,
-        ))
+        );
+        state.cluster_admission = admission;
+        Ok(state)
     }
 
     /// Single-graph convenience construction (RFC-011 cluster-only):
@@ -722,6 +739,7 @@ impl AppState {
                 .expect("a single handle never collides on graph id"),
         );
         Self {
+            cluster_admission: None,
             routing: GraphRouting {
                 registry,
                 config_path: None,
@@ -773,6 +791,7 @@ impl AppState {
         let bearer_tokens = hash_bearer_tokens(bearer_tokens);
         let registry = Arc::new(GraphRegistry::from_entries(entries)?);
         Ok(Self {
+            cluster_admission: None,
             routing: GraphRouting {
                 registry,
                 config_path,
@@ -2024,15 +2043,18 @@ mod external_blob_startup_tests {
         .unwrap();
         let policy = omnigraph::ExternalBlobPolicy::allow(vec![base]).unwrap();
 
-        let opened = open_single_graph(GraphStartupConfig {
-            startup_failure: None,
-            graph_id: "knowledge".to_string(),
-            uri: graph.to_string_lossy().into_owned(),
-            policy: None,
-            embedding: None,
-            external_blob_policy: policy,
-            queries: QueryRegistry::default(),
-        })
+        let opened = open_single_graph(
+            GraphStartupConfig {
+                startup_failure: None,
+                graph_id: "knowledge".to_string(),
+                uri: graph.to_string_lossy().into_owned(),
+                policy: None,
+                embedding: None,
+                external_blob_policy: policy,
+                queries: QueryRegistry::default(),
+            },
+            None,
+        )
         .await
         .unwrap();
         let data = format!(
@@ -2076,15 +2098,18 @@ mod external_blob_startup_tests {
         }))
         .unwrap();
 
-        let result = open_single_graph(GraphStartupConfig {
-            startup_failure: None,
-            graph_id: "knowledge".to_string(),
-            uri: graph.to_string_lossy().into_owned(),
-            policy: None,
-            embedding: None,
-            external_blob_policy: policy,
-            queries: QueryRegistry::default(),
-        })
+        let result = open_single_graph(
+            GraphStartupConfig {
+                startup_failure: None,
+                graph_id: "knowledge".to_string(),
+                uri: graph.to_string_lossy().into_owned(),
+                policy: None,
+                embedding: None,
+                external_blob_policy: policy,
+                queries: QueryRegistry::default(),
+            },
+            None,
+        )
         .await;
         let error = match result {
             Ok(_) => panic!("server must refuse a forged server-safe file base"),
@@ -2116,7 +2141,7 @@ mod external_blob_startup_tests {
             external_blob_policy: omnigraph::ExternalBlobPolicy::Deny,
             queries: QueryRegistry::default(),
         };
-        let error = match open_single_graph(cfg.clone()).await {
+        let error = match open_single_graph(cfg.clone(), None).await {
             Ok(_) => panic!("invalid policy must refuse"),
             Err(error) => error,
         };
@@ -2534,12 +2559,13 @@ async fn serve_config(
                 config = %config_path.display(),
                 "serving omnigraph"
             );
-            open_multi_graph_state(
+            open_multi_graph_state_admitted(
                 graphs,
                 tokens,
                 server_policy.as_ref(),
                 config_path,
                 config.require_all_graphs,
+                config.cluster_admission,
             )
             .await?
         }
@@ -2573,6 +2599,7 @@ async fn serve_config(
             shutdown_grace,
         )
         .with_process_defaults(process_defaults);
+    let retained_admission = state.cluster_admission.clone();
     let mut shutdown_rx = shutdown_rx;
     let served = axum::serve(listener, build_app(state))
         .with_graceful_shutdown(async move {
@@ -2595,6 +2622,13 @@ async fn serve_config(
         std::process::exit(2);
     }
     served?;
+    if let Some(owner) = retained_admission {
+        warn!(
+            root = %omnigraph::storage::redacted_storage_uri(owner.canonical_root()),
+            lock_id = %owner.lock_id(),
+            "v2 cluster admission retained after shutdown; establish prior graph/control I/O quiescence before exact-ID force-unlock"
+        );
+    }
     Ok(())
 }
 
@@ -2622,7 +2656,98 @@ pub async fn open_multi_graph_state(
     config_path: PathBuf,
     require_all_graphs: bool,
 ) -> Result<AppState> {
+    open_multi_graph_state_admitted(
+        graphs,
+        tokens,
+        server_policy_source,
+        config_path,
+        require_all_graphs,
+        None,
+    )
+    .await
+}
+
+async fn acquire_server_graph_admission(
+    uri: &str,
+) -> Result<Option<omnigraph_cluster::ClusterAdmission>> {
+    omnigraph_cluster::acquire_graph_admission(
+        uri,
+        omnigraph_cluster::ClusterAdmissionPurpose::Serve,
+    )
+    .await
+    .map_err(|diagnostic| eyre!("[{}] {}", diagnostic.code, diagnostic.message))
+}
+
+fn expected_server_schema_contract(
+    admission: Option<&omnigraph_cluster::ClusterAdmission>,
+    uri: &str,
+) -> Result<Option<omnigraph::db::SchemaContractDigest>> {
+    admission
+        .map(|owner| {
+            owner
+                .expected_serving_schema_contract(uri)
+                .cloned()
+                .map_err(|diagnostic| eyre!("[{}] {}", diagnostic.code, diagnostic.message))
+        })
+        .transpose()
+}
+
+fn verify_server_schema_contract(
+    db: &Omnigraph,
+    expected: Option<&omnigraph::db::SchemaContractDigest>,
+) -> Result<()> {
+    if expected.is_some_and(|expected| expected != &db.schema_contract_digest()) {
+        bail!("[applied_schema_drift] graph differs from its achieved schema contract");
+    }
+    Ok(())
+}
+
+async fn open_multi_graph_state_admitted(
+    graphs: Vec<GraphStartupConfig>,
+    tokens: Vec<(String, String)>,
+    server_policy_source: Option<&PolicySource>,
+    config_path: PathBuf,
+    require_all_graphs: bool,
+    admission: Option<omnigraph_cluster::ClusterAdmission>,
+) -> Result<AppState> {
     use futures::StreamExt;
+
+    let mut admission = match admission {
+        Some(admission) => Some(admission),
+        None => omnigraph_cluster::acquire_serving_admission(&config_path.to_string_lossy())
+            .await
+            .map_err(|diagnostics| {
+                eyre!(
+                    "cluster startup admission refused: {}",
+                    diagnostics
+                        .iter()
+                        .map(|diagnostic| format!("[{}] {}", diagnostic.code, diagnostic.message))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            })?,
+    };
+    // Public construction helpers must not let a graph URI bypass the cluster
+    // door, or move a captured lease to an unrelated graph/root.
+    if admission.is_none() {
+        for graph in &graphs {
+            admission = acquire_server_graph_admission(&graph.uri).await?;
+            if admission.is_some() {
+                break;
+            }
+        }
+    }
+    if let Some(owner) = admission.as_ref() {
+        owner
+            .validate_serving()
+            .map_err(|diagnostic| eyre!("[{}] {}", diagnostic.code, diagnostic.message))?;
+        for graph in &graphs {
+            owner
+                .validate_graph_uri(&graph.uri)
+                .await
+                .map_err(|diagnostic| eyre!("[{}] {}", diagnostic.code, diagnostic.message))?;
+        }
+    }
 
     // Server-level policy (loaded once, applies to management endpoints).
     // The placeholder graph_id `"server"` is the sentinel the Cedar
@@ -2654,14 +2779,24 @@ pub async fn open_multi_graph_state(
         }
     }
 
+    // Capture each expected contract without opening engines. Contract checks
+    // belong to each graph's startup outcome, alongside open and policy errors.
+    let graphs = graphs
+        .into_iter()
+        .map(|cfg| {
+            let expected = expected_server_schema_contract(admission.as_ref(), &cfg.uri)?;
+            Ok((cfg, expected))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let configured_graphs = graphs.len();
     let results = futures::stream::iter(graphs)
-        .map(|cfg| async move {
+        .map(|(cfg, expected)| async move {
             let key = GraphKey::cluster(
                 GraphId::try_from(cfg.graph_id.clone()).expect("validated startup graph id"),
             );
             let uri = cfg.uri.clone();
-            match open_single_graph(cfg).await {
+            match open_single_graph(cfg, expected).await {
                 Ok(opened) => GraphEntry::Ready(opened.handle),
                 Err(error) => {
                     warn!(
@@ -2701,9 +2836,10 @@ pub async fn open_multi_graph_state(
     }
 
     let workload = workload::WorkloadController::from_env();
-    let state =
+    let mut state =
         AppState::new_multi_entries(results, tokens, server_policy, workload, Some(config_path))
             .map_err(|err| eyre!("multi-graph registry: {err}"))?;
+    state.cluster_admission = admission;
     Ok(state)
 }
 
@@ -2734,6 +2870,7 @@ impl std::fmt::Display for GraphOpenFailure {
 /// validated before the read-write open's local capability-probe effect.
 async fn open_single_graph(
     cfg: GraphStartupConfig,
+    expected: Option<omnigraph::db::SchemaContractDigest>,
 ) -> std::result::Result<OpenedGraph, GraphOpenFailure> {
     let initial_failure = |cause| GraphOpenFailure {
         failure: StartupFailure::OpenFailed,
@@ -2795,6 +2932,8 @@ async fn open_single_graph(
             eyre!("open graph '{}' at {}: {err}", graph_id, uri),
         )
     })?;
+    verify_server_schema_contract(&db, expected.as_ref())
+        .map_err(|cause| failure(StartupFailure::OpenFailed, cause))?;
     let db = db
         .with_external_blob_policy(external_blob_policy)
         .map_err(|err| {

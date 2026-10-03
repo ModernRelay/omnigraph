@@ -42,6 +42,209 @@ async fn cluster_management_policy_can_boot_beside_legacy_catalog_rules() {
     );
 }
 
+#[tokio::test]
+async fn v2_settings_capture_holds_admission_across_drop_and_refuses_another_server() {
+    let temp = converged_cluster_dir("").await;
+    let root = format!("file://{}", temp.path().display());
+    omnigraph_cluster::upgrade_deployment_ledger(
+        &root,
+        true,
+        &omnigraph_cluster::DeploymentCaller::storage_owner(None),
+    )
+    .await
+    .unwrap();
+    let state_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+    let settings = cluster_settings(temp.path()).await.unwrap();
+    let owner = settings.cluster_admission.as_ref().unwrap();
+    let lock_id = owner.lock_id().to_string();
+    assert_eq!(
+        owner.canonical_root(),
+        format!(
+            "file://{}",
+            fs::canonicalize(temp.path()).unwrap().display()
+        )
+    );
+    let blocked = cluster_settings(temp.path()).await.unwrap_err();
+    assert!(blocked.to_string().contains("state_lock_held"), "{blocked}");
+    drop(settings);
+    let lock: Value =
+        serde_json::from_slice(&fs::read(temp.path().join("__cluster/lock.json")).unwrap())
+            .unwrap();
+    assert_eq!(lock["lock_id"], lock_id);
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        state_before
+    );
+    let graph = temp.path().join("graphs/knowledge.omni");
+    let blocked = AppState::open_with_bearer_tokens(graph.to_string_lossy(), Vec::new()).await;
+    assert!(
+        blocked
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("state_lock_held")
+    );
+}
+
+#[tokio::test]
+async fn v2_direct_server_open_keeps_the_lock_after_all_router_clones_drop() {
+    let temp = converged_cluster_dir("").await;
+    let root = format!("file://{}", temp.path().display());
+    omnigraph_cluster::upgrade_deployment_ledger(
+        &root,
+        true,
+        &omnigraph_cluster::DeploymentCaller::storage_owner(None),
+    )
+    .await
+    .unwrap();
+    let graph = temp.path().join("graphs/knowledge.omni");
+    let state = AppState::open_with_bearer_tokens(graph.to_string_lossy(), Vec::new())
+        .await
+        .unwrap();
+    let app = build_app(state.clone());
+    drop(state);
+    let blocked = cluster_settings(temp.path()).await.unwrap_err();
+    assert!(blocked.to_string().contains("state_lock_held"), "{blocked}");
+    drop(app);
+    assert!(temp.path().join("__cluster/lock.json").exists());
+}
+
+#[tokio::test]
+async fn v2_startup_blocks_only_graphs_with_unavailable_or_changed_accepted_contracts() {
+    use omnigraph_server::{GraphId, GraphKey, RegistryLookup, ServerConfigMode};
+
+    for fault in ["missing", "replacement", "source_change"] {
+        let temp = converged_cluster_dir("  healthy:\n    schema: ./people.pg\n").await;
+        let root = format!("file://{}", temp.path().display());
+        let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
+        omnigraph_cluster::upgrade_deployment_ledger(&root, true, &caller)
+            .await
+            .unwrap();
+        // Model a storage holder outside supported admission. Only knowledge
+        // is damaged; the achieved healthy graph must remain serviceable.
+        let graph = temp.path().join("graphs/knowledge.omni");
+        let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+        let original = db.schema_contract_digest();
+        if fault == "source_change" {
+            db.apply_schema_as("node Person {\n  name: String @key\n  age: I32?\n}\n", None)
+                .await
+                .unwrap();
+        }
+        drop(db);
+        if fault != "source_change" {
+            fs::remove_dir_all(&graph).unwrap();
+        }
+        if fault == "replacement" {
+            let source = fs::read_to_string(temp.path().join("people.pg")).unwrap();
+            let replacement = Omnigraph::init(graph.to_str().unwrap(), &source)
+                .await
+                .unwrap();
+            let replaced = replacement.schema_contract_digest();
+            assert_eq!(replaced.source_hash, original.source_hash);
+            assert_ne!(
+                replaced.schema_identity_domain,
+                original.schema_identity_domain
+            );
+        }
+        let ledger = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+        let mut settings = cluster_settings(temp.path()).await.unwrap();
+        // Metadata-only settings capture has opened no engine. Explicitly
+        // release that test owner so the public startup helper acquires its own.
+        settings
+            .cluster_admission
+            .take()
+            .unwrap()
+            .release_after_settlement()
+            .await
+            .unwrap();
+        let ServerConfigMode::Multi {
+            graphs,
+            config_path,
+            server_policy,
+        } = settings.mode;
+        let state = omnigraph_server::open_multi_graph_state(
+            graphs.clone(),
+            Vec::new(),
+            server_policy.as_ref(),
+            config_path.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                state
+                    .routing()
+                    .registry
+                    .get(&GraphKey::cluster(GraphId::try_from("healthy").unwrap())),
+                RegistryLookup::Ready(_)
+            ),
+            "{fault}"
+        );
+        assert!(
+            matches!(
+                state
+                    .routing()
+                    .registry
+                    .get(&GraphKey::cluster(GraphId::try_from("knowledge").unwrap())),
+                RegistryLookup::Blocked(_)
+            ),
+            "{fault}"
+        );
+        let app = build_app(state);
+        let (status, readiness) = json_response(&app, get_request("/readyz", "")).await;
+        assert_eq!(status, StatusCode::OK, "{fault}: {readiness}");
+        assert_eq!(readiness["status"], "degraded");
+        assert_eq!(readiness["ready_graph_count"], 1);
+        assert_eq!(readiness["blocked_graph_count"], 1);
+        for (id, expected) in [
+            ("healthy", StatusCode::OK),
+            ("knowledge", StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let (status, _) =
+                json_response(&app, get_request(&format!("/graphs/{id}/snapshot"), "")).await;
+            assert_eq!(status, expected, "{fault}: {id}");
+        }
+        drop(app);
+        let status = omnigraph_cluster::deployment_status(&root, None, &caller)
+            .await
+            .unwrap();
+        omnigraph_cluster::force_unlock_storage_root(&root, status.lock_id.as_deref().unwrap())
+            .await
+            .unwrap();
+
+        let error = omnigraph_server::open_multi_graph_state(
+            graphs,
+            Vec::new(),
+            server_policy.as_ref(),
+            config_path,
+            true,
+        )
+        .await
+        .err()
+        .expect("strict startup must refuse the blocked graph");
+        assert!(
+            error.to_string().contains("strict multi-graph startup"),
+            "{fault}: {error}"
+        );
+        let status = omnigraph_cluster::deployment_status(&root, None, &caller)
+            .await
+            .unwrap();
+        omnigraph_cluster::force_unlock_storage_root(&root, status.lock_id.as_deref().unwrap())
+            .await
+            .unwrap();
+        let healthy = temp.path().join("graphs/healthy.omni");
+        let direct = AppState::open_with_bearer_tokens(healthy.to_string_lossy(), Vec::new())
+            .await
+            .unwrap();
+        drop(direct);
+        assert_eq!(
+            fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+            ledger
+        );
+    }
+}
+
 /// External consumers may construct and exhaustively destructure the legacy
 /// public settings and identity records without opting into managed trust.
 #[test]
@@ -59,6 +262,7 @@ fn legacy_public_struct_literals_and_destructuring_compile() {
         require_all_graphs,
         witness,
         shutdown_grace,
+        cluster_admission,
     } = ServerConfig {
         mode: ServerConfigMode::Multi {
             graphs: vec![],
@@ -70,6 +274,7 @@ fn legacy_public_struct_literals_and_destructuring_compile() {
         require_all_graphs: false,
         witness: BootWitness::default(),
         shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
+        cluster_admission: None,
     };
     assert!(matches!(mode, ServerConfigMode::Multi { .. }));
     assert_eq!(bind, "127.0.0.1:0");
@@ -77,6 +282,7 @@ fn legacy_public_struct_literals_and_destructuring_compile() {
     assert!(witness.booted_serving_digest.is_none() && witness.state_cas.is_none());
     assert_eq!(witness.state_revision, 0);
     assert_eq!(shutdown_grace, DEFAULT_SHUTDOWN_GRACE);
+    assert!(cluster_admission.is_none());
 
     let ServingSnapshot {
         graphs,
@@ -123,32 +329,43 @@ fn legacy_public_struct_literals_and_destructuring_compile() {
 
 #[tokio::test]
 async fn data_trust_root_mismatch_refuses_before_recovery_open() {
-    let tokens = data_tokens::DataTokens::new();
-    let temp = converged_cluster_dir("").await;
-    let graph = temp.path().join("graphs/knowledge.omni");
-    let recovery = graph.join("__recovery");
-    fs::create_dir_all(&recovery).unwrap();
-    fs::write(recovery.join("unresolved.json"), "malformed sidecar").unwrap();
-    assert!(matches!(
-        Omnigraph::open(graph.to_str().unwrap()).await,
-        Err(omnigraph::error::OmniError::RecoveryRequired { .. })
-    ));
-    let trust_path = temp.path().join("trust.json");
-    fs::write(&trust_path, serde_json::to_vec(&tokens.document).unwrap()).unwrap();
-    let result = omnigraph_server::load_server_settings_with_data_token_trust(
-        Some(&temp.path().to_path_buf()),
-        Some("127.0.0.1:0".into()),
-        true,
-        true,
-        &trust_path,
-    )
-    .await;
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("serving-root binding")
-    );
+    for v2 in [false, true] {
+        let tokens = data_tokens::DataTokens::new();
+        let temp = converged_cluster_dir("").await;
+        if v2 {
+            omnigraph_cluster::upgrade_deployment_ledger(
+                &format!("file://{}", temp.path().display()),
+                true,
+                &omnigraph_cluster::DeploymentCaller::storage_owner(None),
+            )
+            .await
+            .unwrap();
+        }
+        let graph = temp.path().join("graphs/knowledge.omni");
+        let recovery = graph.join("__recovery");
+        fs::create_dir_all(&recovery).unwrap();
+        fs::write(recovery.join("unresolved.json"), "malformed sidecar").unwrap();
+        assert!(matches!(
+            Omnigraph::open(graph.to_str().unwrap()).await,
+            Err(omnigraph::error::OmniError::RecoveryRequired { .. })
+        ));
+        let trust_path = temp.path().join("trust.json");
+        fs::write(&trust_path, serde_json::to_vec(&tokens.document).unwrap()).unwrap();
+        let result = omnigraph_server::load_server_settings_with_data_token_trust(
+            Some(&temp.path().to_path_buf()),
+            Some("127.0.0.1:0".into()),
+            true,
+            true,
+            &trust_path,
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("serving-root binding")
+        );
+    }
 }
 
 #[tokio::test]
@@ -1181,6 +1398,7 @@ mod owned_shutdown {
             require_all_graphs: true,
             witness: Default::default(),
             shutdown_grace: grace,
+            cluster_admission: None,
         }
     }
 
@@ -1191,6 +1409,20 @@ mod owned_shutdown {
             return;
         };
         let mode = std::env::var(MODE).unwrap();
+        if mode.starts_with("v2-") {
+            let mut config = omnigraph_server::load_server_settings(
+                Some(&root),
+                Some("127.0.0.1:0".into()),
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+            config.shutdown_grace = Duration::from_secs(5);
+            omnigraph_server::serve(config).await.unwrap();
+            fs::write(root.join("serve-returned"), b"returned").unwrap();
+            std::process::exit(0);
+        }
         let cutoff = mode == "cutoff";
         if mode.starts_with("panic-") {
             use omnigraph::seams::catalog::{
@@ -1206,7 +1438,11 @@ mod owned_shutdown {
                 fs::write(fault_root.join("fault-reached"), b"reached").unwrap();
                 panic!("contained owned-server engine panic");
             });
-            let _ = omnigraph_server::serve(server_config(&root, Duration::from_secs(10))).await;
+            if let Err(error) =
+                omnigraph_server::serve(server_config(&root, Duration::from_secs(10))).await
+            {
+                eprintln!("{mode}: production server failed: {error:?}");
+            }
             fs::write(root.join("serve-returned"), b"returned").unwrap();
             std::process::exit(91);
         }
@@ -1253,6 +1489,9 @@ mod owned_shutdown {
             Duration::from_secs(if cutoff { 2 } else { 10 }),
         ))
         .await;
+        if let Err(error) = &result {
+            eprintln!("{mode}: production server failed: {error:?}");
+        }
         // Immediate exit makes a premature serve return observable even if a
         // blocked runtime worker would otherwise delay Tokio's destructor.
         fs::write(root.join("serve-returned"), b"returned").unwrap();
@@ -1268,12 +1507,37 @@ mod owned_shutdown {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn disconnected_write_and_shutdown_share_ownership() {
-        for mode in ["finish", "cutoff", "panic-before", "panic-after"] {
+        for mode in [
+            "finish",
+            "cutoff",
+            "panic-before",
+            "panic-after",
+            "v2-finish",
+            "v2-crash",
+        ] {
             let cutoff = mode == "cutoff";
             let panic = mode.starts_with("panic-");
-            let temp = init_loaded_graph().await;
+            let v2 = mode.starts_with("v2-");
+            let temp = if v2 {
+                let temp = converged_cluster_dir("").await;
+                omnigraph_cluster::upgrade_deployment_ledger(
+                    &format!("file://{}", temp.path().display()),
+                    true,
+                    &omnigraph_cluster::DeploymentCaller::storage_owner(None),
+                )
+                .await
+                .unwrap();
+                temp
+            } else {
+                init_loaded_graph().await
+            };
             let root = temp.path();
-            let graph = graph_path(root);
+            let graph = if v2 {
+                root.join("graphs/knowledge.omni")
+            } else {
+                graph_path(root)
+            };
+            let ledger_before = v2.then(|| fs::read(root.join("__cluster/state.json")).unwrap());
             let before = Omnigraph::open_read_only(graph.to_str().unwrap())
                 .await
                 .unwrap()
@@ -1312,9 +1576,22 @@ mod owned_shutdown {
             });
             let address = listen_rx
                 .recv_timeout(Duration::from_secs(15))
-                .expect("production listener did not start");
+                .unwrap_or_else(|error| {
+                    panic!("{mode}: production listener did not start: {error}")
+                });
             let fault_started = Instant::now();
-            if panic {
+            let retained_lock = v2.then(|| fs::read(root.join("__cluster/lock.json")).unwrap());
+            if v2 {
+                let signal = if mode == "v2-crash" {
+                    libc::SIGKILL
+                } else {
+                    libc::SIGTERM
+                };
+                assert_eq!(
+                    unsafe { libc::kill(child.0.id() as libc::pid_t, signal) },
+                    0
+                );
+            } else if panic {
                 let mut response = String::new();
                 // The response may be lost as fatal shutdown begins; the
                 // fault marker and process exit are the independent oracle.
@@ -1360,6 +1637,27 @@ mod owned_shutdown {
                 );
                 std::thread::sleep(Duration::from_millis(10));
             };
+            if v2 {
+                if mode == "v2-finish" {
+                    assert_eq!(status.code(), Some(0));
+                    assert!(root.join("serve-returned").exists());
+                } else {
+                    use std::os::unix::process::ExitStatusExt;
+                    assert_eq!(status.signal(), Some(libc::SIGKILL));
+                }
+                output_thread.join().unwrap();
+                assert_eq!(
+                    fs::read(root.join("__cluster/lock.json")).unwrap(),
+                    retained_lock.unwrap()
+                );
+                assert_eq!(
+                    fs::read(root.join("__cluster/state.json")).unwrap(),
+                    ledger_before.unwrap()
+                );
+                let refusal = cluster_settings(root).await.unwrap_err();
+                assert!(refusal.to_string().contains("state_lock_held"), "{refusal}");
+                continue;
+            }
             assert_eq!(
                 status.code(),
                 Some(if mode == "finish" { 0 } else { 2 }),

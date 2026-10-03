@@ -24,14 +24,19 @@ use ulid::Ulid;
 
 pub mod seams;
 
+mod admission;
 mod authorization;
 mod config;
+mod deployment;
 mod diff;
 mod serve;
 mod state_lock;
 mod store;
 mod sweep;
 mod types;
+pub use admission::{
+    ClusterAdmission, ClusterAdmissionPurpose, acquire_cluster_admission, acquire_graph_admission,
+};
 pub use authorization::{
     AuthorizedApplyOutput, AuthorizedEffect, AuthorizedPlanOutput, IdentityAuthorization,
     PlanAuthorization, PlanReadAuthorization, PolicyAuthorizationCheck, authorize_apply_plan,
@@ -42,6 +47,7 @@ use config::{
     parse_cluster_config, preview_schema_migration, schema_address, state_resource_digests,
     validate_cluster_header,
 };
+pub use deployment::*;
 use diff::{
     FailedGraphOrigin, ResourceKind, append_embedding_profile_changes,
     append_policy_binding_changes, approved_resources, classify_changes, compute_approvals,
@@ -50,8 +56,9 @@ use diff::{
 #[cfg(any(test, feature = "test-util"))]
 pub use serve::read_serving_snapshot_with_display_root;
 pub use serve::{
-    RootBoundServingSnapshot, ServingBlockedGraph, ServingGraph, ServingPolicy, ServingQuery,
-    ServingSnapshot, cluster_graph_ids, cluster_root_for_graph_uri,
+    AdmittedServingSnapshot, RootBoundServingSnapshot, ServingBlockedGraph, ServingGraph,
+    ServingPolicy, ServingQuery, ServingSnapshot, acquire_serving_admission,
+    admit_serving_snapshot, cluster_graph_ids, cluster_root_for_graph_uri,
     read_root_bound_serving_snapshot, read_root_bound_serving_snapshot_from_storage,
     read_serving_snapshot, read_serving_snapshot_from_storage, resolve_graph_storage_uri,
 };
@@ -600,6 +607,22 @@ async fn apply_config_dir_impl(
             diagnostics,
         );
     };
+
+    if state.version == 2 {
+        diagnostics.push(Diagnostic::error(
+            "offline_deployment_required",
+            CLUSTER_STATE_FILE,
+            "ledger v2 requires durable deployment execution; legacy apply/sweep is disabled",
+        ));
+        return early_return(
+            display_path(&desired.config_dir),
+            Some(desired.config_digest),
+            observations,
+            Vec::new(),
+            state.resource_statuses,
+            diagnostics,
+        );
+    }
 
     // State metadata is an authority boundary. Validate the as-read graph
     // composites before the recovery sweep can reuse any embedded policy or
@@ -1502,6 +1525,14 @@ pub async fn approve_config_dir(
             return fail(display_path(&desired.config_dir), diagnostics);
         }
     };
+    if state.version == 2 {
+        diagnostics.push(Diagnostic::error(
+            "offline_deployment_required",
+            CLUSTER_STATE_FILE,
+            "legacy approvals cannot mutate a v2 deployment ledger",
+        ));
+        return fail(display_path(&desired.config_dir), diagnostics);
+    }
 
     let prior_resources = state_resource_digests(&state);
     let changes = diff_resources(&prior_resources, &desired.resource_digests);
@@ -1795,6 +1826,30 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
             };
         }
     };
+
+    if snapshot
+        .state
+        .as_ref()
+        .is_some_and(|state| state.version == 2)
+        && !matches!(operation, StateSyncOperation::Observe)
+    {
+        diagnostics.push(Diagnostic::error(
+            "offline_deployment_required",
+            CLUSTER_STATE_FILE,
+            "legacy import/refresh cannot mutate a v2 deployment ledger",
+        ));
+        return StateSyncOutput {
+            ok: false,
+            operation,
+            authority,
+            config_dir: display_path(&desired.config_dir),
+            state_observations: observations,
+            resource_digests: BTreeMap::new(),
+            resource_statuses: BTreeMap::new(),
+            observations: BTreeMap::new(),
+            diagnostics,
+        };
+    }
 
     let expected_cas = snapshot.state_cas;
     let mut state = match (operation, snapshot.state) {

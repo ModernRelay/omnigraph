@@ -61,7 +61,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `cleanup` | Delete table versions that no retained graph commit pins, under an explicit retention policy ([Maintenance](../operations/maintenance.md#cleanup)) | direct |
 | `graphs list` | List graph metadata or minimal identity discovery | served |
 | `queries list/validate` | Inspect or validate a cluster query registry | cluster |
-| `cluster validate/plan/apply/...` | Operate declarative cluster state | cluster config or managed context |
+| `cluster validate/plan/apply/...` | Operate declarative state; [v2 deployment/recovery flags](../clusters/index.md#durable-offline-deployments) | config, explicit root, or managed context |
 | `policy validate/test/explain` | Validate or evaluate applied policy | cluster |
 | `embed` | Generate, clean, or refresh seed embeddings | local tooling |
 | `login`, `logout` | Manage a named server credential or a managed API session | local or managed API |

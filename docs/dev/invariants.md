@@ -138,7 +138,13 @@ different:
 ## Current support boundaries
 
 - The server is cluster-only. Runtime graph add/remove is performed by
-  `cluster apply` followed by restart, not an HTTP mutation.
+  v1 `cluster apply` followed by restart, not an HTTP mutation. Explicit
+  stopped-writer conversion to ledger v2 freezes inventory and bindings;
+  offline schema/query deployments use one outstanding durable authority and
+  retain exclusive cluster admission through completion and recovery. Server
+  activation still requires restart. Generic drain does not prove native-I/O
+  settlement or authorize lock release; older/raw/embedded writers outside
+  participating admission remain operator-excluded.
 - Azure writes require the admission wrapper and remain a qualification preview
   pending the adversarial live-Azure matrix. The narrower managed-identity
   smoke proof is complete.

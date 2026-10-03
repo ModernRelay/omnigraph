@@ -472,6 +472,7 @@ impl GraphClient {
     /// the source's own `set` lines apply per call, on top.
     async fn open_session(uri: &str, settings: &[(SettingId, SettingValue)]) -> Result<Session> {
         let (defaults, sources) = omnigraph::settings::from_env()?;
+        crate::admission::ensure_graph(uri).await?;
         crate::command_outcome::writable_open();
         let mut session = Arc::new(Omnigraph::open(uri).await?).session(defaults, sources);
         for (id, value) in settings {

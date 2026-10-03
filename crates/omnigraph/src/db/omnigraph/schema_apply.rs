@@ -7,8 +7,11 @@ const SCHEMA_BLOB_DESCRIPTOR_SCAN_ROWS: usize = 1024;
 const SCHEMA_BLOB_DESCRIPTOR_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 
 mod prepared;
+mod settlement;
 pub use prepared::{PreparedSchemaApply, SchemaApplyReconciliation, SchemaContractDigest};
 pub(super) use prepared::{prepare_schema_apply, reconcile_schema_apply};
+pub use settlement::{PreparedSchemaSettlement, SchemaApplySettlement, SchemaNonPublicationProof};
+pub(super) use settlement::{prepare_schema_settlement, settle_prepared_schema};
 
 fn resolve_desired_schema_ir(
     accepted_ir: &SchemaIR,
@@ -895,13 +898,14 @@ where
             desired_schema_source,
         )?));
 
-        let precondition = crate::db::manifest::PublishPrecondition::ExactGraphHead(
-            crate::db::manifest::GraphHeadExpectation::new(
+        let precondition = crate::db::manifest::PublishPrecondition::ExactGraphVersion {
+            authority: crate::db::manifest::GraphHeadExpectation::new(
                 None,
                 base_branch_identifier.clone(),
                 base_graph_head.clone(),
             ),
-        );
+            version: snapshot.graph_manifest_version(),
+        };
         let published = db
             .coordinator
             .write()

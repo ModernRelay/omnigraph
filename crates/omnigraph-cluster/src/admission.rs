@@ -1,0 +1,518 @@
+//! Root-wide ownership for the v2 offline deployment protocol.
+//!
+//! The persisted lock is exclusion among participating storage-owner doors;
+//! it is not native-I/O fencing or permission to reclaim an abandoned owner.
+
+use std::{collections::BTreeMap, sync::Arc};
+
+use omnigraph::db::SchemaContractDigest;
+
+use crate::state_lock::StateLockGuard;
+use crate::store::ClusterStore;
+use crate::{CLUSTER_STATE_FILE, Diagnostic};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClusterAdmissionPurpose {
+    Serve,
+    GraphOperation,
+    Deployment,
+    Reconcile { deployment_id: String },
+}
+
+impl ClusterAdmissionPurpose {
+    fn operation(&self) -> &'static str {
+        match self {
+            Self::Serve => "serve",
+            Self::GraphOperation => "graph_operation",
+            Self::Deployment => "deployment",
+            Self::Reconcile { .. } => "deployment_reconcile",
+        }
+    }
+}
+
+/// Lifetime admission to a v2 cluster. Clones share the same persisted lock.
+///
+/// Dropping this value never unlocks. In particular, returning from a command,
+/// draining HTTP owners, or stopping a runtime is not a native settlement proof.
+#[derive(Debug, Clone)]
+pub struct ClusterAdmission(Arc<AdmissionOwner>);
+
+#[derive(Debug)]
+struct AdmissionOwner {
+    store: ClusterStore,
+    guard: StateLockGuard,
+    canonical_root: String,
+    schema_contracts: BTreeMap<String, SchemaContractDigest>,
+    purpose: ClusterAdmissionPurpose,
+}
+
+impl ClusterAdmission {
+    pub fn canonical_root(&self) -> &str {
+        &self.0.canonical_root
+    }
+
+    pub fn lock_id(&self) -> &str {
+        self.0.guard.lock_id()
+    }
+
+    /// A recovery/deployment owner cannot be reinterpreted as a serving owner.
+    pub fn validate_serving(&self) -> Result<(), Diagnostic> {
+        if self.0.purpose != ClusterAdmissionPurpose::Serve {
+            return Err(Diagnostic::error(
+                "cluster_admission_purpose_mismatch",
+                "__cluster/lock.json",
+                "serving requires its own lifetime admission captured before the serving snapshot",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The exact achieved contract captured with this serving admission.
+    /// This lookup opens no engine. Startup compares it with each opened graph
+    /// independently, so an unavailable graph does not block healthy peers.
+    pub fn expected_serving_schema_contract(
+        &self,
+        graph_uri: &str,
+    ) -> Result<&SchemaContractDigest, Diagnostic> {
+        self.validate_serving()?;
+        let graph_id = self.admitted_graph_id(graph_uri)?;
+        Ok(self
+            .0
+            .schema_contracts
+            .get(&graph_id)
+            .expect("admitted graph"))
+    }
+
+    /// Explicitly release a uniquely owned admission after the caller has
+    /// proved all graph/native effects and accepted control I/O settled.
+    ///
+    /// This method does not establish that proof. Error, cancellation, an
+    /// outstanding clone, or abandonment retains the persisted lock. Operators
+    /// must exclude concurrent force-unlock/release; the backend has no
+    /// conditional-delete guarantee.
+    pub async fn release_after_settlement(self) -> Result<(), Diagnostic> {
+        let owner = Arc::try_unwrap(self.0).map_err(|owner| {
+            Diagnostic::error(
+                "cluster_admission_in_use",
+                "__cluster/lock.json",
+                format!(
+                    "admission {} still has live owners; retaining its lock",
+                    owner.guard.lock_id()
+                ),
+            )
+        })?;
+        let mut observations = owner.store.observations();
+        owner
+            .store
+            .force_unlock(owner.guard.lock_id(), &mut observations)
+            .await
+    }
+
+    /// Verify a graph's current membership while this root remains excluded.
+    /// Alias spellings are accepted only when they resolve inside this root's
+    /// canonical graph layout; graph symlinks escaping that layout are refused.
+    pub async fn validate_graph_uri(&self, graph_uri: &str) -> Result<(), Diagnostic> {
+        self.admitted_graph_id(graph_uri).map(|_| ())
+    }
+
+    fn admitted_graph_id(&self, graph_uri: &str) -> Result<String, Diagnostic> {
+        let canonical = canonical_graph_uri(graph_uri)?;
+        let expected_prefix = format!("{}/graphs/", self.canonical_root().trim_end_matches('/'));
+        let canonical = canonical_store_uri(&canonical)?;
+        let graph_id = canonical
+            .strip_prefix(&expected_prefix)
+            .and_then(|tail| tail.strip_suffix(".omni"))
+            .filter(|id| !id.is_empty() && !id.contains('/'))
+            .ok_or_else(|| {
+                Diagnostic::error(
+                    "cluster_graph_root_mismatch",
+                    omnigraph_storage::redacted_storage_uri(graph_uri),
+                    "graph root is outside the admitted cluster's canonical graph layout",
+                )
+            })?;
+        if !self.0.schema_contracts.contains_key(graph_id) {
+            return Err(Diagnostic::error(
+                "graph_not_applied",
+                format!("graph.{graph_id}"),
+                "graph is not in the admitted cluster's applied inventory",
+            ));
+        }
+        Ok(graph_id.to_string())
+    }
+}
+
+/// Admit a storage-owner operation addressed directly to its storage root.
+/// V1 is unchanged; conversion to v2 requires stopped-writer exclusion.
+pub async fn acquire_cluster_admission(
+    storage_root: &str,
+    purpose: ClusterAdmissionPurpose,
+) -> Result<Option<ClusterAdmission>, Diagnostic> {
+    let store = ClusterStore::for_storage_root(storage_root)?;
+    acquire_with_store(&store, purpose).await
+}
+
+/// Admit an embedded graph door before any writable open or native control.
+/// Standalone graphs and v1 clusters retain their existing admission contract.
+pub async fn acquire_graph_admission(
+    graph_uri: &str,
+    purpose: ClusterAdmissionPurpose,
+) -> Result<Option<ClusterAdmission>, Diagnostic> {
+    let Some(root) = crate::serve::cluster_root_for_graph_uri(graph_uri).await? else {
+        return Ok(None);
+    };
+    let admission = acquire_cluster_admission(&root, purpose).await?;
+    if let Some(owner) = admission {
+        if let Err(refusal) = owner.validate_graph_uri(graph_uri).await {
+            owner.release_after_settlement().await?;
+            return Err(refusal);
+        }
+        return Ok(Some(owner));
+    }
+    Ok(None)
+}
+
+pub(crate) async fn acquire_with_store(
+    store: &ClusterStore,
+    purpose: ClusterAdmissionPurpose,
+) -> Result<Option<ClusterAdmission>, Diagnostic> {
+    let mut observations = store.observations();
+    let state = store.read_state(&mut observations).await?.state;
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    if state.version == 1 {
+        return Ok(None);
+    }
+    let canonical_root = store.canonical_root()?;
+    let mut guard = store
+        .acquire_lock(purpose.operation(), &mut observations)
+        .await?;
+    // No awaited work may occur between receiving the lock and disabling the
+    // legacy destructor's unlock. Cancellation after this point fails closed.
+    guard.hold_on_drop();
+    let state = store
+        .read_state(&mut observations)
+        .await?
+        .state
+        .ok_or_else(missing_state)?;
+    if state.version != 2 {
+        return Err(Diagnostic::error(
+            "cluster_admission_version_changed",
+            CLUSTER_STATE_FILE,
+            "cluster version changed while acquiring admission; retaining the lock",
+        ));
+    }
+    let allowed = match (&purpose, state.outstanding_deployment_id()) {
+        (ClusterAdmissionPurpose::Reconcile { deployment_id }, Some(outstanding)) => {
+            deployment_id == outstanding
+        }
+        (ClusterAdmissionPurpose::Reconcile { .. }, None) => false,
+        (_, None) => true,
+        (_, Some(_)) => false,
+    };
+    if !allowed {
+        // Both control operations completed and no engine was opened. This is
+        // a typed pre-effect refusal, not inference from a writer's error.
+        store
+            .force_unlock(guard.lock_id(), &mut observations)
+            .await?;
+        return Err(Diagnostic::error(
+            "cluster_deployment_outstanding",
+            CLUSTER_STATE_FILE,
+            "only reconciliation of the exact outstanding deployment is admitted; serving and other writers are refused",
+        ));
+    }
+    let schema_contracts = state
+        .applied_revision
+        .schema_contracts
+        .expect("validated v2 state has exact achieved contracts");
+    Ok(Some(ClusterAdmission(Arc::new(AdmissionOwner {
+        store: store.clone(),
+        guard,
+        canonical_root,
+        schema_contracts,
+        purpose,
+    }))))
+}
+
+pub(crate) fn canonical_graph_uri(graph_uri: &str) -> Result<String, Diagnostic> {
+    omnigraph_storage::normalize_root_uri(graph_uri)
+        .and_then(|root| omnigraph_storage::write_queue_root_identity(&root))
+        .map_err(|error| {
+            Diagnostic::error(
+                "storage_root_invalid",
+                omnigraph_storage::redacted_storage_uri(graph_uri),
+                format!("could not resolve graph storage identity: {error}"),
+            )
+        })
+}
+
+fn canonical_store_uri(uri: &str) -> Result<String, Diagnostic> {
+    let kind = omnigraph_storage::storage_kind_for_uri(uri)
+        .map_err(|error| Diagnostic::error("storage_root_invalid", "storage", error.to_string()))?;
+    match kind {
+        omnigraph_storage::StorageKind::Local => {
+            Ok(format!("file://{}", uri.trim_start_matches("file://")))
+        }
+        _ => Ok(uri.to_string()),
+    }
+}
+
+fn missing_state() -> Diagnostic {
+    Diagnostic::error(
+        "cluster_state_missing",
+        CLUSTER_STATE_FILE,
+        "the admitted cluster no longer has applied state",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn state_fixture(version: u32, outstanding: bool) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("__cluster")).unwrap();
+        std::fs::create_dir_all(dir.path().join("graphs/knowledge.omni")).unwrap();
+        let mut state = json!({
+            "version": 1,
+            "state_revision": 1,
+            "applied_revision": {"resources": {
+                "graph.knowledge": {"digest": "a".repeat(64)},
+                "schema.knowledge": {"digest": "c".repeat(64)}
+            }}
+        });
+        if version == 2 {
+            state["version"] = json!(2);
+            state["mode"] = json!("offline");
+            state["ledger_id"] = json!("01K00000000000000000000000");
+            state["next_sequence"] = json!(if outstanding { 2 } else { 1 });
+            state["deployment_results"] = json!([]);
+            state["applied_revision"]["result_revision"] = json!(0);
+            state["applied_revision"]["schema_contracts"] = json!({
+                "knowledge": {
+                    "source_hash": "c".repeat(64),
+                    "schema_ir_hash": format!("sha256:{}", "e".repeat(64)),
+                    "schema_identity_domain": "01K00000000000000000000010",
+                    "schema_identity_version": 2
+                }
+            });
+            if outstanding {
+                state["outstanding"] = json!({
+                    "id": "01K00000000000000000000000:1:01K00000000000000000000001",
+                    "input_digest": "b".repeat(64),
+                    "authorization": {
+                        "version": 2,
+                        "ledger_id": "01K00000000000000000000000",
+                        "authority": {"kind": "storage_owner", "actor": null},
+                        "base": {"result_revision": 0, "resource_digests": {}, "schema_contracts": {}, "capture_cas": format!("sha256:{}", "d".repeat(64))},
+                        "input_digest": "b".repeat(64),
+                        "policy_digests": {},
+                        "effects": []
+                    },
+                    "graphs": {},
+                    "reserved_ledger_bytes": 4096,
+                    "reserved_result_bytes": 1024
+                });
+            }
+        }
+        let mut state: crate::types::ClusterState = serde_json::from_value(state).unwrap();
+        let digest = crate::expected_state_graph_resource_digest(
+            &state,
+            "knowledge",
+            &state.applied_revision.resources["graph.knowledge"],
+        );
+        state
+            .applied_revision
+            .resources
+            .get_mut("graph.knowledge")
+            .unwrap()
+            .digest = digest;
+        let resource_digests = crate::config::state_resource_digests(&state);
+        if let Some(pending) = &mut state.outstanding {
+            pending.authorization.base.resource_digests = resource_digests;
+            pending.authorization.base.schema_contracts =
+                state.applied_revision.schema_contracts.clone().unwrap();
+        }
+        std::fs::write(
+            dir.path().join(CLUSTER_STATE_FILE),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn v1_and_standalone_keep_existing_admission() {
+        let dir = state_fixture(1, false);
+        let graph = dir.path().join("graphs/knowledge.omni");
+        assert!(
+            acquire_graph_admission(graph.to_str().unwrap(), ClusterAdmissionPurpose::Serve)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!dir.path().join("__cluster/lock.json").exists());
+        assert!(
+            acquire_graph_admission(
+                dir.path().join("standalone.omni").to_str().unwrap(),
+                ClusterAdmissionPurpose::GraphOperation
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_admission_is_exclusive_and_abandonment_never_unlocks() {
+        let dir = state_fixture(2, false);
+        let root = dir.path().to_str().unwrap();
+        let owner = acquire_cluster_admission(root, ClusterAdmissionPurpose::GraphOperation)
+            .await
+            .unwrap()
+            .unwrap();
+        let lock_id = owner.lock_id().to_string();
+        let clone = owner.clone();
+        let error = owner.release_after_settlement().await.unwrap_err();
+        assert_eq!(error.code, "cluster_admission_in_use");
+        assert_eq!(clone.lock_id(), lock_id);
+        let blocked = acquire_cluster_admission(root, ClusterAdmissionPurpose::Deployment)
+            .await
+            .unwrap_err();
+        assert_eq!(blocked.code, "state_lock_held");
+        drop(clone);
+        assert!(dir.path().join("__cluster/lock.json").exists());
+        let blocked = acquire_graph_admission(
+            dir.path().join("graphs/knowledge.omni").to_str().unwrap(),
+            ClusterAdmissionPurpose::GraphOperation,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(blocked.code, "state_lock_held");
+    }
+
+    #[tokio::test]
+    async fn explicit_settled_release_allows_the_next_owner() {
+        let dir = state_fixture(2, false);
+        let root = dir.path().to_str().unwrap();
+        let owner = acquire_cluster_admission(root, ClusterAdmissionPurpose::GraphOperation)
+            .await
+            .unwrap()
+            .unwrap();
+        let graph = dir.path().join("graphs/knowledge.omni");
+        assert_eq!(
+            owner
+                .expected_serving_schema_contract(graph.to_str().unwrap())
+                .unwrap_err()
+                .code,
+            "cluster_admission_purpose_mismatch"
+        );
+        owner.release_after_settlement().await.unwrap();
+        assert!(!dir.path().join("__cluster/lock.json").exists());
+        let next = acquire_cluster_admission(root, ClusterAdmissionPurpose::Serve)
+            .await
+            .unwrap()
+            .unwrap();
+        let expected = next
+            .expected_serving_schema_contract(graph.to_str().unwrap())
+            .unwrap();
+        assert_eq!(expected.source_hash, "c".repeat(64));
+        // The admitted contract is metadata. Even an absent manifest does not
+        // prevent its capture; graph-open errors belong to per-graph startup.
+        assert!(!graph.join("__manifest").exists());
+        next.release_after_settlement().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn outstanding_allows_only_exact_original_reconciliation() {
+        let dir = state_fixture(2, true);
+        let root = dir.path().to_str().unwrap();
+        let state_before = std::fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+        for purpose in [
+            ClusterAdmissionPurpose::Serve,
+            ClusterAdmissionPurpose::GraphOperation,
+            ClusterAdmissionPurpose::Deployment,
+            ClusterAdmissionPurpose::Reconcile {
+                deployment_id: "01K00000000000000000000000:1:01K00000000000000000000002".into(),
+            },
+        ] {
+            let error = acquire_cluster_admission(root, purpose).await.unwrap_err();
+            assert_eq!(error.code, "cluster_deployment_outstanding");
+            assert!(!dir.path().join("__cluster/lock.json").exists());
+        }
+        let owner = acquire_cluster_admission(
+            root,
+            ClusterAdmissionPurpose::Reconcile {
+                deployment_id: "01K00000000000000000000000:1:01K00000000000000000000001".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+            state_before
+        );
+        owner.release_after_settlement().await.unwrap();
+        assert_eq!(
+            acquire_cluster_admission(root, ClusterAdmissionPurpose::Serve)
+                .await
+                .unwrap_err()
+                .code,
+            "cluster_deployment_outstanding"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graph_aliases_share_admission_and_inventory_cannot_escape_it() {
+        let dir = state_fixture(2, false);
+        let alias_dir = tempfile::tempdir().unwrap();
+        let alias = alias_dir.path().join("any-name");
+        std::os::unix::fs::symlink(dir.path().join("graphs/knowledge.omni"), &alias).unwrap();
+        let owner = acquire_graph_admission(
+            alias.to_str().unwrap(),
+            ClusterAdmissionPurpose::GraphOperation,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            acquire_cluster_admission(dir.path().to_str().unwrap(), ClusterAdmissionPurpose::Serve)
+                .await
+                .unwrap_err()
+                .code,
+            "state_lock_held"
+        );
+        owner.release_after_settlement().await.unwrap();
+        let unknown = dir.path().join("graphs/unknown.omni");
+        assert_eq!(
+            acquire_graph_admission(
+                unknown.to_str().unwrap(),
+                ClusterAdmissionPurpose::GraphOperation
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "graph_not_applied"
+        );
+        assert!(!dir.path().join("__cluster/lock.json").exists());
+
+        std::fs::remove_dir(dir.path().join("graphs/knowledge.omni")).unwrap();
+        std::os::unix::fs::symlink(alias_dir.path(), dir.path().join("graphs/knowledge.omni"))
+            .unwrap();
+        assert_eq!(
+            acquire_graph_admission(
+                dir.path().join("graphs/knowledge.omni").to_str().unwrap(),
+                ClusterAdmissionPurpose::GraphOperation
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "cluster_graph_root_mismatch"
+        );
+        assert!(!dir.path().join("__cluster/lock.json").exists());
+    }
+}
