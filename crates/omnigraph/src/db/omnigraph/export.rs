@@ -1,5 +1,6 @@
 use super::*;
 use crate::changes::model::is_reserved_storage_system_column;
+use crate::ordered_cursor::{KeyOrder, OrderedRowCursor, WalkSubject};
 use futures::TryStreamExt;
 use omnigraph_compiler::SYSTEM_COLUMNS_META;
 use std::future::Future;
@@ -417,7 +418,7 @@ async fn entity_from_snapshot(
     Ok(None)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExportRowOrder {
     ById,
     Unspecified,
@@ -497,13 +498,57 @@ where
         .storage()
         .open_snapshot_at_table(snapshot, table_key)
         .await?;
-    let ordering = match row_order {
-        ExportRowOrder::ById => Some(vec![ColumnOrdering::asc_nulls_last(
-            catalog.system_columns.id.to_string(),
-        )]),
-        ExportRowOrder::Unspecified => None,
-    };
+    // Blob materialization reaches through to the inner Lance `Dataset`
+    // because `take_blobs` is a Lance-only API not lifted onto the
+    // `TableStorage` trait surface (the trait covers staged-write and
+    // snapshot-scan primitives; blob descriptor materialization sits outside
+    // that surface). The ordered walk reads the same pinned dataset.
+    let source_ds = ds.dataset();
     let blob_properties = blob_properties_for_table_key(catalog, table_key)?;
+
+    if row_order == ExportRowOrder::ById {
+        // Sort keys only and hydrate complete rows in bounded chunks: a
+        // complete-row sort fails on a row wider than the ordered-scan sort
+        // cap, and on an ordinary row arriving as a slice of a larger decoded
+        // batch.
+        let mut rows = OrderedRowCursor::open(
+            Some(source_ds.clone()),
+            KeyOrder {
+                key_batch_rows: EXPORT_SCAN_TARGET_ROWS,
+                key_batch_bytes: EXPORT_SCAN_TARGET_BYTES,
+                chunk_rows: EXPORT_SCAN_TARGET_ROWS,
+                chunk_bytes: EXPORT_SCAN_TARGET_BYTES,
+                ..KeyOrder::full()
+            },
+            WalkSubject {
+                operation: "export",
+                table: table_key.to_string(),
+                role: "export",
+            },
+            catalog.system_columns.id,
+        )
+        .await?;
+        while let Some(batch) = rows.next_ordered_batch().await? {
+            if blob_properties.is_empty() {
+                emit_export_rows_from_batch(catalog, table_key, &batch, None, emit).await?;
+                continue;
+            }
+            for row_index in 0..batch.num_rows() {
+                let row = batch.slice(row_index, 1);
+                emit_export_row(
+                    source_ds,
+                    catalog,
+                    table_key,
+                    &row,
+                    blob_properties,
+                    ranged,
+                    emit,
+                )
+                .await?;
+            }
+        }
+        return Ok(());
+    }
 
     if blob_properties.is_empty() {
         let mut batches = db
@@ -512,7 +557,7 @@ where
                 &ds,
                 None,
                 None,
-                ordering,
+                None,
                 false,
                 EXPORT_SCAN_TARGET_ROWS,
                 EXPORT_SCAN_TARGET_BYTES,
@@ -539,7 +584,7 @@ where
             &ds,
             None,
             None,
-            ordering,
+            None,
             true,
             EXPORT_SCAN_TARGET_ROWS,
             EXPORT_SCAN_TARGET_BYTES,
@@ -552,27 +597,52 @@ where
     {
         for row_index in 0..batch.num_rows() {
             let row = batch.slice(row_index, 1);
-            let row_id = row
-                .column_by_name("_rowid")
-                .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-                .ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "expected _rowid column when exporting '{}'",
-                        table_key
-                    ))
-                })?
-                .value(0);
-            // Blob materialization reaches through to the inner Lance
-            // `Dataset` because `take_blobs` is a Lance-only API not lifted
-            // onto the `TableStorage` trait surface (the trait covers
-            // staged-write and snapshot-scan primitives; blob descriptor
-            // materialization sits outside that surface).
-            let blob_values =
-                export_blob_values(ds.dataset(), &row, &[row_id], blob_properties, ranged).await?;
-            emit_export_rows_from_batch(catalog, table_key, &row, Some(&blob_values), emit).await?;
+            emit_export_row(
+                source_ds,
+                catalog,
+                table_key,
+                &row,
+                blob_properties,
+                ranged,
+                emit,
+            )
+            .await?;
         }
     }
     Ok(())
+}
+
+/// Emit one scanned row, materializing at most that row's Blob values. The
+/// row must carry `_rowid` when the table has Blob properties.
+async fn emit_export_row<Emit, EmitFuture>(
+    source_ds: &Dataset,
+    catalog: &Catalog,
+    table_key: &str,
+    row: &RecordBatch,
+    blob_properties: &std::collections::HashSet<String>,
+    ranged: RangedExternalBlobs,
+    emit: &mut Emit,
+) -> Result<()>
+where
+    Emit: FnMut(Vec<u8>) -> EmitFuture,
+    EmitFuture: Future<Output = Result<()>>,
+{
+    if blob_properties.is_empty() {
+        return emit_export_rows_from_batch(catalog, table_key, row, None, emit).await;
+    }
+    let row_id = row
+        .column_by_name("_rowid")
+        .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "expected _rowid column when exporting '{}'",
+                table_key
+            ))
+        })?
+        .value(0);
+    let blob_values =
+        export_blob_values(source_ds, row, &[row_id], blob_properties, ranged).await?;
+    emit_export_rows_from_batch(catalog, table_key, row, Some(&blob_values), emit).await
 }
 
 /// One logical Blob cell value.

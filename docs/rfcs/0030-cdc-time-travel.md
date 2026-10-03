@@ -1088,3 +1088,13 @@ implementation, recorded here so later phases inherit them:
   - CLI auto-pagination incrementally renders the historical aggregate output
     shape, retaining only the current page/open split block and withholding the
     durable cursor until the terminal page.
+- **Key-only ordered walks (2026-10-02).** The change feed's ordered scans
+  sorted complete rows. A row wider than the 37.5 MiB sorter cap, or an
+  ordinary row that Lance 11's byte-targeted scan handed to the sort as a
+  one-row slice measured at its parent buffer's size, failed the commit diff,
+  the feed and the baseline with `ordered_scan_input_batch_bytes`, which the
+  change routes report as an internal error (ModernRelay/omnigraph#705). Every
+  change-surface walk now uses the branch merge's two-phase cursor: only `id`,
+  `_rowid` and `_rowaddr` enter the sort, and complete rows hydrate in bounded,
+  compacted chunks. The `O(N log N)` sort and full-table key read on the exact
+  fallback remain.

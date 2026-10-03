@@ -981,21 +981,31 @@ node Document {
     .unwrap();
     helpers::seed_ranged_external_blob_row(&db, uri).await;
 
-    let error = db.export_jsonl("main", &[]).await.unwrap_err();
-    let message = error.to_string();
-    assert!(
-        matches!(
-            &error,
-            OmniError::Manifest(manifest)
-                if manifest.kind == omnigraph::error::ManifestErrorKind::BadRequest
+    let mut unordered = Vec::new();
+    for (order, error) in [
+        ("ordered", db.export_jsonl("main", &[]).await.unwrap_err()),
+        (
+            "unordered",
+            db.export_jsonl_unordered_to_writer("main", &[], &mut unordered)
+                .await
+                .unwrap_err(),
         ),
-        "ranged export must be a BadRequest refusal, got {error:?}"
-    );
-    assert!(
-        message.contains("ranged external Blob descriptor (offset 4, length 8) in 'content'"),
-        "{message}"
-    );
-    assert!(!message.contains("s3://bucket"), "{message}");
+    ] {
+        let message = error.to_string();
+        assert!(
+            matches!(
+                &error,
+                OmniError::Manifest(manifest)
+                    if manifest.kind == omnigraph::error::ManifestErrorKind::BadRequest
+            ),
+            "{order} ranged export must be a BadRequest refusal, got {error:?}"
+        );
+        assert!(
+            message.contains("ranged external Blob descriptor (offset 4, length 8) in 'content'"),
+            "{order}: {message}"
+        );
+        assert!(!message.contains("s3://bucket"), "{order}: {message}");
+    }
 
     let entity = db
         .entity_at_target(ReadTarget::branch("main"), "node:Document", "ranged")
@@ -1211,4 +1221,33 @@ node Document {
     )
     .await;
     assert_eq!(&later[..], &[0, 1, 2, 3, 255]);
+}
+
+/// Export orders each table by id. Sorting complete rows failed with
+/// `ordered_scan_input_batch_bytes` once a row was wider than the ordered-scan
+/// sort cap; the walk must sort keys only and still emit every row, the wide
+/// one complete, in id order.
+#[tokio::test]
+async fn export_jsonl_orders_rows_wider_than_the_sort_cap_issue_705() {
+    use helpers::wide_rows::*;
+
+    let dir = tempfile::tempdir().unwrap();
+    let main = init_wide_row_graph(&dir, WIDE_PAYLOAD_BYTES).await;
+    let exported = main
+        .export_jsonl("main", &[])
+        .await
+        .expect("export beside a wide row must succeed");
+    let rows: Vec<serde_json::Value> = exported
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let keys: Vec<&str> = rows
+        .iter()
+        .map(|row| row["data"]["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, vec!["small-0", "small-1", "small-2", "wide"]);
+    assert_eq!(
+        rows[3]["data"]["payload"].as_str().unwrap().len(),
+        WIDE_PAYLOAD_BYTES
+    );
 }
