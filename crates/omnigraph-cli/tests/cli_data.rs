@@ -1597,6 +1597,7 @@ fn load_json_outputs_summary_for_main_branch() {
         );
     }
     assert_eq!(payload["total_entities"], 11);
+    assert_eq!(payload.get("embedding_generation"), Some(&Value::Null));
     assert_eq!(
         payload["nodes"],
         serde_json::json!([
@@ -2484,6 +2485,20 @@ fn data_write_outcomes_and_retry_permission_issue_466() {
             serde_json::json!({"error":"input too large","resource_limit":{"resource":"entities","limit":10,"actual":11}}),
             1,
             "refresh",
+        ),
+        // Admission probes an external Blob source before any effect; the
+        // typed detail, not the status, makes the refusal a refresh.
+        (
+            424,
+            serde_json::json!({"error":"source unavailable","external_blob_source":{"uri":"s3://bucket/object","reason":"not found"}}),
+            1,
+            "refresh",
+        ),
+        (
+            424,
+            serde_json::json!({"error":"source unavailable"}),
+            1,
+            "reconcile",
         ),
         (
             503,

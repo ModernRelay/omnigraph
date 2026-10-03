@@ -16,7 +16,6 @@ use arrow_schema::{DataType, Schema, SchemaRef};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
-use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::{IRAssignment, IRExpr, MutationOpIR, ParamMap};

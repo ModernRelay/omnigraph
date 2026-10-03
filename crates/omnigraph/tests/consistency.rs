@@ -651,6 +651,7 @@ node Attachment {
         0,
         "aggregate admission must finish before either payload read"
     );
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0);
     assert_eq!(
         probes.external_blob_payload_read_calls(),
         0,
@@ -806,6 +807,7 @@ node Attachment {
     assert_eq!(overflow_probes.external_blob_probe_calls(), 0);
     assert_eq!(overflow_probes.external_blob_payload_read_calls(), 0);
     assert_eq!(overflow_probes.blob_payload_read_calls(), 0);
+    assert_eq!(overflow_probes.blob_managed_batch_read_calls(), 0);
     for (table_key, table_uri, before_table, before_head) in overflow_tables {
         assert_lazy_external_blob_rejection_is_effect_free(
             &overflow,

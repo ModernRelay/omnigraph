@@ -705,6 +705,9 @@ pub(super) fn bound_edge_pair_schema(
         fields.push(Field::new(EDGE_TYPE_COLUMN, DataType::Utf8, false));
     }
     for (name, prop) in common_edge_properties(catalog, &names) {
+        // Blob properties are never projected, as in node scans: typecheck
+        // refuses a Blob as a `.gq` read value, so this scan leaves its
+        // descriptors unread, and Blob values are read through `read_blob_at`.
         if members.iter().any(|member| {
             catalog.edge_types[&member.edge_type]
                 .blob_properties

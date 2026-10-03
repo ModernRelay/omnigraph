@@ -1210,14 +1210,31 @@ pub struct MergeWriteProbes {
     /// Legacy whole-delta materializations. RFC-023's bounded keyed path must
     /// keep this at zero; retaining the probe makes regressions observable.
     pub scan_staged_combined_calls: Arc<AtomicU64>,
-    /// Blob payload reads performed while rebuilding descriptor rows into a
-    /// logical keyed-write source. Resource-limit tests use this to prove an
-    /// oversized descriptor is rejected from `BlobFile::size()` before the
-    /// payload allocation/read begins.
+    /// Tables a mutation statement opened for its read or staging (one per
+    /// statement that reaches `open_table_for_mutation`). A statement refused
+    /// while its assignments resolve must leave this at zero.
+    pub mutation_table_open_calls: Arc<AtomicU64>,
+    /// Blob payload values a rewrite consumed while rebuilding descriptor rows
+    /// into a logical source (a keyed write or a schema rewrite): one per
+    /// managed value, counted after the batched managed read returned it and
+    /// its length matched, and one per external object read. Zero does not
+    /// prove that no payload I/O ran: `blob_managed_batch_read_calls` counts
+    /// the managed reads issued, before any byte arrives.
     pub blob_payload_read_calls: Arc<AtomicU64>,
+    /// Batched managed Blob reads (`Dataset::read_blobs`) a materializing
+    /// rewrite issued: one per rewritten batch column holding a managed cell,
+    /// however many managed values it carries, recorded before the read is
+    /// issued. Distinguishes the batched read from one read per value, which
+    /// `blob_payload_read_calls` cannot.
+    pub blob_managed_batch_read_calls: Arc<AtomicU64>,
+    /// Compaction tasks executed over a table with a Blob field.
+    pub compaction_blob_batch_calls: Arc<AtomicU64>,
+    /// The scanner batch size the last such task ran with: the engine's
+    /// derived bound, or a smaller caller value.
+    pub compaction_blob_batch_rows: Arc<AtomicU64>,
     /// Payload reads issued against external sources specifically. Unlike the
-    /// aggregate Blob counter, this excludes managed Lance `BlobFile::read`
-    /// calls so normalized-alias GET deduplication is directly observable.
+    /// aggregate Blob counter, this excludes managed values, so
+    /// normalized-alias GET deduplication is directly observable.
     pub external_blob_payload_read_calls: Arc<AtomicU64>,
     /// External Blob cells presented to one operation-wide preflight and the
     /// distinct normalized object metadata probes that preflight performed.
@@ -1306,8 +1323,20 @@ impl MergeWriteProbes {
     pub fn scan_staged_combined_calls(&self) -> u64 {
         self.scan_staged_combined_calls.load(Ordering::Relaxed)
     }
+    pub fn mutation_table_open_calls(&self) -> u64 {
+        self.mutation_table_open_calls.load(Ordering::Relaxed)
+    }
     pub fn blob_payload_read_calls(&self) -> u64 {
         self.blob_payload_read_calls.load(Ordering::Relaxed)
+    }
+    pub fn blob_managed_batch_read_calls(&self) -> u64 {
+        self.blob_managed_batch_read_calls.load(Ordering::Relaxed)
+    }
+    pub fn compaction_blob_batch_calls(&self) -> u64 {
+        self.compaction_blob_batch_calls.load(Ordering::Relaxed)
+    }
+    pub fn compaction_blob_batch_rows(&self) -> u64 {
+        self.compaction_blob_batch_rows.load(Ordering::Relaxed)
     }
     pub fn external_blob_payload_read_calls(&self) -> u64 {
         self.external_blob_payload_read_calls
@@ -1532,11 +1561,40 @@ pub fn record_stage_vector_index() {
     });
 }
 
-/// Record one impending `BlobFile::read` while logical blob arrays are rebuilt.
-/// No-op in production (no probes installed).
+/// Record one table a mutation statement opens. No-op in production.
+pub fn record_mutation_table_open() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.mutation_table_open_calls.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one Blob payload value a rewrite consumed: a managed value after the
+/// batched managed read returned it, or an external object read. It trails the
+/// managed I/O, which `record_blob_managed_batch_read` marks. No-op in
+/// production (no probes installed).
 pub fn record_blob_payload_read() {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
         p.blob_payload_read_calls.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one batched managed Blob read issued by a materializing rewrite.
+/// No-op in production (no probes installed).
+pub fn record_blob_managed_batch_read() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.blob_managed_batch_read_calls
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one compaction task of a Blob table and the scanner batch size set
+/// on it. No-op in production (no probes installed).
+pub fn record_compaction_blob_batch(batch_rows: usize) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.compaction_blob_batch_calls
+            .fetch_add(1, Ordering::Relaxed);
+        p.compaction_blob_batch_rows
+            .store(batch_rows as u64, Ordering::Relaxed);
     });
 }
 

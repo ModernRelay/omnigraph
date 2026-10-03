@@ -23,8 +23,11 @@ use std::fs;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::LoadMode;
 use omnigraph_cluster::{
-    ApplyOptions, apply_config_dir_with_options, import_config_dir, read_serving_snapshot,
-    read_serving_snapshot_from_storage, status_config_dir, validate_config_dir,
+    ApplyOptions, ClusterAdmissionPurpose, DeploymentCaller, DeploymentLookup,
+    acquire_cluster_admission, apply_config_dir_with_options, apply_deployment, deployment_status,
+    force_unlock_storage_root, import_config_dir, read_serving_snapshot,
+    read_serving_snapshot_from_storage, status_config_dir, upgrade_deployment_ledger,
+    validate_config_dir,
 };
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
@@ -124,6 +127,7 @@ async fn s3_cluster_full_lifecycle_import_apply_serve_evolve_delete() {
         return;
     };
     object_storage_cluster_full_lifecycle(&root, "s3://").await;
+    object_storage_offline_deployment(&root).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -133,6 +137,7 @@ async fn azure_cluster_full_lifecycle_import_apply_serve_evolve_delete() {
         return;
     };
     object_storage_cluster_full_lifecycle(&root, "az://").await;
+    object_storage_offline_deployment(&root).await;
 }
 
 async fn object_storage_cluster_full_lifecycle(root: &str, expected_scheme: &str) {
@@ -326,5 +331,156 @@ async fn object_storage_cluster_full_lifecycle(root: &str, expected_scheme: &str
         );
         assert_eq!(after.state_cas.as_deref(), Some(ledger_cas.as_str()));
     }
+    adapter.delete_prefix(root).await.unwrap();
+}
+
+/// Same fixture and backend matrix as the v1 lifecycle above. This checks the
+/// actual object-store CAS and retained-lock contract, not live-Azure fencing.
+async fn object_storage_offline_deployment(root: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    write_cluster_fixture(dir.path(), root, SCHEMA_V1);
+    let imported = import_config_dir(dir.path()).await;
+    assert!(imported.ok, "{imported:?}");
+    let applied = apply_config_dir_with_options(dir.path(), e2e_apply_options()).await;
+    assert!(applied.ok && applied.converged, "{applied:?}");
+    let graph_root = format!("{root}/graphs/knowledge.omni");
+    let db = session(Omnigraph::open(&graph_root).await.unwrap());
+    db.load(
+        "main",
+        r#"{"type":"Person","data":{"name":"Ada"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    let before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .graph_manifest_version();
+    let history = serde_json::to_value(db.list_commits(None).await.unwrap()).unwrap();
+    drop(db);
+    let caller = DeploymentCaller::storage_owner(Some("act-admin".to_string()));
+    let converted = upgrade_deployment_ledger(root, true, &caller)
+        .await
+        .unwrap();
+    assert_eq!(converted.next_sequence, 1);
+    assert!(converted.lock_id.is_none());
+    let db = session(Omnigraph::open_read_only(&graph_root).await.unwrap());
+    assert_eq!(person_count(&db, "main", "Ada").await, 1);
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .graph_manifest_version(),
+        before
+    );
+    assert_eq!(
+        serde_json::to_value(db.list_commits(None).await.unwrap()).unwrap(),
+        history
+    );
+    drop(db);
+
+    write_cluster_fixture(dir.path(), root, SCHEMA_V2);
+    let query = FIND_PERSON_GQ.replace("return { $p.name }", "return { $p.name, $p.title }");
+    fs::write(dir.path().join("queries/people.gq"), &query).unwrap();
+    let mut reported = None;
+    let DeploymentLookup::Complete { result } =
+        apply_deployment(dir.path(), None, &caller, |id, _, lock| {
+            reported = Some((id.to_string(), lock.to_string()));
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected durable deployment receipt");
+    };
+    let (id, lock) = reported.unwrap();
+    assert!(result.converged);
+    assert_eq!(result.id, id);
+    let status = deployment_status(root, Some(&id), &caller).await.unwrap();
+    assert_eq!(status.lock_id.as_deref(), Some(lock.as_str()));
+    assert!(
+        matches!(status.lookup, Some(DeploymentLookup::Complete { result: observed }) if observed.input_digest == result.input_digest && observed.id == id)
+    );
+    assert_eq!(
+        acquire_cluster_admission(root, ClusterAdmissionPurpose::Serve)
+            .await
+            .unwrap_err()
+            .code,
+        "state_lock_held"
+    );
+    assert!(force_unlock_storage_root(root, "wrong-id").await.is_err());
+    assert_eq!(
+        deployment_status(root, None, &caller)
+            .await
+            .unwrap()
+            .lock_id
+            .as_deref(),
+        Some(lock.as_str())
+    );
+    assert!(matches!(
+        apply_deployment(dir.path(), Some(&id), &caller, |_, _, _| panic!(
+            "same ID cannot execute twice"
+        ))
+        .await
+        .unwrap(),
+        DeploymentLookup::Complete { .. }
+    ));
+    force_unlock_storage_root(root, &lock).await.unwrap();
+    let owner = acquire_cluster_admission(root, ClusterAdmissionPurpose::Serve)
+        .await
+        .unwrap()
+        .unwrap();
+    let serving = read_serving_snapshot_from_storage(root).await.unwrap();
+    assert_eq!(serving.queries[0].source, query);
+    let db = session(Omnigraph::open_read_only(&graph_root).await.unwrap());
+    assert_eq!(person_count(&db, "main", "Ada").await, 1);
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .graph_manifest_version(),
+        before + 1
+    );
+    assert_eq!(db.schema_source().as_str(), SCHEMA_V2);
+    drop(db);
+    let serving_lock = owner.lock_id().to_string();
+    drop(owner);
+    force_unlock_storage_root(root, &serving_lock)
+        .await
+        .unwrap();
+
+    // Reusing an immutable digest must verify existing bytes before acceptance.
+    let adapter = omnigraph_storage::storage_for_uri(root).unwrap();
+    let bundle_uri = format!(
+        "{root}/__cluster/resources/deployment/{}.json",
+        result.input_digest
+    );
+    let ledger_uri = format!("{root}/__cluster/state.json");
+    let ledger = adapter.read_text(&ledger_uri).await.unwrap();
+    adapter.write_text(&bundle_uri, "{}").await.unwrap();
+    assert_eq!(
+        apply_deployment(dir.path(), None, &caller, |_, _, _| {})
+            .await
+            .unwrap_err()
+            .code,
+        "deployment_bundle_write"
+    );
+    assert_eq!(adapter.read_text(&ledger_uri).await.unwrap(), ledger);
+    assert_eq!(adapter.read_text(&bundle_uri).await.unwrap(), "{}");
+    let db = Omnigraph::open_read_only(&graph_root).await.unwrap();
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .graph_manifest_version(),
+        before + 1
+    );
+    drop(db);
+    let lock = deployment_status(root, None, &caller)
+        .await
+        .unwrap()
+        .lock_id
+        .unwrap();
+    force_unlock_storage_root(root, &lock).await.unwrap();
     adapter.delete_prefix(root).await.unwrap();
 }

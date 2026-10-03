@@ -165,10 +165,9 @@ pub(crate) fn blob_url(base_url: &str, query: &BlobReadQuery) -> Result<String> 
 }
 
 pub(crate) fn whole_external_uri(reference: &ExternalBlobRef) -> Result<&str> {
-    if reference.offset != 0 || reference.length.is_some() {
-        return Err(eyre!("Blob delivery failed"));
-    }
-    Ok(&reference.uri)
+    reference
+        .whole_object_uri()
+        .map_err(|_| eyre!("Blob delivery failed"))
 }
 
 pub(crate) fn map_embedded_blob_error(error: OmniError) -> Report {

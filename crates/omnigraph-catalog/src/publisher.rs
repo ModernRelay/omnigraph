@@ -122,10 +122,18 @@ impl GraphHeadExpectation {
 /// check detects delete/recreate ABA on every attempt; it is not a distributed
 /// ref-control fence (Lance branch create/delete still lacks conditional CAS),
 /// so branch control remains within the documented single-writer-process bound.
+/// `ExactGraphVersion` additionally fixes the numeric base on every retry,
+/// including metadata-only contention that preserves graph HEAD.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PublishPrecondition {
     Any,
     ExactGraphHead(GraphHeadExpectation),
+    /// A prepared schema publication or its settlement fence may consume only
+    /// `version + 1`. Even head-preserving metadata contention must not rebase it.
+    ExactGraphVersion {
+        authority: GraphHeadExpectation,
+        version: u64,
+    },
 }
 
 /// The result of a manifest publish that may have folded in a graph commit.
@@ -329,7 +337,11 @@ impl GraphNamespacePublisher {
         precondition: &PublishPrecondition,
     ) -> Option<ManifestIncarnation> {
         let branch_identifier = match precondition {
-            PublishPrecondition::ExactGraphHead(expected) => expected.branch_identifier.clone(),
+            PublishPrecondition::ExactGraphHead(expected)
+            | PublishPrecondition::ExactGraphVersion {
+                authority: expected,
+                ..
+            } => expected.branch_identifier.clone(),
             PublishPrecondition::Any if self.branch.is_none() => {
                 lance::dataset::refs::BranchIdentifier::main()
             }
@@ -996,8 +1008,19 @@ impl GraphNamespacePublisher {
         graph_heads: &HashMap<String, String>,
         precondition: &PublishPrecondition,
     ) -> Result<()> {
-        let PublishPrecondition::ExactGraphHead(expected) = precondition else {
-            return Ok(());
+        let expected = match precondition {
+            PublishPrecondition::Any => return Ok(()),
+            PublishPrecondition::ExactGraphHead(expected) => expected,
+            PublishPrecondition::ExactGraphVersion { authority, version } => {
+                if dataset.version().version != *version {
+                    return Err(OmniError::manifest_read_set_changed(
+                        "prepared_schema_manifest_version",
+                        Some(version.to_string()),
+                        Some(dataset.version().version.to_string()),
+                    ));
+                }
+                authority
+            }
         };
 
         let expected_branch = expected

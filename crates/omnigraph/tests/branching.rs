@@ -1458,7 +1458,9 @@ async fn branch_merge_onto_main_switches_oversized_external_blob_pointers_body()
         ("cross-table", LIMIT / 2 + 1, Some(LIMIT / 2 + 1), true),
     ] {
         let dir = tempfile::tempdir().unwrap();
-        let graph_path = dir.path().join("graph");
+        // The graph root must lie outside every external base.
+        let graph_dir = tempfile::tempdir().unwrap();
+        let graph_path = graph_dir.path().join("graph");
         let graph_uri = graph_path.to_str().unwrap();
         let first_path = dir.path().join("first.blob");
         write_sized_external_blob(&first_path, first_bytes);
@@ -1598,6 +1600,7 @@ async fn assert_pointer_switch_onto_main(
     assert_eq!(probes.external_blob_probe_calls(), 0, "{case}");
     assert_eq!(probes.external_blob_payload_read_calls(), 0, "{case}");
     assert_eq!(probes.blob_payload_read_calls(), 0, "{case}");
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0, "{case}");
     assert_eq!(probes.stage_append_calls(), 0, "{case}");
     assert_eq!(probes.stage_merge_insert_calls(), 0, "{case}");
     assert_eq!(probes.stage_fenced_insert_calls(), 0, "{case}");
@@ -1693,7 +1696,9 @@ async fn branch_merge_onto_main_switches_external_blob_reference_cells() {
 async fn branch_merge_onto_main_switches_external_blob_reference_cells_body() {
     const REFERENCE_LIMIT: usize = 8192;
     let dir = tempfile::tempdir().unwrap();
-    let graph_path = dir.path().join("external-cell-aggregate-graph");
+    // The graph root must lie outside every external base.
+    let graph_dir = tempfile::tempdir().unwrap();
+    let graph_path = graph_dir.path().join("external-cell-aggregate-graph");
     let external_path = dir.path().join("shared-external.blob");
     fs::write(&external_path, b"x").unwrap();
     let external_uri = url::Url::from_file_path(&external_path)

@@ -649,6 +649,121 @@ fn parity_load() {
 }
 
 #[test]
+fn parity_load_embedding_diagnostics() {
+    let temp = tempfile::tempdir().unwrap();
+    let local = temp.path().join("local.omni");
+    let schema = temp.path().join("embeddings.pg");
+    std::fs::write(
+        &schema,
+        format!(
+            "{}\nnode Doc {{ slug: String @key body: String embedding: Vector(2)? @embed(body) }}\n",
+            std::fs::read_to_string(fixture("test.pg")).unwrap(),
+        ),
+    )
+    .unwrap();
+    let cluster_dir = parity_configs_with_schema(temp.path(), &local, &schema);
+    let server = spawn_server_with_cluster_env(
+        &cluster_dir,
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-parity":"parity-tok"}"#,
+        )],
+    );
+    let p = Parity {
+        _temp: temp,
+        local,
+        server,
+        blob_external_uri: None,
+    };
+    let data = p.local.parent().unwrap().join("embeddings.jsonl");
+    std::fs::write(&data, concat!(
+        r#"{"type":"Doc","data":{"slug":"omitted","body":"missing vector"}}"#,
+        "\n",
+        r#"{"type":"Doc","data":{"slug":"supplied","body":"keep vector","embedding":[0.25,0.75]}}"#,
+    )).unwrap();
+    for verb in ["load", "ingest"] {
+        for structured in [true, false] {
+            let mut args = vec![
+                verb,
+                "--branch",
+                "main",
+                "--mode",
+                "merge",
+                "--data",
+                data.to_str().unwrap(),
+            ];
+            if structured {
+                args.push("--json");
+            }
+            let (local, remote) = p.run(&args);
+            for (arm, output) in [("local", &local), ("remote", &remote)] {
+                assert!(output.status.success(), "{verb} {arm}: {output:?}");
+                if structured {
+                    assert_eq!(
+                        parse_stdout_json(output)["embedding_generation"],
+                        "unsupported",
+                        "{verb} {arm}"
+                    );
+                } else {
+                    let human = String::from_utf8_lossy(&output.stdout);
+                    assert!(
+                        human.contains("Loads do not generate embeddings."),
+                        "{verb} {arm}: {human}"
+                    );
+                    assert!(human.contains("omnigraph embed"), "{verb} {arm}: {human}");
+                }
+            }
+            if verb == "load" && structured {
+                assert_write_parity("load embedding diagnostics", &local, &remote);
+            }
+        }
+    }
+    let (local, remote) = p.run(&[
+        "query",
+        "-e",
+        "query docs() { match { $d: Doc } return { $d.slug, $d.embedding } order { $d.slug asc } }",
+        "--json",
+    ]);
+    // Each arm has independently published commits; compare their contents,
+    // not the intentionally different graph-commit identities.
+    for output in [&local, &remote] {
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            parse_stdout_json(output)["rows"],
+            serde_json::json!([
+                {"d.slug": "omitted"},
+                {"d.slug": "supplied", "d.embedding": [0.25, 0.75]},
+            ])
+        );
+    }
+
+    std::fs::write(
+        &data,
+        r#"{"type":"Person","data":{"name":"Plain","age":1}}"#,
+    )
+    .unwrap();
+    for verb in ["load", "ingest"] {
+        let (local, remote) = p.run(&[
+            verb,
+            "--branch",
+            "main",
+            "--mode",
+            "merge",
+            "--data",
+            data.to_str().unwrap(),
+            "--json",
+        ]);
+        for output in [&local, &remote] {
+            assert!(output.status.success(), "{verb}: {output:?}");
+            assert_eq!(
+                parse_stdout_json(output).get("embedding_generation"),
+                Some(&serde_json::Value::Null)
+            );
+        }
+    }
+}
+
+#[test]
 fn parity_export() {
     let p = parity();
     let (l, r) = p.run(&["export"]);

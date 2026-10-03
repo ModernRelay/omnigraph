@@ -12,6 +12,9 @@ documentation = "https://docs.rs/omnigraph-cluster"
 # Fault-injection hooks for the apply protocol (crash-mid-apply, CAS-race
 # tests), including cluster/engine boundary failures.
 failpoints = ["omnigraph/failpoints"]
+# Test support reached by the server's tests: read a local cluster's serving
+# snapshot as if its storage root were spelled differently.
+test-util = []
 
 [dependencies]
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.11.0" }

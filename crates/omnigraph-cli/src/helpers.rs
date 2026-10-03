@@ -1036,6 +1036,7 @@ pub(crate) async fn execute_query_lint(
     }
 
     let uri = resolve_local_uri(cli_uri, "lint")?;
+    crate::admission::ensure_graph(&uri).await?;
     let db = Omnigraph::open(&uri).await?;
     Ok(lint_query_file(
         &db.catalog(),
@@ -1110,6 +1111,7 @@ pub(crate) async fn execute_queries_validate(
                     continue;
                 }
             };
+        crate::admission::ensure_graph(&serving_graph.root.to_string_lossy()).await?;
         let db = Omnigraph::open(&serving_graph.root.to_string_lossy()).await?;
         let report = check(&registry, &db.catalog());
         total += registry.len();

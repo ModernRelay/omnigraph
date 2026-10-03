@@ -2,7 +2,7 @@ use axum::body::Bytes;
 use futures::Stream;
 use omnigraph::db::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
 use omnigraph::error::{OmniError, Result};
-use std::io;
+use std::io::{self, Write};
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
@@ -12,8 +12,11 @@ use tokio::time::timeout;
 
 /// At most two produced chunks may wait behind the response consumer.
 pub(crate) const EXPORT_QUEUE_CHUNKS: usize = 2;
-/// One response reserves enough process memory for its bounded channel, the
-/// producer's chunk awaiting admission, and the consumer's current chunk.
+/// Queued and yielded chunks share these credits; clones and slices keep a
+/// credit until their last owner drops. One further slot covers the sequential
+/// producer's chunk while it waits for a credit.
+const EXPORT_OUTSTANDING_FRAMES: usize = EXPORT_QUEUE_CHUNKS + 1;
+/// One response reserves payload capacity for outstanding and pending chunks.
 pub(crate) const EXPORT_QUEUE_RESERVED_BYTES: usize =
     (EXPORT_QUEUE_CHUNKS + 2) * EXPORT_CHUNK_MAX_BYTES;
 /// At most eight fully reserved export responses may coexist process-wide.
@@ -68,7 +71,11 @@ impl ExportTransport {
         let acquisition =
             Arc::clone(&self.available_bytes).acquire_many_owned(self.queue_reserved_bytes);
         match timeout(self.reservation_timeout, acquisition).await {
-            Ok(Ok(permit)) => Ok(Arc::new(ExportQueueLease { _permit: permit })),
+            Ok(Ok(permit)) => Ok(Arc::new(ExportQueueLease {
+                _permit: permit,
+                frames: Arc::new(Semaphore::new(EXPORT_OUTSTANDING_FRAMES)),
+                reservation_timeout: self.reservation_timeout,
+            })),
             Ok(Err(_closed)) => Err(OmniError::manifest_internal(
                 "served export transport byte budget closed unexpectedly",
             )),
@@ -84,15 +91,118 @@ impl ExportTransport {
     }
 }
 
-/// Two-party ownership of one transport-queue reservation. The body and
-/// producer each retain an `Arc`, so a disconnect cannot recycle the permit
-/// while an unscheduled producer still owns a pending chunk.
+/// The producer, body and every yielded chunk retain this process reservation.
+/// Frame credits subdivide its existing allowance; they are not another pool.
 #[derive(Debug)]
 pub(crate) struct ExportQueueLease {
     _permit: OwnedSemaphorePermit,
+    frames: Arc<Semaphore>,
+    reservation_timeout: Duration,
 }
 
-pub(crate) enum ExportFrame {
+/// A single sequential producer hands off at most one unadmitted chunk at a
+/// time. The engine's write_chunks callback awaits each send before creating
+/// the next chunk; the baseline record uses the same producer after it ends.
+#[derive(Clone)]
+pub(crate) struct ExportSender {
+    sender: mpsc::Sender<ExportFrame>,
+    lease: Arc<ExportQueueLease>,
+}
+
+impl ExportSender {
+    pub(crate) async fn closed(&self) {
+        self.sender.closed().await;
+    }
+
+    pub(crate) async fn send_chunk(&self, chunk: Vec<u8>) -> Result<()> {
+        let bytes = chunk.len().max(chunk.capacity());
+        if bytes > EXPORT_CHUNK_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                "stream_export_chunk_bytes",
+                EXPORT_CHUNK_MAX_BYTES as u64,
+                bytes as u64,
+            ));
+        }
+        let frame = timeout(
+            self.lease.reservation_timeout,
+            Arc::clone(&self.lease.frames).acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            OmniError::resource_limit(
+                "stream_export_retained_chunks",
+                EXPORT_OUTSTANDING_FRAMES as u64,
+                (EXPORT_OUTSTANDING_FRAMES + 1) as u64,
+            )
+        })?
+        .map_err(|_| OmniError::manifest_internal("served export frame credits closed"))?;
+        let bytes = Bytes::from_owner(ExportChunk {
+            chunk,
+            _frame: frame,
+            _lease: Arc::clone(&self.lease),
+        });
+        // Queue backpressure has no new deadline. This chunk already holds a
+        // credit, and the handler's close select interrupts a disconnected body.
+        self.sender
+            .send(ExportFrame::Data(bytes))
+            .await
+            .map_err(|_| OmniError::Io(io::Error::other("served export response closed")))
+    }
+
+    /// The baseline handshake fits one chunk (its cursor is capped at 4 KiB).
+    /// Encode into that pending slot, then transfer the same allocation. Future
+    /// larger records fail before any cursor bytes enter the response.
+    pub(crate) async fn send_json_line<T: serde::Serialize>(&self, value: &T) -> Result<()> {
+        let mut output = JsonChunk(Vec::with_capacity(EXPORT_CHUNK_MAX_BYTES));
+        serde_json::to_writer(&mut output, value)
+            .map_err(|error| OmniError::Io(io::Error::other(error)))?;
+        output.write_all(b"\n")?;
+        self.send_chunk(output.0).await
+    }
+
+    pub(crate) async fn finish(&self, cut: ExportCut, error: Option<io::Error>) {
+        let _ = self
+            .sender
+            .send(ExportFrame::Terminal {
+                cut: Box::new(cut),
+                error,
+            })
+            .await;
+    }
+}
+
+struct ExportChunk {
+    // Drop payload storage before releasing either capacity owner.
+    chunk: Vec<u8>,
+    _frame: OwnedSemaphorePermit,
+    _lease: Arc<ExportQueueLease>,
+}
+
+impl AsRef<[u8]> for ExportChunk {
+    fn as_ref(&self) -> &[u8] {
+        &self.chunk
+    }
+}
+
+struct JsonChunk(Vec<u8>);
+
+impl Write for JsonChunk {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > EXPORT_CHUNK_MAX_BYTES - self.0.len() {
+            return Err(io::Error::other(
+                "served export JSON record exceeds chunk limit",
+            ));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+enum ExportFrame {
     Data(Bytes),
     Terminal {
         /// The move-only cut stays queued behind every data frame. Dropping a
@@ -103,21 +213,22 @@ pub(crate) enum ExportFrame {
 }
 
 /// Response body stream that owns the consumer half of the process-wide queue
-/// reservation and any queued terminal export cut. The producer owns the other
-/// lease half, so disconnect closes its receiver immediately but cannot recycle
-/// bytes until the producer has actually unwound.
+/// reservation and any queued terminal export cut. Disconnect closes its
+/// receiver immediately; capacity remains owned by the producer and any chunks
+/// retained outside the body, including clones and slices.
 pub(crate) struct ExportBodyStream {
     receiver: mpsc::Receiver<ExportFrame>,
     lease: Option<Arc<ExportQueueLease>>,
     done: bool,
 }
 
-pub(crate) fn channel(
-    lease: Arc<ExportQueueLease>,
-) -> (mpsc::Sender<ExportFrame>, ExportBodyStream) {
+pub(crate) fn channel(lease: Arc<ExportQueueLease>) -> (ExportSender, ExportBodyStream) {
     let (sender, receiver) = mpsc::channel(EXPORT_QUEUE_CHUNKS);
     (
-        sender,
+        ExportSender {
+            sender,
+            lease: Arc::clone(&lease),
+        },
         ExportBodyStream {
             receiver,
             lease: Some(lease),
@@ -196,11 +307,23 @@ mod tests {
 
     #[tokio::test]
     async fn disconnected_body_cannot_recycle_bytes_before_producer_exits() {
-        let transport = ExportTransport::new(4, 4, Duration::from_millis(10));
+        let transport = ExportTransport::new(
+            EXPORT_QUEUE_RESERVED_BYTES,
+            EXPORT_QUEUE_RESERVED_BYTES,
+            Duration::from_millis(10),
+        );
         let lease = transport.reserve().await.unwrap();
         let producer_lease = Arc::clone(&lease);
-        let (_sender, body) = channel(lease);
-
+        let (sender, mut body) = channel(lease);
+        sender
+            .send_chunk(vec![b'x'; EXPORT_CHUNK_MAX_BYTES])
+            .await
+            .unwrap();
+        let yielded = body.next().await.unwrap().unwrap();
+        let retained = yielded.slice(0..1);
+        let cloned = yielded.clone();
+        drop(yielded);
+        drop(sender);
         drop(body);
         assert!(matches!(
             transport.reserve().await.unwrap_err(),
@@ -208,27 +331,119 @@ mod tests {
         ));
 
         drop(producer_lease);
+        assert!(matches!(
+            transport
+                .reserve()
+                .await
+                .expect_err("a retained slice must keep its whole chunk charged"),
+            OmniError::ResourceLimitExceeded { .. }
+        ));
+        drop(cloned);
+        assert_eq!(transport.available_bytes.available_permits(), 0);
+        assert_eq!(retained.as_ref(), b"x");
+        drop(retained);
         let recovered = transport.reserve().await.unwrap();
         drop(recovered);
-        assert_eq!(transport.available_bytes.available_permits(), 4);
+        assert_eq!(
+            transport.available_bytes.available_permits(),
+            EXPORT_QUEUE_RESERVED_BYTES
+        );
     }
 
     #[tokio::test]
     async fn bounded_channel_backpressures_after_two_chunks() {
-        let transport = ExportTransport::new(4, 4, Duration::from_millis(10));
+        let transport = ExportTransport::new(
+            EXPORT_QUEUE_RESERVED_BYTES,
+            EXPORT_QUEUE_RESERVED_BYTES,
+            Duration::from_millis(10),
+        );
         let lease = transport.reserve().await.unwrap();
-        let (sender, _body) = channel(lease);
+        let (sender, mut body) = channel(lease);
 
         sender
-            .try_send(ExportFrame::Data(Bytes::from_static(b"a")))
+            .send_chunk(vec![b'a'; EXPORT_CHUNK_MAX_BYTES])
+            .await
             .unwrap();
         sender
-            .try_send(ExportFrame::Data(Bytes::from_static(b"b")))
+            .send_chunk(vec![b'b'; EXPORT_CHUNK_MAX_BYTES])
+            .await
             .unwrap();
-        assert!(matches!(
-            sender.try_send(ExportFrame::Data(Bytes::from_static(b"c"))),
-            Err(mpsc::error::TrySendError::Full(_))
-        ));
+        let first = {
+            let third = sender.send_chunk(vec![b'c'; EXPORT_CHUNK_MAX_BYTES]);
+            tokio::pin!(third);
+            assert!(futures::poll!(&mut third).is_pending());
+            let first = body.next().await.unwrap().unwrap();
+            third.await.unwrap();
+            first
+        };
+        let mut retained = vec![
+            first,
+            body.next().await.unwrap().unwrap(),
+            body.next().await.unwrap().unwrap(),
+        ];
+        assert_eq!(
+            retained.iter().map(Bytes::len).sum::<usize>(),
+            3 * EXPORT_CHUNK_MAX_BYTES
+        );
+        assert_eq!(sender.lease.frames.available_permits(), 0);
+
+        // The single pending chunk occupies the fourth reserved slot. A body
+        // that retains all three preceding allocations must not admit it.
+        let error = {
+            let pending = sender.send_chunk(vec![b'd'; EXPORT_CHUNK_MAX_BYTES]);
+            tokio::pin!(pending);
+            assert!(futures::poll!(&mut pending).is_pending());
+            pending.await.unwrap_err()
+        };
+        assert!(matches!(error, OmniError::ResourceLimitExceeded {
+            ref resource, limit: 3, actual: 4,
+        } if resource == "stream_export_retained_chunks"));
+
+        // Dropping one of several views of an allocation returns no credit.
+        let last_view = retained.pop().unwrap().slice(0..1);
+        assert_eq!(sender.lease.frames.available_permits(), 0);
+        drop(last_view);
+        assert_eq!(sender.lease.frames.available_permits(), 1);
+        // A consuming transport can deliver arbitrarily many frames. Its own
+        // copied result is separate from the server-owned transport buffers.
+        let mut received = Vec::new();
+        for byte in b'd'..=b'z' {
+            sender
+                .send_chunk(vec![byte; EXPORT_CHUNK_MAX_BYTES])
+                .await
+                .unwrap();
+            let frame = body.next().await.unwrap().unwrap();
+            received.push(frame[0]);
+            drop(frame);
+        }
+        assert_eq!(received, (b'd'..=b'z').collect::<Vec<_>>());
+        drop(retained);
+
+        for chunk in [vec![0; EXPORT_CHUNK_MAX_BYTES + 1], {
+            let mut small = Vec::with_capacity(EXPORT_CHUNK_MAX_BYTES + 1);
+            small.push(0);
+            small
+        }] {
+            assert!(matches!(sender.send_chunk(chunk).await.unwrap_err(),
+                OmniError::ResourceLimitExceeded { ref resource, .. }
+                if resource == "stream_export_chunk_bytes"));
+        }
+        // A future oversized handshake cannot allocate beyond one slot or
+        // deliver a partial cursor record.
+        let oversized = "x".repeat(EXPORT_CHUNK_MAX_BYTES);
+        assert!(sender.send_json_line(&oversized).await.is_err());
+        assert!(futures::poll!(body.next()).is_pending());
+        sender.send_json_line(&"cursor").await.unwrap();
+        assert_eq!(
+            body.next().await.unwrap().unwrap().as_ref(),
+            b"\"cursor\"\n"
+        );
+        drop(sender);
+        drop(body);
+        assert_eq!(
+            transport.available_bytes.available_permits(),
+            EXPORT_QUEUE_RESERVED_BYTES
+        );
     }
 
     #[tokio::test]
@@ -258,31 +473,28 @@ mod tests {
             .unwrap(),
         );
         let cut = db.capture_served_export_cut("main", &[]).await.unwrap();
-        let transport = ExportTransport::new(4, 4, Duration::from_millis(10));
+        let transport = ExportTransport::new(
+            EXPORT_QUEUE_RESERVED_BYTES,
+            EXPORT_QUEUE_RESERVED_BYTES,
+            Duration::from_millis(10),
+        );
         let lease = transport.reserve().await.unwrap();
         let producer_lease = Arc::clone(&lease);
-        let (sender, body) = channel(lease);
+        let (sender, mut body) = channel(lease);
 
         let data_sender = sender.clone();
         let (cut, result) = cut
             .write_chunks(move |chunk| {
                 let data_sender = data_sender.clone();
-                async move {
-                    data_sender
-                        .send(ExportFrame::Data(Bytes::from(chunk)))
-                        .await
-                        .map_err(|_| OmniError::Io(io::Error::other("closed")))
-                }
+                async move { data_sender.send_chunk(chunk).await }
             })
             .await;
         result.unwrap();
         sender
-            .send(ExportFrame::Terminal {
-                cut: Box::new(cut),
-                error: None,
-            })
+            .send_chunk(vec![b'x'; EXPORT_CHUNK_MAX_BYTES])
             .await
             .unwrap();
+        sender.finish(cut, None).await;
         drop(sender);
         drop(producer_lease);
 
@@ -299,9 +511,53 @@ mod tests {
             } if resource == "stream_export_slots"
         ));
 
+        let retained = body.next().await.unwrap().unwrap();
+        assert!(body.next().await.is_none());
         drop(body);
         let retry = db.capture_served_export_cut("main", &[]).await.unwrap();
         drop(retry);
-        assert_eq!(transport.available_bytes.available_permits(), 4);
+        assert_eq!(transport.available_bytes.available_permits(), 0);
+        drop(retained);
+        assert_eq!(
+            transport.available_bytes.available_permits(),
+            EXPORT_QUEUE_RESERVED_BYTES
+        );
+
+        // If retained data frames exhaust credits, no baseline cursor is
+        // emitted. Its terminal error releases the cut but not retained bytes.
+        let cut = db.capture_served_export_cut("main", &[]).await.unwrap();
+        let (sender, mut body) = channel(transport.reserve().await.unwrap());
+        let mut retained = Vec::new();
+        for _ in 0..EXPORT_OUTSTANDING_FRAMES {
+            sender
+                .send_chunk(vec![b'x'; EXPORT_CHUNK_MAX_BYTES])
+                .await
+                .unwrap();
+            retained.push(body.next().await.unwrap().unwrap());
+        }
+        let error = sender
+            .send_json_line(&serde_json::json!({"baseline": {"resume_cursor": "cursor"}}))
+            .await
+            .unwrap_err();
+        sender
+            .finish(cut, Some(io::Error::other(error.to_string())))
+            .await;
+        drop(sender);
+        let terminal = body.next().await.unwrap().unwrap_err();
+        assert!(
+            terminal
+                .to_string()
+                .contains("stream_export_retained_chunks")
+        );
+        assert!(body.next().await.is_none());
+        drop(body);
+        assert_eq!(transport.available_bytes.available_permits(), 0);
+        let retry = db.capture_served_export_cut("main", &[]).await.unwrap();
+        drop(retry);
+        drop(retained);
+        assert_eq!(
+            transport.available_bytes.available_permits(),
+            EXPORT_QUEUE_RESERVED_BYTES
+        );
     }
 }

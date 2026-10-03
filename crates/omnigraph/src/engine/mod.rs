@@ -411,9 +411,18 @@ pub(crate) async fn execute(bound: BoundPlan, context: &EngineContext<'_>) -> Re
     let traversal_limit = validate_traversal_admission(&bound.plan)?;
     omnigraph_planner::optimizer::validate_rank_fuse_row_tiebreaks(&bound.plan)
         .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
-    let mut executed = ExecutionReport::default();
     let ctx =
         QueryContext::with_traversal_limit(bound.plan.assumptions().memory_limit, traversal_limit)?;
+    ctx.run_owned(execute_with_context(bound, context, &ctx))
+        .await
+}
+
+async fn execute_with_context(
+    bound: BoundPlan,
+    context: &EngineContext<'_>,
+    ctx: &QueryContext,
+) -> Result<PlanRun> {
+    let mut executed = ExecutionReport::default();
     let policy = bound.plan.assumptions().gate_policy;
     let lowering = Lowering::new(&bound, context);
     let RankedScans { nearest, fusion } = ranked_scans(&bound.plan);
@@ -427,7 +436,7 @@ pub(crate) async fn execute(bound: BoundPlan, context: &EngineContext<'_>) -> Re
         }
         let lowered = lowering.lower_query(&pass)?;
         lowered.record_in_memory_filters();
-        let fused = Box::pin(run_plan(&lowered, &bound.plan, &ctx)).await?;
+        let fused = Box::pin(run_plan(&lowered, &bound.plan, ctx)).await?;
         executed.record(pass_rows(&lowered, &bound.plan, 0)?);
         return Ok(PlanRun {
             result: QueryResult::new(fused.schema(), vec![fused]),
@@ -450,7 +459,7 @@ pub(crate) async fn execute(bound: BoundPlan, context: &EngineContext<'_>) -> Re
         };
     }
 
-    let (result_batch, report, rows) = Box::pin(run_once(&lowering, &ctx, &pass, 0)).await?;
+    let (result_batch, report, rows) = Box::pin(run_once(&lowering, ctx, &pass, 0)).await?;
     executed.record(rows);
     let mut result_batch = result_batch;
     let mut report = report;
@@ -515,7 +524,7 @@ pub(crate) async fn execute(bound: BoundPlan, context: &EngineContext<'_>) -> Re
                     }
                 };
                 let (retried, retried_report, rows) =
-                    Box::pin(run_once(&lowering, &ctx, &wider, rung)).await?;
+                    Box::pin(run_once(&lowering, ctx, &wider, rung)).await?;
                 executed.record(rows);
                 result_batch = retried;
                 report = retried_report;
