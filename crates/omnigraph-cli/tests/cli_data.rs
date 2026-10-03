@@ -2485,6 +2485,20 @@ fn data_write_outcomes_and_retry_permission_issue_466() {
             1,
             "refresh",
         ),
+        // Admission probes an external Blob source before any effect; the
+        // typed detail, not the status, makes the refusal a refresh.
+        (
+            424,
+            serde_json::json!({"error":"source unavailable","external_blob_source":{"uri":"s3://bucket/object","reason":"not found"}}),
+            1,
+            "refresh",
+        ),
+        (
+            424,
+            serde_json::json!({"error":"source unavailable"}),
+            1,
+            "reconcile",
+        ),
         (
             503,
             serde_json::json!({"error":"schema completion required","recovery_required":{"operation_id":"published-commit"}}),

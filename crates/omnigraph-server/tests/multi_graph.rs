@@ -483,6 +483,7 @@ async fn served_export_process_queue_budget_refuses_then_releases() {
             uri: uri.to_string_lossy().to_string(),
             policy: None,
             embedding: None,
+            startup_failure: None,
             external_blob_policy: omnigraph::ExternalBlobPolicy::Deny,
             queries: stored_query_registry(&[]),
         });
@@ -577,6 +578,7 @@ rules:
             uri: bad_uri.to_string_lossy().to_string(),
             policy: None,
             embedding: None,
+            startup_failure: None,
             external_blob_policy: omnigraph::ExternalBlobPolicy::Deny,
             queries: stored_query_registry(&[]),
         },
@@ -585,6 +587,7 @@ rules:
             uri: good_uri.to_string_lossy().to_string(),
             policy: None,
             embedding: None,
+            startup_failure: None,
             external_blob_policy: omnigraph::ExternalBlobPolicy::Deny,
             queries: stored_query_registry(&[]),
         },
@@ -641,6 +644,7 @@ rules:
         .collect();
     ready.sort();
     assert_eq!(ready, vec!["good"]);
+    assert_eq!(state.routing().registry.len(), 2);
     let app = build_app(state);
 
     let (status, body) = json_response(
@@ -661,7 +665,7 @@ rules:
             .iter()
             .map(|graph| graph["graph_id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec!["good"]
+        vec!["broken", "good"]
     );
 
     let (status, body) = json_response(
@@ -674,7 +678,46 @@ rules:
             .unwrap(),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "graph_unavailable");
+    assert!(!body.to_string().contains("missing.omni"));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/graphs/broken/mutate")
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .header("authorization", "Bearer admin-token")
+                .header("content-type", "application/json")
+                .body(Body::from_stream(futures::stream::poll_fn(
+                    |_| -> std::task::Poll<Option<Result<&'static str, std::io::Error>>> {
+                        panic!("a blocked graph must refuse before consuming mutation input")
+                    },
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!response.headers().contains_key("retry-after"));
+    for (id, expected) in [("good", StatusCode::OK), ("unknown", StatusCode::NOT_FOUND)] {
+        let (status, body) = json_response(
+            &app,
+            Request::get(format!("/graphs/{id}/snapshot"))
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .header("authorization", "Bearer admin-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, expected, "{body}");
+    }
+    let (status, body) =
+        json_response(&app, Request::get("/readyz").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["served_graph_count"], 2);
+    assert_eq!(body["ready_graph_count"], 1);
+    assert_eq!(body["blocked_graph_count"], 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

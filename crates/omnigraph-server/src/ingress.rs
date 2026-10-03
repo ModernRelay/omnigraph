@@ -170,7 +170,22 @@ pub(crate) async fn admit(
     };
     // Raw NDJSON authorizes its branch scope before polling any body bytes.
     // Its collector consumes BodyDeadline and the same retained lease.
-    let response = next.run(Request::from_parts(parts, body)).await;
+    let request = Request::from_parts(parts, body);
+    let response = match class {
+        AdmissionClass::Read => {
+            // Body collection is still caller-owned and deadline-bounded.
+            // After it completes, preserve the whole read handler on disconnect
+            // so the engine can join the query workers before capacity returns.
+            observer
+                .clone()
+                .spawn_read(lease.clone(), async move { Ok(next.run(request).await) })
+                .result()
+                .await?
+        }
+        // Effectful handlers register through the owned-write boundary once
+        // their typed input, actor and operation reservations are captured.
+        AdmissionClass::Write => next.run(request).await,
+    };
     let (parts, body) = response.into_parts();
     let stream = ObservedBody {
         stream: Box::pin(body.into_data_stream()),
@@ -225,7 +240,7 @@ mod tests {
     use axum::Router;
     use axum::extract::State;
     use axum::middleware;
-    use axum::routing::{get, post};
+    use axum::routing::{MethodRouter, get, post};
     use futures::StreamExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -236,6 +251,13 @@ mod tests {
     use crate::workload::{WorkloadController, WorkloadLimits, WorkloadSnapshot};
 
     fn router(limits: WorkloadLimits) -> (Router, AppState, Arc<AtomicUsize>) {
+        router_with_read(limits, post(|| async { "read response" }))
+    }
+
+    fn router_with_read(
+        limits: WorkloadLimits,
+        read: MethodRouter,
+    ) -> (Router, AppState, Arc<AtomicUsize>) {
         // Admission itself needs no graph fixture: an independent handler
         // census proves whether the refused request reached execution.
         let state = AppState::new_multi(
@@ -251,7 +273,7 @@ mod tests {
         let observed = Arc::clone(&entered);
         let app = Router::new()
             .route("/snapshot", get(|| async { "read response" }))
-            .route("/query", post(|| async { "read response" }))
+            .route("/query", read)
             .route(
                 "/write",
                 post(move || {
@@ -278,6 +300,63 @@ mod tests {
             .header("content-type", "application/json")
             .body(body)
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn disconnected_read_keeps_handler_input_and_shutdown_ownership() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let completed = Arc::new(AtomicUsize::new(0));
+            let (app, state, _) = router_with_read(
+                WorkloadLimits::default(),
+                post({
+                    let entered = Arc::clone(&entered);
+                    let release = Arc::clone(&release);
+                    let completed = Arc::clone(&completed);
+                    move |body: Bytes| {
+                        let entered = Arc::clone(&entered);
+                        let release = Arc::clone(&release);
+                        let completed = Arc::clone(&completed);
+                        async move {
+                            entered.notify_one();
+                            release.notified().await;
+                            assert_eq!(body.as_ref(), b"query input");
+                            completed.fetch_add(1, Ordering::SeqCst);
+                            "read response"
+                        }
+                    }
+                }),
+            );
+            let caller = tokio::spawn(
+                app.clone().oneshot(
+                    Request::post("/query")
+                        .body(Body::from("query input"))
+                        .unwrap(),
+                ),
+            );
+            entered.notified().await;
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+            assert_eq!(state.operations.snapshot().active_reads, 1);
+            assert_eq!(state.workload.snapshot().read_ingress_bytes, 11);
+            assert_eq!(state.workload.snapshot().read_ingress_count, 1);
+            let refused = app
+                .oneshot(Request::get("/snapshot").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+            state.operations.close();
+            let shutdown = state.operations.wait_logical_owners();
+            tokio::pin!(shutdown);
+            assert!(futures::poll!(&mut shutdown).is_pending());
+            release.notify_one();
+            assert!(shutdown.await);
+            assert_eq!(completed.load(Ordering::SeqCst), 1);
+            assert_eq!(state.workload.snapshot(), WorkloadSnapshot::default());
+        })
+        .await
+        .expect("disconnected read did not settle");
     }
 
     #[tokio::test]

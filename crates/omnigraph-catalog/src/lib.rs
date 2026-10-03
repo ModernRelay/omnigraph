@@ -18,6 +18,11 @@ pub mod commit_graph;
 
 mod commit;
 mod record;
+mod schema_publication;
+pub use schema_publication::{
+    SchemaPublicationCandidate, SchemaPublicationEvidence, read_schema_publication_at,
+    read_schema_publication_candidate_at,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1759,6 +1764,17 @@ impl ManifestCoordinator {
             return Ok(None);
         }
         if new_dataset.version().version == self.dataset.version().version {
+            // Main's native branch identifier and numeric version can survive
+            // replacement of the root. Reuse the projection only when the
+            // complete immutable manifest image still matches its held pin.
+            if !publisher::manifest_image_matches(
+                self.dataset.manifest(),
+                self.dataset.manifest_location(),
+                &new_dataset,
+            ) {
+                tracing::debug!("projection refresh: manifest image changed; full scan");
+                return Ok(None);
+            }
             crate::instrumentation::record_projection_incremental_refresh();
             return Ok(Some(Vec::new()));
         }

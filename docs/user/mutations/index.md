@@ -49,9 +49,9 @@ A constant's value is fixed per invocation: parameters and `now()` are bound
 once before any retry, so a retried mutation computes the same value. It follows the read rules
 for null: with `$flag` null, `true or $flag` is `true` and `false and $flag`
 is `false`, and `$age > 30` with `$age` null is null. A null result assigned
-to a nullable property writes null, with one exception that predates this
-release: an `update` that assigns null to a nullable `Blob` property keeps
-the old value instead of clearing it. Assigned to a non-nullable property a
+to a nullable property writes null; on a `Blob` property it clears the cell.
+`null` is a reserved word, so clear a Blob through a nullable parameter such
+as `$content: Blob?`. Assigned to a non-nullable property a
 null result is refused with a typed error that names the property, never
 written as a default. A
 property or system field in a value is refused, for example ``T45: `age`
@@ -139,10 +139,28 @@ create a missing review branch and load onto it in the same workflow.
 
 ## Limits and conflicts
 
-Incremental keyed writes are bounded to 8,192 entities and 32 MiB per touched type
-in one commit. Every strict load also rejects an input whose projected in-memory
-representation exceeds 32 MiB. Split a larger import into explicit commits; use
-one initial overwrite only when it fits, followed by merge chunks.
+Insert/update mutations and incremental keyed loads are bounded to 8,192
+entities and 32 MiB per touched type, plus 32 MiB of retained Arrow batches
+across all touched types in one operation. Keyed loads also have a separate
+32 MiB parsed-payload estimate across types. External Blob payloads that require
+copying count toward the aggregate allowance. Every strict load retains its
+projected in-memory size check. Blob values have further limits; see
+[Blob limits](../blobs.md#limits).
+
+Deletes, including cascades, and overwrite loads collecting replaced IDs have
+a separate 32 MiB allowance per operation for those IDs, summed over all
+touched types. Each removed ID is charged its UTF-8 length plus 24 bytes, so
+the allowance holds 671,088 IDs of 26 bytes, the length of a generated ID. A
+delete and the edges it cascades to draw on the same allowance. An overwrite of
+entities loaded without a `@key` and without an explicit `id` removes every
+committed ID of that type, because those IDs are generated again on each load.
+
+Oversized work returns a resource-limit error before its data is staged or
+published. These checks do not bound total engine memory, and no setting
+changes them. Split larger inserts, updates, keyed loads and deletes into
+explicit commits. An overwrite replaces each represented type as one image and
+cannot be split: it keeps its bulk-input behavior and remains subject to its
+separate input and removed-ID checks.
 
 Independent existing constructive datasets stage concurrently. The
 `stage_write_concurrency` [session setting](../queries/index.md#session-settings)
@@ -166,7 +184,7 @@ the graph read-write or restart the server, then retry from a fresh branch head.
 Blob assignments accept managed `base64:` data and, when allowed by graph
 policy, external URI references. Ownership differs by load mode, and Blob bytes
 count toward write limits. See the canonical [Blob guide](../blobs.md) before
-loading them.
+loading them, and its [limits](../blobs.md#limits) for the bounds that apply.
 
 ## Conditional mutations
 

@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - ragnorc
 created: 2026-09-18
-updated: 2026-09-29
+updated: 2026-10-02
 discussion: null
 supersedes: []
 superseded_by: []
@@ -29,10 +29,9 @@ the process-local ***schema gate***, the write-queue key
 `("__schema_apply__", None)` that every writer, every maintenance pass, every
 branch control, and every read-view capture took exclusively before this
 change, becomes a shared/exclusive lock. A ***contract-lifecycle pass***
-(schema apply, the system-column upgrade, and every pass that installs,
-discards, or republishes the accepted schema-contract view: open, refresh,
-settle, reload, branch sync) takes it exclusive, exactly as it effectively did
-before. Branch create and create-from take it exclusive too: their namespace
+(schema apply, the system-column upgrade, and passes that replace the handle's
+contract or coordinator view: open, refresh, branch sync) takes it exclusive.
+Branch create and create-from take it exclusive too: their namespace
 inventory changes the live branch-ref set with no CAS over the change (Design,
 The lock). Everything else (ordinary mutations and loads, merges, index
 maintenance, optimize, cleanup, repair, branch delete, and read-view captures)
@@ -140,13 +139,11 @@ in-repo precedent for a shared/exclusive permit pair (`ExportCutPermit` /
   `ensure_no_pending_recovery`, the system-column upgrade under
   `options.check`, the read-view captures, and the test-only
   `reconcile_orphaned_branches`. The write capture (`open_write_txn`) takes
-  it only while a schema-apply sentinel stands and the gate is busy: it
-  parks on the shared side until the apply releases, then recaptures; the
-  common path takes no permit there (Errors and budgets below).
+  no schema permit; it captures the contract with its manifest snapshot and
+  revalidates that authority under the shared permit before effects.
 - `SchemaExclusivePermit`, the write side: taken by schema apply, the
   system-column upgrade, the contract-lifecycle passes on the handle (open,
-  refresh, `settle_pending_schema_install`,
-  `reload_schema_if_source_changed`, and `sync_branch`'s coordinator swap),
+  refresh, and `sync_branch`'s coordinator swap),
   and `branch_create_as` and `branch_create_from_impl`.
 
 The classification rule is auditable in one sentence: **a pass that only
@@ -173,42 +170,24 @@ non-reentrant in both modes on one task: an exclusive holder re-acquiring
 either side self-deadlocks, and a shared holder re-acquiring the shared side
 can park forever behind a queued exclusive in plain mode. No call path takes
 the gate twice: `refresh_coordinator_only` serves holders that need a
-coordinator refresh, and `refresh_for_reprepare` keeps the reprepare off the
-exclusive side (decision log, 2026-09-29). `refresh` itself holds the
-exclusive side twice in sequence, once around the coordinator refresh and
-once inside `reload_schema_if_source_changed`.
+coordinator refresh and the mutation/load reprepare paths. `refresh` holds one
+exclusive permit through coordinator refresh, published-contract reload and
+cache invalidation.
 
-**Errors and budgets.** Only `mutate` and `load` reach the write capture's
-park; `branch_merge_impl`, `ensure_indices`, optimize, cleanup and repair
-call `ensure_schema_apply_idle` first and get the typed `manifest_conflict`
-one call earlier. In `open_write_txn` a standing sentinel
-(`schema_apply_locked`, a live listing of `__manifest`'s `_refs/branches/`,
-not an in-memory flag) is classified by the gate. If an exclusive permit is
-held or queued in this process (`try_acquire_schema_shared` returns `None`),
-the apply is local: the capture parks on the shared side, then recaptures
-under the promoted contract. If the gate is free, the sentinel belongs to
-another process's apply or a dead one: the capture returns the typed
-`manifest_conflict` refusal once a second listing confirms the sentinel still
-stands (an apply in this process may have released between the two). Parks
-do not count against `MAX_CAPTURE_RETRIES` (8), which bounds torn captures
-only; exhausting it returns `manifest_read_set_changed`. Nothing is emitted
-while a capture is parked. Cost: the common path (no sentinel) takes no
-permit and no extra request; each park costs one more listing, and the
-refusal path one more again.
+**Capture and reprepare.** The contract and table registrations come from one
+published manifest image. A stale prepared writer must recapture and reprepare;
+it cannot combine the old contract with a fresh write base. There is no
+schema-sentinel probe or pending contract-file installation.
 
-**Permit sites.** The 24 acquisition sites on this tree, one row per call
-site (the write capture's park counts once; the system-column upgrade's two
-sides count once each). Paths are under `crates/omnigraph/src/`.
+**Permit sites.** Paths are under `crates/omnigraph/src/`; the system-column
+upgrade's check and execute paths take different sides.
 
 | file | function | side |
 |---|---|---|
 | `db/omnigraph.rs` | `open_with_storage_and_mode` (read-write and read-only open) | exclusive |
 | `db/omnigraph.rs` | `ensure_no_pending_recovery` | shared |
-| `db/omnigraph.rs` | `open_write_txn` (the park, sentinel standing only) | shared |
 | `db/omnigraph.rs` | `sync_branch` | exclusive |
 | `db/omnigraph.rs` | `refresh` | exclusive |
-| `db/omnigraph.rs` | `settle_pending_schema_install` | exclusive |
-| `db/omnigraph.rs` | `reload_schema_if_source_changed` | exclusive |
 | `db/omnigraph.rs` | `capture_read_view` | shared |
 | `db/omnigraph.rs` | `capture_current_read_view` | shared |
 | `db/omnigraph.rs` | `capture_historical_read_view` | shared |
@@ -265,7 +244,7 @@ gates, and the publisher's `PublishPrecondition::ExactGraphHead`
 (`crates/omnigraph/src/db/omnigraph/table_ops.rs`) refuses a stale head
 whatever gates were held.
 
-Second, the classification surface is enumerable and closed. The 24
+Second, the classification surface is enumerable and closed. The
 acquisition sites (the permit table above) divide under the rule above, with
 read-only open the one exclusive site held by conservatism; the rule is
 enforceable in review (a new site must name its permit type), and the typed
@@ -280,17 +259,17 @@ a mutex.
   protects: shared holders drain before a contract-lifecycle pass swaps the
   accepted view, so no permit holder is in flight across the swap. Two
   readers of the contract stay outside the gate: the write capture
-  (`open_write_txn` reads the contract and builds its catalog with no permit,
-  safe through the sentinel probe, the trailing schema-state re-read, and
-  revalidation under the shared permit at commit) and `resolved_target`,
-  which reads the contract with no permit at all.
+  (`open_write_txn` captures the contract and catalog from one manifest image,
+  then revalidates that authority under the shared permit before effects) and
+  `resolved_target`, which reads the contract with no permit at all.
 - Recovery and pin semantics (RFC 0067, as amended by detached-only tables)
   are unchanged.
 - The deny-list line "process-local locks presented as distributed writer
   fencing" is reaffirmed, not weakened: the gate remains an in-process
-  contention structure; the durable `__schema_apply_lock__` sentinel, the
-  mono-branch refusal, and the manifest CAS remain the cross-process story,
-  byte-for-byte.
+  contention structure. Schema apply retains its main-only, single-live-branch
+  restriction and exact manifest CAS; the removed schema sentinel supplies no
+  distributed exclusion. Branch controls and cleanup retain their existing
+  single-writer-process boundary.
 
 ## Compatibility and reversibility
 
@@ -346,7 +325,7 @@ The acceptance bar for the implementation PR, mapped to existing owners:
   `refresh_holds_schema_gate_through_catalog_publication`) are unchanged,
   because both sites stay exclusive. Added: `parked_writer_blocks_schema_apply`,
   the mis-classification tripwire, asserts that the apply does not reach
-  `SCHEMA_APPLY_POST_SENTINEL` while a writer holds its shared permit (with
+  `SCHEMA_APPLY_POST_LOCK_PRE_EFFECT` while a writer holds its shared permit (with
   the writer's permit dropped in `HeldWriteGates::new` it is red);
   `cross_branch_writers_overlap_inside_schema_gate` and
   `read_capture_proceeds_while_writer_parked` pin the two shared-side gains;
@@ -367,11 +346,9 @@ The acceptance bar for the implementation PR, mapped to existing owners:
   `dst_seam_scheduler_bite_and_replay` has no schema actor: it pins the
   shared permit's turn/epoch protocol, and the exclusive side under the
   scheduler is pinned only by the ignored hunt.
-- **Cost contracts.** The `write_cost.rs` per-op counts (manifest ceiling,
-  the schema fence's exact read/exists counts) stay green unchanged; gate
-  scope changes overlap, not the common-path operation counts. The write
-  capture's park adds one `_refs/branches/` listing per park, on the
-  sentinel-standing path only.
+- **Cost contracts.** `write_cost.rs` owns per-operation counts. The gate
+  split changed overlap, not common-path operation counts; subsequent manifest
+  contract capture removes the old sentinel-listing cost.
 - **Not evidenced here:** independent merges overlapping. `branch_merge_impl`
   takes the shared permit, and no instrument or pin in this change runs two
   merges at once; the merge case of RFC 0067's question stays open there.
@@ -589,3 +566,10 @@ revert.
   or writer in flight". The 2026-09-19 entry's grain and conservatism
   clauses are corrected in place and marked.
 
+- 2026-10-02: Aligned current mechanisms with manifest-resident contracts.
+  Summary and The lock replace the install/settle lifecycle list, sentinel
+  parking and retry paragraph, two-pass refresh, and removed permit sites with
+  coherent manifest capture and one exclusive refresh. Invariants replaces the
+  sentinel-based capture and distributed-exclusion sentences. Evidence replaces
+  the removed `SCHEMA_APPLY_POST_SENTINEL` name and sentinel-listing cost claim.
+  Historical rollout and measurements remain unchanged.

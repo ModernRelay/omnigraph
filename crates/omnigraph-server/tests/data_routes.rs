@@ -3,6 +3,7 @@
 
 use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::convert::Infallible;
+use std::fmt::Write;
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -4805,6 +4806,175 @@ async fn change_concurrent_inserts_same_key_serialize_without_409() {
         SEED_PERSON_ROWS + N as u64,
         person_rows,
     );
+}
+
+/// The wire body fits the 1 MiB route limit; one reused parameter expands to over
+/// 32 MiB of retained Arrow across two individually legal tables, so the engine's
+/// operation bound makes the refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aggregate_mutation_memory_refusal_keeps_graph_and_admission_usable() {
+    let temp = init_graph_with_schema_and_data(
+        "node First { name: String @key payload: String }\n\
+         node Second { name: String @key payload: String }",
+        "",
+    )
+    .await;
+    let graph = graph_path(temp.path());
+    let state = AppState::open(graph.to_string_lossy().to_string())
+        .await
+        .unwrap();
+    let operations = state.operation_runtime().clone();
+    let app = build_app(state);
+    let history = || {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/commits"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (_, before) = json_response(&app, history()).await;
+
+    let mut query = String::from("query wide($payload: String) {\n");
+    for table in ["First", "Second"] {
+        for row in 0..32 {
+            writeln!(
+                query,
+                "insert {table} {{ name: \"row{row}\", payload: $payload }}"
+            )
+            .unwrap();
+        }
+    }
+    query.push('}');
+    let request = json!({"query": query, "params": {"payload": "x".repeat(600_000)}});
+    assert!(serde_json::to_vec(&request).unwrap().len() < 1024 * 1024);
+    let (status, output) = json_response(&app, json_post("/mutate", &request)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{output}");
+    let error: ErrorOutput = serde_json::from_value(output).unwrap();
+    let refusal = error.resource_limit.expect("engine resource refusal");
+    assert_eq!(refusal.resource, "retained keyed batch bytes per operation");
+    assert_eq!(refusal.limit, 32 * 1024 * 1024);
+    assert!(refusal.actual > refusal.limit);
+    assert_eq!(operations.snapshot().uncertain_writes, 0);
+    assert!(!operations.snapshot().closed);
+    let (_, after) = json_response(&app, history()).await;
+    assert_eq!(after, before, "refusal must publish no graph commit");
+
+    for table in ["First", "Second"] {
+        let (status, rows) = json_response(
+            &app,
+            json_post(
+                "/query",
+                &json!({"query": format!(
+                    "query rows() {{ match {{ $n: {table} }} return {{ $n.name }} }}"
+                )}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+        assert_eq!(rows["row_count"], 0);
+    }
+    let (status, output) = json_response(
+        &app,
+        json_post(
+            "/mutate",
+            &json!({"query":
+                "query small() { insert First { name: \"ok\", payload: \"ok\" } }"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_receipt_commit_matches_get(&app, &output).await;
+}
+
+/// Two 16 MiB ids are seeded through the engine (no route carries them); a `/mutate`
+/// delete and a `/load` overwrite must each refuse the removed-id sum as a certain 413.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removed_id_memory_refusals_keep_graph_and_admission_usable() {
+    let wide = "x".repeat(16 * 1024 * 1024);
+    let temp = init_graph_with_schema_and_data(
+        "node First { name: String @key tag: String? }\n\
+         node Second { name: String @key tag: String? }",
+        &format!(
+            "{}\n{}",
+            json!({"type": "First", "data": {"name": wide}}),
+            json!({"type": "Second", "data": {"name": wide}}),
+        ),
+    )
+    .await;
+    drop(wide);
+    let graph = graph_path(temp.path());
+    let state = AppState::open(graph.to_string_lossy().to_string())
+        .await
+        .unwrap();
+    let operations = state.operation_runtime().clone();
+    let app = build_app(state);
+    let history = || {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/commits"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (_, before) = json_response(&app, history()).await;
+
+    for (door, request) in [
+        (
+            "/mutate",
+            json!({"query": "query clear() {\n\
+                delete First where name != \"\"\n\
+                delete Second where name != \"\"\n\
+            }"}),
+        ),
+        (
+            "/load",
+            json!({
+                "mode": "overwrite",
+                "data": "{\"type\":\"First\",\"data\":{\"name\":\"small\"}}\n\
+                         {\"type\":\"Second\",\"data\":{\"name\":\"small\"}}",
+            }),
+        ),
+    ] {
+        let (status, output) = json_response(&app, json_post(door, &request)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{door}: {output}");
+        let error: ErrorOutput = serde_json::from_value(output).unwrap();
+        let refusal = error.resource_limit.expect("engine resource refusal");
+        assert_eq!(
+            refusal.resource, "retained removed-id bytes per operation",
+            "{door}"
+        );
+        assert_eq!(refusal.limit, 32 * 1024 * 1024, "{door}");
+        assert!(refusal.actual > refusal.limit, "{door}");
+        assert_eq!(operations.snapshot().uncertain_writes, 0, "{door}");
+        assert!(!operations.snapshot().closed, "{door}");
+        let (_, after) = json_response(&app, history()).await;
+        assert_eq!(after, before, "{door} refusal must publish no graph commit");
+    }
+
+    for table in ["First", "Second"] {
+        let (status, rows) = json_response(
+            &app,
+            json_post(
+                "/query",
+                &json!({"query": format!(
+                    "query rows() {{ match {{ $n: {table} }} return {{ $n.tag }} }}"
+                )}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+        assert_eq!(rows["row_count"], 1);
+    }
+    let (status, output) = json_response(
+        &app,
+        json_post(
+            "/mutate",
+            &json!({"query": "query small() { insert First { name: \"ok\" } }"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_receipt_commit_matches_get(&app, &output).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

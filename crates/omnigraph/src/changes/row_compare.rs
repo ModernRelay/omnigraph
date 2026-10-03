@@ -23,7 +23,9 @@ use omnigraph_compiler::{SYSTEM_COLUMNS_META, SystemColumns};
 
 use super::model::{COMMIT_CHANGES_MAX_BYTES, is_reserved_storage_system_column};
 use crate::blob::{BlobDescriptor, BlobDescriptorDecoder};
-use crate::db::{STABLE_PROPERTY_ID_METADATA_KEY, export_blob_values};
+use crate::db::{
+    LogicalBlobValue, RangedExternalBlobs, STABLE_PROPERTY_ID_METADATA_KEY, export_blob_values,
+};
 use crate::error::{OmniError, Result};
 use crate::ordered_cursor::{KeyFilter, KeyOrder, OrderedRowCursor, WalkSubject};
 
@@ -589,17 +591,25 @@ async fn rows_equal_by_column(
     Ok(left_values == right_values)
 }
 
-/// Logical Blob values (managed bytes, external URI, or null) for one row's
-/// selected columns, read through the same helper export uses.
+/// Managed Blob bytes for one row's selected columns, read through the same
+/// helper export uses. Only columns managed on both sides reach this: external
+/// and null cells are decided by descriptor identity in [`rows_equal_by_column`].
 async fn blob_values_for(
     dataset: &Dataset,
     slice: &RecordBatch,
     columns: &HashSet<String>,
-) -> Result<HashMap<String, Vec<Option<String>>>> {
+) -> Result<HashMap<String, Vec<Option<LogicalBlobValue>>>> {
     let row_id = slice
         .column_by_name("_rowid")
         .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
         .ok_or_else(|| OmniError::manifest_internal("change row is missing _rowid"))?
         .value(0);
-    export_blob_values(dataset, slice, &[row_id], columns).await
+    export_blob_values(
+        dataset,
+        slice,
+        &[row_id],
+        columns,
+        RangedExternalBlobs::Describe,
+    )
+    .await
 }

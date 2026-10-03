@@ -157,6 +157,137 @@ async fn server_boots_with_a_valid_stored_query_registry() {
     );
 }
 
+/// E1 qualification probe, not a supported deployment path: a raw engine apply
+/// cannot replace the serving contract captured before body collection. The
+/// negative control deliberately bypasses cluster admission; the positive
+/// control finishes that invocation before applying on the same engine.
+/// This needs HTTP body scheduling and handle identity, which GQT cannot express.
+#[tokio::test(flavor = "multi_thread")]
+async fn parked_stored_invocation_requires_a_serving_transition_barrier() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::body::Bytes;
+    use axum::http::Request;
+    use omnigraph_server::{GraphHandle, build_app, workload::WorkloadController};
+
+    fn request(body: Body) -> Request<Body> {
+        Request::post(g("/queries/find_person"))
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap()
+    }
+
+    for finish_before_apply in [false, true] {
+        let temp = init_loaded_graph().await;
+        let state = AppState::open_single_with_queries(
+            graph_path(temp.path()).to_string_lossy().into_owned(),
+            vec![],
+            None,
+            stored_query_registry(&[("find_person", FIND_PERSON_GQ, true)]),
+        )
+        .await
+        .unwrap();
+        let handle = state.routing().registry.list().pop().unwrap();
+        let operations = state.operation_runtime().clone();
+        let app = build_app(state);
+        let (polled, body_polled) = tokio::sync::oneshot::channel();
+        let (release, body_released) = tokio::sync::oneshot::channel();
+        let body = Body::from_stream(futures::stream::once(async move {
+            polled.send(()).unwrap();
+            body_released.await.unwrap();
+            Ok::<_, std::io::Error>(Bytes::from_static(br#"{"params":{"name":"Alice"}}"#))
+        }));
+        let invocation = tokio::spawn(async move { json_response(&app, request(body)).await });
+        tokio::time::timeout(Duration::from_secs(10), body_polled)
+            .await
+            .expect("body collection must reach the deterministic parking point")
+            .unwrap();
+        assert_eq!(operations.snapshot().active_reads, 1);
+        assert!(!invocation.is_finished());
+
+        if !finish_before_apply {
+            // Deliberately unsafe composition: this is not cluster apply or the
+            // guarded HTTP schema route, which validates the current registry.
+            handle
+                .engine
+                .apply_schema(&renamed_age_schema())
+                .await
+                .unwrap();
+        }
+        release.send(()).unwrap();
+        let (status, output) = tokio::time::timeout(Duration::from_secs(10), invocation)
+            .await
+            .expect("released invocation must finish")
+            .unwrap();
+        // Result delivery can precede the producer's final observer drop.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), operations.wait_logical_owners())
+                .await
+                .expect("released invocation's logical owners must settle")
+        );
+        assert_eq!(operations.snapshot().active_reads, 0);
+        if finish_before_apply {
+            assert_eq!(status, StatusCode::OK, "{output}");
+            assert_eq!(output["rows"], json!([{ "p.age": 30 }]));
+            handle
+                .engine
+                .apply_schema(&renamed_age_schema())
+                .await
+                .unwrap();
+        } else {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{output}");
+            assert!(
+                output["error"].as_str().unwrap().contains("age"),
+                "{output}"
+            );
+        }
+
+        // Updating the engine does not update the immutable serving binding.
+        // Even refresh cannot repair the stale stored-query source.
+        handle.engine.refresh().await.unwrap();
+        let old_queries = handle.queries.as_ref().unwrap();
+        assert_eq!(
+            old_queries.lookup("find_person").unwrap().source.as_ref(),
+            FIND_PERSON_GQ
+        );
+        assert!(
+            omnigraph_server::queries::check(old_queries, &handle.engine.catalog()).has_breakages()
+        );
+
+        let new_source = FIND_PERSON_GQ.replace("$p.age", "$p.years");
+        let new_queries = stored_query_registry(&[("find_person", &new_source, true)]);
+        assert!(
+            !omnigraph_server::queries::check(&new_queries, &handle.engine.catalog())
+                .has_breakages()
+        );
+        let replacement = Arc::new(GraphHandle {
+            key: handle.key.clone(),
+            uri: handle.uri.clone(),
+            engine: Arc::clone(&handle.engine),
+            policy: None,
+            queries: Some(Arc::new(new_queries)),
+        });
+        assert!(Arc::ptr_eq(&replacement.engine, &handle.engine));
+        let state = AppState::new_multi(
+            vec![replacement],
+            vec![],
+            None,
+            WorkloadController::with_defaults(),
+            None,
+        )
+        .unwrap();
+        let (status, output) = json_response(
+            &build_app(state),
+            request(Body::from(r#"{"params":{"name":"Alice"}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{output}");
+        assert_eq!(output["rows"], json!([{ "p.years": 30 }]));
+    }
+}
+
 #[tokio::test]
 async fn server_refuses_boot_on_type_broken_stored_query() {
     // A stored query referencing a type not in the schema (`Widget`)

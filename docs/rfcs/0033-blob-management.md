@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-08-09
-updated: 2026-09-30
+updated: 2026-10-03
 discussion: null
 supersedes: []
 superseded_by: []
@@ -19,7 +19,7 @@ blocked_on: []
 **Depends on:** RFC 0022 unified writes, RFC 0023 exact `id` fencing,
 RFC 0028 stable schema identity, internal manifest schema v6, and Lance 10.0.0
 blob-v2 (`lance.blob.v2`) on file format V2_2.
-Phase 3 and the served-route lifecycle additionally depend on the proposed
+Phase 3 and the served-route lifecycle additionally depend on the accepted
 [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md)
 contracts for operation ownership, coherent serving views, and completion.
 **Surveyed:** OmniGraph `db23f58a5d97`; Lance 9.0.0 as the defect baseline;
@@ -221,6 +221,11 @@ The following rules are normative:
   unknown persisted length). The descriptor model carries a range so existing
   or future Lance values can be represented without changing the facade, but no
   public V1 command accepts an external offset/length.
+- An external descriptor with `offset > 0` and a persisted size of 0 is not a
+  valid `External` state. The central decoder refuses it as a Blob integrity
+  error: Lance's external reader substitutes the object size for a size of 0
+  but keeps the position, so reading it would run past the object's end. Only
+  a writer outside OmniGraph can persist it.
 
 Null detection uses only the parent struct's Arrow validity. A non-null struct
 with a zero length is a non-null empty value. Field-value heuristics are
@@ -245,7 +250,7 @@ pub struct BlobCell {
 ```
 
 `type_name` and `property` are public graph vocabulary. They are resolved through
-the accepted catalog captured with the read view; under the proposed
+the accepted catalog captured with the read view; under the accepted
 [serving-view contract](2026-09-29-server-runtime-and-online-deployment.md#serving-views)
 that catalog, the schema token, Cedar policy, and external-Blob policy all come from the same
 immutable runtime generation. The engine then carries stable table identity,
@@ -341,7 +346,7 @@ boundaries, just like `cleanup`: Phase 1 adds
 no durable reader lease or cross-process live-reader registry. Callers that
 require an opened reader to finish must quiesce it before deleting that branch,
 running version GC, or performing an offline operation that removes a ref/path.
-The v0.12 [server runtime proposal](2026-09-29-server-runtime-and-online-deployment.md)
+The v0.12 [server runtime decision](2026-09-29-server-runtime-and-online-deployment.md)
 drains affected reads during deployment. Independent historical availability
 and its stronger reader-retention protocol require a separate proposal; neither
 changes the quiescence rule above. Ordinary detached writes need no compensation.
@@ -479,12 +484,17 @@ escape hatch.
 
 An implementation may wrap Lance `read_blob_ranges`, `read_blobs`, or
 `take_blobs`, but Lance types do not appear in public signatures.
-Complete-payload internal work uses Lance's batched `read_blobs` API. It and
-`read_blob_ranges` already shipped in Lance 9.0.0 with row-id, row-index, and
-row-address selectors; Lance 10.0.0 is required for their null-preserving,
-request-cardinality behavior. The hard rule is the anti-pattern: it must not
-build a thread pool around one `BlobFile::read()` per row. Range work prefers
-`read_blob_ranges` when it supports the needed selector.
+Materializing rewrites use Lance's batched `read_blobs` API on managed rows
+with an explicit I/O buffer: a carried update or merge cell, the bounded rewrite
+stream and the schema-apply rewrite each pass one batch's managed stable row ids
+to one streamed call. Upgrade validation reads managed bytes through
+`read_blob_ranges` in bounded windows. Both APIs shipped in Lance 9.0.0 with
+row-id, row-index, and row-address selectors; Lance 10.0.0 is required for their
+null-preserving, request-cardinality behavior. Export and change-feed images
+still read one row at a time through `take_blobs` and `BlobFile::read`, and the
+single-cell read facade uses `take_blobs`; moving export and change images onto
+batched reads is Phase 4 work. The hard rule is the anti-pattern: it must not
+build a thread pool around one `BlobFile::read()` per row.
 
 ### 4.1 Descriptor-first classification
 
@@ -533,6 +543,9 @@ as `NotFound`, null, or an opaque Lance display string.
 `put_blob_at_as` replaces exactly one cell with managed bytes. `clear_blob_at_as`
 sets exactly one nullable cell to null. Both require an existing entity row; they
 never insert a row. Clear on a non-nullable property is `BadRequest`.
+A `.gq` `update` that assigns null to a nullable Blob clears the cell the same
+way, and an `update` never reads the old value of a Blob it assigns. A null
+assigned to a non-nullable Blob is refused before the update opens its table.
 
 These methods require an exact-ID, update-only preparation path; they are not
 implemented by synthesizing a `.gq` update. The implementation may be a focused
@@ -590,8 +603,8 @@ manifest CAS. The shared publish tail remains one call site. Unpublished table
 effects remain unreachable; published pins are final, with no recovery sidecar
 or table promotion. See [the write contract](../dev/writes.md).
 
-The proposed [authority and completion contract](2026-09-29-server-runtime-and-online-deployment.md#authority-and-completion)
-owns the server's use of engine publication evidence and schema/control
+The accepted [authority and completion contract](2026-09-29-server-runtime-and-online-deployment.md#authority-and-completion)
+owns the server's use of engine publication evidence and control
 completion. A served Blob operation never heals inline or replays after an
 unknown outcome. It preserves exact evidence and notifies the designated owner;
 runtime candidates are built without completion effects.
@@ -602,8 +615,8 @@ checks its schema token before entering the engine. The engine write:
 
 1. normalizes and rejects internal branch names;
 2. enforces Cedar `change` for the supplied actor identity and branch;
-3. respects pending schema/control completion before effects, then captures one
-   fresh write base;
+3. respects remaining control obligations and captures one fresh write base
+   with its complete accepted schema contract;
 4. resolves stable schema/table/property identity and exact row ID;
 5. evaluates the precondition and prepares one-row replacement state under the
    normal row/byte ceilings;
@@ -637,7 +650,7 @@ Reads additionally accept `branch=<name>` or `snapshot=<commit>`, never both;
 the transport default is `branch=main`. Authorization uses the existing `read`
 action and the same snapshot-to-policy-branch resolution as `/read`.
 
-Under the proposed [operation ownership contract](2026-09-29-server-runtime-and-online-deployment.md#operation-ownership)
+Under the accepted [operation ownership contract](2026-09-29-server-runtime-and-online-deployment.md#operation-ownership)
 the route first captures one exact served generation and a read-lifetime permit
 before target observation. The generation supplies the engine, catalog, policy,
 external-Blob policy, and cache namespace. HEAD and an
@@ -843,8 +856,13 @@ pub enum ExternalBlobPolicy {
 Cluster configuration exposes the same policy per graph. The default is
 `deny`. An allowed base contains an absolute URI prefix and an execution scope:
 server-safe or embedded-only. Configuration validation normalizes it once,
-rejects URI user-info and query/fragment credentials, and rejects overlapping or
-ambiguous encodings.
+rejects URI user-info and query/fragment credentials, rejects overlapping or
+ambiguous encodings, and rejects a base that overlaps OmniGraph storage: the
+cluster storage root, and with it every graph root and the cluster ledger, at
+config validation and serve boot, and the handle's own graph root at engine
+policy install. Ingress reads with the process's storage principal, so such a
+base would let an authorized writer copy graph or ledger bytes into a managed
+cell readable past Cedar.
 
 Every raw configured base and input URI is capped at 64 KiB inclusive before
 trimming, URL parsing, percent decoding, or filesystem resolution. This bounds
@@ -947,8 +965,9 @@ and parity cost.
 ### 7.3 Existing references and disclosure
 
 The new ingress policy does not make existing graphs unreadable. Stored external
-references can be opened, exported, inspected, and redirected even when new
-ingress is denied. This separation permits an operator to freeze reference
+references can be opened and inspected even when new ingress is denied, and a
+reference that names its whole object can also be exported and redirected; a
+ranged descriptor is refused by those surfaces (§5.1, §8.3). This separation permits an operator to freeze reference
 creation without losing access to historical data.
 
 Read authorization permits observing the selected Blob cell, including its
@@ -994,7 +1013,15 @@ a parser/validator hole without stranding a historical root.
 
 Export uses the central decoder. Null emits JSON null, managed zero bytes emits
 `base64:` with an empty payload, non-empty managed content emits base64, and an
-external reference emits its URI. Export's current one-row indivisible Blob
+external reference that names its whole object emits its URI. A ranged
+external descriptor is refused: a bare URI reloads as the whole object, so
+emitting it would widen the cell. Change-feed images, entity reads and the
+change-feed baseline share the decoder but describe a ranged descriptor
+exactly as `{"uri", "offset", "length"}` without reading the object. Images and
+entity reads are not reloaded, so a feed cursor passes the commit that holds
+one. The baseline is the exact state a feed consumer starts from, so a
+refusal there would leave the graph with no baseline; a baseline holding a
+ranged descriptor does not reload with `load`. Export's current one-row indivisible Blob
 scratch and chunked transport limits remain documented; the Blob GET endpoint is
 the preferred way to move a single large payload without base64 expansion.
 
@@ -1016,8 +1043,12 @@ ranged descriptor before recovery arm or table movement; it never silently
 widens the cell to the whole object. Supporting descriptor-preserving ranged
 schema rewrites remains part of the future ownership-proof optimization below.
 
-The current materializing rewrite is accepted as a bounded V1 implementation,
-not as an ideal physical plan. A future optimization may carry immutable
+The current materializing rewrite is a V1 implementation, not an ideal
+physical plan, and the schema-apply rewrite is not bounded: it scans the whole
+table into one batch and holds every managed payload of a rewritten Blob column
+in memory before staging. Mutation and merge carries stay under their operation
+budget (§10). A bounded, streamed schema-apply rewrite is required future work.
+A future optimization may carry immutable
 prepared descriptors for unchanged cells only after a Lance surface guard proves
 that references cannot escape their source dataset/incarnation and recovery can
 account for every file. Correctness and ownership proof come before avoiding the
@@ -1057,9 +1088,11 @@ duplicated descriptor heuristics. Those still misclassify inline
 `0/0/empty-uri` as null, so the §4.1 central Arrow-validity decoder work remains
 required in full.
 
-Cleanup remains Lance-owned version GC under OmniGraph's manifest/ref/recovery
-floors. It can remove managed Blob sidecars only when Lance proves they are no
-longer reachable from retained dataset versions. It never interprets or deletes
+Cleanup is OmniGraph's tracing collector under the manifest/ref/recovery
+floors; stock `cleanup_old_versions` is never called on a graph table. The
+collector marks every file reachable from retained graph snapshots, tags and
+selected merge bases, Blob sidecars included, so a managed sidecar is kept or
+reclaimed with the data file that references it. It never interprets or deletes
 external URIs.
 
 ## 9. Physical layout and Lance alignment
@@ -1081,9 +1114,10 @@ evidence that users need the control. If production metrics later show placement
 as a material cost term, a follow-up RFC can propose an annotation with migration
 semantics and a comparative benchmark.
 
-Batch complete reads use `Dataset::read_blobs`; batch range reads use
-`Dataset::read_blob_ranges`; lazy single-cell reads may use `take_blobs` behind
-the engine facade. Logical row IDs are preferred within an exact snapshot.
+Materializing rewrites read complete managed payloads with
+`Dataset::read_blobs` and upgrade validation reads ranges with
+`Dataset::read_blob_ranges` (§4); export, change images and lazy single-cell
+reads use `take_blobs` behind the engine facade. Logical row IDs are preferred within an exact snapshot.
 Physical row addresses never become public stable identity.
 
 ## 10. Security and resource model
@@ -1091,11 +1125,13 @@ Physical row addresses never become public stable identity.
 | Risk | Required control |
 |---|---|
 | Server-side file/object read through URI input | Default-deny engine policy, exact normalized bases, no server `file://`, no per-request override |
+| Graph/ledger bytes copied through an ingress base | Base/root disjointness at config, serve and engine |
 | URI credential disclosure | Reject user-info/query/fragment credentials at config and input; return URI only to an authorized Blob reader |
 | URI parser amplification | Reject a raw configured or input URI above 64 KiB before trimming, parsing, decoding, or filesystem resolution |
 | External SSRF during read | Descriptor-first classification; redirect only; no proxy or validation on GET/HEAD |
 | Oversize upload | Route and engine 32 MiB inclusive limits; refusal before effect |
-| Rewrite amplification | New logical input and row-writing branch merge pre-size all carried Blob payloads under one 32 MiB operation budget before read; predicate mutation carry applies the same cumulative byte ceiling while materializing bounded scan batches |
+| Rewrite amplification | New logical input and row-writing branch merge pre-size all carried Blob payloads under one 32 MiB operation budget before read; predicate mutation carry applies the same cumulative byte ceiling while materializing bounded scan batches. The schema-apply rewrite has no byte ceiling yet (§8.4) |
+| Compaction memory | Optimize sets the compaction scanner batch from the planned fragments' largest row, summing that row's Blob columns: as many rows (1 to 8,192) as fit 32 MiB of managed payload at that row's size, so one batch materializes at most 32 MiB of managed payload. A row whose Blob values together exceed 32 MiB is compacted in a batch of its own and materialized whole. This bounds payload per batch, not heap: Lance's writer copies inline payloads into its prepared arrays while it holds the batch (see the operator guide's optimize section). External descriptors are carried unread |
 | External-source planning | Row-writing branch merge admits at most 8,192 external-reference cells and 32 MiB of retained URI metadata before HEAD; probes are bounded and normalized aliases deduplicate within the applicable operation or scan-batch envelope |
 | Engine read memory | `BlobReader::read_range` returns at most `BLOB_READ_RANGE_MAX_BYTES` (4 MiB); larger values require consecutive calls and there is no unbounded full-read method |
 | Delivery memory | Phase 2A adds a two-chunk queue, backpressure, and prompt cancellation without weakening the engine's 4 MiB per-call bound |
@@ -1124,6 +1160,7 @@ depends on typed code and fields, not an opaque Lance string.
 | Non-Blob property, invalid selector, non-nullable clear | `bad_request` | 400 |
 | Branch and snapshot together / snapshot on write | `bad_request` | 400 |
 | Disallowed or malformed external URI | `bad_request` with policy reason | 400 |
+| Update must carry a stored external reference the graph's policy refuses | `StoredExternalBlobDenied`, naming type, id, and property | 400 |
 | External source missing/unreadable | typed external source error | 424 Failed Dependency; never generic 500 |
 | Upload/rewrite budget exceeded | `resource_limit` with limit/observed | 413 |
 | Managed HTTP range exceeds 4 MiB | consecutive bounded engine reads | 200/206; the 4 MiB ceiling bounds each payload read, not the requested representation |
@@ -1131,7 +1168,7 @@ depends on typed code and fields, not an opaque Lance string.
 | Blob write If-Match failed | `BlobWritePreconditionFailed { current_etag }` | 412 plus `blob_precondition_failure`; never graph `precondition_failure` |
 | Generation lane closed before operation | shared proposed lifecycle detail | 503, not started |
 | Captured generation schema token is stale | shared proposed stale-generation outcome | shared refusal and designated-owner notification; no Blob-specific error or inline repair |
-| Publication or schema/control completion uncertain | exact engine outcome and retained publication evidence | existing mapping; never permission to replay |
+| Publication or control completion uncertain | exact engine outcome and retained publication evidence | existing mapping; never permission to replay |
 | Owned write panics or has no knowable terminal outcome | shared proposed unknown-outcome class | 500; never success or replay |
 | Persisted table/Blob integrity contradiction | `BlobIntegrity { reason }` | exhaustive server mapping is 5xx |
 
@@ -1149,7 +1186,7 @@ credentials, or complete sensitive URIs. URI metrics use scheme plus a
 keyed/irreversible base identifier. Phase 2A deliberately does not add a new
 metrics backend merely to claim this box; the telemetry ships in a focused
 follow-up against the repository's eventual production observability owner.
-The [server runtime proposal](2026-09-29-server-runtime-and-online-deployment.md#availability-and-supervision)
+The [server runtime decision](2026-09-29-server-runtime-and-online-deployment.md#availability-and-supervision)
 specifies bounded lifecycle status. Production telemetry stays with the
 observability owner above; this RFC adds Blob classification, range, payload-byte,
 validator, and delivery timing dimensions.
@@ -1206,8 +1243,8 @@ The implementation extends existing owners before creating new fixtures, per
   as a different stable-property lifetime.
 - Phase 1 migrates `export.rs`'s four-way null/empty/non-empty/external fixture to
   the facade. External classification stays descriptor-first while the target is
-  unavailable; bulk export itself retains its batched reader and must not loop
-  over the single-cell API.
+  unavailable; bulk export keeps its own `take_blobs` selection and must not
+  loop over the single-cell API.
 - `forbidden_apis.rs` removes the old `read_blob -> BlobFile` surface, classifies
   `read_blob_at` as read-only, and proves no durable call site was added.
 - The canonical-input owner presents Lance's prepared four-child Blob struct to
@@ -1283,12 +1320,12 @@ The implementation extends existing owners before creating new fixtures, per
   conditionals; external 302 with zero external I/O; branch/snapshot validation;
   node and edge selectors; and authorization. A payload-read probe remains at
   zero for managed HEAD on both empty and near-limit values. The server runtime
-  proposal extends the same route owner with exact-generation read ownership and shared
+  decision extends the same route owner with exact-generation read ownership and shared
   lifecycle 503s. Phase 3 extends it with owned PUT/DELETE, exact receipts,
   no-op clear `commit: null`, distinct Blob 412 details, 413, and actor
   attribution.
 - `openapi.rs`: regenerate and compare each phase's binary request/response
-  surface. The server runtime proposal adds GET/HEAD lifecycle responses;
+  surface. The server runtime decision adds GET/HEAD lifecycle responses;
   Phase 3 pins write lifecycle, the exact receipt, and the distinct Blob precondition without
   exposing storage identity.
 - Phase 2B's pure `crates/omnigraph-cli/src/blob_cli.rs` units own range
@@ -1451,9 +1488,11 @@ correctness gate.
 
 ### Phase 4 — measured optimization
 
-- Benchmark and tune the already-required batched complete/range reads in export
-  and materializing rewrites. Tuning is optional and may not weaken the batched
-  contract or change logical behavior.
+- Batched reads landed for materializing rewrites (`read_blobs`) and upgrade
+  validation (`read_blob_ranges`). Remaining: move export and change images onto
+  batched reads and make the schema-apply rewrite bounded and streamed (§8.4),
+  then benchmark. Tuning is optional and may not weaken the batched contract or
+  change logical behavior.
 - Retain the exact empty/null/neighbor compaction guard across every future Lance
   dependency bump.
 - Consider descriptor-preserving unchanged-cell updates only with an ownership
@@ -1684,6 +1723,44 @@ publisher architecture.
 
 ## Decision log
 
+- 2026-10-03: Current server-runtime cross-references now name the accepted
+  decision; implementation and qualification gates remain with that owner.
+
+
+- 2026-10-02: §8.3's change-feed baseline describes a ranged external
+  descriptor as `{"uri", "offset", "length"}`, as change images do, instead
+  of refusing it. The consumer starts from exactly the baseline's state and
+  already reads that object in images; a refusal left a graph holding such a
+  row with no baseline, and a bare URI would be wrong data. Plain export still
+  refuses, because its output is a reloadable backup. §8.3's "Change-feed
+  images and entity reads, which are not reloaded, share the decoder but
+  describe a ranged descriptor exactly as `{"uri", "offset", "length"}`
+  without reading the object, so a feed cursor passes its commit." and the
+  2026-09-30 entry's "the change-feed baseline, an export, still refuses." are
+  superseded.
+- 2026-10-02: §7.3's sentence "Stored external references can be opened,
+  exported, inspected, and redirected even when new ingress is denied." is
+  superseded by the version that limits export and redirect to a reference
+  naming its whole object, as §5.1 and §8.3 already require.
+- 2026-10-02: §3.1 adds that an external descriptor with an offset and a
+  persisted size of 0 is refused by the decoder as a Blob integrity error,
+  because Lance's external reader substitutes the object size for size 0 but
+  keeps the position. No earlier sentence is superseded; the rule narrows the
+  `External` state.
+- 2026-10-02: §11 gains the `StoredExternalBlobDenied` row (HTTP 400, naming
+  type, id, and property): an update that must carry a stored external
+  reference the graph's policy refuses, kept apart from the policy refusal of
+  caller input. No earlier sentence is superseded.
+- 2026-10-02: §4.3 adds that a `.gq` `update` assigning null to a nullable Blob
+  clears it, that an update never reads the old value of a Blob it assigns,
+  and that a null on a non-nullable Blob is refused before the table opens.
+  No sentence of this RFC is superseded; an update that kept the old value on
+  null was a defect outside it.
+- 2026-09-30: §8.3 adds that change-feed images and entity reads describe a
+  ranged external descriptor as `{"uri", "offset", "length"}` instead of
+  refusing it. Refusing there made a feed page holding such a row fail on
+  every poll, so its cursor could never pass the commit. No earlier sentence
+  is superseded; the change-feed baseline, an export, still refuses.
 - 2026-09-30: Narrowed references to the proposed v0.12 server scope: independent
   historical availability and stronger retention need a separate proposal;
   stale-generation refusal notifies the designated owner, and lifecycle status
@@ -1699,3 +1776,42 @@ publisher architecture.
   effects and final pins, superseding their recovery-v9 sidecar, compensation,
   and recovery-audit requirements. Blob behavior and this RFC's acceptance are
   unchanged; the replacement server contracts remain proposed.
+- 2026-09-29: External Blob bases must be disjoint from OmniGraph storage. A
+  base over a graph or cluster root let a keyed write copy manifest, table, or
+  ledger bytes into a managed cell served past Cedar. §7.1's sentence
+  "Configuration validation normalizes it once, rejects URI user-info and
+  query/fragment credentials, and rejects overlapping or ambiguous encodings."
+  is superseded by the version that also rejects a base overlapping the cluster
+  storage root (config validation, serve boot) or the handle's own graph root
+  (engine policy install); §10 gains the matching risk row.
+- 2026-09-29: §8.3 now refuses a ranged external descriptor on export,
+  superseding "an external reference emits its URI", which widened the range
+  to the whole object on reload. The redirect, CLI delivery and schema rewrite
+  already refused it; export now shares their whole-object check.
+- 2026-09-29: Factual corrections to match the code. §4's "Complete-payload
+  internal work uses Lance's batched `read_blobs` API." and "Range work prefers
+  `read_blob_ranges` when it supports the needed selector." are superseded by
+  the account of which paths batch (materializing rewrites, upgrade validation)
+  and which still read one row at a time (export, change images, single-cell
+  reads). §8.4's "The current materializing rewrite is accepted as a bounded V1
+  implementation, not as an ideal physical plan." is superseded: the
+  schema-apply rewrite holds a whole Blob column in memory, and a bounded
+  streamed rewrite is required future work. §8.5's "Cleanup remains
+  Lance-owned version GC under OmniGraph's manifest/ref/recovery floors. It can
+  remove managed Blob sidecars only when Lance proves they are no longer
+  reachable from retained dataset versions." is superseded by the engine
+  collector, which never calls stock `cleanup_old_versions`. §9's "Batch
+  complete reads use `Dataset::read_blobs`; batch range reads use
+  `Dataset::read_blob_ranges`; lazy single-cell reads may use `take_blobs`
+  behind the engine facade." is superseded by the version aligned with §4.
+  §12.2's "bulk export itself retains its batched reader" is superseded by
+  "bulk export keeps its own `take_blobs` selection". Phase 4's "Benchmark and
+  tune the already-required batched complete/range reads in export and
+  materializing rewrites." (§13) is superseded by the landed/remaining split. §10's
+  rewrite-amplification row gains the schema-apply gap, and a compaction-memory
+  row records optimize's derived batch bound.
+- 2026-10-02: §4.4 replaces "schema/control completion" and step 3's pending
+  schema-completion prerequisite with coherent capture of the manifest-resident
+  contract; §11's uncertainty row retains publication/control uncertainty without
+  the removed schema-installation phase. Blob behavior and serving-view
+  requirements are unchanged.

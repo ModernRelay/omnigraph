@@ -1625,10 +1625,11 @@ fn error_code_schema_has_expected_variants() {
             "conflict",
             "too_many_requests",
             "service_unavailable",
+            "graph_unavailable",
             "internal",
         ]),
         "ErrorCode must match the closed v0.12 HTTP contract, including its \
-         explicit API admission refusal",
+         explicit API admission and graph availability refusals",
     );
 }
 

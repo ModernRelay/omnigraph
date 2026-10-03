@@ -648,6 +648,16 @@ pub(crate) struct PolicyConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ClusterState {
     pub(crate) version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mode: Option<crate::deployment::DeploymentMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ledger_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) next_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) outstanding: Option<crate::deployment::OutstandingDeployment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) deployment_results: Option<Vec<crate::deployment::DeploymentResult>>,
     #[serde(default)]
     pub(crate) state_revision: u64,
     pub(crate) applied_revision: AppliedRevisionState,
@@ -664,6 +674,10 @@ pub(crate) struct ClusterState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AppliedRevisionState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) schema_contracts: Option<BTreeMap<String, omnigraph::db::SchemaContractDigest>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) result_revision: Option<u64>,
     #[serde(default)]
     pub(crate) config_digest: Option<String>,
     #[serde(default)]
@@ -696,6 +710,12 @@ pub(crate) struct StateResource {
     /// [`omnigraph::ExternalBlobPolicy::Deny`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
+}
+
+impl ClusterState {
+    pub(crate) fn outstanding_deployment_id(&self) -> Option<&str> {
+        self.outstanding.as_ref().map(|pending| pending.id.as_str())
+    }
 }
 
 /// Recovery-intent record for a graph-moving apply operation (RFC-004 §D2).

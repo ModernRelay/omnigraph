@@ -1158,6 +1158,179 @@ async fn change_feed_detects_same_length_blob_only_update() {
     );
 }
 
+/// A ranged external Blob descriptor, which only a writer outside OmniGraph
+/// can create, has no load-format spelling, so export refuses it. The change
+/// feed must still cross the commit that introduced it: its image describes
+/// the exact reference as `{uri, offset, length}` without contacting the
+/// object (`s3://bucket/object` does not exist), and the cursor advances past
+/// it to the next commit. The same holds for a range-only update of the same
+/// URI, whose before and after images carry the two exact ranges, and for its
+/// delete, whose before image carries the last range. A baseline taken while
+/// the row exists describes it the same way, where export refuses it, and its
+/// cursor resumes at the next commit.
+#[tokio::test]
+#[cfg(feature = "failpoints")]
+async fn change_feed_describes_ranged_external_blob_and_advances_past_it() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedScope, ChangeFeedStart, ChangeOpKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(
+        uri,
+        "node Document {\n    title: String @key\n    content: Blob?\n}\n",
+    )
+    .await
+    .unwrap();
+    let now = db
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::Now),
+        ))
+        .await
+        .unwrap();
+    let (cursor, _) = boundary_cursor(&now);
+
+    helpers::seed_ranged_external_blob_row(&db, uri).await;
+
+    // The baseline is the exact state its consumer starts from. Refusing the
+    // ranged row would leave the graph with no baseline at all, so the
+    // snapshot describes it as the change images do.
+    let mut snapshot = Vec::new();
+    let baseline = db
+        .capture_change_baseline("main", &ChangeFeedScope::default(), &mut snapshot)
+        .await
+        .expect("a ranged external descriptor must not refuse the baseline");
+    let snapshot = String::from_utf8(snapshot)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        snapshot,
+        [serde_json::json!({
+            "type": "Document",
+            "id": "ranged",
+            "data": {
+                "title": "ranged",
+                "content": {"uri": "s3://bucket/object", "offset": 4, "length": 8},
+            },
+        })]
+    );
+    assert!(
+        db.export_jsonl("main", &[]).await.is_err(),
+        "export, whose output reloads, still refuses the ranged row"
+    );
+
+    helpers::replace_ranged_external_blob_range(&db, uri, 16, 3).await;
+    let db = helpers::session(db);
+    db.mutate(
+        "main",
+        "query drop_document($title: String) {\n    delete Document where title = $title\n}\n",
+        "drop_document",
+        &helpers::params(&[("$title", "ranged")]),
+    )
+    .await
+    .unwrap();
+    db.load(
+        "main",
+        r#"{"type":"Document","data":{"title":"later","content":"base64:QQ=="}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+
+    let one_commit = |cursor: String| {
+        let mut request = feed_request(None, ChangeFeedPosition::Cursor(cursor));
+        request.max_commits = Some(1);
+        request
+    };
+    let ranged_page = db
+        .poll_change_feed(one_commit(cursor))
+        .await
+        .expect("a ranged external descriptor must not wedge the feed");
+    assert_eq!(ranged_page.blocks.len(), 1);
+    let changes = &ranged_page.blocks[0].changes;
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].id, "ranged");
+    assert_eq!(changes[0].op, ChangeOpKind::Insert);
+    assert_eq!(
+        changes[0].after.as_ref().unwrap().properties["content"],
+        serde_json::json!({"uri": "s3://bucket/object", "offset": 4, "length": 8})
+    );
+    let (cursor, caught_up) = boundary_cursor(&ranged_page);
+    assert!(!caught_up, "the later commit is still unread");
+
+    let first_range = serde_json::json!({"uri": "s3://bucket/object", "offset": 4, "length": 8});
+    let second_range = serde_json::json!({"uri": "s3://bucket/object", "offset": 16, "length": 3});
+    let update_page = db
+        .poll_change_feed(one_commit(cursor))
+        .await
+        .expect("a range-only update must not wedge the feed");
+    assert_eq!(update_page.blocks.len(), 1);
+    let changes = &update_page.blocks[0].changes;
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(changes[0].id, "ranged");
+    assert_eq!(changes[0].op, ChangeOpKind::Update);
+    assert_eq!(
+        changes[0].before.as_ref().unwrap().properties["content"],
+        first_range
+    );
+    assert_eq!(
+        changes[0].after.as_ref().unwrap().properties["content"],
+        second_range
+    );
+    let (cursor, caught_up) = boundary_cursor(&update_page);
+    assert!(!caught_up);
+
+    // The baseline's cursor resumes at the first commit after its snapshot.
+    let resumed = db
+        .poll_change_feed(one_commit(baseline.resume_cursor))
+        .await
+        .unwrap();
+    assert_eq!(resumed.blocks.len(), 1);
+    assert_eq!(
+        resumed.blocks[0].cause.graph_commit_id,
+        update_page.blocks[0].cause.graph_commit_id
+    );
+    assert_eq!(
+        resumed.blocks[0].changes[0]
+            .after
+            .as_ref()
+            .unwrap()
+            .properties["content"],
+        second_range
+    );
+
+    let delete_page = db
+        .poll_change_feed(one_commit(cursor))
+        .await
+        .expect("deleting a ranged row must not wedge the feed");
+    assert_eq!(delete_page.blocks.len(), 1);
+    let changes = &delete_page.blocks[0].changes;
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(changes[0].id, "ranged");
+    assert_eq!(changes[0].op, ChangeOpKind::Delete);
+    assert_eq!(
+        changes[0].before.as_ref().unwrap().properties["content"],
+        second_range
+    );
+    assert!(changes[0].after.is_none());
+    let (cursor, caught_up) = boundary_cursor(&delete_page);
+    assert!(!caught_up);
+
+    let later_page = db.poll_change_feed(one_commit(cursor)).await.unwrap();
+    assert_eq!(later_page.blocks.len(), 1);
+    let changes = &later_page.blocks[0].changes;
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].id, "later");
+    assert_eq!(
+        changes[0].after.as_ref().unwrap().properties["content"],
+        serde_json::json!("base64:QQ==")
+    );
+    let (_, caught_up) = boundary_cursor(&later_page);
+    assert!(caught_up);
+}
+
 /// Acceptance #7: the cross-branch net diff shares the same comparator, so a
 /// same-length Blob-only update on a forked branch must surface through
 /// `diff_commits` too.

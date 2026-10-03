@@ -1474,6 +1474,7 @@ async fn fast_forward_merge_switches_blob_table_pin() {
         "Blob descriptor classification must not pull a proven insert interval back through the general base/source diff"
     );
     assert_eq!(probes.blob_payload_read_calls(), 0);
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0);
     assert_eq!(
         probes.stage_vector_index_calls(),
         0,
