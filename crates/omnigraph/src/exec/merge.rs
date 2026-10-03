@@ -4902,10 +4902,28 @@ impl Omnigraph {
 
         let relevant_branches = [source_branch.as_deref(), target_branch.as_deref()];
         let _schema_permit = self.write_queue().acquire_schema_shared().await;
-        let _branch_guards = self
-            .write_queue()
-            .acquire_branches(&[source_branch.clone(), target_branch.clone()])
-            .await;
+        // The target gate is held through publication: it keeps a target
+        // delete/recreate from reusing the name underneath the plan (ABA) and
+        // serializes merges into one target. The source gate is held only
+        // until the source snapshot is captured, tagged and proved still
+        // current below; from then on the tagged snapshot is the merge's
+        // input, so writes and deletes on the source do not wait for the merge.
+        // Both are taken in the sorted order `acquire_branches` uses, so the
+        // pair cannot deadlock with another multi-branch acquirer.
+        let queue = self.write_queue();
+        let (source_gate, _target_gate) = if source_branch <= target_branch {
+            let source_gate = queue.acquire_branch(source_branch.as_deref()).await;
+            (
+                source_gate,
+                queue.acquire_branch(target_branch.as_deref()).await,
+            )
+        } else {
+            let target_gate = queue.acquire_branch(target_branch.as_deref()).await;
+            (
+                queue.acquire_branch(source_branch.as_deref()).await,
+                target_gate,
+            )
+        };
         // Capture each branch as one coherent RFC-022 authority token plus
         // immutable snapshot. The target token is the coarse publish read set;
         // the source token pins the exact merge input without requiring the
@@ -4981,6 +4999,7 @@ impl Omnigraph {
                 return Err(error);
             }
         };
+        drop(source_gate);
         // The handle remains bound to its original branch throughout the merge.
         // The captured transaction supplies every physical and publish target.
         let target_was_active = self.active_branch().await == target_branch;
@@ -5384,18 +5403,17 @@ impl Omnigraph {
         //
         // This bridge still coexists with legacy maintenance writers that take
         // only `(table, branch)` queues. Acquire the conservative all-catalog
-        // envelope for BOTH source and target, in the global sorted order, then
-        // re-read both manifest branches before the first effect. Planning
-        // remains outside table queues, but no plan derived from a stale
-        // source/target snapshot can cross into physical effects.
+        // envelope for the target, in the global sorted order, then re-read
+        // both manifest branches before the first effect. Planning remains
+        // outside table queues, but no plan derived from a stale target
+        // snapshot can cross into physical effects. The source's queues are
+        // not taken: its input is the tagged snapshot captured above, so a
+        // write, index build or delete on the source may proceed; the re-read
+        // still refuses a source whose incarnation or schema changed by then.
         let final_revalidation_timing = crate::instrumentation::start_merge_timing(
             crate::instrumentation::MergeTimingPhase::FinalRevalidation,
         );
-        let active_branch_for_keys = target_branch.map(str::to_string);
-        let merge_branches = [
-            source_branch.map(str::to_string),
-            active_branch_for_keys.clone(),
-        ];
+        let merge_branches = [target_branch.map(str::to_string)];
         let merge_queue_keys = self.table_queue_keys_for_branches(&merge_branches, catalog);
         let _merge_queue_guards = self.write_queue().acquire_many(&merge_queue_keys).await;
 

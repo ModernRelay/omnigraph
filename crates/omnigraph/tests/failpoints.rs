@@ -269,6 +269,11 @@ fn rfc023_external_writer_process() {
                     .await
                     .unwrap();
                 }
+                "merge_target_recreated" => {
+                    db.branch_delete("t").await.unwrap();
+                    db.branch_create("t").await.unwrap();
+                    db.load("t", &payload, mode).await.unwrap();
+                }
                 other => panic!("unknown external writer action '{other}'"),
             }
         });
@@ -2002,6 +2007,598 @@ async fn cross_branch_writers_overlap_inside_schema_gate() {
     assert_eq!(
         helpers::count_rows_branch(&db, "b2", "node:Person").await,
         5
+    );
+}
+
+/// Create `source` and `target` from main and give each its own insert, so a
+/// merge between them is three-way and reaches its manifest commit.
+async fn diverged_merge_pair(db: &helpers::Session, source: &str, target: &str) {
+    db.branch_create(source).await.unwrap();
+    db.branch_create(target).await.unwrap();
+    for (branch, age) in [(source, 51), (target, 52)] {
+        db.mutate(
+            branch,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", &format!("On-{branch}"))], &[("$age", age)]),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+/// Issue 643: merges into independent targets overlap. Merge A parks after
+/// its table effects, before its manifest commit, holding the shared schema
+/// permit and its own source and target branch gates; merge B between two
+/// other branches must run to completion meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn independent_target_merges_overlap_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s1", "t1").await;
+    diverged_merge_pair(&db, "s2", "t2").await;
+    let db = std::sync::Arc::new(db);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let merge_a_db = std::sync::Arc::clone(&db);
+    let merge_a = tokio::spawn(async move { merge_a_db.branch_merge("s1", "t1").await });
+    parked.wait_until_reached().await;
+
+    let merge_b_db = std::sync::Arc::clone(&db);
+    let merge_b = tokio::spawn(async move { merge_b_db.branch_merge("s2", "t2").await });
+    let merged_b = tokio::time::timeout(std::time::Duration::from_secs(10), merge_b)
+        .await
+        .expect("a merge into another target must complete while A is parked")
+        .unwrap()
+        .expect("B must merge");
+    assert_eq!(merged_b.outcome, omnigraph::db::MergeOutcome::Merged);
+    assert!(
+        !merge_a.is_finished(),
+        "A must still be parked before its manifest commit while B published"
+    );
+
+    parked.release();
+    assert_eq!(
+        merge_a
+            .await
+            .unwrap()
+            .expect("A must merge after release")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    for target in ["t1", "t2"] {
+        assert_eq!(
+            helpers::count_rows_branch(&db, target, "node:Person").await,
+            6,
+            "{target} holds the seed rows, its own insert and its source's"
+        );
+    }
+}
+
+/// Issue 643: merges into the same target stay serialized. With merge A
+/// parked before its manifest commit, holding the target's branch gate, a
+/// second merge into that target must wait; once A publishes, B merges on
+/// top of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn same_target_merges_serialize_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s1", "t").await;
+    db.branch_create("s2").await.unwrap();
+    db.mutate(
+        "s2",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "On-s2")], &[("$age", 53)]),
+    )
+    .await
+    .unwrap();
+    let db = std::sync::Arc::new(db);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let merge_a_db = std::sync::Arc::clone(&db);
+    let merge_a = tokio::spawn(async move { merge_a_db.branch_merge("s1", "t").await });
+    parked.wait_until_reached().await;
+
+    let merge_b_db = std::sync::Arc::clone(&db);
+    let mut merge_b = tokio::spawn(async move { merge_b_db.branch_merge("s2", "t").await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), &mut merge_b)
+            .await
+            .is_err(),
+        "a merge into the same target must wait while A holds that target's gate"
+    );
+
+    parked.release();
+    assert_eq!(
+        merge_a
+            .await
+            .unwrap()
+            .expect("A must merge after release")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert_eq!(
+        merge_b
+            .await
+            .unwrap()
+            .expect("B must merge after A")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&db, "t", "node:Person").await,
+        7,
+        "t holds the seed rows, its own insert and both sources' inserts"
+    );
+}
+
+/// Issue 643, delete boundary. Deleting a merge's target while the merge is
+/// parked before its manifest commit waits on the target's gate; the merge
+/// publishes, then the delete succeeds. Deleting its source does not wait:
+/// the merge released the source's gate once its tagged source snapshot was
+/// captured. The merge still publishes that snapshot, and the target keeps
+/// reading the merged row after cleanup reclaims what the deletion retired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn merge_target_delete_waits_and_source_delete_does_not_issue_643() {
+    for victim in ["t", "s"] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let db = helpers::init_and_load(&dir).await;
+        diverged_merge_pair(&db, "s", "t").await;
+        // An edge only the source adds: the merge adopts the source's
+        // `edge:Knows` pin as the target's, the case a reclaimed source would
+        // break.
+        db.mutate(
+            "s",
+            MUTATION_QUERIES,
+            "add_friend",
+            &params(&[("$from", "Diana"), ("$to", "Alice")]),
+        )
+        .await
+        .unwrap();
+        let db = std::sync::Arc::new(db);
+
+        let parked = helpers::failpoint::Rendezvous::park_first(
+            &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+        );
+        let merge_db = std::sync::Arc::clone(&db);
+        let merge = tokio::spawn(async move { merge_db.branch_merge("s", "t").await });
+        parked.wait_until_reached().await;
+
+        let delete_db = std::sync::Arc::clone(&db);
+        let mut delete = tokio::spawn(async move { delete_db.branch_delete(victim).await });
+        let early = tokio::time::timeout(std::time::Duration::from_millis(500), &mut delete).await;
+        if victim == "t" {
+            assert!(
+                early.is_err(),
+                "deleting the target must wait while the merge holds its gate"
+            );
+        } else {
+            early
+                .expect("deleting the source must not wait for the merge")
+                .unwrap()
+                .unwrap_or_else(|error| panic!("deleting the source during the merge: {error}"));
+        }
+
+        parked.release();
+        assert_eq!(
+            merge
+                .await
+                .unwrap()
+                .expect("the merge must publish after release")
+                .outcome,
+            omnigraph::db::MergeOutcome::Merged,
+            "deleting {victim}"
+        );
+        if victim == "t" {
+            delete
+                .await
+                .unwrap()
+                .unwrap_or_else(|error| panic!("deleting the target after the merge: {error}"));
+        } else {
+            let rows = db.cleanup(keep_one()).await.unwrap();
+            assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
+            assert_eq!(
+                helpers::count_rows_branch(&db, "t", "node:Person").await,
+                6,
+                "t holds the seed rows, its own insert and the deleted source's"
+            );
+            assert_eq!(
+                helpers::count_rows_branch(&db, "t", "edge:Knows").await,
+                4,
+                "t reads the edge adopted from the deleted source after cleanup"
+            );
+        }
+        assert!(
+            !db.branch_list().await.unwrap().iter().any(|b| b == victim),
+            "{victim} is gone"
+        );
+    }
+}
+
+/// Issue 643, same-source case: with a merge from `s` into `t1` parked
+/// before its manifest commit, a merge from `s` into `t2` runs to
+/// completion, because a merge holds its source's gate only through
+/// capture. Both land, and each target gets the source's row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn same_source_merges_overlap_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s", "t1").await;
+    db.branch_create("t2").await.unwrap();
+    db.mutate(
+        "t2",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "On-t2")], &[("$age", 54)]),
+    )
+    .await
+    .unwrap();
+    let db = std::sync::Arc::new(db);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let first_db = std::sync::Arc::clone(&db);
+    let first = tokio::spawn(async move { first_db.branch_merge("s", "t1").await });
+    parked.wait_until_reached().await;
+
+    let second_db = std::sync::Arc::clone(&db);
+    let second = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::spawn(async move { second_db.branch_merge("s", "t2").await }),
+    )
+    .await
+    .expect("a second merge from the same source must complete while the first is parked")
+    .unwrap()
+    .expect("the second merge must land");
+    assert_eq!(second.outcome, omnigraph::db::MergeOutcome::Merged);
+    assert!(!first.is_finished(), "the first merge is still parked");
+
+    parked.release();
+    assert_eq!(
+        first
+            .await
+            .unwrap()
+            .expect("the first merge must land")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    for target in ["t1", "t2"] {
+        assert_eq!(
+            helpers::count_rows_branch(&db, target, "node:Person").await,
+            6,
+            "{target} holds the seed rows, its own insert and the source's"
+        );
+    }
+}
+
+/// Issue 643, writes on a merge's source: with a merge from `s` into `t`
+/// parked before its manifest commit, an insert on `s` completes. The merge
+/// publishes the source snapshot it captured, so the concurrent insert is not
+/// in `t` until a second merge carries it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn source_write_proceeds_during_merge_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s", "t").await;
+    let db = std::sync::Arc::new(db);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let merge_db = std::sync::Arc::clone(&db);
+    let merge = tokio::spawn(async move { merge_db.branch_merge("s", "t").await });
+    parked.wait_until_reached().await;
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        db.mutate(
+            "s",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "During-merge")], &[("$age", 63)]),
+        ),
+    )
+    .await
+    .expect("an insert on the merge's source must not wait for the merge")
+    .expect("the insert on the source must land");
+    assert!(!merge.is_finished(), "the merge is still parked");
+
+    parked.release();
+    assert_eq!(
+        merge
+            .await
+            .unwrap()
+            .expect("the merge must publish after release")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&db, "s", "node:Person").await,
+        6,
+        "s holds the seed rows, its own insert and the concurrent one"
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&db, "t", "node:Person").await,
+        6,
+        "t holds the seed rows, its own insert and the source as captured"
+    );
+    assert_eq!(
+        db.branch_merge("s", "t").await.unwrap().outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&db, "t", "node:Person").await,
+        7,
+        "a second merge carries the concurrent insert"
+    );
+}
+
+/// Issue 643, failure boundary: merge A fails after its table effects,
+/// before its manifest commit, while merge B into an independent target is
+/// parked mid-merge holding its gates and the shared schema permit. A's
+/// target does not move, B still publishes, and A's gates are released: the
+/// same handle retries A to completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn failed_merge_beside_an_independent_merge_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s1", "t1").await;
+    diverged_merge_pair(&db, "s2", "t2").await;
+    let db = std::sync::Arc::new(db);
+    let t1_head = branch_head_commit_id(dir.path(), "t1").await.unwrap();
+    let t1_person = helpers::snapshot_branch(&db, "t1")
+        .await
+        .unwrap()
+        .dataset("node:Person")
+        .unwrap()
+        .published_dataset_version;
+
+    let parked =
+        helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+    let merge_b_db = std::sync::Arc::clone(&db);
+    let merge_b = tokio::spawn(async move { merge_b_db.branch_merge("s2", "t2").await });
+    parked.wait_until_reached().await;
+
+    {
+        let _failpoint = catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            db.branch_merge("s1", "t1"),
+        )
+        .await
+        .expect("A must not wait on B's gates")
+        .expect_err("A must fail at its injected fault");
+        assert!(
+            error.to_string().contains(
+                "injected failpoint triggered: branch_merge.post_phase_b_pre_manifest_commit"
+            ),
+            "A must fail at the injected fault, not earlier: {error}"
+        );
+    }
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "t1").await.unwrap(),
+        t1_head,
+        "the failed merge must not move its target's graph head"
+    );
+    assert_eq!(
+        helpers::snapshot_branch(&db, "t1")
+            .await
+            .unwrap()
+            .dataset("node:Person")
+            .unwrap()
+            .published_dataset_version,
+        t1_person,
+        "the failed merge's table effects must stay unpublished"
+    );
+    assert!(
+        !merge_b.is_finished(),
+        "B must still be parked after A failed"
+    );
+
+    parked.release();
+    assert_eq!(
+        merge_b
+            .await
+            .unwrap()
+            .expect("B must merge after release")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            db.branch_merge("s1", "t1"),
+        )
+        .await
+        .expect("the failed merge must have released its gates")
+        .expect("the same handle must retry A once the fault stops")
+        .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    for target in ["t1", "t2"] {
+        assert_eq!(
+            helpers::count_rows_branch(&db, target, "node:Person").await,
+            6,
+            "{target} holds the seed rows, its own insert and its source's"
+        );
+    }
+}
+
+/// Issue 643, cancellation: a merge whose task is aborted while it is parked
+/// at a seam stops at its first await after the release. On a local store
+/// that falls before its manifest commit, after its table effects at the
+/// later seam; the assertions also accept a merge that published before the
+/// cancel took effect. Either way the target is whole (untouched, or merged
+/// with a new head), the handle stays live (the retry completes and another
+/// write lands), and cleanup succeeds afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn cancelled_merge_leaves_the_target_whole_issue_643() {
+    for seam in [
+        &catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE,
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    ] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let db = helpers::init_and_load(&dir).await;
+        diverged_merge_pair(&db, "s", "t").await;
+        let db = std::sync::Arc::new(db);
+        let head_before = branch_head_commit_id(dir.path(), "t").await.unwrap();
+
+        let parked = helpers::failpoint::Rendezvous::park_first(seam);
+        let merge_db = std::sync::Arc::clone(&db);
+        let merge = tokio::spawn(async move { merge_db.branch_merge("s", "t").await });
+        parked.wait_until_reached().await;
+        merge.abort();
+        parked.release();
+        let outcome = merge.await;
+        drop(parked);
+
+        let merged = branch_head_commit_id(dir.path(), "t").await.unwrap() != head_before;
+        let rows = helpers::count_rows_branch(&db, "t", "node:Person").await;
+        let seam = seam.name();
+        match &outcome {
+            Ok(result) => assert_eq!(
+                &result
+                    .as_ref()
+                    .expect("an uncancelled merge must land")
+                    .outcome,
+                &omnigraph::db::MergeOutcome::Merged,
+                "{seam}"
+            ),
+            Err(join) => assert!(join.is_cancelled(), "{seam}: {join}"),
+        }
+        if outcome.is_ok() {
+            assert!(
+                merged,
+                "{seam}: an acknowledged merge moves the target head"
+            );
+        }
+        assert_eq!(
+            rows,
+            if merged { 6 } else { 5 },
+            "{seam}: the target is merged whole or untouched"
+        );
+
+        let retried = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            db.branch_merge("s", "t"),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{seam}: the cancelled merge must have released its gates"))
+        .unwrap_or_else(|error| panic!("{seam}: the retry must merge: {error}"));
+        assert_eq!(
+            retried.outcome,
+            if merged {
+                omnigraph::db::MergeOutcome::AlreadyUpToDate
+            } else {
+                omnigraph::db::MergeOutcome::Merged
+            },
+            "{seam}"
+        );
+        db.mutate(
+            "t",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "After-cancel")], &[("$age", 56)]),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{seam}: a later write on the target: {error}"));
+        let rows = db.cleanup(keep_one()).await.unwrap();
+        assert!(
+            rows.iter().all(|row| row.error.is_none()),
+            "{seam}: {rows:?}"
+        );
+        assert_eq!(
+            helpers::count_rows_branch(&db, "t", "node:Person").await,
+            7,
+            "{seam}: seed rows, both inserts, the merged row and the later write"
+        );
+    }
+}
+
+/// Issue 643, branch recreation: another process deletes a merge's target
+/// and creates a branch of the same name while the merge is parked after its
+/// table effects, before its manifest commit. The name now denotes a new
+/// branch lifetime, so the merge must refuse rather than publish into it,
+/// and the recreated target keeps exactly what its own writer put there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn merge_refuses_a_target_recreated_by_another_process_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s", "t").await;
+    let db = std::sync::Arc::new(db);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let merge_db = std::sync::Arc::clone(&db);
+    let merge = tokio::spawn(async move { merge_db.branch_merge("s", "t").await });
+    parked.wait_until_reached().await;
+
+    let child_uri = uri.clone();
+    tokio::task::spawn_blocking(move || {
+        run_rfc023_external_writer_action(
+            child_uri,
+            LoadMode::Append,
+            r#"{"type":"Person","data":{"name":"On-t-recreated","age":55}}"#.to_string(),
+            "merge_target_recreated",
+        )
+    })
+    .await
+    .unwrap()
+    .expect("the other process recreates the target");
+    let recreated_head = branch_head_commit_id(dir.path(), "t").await.unwrap();
+
+    parked.release();
+    let error = merge
+        .await
+        .unwrap()
+        .expect_err("the merge must refuse a target recreated under its name");
+    assert!(
+        matches!(
+            &error,
+            OmniError::Manifest(manifest)
+                if !manifest.publication_in_doubt
+                    && matches!(
+                        &manifest.details,
+                        Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged { member, .. })
+                            if member == "branch_identifier:t"
+                    )
+        ),
+        "the refusal must name the target's changed branch identity: {error:?}"
+    );
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "t").await.unwrap(),
+        recreated_head,
+        "the refused merge must not move the recreated target"
+    );
+    let reader = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    assert_eq!(
+        helpers::count_rows_branch(&reader, "t", "node:Person").await,
+        5,
+        "the recreated target holds the seed rows and its own writer's row only"
     );
 }
 
