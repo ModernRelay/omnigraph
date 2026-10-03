@@ -17,8 +17,7 @@ supersedes:
 superseded_by: []
 blocked_on:
   - "B: native accepted-I/O settlement, completion-memory/local-I/O reserves and engine-work bounds"
-  - "E0: offline ledger v2, bounded inputs/results, exclusive admission and data-preserving ledger conversion"
-  - "E0: strict schema intents, settlement fences, current recovery authorization and process-death qualification"
+  - "E0: backend-specific offline deployment/recovery qualification beyond the recorded evidence"
   - "E1: online submission authority, activation witness and bounded observation"
   - "E1: same-engine transition qualification, coherent request bindings and bounded preparation/retirement"
   - "Existing-cluster rollout: qualified data-preserving offline conversion to storage v13"
@@ -56,8 +55,10 @@ The reviewed foundation implementation is [PR #844](https://github.com/ModernRel
 The operation, availability and prepared-schema contracts below are accepted;
 `Unknown` establishes neither absence nor permission to replay.
 This amendment accepts the offline ledger v2 protocol below, including exclusive
-admission, strict publication intents and no-reset ledger conversion. Production
-v2 admission remains disabled until E0 implementation and qualification pass.
+admission, strict publication intents and no-reset ledger conversion.
+[PR #849](https://github.com/ModernRelay/omnigraph/pull/849) implements explicit
+offline v2 conversion and admission; qualification remains limited to the
+[recorded evidence](#e0-implementation-evidence).
 Online activation, native runtime reuse, existing-cluster graph-format conversion
 and Azure online submission retain their separate gates. Accepted design is not
 evidence that any of those capabilities has shipped.
@@ -254,8 +255,8 @@ E0 admits `version: 2, mode: offline` in the existing `__cluster/state.json`.
 Use the existing content-addressed resource catalog and persisted cluster lock;
 add no job store, retention tags or background executor. `mode: online`, unknown
 versions/modes and `state.lock: false` refuse before graph effects. No failure
-falls back to the old direct-apply/sweep path. The protocol below is accepted;
-its implementation and backend qualification remain E0 shipping gates.
+falls back to the old direct-apply/sweep path. The accepted protocol below is
+implemented by PR #849; each admitted backend still requires qualification.
 
 ### Ledger v2
 
@@ -479,9 +480,8 @@ quiescence and exclusive admission remain required independently.
 
 ### CLI and conversion
 
-Reuse the existing global `--cluster ROOT` selector for root-addressed Core
-commands. These extensions are the E0 implementation contract, not currently
-available command forms. An explicit canonical storage URI permits recovery
+PR #849 implements these offline commands using the existing global
+`--cluster ROOT` selector. An explicit canonical storage URI permits recovery
 independently of configuration discovery or current input files.
 
 | Command | Behavior |
@@ -776,6 +776,27 @@ its documented coverage limits. Neither that accounting nor engine-DST schedulin
 establishes server process, transport, retained-I/O or performance behavior.
 Missing services, zero selected cases and unreached faults do not pass qualification.
 
+### E0 implementation evidence
+
+PR #849 implements offline ledger v2, strict intent/fence settlement, bounded
+input/results, lifetime admission, current recovery authorization and no-reset
+ledger conversion. Local engine, cluster, CLI and server owners cover real
+process death, partial correction, exact receipts, refused authority and retained
+locks. In the local debug `manifest_schema_settlement_history_curve` instrument,
+at 16 updates and 15,917-byte IR, increasing source from 16 KiB to 1 MiB kept
+the first lookup after reopening at 22 requests (original/fence) or 31 (occupied), while
+manifest reads grew from about 116.7 kB to 2.18 MB or 171.7 kB to 3.27 MB,
+respectively. This file-storage sample with uncontrolled OS caches establishes
+neither constant scan bytes, aggregate E1 or RSS bounds, nor native-I/O settlement.
+
+At `2032f6ef`, local workspace and standalone GQT/clippy gates passed, as did CI
+[workspace, RustFS default/failpoints, Azurite and clippy](https://github.com/ModernRelay/omnigraph/actions/runs/37082815427),
+[GQT](https://github.com/ModernRelay/omnigraph/actions/runs/37082815098) and
+[DST](https://github.com/ModernRelay/omnigraph/actions/runs/37082815106).
+Azurite is emulator evidence; live Azure retains its wrapper and preview gate.
+These results do not qualify untested provider profiles or existing-cluster v13
+conversion. Online activation remains unavailable.
+
 ### Initial E1 qualification: not yet qualified
 
 The 2026-10-02 probes against main `7fe1789a` and pinned Lance 11.0.0 establish:
@@ -797,12 +818,10 @@ The 2026-10-02 probes against main `7fe1789a` and pinned Lance 11.0.0 establish:
   0.98 MB/21.62 MB of manifest files for those source sizes. This is physical
   storage evidence, not RSS, a supported limit or a performance claim.
 
-Online apply and ledger v2 admission remain unavailable. Exact version-1 engine
-schema intents and receipts are implemented independently; they provide positive
-publication evidence, not E0's strict version-2 terminal non-publication proof.
-E0 next implements the accepted offline protocol and its gates above. Online
-activation additionally requires owned, bounded native read/CPU lifetimes,
-aggregate evidence-lookup bounds and coherent serving-view qualification.
+Online apply remains unavailable. E0's implemented strict version-2 recovery
+does not qualify online activation, which additionally requires owned, bounded
+native read/CPU lifetimes, aggregate evidence-lookup bounds and coherent
+serving-view qualification.
 
 ## Rollout
 
@@ -812,15 +831,13 @@ aggregate evidence-lookup bounds and coherent serving-view qualification.
 | B | Owned writes, read/stream accounting, drain and shared shutdown | [Owned server operations](2026-09-30-owned-server-operations.md) qualifies the task/body foundation. [Engine settlement and resource bounds](2026-10-01-engine-settlement-and-resource-bounds.md) is accepted and partially implements query-child ownership and named aggregate write limits. Native settlement, completion reserves and runtime reuse remain unqualified under its T6/T10 gates. |
 | C | Remaining initialization/native-control completion, owned maintenance and bounded transient startup retry | Atomic schema publication is landed; T4/T6/T7/T11 retain same-process progress and protected reclamation |
 | D | Aggregate budgets, feed progress and embedding diagnostics | T10–T11 and workload qualification |
-| E0 | Durable offline schema/query execution and exact recovery | Ledger bounds/reserves, exclusive admission and fail-closed abandonment, strict intent/fence publication, current authorization, real process-death matrix and explicit no-reset ledger conversion; qualify each admitted backend |
+| E0 | Durable offline schema/query execution and exact recovery | Implemented in PR #849; qualification is limited to the [recorded evidence](#e0-implementation-evidence), with backend-specific gates retained. |
 | E1 | Same-engine schema/query activation with one outstanding deployment | Qualified E1 transition proof, relevant B/C/D ownership and bounds, T8.live/T9 and durable ledger/crash gates; generic reuse still requires full B; Azure separately gated |
 
-A and focused C/D repairs may proceed alongside B. The prepared schema
-publication interface is implemented independently: exact authority and intent,
-own-publication receipts, source-bound no-ops, contract-only publications and
-read-only committed-result reconciliation. E0 adds strict intent version 2, neutral
-settlement fencing and the [offline ledger protocol](#ledger-v2); protected
-evidence and prior-owner/control-I/O quiescence are independent obligations.
+A and focused C/D repairs may proceed alongside B. PR #849 extends the prepared
+schema interface with strict intent version 2, neutral settlement fencing and
+the [offline ledger protocol](#ledger-v2). Protected evidence and
+prior-owner/control-I/O quiescence remain independent obligations.
 E0 does not wait for E1's native reuse/activation proof and does not claim it.
 Existing-cluster rollout also requires qualified offline v13 conversion.
 E1 does not wait for deferred
@@ -836,10 +853,10 @@ Before enabling an affected increment, its owners must implement and qualify:
    A3 and the B foundation are qualified under
    [Owned server operations](2026-09-30-owned-server-operations.md); A1 admission
    and A2 exact receipt contracts and evidence remain with their accepted owners.
-2. Cluster/engine/CLI: E0's specified offline encoding, bounded control reads and
-   completion reserves, strict intent/fence proof, exclusive entry-point coverage,
-   recovery authorization and no-reset ledger conversion. Qualify its offline
-   history-dependent lookup cost; E1 still needs an aggregate bound, coexistence
+2. Cluster/engine/CLI: complete E0 qualification for each admitted backend and
+   record its offline history-dependent lookup envelope. PR #849 supplies the
+   implementation and [current evidence](#e0-implementation-evidence); E1 still
+   needs an aggregate bound, coexistence
    of submission with serving admission, observation interval and active-witness
    extension. Existing digest-based sweep supplies none of those proofs.
 3. Engine/server: qualify the native settlement mechanism and measured
@@ -852,6 +869,18 @@ Before enabling an affected increment, its owners must implement and qualify:
    cluster roots to v13 before rollout, under the storage-upgrade owner.
 
 ## Decision log
+
+- 2026-10-03: Record E0 implementation and bounded evidence in PR #849.
+  Acceptance boundary replaces "Production v2 admission remains disabled";
+  Durable offline deployment replaces its implementation shipping gate; CLI and
+  conversion replaces "not currently available command forms". Initial E1
+  qualification replaces "Online apply and ledger v2 admission remain
+  unavailable", the version-1-only implementation claim and "E0 next implements".
+  Rollout replaces "E0 adds" and its implementation-only gate; Unresolved
+  questions item 2 and `blocked_on` retain backend qualification rather than
+  implemented protocol work. The new evidence section records validation and its
+  limits separately from implementation. E1, native reuse, existing-cluster v13
+  conversion and Azure qualification boundaries are unchanged.
 
 - 2026-10-03: Accepted E0's durable offline deployment protocol. Summary,
   Acceptance boundary, Scope, Observable behavior, Authority, Deployment,
