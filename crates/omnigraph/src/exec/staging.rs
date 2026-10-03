@@ -849,6 +849,43 @@ pub(crate) struct CommittedMutation {
     /// set across manifest publish (see `commit_all`) so no same-process
     /// writer interleaves after revalidation.
     pub(crate) gates: crate::db::write_queue::HeldWriteGates,
+    /// The detached versions this write committed, each under the pin its
+    /// update registers. The caller holds them in the read-handle cache once
+    /// the publication succeeds (`hold_published_handles`), so the next write
+    /// of the same table opens nothing.
+    pub(crate) committed: Vec<CommittedHandle>,
+}
+
+/// One committed detached version and the pin that will name it.
+pub(crate) struct CommittedHandle {
+    dataset_path: String,
+    table_branch: Option<String>,
+    version: u64,
+    staged_version: Option<u64>,
+    e_tag: Option<String>,
+    dataset: lance::Dataset,
+}
+
+/// Hold every version a write committed in the read-handle cache, under the
+/// pin its publication registered. Called only after the publication
+/// succeeded; each key names an immutable detached version.
+pub(crate) async fn hold_published_handles(
+    db: &crate::db::Omnigraph,
+    committed: Vec<CommittedHandle>,
+) {
+    let handles = &db.read_caches().handles;
+    for handle in committed {
+        handles
+            .hold_published(
+                &handle.dataset_path,
+                handle.table_branch.as_deref(),
+                handle.version,
+                handle.staged_version,
+                handle.e_tag.as_deref(),
+                handle.dataset,
+            )
+            .await;
+    }
 }
 
 decide_seam! {
@@ -953,6 +990,7 @@ impl StagedMutation {
                 updates: Vec::new(),
                 expected_versions,
                 gates,
+                committed: Vec::new(),
             });
         }
 
@@ -972,6 +1010,7 @@ impl StagedMutation {
 
         let witness = txn.authority.staging_witness()?;
         let mut updates: Vec<DatasetUpdate> = Vec::with_capacity(staged.len());
+        let mut committed: Vec<CommittedHandle> = Vec::with_capacity(staged.len());
         for entry in staged {
             let StagedTableEntry {
                 table_key,
@@ -997,6 +1036,14 @@ impl StagedMutation {
                 .with_table_fork_owner(table_fork_owner)
                 .with_staged(state.version, identity.uuid.clone())
                 .with_last_linear_version(path.entry.version_metadata.last_linear_version());
+            committed.push(CommittedHandle {
+                dataset_path: path.entry.dataset_path.clone(),
+                table_branch: path.table_branch.clone(),
+                version: target,
+                staged_version: version_metadata.staged_version(),
+                e_tag: version_metadata.e_tag().map(str::to_string),
+                dataset: detached.into_dataset(),
+            });
             updates.push(DatasetUpdate {
                 identity: path.identity,
                 type_key: table_key,
@@ -1012,6 +1059,7 @@ impl StagedMutation {
             updates,
             expected_versions,
             gates,
+            committed,
         })
     }
 }
