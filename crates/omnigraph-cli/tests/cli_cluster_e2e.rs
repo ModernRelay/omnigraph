@@ -11,6 +11,171 @@ mod support;
 use support::*;
 
 #[test]
+fn cluster_e2e_offline_deployment_has_root_only_receipts_and_explicit_unlock() {
+    for root_first in [true, false] {
+        let temp = tempdir().unwrap();
+        write_cluster_config_fixture(temp.path());
+        let config_path = temp.path().join("cluster.yaml");
+        let config = fs::read_to_string(&config_path).unwrap();
+        fs::write(&config_path, config.split("policies:").next().unwrap()).unwrap();
+        init_cluster_derived_graph(temp.path());
+        assert_eq!(cluster_json(temp.path(), "import")["ok"], true);
+        assert_eq!(cluster_json(temp.path(), "apply")["converged"], true);
+        let root = format!("file://{}", temp.path().display());
+        let rooted = |args: &[&str]| {
+            let mut command = cli();
+            command.current_dir(temp.path());
+            if root_first {
+                command.args(["--cluster", &root]);
+            }
+            command.arg("cluster").args(args);
+            if !root_first {
+                command.args(["--cluster", &root]);
+            }
+            command
+        };
+        // Both global-flag positions must work without mutable source files.
+        fs::rename(&config_path, temp.path().join("saved-cluster.yaml")).unwrap();
+        fs::rename(
+            temp.path().join("people.pg"),
+            temp.path().join("saved-people.pg"),
+        )
+        .unwrap();
+        let before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+        output_failure(&mut rooted(&["upgrade-ledger", "--json"]));
+        assert_eq!(
+            fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+            before
+        );
+        let converted = parse_stdout_json(&output_success(&mut rooted(&[
+            "upgrade-ledger",
+            "--writers-stopped",
+            "--json",
+        ])));
+        assert_eq!(converted["next_sequence"], 1);
+        assert_eq!(converted["result_revision"], 0);
+        fs::rename(temp.path().join("saved-cluster.yaml"), &config_path).unwrap();
+        fs::write(
+            temp.path().join("people.pg"),
+            "node Person { name: String @key age: I32? bio: String? }\n",
+        )
+        .unwrap();
+        fs::write(temp.path().join("people.gq"), "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.bio } }\n").unwrap();
+        let output = output_success(
+            cli()
+                .args(["--as", "operator:deploy", "cluster", "apply", "--config"])
+                .arg(temp.path())
+                .arg("--json"),
+        );
+        let deployed = parse_stdout_json(&output);
+        assert_eq!(deployed["status"], "complete", "{deployed}");
+        assert_eq!(deployed["result"]["converged"], true);
+        let id = deployed["result"]["id"].as_str().unwrap();
+        assert!(String::from_utf8_lossy(&output.stderr).contains(id));
+        assert_eq!(
+            deployed["result"]["graphs"]["knowledge"]["result"]["Committed"]["commit"]["actor_id"],
+            "operator:deploy"
+        );
+        fs::remove_file(&config_path).unwrap();
+        fs::remove_file(temp.path().join("people.pg")).unwrap();
+        fs::remove_file(temp.path().join("people.gq")).unwrap();
+        fs::create_dir(temp.path().join(".omnigraph")).unwrap();
+        fs::write(temp.path().join(".omnigraph/context"), "malformed").unwrap();
+        let status = parse_stdout_json(&output_success(&mut rooted(&[
+            "status",
+            "--deployment-id",
+            id,
+            "--json",
+        ])));
+        assert_eq!(status["lookup"], deployed);
+        assert_eq!(status["next_sequence"], 2);
+        let lock_id = status["lock_id"].as_str().unwrap();
+        let ledger_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+        let lock_before = fs::read(temp.path().join("__cluster/lock.json")).unwrap();
+        for args in [
+            vec!["cluster", "upgrade-ledger", "--writers-stopped"],
+            vec!["cluster", "status", "--deployment-id", id],
+            vec![
+                "cluster",
+                "apply",
+                "--deployment-id",
+                id,
+                "--writers-stopped",
+            ],
+        ] {
+            let missing_root = output_failure(cli().current_dir(temp.path()).args(args));
+            assert_eq!(missing_root.status.code(), Some(2));
+            assert!(String::from_utf8_lossy(&missing_root.stderr).contains("requires --cluster"));
+        }
+        for managed_flag in [
+            vec!["--no-wait"],
+            vec!["--timeout", "1"],
+            vec!["--idempotency-key", "key"],
+        ] {
+            let output = output_failure(
+                rooted(&["apply", "--deployment-id", id, "--json"]).args(managed_flag),
+            );
+            assert_eq!(output.status.code(), Some(2));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("managed_scope_conflict"));
+        }
+        output_failure(&mut rooted(&["force-unlock", "wrong-lock", "--json"]));
+        let unknown_id = format!(
+            "{}:00000000000000000000000000",
+            id.rsplit_once(':').unwrap().0
+        );
+        assert_ne!(unknown_id, id);
+        let unresolved = output_failure(&mut rooted(&[
+            "apply",
+            "--deployment-id",
+            &unknown_id,
+            "--writers-stopped",
+            "--json",
+        ]));
+        assert_eq!(
+            parse_stdout_json(&unresolved)["status"],
+            "identity_mismatch"
+        );
+        let guidance = String::from_utf8_lossy(&unresolved.stderr);
+        assert!(
+            guidance.contains(lock_id) && guidance.contains("exact-ID force-unlock"),
+            "{guidance}"
+        );
+        assert_eq!(
+            fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+            ledger_before
+        );
+        assert_eq!(
+            fs::read(temp.path().join("__cluster/lock.json")).unwrap(),
+            lock_before
+        );
+        let repeated = parse_stdout_json(&output_success(&mut rooted(&[
+            "apply",
+            "--deployment-id",
+            id,
+            "--json",
+        ])));
+        assert_eq!(
+            repeated, deployed,
+            "terminal recovery is lookup only and needs no mutable files"
+        );
+        let unlocked = parse_stdout_json(&output_success(&mut rooted(&[
+            "force-unlock",
+            lock_id,
+            "--json",
+        ])));
+        assert_eq!(unlocked["unlocked"], true);
+        let status = parse_stdout_json(&output_success(&mut rooted(&["status", "--json"])));
+        assert!(status["lock_id"].is_null());
+        assert_eq!(status["next_sequence"], 2);
+        let conflict = output_failure(&mut rooted(&["status", "--config", "."]));
+        assert_eq!(conflict.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&conflict.stderr).contains("--cluster and explicit --config")
+        );
+    }
+}
+
+#[test]
 fn cluster_e2e_lifecycle_import_apply_status_refresh_converges() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());

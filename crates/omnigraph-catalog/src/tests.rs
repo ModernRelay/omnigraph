@@ -4789,3 +4789,69 @@ async fn manifest_scan_keeps_raw_memory_binding_readable() {
         assert_eq!(values.values().as_ref(), &[31, 47]);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_version_publish_races_for_one_candidate_without_rebase() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let coordinator = ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let base = coordinator.version();
+    let head = coordinator.exact_graph_head();
+    let precondition = PublishPrecondition::ExactGraphVersion {
+        authority: GraphHeadExpectation::new(
+            None,
+            lance::dataset::refs::BranchIdentifier::main(),
+            head.clone(),
+        ),
+        version: base,
+    };
+    let original = LineageIntent {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        branch: None,
+        actor_id: Some("original".to_string()),
+        merged_parent_commit_id: None,
+        created_at: lineage_now_micros(),
+    };
+    let fence = LineageIntent {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        actor_id: Some("recovery".to_string()),
+        ..original.clone()
+    };
+    let left = GraphNamespacePublisher::new(uri, None);
+    let right = GraphNamespacePublisher::new(uri, None);
+    let expected = HashMap::new();
+    let (a, b) = tokio::join!(
+        left.publish_with_precondition(&[], &expected, Some(&original), &precondition),
+        right.publish_with_precondition(&[], &expected, Some(&fence), &precondition),
+    );
+    let (winner, loser) = match (a, b) {
+        (Ok(_), Err(error)) => (&original, error),
+        (Err(error), Ok(_)) => (&fence, error),
+        other => panic!("exactly one numeric candidate must win: {other:?}"),
+    };
+    assert!(matches!(loser, OmniError::Manifest(ManifestError {
+        details: Some(ManifestConflictDetails::ReadSetChanged { ref member, .. }), ..
+    }) if member == "prepared_schema_manifest_version"));
+    let candidate = read_schema_publication_candidate_at(
+        uri,
+        base + 1,
+        Some(&original.graph_commit_id),
+        Some(&fence.graph_commit_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(candidate.head.graph_commit_id, winner.graph_commit_id);
+    assert_eq!(candidate.head.parent_commit_id, head);
+    assert_ne!(candidate.original.is_some(), candidate.settlement.is_some());
+    assert_eq!(
+        open_manifest_dataset(uri, None)
+            .await
+            .unwrap()
+            .version()
+            .version,
+        base + 1
+    );
+}

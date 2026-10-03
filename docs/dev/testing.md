@@ -24,7 +24,7 @@ The invariants behind these rules are in [invariants.md](invariants.md). Lance-d
 | `omnigraph-catalog` | In-source tests (52 today): `crates/omnigraph-catalog/src/tests.rs` for `__manifest` publication, state and lineage, plus in-file tests in `migrations.rs` and `retention.rs` | Module-local fixtures; `omnigraph-core`'s `test-util` helpers |
 | `omnigraph-engine` | `crates/omnigraph/tests/` plus focused in-source tests | `tests/helpers/` and `tests/fixtures/` |
 | `omnigraph-policy` | In-source Cedar policy parsing and evaluation tests | Module-local fixtures |
-| `omnigraph-cluster` | In-source lifecycle tests; `tests/failpoints.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
+| `omnigraph-cluster` | In-source lifecycle, offline deployment and admission tests; `tests/failpoints.rs`; `tests/identity_recovery.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
 | `omnigraph-server` | `crates/omnigraph-server/tests/` | `tests/support/mod.rs` |
 | `omnigraph-cli` | `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
 | `omnigraph-dst` | `crates/omnigraph-dst/tests/` (`scenarios.rs`, `lane_b.rs`, `torn_init.rs`) plus in-source proofs | Crate-local fixtures. Deterministic simulation; needs `--cfg tokio_unstable` (the workspace `.cargo/config.toml` sets it for every build; the default workspace gate excludes the crate by name). Run from `crates/omnigraph-dst`: its `[env]`-only `.cargo/config.toml` supplies the pool trio that `require_pool_env` asserts at process start. `#[ignore]`d tests are fleet/hunt instruments driven by the DST workflows |
@@ -125,6 +125,21 @@ The guards pin only substrate behavior OmniGraph actually depends on: version an
 Server suites are organized by public route: `auth_policy`, `data_routes`, `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings`, object-store coverage in `s3`, and the generated contract in `openapi`.
 
 CLI suites own their named planes: cluster lifecycle, data commands, stored queries, schema/config, cross-version rebuild, embedded/remote parity, and local/remote system journeys. Keep `OMNIGRAPH_HOME` hermetic by using `tests/support::cli()` or `cli_process()`.
+
+Offline deployment tests extend these owners: cluster `tests.rs` pins no-reset
+ledger conversion, captured source bytes, exact-ID lookup, bounded results and
+exact applied schema identity after receipt eviction; `admission.rs` pins lifetime
+exclusion and exact reconciliation admission. Cluster `tests/failpoints.rs` owns
+interruption windows, killed-process recovery and corrective successors;
+`tests/identity_recovery.rs` owns current-actor authorization and adoption of a
+persisted settlement without replacing its author. CLI
+`tests/cli_cluster_e2e.rs` owns the root-only deployment round trip, and
+`tests/cli_cluster.rs` owns CLI admission. Engine `tests/schema_apply.rs` owns
+strict prepared publication and settlement proofs, with actor checks in
+`tests/policy_engine_chassis.rs`; catalog tests own numeric CAS. The storage
+in-source contract owns bounded same-GET bytes/tokens, and cluster
+`tests/s3_cluster.rs` owns the shared S3/Azure backend journey. Passing Azurite is
+not qualification of live Azure lease-loss or delayed accepted writes.
 
 The cross-version rebuild owner, `crossversion_upgrade.rs`, skips each predecessor case when its binary is not configured, so a local `cargo test -p omnigraph-cli --test crossversion_upgrade` is green even while CI's `V5 ↔ V10 Format Fence` is red. To run the fence locally, build the predecessor CLI from the commit `ci.yml` pins as `FINAL_INTERNAL_V5_COMMIT` (`git worktree add <dir> <sha>`, then `cargo build --locked -p omnigraph-cli --bin omnigraph` inside it) and run the exact case with that binary:
 

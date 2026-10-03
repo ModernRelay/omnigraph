@@ -19,8 +19,8 @@ URI): query, mutate, load, blob, branch, snapshot, export, commit, changes, sche
 served — require a server: graphs (registry scope).\n  \
 direct — direct storage access; reject --server (init, upgrade, optimize, rebuild-full-text-indexes, \
 repair, cleanup, schema plan, lint).\n  \
-control — manage or inspect a cluster (cluster via --config; policy & queries via \
---cluster).\n  \
+control — manage or inspect a cluster (--config for bundles; explicit --cluster roots for \
+Core deployment/recovery; policy & queries via --cluster).\n  \
 local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, version.\n\
 MANAGED FOLDERS: cluster commands use .omnigraph/context; data commands acquire identity credentials automatically.\n\
 Implicit query, mutate, load and commit list/show use folder context and require --graph.\n\
@@ -72,14 +72,14 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "URI")]
     pub(crate) store: Option<String>,
 
-    /// Address a cluster-managed graph's storage for maintenance:
-    /// a cluster directory or storage-root URI — named via `clusters:` in
-    /// ~/.omnigraph/config.yaml, or a literal `file://`/`s3://`/`az://` root. Pair
-    /// with `--graph <id>` to select the graph. Used by optimize /
-    /// rebuild-full-text-indexes / repair / cleanup. Azure is a qualification
-    /// preview pending adversarial live qualification, and its maintenance still
-    /// requires the cluster-root external admission wrapper. Exclusive with a
-    /// positional URI / `--store` / `--server`.
+    /// Address a cluster. Core apply/status/force-unlock/upgrade-ledger accept
+    /// a literal file://, s3:// or az:// storage root independently of local
+    /// bundle files. Root-addressed apply reconciles an exact --deployment-id.
+    /// Maintenance also accepts a cluster directory or a `clusters:` name from
+    /// ~/.omnigraph/config.yaml; pair it with --graph to select the graph.
+    /// Azure writes still require the cluster-root external admission wrapper
+    /// and remain a qualification preview. Exclusive with a positional URI,
+    /// --store or --server; Core root commands also reject explicit --config.
     #[arg(long, global = true, value_name = "DIR|URI")]
     pub(crate) cluster: Option<String>,
 
@@ -652,10 +652,10 @@ pub(crate) enum ClusterCommand {
         #[command(flatten)]
         managed: ManagedRunArgs,
     },
-    /// Converge the cluster to its config: create graphs, apply schema updates,
-    /// write stored-query/policy catalog resources, and execute
-    /// approved graph deletes, in one ordered run. Serving picks up the applied
-    /// revision after an `omnigraph-server --cluster` restart.
+    /// Apply a bundle: bootstrap and inventory changes on v1; schema and stored
+    /// query changes on v2. With --cluster ROOT and --deployment-id, reconcile
+    /// the original deployment without local source files. Serving activates
+    /// the applied revision after an `omnigraph-server --cluster` restart.
     Apply {
         /// Cluster config directory containing cluster.yaml.
         #[arg(long, default_value = ".")]
@@ -666,6 +666,12 @@ pub(crate) enum ClusterCommand {
         /// Managed: apply this exact saved plan run. Required in managed mode.
         #[arg(long)]
         plan: Option<String>,
+        /// Original durable Core deployment identity; never allocates a retry.
+        #[arg(long, conflicts_with = "plan")]
+        deployment_id: Option<String>,
+        /// Attest prior writers and accepted graph/control I/O are quiescent.
+        #[arg(long, requires = "deployment_id")]
+        writers_stopped: bool,
         #[command(flatten)]
         managed: ManagedRunArgs,
     },
@@ -681,11 +687,15 @@ pub(crate) enum ClusterCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Read the local JSON state ledger without scanning live graph resources.
+    /// Read the cluster ledger without scanning live graphs; --cluster ROOT
+    /// supports source-independent lookup of an exact --deployment-id.
     Status {
         /// Managed: inspect a run instead of the cluster projections.
         #[arg(conflicts_with = "operation")]
         run_id: Option<String>,
+        /// Look up the exact durable Core deployment without opening graphs.
+        #[arg(long, conflicts_with_all = ["run_id", "operation", "api", "wait", "timeout"])]
+        deployment_id: Option<String>,
         /// Managed: inspect a service lifecycle operation instead of a run.
         #[arg(long)]
         operation: Option<String>,
@@ -754,7 +764,8 @@ pub(crate) enum ClusterCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Remove a held local JSON state lock after operator confirmation.
+    /// Remove an exact persisted lock after stopping the owner and establishing
+    /// graph/control I/O quiescence, with admissions and other unlocks excluded.
     ForceUnlock {
         /// Exact lock id from cluster status or a state_lock_held diagnostic.
         lock_id: String,
@@ -762,6 +773,14 @@ pub(crate) enum ClusterCommand {
         #[arg(long, default_value = ".")]
         config: PathBuf,
         /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Convert the stopped cluster ledger without resetting graphs or history.
+    UpgradeLedger {
+        /// Attest prior writers and accepted graph/control I/O are quiescent.
+        #[arg(long, required = true)]
+        writers_stopped: bool,
         #[arg(long)]
         json: bool,
     },

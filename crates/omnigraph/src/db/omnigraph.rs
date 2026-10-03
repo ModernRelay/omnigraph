@@ -52,7 +52,10 @@ pub use optimize::{CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeSta
 pub use repair::{
     DatasetRepairStats, RepairAction, RepairClassification, RepairOptions, RepairStats,
 };
-pub use schema_apply::{PreparedSchemaApply, SchemaApplyReconciliation, SchemaContractDigest};
+pub use schema_apply::{
+    PreparedSchemaApply, PreparedSchemaSettlement, SchemaApplyReconciliation,
+    SchemaApplySettlement, SchemaContractDigest, SchemaNonPublicationProof,
+};
 pub use system_column_upgrade::{
     SYSTEM_COLUMNS_PREFLIGHT, SystemColumnUpgradeFinding, SystemColumnUpgradeOptions,
     SystemColumnUpgradeOutcome, SystemColumnUpgradeReport,
@@ -841,6 +844,22 @@ impl Omnigraph {
         Arc::clone(&self.schema_view.load().source)
     }
 
+    /// Return the source and identity digest from one coherent handle-local
+    /// accepted schema view, including when the graph has named branches.
+    /// This does not refresh storage; callers comparing current durable
+    /// authority must open or refresh under their writer-exclusion boundary.
+    pub fn schema_contract_digest(&self) -> SchemaContractDigest {
+        use sha2::Digest;
+
+        let view = self.schema_view.load();
+        SchemaContractDigest {
+            source_hash: format!("{:x}", sha2::Sha256::digest(view.source.as_bytes())),
+            schema_ir_hash: view.schema_ir_hash.clone(),
+            schema_identity_domain: view.schema_identity_domain.clone(),
+            schema_identity_version: super::schema_state::SCHEMA_IDENTITY_VERSION,
+        }
+    }
+
     /// Publish one coherent handle-local projection after the durable schema
     /// contract is live. The catalog must be bound to the exact accepted IR;
     /// source, catalog, hash, and domain then move through one ArcSwap.
@@ -1177,6 +1196,30 @@ impl Omnigraph {
         actor: Option<&str>,
     ) -> Result<SchemaApplyReconciliation> {
         schema_apply::reconcile_schema_apply(self, prepared, actor).await
+    }
+
+    /// Issue a serializable neutral settlement intent without graph effects.
+    /// Persist this token before settlement. Current policy authorizes its
+    /// author independently from the actor of the original schema intent.
+    pub async fn prepare_schema_settlement_as(
+        &self,
+        original: &PreparedSchemaApply,
+        actor: Option<&str>,
+    ) -> Result<PreparedSchemaSettlement> {
+        schema_apply::prepare_schema_settlement(self, original, actor).await
+    }
+
+    /// Settle a stopped owner's original schema intent without replaying it.
+    /// May publish the persisted neutral fence at the original candidate only.
+    /// The caller must exclude cleanup/other writers and establish prior native
+    /// and control-I/O quiescence. This grants no general runtime reuse proof.
+    pub async fn settle_prepared_schema_as(
+        &self,
+        original: &PreparedSchemaApply,
+        settlement: &PreparedSchemaSettlement,
+        actor: Option<&str>,
+    ) -> Result<SchemaApplySettlement> {
+        schema_apply::settle_prepared_schema(self, original, settlement, actor).await
     }
 
     /// Apply a schema migration with an explicit actor for engine-layer

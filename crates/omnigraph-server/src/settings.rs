@@ -10,7 +10,7 @@ use std::path::Path;
 /// catalog blob content, policy bundles from blob paths with their applied
 /// bindings. Always multi-graph routing.
 pub(crate) async fn load_cluster_settings(
-    cluster_dir: &PathBuf,
+    cluster_dir: &Path,
     cli_bind: Option<String>,
     cli_allow_unauthenticated: bool,
     cli_require_all_graphs: bool,
@@ -22,19 +22,19 @@ pub(crate) async fn load_cluster_settings(
     // Any supported scheme-qualified argument (s3://, az://, file://) is a storage root; a
     // bare path is a config directory.
     let cluster_arg = cluster_dir.to_string_lossy();
-    let snapshot = if cluster_arg.contains("://") {
-        omnigraph_cluster::read_serving_snapshot_from_storage(cluster_arg.as_ref()).await
-    } else {
-        omnigraph_cluster::read_serving_snapshot(cluster_dir).await
-    }
-    .map_err(|diagnostics| serving_snapshot_error(cluster_dir, &diagnostics))?;
-    settings_from_snapshot(
+    let admitted = omnigraph_cluster::admit_serving_snapshot(&cluster_arg)
+        .await
+        .map_err(|diagnostics| serving_snapshot_error(cluster_dir, &diagnostics))?;
+    let (snapshot, _, admission) = admitted.into_parts();
+    let mut config = settings_from_snapshot(
         cluster_dir,
         cli_bind,
         cli_allow_unauthenticated,
         cli_require_all_graphs,
         snapshot,
-    )
+    )?;
+    config.cluster_admission = admission;
+    Ok(config)
 }
 
 fn serving_snapshot_error(
@@ -250,6 +250,7 @@ fn settings_from_snapshot(
         // The binary resolves the flag, then the environment, then the default
         // (`resolve_shutdown_grace`); settings carry the default.
         shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
+        cluster_admission: None,
     })
 }
 
@@ -309,12 +310,9 @@ pub async fn load_server_settings_with_identity_trust(
     }
     let cluster_dir = required_cluster(cli_cluster)?;
     let cluster_arg = cluster_dir.to_string_lossy();
-    let bound = if cluster_arg.contains("://") {
-        omnigraph_cluster::read_root_bound_serving_snapshot_from_storage(&cluster_arg).await
-    } else {
-        omnigraph_cluster::read_root_bound_serving_snapshot(cluster_dir).await
-    }
-    .map_err(|diagnostics| serving_snapshot_error(cluster_dir, &diagnostics))?;
+    let bound = omnigraph_cluster::admit_serving_snapshot(&cluster_arg)
+        .await
+        .map_err(|diagnostics| serving_snapshot_error(cluster_dir, &diagnostics))?;
     let canonical_root = bound.canonical_root().to_string();
     let trust = data_trust_path
         .map(|path| data_tokens::DataTokenTrust::read(path, &canonical_root))
@@ -322,13 +320,15 @@ pub async fn load_server_settings_with_identity_trust(
     let oidc_trust = oidc_trust_path
         .map(|path| oidc_identity::OidcIdentityTrust::read(path, &canonical_root))
         .transpose()?;
-    let config = settings_from_snapshot(
+    let (snapshot, _, admission) = bound.into_parts();
+    let mut config = settings_from_snapshot(
         cluster_dir,
         cli_bind,
         cli_allow_unauthenticated,
         cli_require_all_graphs,
-        bound.into_snapshot(),
+        snapshot,
     )?;
+    config.cluster_admission = admission;
     Ok(ManagedServerConfig {
         config,
         canonical_root,
@@ -794,6 +794,7 @@ mod tests {
             require_all_graphs: false,
             witness: crate::BootWitness::default(),
             shutdown_grace: crate::DEFAULT_SHUTDOWN_GRACE,
+            cluster_admission: None,
         };
         let result = serve(config).await;
         let err = result
@@ -851,6 +852,7 @@ mod tests {
             require_all_graphs: false,
             witness: crate::BootWitness::default(),
             shutdown_grace: crate::DEFAULT_SHUTDOWN_GRACE,
+            cluster_admission: None,
         };
         let result = serve(config).await;
         let err =
@@ -1011,7 +1013,8 @@ mod tests {
     /// the base is disjoint and apply accepts it) and the production snapshot
     /// reader then reads it with the storage root spelled as the overlapping
     /// `s3://` prefix. Graph roots derived from that spelling name the same
-    /// bytes, so the served sibling is opened at its local root.
+    /// bytes, so both graph URIs return to their local roots before startup
+    /// admission probes cluster membership; only the served sibling is opened.
     #[tokio::test]
     async fn boot_quarantines_overlapping_external_blob_base_and_strict_boot_refuses() {
         let dir = tempfile::tempdir().unwrap();
@@ -1091,11 +1094,13 @@ graphs:
             Some(StartupFailure::InvalidConfiguration)
         );
         assert_eq!(graphs[0].uri, "s3://assets/cluster/graphs/archive.omni");
-        graphs[0].uri = dir
-            .path()
-            .join("graphs/archive.omni")
-            .to_string_lossy()
-            .to_string();
+        for graph in &mut graphs {
+            graph.uri = dir
+                .path()
+                .join(format!("graphs/{}.omni", graph.graph_id))
+                .to_string_lossy()
+                .to_string();
+        }
         let state = open_multi_graph_state(
             graphs,
             Vec::new(),

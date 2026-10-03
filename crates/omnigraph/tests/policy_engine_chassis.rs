@@ -592,3 +592,74 @@ async fn full_text_rebuild_enforces_selected_branch_before_effects_and_records_a
         main_before[0].graph_commit_id
     );
 }
+
+#[tokio::test]
+async fn schema_settlement_authorizes_current_executor_and_preserves_original_authorship() {
+    use omnigraph::db::{SchemaApplySettlement, SchemaNonPublicationProof};
+    for original_wins in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _) = init_with_policy(&dir).await;
+        let original = db
+            .prepare_schema_apply_as(&additive_schema(), Some("act-allowed"))
+            .await
+            .unwrap();
+        let fence = db
+            .prepare_schema_settlement_as(&original, Some("act-allowed"))
+            .await
+            .unwrap();
+        assert_denied(
+            db.prepare_schema_settlement_as(&original, Some("act-denied"))
+                .await,
+            "prepare_schema_settlement_as",
+        );
+        assert_denied(
+            db.settle_prepared_schema_as(&original, &fence, Some("act-denied"))
+                .await,
+            "settle_prepared_schema_as",
+        );
+        if original_wins {
+            db.apply_prepared_schema_as(&original, Some("act-allowed"))
+                .await
+                .unwrap();
+        }
+        let source = POLICY_YAML
+            .replace("writers: [act-allowed]", "writers: [act-other]")
+            .replace(
+                "readers: [act-denied]",
+                "readers: [act-denied, act-allowed]",
+            );
+        let (recovery, _) = install_policy_source(
+            Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap(),
+            dir.path(),
+            &source,
+        );
+        let before = recovery.list_commits(None).await.unwrap();
+        assert_denied(
+            recovery
+                .settle_prepared_schema_as(&original, &fence, Some("act-allowed"))
+                .await,
+            "authored fence is not a capability after revocation",
+        );
+        assert_eq!(recovery.list_commits(None).await.unwrap(), before);
+        let result = recovery
+            .settle_prepared_schema_as(&original, &fence, Some("act-other"))
+            .await
+            .unwrap();
+        let commit = match result {
+            SchemaApplySettlement::Committed { commit, .. } if original_wins => commit,
+            SchemaApplySettlement::NotPublished {
+                proof: SchemaNonPublicationProof::Fence { commit, .. },
+            } if !original_wins => commit,
+            other => panic!("wrong authorized settlement: {other:?}"),
+        };
+        assert_eq!(
+            commit.actor_id.as_deref(),
+            Some("act-allowed"),
+            "adoption must not rewrite authored lineage"
+        );
+        assert_eq!(
+            commit.graph_manifest_version,
+            original.base_manifest_version() + 1
+        );
+    }
+}

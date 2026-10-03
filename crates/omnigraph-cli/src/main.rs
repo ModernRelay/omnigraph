@@ -47,6 +47,7 @@ mod read_format;
 use embed::{EmbedArgs, EmbedOutput, execute_embed};
 use read_format::{ReadOutputFormat, ReadRenderOptions, render_read};
 
+mod admission;
 mod blob_cli;
 mod cli;
 mod client;
@@ -181,13 +182,17 @@ async fn main() -> Result<()> {
         } else {
             None
         };
-        (Cli::from_arg_matches(&matches)?, machine)
+        let cli = Cli::from_arg_matches(&matches)?;
+        if let Err(error) = validate_core_root_arguments(&cli, command_matches) {
+            error.exit();
+        }
+        (cli, machine)
     };
     let (result, evidence) = if command_outcome::applies(&cli) {
-        let (result, evidence) = command_outcome::observe(run(cli)).await;
+        let (result, evidence) = admission::scope(command_outcome::observe(run(cli))).await;
         (result, Some(evidence))
     } else {
-        (run(cli).await, None)
+        (admission::scope(run(cli)).await, None)
     };
     match result {
         Err(error) => {
@@ -242,6 +247,50 @@ async fn main() -> Result<()> {
         }
         result => result,
     }
+}
+
+/// Cross-level argument relations must be checked after Clap propagates global
+/// values: subcommand validation cannot see `--cluster` given before `cluster`.
+fn validate_core_root_arguments(
+    cli: &Cli,
+    command_matches: &clap::ArgMatches,
+) -> std::result::Result<(), clap::Error> {
+    let Command::Cluster { command } = &cli.command else {
+        return Ok(());
+    };
+    if cli.cluster.is_some()
+        && command_matches
+            .try_get_one::<PathBuf>("config")
+            .ok()
+            .flatten()
+            .is_some()
+        && command_matches.value_source("config") == Some(clap::parser::ValueSource::CommandLine)
+    {
+        return Err(Cli::command().error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--cluster and explicit --config cannot be used together",
+        ));
+    }
+    if cli.cluster.is_none()
+        && matches!(
+            command,
+            ClusterCommand::UpgradeLedger { .. }
+                | ClusterCommand::Apply {
+                    writers_stopped: true,
+                    ..
+                }
+                | ClusterCommand::Status {
+                    deployment_id: Some(_),
+                    ..
+                }
+        )
+    {
+        return Err(Cli::command().error(
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "this Core deployment operation requires --cluster <ROOT>",
+        ));
+    }
+    Ok(())
 }
 
 /// The machine error format a run's output format asks for: `--json` (and
@@ -1029,6 +1078,7 @@ async fn run(cli: Cli) -> Result<()> {
                 )
                 .await?;
                 let schema_source = fs::read_to_string(&schema)?;
+                crate::admission::ensure_graph(&uri).await?;
                 let db = Omnigraph::open(&uri).await?;
                 let plan = db.plan_schema(&schema_source).await?;
                 let output = SchemaPlanOutput {
@@ -1579,6 +1629,7 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?;
             echo_write_target(cli.quiet, "optimize", &uri, false);
+            crate::admission::ensure_graph(&uri).await?;
             let db = Omnigraph::open(&uri).await?;
             let stats = db.optimize().await?;
             if json {
@@ -1634,6 +1685,7 @@ async fn run(cli: Cli) -> Result<()> {
             .await?;
             let actor = resolve_cli_actor(cli.as_actor.as_deref())?;
             echo_write_target(cli.quiet, "rebuild-full-text-indexes", &uri, false);
+            crate::admission::ensure_graph(&uri).await?;
             let db = Omnigraph::open(&uri).await?;
             let result = db
                 .rebuild_full_text_indices_on_as(&branch, actor.as_deref())
@@ -1698,6 +1750,7 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?;
             echo_write_target(cli.quiet, "repair", &uri, false);
+            crate::admission::ensure_graph(&uri).await?;
             let db = Omnigraph::open(&uri).await?;
             let stats = db
                 .repair(omnigraph::db::RepairOptions { confirm, force })
@@ -1850,6 +1903,7 @@ async fn run(cli: Cli) -> Result<()> {
                 older_than: older_than_dur,
             };
 
+            crate::admission::ensure_graph(&uri).await?;
             let db = Omnigraph::open(&uri).await?;
             let stats = db.cleanup(options).await?;
             if json {
@@ -1913,14 +1967,74 @@ async fn run(cli: Cli) -> Result<()> {
                 let output = observe_config_dir(config).await;
                 finish_cluster_state_sync(&output, json)?;
             }
-            ClusterCommand::Apply { config, json, .. } => {
-                // The actor attributes graph-moving operations (sidecars,
-                // audit entries, engine schema-apply commits). Cluster FACTS
-                // stay unlayered; the operator's identity resolves --as flag
-                // first, then per-operator config `operator.actor`.
-                let actor = resolve_cluster_actor(cli.as_actor.as_deref())?;
-                let output = apply_config_dir_with_options(config, ApplyOptions { actor }).await;
-                finish_cluster_apply(&output, json)?;
+            ClusterCommand::Apply {
+                config,
+                json,
+                deployment_id,
+                writers_stopped,
+                ..
+            } => {
+                let caller = omnigraph_cluster::DeploymentCaller::storage_owner(
+                    resolve_cluster_actor(cli.as_actor.as_deref())?,
+                );
+                if let Some(root) = cli.cluster.as_deref() {
+                    let id = deployment_id.as_deref().ok_or_else(|| color_eyre::eyre::eyre!("root-addressed apply requires --deployment-id; it only reconciles the original deployment"))?;
+                    let result =
+                        omnigraph_cluster::reconcile_deployment(root, id, writers_stopped, &caller)
+                            .await;
+                    let status = omnigraph_cluster::deployment_status(root, None, &caller).await;
+                    if let Ok(status) = status {
+                        report_deployment_lock(&status);
+                    }
+                    finish_core_deployment(result, json)?;
+                } else {
+                    let result = omnigraph_cluster::apply_deployment(
+                        &config,
+                        deployment_id.as_deref(),
+                        &caller,
+                        |id, root, lock| {
+                            let root = omnigraph::storage::redacted_storage_uri(root);
+                            eprintln!(
+                                "Deployment-ID: {id}\nCluster-root: {root}\nAdmission lock: {lock}; retain until prior work is quiescent, then exact-ID force-unlock"
+                            );
+                        },
+                    )
+                    .await;
+                    match result {
+                        Err(error)
+                            if error.code == "ledger_upgrade_required"
+                                && deployment_id.is_none() =>
+                        {
+                            let output = apply_config_dir_with_options(
+                                config,
+                                ApplyOptions {
+                                    actor: caller.actor().map(str::to_owned),
+                                },
+                            )
+                            .await;
+                            finish_cluster_apply(&output, json)?;
+                        }
+                        result => finish_core_deployment(result, json)?,
+                    }
+                }
+            }
+            ClusterCommand::UpgradeLedger {
+                writers_stopped,
+                json,
+            } => {
+                let root = cli.cluster.as_deref().ok_or_else(|| {
+                    color_eyre::eyre::eyre!("upgrade-ledger requires --cluster ROOT")
+                })?;
+                let caller = omnigraph_cluster::DeploymentCaller::storage_owner(
+                    resolve_cluster_actor(cli.as_actor.as_deref())?,
+                );
+                let status = core_deployment_result(
+                    omnigraph_cluster::upgrade_deployment_ledger(root, writers_stopped, &caller)
+                        .await,
+                    json,
+                )?;
+                print_json(&status)?;
+                report_deployment_lock(&status);
             }
             ClusterCommand::Approve {
                 resource,
@@ -1935,9 +2049,42 @@ async fn run(cli: Cli) -> Result<()> {
                 let output = approve_config_dir(config, &resource, &approver).await;
                 finish_cluster_approve(&output, json)?;
             }
-            ClusterCommand::Status { config, json, .. } => {
-                let output = status_config_dir(config).await;
-                finish_cluster_status(&output, json)?;
+            ClusterCommand::Status {
+                config,
+                json,
+                deployment_id,
+                run_id,
+                operation,
+                api,
+                wait,
+                timeout,
+            } => {
+                if let Some(root) = cli.cluster.as_deref() {
+                    if run_id.is_some()
+                        || operation.is_some()
+                        || api.is_some()
+                        || wait
+                        || timeout.is_some()
+                    {
+                        bail!(
+                            "root-addressed Core status does not accept managed run/operation flags"
+                        );
+                    }
+                    let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
+                    let status = core_deployment_result(
+                        omnigraph_cluster::deployment_status(
+                            root,
+                            deployment_id.as_deref(),
+                            &caller,
+                        )
+                        .await,
+                        json,
+                    )?;
+                    print_json(&status)?;
+                } else {
+                    let output = status_config_dir(config).await;
+                    finish_cluster_status(&output, json)?;
+                }
             }
             ClusterCommand::Refresh { config, json } => {
                 let output = refresh_config_dir(config).await;
@@ -1952,8 +2099,16 @@ async fn run(cli: Cli) -> Result<()> {
                 config,
                 json,
             } => {
-                let output = force_unlock_config_dir(config, lock_id).await;
-                finish_cluster_force_unlock(&output, json)?;
+                if let Some(root) = cli.cluster.as_deref() {
+                    core_deployment_result(
+                        omnigraph_cluster::force_unlock_storage_root(root, &lock_id).await,
+                        json,
+                    )?;
+                    print_json(&serde_json::json!({"unlocked": true, "lock_id": lock_id}))?;
+                } else {
+                    let output = force_unlock_config_dir(config, lock_id).await;
+                    finish_cluster_force_unlock(&output, json)?;
+                }
             }
             ClusterCommand::History { .. }
             | ClusterCommand::Cancel { .. }
@@ -2101,3 +2256,42 @@ async fn run_branch_statement_cli(
 #[cfg(test)]
 #[path = "main_tests.rs"]
 mod tests;
+
+fn core_deployment_result<T>(
+    result: std::result::Result<T, omnigraph_cluster::Diagnostic>,
+    json: bool,
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if json {
+                print_json(&serde_json::json!({"ok": false, "diagnostics": [&error]}))?;
+            }
+            bail!("{}: {}", error.code, error.message)
+        }
+    }
+}
+
+fn finish_core_deployment(
+    result: std::result::Result<omnigraph_cluster::DeploymentLookup, omnigraph_cluster::Diagnostic>,
+    json: bool,
+) -> Result<()> {
+    let result = core_deployment_result(result, json)?;
+    print_json(&result)?;
+    if !matches!(result, omnigraph_cluster::DeploymentLookup::Complete { ref result } if result.converged)
+    {
+        bail!(
+            "deployment has not fully converged; inspect the original identity, never replay unknown work"
+        );
+    }
+    Ok(())
+}
+
+fn report_deployment_lock(status: &omnigraph_cluster::DeploymentStatus) {
+    if let Some(lock) = &status.lock_id {
+        eprintln!(
+            "Admission lock retained: {lock} ({}); establish prior-work quiescence before exact-ID force-unlock",
+            omnigraph::storage::redacted_storage_uri(&status.canonical_root)
+        );
+    }
+}
