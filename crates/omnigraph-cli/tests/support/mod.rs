@@ -273,9 +273,15 @@ fn spawn_server_process(mut command: StdCommand) -> TestServer {
         }
         if let Some(base_url) = &base_url
             && client
-                .get(format!("{base_url}/healthz"))
+                .get(format!("{base_url}/readyz"))
                 .send()
-                .map(|response| response.status().is_success())
+                .map(|response| {
+                    response.status().is_success()
+                        && response
+                            .json::<Value>()
+                            .map(|body| body["loading_graph_count"] == 0)
+                            .unwrap_or(false)
+                })
                 .unwrap_or(false)
         {
             return TestServer {
@@ -299,10 +305,10 @@ fn spawn_server_process(mut command: StdCommand) -> TestServer {
     let stderr = read_stderr(&stderr_log);
     match early_exit {
         Some(status) => {
-            panic!("server exited before becoming healthy ({status}); stderr:\n{stderr}")
+            panic!("server exited before becoming ready ({status}); stderr:\n{stderr}")
         }
         None => panic!(
-            "server did not become healthy{}; stderr:\n{stderr}",
+            "server did not become ready{}; stderr:\n{stderr}",
             base_url
                 .as_deref()
                 .map(|url| format!(" on {url}"))
@@ -1251,6 +1257,12 @@ pub const PARITY_GRAPH_ID: &str = "parity";
 ///
 /// Returns the `cluster_dir`. The caller spawns the server with `--cluster`.
 pub fn parity_configs(root: &Path, local_graph: &Path, _remote_graph: &Path) -> PathBuf {
+    parity_configs_with_schema(root, local_graph, &fixture("test.pg"))
+}
+
+/// The same parity setup with additional schema declarations. Seed data and
+/// policy remain shared with the ordinary parity fixture.
+pub fn parity_configs_with_schema(root: &Path, local_graph: &Path, schema: &Path) -> PathBuf {
     let policy = root.join("parity.policy.yaml");
     fs::write(&policy, parity_policy_yaml()).unwrap();
 
@@ -1258,7 +1270,7 @@ pub fn parity_configs(root: &Path, local_graph: &Path, _remote_graph: &Path) -> 
     // (`parity`), schema = the shared fixture, policy bound to the graph.
     let cluster_dir = root.join("parity-cluster");
     fs::create_dir_all(&cluster_dir).unwrap();
-    fs::copy(fixture("test.pg"), cluster_dir.join("parity.pg")).unwrap();
+    fs::copy(schema, cluster_dir.join("parity.pg")).unwrap();
     fs::copy(&policy, cluster_dir.join("parity.policy.yaml")).unwrap();
     fs::write(
         cluster_dir.join("cluster.yaml"),

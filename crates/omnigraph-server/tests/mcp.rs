@@ -94,6 +94,15 @@ async fn fixture_app() -> (tempfile::TempDir, Router, AppState) {
     let mut entries = vec![omnigraph_server::registry::GraphEntry::ready(Arc::clone(
         handle.handle(),
     ))];
+    entries.push(omnigraph_server::GraphEntry::Loading(Arc::new(
+        omnigraph_server::LoadingGraph {
+            key: omnigraph_server::GraphKey::cluster(
+                omnigraph_server::GraphId::try_from("loading").unwrap(),
+            ),
+            uri: temp.path().join("loading").to_string_lossy().into_owned(),
+            policy: handle.policy.clone(),
+        },
+    )));
     for (id, failure) in [
         (
             "blocked",
@@ -205,11 +214,13 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
     let discovered = call(&app, &bob, "graphs", json!({})).await;
     assert_eq!(
         discovered["result"]["structuredContent"],
-        json!({"graphs":[{"graph_id":"blocked","display_name":"blocked"},{"graph_id":"default","display_name":"default"},{"graph_id":"invalid-config","display_name":"invalid-config"},{"graph_id":"invalid-policy","display_name":"invalid-policy"}]})
+        json!({"graphs":[{"graph_id":"blocked","display_name":"blocked"},{"graph_id":"default","display_name":"default"},{"graph_id":"invalid-config","display_name":"invalid-config"},{"graph_id":"invalid-policy","display_name":"invalid-policy"},{"graph_id":"loading","display_name":"loading"}]})
     );
     for (credential, graph, expected) in [
         (&alice, "blocked", 503),
         (&bob, "blocked", 404),
+        (&alice, "loading", 503),
+        (&bob, "loading", 404),
         (&alice, "default", 503),
         (&bob, "default", 404),
         (&alice, "invalid-policy", 404),

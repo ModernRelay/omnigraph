@@ -7469,7 +7469,7 @@
           "health"
         ],
         "summary": "Readiness witness (RFC 0049).",
-        "description": "Unauthenticated, and therefore minimal: it reports whether this replica\nis serving or draining, the applied `config_digest` it booted from, the\nledger revision and CAS it read, and registry/ready/blocked counts. Graph\nids stay behind authenticated catalog endpoints. Partial availability is\nready but degraded; no available graph or shutdown returns 503. A valid\nempty registry is ready. `/healthz` reports liveness independently.",
+        "description": "Unauthenticated, and therefore minimal: it reports whether this replica\nis serving or draining, the applied `config_digest` it booted from, the\nledger revision and CAS it read, and registry/ready/loading/blocked counts. Graph\nids stay behind authenticated catalog endpoints. Partial availability is\nready but degraded; no available graph or shutdown returns 503. A valid\nempty registry is ready. `/healthz` reports liveness independently.",
         "operationId": "readiness",
         "responses": {
           "200": {
@@ -8675,6 +8675,7 @@
       "GraphAvailability": {
         "type": "string",
         "enum": [
+          "loading",
           "ready",
           "transitioning",
           "blocked",
@@ -8685,6 +8686,7 @@
         "type": "string",
         "enum": [
           "none",
+          "wait_for_startup",
           "wait_for_transition",
           "restart_after_correction",
           "wait_for_restart"
@@ -8716,7 +8718,8 @@
           "mode",
           "nodes",
           "edges",
-          "total_entities"
+          "total_entities",
+          "embedding_generation"
         ],
         "properties": {
           "actor_id": {
@@ -8754,6 +8757,17 @@
               "$ref": "#/components/schemas/GraphBatchDeclarationOutput"
             },
             "description": "Logical edge declarations touched by this batch, sorted by name."
+          },
+          "embedding_generation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LoadEmbeddingGeneration",
+                "description": "`unsupported` when a loaded node type declares `@embed`, including\nwhen all vectors were supplied; `null` otherwise."
+              }
+            ]
           },
           "mode": {
             "$ref": "#/components/schemas/LoadMode"
@@ -8911,7 +8925,8 @@
           "mode",
           "nodes",
           "edges",
-          "total_entities"
+          "total_entities",
+          "embedding_generation"
         ],
         "properties": {
           "actor_id": {
@@ -8949,6 +8964,17 @@
               "$ref": "#/components/schemas/GraphBatchDeclarationOutput"
             },
             "description": "Logical edge declarations touched by this load, sorted by name."
+          },
+          "embedding_generation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LoadEmbeddingGeneration",
+                "description": "`unsupported` when a loaded node type declares `@embed`, including\nwhen all vectors were supplied; `null` otherwise."
+              }
+            ]
           },
           "mode": {
             "$ref": "#/components/schemas/LoadMode"
@@ -9098,6 +9124,13 @@
             "$ref": "#/components/schemas/ReadTargetOutput"
           }
         }
+      },
+      "LoadEmbeddingGeneration": {
+        "type": "string",
+        "description": "Load capability for a batch touching a node type with declared `@embed`.",
+        "enum": [
+          "unsupported"
+        ]
       },
       "LoadMode": {
         "type": "string",
@@ -9509,13 +9542,14 @@
           "state_revision",
           "served_graph_count",
           "ready_graph_count",
+          "loading_graph_count",
           "blocked_graph_count",
           "shutdown_grace_seconds"
         ],
         "properties": {
           "blocked_graph_count": {
             "type": "integer",
-            "description": "Registered graphs whose startup failed. `GET /graphs` names them.",
+            "description": "Unavailable graphs outside startup, including closed transitions.",
             "minimum": 0
           },
           "booted_serving_digest": {
@@ -9524,6 +9558,11 @@
               "null"
             ],
             "description": "The `config_digest` of the applied revision this process booted from.\nFixed for the life of the process: the server never reloads."
+          },
+          "loading_graph_count": {
+            "type": "integer",
+            "description": "Registered graphs waiting for their initial startup admission.",
+            "minimum": 0
           },
           "ready": {
             "type": "boolean",
@@ -9560,7 +9599,7 @@
           },
           "status": {
             "type": "string",
-            "description": "`serving`, `degraded`, `blocked` or `draining`."
+            "description": "`loading`, `serving`, `degraded`, `blocked` or `draining`."
           }
         }
       },

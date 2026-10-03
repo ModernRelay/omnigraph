@@ -3624,6 +3624,213 @@ async fn load_endpoint_loads_into_existing_branch() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn loads_report_unsupported_embedding_generation_without_changing_vectors() {
+    use futures::FutureExt;
+    use std::sync::atomic::AtomicUsize;
+
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    body: String
+    embedding: Vector(2)? @embed(body)
+}
+node RequiredDoc {
+    slug: String @key
+    body: String
+    embedding: Vector(2) @embed(body)
+}
+node Plain { slug: String @key }
+"#;
+    // Count every provider request independently of the load response, including
+    // unexpected paths. Positive controls prove that this endpoint is reachable
+    // and the real embedding client is using it throughout the load matrix.
+    let provider_requests = Arc::new(AtomicUsize::new(0));
+    let received = Arc::clone(&provider_requests);
+    let provider = axum::Router::new().fallback(move |request: Request<Body>| {
+        let received = Arc::clone(&received);
+        async move {
+            received.fetch_add(1, Ordering::SeqCst);
+            if to_bytes(request.into_body(), 4096).await.is_ok() {
+                (
+                    StatusCode::OK,
+                    axum::Json(json!({"data": [{"index": 0, "embedding": [1.0, 0.0]}]})),
+                )
+            } else {
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    axum::Json(
+                        json!({"error": {"message": "provider request body exceeded test bound"}}),
+                    ),
+                )
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let mut provider_tasks = tokio::task::JoinSet::new();
+    provider_tasks.spawn(async move {
+        axum::serve(listener, provider)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let config = omnigraph::embedding::EmbeddingConfig::from_parts(
+        Some("openai-compatible"),
+        Some(base_url),
+        Some("diagnostics-test".to_string()),
+        "diagnostics-key".to_string(),
+    )
+    .unwrap();
+    let client = omnigraph::embedding::EmbeddingClient::new(config.clone()).unwrap();
+    // Always signal and join the provider, including after an assertion panic or
+    // a stalled request; dropping JoinSet aborts it if graceful shutdown stalls.
+    let exercise = async {
+        assert_eq!(
+            client
+                .embed_document_text("positive control before loads", 2)
+                .await
+                .unwrap(),
+            vec![1.0, 0.0]
+        );
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
+        for path in ["/load", "/load/ndjson", "/ingest"] {
+            let temp = init_graph_with_schema(SCHEMA).await;
+            let graph = graph_path(temp.path());
+            let db = Omnigraph::open(graph.to_str().unwrap())
+                .await
+                .unwrap()
+                .with_embedding_config(Arc::new(config.clone()));
+            let app = build_app(AppState::new(graph.to_string_lossy().to_string(), db));
+            let request = |data: &str| {
+                if path == "/load/ndjson" {
+                    Request::builder()
+                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                        .uri(g("/load/ndjson?branch=main&mode=merge"))
+                        .method(Method::POST)
+                        .header("content-type", "application/x-ndjson")
+                        .body(Body::from(data.to_owned()))
+                        .unwrap()
+                } else {
+                    json_post(
+                        path,
+                        &json!({"branch": "main", "mode": "merge", "data": data}),
+                    )
+                }
+            };
+            let (status, body) = json_response(
+            &app,
+            request(concat!(
+                r#"{"type":"Doc","data":{"slug":"omitted","body":"missing vector"}}"#,
+                "\n",
+                r#"{"type":"Doc","data":{"slug":"supplied","body":"keep vector","embedding":[0.25,0.75]}}"#,
+            )),
+        )
+        .await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(body["embedding_generation"], "unsupported", "{path}");
+
+            let (status, body) = json_response(
+            &app,
+            json_post("/query", &json!({"query": "query docs() { match { $d: Doc } return { $d.slug, $d.embedding } order { $d.slug asc } }"})),
+        )
+        .await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(
+                body["rows"],
+                json!([
+                    {"d.slug": "omitted"},
+                    {"d.slug": "supplied", "d.embedding": [0.25, 0.75]},
+                ]),
+                "{path}"
+            );
+            // JSON query projection omits null cells. Independently verify the
+            // durable Arrow column so an omitted output key is not our null oracle.
+            let persisted = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+            let snapshot = persisted
+                .snapshot_of(ReadTarget::branch("main"))
+                .await
+                .unwrap();
+            let batches: Vec<_> = snapshot
+                .open_dataset("node:Doc")
+                .await
+                .unwrap()
+                .scan()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                2
+            );
+            assert_eq!(
+                batches
+                    .iter()
+                    .map(|batch| batch.column_by_name("embedding").unwrap().null_count())
+                    .sum::<usize>(),
+                1
+            );
+
+            // This is a capability diagnostic, even when every vector is supplied.
+            let (status, body) = json_response(
+            &app,
+            request(r#"{"type":"Doc","data":{"slug":"all-supplied","body":"also keep","embedding":[1,0]}}"#),
+        )
+        .await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(body["embedding_generation"], "unsupported", "{path}");
+
+            let (status, body) = json_response(
+                &app,
+                request(
+                    r#"{"type":"RequiredDoc","data":{"slug":"missing","body":"requires vector"}}"#,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+            let (status, body) =
+                json_response(&app, request(r#"{"type":"Plain","data":{"slug":"plain"}}"#)).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(
+                body.get("embedding_generation"),
+                Some(&Value::Null),
+                "{path}"
+            );
+            assert_eq!(
+                provider_requests.load(Ordering::SeqCst),
+                1,
+                "{path} must not call the embedding provider"
+            );
+        }
+        assert_eq!(
+            client
+                .embed_document_text("positive control after loads", 2)
+                .await
+                .unwrap(),
+            vec![1.0, 0.0]
+        );
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 2);
+    };
+    let exercise = std::panic::AssertUnwindSafe(exercise).catch_unwind();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), exercise).await;
+    let _ = shutdown.send(());
+    tokio::time::timeout(Duration::from_secs(2), provider_tasks.join_next())
+        .await
+        .expect("embedding provider shutdown timed out")
+        .expect("embedding provider task exists")
+        .expect("embedding provider task panicked")
+        .expect("embedding provider server failed");
+    if let Err(panic) = outcome.expect("embedding load matrix timed out") {
+        std::panic::resume_unwind(panic);
+    }
+    assert_eq!(provider_requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn raw_graph_batch_load_publishes_mixed_declarations_in_one_commit() {
     let (temp, app) = app_for_loaded_graph().await;
     let graph = graph_path(temp.path());
@@ -6020,7 +6227,41 @@ async fn change_routes_report_a_missing_branch_without_storage_detail() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn change_feed_poll_advances_cursor_only_after_complete_commits() {
-    let (_temp, app) = app_for_loaded_graph().await;
+    let schema = r#"
+node Document {
+    title: String @key
+    body: String?
+    content: Blob?
+}
+"#;
+    // A real changed row exceeds the HTTP feed's default packing target;
+    // both images and managed-Blob base64 must remain complete. The engine's
+    // issue_705 tests separately own the wider-than-sort-cap scan regression.
+    let before_body = "x".repeat(4 * 1024 * 1024 + 1);
+    let after_body = "y".repeat(before_body.len());
+    let before_blob = repeated_zero_blob_input(64 * 1024 + 1);
+    let after_blob = repeated_zero_blob_input(64 * 1024 + 2);
+    let row = |title: &str, body: &str, content: Option<&str>| {
+        json!({"type": "Document", "data": {
+            "title": title, "body": body, "content": content,
+        }})
+        .to_string()
+    };
+    let temp = init_graph_with_schema_and_data(
+        schema,
+        &[
+            row("A-small", "before", None),
+            row("B-wide", &before_body, Some(&before_blob)),
+            row("C-tail", "before", None),
+        ]
+        .join("\n"),
+    )
+    .await;
+    let state = AppState::open(graph_path(temp.path()).to_string_lossy().to_string())
+        .await
+        .unwrap();
+    let view = state.routing().registry.list().pop().unwrap();
+    let app = build_app(state.clone());
 
     // `start=now` captures the head: no replay, a caught-up durable cursor.
     let (status, now) = get_json(&app, g("/changes?start=now")).await;
@@ -6031,31 +6272,143 @@ async fn change_feed_poll_advances_cursor_only_after_complete_commits() {
 
     let commit_id = load_commit(
         &app,
-        concat!(
-            r#"{"type":"Person","data":{"name":"Feed A","age":1}}"#,
-            "\n",
-            r#"{"type":"Person","data":{"name":"Feed B","age":2}}"#,
-        ),
+        &[
+            row("A-small", "after", None),
+            row("B-wide", &after_body, Some(&after_blob)),
+            row("C-tail", "after", None),
+        ]
+        .join("\n"),
     )
     .await;
 
-    // A mid-block page carries only a page token — no cursor to checkpoint.
-    let (status, partial) = get_json(&app, g(&format!("/changes?cursor={c0}&limit=1"))).await;
+    // Bytes, not the row limit, split this commit. An initial small change
+    // leaves positive space but cannot grant the wide change a second page's
+    // solo-overflow allowance. No mid-block cursor is safe to checkpoint.
+    let (status, partial) = get_json(&app, g(&format!("/changes?cursor={c0}&limit=100"))).await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(partial["blocks"].as_array().unwrap().len(), 1);
+    assert_eq!(partial["blocks"][0]["changes"].as_array().unwrap().len(), 1);
     assert_eq!(
         partial["blocks"][0]["cause"]["graph_commit_id"],
         commit_id.as_str()
     );
-    assert_eq!(partial["blocks"][0]["changes"][0]["id"], "Feed A");
+    assert_eq!(partial["blocks"][0]["changes"][0]["id"], "A-small");
+    assert_eq!(partial["blocks"][0]["changes"][0]["op"], "update");
     assert!(partial["cursor"].is_null(), "no durable cursor mid-block");
     let token = partial["next_page_token"].as_str().expect("page token");
+    assert!(token.len() <= 4 * 1024);
 
-    let (status, resumed) = get_json(&app, g(&format!("/changes?page_token={token}"))).await;
+    // A later commit cannot enter this page token's captured cut. It must be
+    // reached by the next durable-cursor poll after the original block ends.
+    let sentinel_commit = load_commit(&app, &row("D-sentinel", "later", None)).await;
+
+    let wide_uri = g(&format!("/changes?page_token={token}"));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .uri(&wide_uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let transition = state
+        .prepare_same_view(
+            &view.key,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap()
+        .close()
+        .unwrap();
+    {
+        let wait = transition.wait_requests();
+        tokio::pin!(wait);
+        assert!(
+            futures::poll!(&mut wait).is_pending(),
+            "unpolled wide response owns the graph"
+        );
+        let mut stream = response.into_body().into_data_stream();
+        let chunk = stream.try_next().await.unwrap().expect("wide feed page");
+        assert!(!chunk.is_empty());
+        let retained = chunk.slice(..1);
+        drop(chunk);
+        drop(stream);
+        assert!(
+            futures::poll!(&mut wait).is_pending(),
+            "a yielded byte slice still owns the abandoned response"
+        );
+        drop(retained);
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert_ne!(transition.resume_same_view().unwrap(), view.epoch());
+    let resumed_view = state.routing().registry.list().pop().unwrap();
+    assert!(Arc::ptr_eq(resumed_view.handle(), view.handle()));
+
+    // Abandoning delivery does not advance a checkpoint. Replaying its exact
+    // token returns the complete wide change again, then continuation visits
+    // every authored change exactly once in the completed checkpoint walk.
+    let (status, resumed) = get_json(&app, wide_uri).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(resumed["blocks"][0]["changes"][0]["id"], "Feed B");
-    let c1 = resumed["cursor"].as_str().expect("boundary cursor");
+    assert_eq!(resumed["blocks"].as_array().unwrap().len(), 1);
+    assert_eq!(resumed["blocks"][0]["changes"].as_array().unwrap().len(), 1);
+    assert_eq!(resumed["blocks"][0]["cause"]["graph_commit_id"], commit_id);
+    let wide = &resumed["blocks"][0]["changes"][0];
+    assert_eq!(wide["id"], "B-wide");
+    assert_eq!(wide["op"], "update");
+    assert_eq!(wide["before"]["properties"]["body"], before_body);
+    assert_eq!(wide["after"]["properties"]["body"], after_body);
+    assert_eq!(wide["before"]["properties"]["content"], before_blob);
+    assert_eq!(wide["after"]["properties"]["content"], after_blob);
+    assert!(
+        serde_json::to_vec(wide).unwrap().len()
+            > omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES as usize
+    );
+    assert!(resumed["cursor"].is_null());
+    let token = resumed["next_page_token"]
+        .as_str()
+        .expect("tail page token");
+    assert!(token.len() <= 4 * 1024);
 
-    let (status, caught_up) = get_json(&app, g(&format!("/changes?cursor={c1}"))).await;
+    let (status, tail) = get_json(&app, g(&format!("/changes?page_token={token}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tail["blocks"].as_array().unwrap().len(), 1);
+    assert_eq!(tail["blocks"][0]["changes"].as_array().unwrap().len(), 1);
+    assert_eq!(tail["blocks"][0]["cause"]["graph_commit_id"], commit_id);
+    assert_eq!(tail["blocks"][0]["changes"][0]["id"], "C-tail");
+    assert_eq!(tail["blocks"][0]["changes"][0]["op"], "update");
+    assert!(tail["next_page_token"].is_null());
+    assert_eq!(
+        tail["caught_up"], false,
+        "later commit remains outside the cut"
+    );
+    let c1 = tail["cursor"].as_str().expect("boundary cursor");
+
+    let (status, sentinel) = get_json(&app, g(&format!("/changes?cursor={c1}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(sentinel["blocks"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        sentinel["blocks"][0]["changes"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        sentinel["blocks"][0]["cause"]["graph_commit_id"],
+        sentinel_commit
+    );
+    assert_eq!(sentinel["blocks"][0]["changes"][0]["id"], "D-sentinel");
+    assert_eq!(sentinel["blocks"][0]["changes"][0]["op"], "insert");
+    assert!(sentinel["next_page_token"].is_null());
+    assert_eq!(sentinel["caught_up"], true);
+    let c2 = sentinel["cursor"]
+        .as_str()
+        .expect("sentinel boundary cursor");
+
+    let (status, caught_up) = get_json(&app, g(&format!("/changes?cursor={c2}"))).await;
     assert_eq!(status, StatusCode::OK);
     assert!(caught_up["blocks"].as_array().unwrap().is_empty());
     assert_eq!(caught_up["caught_up"], true);

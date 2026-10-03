@@ -71,7 +71,7 @@ immutable snapshot/catalog without reopening. Request-independent write owners,
 query-worker joins and named aggregate write limits have landed; native-I/O
 settlement and comprehensive resource bounds remain unqualified. Registry and
 stored queries are built at boot, and cluster-backed schema apply still requires
-restart. The registry retains ready and blocked startup outcomes, with authorized
+restart. The registry retains loading, ready and blocked startup entries, with authorized
 availability and aggregate readiness. The implemented per-graph transition
 foundation atomically captures serving views and leases and can resume the exact
 same view under a fresh epoch. Schema/query replacement, online activation and
@@ -637,7 +637,7 @@ read catalogs do not alone prove E1's request-binding or reclamation safety.
 ## Availability and supervision
 
 Keep liveness separate from readiness. The implemented registry retains actual
-startup outcomes as ready or blocked entries. A closed same-view transition
+startup as loading entries, then ready or blocked outcomes. A closed same-view transition
 projects its graph as `transitioning` with action `wait_for_transition`; shutdown
 projects all entries as stopping. Transitioning graphs count as unavailable in
 readiness and retain the existing authorized-unavailability disclosure rule.
@@ -648,11 +648,21 @@ list. Credential graph scope precedes resolution. Unavailable graphs disclose 50
 only to graph-read or management-inventory authorized callers; an invalid graph
 policy or configuration cannot authorize read disclosure. Other callers cannot
 discover them through that distinction. Registry membership and availability are distinct
-facts: `served_graph_count` counts registry entries; readiness also reports ready
-and blocked counts. An empty valid inventory is ready; shutdown is unready.
-The listener still starts after graph opening, and nonempty startup still
-requires a healthy graph. Loading/deploying states and bounded transient retries
-remain gated implementation work. No historical-only readiness mode is introduced.
+facts: `served_graph_count` counts registry entries; readiness also reports ready,
+loading and blocked counts. Closed transitions count as blocked. An empty valid
+inventory is ready; shutdown is unready. The listener starts after fixed identity,
+trust, admission and policy validation, before graph opening. One process-owned
+startup batch opens at most four graphs concurrently without retry or cancellation
+timeout. Loading graphs return authorized 503 with action `wait_for_startup` and
+no retry promise; health remains live and readiness is `loading` until one graph
+is ready. Default startup admits each successful graph immediately.
+`--require-all-graphs` admits the successful batch atomically only after every
+graph succeeds. Strict failure or a nonempty, entirely failed batch stops the
+server. Shutdown retains entered opens and fences late installation through the
+same process/registry boundary. Policies are captured once before listening.
+Deploying states and bounded transient retries remain gated implementation work.
+This logical startup owner supplies no native-settlement or reuse proof.
+No historical-only readiness mode is introduced.
 
 Keep boot revision/digest as boot facts. E0 records achieved deployment results
 behind authorized lookup and creates no active witness. E1's future active
@@ -675,10 +685,13 @@ Supervisor `Retry-After` requires a finite scheduled retry; admission 429 may gi
 caller-backoff guidance without scheduling work. Neither header authorizes write
 replay. A timer alone is not recovery progress.
 
-Declared `@embed` configuration must not silently imply population occurred:
-report the load/capability limitation without treating a successful nullable load
-as failed. Supplied vectors remain unchanged; omitted vectors follow schema
-nullability, and ingestion does not call the provider. Automatic embedding remains owned by
+Declared `@embed` configuration does not imply population occurred. HTTP JSON,
+NDJSON and deprecated ingest results and CLI JSON now carry the required nullable
+`embedding_generation` capability: `unsupported` when a loaded node declaration
+has `@embed`, including when all vectors were supplied, and `null` otherwise.
+Human CLI output provides actionable guidance. A successful nullable load remains
+successful; supplied vectors remain unchanged, omissions follow schema nullability,
+and ingestion does not call the provider. Automatic embedding remains owned by
 [Ingest-time embedding reconciliation](0015-ingest-embeddings.md).
 
 ## Invariants
@@ -726,7 +739,7 @@ Offline apply retains its stopped-writer wrapper procedure.
 The v0.12 OpenAPI, CLI contract, user guidance and tests ship together. Document
 intentional breaks: structured deletion errors replace the string alias; one
 inventory includes unavailable graphs without a `quarantined` alias;
-`served_graph_count` includes those entries, with separate ready/blocked counts.
+`served_graph_count` includes those entries, with separate ready/loading/blocked counts.
 Known unavailable graphs use 503, unknown graphs 404, with
 authorization/disclosure rules intact. Generic 503 is not retry
 permission. There is no promise to preserve older wire fields or exit behavior.
@@ -761,6 +774,27 @@ server controls. Keep T/B identifiers stable, with these acceptance obligations:
 | T9 | Concurrent new submission refuses while one revision is pending, including across restart. Settled partial/inactive D1 permits corrective D2; stale-base submission refuses without effects; original lookup never replays. E0 additionally proves strict numeric publication/fence races and durable exclusive admission through recovery. |
 | T10 | Declared bounds and completion/status reserves hold under saturation, slow/abandoned consumers and repeated failed deployments; reconcile counters with independent allocation/lifetime evidence. |
 | T11 | Wide-feed progress, explicit ingestion-embedding diagnostics and bounded authorized status; unavailable 503 versus unknown 404, correct disclosure, liveness/readiness, bounded transient startup retries and permanent policy refusals. |
+
+T11.feed extends `data_routes::change_feed_poll_advances_cursor_only_after_complete_commits`
+with an actually updated row over 4 MiB, complete managed-Blob before/after
+encoding, byte-driven continuation and a later sentinel commit. It checks that
+an abandoned response and yielded byte slice retain the serving view, and that
+replaying its page token delivers the same logical change before a completed
+checkpoint advances. This HTTP evidence complements the sort-cap and sliced-parent
+engine regressions in [PR #843](https://github.com/ModernRelay/omnigraph/pull/843);
+it does not itself qualify that scan repair, native settlement, RSS bounds or
+provider request counts.
+
+The embedding diagnostic has focused HTTP regression coverage in `data_routes`
+with a counted OpenAI-compatible endpoint, successful embedding calls before and
+after the load matrix, and zero provider requests attributable to loads. The
+same test checks exact supplied vectors, durable Arrow nulls, required-vector
+refusal and unannotated loads; `parity_matrix` covers CLI load/ingest output.
+T11.embed remains incomplete: [RFC 0045](0045-gq-logic-tests.md)
+explicitly excludes `@embed` schemas, and GQT has no load step with outcome
+expectations. Setup-only seed loading cannot supply that evidence. Changing
+those accepted format boundaries requires its own decision; this work adds no
+GQT protocol, native-lifetime or automatic-generation qualification.
 
 E0 qualification extends engine `schema_apply.rs` and `detached_commit_matrix.rs`,
 cluster lifecycle/failpoint tests, and CLI cluster lifecycle/system journeys. Prove
@@ -853,7 +887,7 @@ serving-view qualification.
 | A | A1 v0.12 HTTP admission; A2 own-publication merge receipts; A3 CLI outcomes | A1 follows [its accepted decision](2026-09-30-v012-http-admission.md); A2 is qualified under [Exact merge receipts](2026-09-30-exact-merge-receipts.md), including T1/T2; A3's initial typed-429 and qualified-HTTP-412 contract is qualified under [Owned server operations](2026-09-30-owned-server-operations.md) |
 | B | Owned writes, read/stream accounting, drain and shared shutdown | [Owned server operations](2026-09-30-owned-server-operations.md) qualifies the task/body foundation. [Engine settlement and resource bounds](2026-10-01-engine-settlement-and-resource-bounds.md) is accepted and partially implements query-child ownership and named aggregate write limits. Native settlement, completion reserves and runtime reuse remain unqualified under its T6/T10 gates. |
 | C | Remaining initialization/native-control completion, owned maintenance and bounded transient startup retry | Atomic schema publication is landed; T4/T6/T7/T11 retain same-process progress and protected reclamation |
-| D | Aggregate budgets, feed progress and embedding diagnostics | T10–T11 and workload qualification |
+| D | Aggregate budgets and feed progress; embedding diagnostics implemented | T10–T11 and workload qualification, including the remaining T11.embed evidence above |
 | E0 | Durable offline schema/query execution and exact recovery | Implemented in PR #849; qualification is limited to the [recorded evidence](#e0-implementation-evidence), with backend-specific gates retained. |
 | E1 | Same-engine schema/query activation with one outstanding deployment | Qualified E1 transition proof, relevant B/C/D ownership and bounds, T8.live/T9 and durable ledger/crash gates; generic reuse still requires full B; Azure separately gated |
 
@@ -892,6 +926,23 @@ Before enabling an affected increment, its owners must implement and qualify:
    cluster roots to v13 before rollout, under the storage-upgrade owner.
 
 ## Decision log
+
+- 2026-10-03: Extended T11.feed's existing HTTP continuation owner with a changed
+  wide row, managed-Blob images and abandoned-delivery ownership/replay. The
+  Qualification section distinguishes this transport evidence from the engine
+  sort repair and remaining resource/native qualification.
+
+- 2026-10-03: Implemented explicit load embedding capability diagnostics across
+  HTTP and CLI output. Availability and Rollout record the implementation;
+  Qualification records independent provider-request evidence and retains
+  T11.embed's GQT format gate. Nullable loads remain successful and automatic
+  generation stays outside scope.
+
+- 2026-10-03: Implemented early listener and initial loading visibility. One owned
+  batch retains at most four concurrent opens through shutdown; captured policy
+  and loading-entry identity fence completion. Strict startup admits all graphs
+  atomically, while default startup exposes ready siblings. Updated Scope and
+  Availability; startup retries and native qualification remain unavailable.
 
 - 2026-10-03: Implemented per-graph serving leases and bounded same-view
   transitions. Scope and baseline replaces the foundation-only availability

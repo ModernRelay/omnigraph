@@ -966,6 +966,7 @@ impl GraphClient {
                     branch,
                     mode.as_str(),
                     &receipt,
+                    &session.catalog(),
                 ))
             }
         }
@@ -1020,7 +1021,13 @@ impl GraphClient {
                         actor.as_deref(),
                     )
                     .await?;
-                Ok(ingest_receipt_output(uri, &receipt, mode.into(), None))
+                Ok(ingest_receipt_output(
+                    uri,
+                    &receipt,
+                    &session.catalog(),
+                    mode.into(),
+                    None,
+                ))
             }
         }
     }

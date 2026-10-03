@@ -30,6 +30,9 @@ struct Inner {
 #[derive(Default)]
 struct State {
     closed: bool,
+    startup_started: bool,
+    active_startup: bool,
+    startup_uncertain: bool,
     active_writes: usize,
     active_reads: usize,
     active_write_responses: usize,
@@ -41,6 +44,8 @@ struct State {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OperationSnapshot {
     pub closed: bool,
+    pub active_startup: bool,
+    pub startup_uncertain: bool,
     pub active_writes: usize,
     pub active_reads: usize,
     pub active_write_responses: usize,
@@ -78,11 +83,39 @@ impl OperationRuntime {
         let state = locked(&self.inner.state);
         OperationSnapshot {
             closed: state.closed,
+            active_startup: state.active_startup,
+            startup_uncertain: state.startup_uncertain,
             active_writes: state.active_writes,
             active_reads: state.active_reads,
             active_write_responses: state.active_write_responses,
             uncertain_writes: state.uncertain.len(),
         }
+    }
+
+    /// The process has one initial startup batch, independent of HTTP lane
+    /// capacity. Its owner must survive listener failure and shutdown.
+    pub(crate) fn own_startup(&self) -> Result<StartupOwner, ApiError> {
+        let mut state = locked(&self.inner.state);
+        if state.closed {
+            return Err(ApiError::admission_closed());
+        }
+        if state.startup_started {
+            return Err(ApiError::internal("server startup already started"));
+        }
+        state.startup_started = true;
+        state.active_startup = true;
+        Ok(StartupOwner {
+            inner: Arc::clone(&self.inner),
+            finished: false,
+        })
+    }
+
+    pub(crate) fn contain_startup(&self) {
+        let mut state = locked(&self.inner.state);
+        state.startup_uncertain = true;
+        state.closed = true;
+        drop(state);
+        self.inner.changed.notify_waiters();
     }
 
     /// Serialize synchronous graph admission/transition against process closure.
@@ -148,11 +181,12 @@ impl OperationRuntime {
             tokio::pin!(changed);
             changed.as_mut().enable();
             let snapshot = self.snapshot();
-            if snapshot.active_writes == 0
+            if !snapshot.active_startup
+                && snapshot.active_writes == 0
                 && snapshot.active_reads == 0
                 && snapshot.active_write_responses == 0
             {
-                return snapshot.uncertain_writes == 0;
+                return !snapshot.startup_uncertain && snapshot.uncertain_writes == 0;
             }
             changed.await;
         }
@@ -178,7 +212,8 @@ impl OperationRuntime {
             let changed = self.inner.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if self.snapshot().uncertain_writes != 0 {
+            let snapshot = self.snapshot();
+            if snapshot.startup_uncertain || snapshot.uncertain_writes != 0 {
                 return;
             }
             changed.await;
@@ -238,6 +273,32 @@ impl OperationRuntime {
             .in_current_span(),
         );
         Ok(OwnedResponse(receiver))
+    }
+}
+
+pub(crate) struct StartupOwner {
+    inner: Arc<Inner>,
+    finished: bool,
+}
+
+impl StartupOwner {
+    pub(crate) fn finish(mut self) {
+        self.finished = true;
+        locked(&self.inner.state).active_startup = false;
+        self.inner.changed.notify_waiters();
+    }
+}
+
+impl Drop for StartupOwner {
+    fn drop(&mut self) {
+        if !self.finished {
+            let mut state = locked(&self.inner.state);
+            state.active_startup = false;
+            state.startup_uncertain = true;
+            state.closed = true;
+            drop(state);
+            self.inner.changed.notify_waiters();
+        }
     }
 }
 
@@ -630,6 +691,8 @@ mod tests {
     #[tokio::test]
     async fn uncertainty_waits_for_other_logical_owners_before_nonclean_completion() {
         let runtime = OperationRuntime::new();
+        let startup = runtime.own_startup().unwrap();
+        assert!(runtime.own_startup().is_err(), "startup cannot be replayed");
         let releases = Arc::new(AtomicUsize::new(0));
         let (release, held) = oneshot::channel();
         let healthy = runtime
@@ -649,8 +712,26 @@ mod tests {
         assert!(futures::poll!(&mut wait).is_pending());
         release.send(()).unwrap();
         healthy.result().await.unwrap();
+        assert!(
+            futures::poll!(&mut wait).is_pending(),
+            "startup is still owned"
+        );
+        startup.finish();
         assert!(!wait.await);
         assert_eq!(releases.load(Ordering::SeqCst), 1);
+        let abandoned = OperationRuntime::new();
+        drop(abandoned.own_startup().unwrap());
+        assert!(abandoned.snapshot().closed);
+        assert!(abandoned.snapshot().startup_uncertain);
+        assert!(!abandoned.wait_logical_owners().await);
+        abandoned.fatal().await;
+        let completed = OperationRuntime::new();
+        completed.own_startup().unwrap().finish();
+        assert!(completed.wait_logical_owners().await);
+        assert!(
+            completed.own_startup().is_err(),
+            "completion does not enable reopening"
+        );
         assert_eq!(runtime.snapshot().uncertain_writes, 1);
     }
 

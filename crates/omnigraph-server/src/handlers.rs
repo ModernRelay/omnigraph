@@ -72,7 +72,7 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
 ///
 /// Unauthenticated, and therefore minimal: it reports whether this replica
 /// is serving or draining, the applied `config_digest` it booted from, the
-/// ledger revision and CAS it read, and registry/ready/blocked counts. Graph
+/// ledger revision and CAS it read, and registry/ready/loading/blocked counts. Graph
 /// ids stay behind authenticated catalog endpoints. Partial availability is
 /// ready but degraded; no available graph or shutdown returns 503. A valid
 /// empty registry is ready. `/healthz` reports liveness independently.
@@ -97,15 +97,21 @@ pub(crate) async fn server_ready(
         .iter()
         .filter(|entry| matches!(entry, GraphEntry::Ready(_)))
         .count();
-    let blocked_graph_count = served_graph_count - ready_graph_count;
+    let loading_graph_count = entries
+        .iter()
+        .filter(|entry| matches!(entry, GraphEntry::Loading(_)))
+        .count();
+    let blocked_graph_count = served_graph_count - ready_graph_count - loading_graph_count;
     let ready = !draining && (served_graph_count == 0 || ready_graph_count > 0);
     let output = ReadinessOutput {
         ready,
         status: if draining {
             "draining"
+        } else if !ready && loading_graph_count > 0 {
+            "loading"
         } else if !ready {
             "blocked"
-        } else if blocked_graph_count > 0 {
+        } else if blocked_graph_count > 0 || loading_graph_count > 0 {
             "degraded"
         } else {
             "serving"
@@ -116,6 +122,7 @@ pub(crate) async fn server_ready(
         state_cas: state.witness.state_cas.clone(),
         served_graph_count,
         ready_graph_count,
+        loading_graph_count,
         blocked_graph_count,
         shutdown_grace_seconds: state.shutdown_grace.as_secs(),
     };
@@ -184,7 +191,9 @@ pub(crate) async fn server_graphs_list(
         .filter(|entry| may_list(entry.key().graph_id.as_str()))
         .map(|entry| {
             let failure = match &entry {
-                GraphEntry::Ready(_) | GraphEntry::Transitioning(_) => None,
+                GraphEntry::Loading(_) | GraphEntry::Ready(_) | GraphEntry::Transitioning(_) => {
+                    None
+                }
                 GraphEntry::Blocked(graph) => Some(graph.failure),
             };
             let available = !stopping && matches!(entry, GraphEntry::Ready(_));
@@ -195,6 +204,7 @@ pub(crate) async fn server_graphs_list(
                     GraphAvailability::Stopping
                 } else {
                     match &entry {
+                        GraphEntry::Loading(_) => GraphAvailability::Loading,
                         GraphEntry::Ready(_) => GraphAvailability::Ready,
                         GraphEntry::Transitioning(_) => GraphAvailability::Transitioning,
                         GraphEntry::Blocked(_) => GraphAvailability::Blocked,
@@ -207,6 +217,7 @@ pub(crate) async fn server_graphs_list(
                     GraphAvailabilityAction::WaitForRestart
                 } else {
                     match &entry {
+                        GraphEntry::Loading(_) => GraphAvailabilityAction::WaitForStartup,
                         GraphEntry::Ready(_) => GraphAvailabilityAction::None,
                         GraphEntry::Transitioning(_) => GraphAvailabilityAction::WaitForTransition,
                         GraphEntry::Blocked(_) => GraphAvailabilityAction::RestartAfterCorrection,
@@ -499,6 +510,11 @@ pub(crate) fn resolve_registered_graph(
 ) -> std::result::Result<GraphRequest, ApiError> {
     let (policy, invalid_policy, message) =
         match state.routing().registry.capture(&state.operations, key)? {
+            RegistryCapture::Loading(graph) => (
+                graph.policy.clone(),
+                false,
+                "graph is loading; wait for its startup attempt to complete",
+            ),
             RegistryCapture::Ready(handle) => return Ok(handle),
             RegistryCapture::Gone => return Err(ApiError::not_found("graph not found")),
             RegistryCapture::Transitioning(view) => (
@@ -2283,6 +2299,7 @@ async fn run_ingest(
         Ok(ingest_receipt_output(
             handle.uri.as_str(),
             &receipt,
+            &session.catalog(),
             mode,
             actor_id,
         ))
@@ -2486,7 +2503,10 @@ pub(crate) async fn server_load_ndjson(
             .await
             .map_err(ApiError::from_omni)?;
         Ok(Json(graph_batch_load_receipt_output(
-            &receipt, mode, actor_id,
+            &receipt,
+            &session.catalog(),
+            mode,
+            actor_id,
         )))
     })
     .await

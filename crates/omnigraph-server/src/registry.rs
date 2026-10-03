@@ -54,8 +54,17 @@ pub struct BlockedGraph {
     pub failure: StartupFailure,
 }
 
+/// Captured startup identity and disclosure policy, before an engine exists.
+/// Its Arc identity also fences the sole startup completion for this entry.
+pub struct LoadingGraph {
+    pub key: GraphKey,
+    pub uri: String,
+    pub policy: Option<Arc<PolicyEngine>>,
+}
+
 #[derive(Clone)]
 pub enum GraphEntry {
+    Loading(Arc<LoadingGraph>),
     Ready(Arc<ServingView>),
     Transitioning(Arc<ServingView>),
     Blocked(Arc<BlockedGraph>),
@@ -69,6 +78,7 @@ impl GraphEntry {
 
     pub fn key(&self) -> &GraphKey {
         match self {
+            Self::Loading(graph) => &graph.key,
             Self::Ready(view) | Self::Transitioning(view) => &view.key,
             Self::Blocked(graph) => &graph.key,
         }
@@ -76,6 +86,7 @@ impl GraphEntry {
 
     pub fn uri(&self) -> &str {
         match self {
+            Self::Loading(graph) => &graph.uri,
             Self::Ready(view) | Self::Transitioning(view) => &view.uri,
             Self::Blocked(graph) => &graph.uri,
         }
@@ -83,6 +94,7 @@ impl GraphEntry {
 
     pub fn policy(&self) -> Option<&Arc<PolicyEngine>> {
         match self {
+            Self::Loading(graph) => graph.policy.as_ref(),
             Self::Ready(view) | Self::Transitioning(view) => view.policy.as_ref(),
             Self::Blocked(graph) => graph.policy.as_ref(),
         }
@@ -120,6 +132,7 @@ impl Default for RegistrySnapshot {
 /// Introspection only. Ready views do not admit requests or allow a caller to
 /// resume a closed epoch.
 pub enum RegistryLookup {
+    Loading(Arc<LoadingGraph>),
     Ready(Arc<ServingView>),
     Transitioning(Arc<ServingView>),
     Blocked(Arc<BlockedGraph>),
@@ -129,6 +142,7 @@ pub enum RegistryLookup {
 /// Coherent request capture, including the effective bindings required to
 /// authorize disclosure of an unavailable graph.
 pub(crate) enum RegistryCapture {
+    Loading(Arc<LoadingGraph>),
     Ready(GraphRequest),
     Transitioning(Arc<ServingView>),
     Blocked(Arc<BlockedGraph>),
@@ -204,6 +218,7 @@ impl GraphRegistry {
 
     pub fn get(&self, key: &GraphKey) -> RegistryLookup {
         match self.snapshot_ref().graphs.get(key) {
+            Some(GraphEntry::Loading(graph)) => RegistryLookup::Loading(Arc::clone(graph)),
             Some(GraphEntry::Ready(view)) => RegistryLookup::Ready(Arc::clone(view)),
             Some(GraphEntry::Transitioning(view)) => {
                 RegistryLookup::Transitioning(Arc::clone(view))
@@ -219,7 +234,9 @@ impl GraphRegistry {
             .values()
             .filter_map(|entry| match entry {
                 GraphEntry::Ready(view) => Some(Arc::clone(view)),
-                GraphEntry::Transitioning(_) | GraphEntry::Blocked(_) => None,
+                GraphEntry::Loading(_) | GraphEntry::Transitioning(_) | GraphEntry::Blocked(_) => {
+                    None
+                }
             })
             .collect()
     }
@@ -246,6 +263,7 @@ impl GraphRegistry {
         operations.while_open(|| {
             let state = locked(&self.state);
             Ok(match state.snapshot.graphs.get(key) {
+                Some(GraphEntry::Loading(graph)) => RegistryCapture::Loading(Arc::clone(graph)),
                 Some(GraphEntry::Ready(view)) => RegistryCapture::Ready(view.capture()?),
                 Some(GraphEntry::Transitioning(view)) => {
                     RegistryCapture::Transitioning(Arc::clone(view))
@@ -253,6 +271,34 @@ impl GraphRegistry {
                 Some(GraphEntry::Blocked(graph)) => RegistryCapture::Blocked(Arc::clone(graph)),
                 None => RegistryCapture::Gone,
             })
+        })
+    }
+
+    /// Install one startup result, or the complete strict-startup batch. The
+    /// process boundary fences shutdown; the captured entry fences stale work.
+    pub(crate) fn complete_startup(
+        &self,
+        operations: &OperationRuntime,
+        results: Vec<(Arc<LoadingGraph>, GraphEntry)>,
+    ) -> Result<(), ApiError> {
+        operations.while_open(|| {
+            let mut state = locked(&self.state);
+            for (pending, result) in &results {
+                if !matches!(state.snapshot.graphs.get(&pending.key),
+                    Some(GraphEntry::Loading(current)) if Arc::ptr_eq(current, pending))
+                    || result.key() != &pending.key
+                    || result.uri() != pending.uri
+                    || !matches!(result, GraphEntry::Ready(_) | GraphEntry::Blocked(_))
+                {
+                    return Err(ApiError::internal("stale graph startup completion"));
+                }
+            }
+            let mut graphs = state.snapshot.graphs.clone();
+            for (pending, result) in results {
+                graphs.insert(pending.key.clone(), result);
+            }
+            state.snapshot = Arc::new(RegistrySnapshot::new(graphs));
+            Ok(())
         })
     }
 
@@ -274,7 +320,9 @@ impl GraphRegistry {
             }
             let predecessor = match state.snapshot.graphs.get(key) {
                 Some(GraphEntry::Ready(view)) => Arc::clone(view),
-                Some(GraphEntry::Transitioning(_) | GraphEntry::Blocked(_)) => {
+                Some(
+                    GraphEntry::Loading(_) | GraphEntry::Transitioning(_) | GraphEntry::Blocked(_),
+                ) => {
                     return Err(ServingTransitionError::Unavailable);
                 }
                 None => return Err(ServingTransitionError::Gone),
@@ -412,6 +460,21 @@ fn validate_candidate(
 
 fn canonicalize_entry_uri(entry: GraphEntry) -> Result<GraphEntry, InsertError> {
     match entry {
+        GraphEntry::Loading(graph) => {
+            let uri = normalize_root_uri(&graph.uri).map_err(|err| InsertError::InvalidUri {
+                uri: graph.uri.clone(),
+                message: err.to_string(),
+            })?;
+            if uri == graph.uri {
+                Ok(GraphEntry::Loading(graph))
+            } else {
+                Ok(GraphEntry::Loading(Arc::new(LoadingGraph {
+                    key: graph.key.clone(),
+                    uri,
+                    policy: graph.policy.clone(),
+                })))
+            }
+        }
         GraphEntry::Ready(view) => {
             let (_, handle) = canonicalize_handle_uri(Arc::clone(view.handle()))?;
             if Arc::ptr_eq(&handle, view.handle()) {
@@ -511,6 +574,7 @@ mod tests {
                 assert!(Arc::ptr_eq(found.handle(), &handle));
             }
             RegistryLookup::Gone
+            | RegistryLookup::Loading(_)
             | RegistryLookup::Blocked(_)
             | RegistryLookup::Transitioning(_) => panic!("expected Ready"),
         }
@@ -523,6 +587,7 @@ mod tests {
         match registry.get(&key) {
             RegistryLookup::Gone => {}
             RegistryLookup::Ready(_)
+            | RegistryLookup::Loading(_)
             | RegistryLookup::Blocked(_)
             | RegistryLookup::Transitioning(_) => panic!("expected Gone"),
         }
@@ -624,7 +689,10 @@ mod tests {
                 assert!(found.policy.is_none());
                 assert_eq!(found.uri, normalize_root_uri(&blocked.uri).unwrap());
             }
-            RegistryLookup::Ready(_) | RegistryLookup::Gone | RegistryLookup::Transitioning(_) => {
+            RegistryLookup::Ready(_)
+            | RegistryLookup::Loading(_)
+            | RegistryLookup::Gone
+            | RegistryLookup::Transitioning(_) => {
                 panic!("expected Blocked")
             }
         }
@@ -646,6 +714,84 @@ mod tests {
             GraphRegistry::from_entries(duplicate_uri),
             Err(InsertError::DuplicateUri(_)),
         ));
+
+        // A strict startup installs the whole captured batch or none. A stale
+        // completion and process shutdown cannot admit either loading graph.
+        let handles = registry
+            .list()
+            .into_iter()
+            .map(|view| Arc::clone(view.handle()))
+            .collect::<Vec<_>>();
+        let loading = handles
+            .iter()
+            .map(|handle| {
+                Arc::new(LoadingGraph {
+                    key: handle.key.clone(),
+                    uri: handle.uri.clone(),
+                    policy: handle.policy.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let pending_registry =
+            GraphRegistry::from_entries(loading.iter().cloned().map(GraphEntry::Loading).collect())
+                .unwrap();
+        let operations = OperationRuntime::new();
+        assert!(matches!(
+            pending_registry
+                .capture(&operations, &handles[0].key)
+                .unwrap(),
+            RegistryCapture::Loading(_)
+        ));
+        assert!(pending_registry.list().is_empty());
+        let foreign = Arc::new(LoadingGraph {
+            key: loading[1].key.clone(),
+            uri: loading[1].uri.clone(),
+            policy: None,
+        });
+        assert!(
+            pending_registry
+                .complete_startup(
+                    &operations,
+                    vec![
+                        (
+                            Arc::clone(&loading[0]),
+                            GraphEntry::ready(Arc::clone(&handles[0]))
+                        ),
+                        (foreign, GraphEntry::ready(Arc::clone(&handles[1]))),
+                    ]
+                )
+                .is_err()
+        );
+        assert!(
+            pending_registry.list().is_empty(),
+            "partial strict install is forbidden"
+        );
+        let results = || {
+            loading
+                .iter()
+                .cloned()
+                .zip(handles.iter().cloned().map(GraphEntry::ready))
+                .collect()
+        };
+        pending_registry
+            .complete_startup(&operations, results())
+            .unwrap();
+        assert_eq!(pending_registry.list().len(), 2);
+        assert!(
+            pending_registry
+                .complete_startup(&operations, results())
+                .is_err()
+        );
+        let stopped_registry =
+            GraphRegistry::from_entries(loading.iter().cloned().map(GraphEntry::Loading).collect())
+                .unwrap();
+        operations.close();
+        assert!(
+            stopped_registry
+                .complete_startup(&operations, results())
+                .is_err()
+        );
+        assert!(stopped_registry.list().is_empty());
     }
 
     #[tokio::test]
@@ -807,6 +953,7 @@ mod tests {
                             assert!(Arc::ptr_eq(&found, handle));
                         }
                         RegistryLookup::Gone
+                        | RegistryLookup::Loading(_)
                         | RegistryLookup::Blocked(_)
                         | RegistryLookup::Transitioning(_) => panic!(
                             "snapshot listed ready key {} but get() did not return Ready",

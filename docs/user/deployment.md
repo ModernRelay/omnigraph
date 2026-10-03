@@ -32,32 +32,39 @@ OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-service":"secret"}' \
 ```
 
 Use `GET /healthz` for process health and `GET /readyz` for readiness:
-`/readyz` reports `serving`, `degraded` (some graphs unavailable), `blocked` (none
-ready), or `draining`. It includes the applied `config_digest` it booted from
+`/readyz` reports `loading` (none ready while startup is pending), `serving`,
+`degraded` (some graphs unavailable), `blocked` (none ready), or `draining`.
+It includes the applied `config_digest` it booted from
 (`booted_serving_digest`), the ledger revision, and `served_graph_count`,
-`ready_graph_count` and `blocked_graph_count`. `served_graph_count` counts the
-whole registry, including blocked entries. Graphs closed for a transition also
+`ready_graph_count`, `loading_graph_count` and `blocked_graph_count`.
+`served_graph_count` counts the whole registry. Graphs closed for a transition also
 contribute to `blocked_graph_count`. Readiness returns 200 when at least one
 graph is ready or the applied inventory is empty, and 503 when all graphs are
-unavailable or shutdown has begun. The listener opens after startup completes;
-these endpoints do not report loading progress. A nonempty cluster with no
-healthy graph still refuses startup.
+unavailable or shutdown has begun. The listener opens after configuration and
+authorization validation, before graphs open. Healthy graphs become available
+as they finish loading. A nonempty cluster with no healthy graph exits with a
+startup error after its opening attempts finish. With `--require-all-graphs`,
+all graphs remain unavailable until every graph opens successfully; any failure
+stops the server. Wait for readiness before sending data requests: the printed
+listening address and `/healthz` confirm only that the listener is live.
 
 Readiness is unauthenticated and names no graph. Authorized `GET /graphs`
 returns one `graphs` list, including blocked entries, with each graph's `state`
-(`ready`, `blocked`, `transitioning` or `stopping`), `read_available`, `write_available` and
+(`loading`, `ready`, `blocked`, `transitioning` or `stopping`), `read_available`, `write_available` and
 `action`. Availability describes the runtime, not the caller's permissions.
 Blocked entries include a sanitized `failure`: `invalid_configuration`,
 `invalid_policy`, `invalid_external_blob_policy`, `open_failed` or
 `invalid_stored_queries`. Details remain in server logs.
 `restart_after_correction` means correct that graph's configuration or
 storage problem and restart; `wait_for_restart` describes shutdown.
+`wait_for_startup` means the graph's one startup attempt has not completed
+admission. It promises no retry time and does not trigger another open.
 `wait_for_transition` means that graph's admissions are closed while its owner
 finishes a transition. Wait for that owner, or restart if the transition was
 abandoned or expired; there is no promised retry time. The current transition
 can resume only the same serving bindings. Schema/query deployments still need
 an explicit restart. Ready entries use `none`. There is no separate `quarantined` list or automatic startup retry.
-Known blocked or transitioning graphs return 503 (`graph_unavailable`) to callers authorized to
+Known loading, blocked or transitioning graphs return 503 (`graph_unavailable`) to callers authorized to
 read `main` or list the management inventory; other callers cannot use this response to discover
 them. Unknown graphs return 404. A 503 does not authorize replaying a write.
 Add `--require-all-graphs` when any blocked graph should fail startup.
@@ -76,14 +83,15 @@ cancellation and its 30-second response deadline stop waiting for the result;
 an admitted read continues and retains its tool slot until execution finishes.
 
 Shutdown is bounded: at SIGTERM the server closes operation admission and stops
-accepting connections. It waits for admitted writes, executing reads, read bodies
+accepting connections. It waits for entered graph opens, admitted writes, executing reads, read bodies
 and server stream producers for at most `--shutdown-grace-seconds` (else
 `OMNIGRAPH_SHUTDOWN_GRACE_SECONDS`, else 25), then exits 2 with the unfinished
 work logged. The deadline is kept by a thread, so a stalled request or a
 blocked runtime cannot extend it. Signal handling begins after configuration
 loading, before graph opening, and covers serving startup. Disconnected callers
-do not remove their executing work from this wait. A panic or uncertain
-completion in an admitted write closes admission
+do not remove their executing work from this wait. A graph finishing startup
+after shutdown begins cannot become available. A panic or uncertain
+completion in startup or an admitted write closes admission
 for every graph in that process and starts the same shutdown path without renewing
 an existing deadline. After HTTP connections and the other known logical owners
 finish, the process exits 2 immediately; the watchdog remains the upper bound.
