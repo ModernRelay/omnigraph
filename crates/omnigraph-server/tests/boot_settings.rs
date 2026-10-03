@@ -579,7 +579,7 @@ mod multi_graph_startup {
         let workload = omnigraph_server::workload::WorkloadController::from_env();
         let mut entries: Vec<_> = handles
             .into_iter()
-            .map(omnigraph_server::registry::GraphEntry::Ready)
+            .map(omnigraph_server::registry::GraphEntry::ready)
             .collect();
         for id in blocked_ids {
             let dir = tempfile::tempdir().unwrap();
@@ -1220,7 +1220,7 @@ rules:
             failure: omnigraph_server::api::GraphStartupFailure::OpenFailed,
         });
         let entries = vec![
-            omnigraph_server::registry::GraphEntry::Ready(handle),
+            omnigraph_server::registry::GraphEntry::ready(handle),
             omnigraph_server::registry::GraphEntry::Blocked(Arc::clone(&blocked)),
         ];
         let state =
@@ -1235,7 +1235,7 @@ rules:
                     Arc::clone(&draining),
                     std::time::Duration::from_secs(7),
                 );
-        let app = build_app(state);
+        let app = build_app(state.clone());
 
         let (status, body) = json_response(&app, get_request("/readyz", "")).await;
         assert_eq!(status, StatusCode::OK);
@@ -1275,6 +1275,51 @@ rules:
         assert_eq!(body["graphs"][1]["write_available"], false);
         assert!(body.get("quarantined").is_none());
 
+        let key = GraphKey::cluster(GraphId::try_from("alpha").unwrap());
+        let transition = state
+            .prepare_same_view(
+                &key,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+            )
+            .unwrap()
+            .close()
+            .unwrap();
+        let (status, body) = json_response(&app, get_request("/readyz", "")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "blocked");
+        assert_eq!(body["ready_graph_count"], 0);
+        assert_eq!(body["blocked_graph_count"], 2);
+        let (status, inventory) = json_response(&app, get_request("/graphs", "secret")).await;
+        assert_eq!(status, StatusCode::OK);
+        let graph = &inventory["graphs"][0];
+        assert_eq!(graph["state"], "transitioning");
+        assert_eq!(graph["action"], "wait_for_transition");
+        assert_eq!(graph["read_available"], false);
+        assert_eq!(graph["write_available"], false);
+        assert!(graph.get("failure").is_none());
+        let (status, unavailable) =
+            json_response(&app, get_request("/graphs/alpha/snapshot", "secret")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable["code"], "graph_unavailable");
+        transition.wait_requests().await.unwrap();
+        transition.resume_same_view().unwrap();
+        let (status, body) = json_response(&app, get_request("/readyz", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["ready_graph_count"], 1);
+
+        // A completed graph wait cannot override later process shutdown.
+        let transition = state
+            .prepare_same_view(
+                &key,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+            )
+            .unwrap()
+            .close()
+            .unwrap();
+        transition.wait_requests().await.unwrap();
+        state.operation_runtime().close();
+        assert!(transition.resume_same_view().is_err());
         draining.store(true, Ordering::SeqCst);
         let (status, body) = json_response(&app, get_request("/readyz", "")).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);

@@ -32,27 +32,32 @@ OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-service":"secret"}' \
 ```
 
 Use `GET /healthz` for process health and `GET /readyz` for readiness:
-`/readyz` reports `serving`, `degraded` (some graphs blocked), `blocked` (none
+`/readyz` reports `serving`, `degraded` (some graphs unavailable), `blocked` (none
 ready), or `draining`. It includes the applied `config_digest` it booted from
 (`booted_serving_digest`), the ledger revision, and `served_graph_count`,
 `ready_graph_count` and `blocked_graph_count`. `served_graph_count` counts the
-whole registry, including blocked entries. Readiness returns 200 when at least
-one graph is ready or the applied inventory is empty, and 503 when all graphs
-are blocked or shutdown has begun. The listener opens after startup completes;
+whole registry, including blocked entries. Graphs closed for a transition also
+contribute to `blocked_graph_count`. Readiness returns 200 when at least one
+graph is ready or the applied inventory is empty, and 503 when all graphs are
+unavailable or shutdown has begun. The listener opens after startup completes;
 these endpoints do not report loading progress. A nonempty cluster with no
 healthy graph still refuses startup.
 
 Readiness is unauthenticated and names no graph. Authorized `GET /graphs`
 returns one `graphs` list, including blocked entries, with each graph's `state`
-(`ready`, `blocked` or `stopping`), `read_available`, `write_available` and
+(`ready`, `blocked`, `transitioning` or `stopping`), `read_available`, `write_available` and
 `action`. Availability describes the runtime, not the caller's permissions.
 Blocked entries include a sanitized `failure`: `invalid_configuration`,
 `invalid_policy`, `invalid_external_blob_policy`, `open_failed` or
 `invalid_stored_queries`. Details remain in server logs.
 `restart_after_correction` means correct that graph's configuration or
-storage problem and restart; `wait_for_restart` describes shutdown. Ready entries
-use `none`. There is no separate `quarantined` list or automatic startup retry.
-Known blocked graphs return 503 (`graph_unavailable`) to callers authorized to
+storage problem and restart; `wait_for_restart` describes shutdown.
+`wait_for_transition` means that graph's admissions are closed while its owner
+finishes a transition. Wait for that owner, or restart if the transition was
+abandoned or expired; there is no promised retry time. The current transition
+can resume only the same serving bindings. Schema/query deployments still need
+an explicit restart. Ready entries use `none`. There is no separate `quarantined` list or automatic startup retry.
+Known blocked or transitioning graphs return 503 (`graph_unavailable`) to callers authorized to
 read `main` or list the management inventory; other callers cannot use this response to discover
 them. Unknown graphs return 404. A 503 does not authorize replaying a write.
 Add `--require-all-graphs` when any blocked graph should fail startup.

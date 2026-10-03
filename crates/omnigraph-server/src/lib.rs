@@ -24,6 +24,7 @@ pub mod oidc_identity;
 pub mod policy;
 pub mod queries;
 pub mod registry;
+pub mod serving;
 pub mod workload;
 
 pub use graph_id::GraphId;
@@ -367,7 +368,7 @@ pub struct GraphStartupConfig {
 /// the source as operator-owned and never writes it.
 ///
 /// All handler bodies are mode-agnostic — the routing middleware
-/// (`resolve_graph_handle`) injects `Arc<GraphHandle>` as a request
+/// (`resolve_graph_handle`) injects `serving::GraphRequest` as a request
 /// extension by looking up the `{graph_id}` URL segment in the registry.
 #[derive(Clone)]
 pub struct GraphRouting {
@@ -381,7 +382,7 @@ pub struct AppState {
     // drain is not qualified native settlement, so the server never unlocks.
     cluster_admission: Option<omnigraph_cluster::ClusterAdmission>,
     /// Runtime routing and availability for every configured graph.
-    /// Middleware injects a ready `Arc<GraphHandle>` or refuses a blocked
+    /// Middleware injects an admitted `serving::GraphRequest` or refuses a blocked
     /// graph before collecting its request body.
     routing: GraphRouting,
     /// Per-actor admission control. Process-wide (not per-graph) —
@@ -484,6 +485,21 @@ impl AppState {
         &self.operations
     }
 
+    /// Prepare a bounded transition that can resume only this exact serving
+    /// view. It changes neither the schema nor any query/policy/provider binding.
+    /// The transition retains this process runtime; shutdown and uncertain
+    /// completion cannot be bypassed by supplying a different runtime.
+    pub fn prepare_same_view(
+        &self,
+        key: &GraphKey,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<serving::PreparedTransition, serving::ServingTransitionError> {
+        self.routing
+            .registry
+            .prepare_same_view(&self.operations, key, deadline)
+    }
+
+    // Startup only, before a router or transition can expose this state.
     fn with_operations(mut self, operations: operations::OperationRuntime) -> Self {
         self.operations = operations;
         self
@@ -772,7 +788,7 @@ impl AppState {
         config_path: Option<PathBuf>,
     ) -> std::result::Result<Self, InsertError> {
         Self::new_multi_entries(
-            handles.into_iter().map(GraphEntry::Ready).collect(),
+            handles.into_iter().map(GraphEntry::ready).collect(),
             bearer_tokens,
             server_policy,
             workload,
@@ -857,7 +873,7 @@ impl AppState {
     }
 
     /// Runtime routing accessor. Handlers don't typically inspect this —
-    /// they extract `Arc<GraphHandle>` via the routing middleware — but
+    /// they extract `serving::GraphRequest` via the routing middleware — but
     /// `server_graphs_list` reads the registry through it.
     pub fn routing(&self) -> &GraphRouting {
         &self.routing
@@ -2352,7 +2368,7 @@ pub fn build_app(state: AppState) -> Router {
     //      `AuthenticatedActor` (or rejects 401).
     //   2. `require_contract` — refuses unsupported HTTP contracts before
     //      graph resolution or request-body work.
-    //   3. `resolve_graph_handle` — injects `Arc<GraphHandle>` based on
+    //   3. `resolve_graph_handle` — captures `serving::GraphRequest` based on
     //      the active mode (single: the only handle; multi: lookup by
     //      `{graph_id}` in the URI path).
     let per_graph_protected = Router::new()
@@ -2797,7 +2813,7 @@ async fn open_multi_graph_state_admitted(
             );
             let uri = cfg.uri.clone();
             match open_single_graph(cfg, expected).await {
-                Ok(opened) => GraphEntry::Ready(opened.handle),
+                Ok(opened) => GraphEntry::ready(opened.handle),
                 Err(error) => {
                     warn!(
                         graph_id = %key.graph_id,

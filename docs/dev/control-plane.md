@@ -191,8 +191,9 @@ list containing runtime availability, sanitized failure and action. Version 1
 filtering remains an additional restriction. Neither inventory synthesizes graph
 entries from the boot witness. Discovery still discloses no availability.
 
-HTTP and MCP graph resolution apply credential graph scope before lookup. A
-blocked graph yields 503 only after graph `read` authorization on `main` or
+HTTP and MCP graph resolution apply credential graph scope before lookup and
+atomically capture a serving view with its graph-epoch lease. A blocked or
+transitioning graph yields 503 only after graph `read` authorization on `main` or
 management `graph_list` authorization; otherwise it remains undisclosed as 404.
 An invalid graph policy or configuration cannot authorize the graph-read fallback.
 Availability booleans describe the runtime, not a policy grant; route
@@ -210,7 +211,8 @@ infers routing from an arbitrary bearer token's unverified shape.
 A replica reports what it booted from on `GET /readyz` (RFC 0049): the
 applied `config_digest` as `booted_serving_digest`, the ledger revision and
 CAS, and registry, ready and blocked graph counts. `served_graph_count` counts
-every registry entry. Status is `serving`, `degraded`, `blocked` or `draining`;
+every registry entry; closed graph admissions contribute to the blocked count.
+Status is `serving`, `degraded`, `blocked` or `draining`;
 readiness requires a ready graph or valid empty inventory and open admission.
 Graph IDs stay on the authenticated catalog routes under their respective
 disclosure contracts. Status reads registry snapshots without graph/storage I/O;
@@ -230,7 +232,10 @@ connections finish. After bounded body collection, read handlers also run in
 owned tasks; losing the HTTP waiter leaves their engine future, read observer
 and input reservation alive. MCP tool execution retains its own concurrency
 permit after its caller cancels or reaches the response deadline. Completed
-results occupy one observed delivery slot until consumed or dropped. A read
+results occupy one observed delivery slot until consumed or dropped. A known
+write retains its reservations in that slot: consuming it releases write
+capacity before the handler responds, while abandoning it destroys the output
+before releasing ownership. A read
 error or panic does not trigger write uncertainty. A write panic or explicitly
 indeterminate owned completion closes admission for every graph and signals the
 same bounded process shutdown, retaining
@@ -239,6 +244,22 @@ nonfatal. Read/write body and response lanes have independent capacity; bodyless
 reads consume only read observers. Once HTTP connections and the remaining known
 logical owners finish, uncertain completion exits 2 immediately, with the original
 watchdog as the upper bound. This does not establish native-I/O settlement.
+
+A same-view transition can close one graph while other graphs keep serving.
+Preparation reserves bounded transition capacity before closing admission.
+Its graph lease follows body collection, owned execution, producers, retained
+results and yielded transport bytes; disconnect or MCP response expiry cannot
+release surviving owners. After those logical owners finish, the transition
+can resume only the exact existing engine, schema, queries and fixed bindings
+under a fresh epoch. Close, resume and shutdown share a synchronous ordering
+boundary. Expiry or an abandoned closed transition leaves that graph unavailable;
+there is no automatic reopen or retry. Status reports `transitioning` with
+`wait_for_transition`, without a finite `Retry-After` promise.
+
+The embedding entry point is `AppState::prepare_same_view`. It binds the actual
+process runtime; callers cannot substitute a new runtime to bypass stopping.
+It grants no schema/query replacement or deployment authority. There is no HTTP
+transition endpoint or live deployment mode.
 
 These registrations account for server lifetimes, not universal storage-I/O
 settlement. A joined future or zero operation counter cannot authorize runtime

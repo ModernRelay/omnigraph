@@ -159,8 +159,9 @@ async fn server_boots_with_a_valid_stored_query_registry() {
 
 /// E1 qualification probe, not a supported deployment path: a raw engine apply
 /// cannot replace the serving contract captured before body collection. The
-/// negative control deliberately bypasses cluster admission; the positive
-/// control finishes that invocation before applying on the same engine.
+/// negative control deliberately bypasses cluster admission. The positive
+/// control uses the production same-view transition on the same router before
+/// the separate, deliberately unqualified schema/query replacement probe.
 /// This needs HTTP body scheduling and handle identity, which GQT cannot express.
 #[tokio::test(flavor = "multi_thread")]
 async fn parked_stored_invocation_requires_a_serving_transition_barrier() {
@@ -170,6 +171,8 @@ async fn parked_stored_invocation_requires_a_serving_transition_barrier() {
     use axum::body::Bytes;
     use axum::http::Request;
     use omnigraph_server::{GraphHandle, build_app, workload::WorkloadController};
+    use omnigraph_server::{graph_id::GraphId, identity::GraphKey};
+    use tower::ServiceExt;
 
     fn request(body: Body) -> Request<Body> {
         Request::post(g("/queries/find_person"))
@@ -189,9 +192,43 @@ async fn parked_stored_invocation_requires_a_serving_transition_barrier() {
         )
         .await
         .unwrap();
-        let handle = state.routing().registry.list().pop().unwrap();
+        let handle = Arc::clone(state.routing().registry.list().pop().unwrap().handle());
+        let sibling_temp = init_loaded_graph().await;
+        let sibling = Arc::new(GraphHandle {
+            key: GraphKey::cluster(GraphId::try_from("sibling").unwrap()),
+            uri: graph_path(sibling_temp.path())
+                .to_string_lossy()
+                .into_owned(),
+            engine: Arc::new(
+                omnigraph::db::Omnigraph::open(graph_path(sibling_temp.path()).to_str().unwrap())
+                    .await
+                    .unwrap(),
+            ),
+            policy: None,
+            queries: None,
+        });
+        let state = AppState::new_multi(
+            vec![Arc::clone(&handle), sibling],
+            vec![],
+            None,
+            WorkloadController::with_defaults(),
+            None,
+        )
+        .unwrap();
         let operations = state.operation_runtime().clone();
-        let app = build_app(state);
+        let original_epoch = state
+            .routing()
+            .registry
+            .list()
+            .into_iter()
+            .find(|view| view.key == handle.key)
+            .unwrap()
+            .epoch();
+        let original_contract = handle.engine.schema_contract_digest();
+        let original_head = handle.engine.list_commits(None).await.unwrap()[0]
+            .graph_commit_id
+            .clone();
+        let app = build_app(state.clone());
         let (polled, body_polled) = tokio::sync::oneshot::channel();
         let (release, body_released) = tokio::sync::oneshot::channel();
         let body = Body::from_stream(futures::stream::once(async move {
@@ -199,13 +236,57 @@ async fn parked_stored_invocation_requires_a_serving_transition_barrier() {
             body_released.await.unwrap();
             Ok::<_, std::io::Error>(Bytes::from_static(br#"{"params":{"name":"Alice"}}"#))
         }));
-        let invocation = tokio::spawn(async move { json_response(&app, request(body)).await });
+        let invocation_app = app.clone();
+        let invocation =
+            tokio::spawn(async move { json_response(&invocation_app, request(body)).await });
         tokio::time::timeout(Duration::from_secs(10), body_polled)
             .await
             .expect("body collection must reach the deterministic parking point")
             .unwrap();
         assert_eq!(operations.snapshot().active_reads, 1);
         assert!(!invocation.is_finished());
+
+        let transition = if finish_before_apply {
+            let transition = state
+                .prepare_same_view(
+                    &handle.key,
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                )
+                .unwrap()
+                .close()
+                .unwrap();
+            {
+                let wait = transition.wait_requests();
+                tokio::pin!(wait);
+                assert!(
+                    futures::poll!(&mut wait).is_pending(),
+                    "body collection must retain the graph root before engine snapshot capture"
+                );
+            }
+            let refused = app
+                .clone()
+                .oneshot(request(Body::from(r#"{"params":{"name":"Alice"}}"#)))
+                .await
+                .unwrap();
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!refused.headers().contains_key("retry-after"));
+            drop(refused);
+            let (status, ready) = json_response(&app, get_request("/readyz", "")).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(ready["status"], "degraded");
+            assert_eq!(ready["ready_graph_count"], 1);
+            assert_eq!(ready["blocked_graph_count"], 1);
+            let (status, _) =
+                json_response(&app, get_request("/graphs/sibling/snapshot", "")).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "an unrelated graph remains available"
+            );
+            Some(transition)
+        } else {
+            None
+        };
 
         if !finish_before_apply {
             // Deliberately unsafe composition: this is not cluster apply or the
@@ -231,6 +312,33 @@ async fn parked_stored_invocation_requires_a_serving_transition_barrier() {
         if finish_before_apply {
             assert_eq!(status, StatusCode::OK, "{output}");
             assert_eq!(output["rows"], json!([{ "p.age": 30 }]));
+            let transition = transition.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), transition.wait_requests())
+                .await
+                .unwrap()
+                .unwrap();
+            let next_epoch = transition.resume_same_view().unwrap();
+            assert_ne!(next_epoch, original_epoch);
+            let resumed = state
+                .routing()
+                .registry
+                .list()
+                .into_iter()
+                .find(|view| view.key == handle.key)
+                .unwrap();
+            assert_eq!(resumed.epoch(), next_epoch);
+            assert!(Arc::ptr_eq(resumed.handle(), &handle));
+            assert_eq!(resumed.schema_contract(), &original_contract);
+            assert_eq!(handle.engine.schema_contract_digest(), original_contract);
+            assert_eq!(
+                handle.engine.list_commits(None).await.unwrap()[0].graph_commit_id,
+                original_head
+            );
+            let (status, output) =
+                json_response(&app, request(Body::from(r#"{"params":{"name":"Alice"}}"#))).await;
+            assert_eq!(status, StatusCode::OK, "{output}");
+            assert_eq!(output["rows"], json!([{ "p.age": 30 }]));
+            assert!(!operations.snapshot().closed);
             handle
                 .engine
                 .apply_schema(&renamed_age_schema())

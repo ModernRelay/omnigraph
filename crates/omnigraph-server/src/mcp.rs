@@ -25,7 +25,8 @@ use tokio::sync::Semaphore;
 
 use crate::api::InvokeStoredQueryRequest;
 use crate::handlers::{self, QueryNamePath};
-use crate::registry::GraphHandle;
+use crate::ingress::McpGraphRequest;
+use crate::serving::GraphRequest;
 use crate::workload::IngressLease;
 use crate::{ApiError, AppState, AuthenticatedActor, GraphId, GraphKey};
 
@@ -192,22 +193,29 @@ impl ServerHandler for GraphTools {
         // The SDK transports the admitted HTTP request's extensions into its
         // task. Reuse that one lease and observer instead of admitting again
         // after collection or releasing them before the SDK task finishes.
-        let Some((observer, input)) = parts.and_then(|parts| {
+        let Some((observer, input, graph)) = parts.and_then(|parts| {
             parts
                 .extensions
                 .get::<crate::operations::ReadObserver>()
                 .zip(parts.extensions.get::<IngressLease>())
-                .map(|(observer, input)| (observer.clone(), input.clone()))
+                .zip(parts.extensions.get::<McpGraphRequest>())
+                .map(|((observer, input), graph)| (observer.clone(), input.clone(), graph.clone()))
         }) else {
             return Ok(failure("internal_error", "MCP admission context is missing.").into());
         };
         let service = self.clone();
         let execution_input = input.clone();
+        let execution_graph = graph.clone();
         let result = self
             .run_read(
                 observer,
                 input,
-                async move { service.execute(request, actor, execution_input).await },
+                graph,
+                async move {
+                    service
+                        .execute(request, actor, execution_input, execution_graph)
+                        .await
+                },
                 context.ct.cancelled(),
                 READ_DEADLINE,
             )
@@ -224,6 +232,7 @@ impl GraphTools {
         &self,
         observer: crate::operations::ReadObserver,
         input: IngressLease,
+        graph: McpGraphRequest,
         operation: F,
         cancelled: C,
         deadline: Duration,
@@ -238,7 +247,7 @@ impl GraphTools {
                 "The server is handling its maximum concurrent MCP reads.",
             );
         };
-        let read = observer.spawn_read((input, permit), operation);
+        let read = observer.spawn_read((input, permit, graph), operation);
         tokio::select! {
             _ = cancelled => failure("cancelled", "The read was cancelled."),
             result = tokio::time::timeout(deadline, read.result()) => {
@@ -256,6 +265,7 @@ impl GraphTools {
         request: CallToolRequestParams,
         actor: AuthenticatedActor,
         input: IngressLease,
+        graph: McpGraphRequest,
     ) -> Result<CallToolResult, ApiError> {
         let arguments = Value::Object(request.arguments.unwrap_or_default());
         match request.name.as_ref() {
@@ -271,7 +281,7 @@ impl GraphTools {
             }
             "queries" => {
                 let args: GraphArguments = arguments_as(arguments)?;
-                let (handle, actor) = self.graph(&args.graph, actor)?;
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
                 let mut output =
                     handlers::server_list_queries(Extension(handle), Some(Extension(actor)))
                         .await?
@@ -281,7 +291,7 @@ impl GraphTools {
             }
             "query" => {
                 let args: QueryArguments = arguments_as(arguments)?;
-                let (handle, actor) = self.graph(&args.graph, actor)?;
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
                 let body = serde_json::to_vec(&InvokeStoredQueryRequest {
                     params: args.params.map(Value::Object),
                     branch: args.branch,
@@ -310,7 +320,8 @@ impl GraphTools {
         &self,
         name: &str,
         mut actor: AuthenticatedActor,
-    ) -> Result<(Arc<GraphHandle>, AuthenticatedActor), ApiError> {
+        graph: &McpGraphRequest,
+    ) -> Result<(GraphRequest, AuthenticatedActor), ApiError> {
         let id = GraphId::try_from(name.to_string())
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
         if !actor.select_graph(&id) {
@@ -318,6 +329,11 @@ impl GraphTools {
         }
         let handle =
             handlers::resolve_registered_graph(&self.state, &GraphKey::cluster(id), Some(&actor))?;
+        if graph.set(handle.clone()).is_err() {
+            return Err(ApiError::internal(
+                "MCP request selected its graph more than once",
+            ));
+        }
         Ok((handle, actor))
     }
 }
@@ -397,32 +413,49 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_or_expired_mcp_read_retains_capacity_until_execution_finishes() {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             use crate::operations::OperationRuntime;
             use crate::workload::{WorkloadController, WorkloadSnapshot};
 
             for cancelled in [false, true] {
                 let workload = WorkloadController::with_defaults();
                 let operations = OperationRuntime::with_read_limit(2);
+                let temp = tempfile::TempDir::new().unwrap();
+                let uri = temp.path().join("graph").to_string_lossy().into_owned();
+                let engine =
+                    omnigraph::db::Omnigraph::init(&uri, "node Person { name: String @key }\n")
+                        .await
+                        .unwrap();
                 let service = GraphTools {
-                    state: AppState::new_multi(
-                        Vec::new(),
-                        Vec::new(),
-                        None,
-                        workload.clone(),
-                        None,
-                    )
-                    .unwrap()
-                    .with_operations(operations.clone()),
+                    state: AppState::new_single(uri, engine, Vec::new(), None, workload.clone())
+                        .with_operations(operations.clone()),
                     slots: Arc::new(Semaphore::new(1)),
                 };
+                let key = GraphKey::cluster(GraphId::try_from("default").unwrap());
+                let registry = service.state.routing.registry.clone();
+                let execution_key = key.clone();
+                let execution_runtime = operations.clone();
+                let graph = McpGraphRequest::default();
+                let execution_graph = graph.clone();
+                let (select, selected) = tokio::sync::oneshot::channel();
                 let (entered, started) = tokio::sync::oneshot::channel();
                 let (release, held) = tokio::sync::oneshot::channel();
                 let result = service
                     .run_read(
                         operations.try_observe().unwrap(),
                         workload.try_read_ingress(17).unwrap(),
+                        graph,
                         async move {
+                            // Graph resolution can happen after MCP cancellation
+                            // has already returned its error to the HTTP task.
+                            selected.await.unwrap();
+                            let crate::registry::RegistryCapture::Ready(request) = registry
+                                .capture(&execution_runtime, &execution_key)
+                                .unwrap()
+                            else {
+                                panic!("fixture graph must be available");
+                            };
+                            assert!(execution_graph.set(request).is_ok());
                             entered.send(()).unwrap();
                             held.await.unwrap();
                             bounded_result(&json!({"finished": true}))
@@ -447,7 +480,17 @@ mod tests {
                         "deadline_exceeded"
                     }
                 );
+                select.send(()).unwrap();
                 started.await.unwrap();
+                let transition = service
+                    .state
+                    .prepare_same_view(&key, tokio::time::Instant::now() + Duration::from_secs(2))
+                    .unwrap()
+                    .close()
+                    .unwrap();
+                let settled = transition.wait_requests();
+                tokio::pin!(settled);
+                assert!(futures::poll!(&mut settled).is_pending());
                 assert_eq!(operations.snapshot().active_reads, 1);
                 assert_eq!(workload.snapshot().read_ingress_bytes, 17);
                 assert_eq!(service.slots.available_permits(), 0);
@@ -455,6 +498,7 @@ mod tests {
                     .run_read(
                         operations.try_observe().unwrap(),
                         workload.try_read_ingress(3).unwrap(),
+                        McpGraphRequest::default(),
                         async { panic!("refused MCP read must not execute") },
                         std::future::pending(),
                         READ_DEADLINE,
@@ -467,6 +511,10 @@ mod tests {
                 assert_eq!(operations.snapshot().active_reads, 1);
                 assert_eq!(workload.snapshot().read_ingress_bytes, 17);
                 operations.close();
+                assert!(matches!(
+                    settled.await,
+                    Err(crate::serving::ServingTransitionError::ProcessClosed)
+                ));
                 let shutdown = operations.wait_logical_owners();
                 tokio::pin!(shutdown);
                 assert!(futures::poll!(&mut shutdown).is_pending());

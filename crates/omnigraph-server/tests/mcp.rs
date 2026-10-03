@@ -91,8 +91,8 @@ async fn fixture_app() -> (tempfile::TempDir, Router, AppState) {
     .await
     .unwrap();
     let handle = state.routing().registry.list().pop().unwrap();
-    let mut entries = vec![omnigraph_server::registry::GraphEntry::Ready(Arc::clone(
-        &handle,
+    let mut entries = vec![omnigraph_server::registry::GraphEntry::ready(Arc::clone(
+        handle.handle(),
     ))];
     for (id, failure) in [
         (
@@ -172,7 +172,7 @@ async fn call(app: &Router, token: &str, tool: &str, arguments: Value) -> Value 
 
 #[tokio::test]
 async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutations() {
-    let (temp, app, _state) = fixture_app().await;
+    let (temp, app, state) = fixture_app().await;
     let alice = token("alice", RESOURCE);
     let bob = token("bob", RESOURCE);
     let response=app.clone().oneshot(rpc(Some(&alice),"initialize",json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}))).await.unwrap();
@@ -191,6 +191,17 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
     for tool in list["result"]["tools"].as_array().unwrap() {
         assert_eq!(tool["annotations"]["readOnlyHint"], true);
     }
+    let key = omnigraph_server::GraphKey::cluster(
+        omnigraph_server::GraphId::try_from("default").unwrap(),
+    );
+    let transition = state
+        .prepare_same_view(
+            &key,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap()
+        .close()
+        .unwrap();
     let discovered = call(&app, &bob, "graphs", json!({})).await;
     assert_eq!(
         discovered["result"]["structuredContent"],
@@ -199,6 +210,8 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
     for (credential, graph, expected) in [
         (&alice, "blocked", 503),
         (&bob, "blocked", 404),
+        (&alice, "default", 503),
+        (&bob, "default", 404),
         (&alice, "invalid-policy", 404),
         (&alice, "invalid-config", 404),
         (&alice, "unknown", 404),
@@ -220,6 +233,8 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
             assert_eq!(result["result"]["structuredContent"]["error"], native);
         }
     }
+    transition.wait_requests().await.unwrap();
+    transition.resume_same_view().unwrap();
     let catalog = call(&app, &alice, "queries", json!({"graph":"default"})).await;
     let queries = catalog["result"]["structuredContent"]["queries"]
         .as_array()
@@ -417,7 +432,13 @@ async fn mcp_shares_response_lifetimes_closed_admission_and_the_status_lane() {
     let runtime = state.operation_runtime();
     let response = app
         .clone()
-        .oneshot(rpc(Some(&alice), "tools/list", json!({})))
+        .oneshot(rpc(
+            Some(&alice),
+            "tools/call",
+            json!({
+                "name":"query", "arguments":{"graph":"default","name":"people"}
+            }),
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -447,6 +468,23 @@ async fn mcp_shares_response_lifetimes_closed_admission_and_the_status_lane() {
     );
     assert_eq!(ready["ready"], true);
     drop(held);
+    let view = state.routing().registry.list().pop().unwrap();
+    let transition = state
+        .prepare_same_view(
+            &view.key,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap()
+        .close()
+        .unwrap();
+    {
+        let wait = transition.wait_requests();
+        tokio::pin!(wait);
+        assert!(
+            futures::poll!(&mut wait).is_pending(),
+            "MCP yielded bytes must retain the selected graph after body drop"
+        );
+    }
     drop(bytes);
     assert!(
         tokio::time::timeout(
@@ -457,6 +495,8 @@ async fn mcp_shares_response_lifetimes_closed_admission_and_the_status_lane() {
         .unwrap()
     );
     assert_eq!(runtime.snapshot().active_reads, 0);
+    transition.wait_requests().await.unwrap();
+    assert_ne!(transition.resume_same_view().unwrap(), view.epoch());
     runtime.close();
     let response = app
         .clone()
