@@ -232,7 +232,10 @@ connections finish. After bounded body collection, read handlers also run in
 owned tasks; losing the HTTP waiter leaves their engine future, read observer
 and input reservation alive. MCP tool execution retains its own concurrency
 permit after its caller cancels or reaches the response deadline. Completed
-results occupy one observed delivery slot until consumed or dropped. A read
+results occupy one observed delivery slot until consumed or dropped. A known
+write retains its reservations in that slot: consuming it releases write
+capacity before the handler responds, while abandoning it destroys the output
+before releasing ownership. A read
 error or panic does not trigger write uncertainty. A write panic or explicitly
 indeterminate owned completion closes admission for every graph and signals the
 same bounded process shutdown, retaining
