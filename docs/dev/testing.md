@@ -124,6 +124,13 @@ The guards pin only substrate behavior OmniGraph actually depends on: version an
 
 Server suites are organized by public route: `auth_policy`, `data_routes`, `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings`, object-store coverage in `s3`, and the generated contract in `openapi`.
 
+Per-graph serving transitions extend these owners: in-source `registry` tests
+own capture/close ordering, deadlines, schema identity and candidate bounds;
+`operations`, `ingress` and `mcp` own detached execution and output lifetimes.
+`stored_queries` parks a request before engine capture, `data_routes` retains
+disconnected writes and stream bytes, and `boot_settings`/`mcp` check authorized
+availability. These prove unchanged-view resumption, not native settlement.
+
 CLI suites own their named planes: cluster lifecycle, data commands, stored queries, schema/config, cross-version rebuild, embedded/remote parity, and local/remote system journeys. Keep `OMNIGRAPH_HOME` hermetic by using `tests/support::cli()` or `cli_process()`.
 
 Offline deployment tests extend these owners: cluster `tests.rs` pins no-reset

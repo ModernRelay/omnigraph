@@ -67,8 +67,8 @@ impl OperationRuntime {
         }
     }
 
-    /// Close both lanes under the same boundary as registration. There is no
-    /// reopen method: a replacement serving epoch needs a new runtime.
+    /// Permanently close both process lanes under the registration boundary.
+    /// Graph-only transitions retain this runtime and its admission limits.
     pub fn close(&self) {
         locked(&self.inner.state).closed = true;
         self.inner.changed.notify_waiters();
@@ -83,6 +83,20 @@ impl OperationRuntime {
             active_write_responses: state.active_write_responses,
             uncertain_writes: state.uncertain.len(),
         }
+    }
+
+    /// Serialize synchronous graph admission/transition against process closure.
+    /// The callback may take the registry lock, but must not await or re-enter
+    /// this runtime: the lock order is process, then registry.
+    pub(crate) fn while_open<T, E>(&self, operation: impl FnOnce() -> Result<T, E>) -> Result<T, E>
+    where
+        E: From<ApiError>,
+    {
+        let state = locked(&self.inner.state);
+        if state.closed {
+            return Err(ApiError::admission_closed().into());
+        }
+        operation()
     }
 
     /// Server read lifetime only. Clone into each producer and response body;
@@ -144,6 +158,20 @@ impl OperationRuntime {
         }
     }
 
+    /// Wake graph-transition waiters when shutdown or an uncertain write closes
+    /// process admission. Closure is not proof that existing owners settled.
+    pub(crate) async fn wait_closed(&self) {
+        loop {
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.snapshot().closed {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     /// Sticky notification for the production host's fail-stop path.
     pub async fn fatal(&self) {
         loop {
@@ -192,11 +220,16 @@ impl OperationRuntime {
                         uncertain: true,
                     },
                 };
-                let uncertain = result.uncertain;
                 // A single completed result is offered once. With no receiver the
-                // result is dropped here; there is no detached-result history.
-                owner.finish(uncertain);
-                let _ = sender.send(result.result);
+                // result is dropped before releasing its graph reservation.
+                // Uncertainty closes admission before its result is observable.
+                if result.uncertain {
+                    owner.finish(true);
+                    let _ = sender.send(result.result);
+                } else {
+                    let _ = sender.send(result.result);
+                    owner.finish(false);
+                }
             }
             .in_current_span(),
         );
@@ -362,26 +395,60 @@ mod tests {
 
     #[tokio::test]
     async fn receiver_loss_preserves_reservation_and_executes_once() {
+        struct DroppedOutput {
+            releases: Arc<AtomicUsize>,
+            observed: Arc<AtomicUsize>,
+        }
+
+        impl Drop for DroppedOutput {
+            fn drop(&mut self) {
+                self.observed
+                    .store(self.releases.load(Ordering::SeqCst), Ordering::SeqCst);
+            }
+        }
+
         let runtime = OperationRuntime::new();
         let releases = Arc::new(AtomicUsize::new(0));
         let effects = Arc::new(AtomicUsize::new(0));
         let observed_effects = Arc::clone(&effects);
+        let output_drop = Arc::new(AtomicUsize::new(usize::MAX));
+        let output = DroppedOutput {
+            releases: Arc::clone(&releases),
+            observed: Arc::clone(&output_drop),
+        };
         let (release, held) = oneshot::channel();
         let result = runtime
             .submit(Reservation(Arc::clone(&releases)), async move {
                 held.await.unwrap();
                 observed_effects.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, ApiError>(()).into()
+                Ok::<_, ApiError>(output).into()
             })
             .unwrap();
         drop(result);
+        let closed = runtime.wait_closed();
+        tokio::pin!(closed);
+        assert!(futures::poll!(&mut closed).is_pending());
         runtime.close();
+        assert!(futures::poll!(&mut closed).is_ready());
+        let already_closed = runtime.wait_closed();
+        tokio::pin!(already_closed);
+        assert!(futures::poll!(&mut already_closed).is_ready());
         assert_eq!(runtime.snapshot().active_writes, 1);
         assert_eq!(releases.load(Ordering::SeqCst), 0);
         assert!(runtime.try_observe().is_err());
+        assert!(
+            runtime
+                .while_open::<(), ApiError>(|| panic!("closed process must not enter registry"))
+                .is_err()
+        );
         release.send(()).unwrap();
         assert!(runtime.wait_logical_owners().await);
         assert_eq!(effects.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            output_drop.load(Ordering::SeqCst),
+            0,
+            "abandoned output must drop before its graph reservation"
+        );
         assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
 
@@ -398,9 +465,17 @@ mod tests {
             .unwrap();
         assert!(response.result().await.is_err());
         runtime.fatal().await;
+        let closed = runtime.wait_closed();
+        tokio::pin!(closed);
+        assert!(futures::poll!(&mut closed).is_ready());
         assert!(!runtime.wait_logical_owners().await);
         assert_eq!(runtime.snapshot().uncertain_writes, 1);
         assert_eq!(releases.load(Ordering::SeqCst), 0);
+        assert!(
+            runtime
+                .while_open::<(), ApiError>(|| panic!("uncertain process must not enter registry"))
+                .is_err()
+        );
         assert!(
             runtime
                 .submit((), async { Ok::<_, ApiError>(()).into() })
@@ -629,10 +704,10 @@ mod tests {
                 })
                 .unwrap();
             assert!(response.result().await.is_err());
+            assert_eq!(runtime.wait_logical_owners().await, !uncertain);
             assert_eq!(runtime.snapshot().closed, uncertain);
             assert_eq!(runtime.snapshot().uncertain_writes, usize::from(uncertain));
             assert_eq!(releases.load(Ordering::SeqCst), usize::from(!uncertain));
-            assert_eq!(runtime.wait_logical_owners().await, !uncertain);
         }
     }
 

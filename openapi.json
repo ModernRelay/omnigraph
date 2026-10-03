@@ -8676,6 +8676,7 @@
         "type": "string",
         "enum": [
           "ready",
+          "transitioning",
           "blocked",
           "stopping"
         ]
@@ -8684,6 +8685,7 @@
         "type": "string",
         "enum": [
           "none",
+          "wait_for_transition",
           "restart_after_correction",
           "wait_for_restart"
         ]

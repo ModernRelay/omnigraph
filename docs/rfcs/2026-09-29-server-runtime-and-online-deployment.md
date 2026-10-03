@@ -72,8 +72,10 @@ query-worker joins and named aggregate write limits have landed; native-I/O
 settlement and comprehensive resource bounds remain unqualified. Registry and
 stored queries are built at boot, and cluster-backed schema apply still requires
 restart. The registry retains ready and blocked startup outcomes, with authorized
-availability and aggregate readiness. This foundation and existing trust refresh
-do not establish online activation or transient startup retry.
+availability and aggregate readiness. The implemented per-graph transition
+foundation atomically captures serving views and leases and can resume the exact
+same view under a fresh epoch. Schema/query replacement, online activation and
+transient startup retry remain unavailable.
 
 The initial deployment class changes only schema and stored queries. Graph
 inventory, canonical roots, storage format, policy, credentials, providers, trust
@@ -216,6 +218,14 @@ disconnect or an MCP deadline cannot drop ownership of surviving workers.
 Closing admission prevents new roots, not children finishing admitted work.
 Read cancellation needs a request-independent completion owner or an engine
 settlement handle; a middleware lease alone cannot prove those children finished.
+
+The implemented transition foundation reserves bounded process capacity before
+closing a graph, owns HTTP/MCP roots through their final logical users and allows
+only exact-view resumption under a fresh epoch. Preparation and resumption bind
+the real process runtime and share shutdown's synchronous boundary. No caller
+can supply a replacement engine, schema, query registry or runtime. Expired or
+abandoned closed attempts stay closed; they do not reset admission budgets.
+This proves logical request ownership, not native settlement or E1 activation.
 
 Candidate validation uses read-only captured state. Current v13 engine `refresh`
 reads storage and adopts an in-memory view; it no longer installs a contract.
@@ -627,10 +637,14 @@ read catalogs do not alone prove E1's request-binding or reclamation safety.
 ## Availability and supervision
 
 Keep liveness separate from readiness. The implemented registry retains actual
-startup outcomes as ready or blocked entries; shutdown projects all entries
-as stopping. One authorized inventory reports read/write runtime availability,
+startup outcomes as ready or blocked entries. A closed same-view transition
+projects its graph as `transitioning` with action `wait_for_transition`; shutdown
+projects all entries as stopping. Transitioning graphs count as unavailable in
+readiness and retain the existing authorized-unavailability disclosure rule.
+No finite retry time is promised; an expired or abandoned owner requires restart.
+One authorized inventory reports read/write runtime availability,
 sanitized failure and a supported action, replacing the separate quarantined
-list. Credential graph scope precedes resolution. Blocked graphs disclose 503
+list. Credential graph scope precedes resolution. Unavailable graphs disclose 503
 only to graph-read or management-inventory authorized callers; an invalid graph
 policy or configuration cannot authorize read disclosure. Other callers cannot
 discover them through that distinction. Registry membership and availability are distinct
@@ -799,13 +813,22 @@ conversion. Online activation remains unavailable.
 
 ### Initial E1 qualification: not yet qualified
 
+The same-view runtime foundation now closes affected HTTP/MCP graph admission,
+retains logical request/response owners and resumes the identical bindings under
+a fresh epoch. Existing server owners cover a parked HTTP body, sibling progress,
+disconnected writes, retained stream bytes, uncertainty and shutdown ordering.
+These are request-lifetime and same-view resumption proofs, not online schema or
+query replacement, native settlement or a process-memory envelope.
+
 The 2026-10-02 probes against main `7fe1789a` and pinned Lance 11.0.0 establish:
 
 - `stored_queries::parked_stored_invocation_requires_a_serving_transition_barrier`
   parks a real HTTP body after routing. Raw apply before releasing it mixes the
   old query with the new contract and fails; finishing it first, then applying
   and replacing the query binding on the same engine succeeds. This isolates
-  the binding requirement; it does not implement same-listener activation.
+  the binding requirement. Its extended positive control now exercises
+  production same-view resumption on the existing router; its raw schema/query
+  replacement remains an intentionally unqualified composition.
 - The three read/CPU guards in `lance_surface_guards.rs` observe independent
   retained inputs, actual late local reads and separate standard-scheduler read
   budgets after callers disappear. These read-only tails do not show graph
@@ -869,6 +892,14 @@ Before enabling an affected increment, its owners must implement and qualify:
    cluster roots to v13 before rollout, under the storage-upgrade owner.
 
 ## Decision log
+
+- 2026-10-03: Implemented per-graph serving leases and bounded same-view
+  transitions. Scope and baseline replaces the foundation-only availability
+  description; Serving views records the narrow resumption capability;
+  Availability replaces ready/blocked-only runtime projection; Initial E1
+  qualification replaces the parked probe's no-runtime-integration description.
+  The exact engine, schema, query and fixed bindings stay unchanged. Native
+  settlement, online submission and schema/query activation remain unqualified.
 
 - 2026-10-03: Record E0 implementation and bounded evidence in PR #849.
   Acceptance boundary replaces "Production v2 admission remains disabled";

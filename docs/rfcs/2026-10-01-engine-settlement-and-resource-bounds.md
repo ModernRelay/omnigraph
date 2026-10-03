@@ -54,6 +54,12 @@ no engine-reuse capability. Early termination, including `LIMIT`, and errors can
 still wait for a running blocking worker. Ownership does not establish a finite
 cancellation or early-completion latency; that cost remains to be measured.
 
+Server graph-epoch leases now accompany those logical owners through HTTP/MCP
+execution, body production and retained output. A bounded same-view transition
+can wait for them and resume identical serving bindings under a fresh epoch;
+expiry, shutdown or uncertainty cannot mint resumption authority. This adds no
+native scope ownership, resource refund or engine disposal/reuse capability.
+
 Named mutations and keyed loads share a 32 MiB retained-batch allowance across
 their touched tables, in addition to the existing per-table keyed limits.
 Keyed parsing and removed-ID collection have their own 32 MiB operation-wide
@@ -389,6 +395,10 @@ create parallel ownership and remains outside this decision.
   dimensions explicitly.
 
 ## Decision log
+
+- 2026-10-03: Extended Implemented boundary with per-graph logical ownership
+  and exact-view resumption. This supplements query-worker joining without
+  changing native settlement, aggregate resource or engine-reuse gates.
 
 - 2026-10-03: The umbrella acceptance replaces the draft/proposal descriptions
   in Motivation and observable behavior, General reuse and schema activation,

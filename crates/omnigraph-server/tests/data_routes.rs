@@ -972,7 +972,8 @@ async fn stalled_export_refuses_a_second_cut_and_disconnect_releases_it() {
             .await
             .unwrap();
         let operations = state.operation_runtime().clone();
-        let app = build_app(state);
+        let view = state.routing().registry.list().pop().unwrap();
+        let app = build_app(state.clone());
         let request = || match door {
             "/export" => export_request(Vec::new()),
             _ => json_post(door, &json!({"branch": "main"})),
@@ -1018,6 +1019,44 @@ async fn stalled_export_refuses_a_second_cut_and_disconnect_releases_it() {
                 .await
                 .unwrap()
         );
+
+        // A graph transition must retain the same body/producer/transport-byte
+        // owners without closing the process or replacing the engine.
+        let response = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        let first_chunk = stream.try_next().await.unwrap().expect("snapshot record");
+        let transition = state
+            .prepare_same_view(
+                &view.key,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap()
+            .close()
+            .unwrap();
+        {
+            let wait = transition.wait_requests();
+            tokio::pin!(wait);
+            assert!(
+                futures::poll!(&mut wait).is_pending(),
+                "{door}: unread body owns the graph"
+            );
+            drop(stream);
+            assert!(
+                futures::poll!(&mut wait).is_pending(),
+                "{door}: yielded bytes own the graph"
+            );
+            drop(first_chunk);
+            tokio::time::timeout(Duration::from_secs(5), wait)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let next_epoch = transition.resume_same_view().unwrap();
+        assert_ne!(next_epoch, view.epoch());
+        let resumed = state.routing().registry.list().pop().unwrap();
+        assert!(Arc::ptr_eq(resumed.handle(), view.handle()));
+        assert!(!operations.snapshot().closed);
 
         // Exercise the actual streaming handlers through the process-close
         // boundary. Both response bodies and already-yielded transport chunks
@@ -1553,7 +1592,8 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
         )
         .unwrap();
         let operations = state.operation_runtime().clone();
-        let app = build_app(state);
+        let view = state.routing().registry.list().pop().unwrap();
+        let app = build_app(state.clone());
         let harness = matrix::Harness {
             _temp: temp,
             app: app.clone(),
@@ -1641,6 +1681,24 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
             workload.snapshot().ingress_bytes > 0,
             "disconnect cannot release the retained input budget"
         );
+        let transition = state
+            .prepare_same_view(
+                &view.key,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap()
+            .close()
+            .unwrap();
+        {
+            let wait = transition.wait_requests();
+            tokio::pin!(wait);
+            assert!(
+                futures::poll!(&mut wait).is_pending(),
+                "{door}: the detached write must still own its graph root"
+            );
+        }
+        let (status, _) = json_response(&app, get_request(&g("/snapshot"), "")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         hold.release();
         holder_thread.join().unwrap();
         assert!(
@@ -1655,6 +1713,12 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
         assert_eq!(workload.snapshot().operation_count, 0);
         assert_eq!(workload.snapshot().ingress_count, 0);
         assert_eq!(workload.snapshot().ingress_bytes, 0);
+        tokio::time::timeout(Duration::from_secs(10), transition.wait_requests())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(transition.resume_same_view().unwrap(), view.epoch());
+        assert!(!operations.snapshot().closed);
         let after = db.list_commits(None).await.unwrap();
         assert_eq!(
             after.len(),
@@ -1724,7 +1788,16 @@ async fn engine_panics_close_admission_without_fabricating_rollback() {
             .await
             .unwrap();
         let operations = state.operation_runtime().clone();
-        let app = build_app(state);
+        let view = state.routing().registry.list().pop().unwrap();
+        // Preparing cannot close healthy admission; later uncertainty must
+        // invalidate this reserved attempt before it can close or resume.
+        let prepared = state
+            .prepare_same_view(
+                &view.key,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap();
+        let app = build_app(state.clone());
         let history = || {
             Request::builder()
                 .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
@@ -1752,6 +1825,19 @@ async fn engine_panics_close_admission_without_fabricating_rollback() {
         assert!(operations.snapshot().closed);
         assert_eq!(operations.snapshot().uncertain_writes, 1);
         assert!(!operations.wait_logical_owners().await);
+        assert!(
+            prepared.close().is_err(),
+            "uncertainty must defeat an earlier prepared transition"
+        );
+        assert!(
+            state
+                .prepare_same_view(
+                    &view.key,
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                )
+                .is_err(),
+            "uncertainty must refuse a new transition"
+        );
         let (status, refusal) = json_response(&app, json_post("/mutate", &json!({"query": MUTATION_QUERIES, "name": "insert_person", "params": {"name": "MustNotRun", "age": 1}}))).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refusal}");
         // The closed serving epoch cannot provide the oracle. Use a
