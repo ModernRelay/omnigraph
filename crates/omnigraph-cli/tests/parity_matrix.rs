@@ -811,8 +811,6 @@ fn parity_export() {
 #[cfg(unix)]
 fn assert_slow_export_and_baseline_complete(p: &Parity) {
     use std::io::{Read, Write};
-    use std::net::TcpStream;
-    use std::os::fd::AsRawFd;
     use std::time::{Duration, Instant};
 
     let data = p._temp.path().join("slow-export.jsonl");
@@ -845,27 +843,30 @@ fn assert_slow_export_and_baseline_complete(p: &Parity) {
     );
 
     let address = p.server.base_url.strip_prefix("http://").unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .unwrap();
     for route in ["export", "changes/baseline"] {
-        let mut socket = TcpStream::connect(address).unwrap();
+        let mut socket = runtime.block_on(async {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            // Negotiate TCP with the small receive buffer. Shrinking it after
+            // connect can throttle Linux loopback even after reads resume.
+            socket.set_recv_buffer_size(16 * 1024).unwrap();
+            socket
+                .connect(address.parse().unwrap())
+                .await
+                .unwrap()
+                .into_std()
+                .unwrap()
+        });
+        socket.set_nonblocking(false).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(15)))
             .unwrap();
         socket
             .set_write_timeout(Some(Duration::from_secs(15)))
             .unwrap();
-        let receive_bytes: libc::c_int = 16 * 1024;
-        // SAFETY: the descriptor is live and the typed option points to a
-        // correctly sized, initialized integer throughout setsockopt.
-        let result = unsafe {
-            libc::setsockopt(
-                socket.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                std::ptr::from_ref(&receive_bytes).cast(),
-                std::mem::size_of_val(&receive_bytes) as libc::socklen_t,
-            )
-        };
-        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
         let request = r#"{"branch":"main"}"#;
         write!(socket,
             "POST /graphs/parity/{route} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer parity-tok\r\n{}: {}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{request}",
@@ -896,13 +897,21 @@ fn assert_slow_export_and_baseline_complete(p: &Parity) {
         // This is a protocol-deadline regression, not a throughput threshold:
         // socket backpressure must outlive the 250 ms admission timeout.
         std::thread::sleep(Duration::from_secs(2));
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let drain_started = Instant::now();
+        let deadline = drain_started + Duration::from_secs(30);
         let mut buffer = [0; 64 * 1024];
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(!remaining.is_zero(), "{route}: response did not complete");
             socket.set_read_timeout(Some(remaining)).unwrap();
-            let count = socket.read(&mut buffer).unwrap();
+            let count = socket.read(&mut buffer).unwrap_or_else(|error| {
+                panic!(
+                    "{route}: response read failed after {:?} and {} bytes: {error}\nserver stderr:\n{}",
+                    drain_started.elapsed(),
+                    wire.len(),
+                    p.server.stderr()
+                )
+            });
             if count == 0 {
                 break;
             }
