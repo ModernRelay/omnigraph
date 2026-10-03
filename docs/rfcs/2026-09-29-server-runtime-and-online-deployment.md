@@ -350,11 +350,14 @@ already bind one.
 | Ledger read/replacement | 16 MiB |
 | One configuration/schema/query/policy source | 1 MiB |
 | Distinct source bytes in one immutable bundle | 8 MiB |
+| Encoded immutable bundle | 16 MiB |
 | Resources in applied/input projections | 4,096 |
 | Retained terminal records | 32 records and 4 MiB total; at most 1 MiB each |
 | Diagnostics in one terminal record | 4 KiB total, with explicit truncation |
 | Actor / resource address / canonical root URI | 256 / 512 / 4,096 UTF-8 bytes |
 
+The encoded bundle limit also bounds JSON escaping and its resource projection;
+an input can fit the source-byte limit and still be refused before acceptance.
 Enforce byte limits while reading, before decoding or unbounded buffering, and
 associate the bounded ledger bytes with that same read's CAS token. Bound paths,
 actors and collections before constructing the plan. Prepare **all** engine
