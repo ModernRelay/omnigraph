@@ -351,6 +351,16 @@ node Document {
     })
     .to_string();
     db.load_jsonl(&wide, LoadMode::Append).await.unwrap();
+    let small = (0..200)
+        .map(|row| {
+            serde_json::json!({
+                "type": "Document", "data": {"key": format!("small-{row:03}"), "body": "small"}
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    db.load_jsonl(&small, LoadMode::Append).await.unwrap();
     let expected = db.export_jsonl("main", &[]).await.unwrap();
     let cut = db.capture_served_export_cut("main", &[]).await.unwrap();
     let mut chunks = Vec::new();
@@ -358,6 +368,7 @@ node Document {
         .write_chunks(|chunk| {
             assert!(!chunk.is_empty());
             assert!(chunk.len() <= omnigraph::db::EXPORT_CHUNK_MAX_BYTES);
+            assert!(chunk.capacity() <= omnigraph::db::EXPORT_CHUNK_MAX_BYTES);
             chunks.push(chunk);
             std::future::ready(Ok(()))
         })
@@ -366,6 +377,14 @@ node Document {
     drop(cut);
 
     assert!(chunks.len() > 1, "wide row must exercise chunk splitting");
+    assert_eq!(
+        chunks.len(),
+        expected
+            .len()
+            .div_ceil(omnigraph::db::EXPORT_CHUNK_MAX_BYTES),
+        "small rows share chunks; only the final chunk may be partial"
+    );
+    assert!(chunks.last().unwrap().len() < omnigraph::db::EXPORT_CHUNK_MAX_BYTES);
     let joined = chunks.concat();
     assert_eq!(joined, expected.as_bytes());
     assert!(std::str::from_utf8(&joined).is_ok());

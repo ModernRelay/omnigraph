@@ -211,11 +211,7 @@ pub(crate) fn print_cluster_validate_human(output: &ValidateOutput) {
 
 pub(crate) fn print_cluster_plan_human(output: &PlanOutput) {
     if output.ok {
-        println!(
-            "cluster plan: {} change(s), {} approval gate(s)",
-            output.changes.len(),
-            output.approvals_required.len()
-        );
+        println!("cluster plan: {} change(s)", output.changes.len());
         match output.authority {
             omnigraph_cluster::LedgerAuthority::Observed => {
                 println!("  authority: observed (no lock taken, nothing written)");
@@ -253,55 +249,6 @@ pub(crate) fn print_cluster_plan_human(output: &PlanOutput) {
     print_cluster_diagnostics(&output.diagnostics);
 }
 
-pub(crate) fn print_cluster_apply_human(output: &ApplyOutput) {
-    if output.ok {
-        println!(
-            "cluster apply: {} applied, {} deferred/blocked",
-            output.applied_count, output.deferred_count
-        );
-    } else {
-        println!("cluster apply failed");
-    }
-    // The change list prints on failure too: an operator debugging a partial
-    // apply (payload or state-write error) needs to see what was attempted.
-    print_cluster_apply_changes(&output.changes);
-    if output.ok {
-        let state = &output.state_observations;
-        println!(
-            "  state: revision {}, converged: {}, written: {}",
-            state.state_revision, output.converged, output.state_written
-        );
-        println!(
-            "  note: cluster-booted servers (--cluster) serve this on their next restart; omnigraph.yaml deployments are unaffected"
-        );
-    }
-    print_cluster_diagnostics(&output.diagnostics);
-}
-
-pub(crate) fn print_cluster_apply_changes(changes: &[omnigraph_cluster::PlanChange]) {
-    for change in changes {
-        let bindings = if change.binding_change {
-            " [bindings]"
-        } else {
-            ""
-        };
-        match (&change.disposition, change.reason.as_deref()) {
-            (Some(disposition), Some(reason)) => println!(
-                "  {:?} {}{bindings} [{disposition:?}: {reason}]",
-                change.operation, change.resource
-            ),
-            (Some(disposition), None) => println!(
-                "  {:?} {}{bindings} [{disposition:?}]",
-                change.operation, change.resource
-            ),
-            _ => println!("  {:?} {}{bindings}", change.operation, change.resource),
-        }
-    }
-    if changes.is_empty() {
-        println!("  no changes");
-    }
-}
-
 pub(crate) fn print_cluster_status_human(output: &StatusOutput) {
     if output.ok {
         let state = &output.state_observations;
@@ -329,8 +276,6 @@ pub(crate) fn print_cluster_status_human(output: &StatusOutput) {
 
 pub(crate) fn print_cluster_state_sync_human(output: &StateSyncOutput) {
     let operation = match output.operation {
-        omnigraph_cluster::StateSyncOperation::Refresh => "refresh",
-        omnigraph_cluster::StateSyncOperation::Import => "import",
         omnigraph_cluster::StateSyncOperation::Observe => "observe",
     };
     if output.ok {
@@ -467,46 +412,6 @@ pub(crate) fn finish_cluster_plan(output: &PlanOutput, json: bool) -> Result<()>
         print_json(output)?;
     } else {
         print_cluster_plan_human(output);
-    }
-    if !output.ok {
-        io::stdout().flush()?;
-        std::process::exit(1);
-    }
-    Ok(())
-}
-
-pub(crate) fn finish_cluster_apply(output: &ApplyOutput, json: bool) -> Result<()> {
-    if json {
-        print_json(output)?;
-    } else {
-        print_cluster_apply_human(output);
-    }
-    if !output.ok {
-        io::stdout().flush()?;
-        std::process::exit(1);
-    }
-    Ok(())
-}
-
-pub(crate) fn finish_cluster_approve(output: &ApproveOutput, json: bool) -> Result<()> {
-    if json {
-        print_json(output)?;
-    } else if output.ok {
-        println!(
-            "cluster approve: {} {} approved by {} (approval {})",
-            output
-                .operation
-                .as_ref()
-                .map(|operation| format!("{operation:?}").to_lowercase())
-                .unwrap_or_default(),
-            output.resource.as_deref().unwrap_or("?"),
-            output.approved_by.as_deref().unwrap_or("?"),
-            output.approval_id.as_deref().unwrap_or("?"),
-        );
-        print_cluster_diagnostics(&output.diagnostics);
-    } else {
-        println!("cluster approve failed");
-        print_cluster_diagnostics(&output.diagnostics);
     }
     if !output.ok {
         io::stdout().flush()?;

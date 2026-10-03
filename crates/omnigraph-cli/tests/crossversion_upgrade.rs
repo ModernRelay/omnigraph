@@ -29,7 +29,10 @@ use std::process::Command;
 
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::{BlobCell, BlobContent, EntityKind};
-use support::{HERMETIC_OPERATOR_HOME, cli, fixture, output_failure, output_success};
+use support::{
+    HERMETIC_OPERATOR_HOME, apply_cluster_fixture, cli, fixture, output_failure, output_success,
+    unlock_cluster_fixture,
+};
 use tempfile::tempdir;
 
 /// Resolve the old (0.7.2) binary. `None` ONLY when `OMNIGRAPH_OLD_BIN` is
@@ -1086,13 +1089,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
     for name in ["graph.pg", "queries.gq", "cluster.yaml"] {
         fs::copy(cluster.join(name), rebuilt_cluster.join(name)).unwrap();
     }
-    for operation in ["import", "plan", "apply"] {
-        output_success(
-            cli()
-                .args(["cluster", operation, "--config"])
-                .arg(&rebuilt_cluster),
-        );
-    }
+    apply_cluster_fixture(&rebuilt_cluster);
     let rebuilt = rebuilt_cluster.join("graphs/knowledge.omni");
     let rebuilt_uri = rebuilt.to_str().unwrap();
     for (i, branch) in ["main", "review"].into_iter().enumerate() {
@@ -1106,6 +1103,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
             load.args(["--from", "main"]);
         }
         output_success(load.arg(&rebuilt));
+        unlock_cluster_fixture(&rebuilt_cluster);
     }
 
     assert_rebuilt_v10_graph(&rebuilt);

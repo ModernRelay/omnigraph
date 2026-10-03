@@ -29,11 +29,10 @@ or `change`. Ad-hoc query and mutation source uses `read` or `change`
 respectively. Control-plane admin or apply permission does not confer graph
 permission.
 
-When a changed policy is applied and activated by a server restart, it governs
-the next request using the same credential. Editing a source file alone has
-no effect. Schema changes retain the [cluster configuration
-workflow](../operations/policy.md#actions); identity credentials do not bypass
-its ownership or permission checks.
+Existing graph policy bindings stay fixed in the current deployment class;
+editing a source file alone has no effect. Schema changes use the
+[cluster configuration workflow](../clusters/index.md#deploy-without-restarting);
+identity credentials do not bypass its ownership or permission checks.
 
 Normal issuance takes neither `--graph` nor `--actions`; choose a graph on the
 operation that needs it. `--ttl` accepts seconds or an `s`, `m`, `h`, or `d`

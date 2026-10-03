@@ -123,7 +123,8 @@ struct TableTombstoneEntry {
 /// so the commit-graph cache can be sourced from the manifest projection without
 /// touching any reader above that boundary. Kept as a separate struct here to
 /// keep `state.rs` free of the `commit_graph` module dependency.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GraphLineageRow {
     pub graph_commit_id: String,
     pub graph_branch: Option<String>,

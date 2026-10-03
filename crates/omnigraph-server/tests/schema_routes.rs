@@ -155,7 +155,7 @@ async fn schema_apply_route_refuses_cluster_backed_server_mode() {
         payload["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("cluster apply"),
+            .contains("cluster apply --server <SERVER> --config <CONFIG>"),
         "body: {payload}"
     );
     let reopened = Omnigraph::open(&graph_uri).await.unwrap();

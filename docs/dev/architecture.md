@@ -30,6 +30,7 @@ flowchart TB
     CLI --> CLUSTER
     CLI --> ENGINE
     HTTP --> ENGINE
+    HTTP --> CLUSTER
     HTTP --> POLICY
     CLUSTER --> ENGINE
     ENGINE --> COMPILER
@@ -62,8 +63,8 @@ Three kinds of state must not be conflated:
    branch heads, visible table versions, and graph lineage. One manifest
    publication makes a graph change visible.
 2. **Lance physical state.** Each node and edge table is a Lance dataset with
-   its own versions, branches, fragments, and indexes. A table HEAD may move
-   before graph publication only when a durable recovery record owns the gap.
+   its own versions, branches, fragments, and indexes. Graph writes stage detached
+   versions; a registered table's linear HEAD remains at its creation version.
 3. **Derived runtime state.** Topology indexes, physical index coverage,
    caches, fragment layout, and serving projections may be rebuilt. They never
    become a second authority for graph contents.
@@ -82,13 +83,13 @@ alias is reused. See [invariants.md](invariants.md) and
 | `omnigraph` (`omnigraph-engine`) | The public facade (`Omnigraph`, `Snapshot`), the graph coordinator, query and mutation execution, the table store, graph topology, validation, and recovery. |
 | `omnigraph-catalog` | `__manifest` publication (multi-dataset publication), graph branch registrations and lineage, retention, and `commit_graph`. |
 | `omnigraph-core` | `OmniError`, Lance dataset access and instrumentation, native Lance branch ref control (`branch_control`), and dataset addressing. |
-| `omnigraph-storage` | Shared local/S3/Azure control-object access used for manifests' companion objects, cluster state, locks, approvals, and recovery artifacts. |
+| `omnigraph-storage` | Shared local/S3/Azure control-object access for cluster state, locks, immutable resources and legacy conversion evidence. |
 | Lance | Dataset files, transactions, versions, native refs, secondary indexes, compaction, and version cleanup. |
 | `omnigraph-policy` | Cedar compilation and the engine-facing action/scope/actor gate. |
-| `omnigraph-cluster` | Desired configuration, state ledger, plan/apply, approvals, cluster recovery, and immutable serving snapshots. |
+| `omnigraph-cluster` | Desired configuration, deployment ledger, plan/apply, exact recovery, and immutable serving snapshots. |
 | `omnigraph-api-types` | Additive HTTP wire DTOs shared by server and CLI. |
 | `omnigraph-cli` | Operator commands, target resolution, output, embedded/remote dispatch, and local credential selection. |
-| `omnigraph-server` | HTTP authentication, read authorization, admission control, routing, OpenAPI, and multi-graph serving. |
+| `omnigraph-server` | HTTP authentication, read authorization, admission control, routing, OpenAPI, multi-graph serving and live deployment activation. |
 | `omnigraph-azure-admission` | Azure deployment wrapper that admits one mutation-capable server process through the root-derived Blob lease. It is not a storage backend. |
 | `omnigraph-reference-engine` | Engine v1, frozen (`publish = false`, hash-pinned by its `tests/frozen.rs`): the reference executor a GQT step's `--- expect same as v1` compares engine v2 against. It depends only on `omnigraph-compiler`, `omnigraph-core`, `omnigraph-catalog` and third-party crates; `omnigraph-gqt` is the only crate that may depend on it (`forbidden_apis.rs` guards both), and no production door reaches it. |
 
@@ -99,8 +100,8 @@ alias is reused. See [invariants.md](invariants.md) and
   scans/search with the scoped in-memory topology index. See
   [execution.md](execution.md).
 - A content write captures one accepted authority view, stages exact Lance
-  transactions, arms recovery, applies table effects, and publishes all table
-  pointers plus lineage in one manifest CAS. See [writes.md](writes.md) and
+  transactions as unreachable detached table versions, and publishes every table
+  pin, accepted schema and lineage change in one manifest CAS. See [writes.md](writes.md) and
   [recovery.md](recovery.md).
 - A merge performs a graph-level three-way comparison, validates the selected
   result, stages its table effects, and uses the same publication boundary. See
@@ -108,8 +109,8 @@ alias is reused. See [invariants.md](invariants.md) and
 - Blob cells use an engine-owned, snapshot-bound facade; callers never receive
   a raw Lance `BlobFile` or physical placement. See [blob.md](blob.md).
 - Cluster apply converges definitions and graph topology into a CAS-protected
-  ledger. Servers boot only from an applied serving snapshot and do not mutate
-  cluster state at runtime. See [control-plane.md](control-plane.md).
+  ledger. Servers boot from an applied serving snapshot and execute live
+  deployments under their existing exclusive cluster admission. See [control-plane.md](control-plane.md).
 
 ## Trust and policy boundaries
 
@@ -142,7 +143,7 @@ gates for single-writer ownership.
   schema, branch, and sorted-table gates, then fenced again by persisted
   authority and Lance transaction identity.
 - The gates prevent same-process races and deadlocks; manifest preconditions,
-  Lance transactions, and recovery records provide durable correctness.
+  Lance transactions, and accepted manifest identities provide durable correctness.
 - Some maintenance and destructive-recovery classifiers intentionally retain
   a one-mutation-process support boundary. Do not infer distributed writer
   safety from an in-process mutex. [recovery.md](recovery.md) names the modes.

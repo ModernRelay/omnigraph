@@ -1,19 +1,23 @@
 //! Immutable serving bindings and logical request lifetimes.
 //!
-//! A closed epoch can resume only its unchanged view in a fresh epoch. These
-//! logical counters prove neither native-I/O settlement nor engine reuse.
+//! A deployment closes its affected epochs, drains admitted request owners,
+//! and activates validated bindings on the same engines. Logical counters do
+//! not prove native-I/O settlement or permit engine disposal or lock release.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use omnigraph::db::SchemaContractDigest;
+use omnigraph::db::{Omnigraph, SchemaContractDigest};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use crate::ApiError;
+use crate::identity::GraphKey;
 use crate::operations::OperationRuntime;
+use crate::queries::QueryRegistry;
 use crate::registry::{GraphHandle, GraphRegistry};
 
 /// A non-reusable epoch within one registered graph's lifetime.
@@ -33,8 +37,8 @@ impl ServingEpoch {
     }
 }
 
-/// Immutable bindings for one epoch. An engine remains shared across unchanged
-/// resumption; a view is not an engine snapshot or a native settlement proof.
+/// Immutable bindings for one epoch. Changed bindings retain the same engine;
+/// a view is not an engine snapshot or a native settlement proof.
 pub struct ServingView {
     handle: Arc<GraphHandle>,
     epoch: ServingEpoch,
@@ -59,6 +63,18 @@ impl ServingView {
             epoch,
             schema_contract: self.schema_contract.clone(),
             requests: Arc::new(EpochRequests::default()),
+        }
+    }
+
+    /// Unchanged admission can reopen before a drain completes. Old request
+    /// descendants still own this engine, so the next transition must include
+    /// their count instead of starting an unrelated empty epoch counter.
+    pub(crate) fn successor_retaining_requests(&self, epoch: ServingEpoch) -> Self {
+        Self {
+            handle: Arc::clone(&self.handle),
+            epoch,
+            schema_contract: self.schema_contract.clone(),
+            requests: Arc::clone(&self.requests),
         }
     }
 
@@ -198,8 +214,8 @@ impl fmt::Debug for GraphRequest {
     }
 }
 
-/// Actual refusal cases of unchanged-view transitions. No variant grants
-/// schema publication, native settlement or automatic lock release.
+/// Refusals at the serving transition boundary. No variant grants native
+/// settlement, engine disposal, or automatic lock release.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ServingTransitionError {
     #[error("server operation admission is closed")]
@@ -220,6 +236,12 @@ pub enum ServingTransitionError {
     SchemaChanged,
     #[error("serving epoch identity is exhausted")]
     EpochExhausted,
+    #[error("activation bindings do not match the reserved graph set")]
+    InvalidBindings,
+    #[error("stored queries do not match the achieved schema: {0}")]
+    InvalidQueries(String),
+    #[error("new graph cannot be registered: {0}")]
+    InvalidGraph(String),
 }
 
 impl From<ApiError> for ServingTransitionError {
@@ -230,14 +252,14 @@ impl From<ApiError> for ServingTransitionError {
     }
 }
 
-/// The one bounded candidate contains only retained predecessor bindings.
+/// One bounded deployment candidate retains its affected predecessor views.
 /// Arc identity fences stale tickets without a second persistent identity.
 pub(crate) struct TransitionRecord {
-    pub(crate) predecessor: Arc<ServingView>,
+    pub(crate) predecessors: Vec<Arc<ServingView>>,
     pub(crate) deadline: Instant,
 }
 
-/// Reserved same-view candidate. Dropping before closure releases only this
+/// Reserved deployment candidate. Dropping before closure releases only this
 /// exact reservation; no graph or native effects have begun.
 pub struct PreparedTransition {
     registry: Arc<GraphRegistry>,
@@ -275,9 +297,9 @@ impl Drop for PreparedTransition {
     }
 }
 
-/// Closed predecessor. Dropping this ticket cannot reopen its epoch or free
-/// its candidate slot. The registry retains its exact view until resumption or
-/// process shutdown. The original absolute deadline never moves.
+/// Closed predecessors. Dropping this ticket retires its scheduling record;
+/// the registry retains closed views and their resources until process shutdown.
+/// Successful validated activation opens fresh epochs under the original deadline.
 pub struct GraphTransition {
     registry: Arc<GraphRegistry>,
     record: Arc<TransitionRecord>,
@@ -286,16 +308,84 @@ pub struct GraphTransition {
 
 impl GraphTransition {
     pub async fn wait_requests(&self) -> Result<(), ServingTransitionError> {
-        self.record
-            .predecessor
-            .wait_requests(&self.operations, self.record.deadline)
-            .await
+        for predecessor in &self.record.predecessors {
+            predecessor
+                .wait_requests(&self.operations, self.record.deadline)
+                .await?;
+        }
+        self.operations
+            .while_open(|| self.registry.check_drained(&self.record))
+    }
+
+    /// The deployment controller uses the same engines after all affected
+    /// request owners drain. This does not authorize another writer process.
+    pub(crate) fn engines(
+        &self,
+    ) -> Result<HashMap<GraphKey, Arc<Omnigraph>>, ServingTransitionError> {
+        self.operations.while_open(|| {
+            self.registry.check_drained(&self.record)?;
+            if self
+                .record
+                .predecessors
+                .iter()
+                .any(|view| !view.contract_is_current())
+            {
+                return Err(ServingTransitionError::SchemaChanged);
+            }
+            Ok(self
+                .record
+                .predecessors
+                .iter()
+                .map(|view| (view.key.clone(), Arc::clone(&view.engine)))
+                .collect())
+        })
+    }
+
+    /// Publish complete query/schema bindings only after the deployment
+    /// controller has recorded their durable achieved state. All replacement
+    /// engines and policies stay identical; additions are already durable graphs.
+    pub(crate) fn activate(
+        self,
+        bindings: HashMap<GraphKey, (SchemaContractDigest, QueryRegistry)>,
+        additions: Vec<(Arc<GraphHandle>, SchemaContractDigest)>,
+    ) -> Result<HashMap<GraphKey, ServingEpoch>, ServingTransitionError> {
+        let replacements = self
+            .registry
+            .validate_activation(&self.record, bindings, additions)?;
+        self.operations
+            .while_open(|| self.registry.activate(&self.record, replacements))
+    }
+
+    /// The controller attests no deployment effect began. Reopen only these
+    /// exact unchanged predecessors even if drain timed out. Old descendants
+    /// remain counted by subsequent transitions. Shutdown and stale tickets
+    /// still refuse; this never releases root admission or disposes an engine.
+    pub(crate) fn abort_before_effects(
+        self,
+    ) -> Result<HashMap<GraphKey, ServingEpoch>, ServingTransitionError> {
+        self.operations
+            .while_open(|| self.registry.abort_before_effects(&self.record))
+    }
+
+    /// Resume all original bindings after a proven pre-effect refusal. Any
+    /// changed engine contract refuses the entire batch.
+    pub(crate) fn resume_same_views(
+        self,
+    ) -> Result<HashMap<GraphKey, ServingEpoch>, ServingTransitionError> {
+        self.operations
+            .while_open(|| self.registry.resume_same_views(&self.record))
     }
 
     /// Install precisely the original bindings in a fresh epoch. This is not
-    /// schema/query replacement, native disposal, or lock-release authority.
+    /// native disposal or lock-release authority.
     pub fn resume_same_view(self) -> Result<ServingEpoch, ServingTransitionError> {
         self.operations
             .while_open(|| self.registry.resume_same_view(&self.record))
+    }
+}
+
+impl Drop for GraphTransition {
+    fn drop(&mut self) {
+        self.registry.discard_transition(&self.record);
     }
 }

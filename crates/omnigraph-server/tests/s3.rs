@@ -172,10 +172,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
             ),
         )
         .unwrap();
-        let import = omnigraph_cluster::import_config_dir(dir.path()).await;
-        assert!(import.ok, "{:?}", import.diagnostics);
-        let apply = omnigraph_cluster::apply_config_dir(dir.path()).await;
-        assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+        support::apply_cluster_fixture(dir.path()).await;
 
         let graph_uri = format!("{root}/graphs/knowledge.omni");
         let db = session(Omnigraph::open(&graph_uri).await.unwrap());
@@ -187,7 +184,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
         .unwrap();
     }
 
-    let settings = omnigraph_server::load_server_settings(
+    let mut settings = omnigraph_server::load_server_settings(
         Some(&std::path::PathBuf::from(&root)),
         None,
         true,
@@ -195,6 +192,17 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
     )
     .await
     .unwrap();
+    // This fixture calls the settings loader and opener independently. No
+    // engine has opened or issued work yet; settle the read-only settings owner
+    // before the independent opener takes its own exact admission. Production
+    // `serve` transfers that owner directly instead.
+    settings
+        .cluster_admission
+        .take()
+        .expect("v2 settings retain admission")
+        .release_after_settlement()
+        .await
+        .unwrap();
     let omnigraph_server::ServerConfigMode::Multi {
         graphs,
         config_path,
@@ -354,10 +362,7 @@ async fn server_boots_azure_cluster_from_bare_storage_uri_and_serves_query() {
             ),
         )
         .unwrap();
-        let import = omnigraph_cluster::import_config_dir(dir.path()).await;
-        assert!(import.ok, "{:?}", import.diagnostics);
-        let apply = omnigraph_cluster::apply_config_dir(dir.path()).await;
-        assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+        support::apply_cluster_fixture(dir.path()).await;
 
         let graph_uri = format!("{root}/graphs/knowledge.omni");
         let db = session(Omnigraph::open(&graph_uri).await.unwrap());
@@ -369,7 +374,7 @@ async fn server_boots_azure_cluster_from_bare_storage_uri_and_serves_query() {
         .unwrap();
     }
 
-    let settings = omnigraph_server::load_server_settings(
+    let mut settings = omnigraph_server::load_server_settings(
         Some(&std::path::PathBuf::from(&root)),
         None,
         true,
@@ -377,6 +382,17 @@ async fn server_boots_azure_cluster_from_bare_storage_uri_and_serves_query() {
     )
     .await
     .unwrap();
+    // This fixture calls the settings loader and opener independently. No
+    // engine has opened or issued work yet; settle the read-only settings owner
+    // before the independent opener takes its own exact admission. Production
+    // `serve` transfers that owner directly instead.
+    settings
+        .cluster_admission
+        .take()
+        .expect("v2 settings retain admission")
+        .release_after_settlement()
+        .await
+        .unwrap();
     let omnigraph_server::ServerConfigMode::Multi {
         graphs,
         config_path,

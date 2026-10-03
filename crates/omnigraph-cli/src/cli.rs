@@ -652,10 +652,10 @@ pub(crate) enum ClusterCommand {
         #[command(flatten)]
         managed: ManagedRunArgs,
     },
-    /// Apply a bundle: bootstrap and inventory changes on v1; schema and stored
-    /// query changes on v2. With --cluster ROOT and --deployment-id, reconcile
-    /// the original deployment without local source files. Serving activates
-    /// the applied revision after an `omnigraph-server --cluster` restart.
+    /// Apply a captured bundle through the v2 deployment ledger. --server
+    /// updates the running server without restarting; direct storage apply
+    /// requires stopped serving. With --cluster ROOT and --deployment-id,
+    /// reconcile the original deployment without local source files.
     Apply {
         /// Cluster config directory containing cluster.yaml.
         #[arg(long, default_value = ".")]
@@ -669,23 +669,15 @@ pub(crate) enum ClusterCommand {
         /// Original durable Core deployment identity; never allocates a retry.
         #[arg(long, conflicts_with = "plan")]
         deployment_id: Option<String>,
+        /// Core config apply only: JSON map from graph id to the exact observed
+        /// SchemaContractDigest being corrected (at most 16 MiB).
+        #[arg(long, conflicts_with = "plan")]
+        schema_correction: Option<PathBuf>,
         /// Attest prior writers and accepted graph/control I/O are quiescent.
         #[arg(long, requires = "deployment_id")]
         writers_stopped: bool,
         #[command(flatten)]
         managed: ManagedRunArgs,
-    },
-    /// Record a digest-bound approval for a gated (irreversible) change,
-    /// e.g. a graph delete. Requires the global --as actor.
-    Approve {
-        /// Typed resource address of the gated change (e.g. graph.scratch).
-        resource: String,
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
     },
     /// Read the cluster ledger without scanning live graphs; --cluster ROOT
     /// supports source-independent lookup of an exact --deployment-id.
@@ -735,28 +727,9 @@ pub(crate) enum ClusterCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Observe declared graphs and catalog payloads without the lock, the
-    /// recovery sweep, or a write: what `refresh` would record, labeled
-    /// `observed`, with the exact ledger CAS it read.
+    /// Inspect declared graphs and catalog payloads without acquiring writer
+    /// admission. Reports observed state with the exact ledger CAS it read.
     Observe {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Refresh existing local JSON state from declared graph observations.
-    Refresh {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Import initial local JSON state from declared graph observations.
-    Import {
         /// Cluster config directory containing cluster.yaml.
         #[arg(long, default_value = ".")]
         config: PathBuf,
@@ -804,8 +777,7 @@ pub(crate) struct ManagedRunArgs {
 /// Registry scope (RFC-011): these address the server itself, not a graph
 /// within it — `--server <name|url>` / `--profile <name>` apply, while
 /// `--graph`, `--store`, and `--as` are rejected by the addressing guard.
-/// To add or remove graphs, operators run `cluster apply` and restart the
-/// server — runtime mutation is not exposed.
+/// Use `cluster apply --server` to deploy graph additions and schema/query changes.
 #[derive(Debug, Subcommand)]
 pub(crate) enum GraphsCommand {
     /// List every graph registered with the multi-graph server.

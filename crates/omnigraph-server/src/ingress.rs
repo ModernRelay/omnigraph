@@ -133,6 +133,8 @@ pub(crate) async fn admit(
     let raw = receives_body && route == "/load/ndjson";
     let limit = if !receives_body {
         0
+    } else if route == "/cluster/deployments" {
+        crate::deployment::REQUEST_BYTES
     } else if route == "/mcp" {
         crate::mcp::REQUEST_BYTES
     } else if matches!(route, "/load/ndjson" | "/load" | "/ingest") {

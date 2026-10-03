@@ -98,6 +98,34 @@ impl IdentityAuthorization {
     pub fn actor(&self) -> &str {
         &self.actor
     }
+
+    pub(crate) fn has_bootstrap_authority(&self) -> bool {
+        self.bootstrap.is_some()
+    }
+
+    pub(crate) fn check_bootstrap_input(
+        &self,
+        config_digest: &str,
+        resources: &BTreeMap<String, String>,
+    ) -> Result<(), Diagnostic> {
+        let bootstrap = self.bootstrap.as_ref().ok_or_else(|| {
+            refusal(
+                "bootstrap_authority_required",
+                "bootstrap",
+                "initialization requires exact, explicitly granted bootstrap authority",
+            )
+        })?;
+        if bootstrap.initial_config_digest != config_digest
+            || &bootstrap.initial_resource_digests != resources
+        {
+            return Err(refusal(
+                "bootstrap_authority_mismatch",
+                "bootstrap",
+                "initial configuration differs from the explicitly authorized initialization",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -149,16 +177,6 @@ pub struct PlanAuthorization {
 #[derive(Debug, Clone, Serialize)]
 pub struct AuthorizedPlanOutput {
     pub plan: PlanOutput,
-    pub authorization: Option<PlanAuthorization>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AuthorizedApplyOutput {
-    pub apply: ApplyOutput,
-    /// `None` guarantees this call stopped before recovery, graph or catalog
-    /// effects (it may have acquired/released the cluster lock). `Some` records
-    /// completed preflight; later failure may have effects and needs the normal
-    /// recovery analysis. This says nothing about effects from earlier calls.
     pub authorization: Option<PlanAuthorization>,
 }
 
@@ -611,22 +629,15 @@ pub(crate) fn compare_authorization(
     let same_base = expected.state_revision == actual.state_revision
         && expected.state_cas == actual.state_cas
         && expected.applied_config_digest == actual.applied_config_digest;
-    // The existing explicit import initializes only the empty ledger between
-    // an absent-root bootstrap plan and its apply. No normal path gets this.
-    let bootstrap_import = expected.bootstrap
-        && actual.bootstrap
-        && expected.state_revision == 0
-        && expected.state_cas.is_none()
-        && actual.state_revision == 1
-        && actual.applied_config_digest.as_ref() == Some(&actual.desired_config_digest);
     if expected.version != 1
+        || expected.actor != actual.actor
         || expected.effects.len() > MAX_AUTHORIZATION_RESOURCES
         || expected.canonical_root != actual.canonical_root
         || expected.desired_config_digest != actual.desired_config_digest
         || expected.policy_digests != actual.policy_digests
         || expected.effects != actual.effects
         || expected.bootstrap != actual.bootstrap
-        || !(same_base || bootstrap_import)
+        || !same_base
     {
         return Err(refusal(
             "plan_authorization_stale",
@@ -726,8 +737,9 @@ pub async fn authorize_plan_read(
 
 /// Effect-free execution preflight for a trusted orchestrator. This checks the
 /// complete candidate against current applied policy before the caller writes
-/// its own execution artifacts. It does not acquire writer authority: the
-/// authorized apply entry point repeats the check under the cluster lock.
+/// its own execution artifacts. It is read-only evidence, never writer
+/// authority. V2 deployment independently rechecks current policy and scope
+/// under the root admission; legacy ledgers require explicit conversion.
 pub async fn authorize_apply_plan(
     config_dir: impl AsRef<Path>,
     identity: &IdentityAuthorization,
@@ -751,7 +763,23 @@ pub async fn authorize_apply_plan(
     let backend = store_for(&desired.config_dir, desired.storage_root.as_deref())?;
     let mut observations = backend.observations();
     let snapshot = backend.read_state(&mut observations).await?;
+    let captured = crate::capture_deployment(config_dir.as_ref(), &BTreeMap::new())?;
+    if captured.config_digest() != desired.config_digest {
+        return Err(refusal(
+            "resource_content_changed",
+            "configuration",
+            "candidate changed during authorization capture",
+        ));
+    }
     if let Some(state) = &snapshot.state {
+        if state.version != 2 {
+            return Err(refusal(
+                "ledger_upgrade_required",
+                CLUSTER_STATE_FILE,
+                "explicitly convert the stopped legacy ledger before planning deployment",
+            ));
+        }
+        crate::deployment::preview_deployment_scope(state, &captured)?;
         let mut diagnostics = Vec::new();
         if !validate_state_graph_resource_digests(state, &mut diagnostics) {
             return Err(diagnostics.remove(0));

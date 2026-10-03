@@ -137,14 +137,15 @@ different:
 
 ## Current support boundaries
 
-- The server is cluster-only. Runtime graph add/remove is performed by
-  v1 `cluster apply` followed by restart, not an HTTP mutation. Explicit
-  stopped-writer conversion to ledger v2 freezes inventory and bindings;
-  offline schema/query deployments use one outstanding durable authority and
-  retain exclusive cluster admission through completion and recovery. Server
-  activation still requires restart. Generic drain does not prove native-I/O
-  settlement or authorize lock release; older/raw/embedded writers outside
-  participating admission remain operator-excluded.
+- The server is cluster-only and ledger v2 is the sole operational protocol.
+  Server-owned apply activates schemas, stored queries and new graphs under the
+  existing writer admission; existing engines and runtime bindings stay owned.
+  Direct apply bootstraps or deploys while serving is stopped. Legacy ledger
+  conversion is explicit and preserves data; no v1 executor remains. Graph
+  deletion and replacement of existing runtime bindings are outside this class.
+  One outstanding durable authority owns completion/recovery. Generic drain
+  does not prove native-I/O settlement or authorize lock release; excluded raw
+  and older writers remain an operator obligation.
 - Azure writes require the admission wrapper and remain a qualification preview
   pending the adversarial live-Azure matrix. The narrower managed-identity
   smoke proof is complete.

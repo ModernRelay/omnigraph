@@ -16,6 +16,12 @@
 
 use tempfile::TempDir;
 
+#[path = "support/http_bench.rs"]
+mod http_bench;
+#[path = "support/http_perf_layout.rs"]
+mod http_perf_layout;
+#[path = "support/http_soak.rs"]
+mod http_soak;
 mod support;
 use support::*;
 
@@ -795,6 +801,167 @@ fn parity_export() {
         local_lines, remote_lines,
         "export: JSONL streams diverge (left=local, right=remote)"
     );
+
+    #[cfg(unix)]
+    assert_slow_export_and_baseline_complete(&p);
+}
+
+/// Exercise the actual Hyper/socket ownership boundary. A Tower body consumer
+/// cannot reproduce a transport retaining yielded chunks behind a full socket.
+#[cfg(unix)]
+fn assert_slow_export_and_baseline_complete(p: &Parity) {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::os::fd::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    let data = p._temp.path().join("slow-export.jsonl");
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&data).unwrap());
+    for row in 0..4096 {
+        serde_json::to_writer(
+            &mut file,
+            &serde_json::json!({
+                "type": "Person",
+                "data": {"name": format!("slow-{row:04}-{}", "x".repeat(2048)), "age": 12}
+            }),
+        )
+        .unwrap();
+        file.write_all(b"\n").unwrap();
+    }
+    file.flush().unwrap();
+    let (local, remote) = p.run(&[
+        "load",
+        "--mode",
+        "merge",
+        "--data",
+        data.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_write_parity("slow export fixture", &local, &remote);
+    let expected = output_success(cli().args(["export", "--store", p.local.to_str().unwrap()]));
+    assert!(
+        expected.stdout.len() > 8 * 1024 * 1024,
+        "fixture must exceed socket buffers"
+    );
+
+    let address = p.server.base_url.strip_prefix("http://").unwrap();
+    for route in ["export", "changes/baseline"] {
+        let mut socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        let receive_bytes: libc::c_int = 16 * 1024;
+        // SAFETY: the descriptor is live and the typed option points to a
+        // correctly sized, initialized integer throughout setsockopt.
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                std::ptr::from_ref(&receive_bytes).cast(),
+                std::mem::size_of_val(&receive_bytes) as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+        let request = r#"{"branch":"main"}"#;
+        write!(socket,
+            "POST /graphs/parity/{route} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer parity-tok\r\n{}: {}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{request}",
+            omnigraph_api_types::HTTP_API_CONTRACT_HEADER,
+            omnigraph_api_types::HTTP_API_CONTRACT,
+            request.len(),
+        ).unwrap();
+        let mut first = [0; 4096];
+        let count = socket.read(&mut first).unwrap();
+        assert!(count > 0);
+        let mut wire = first[..count].to_vec();
+        // A headers-only first read does not prove export production started.
+        // Consume a little body data before holding the receive window closed.
+        let first_body_deadline = Instant::now() + Duration::from_secs(15);
+        while !wire
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .is_some_and(|offset| wire.len() > offset + 4 + 64)
+        {
+            let remaining = first_body_deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "{route}: no response body arrived");
+            socket.set_read_timeout(Some(remaining)).unwrap();
+            let count = socket.read(&mut first).unwrap();
+            assert!(count > 0, "{route}: response closed before body data");
+            wire.extend_from_slice(&first[..count]);
+            assert!(wire.len() < 64 * 1024, "{route}: invalid response headers");
+        }
+        // This is a protocol-deadline regression, not a throughput threshold:
+        // socket backpressure must outlive the 250 ms admission timeout.
+        std::thread::sleep(Duration::from_secs(2));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "{route}: response did not complete");
+            socket.set_read_timeout(Some(remaining)).unwrap();
+            let count = socket.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            wire.extend_from_slice(&buffer[..count]);
+            assert!(
+                wire.len() <= 64 * 1024 * 1024,
+                "{route}: unexpected response growth"
+            );
+        }
+        let header_end = wire
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let headers = std::str::from_utf8(&wire[..header_end]).unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200"), "{route}: {headers}");
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("transfer-encoding: chunked")
+        );
+        let mut remaining = &wire[header_end..];
+        let mut body = Vec::new();
+        loop {
+            let end = remaining
+                .windows(2)
+                .position(|part| part == b"\r\n")
+                .unwrap_or_else(|| {
+                    panic!("{route}: truncated response without chunked terminator")
+                });
+            let count =
+                usize::from_str_radix(std::str::from_utf8(&remaining[..end]).unwrap(), 16).unwrap();
+            remaining = &remaining[end + 2..];
+            if count == 0 {
+                assert_eq!(remaining, b"\r\n", "{route}: invalid terminal chunk");
+                break;
+            }
+            assert!(remaining.len() >= count + 2, "{route}: incomplete chunk");
+            body.extend_from_slice(&remaining[..count]);
+            assert_eq!(&remaining[count..count + 2], b"\r\n");
+            remaining = &remaining[count + 2..];
+        }
+        if route == "changes/baseline" {
+            assert!(
+                body.starts_with(&expected.stdout),
+                "baseline snapshot changed"
+            );
+            let terminal: serde_json::Value =
+                serde_json::from_slice(&body[expected.stdout.len()..]).unwrap();
+            assert!(terminal["baseline"]["resume_cursor"].as_str().is_some());
+            assert!(
+                terminal["baseline"]["snapshot_commit_id"]
+                    .as_str()
+                    .is_some()
+            );
+        } else {
+            assert_eq!(body, expected.stdout, "slow export lost or changed rows");
+        }
+    }
 }
 
 #[test]
