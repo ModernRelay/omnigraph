@@ -16,7 +16,7 @@ offline storage conversion retains its separate intent and activation protocol.
 
 | Interrupted | What is on storage | Who finishes it |
 |---|---|---|
-| Before the manifest commit | Unreferenced detached Lance versions and possibly an unregistered original empty added-type dataset | The caller retries from a fresh capture. The collector reclaims detached versions only when their recorded publication authority is gone. Added-type retry preserves the existing path and qualifies its original Create as described in [writes.md](writes.md) |
+| Before the manifest commit | Unreferenced detached Lance versions and possibly an unregistered original empty added-type dataset | A replay-safe caller retries from a fresh capture. A durably accepted prepared schema invocation instead retains its original identity and uses settlement below. The collector reclaims detached versions only when their recorded publication authority is gone. Added-type retry preserves the existing path and qualifies its original Create as described in [writes.md](writes.md) |
 | After the manifest commit | Complete table pins and the accepted contract row in the branch's `__manifest` | No durable installation remains. Reads open the published pins and contract; refresh rebuilds disposable memory |
 | During explicit storage conversion | Main's pending intent, branch receipts and possibly partially deleted legacy contract files | Rerun the same upgrade-capable executable and target while the root remains offline; activation is last |
 
@@ -50,6 +50,20 @@ uses root schema files or a schema-apply sentinel. A proven publication is
 complete even if a later error interrupts adoption of the in-memory view.
 Lost acknowledgement remains a distinct outcome checked against the exact
 attempted publication, not evidence that the write lost.
+
+A durably recorded version-2 prepared schema intent fixes numeric manifest base
+`M` and can publish only at `M + 1`, including under head-preserving metadata
+contention. Its ordinary read-only reconciliation reports exact publication or
+`Unknown`; unknown is not permission to reissue it. After prior-owner and
+accepted-I/O quiescence, an authorized recovery owner persists the engine's
+neutral settlement intent before invocation. `settle_prepared_schema_as` can
+prove nonpublication from a verified occupant of `M + 1` or its own exact fence
+receipt. It adds no schema/data changes, never adopts foreign schema, and never
+rebases either contender. Missing evidence stays unresolved, while a stale
+no-op certificate can be refused without a fence. Version-1 prepared intents
+are rejected. See [writes.md](writes.md#mutation-and-load) for the two engine
+APIs and [control-plane.md](control-plane.md#deployment-ledger) for their
+durable cluster owner; neither result alone proves native-I/O settlement.
 
 Historical queries keep the accepted live contract and rebind its aliases by
 stable identity to the selected historical table image. Retained contract rows
@@ -125,6 +139,17 @@ attempt-local genesis before deciding the outcome:
   the committed graph;
 - an unavailable or mismatched proof returns `InitializationIndeterminate`
   and preserves initialization artifacts and the claim.
+
+Cluster deployment persists an engine-issued `PreparedGraphCreate` before
+invocation. Its claim binds the exact root, genesis and source/IR contract.
+Read-only reconciliation recognizes that birth or returns `Absent`/`Unknown`;
+matching schema text is insufficient. After explicit prior-owner quiescence,
+`settle_prepared_graph_create_after_quiescence` may remove only that token's
+unpublished empty creation artifacts. It preserves any manifest publication,
+foreign claim, advanced table, branch/ref/index state or malformed evidence.
+Cleanup keeps the claim until last and is repeatable after interruption; a
+successor uses a fresh token and identity. See the [deployment ledger](control-plane.md#deployment-ledger)
+for its admission and durable-result owner.
 
 Do not retry initialization or remove an indeterminate claim until every
 initializer for that root is quiescent and the root has been inspected. The

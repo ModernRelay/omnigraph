@@ -1243,7 +1243,7 @@ graphs:
     )
     .unwrap();
     std::fs::write(reserved.path().join("cluster.yaml"), cluster_yaml).unwrap();
-    let import = omnigraph_cluster::import_config_dir(reserved.path()).await;
+    let import = omnigraph_cluster::validate_config_dir(reserved.path());
     assert!(!import.ok, "{:?}", import.diagnostics);
     let parse_errors: Vec<&str> = import
         .diagnostics
@@ -1279,12 +1279,16 @@ graphs:
     )
     .unwrap();
     std::fs::write(rewritten.path().join("cluster.yaml"), cluster_yaml).unwrap();
-    let import = omnigraph_cluster::import_config_dir(rewritten.path()).await;
-    assert!(import.ok, "{:?}", import.diagnostics);
-    let apply = omnigraph_cluster::apply_config_dir(rewritten.path()).await;
-    assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+    support::apply_cluster_fixture(rewritten.path()).await;
 
-    let settings = cluster_settings(rewritten.path()).await.unwrap();
+    let mut settings = cluster_settings(rewritten.path()).await.unwrap();
+    settings
+        .cluster_admission
+        .take()
+        .unwrap()
+        .release_after_settlement()
+        .await
+        .unwrap();
     let omnigraph_server::ServerConfigMode::Multi {
         graphs,
         config_path,

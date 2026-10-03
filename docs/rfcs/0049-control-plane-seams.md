@@ -139,8 +139,9 @@ The accepted empty-cluster amendment in [RFC 0005](0005-server-cluster-boot.md)
 permits an actual applied zero-graph revision to report serving with all
 counts zero. Its real digest, positive ledger revision and CAS remain required;
 canonical-root and configured public-trust validation remain internal boot
-checks. A nonempty inventory is ready while any graph is ready, with degraded
-status if some are loading or blocked; no ready graph or draining is unready.
+checks. Loading keeps readiness at 503 even when a sibling is ready. After all
+startup attempts finish, a nonempty inventory is ready while any graph is ready,
+with degraded status if some are blocked; no ready graph or draining is unready.
 The listener starts after fixed configuration, admission and policy validation,
 before engine opening. A nonempty, entirely failed graph set still refuses
 startup after its attempts finish. `--require-all-graphs` retains successful
@@ -316,6 +317,10 @@ None that block acceptance. The default grace of 25 seconds matched the earlier
 RFC 0035 proposal; it is a default, not a contract.
 
 ## Decision log
+
+- 2026-10-03: Aggregate readiness remains unready throughout startup loading,
+  while completed healthy graphs may serve direct requests. Degraded readiness
+  applies after startup attempts finish; strict startup remains all-or-nothing.
 
 - 2026-10-03: Added initial loading visibility under the accepted server runtime
   decision. Configuration and policies precede listening; one bounded startup

@@ -474,10 +474,13 @@ async fn mcp_shares_response_lifetimes_closed_admission_and_the_status_lane() {
         json_response(&app, Request::get("/readyz").body(Body::empty()).unwrap()).await;
     assert_eq!(
         status,
-        StatusCode::OK,
-        "saturated data admission must leave status available"
+        StatusCode::SERVICE_UNAVAILABLE,
+        "saturated data admission must leave loading readiness observable"
     );
-    assert_eq!(ready["ready"], true);
+    assert_eq!(ready["ready"], false);
+    assert_eq!(ready["status"], "loading");
+    assert_eq!(ready["ready_graph_count"], 1);
+    assert_eq!(ready["loading_graph_count"], 1);
     drop(held);
     let view = state.routing().registry.list().pop().unwrap();
     let transition = state
@@ -520,6 +523,7 @@ async fn mcp_shares_response_lifetimes_closed_admission_and_the_status_lane() {
         json_response(&app, Request::get("/readyz").body(Body::empty()).unwrap()).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(ready["ready"], false);
+    assert_eq!(ready["status"], "draining");
     assert_eq!(
         app.oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
             .await

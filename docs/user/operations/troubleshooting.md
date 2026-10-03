@@ -108,9 +108,9 @@ files remain to be installed, so reopen read-write rather than retrying it.
 ## Storage-format mismatch
 
 If a graph was written by a different storage-format generation, the binary
-refuses to open it and names the required release line. Follow
-[Upgrading](upgrade.md): export with a compatible old binary, then initialize
-and load a new graph with the current binary.
+refuses to open it and names the required release line. Follow the qualified
+explicit routes in [Upgrading](upgrade.md) to preserve graph identity and history;
+normal open does not migrate or reset the graph.
 
 Do not edit internal metadata or copy files from individual backing datasets
 between graph roots.
@@ -118,28 +118,30 @@ between graph roots.
 ## Cluster failures
 
 - Run `cluster validate` before `plan` or `apply`.
-- A blocked graph deletion needs an approval for the exact current plan.
-- A stale lock may be removed only after proving no cluster operation is
-  running and supplying the exact lock ID to `cluster force-unlock`.
+- Graph deletion is outside the supported deployment class; no approval command
+  authorizes it.
+- A retained lock requires prior-owner and accepted-I/O quiescence, exclusion
+  of other admissions/unlocks, and its exact ID; follow
+  [ownership transfer](../deployment.md#writer-topology).
 - Directory boot reads `cluster.yaml` to resolve storage, but served graph,
-  query, and policy resources come from applied state; apply changes and
-  restart.
+  query, and policy resources come from applied state. Submit schema/query
+  changes and graph additions with `cluster apply --server` for live activation.
 - By default one graph that cannot open is quarantined while healthy graphs
   serve. Use `--require-all-graphs` when partial startup is unacceptable.
 - `external_blob_base_overlaps_storage_root`: an `external_blobs` base lies
   inside, or contains, the cluster storage root that holds every graph and the
-  applied state. Move the base to a sibling prefix, run `cluster apply`, and
-  restart the server; until then the server quarantines the graph, and fails
-  to start with `cluster_no_healthy_graphs` if every applied graph is
-  quarantined. See
+  applied state. For a new declaration, move the base to a sibling prefix before
+  applying. Existing external-Blob bindings cannot be replaced through the
+  current deployment class. An invalid applied binding keeps its graph blocked;
+  if every graph is blocked, startup fails with `cluster_no_healthy_graphs`. See
   [External Blob references](../clusters/config.md#external-blob-references).
 - `external_blob_storage_root_uncomparable`: the cluster storage root is
   spelled with a path component an external Blob base cannot express (an empty
   component, or a percent sign in a local path), so a base of the same storage
   kind cannot be proven to lie outside it. Moving the base does not help:
-  use a storage root without such a component, or remove the graph's bases of
-  that kind with `cluster apply`. Validation refuses the base, and the server
-  quarantines the graph, as for an overlap.
+  correct a new declaration before applying. Existing graph roots and Blob
+  bindings remain fixed. Validation refuses the base, and an invalid applied
+  binding keeps the graph blocked, as for an overlap.
 
 See [Operating a cluster](../clusters/index.md).
 

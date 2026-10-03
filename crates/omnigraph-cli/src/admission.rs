@@ -1,5 +1,5 @@
-//! One root admission per embedded CLI invocation, shared by every graph open.
-//! HTTP commands inherit their server's admission instead.
+//! Writable embedded commands share one root admission per CLI invocation.
+//! Read-only commands observe authority without a lock; HTTP uses its server.
 
 use std::{collections::BTreeMap, future::Future, sync::Arc};
 
@@ -15,6 +15,22 @@ tokio::task_local! {
 
 pub(crate) async fn scope<F: Future>(future: F) -> F::Output {
     COMMAND.scope(Owners::default(), future).await
+}
+
+/// Read commands never acquire writer admission or run the writable capability
+/// probe. Cluster authority is observed around the open, not held as a lease.
+pub(crate) async fn open_read_only(
+    uri: &str,
+    expected_state_cas: Option<&str>,
+) -> Result<omnigraph::db::Omnigraph> {
+    let authority = omnigraph_cluster::GraphReadAuthority::capture(uri, expected_state_cas)
+        .await
+        .map_err(report)?;
+    let db = omnigraph::db::Omnigraph::open_read_only(uri).await?;
+    if let Some(authority) = authority {
+        authority.validate_opened(&db).await.map_err(report)?;
+    }
+    Ok(db)
 }
 
 /// Acquire before the writable opener (including its capability probe), and

@@ -987,6 +987,19 @@ async fn stalled_export_refuses_a_second_cut_and_disconnect_releases_it() {
         let operations = state.operation_runtime().clone();
         let view = state.routing().registry.list().pop().unwrap();
         let app = build_app(state.clone());
+        // Enough encoded data for more than three transport frames even when
+        // small rows are coalesced into 64 KiB chunks.
+        let data = (0..128)
+            .map(|row| {
+                json!({
+                    "type": "Person",
+                    "data": {"name": format!("export-{row:03}-{}", "x".repeat(1024)), "age": 12}
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        load_commit(&app, &data).await;
         let request = || match door {
             "/export" => export_request(Vec::new()),
             _ => json_post(door, &json!({"branch": "main"})),
@@ -1026,7 +1039,6 @@ async fn stalled_export_refuses_a_second_cut_and_disconnect_releases_it() {
         .expect("disconnect must promptly release served-export ownership");
         let body = consume_export(response.into_body()).await;
         assert!(!body.is_empty());
-        drop(body);
         assert!(
             tokio::time::timeout(Duration::from_secs(5), operations.wait_logical_owners())
                 .await
@@ -1034,8 +1046,8 @@ async fn stalled_export_refuses_a_second_cut_and_disconnect_releases_it() {
         );
 
         // Retaining three yielded allocations exhausts this response's lane.
-        // Both real handlers report a stream error; baseline cannot append a
-        // usable cursor after snapshot production failed.
+        // Slow transports must backpressure beyond admission's 250 ms timeout,
+        // then deliver every row and the baseline cursor once credits return.
         let response = app.clone().oneshot(request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let mut stream = response.into_body().into_data_stream();
@@ -1049,14 +1061,35 @@ async fn stalled_export_refuses_a_second_cut_and_disconnect_releases_it() {
             );
             retained.push(chunk);
         }
-        let error = tokio::time::timeout(Duration::from_secs(5), stream.try_next())
-            .await
-            .expect("retained transport frames must fail within their credit deadline")
-            .unwrap_err();
-        assert!(error.to_string().contains("stream_export_retained_chunks"));
-        assert!(stream.try_next().await.unwrap().is_none());
-        drop(stream);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), stream.try_next())
+                .await
+                .is_err(),
+            "{door}: admitted transport backpressure must remain pending"
+        );
+        let mut completed = retained
+            .iter()
+            .flat_map(|chunk| chunk.iter().copied())
+            .collect::<Vec<_>>();
         drop(retained);
+        while let Some(chunk) = stream.try_next().await.unwrap() {
+            completed.extend_from_slice(&chunk);
+        }
+        drop(stream);
+        assert_eq!(
+            completed, body,
+            "{door}: backpressure changed the complete stream"
+        );
+        if door == "/changes/baseline" {
+            let terminal: Value = serde_json::from_slice(
+                completed
+                    .rsplit(|byte| *byte == b'\n')
+                    .find(|line| !line.is_empty())
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(terminal["baseline"]["resume_cursor"].as_str().is_some());
+        }
         assert!(
             tokio::time::timeout(Duration::from_secs(5), operations.wait_logical_owners())
                 .await

@@ -486,10 +486,10 @@ pub(crate) fn state_resource_digests(state: &ClusterState) -> BTreeMap<String, S
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn initial_import_state(desired: &DesiredCluster) -> ClusterState {
     ClusterState {
         version: 1,
-        mode: None,
         ledger_id: None,
         next_sequence: None,
         outstanding: None,
@@ -1232,7 +1232,7 @@ fn load_desired_captured(config_dir: &Path, capture: &mut SourceCapture) -> Load
     }
 }
 
-fn validate_external_blob_policy(
+pub(crate) fn validate_external_blob_policy(
     graph_id: &str,
     config: &ExternalBlobsConfig,
     storage_root: Option<&str>,
@@ -1451,12 +1451,12 @@ pub(crate) fn normalize_policy_target(value: &str) -> PolicyTarget {
     }
 }
 
-enum EmbeddingProviderTarget {
+pub(crate) enum EmbeddingProviderTarget {
     Provider(String),
     WrongKind(String),
 }
 
-fn normalize_embedding_provider_target(value: &str) -> EmbeddingProviderTarget {
+pub(crate) fn normalize_embedding_provider_target(value: &str) -> EmbeddingProviderTarget {
     if let Some(name) = value.strip_prefix("provider.embedding.") {
         EmbeddingProviderTarget::Provider(name.to_string())
     } else if value.contains('.') {

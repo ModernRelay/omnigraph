@@ -2,7 +2,9 @@ mod helpers;
 
 use std::fs;
 
-use omnigraph::db::{InitOptions, Omnigraph, ReadTarget};
+use omnigraph::db::{
+    GraphCreateReconciliation, InitOptions, Omnigraph, PreparedGraphCreate, ReadTarget,
+};
 use omnigraph_compiler::schema::parser::{parse_persisted_schema_contract, parse_schema};
 use omnigraph_compiler::{
     SchemaIR, SchemaIdentityDomain, compile_schema_shape, resolve_schema_ir, schema_ir_hash,
@@ -210,6 +212,127 @@ async fn schema_contract_integrity_refuses_mismatched_identity() {
                 .version(),
             before
         );
+    }
+}
+
+// Prepared birth is a storage-authority protocol, not query behavior: exercise
+// serialization, exact identity and absence of writes through the public engine.
+#[tokio::test]
+async fn prepared_graph_create_reconciles_only_its_own_exact_genesis() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let prepared = Omnigraph::prepare_graph_create(uri, TEST_SCHEMA)
+        .await
+        .unwrap();
+    let other = Omnigraph::prepare_graph_create(uri, TEST_SCHEMA)
+        .await
+        .unwrap();
+    assert_ne!(prepared.desired_contract(), other.desired_contract());
+    assert_ne!(prepared.graph_commit_id(), other.graph_commit_id());
+    assert_eq!(
+        fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "preparation has no storage effects"
+    );
+    assert_eq!(
+        Omnigraph::reconcile_prepared_graph_create(&prepared)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Absent
+    );
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    let encoded = serde_json::to_vec(&prepared).unwrap();
+    let prepared: PreparedGraphCreate = serde_json::from_slice(&encoded).unwrap();
+    prepared.validate().unwrap();
+    let db = Omnigraph::apply_prepared_graph_create(&prepared)
+        .await
+        .unwrap();
+    assert_eq!(&db.schema_contract_digest(), prepared.desired_contract());
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(snapshot.graph_manifest_version(), 1);
+    assert_eq!(snapshot.graph_head(None), Some(prepared.graph_commit_id()));
+    assert_eq!(
+        Omnigraph::reconcile_prepared_graph_create(&prepared)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Created {
+            graph_manifest_version: 1,
+            contract: prepared.desired_contract().clone(),
+        }
+    );
+    assert_eq!(
+        Omnigraph::reconcile_prepared_graph_create(&other)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Unknown
+    );
+    assert!(
+        Omnigraph::apply_prepared_graph_create(&other)
+            .await
+            .is_err()
+    );
+    assert!(
+        Omnigraph::apply_prepared_graph_create(&prepared)
+            .await
+            .is_err(),
+        "reconciliation is not replay"
+    );
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .graph_manifest_version(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn prepared_graph_create_rejects_mutated_serialized_input_before_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let prepared = Omnigraph::prepare_graph_create(dir.path().to_str().unwrap(), TEST_SCHEMA)
+        .await
+        .unwrap();
+    for (pointer, value) in [
+        ("/version", serde_json::json!(2)),
+        (
+            "/source",
+            serde_json::json!("node Different { key: String @key }"),
+        ),
+        ("/contract/schema_ir_hash", serde_json::json!("wrong")),
+        (
+            "/contract/schema_identity_domain",
+            serde_json::json!("not-a-domain"),
+        ),
+        (
+            "/genesis/lineage/graph_manifest_version",
+            serde_json::json!(2),
+        ),
+        (
+            "/genesis/lineage/parent_commit_id",
+            serde_json::json!("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        ),
+        (
+            "/genesis/lineage/graph_commit_id",
+            serde_json::json!("invalid"),
+        ),
+    ] {
+        let mut encoded = serde_json::to_value(&prepared).unwrap();
+        *encoded.pointer_mut(pointer).unwrap() = value;
+        let corrupted: PreparedGraphCreate = serde_json::from_value(encoded).unwrap();
+        assert!(corrupted.validate().is_err(), "{pointer}");
+        assert!(
+            Omnigraph::apply_prepared_graph_create(&corrupted)
+                .await
+                .is_err(),
+            "{pointer}"
+        );
+        assert!(
+            Omnigraph::reconcile_prepared_graph_create(&corrupted)
+                .await
+                .is_err(),
+            "{pointer}"
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0, "{pointer}");
     }
 }
 

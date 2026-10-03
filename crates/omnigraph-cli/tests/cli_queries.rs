@@ -973,7 +973,7 @@ fn queries_list_with_store_flag_errors() {
 #[test]
 fn queries_list_with_as_flag_errors() {
     // Read-only control verbs (`queries`, `policy`, `cluster status`, …) never
-    // read the actor; only `cluster apply`/`cluster approve` do. `--as` on a
+    // read the actor; only actor-bound `cluster apply` does. `--as` on a
     // non-attributing control verb must be a loud guard error, not a silently
     // dropped identity (PR #377 review follow-up).
     let output = output_failure(
@@ -1037,8 +1037,7 @@ fn converged_cluster_with_query(
         ),
     )
     .unwrap();
-    output_success(cli().arg("cluster").arg("import").arg("--config").arg(dir));
-    output_success(cli().arg("cluster").arg("apply").arg("--config").arg(dir));
+    apply_cluster_fixture(dir);
     temp
 }
 
@@ -1061,11 +1060,11 @@ fn queries_validate_exits_zero_on_clean_registry() {
 }
 
 #[test]
-fn cluster_import_rejects_a_broken_query_naming_it_and_where() {
+fn cluster_apply_rejects_a_broken_query_naming_it_and_where() {
     // In the cluster model a stored query is checked at the cluster boundary
-    // (import/apply), so a broken query can never reach the applied state
+    // (apply), so a broken query can never reach the applied state
     // `queries validate` reads — the gate is upstream. `Widget` is not in the
-    // fixture schema, so import must reject `ghost`, naming it; `broken` does
+    // fixture schema, so apply must reject `ghost`, naming it; `broken` does
     // not parse, and the human report also says where, from the diagnostic.
     let cases: [(&str, &str, &[&str]); 2] = [
         (
@@ -1095,7 +1094,7 @@ fn cluster_import_rejects_a_broken_query_naming_it_and_where() {
             ),
         )
         .unwrap();
-        let output = output_failure(cli().arg("cluster").arg("import").arg("--config").arg(dir));
+        let output = output_failure(cli().arg("cluster").arg("apply").arg("--config").arg(dir));
         let combined = format!(
             "{}{}",
             stdout_string(&output),
@@ -1104,7 +1103,7 @@ fn cluster_import_rejects_a_broken_query_naming_it_and_where() {
         for needle in expected {
             assert!(
                 combined.contains(needle),
-                "cluster import must reject `{name}` with {needle:?}; got:\n{combined}"
+                "cluster apply must reject `{name}` with {needle:?}; got:\n{combined}"
             );
         }
     }
@@ -1282,8 +1281,7 @@ fn queries_validate_graph_filter_selects_one_graph() {
     let temp = tempdir().unwrap();
     let dir = temp.path();
     write_multi_graph_cluster_fixture(dir);
-    output_success(cli().arg("cluster").arg("import").arg("--config").arg(dir));
-    output_success(cli().arg("cluster").arg("apply").arg("--config").arg(dir));
+    apply_cluster_fixture(dir);
     let output = output_success(
         cli()
             .arg("queries")

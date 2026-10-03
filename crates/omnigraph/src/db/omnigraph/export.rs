@@ -441,10 +441,23 @@ where
     Emit: FnMut(Vec<u8>) -> EmitFuture,
     EmitFuture: Future<Output = Result<()>>,
 {
+    let mut chunks = ExportChunks {
+        emit,
+        pending: Vec::new(),
+    };
     for table_key in selected_tables {
-        export_table(db, snapshot, catalog, table_key, row_order, ranged, emit).await?;
+        export_table(
+            db,
+            snapshot,
+            catalog,
+            table_key,
+            row_order,
+            ranged,
+            &mut chunks,
+        )
+        .await?;
     }
-    Ok(())
+    chunks.flush().await
 }
 
 fn export_type_keys(snapshot: &Snapshot, type_names: &[String]) -> Result<Vec<String>> {
@@ -488,7 +501,7 @@ async fn export_table<Emit, EmitFuture>(
     table_key: &str,
     row_order: ExportRowOrder,
     ranged: RangedExternalBlobs,
-    emit: &mut Emit,
+    emit: &mut ExportChunks<'_, Emit>,
 ) -> Result<()>
 where
     Emit: FnMut(Vec<u8>) -> EmitFuture,
@@ -621,7 +634,7 @@ async fn emit_export_row<Emit, EmitFuture>(
     row: &RecordBatch,
     blob_properties: &std::collections::HashSet<String>,
     ranged: RangedExternalBlobs,
-    emit: &mut Emit,
+    emit: &mut ExportChunks<'_, Emit>,
 ) -> Result<()>
 where
     Emit: FnMut(Vec<u8>) -> EmitFuture,
@@ -839,7 +852,7 @@ async fn emit_export_rows_from_batch<Emit, EmitFuture>(
     table_key: &str,
     batch: &RecordBatch,
     blob_values: Option<&HashMap<String, Vec<Option<LogicalBlobValue>>>>,
-    emit: &mut Emit,
+    emit: &mut ExportChunks<'_, Emit>,
 ) -> Result<()>
 where
     Emit: FnMut(Vec<u8>) -> EmitFuture,
@@ -878,7 +891,7 @@ where
                 line.extend_from_slice(b",\"data\":");
                 line.extend_from_slice(&data);
                 line.extend_from_slice(b"}\n");
-                emit_export_line(emit, line).await?;
+                emit.line(line).await?;
             }
         }
         return Ok(());
@@ -920,7 +933,7 @@ where
                 line.extend_from_slice(b",\"data\":");
                 line.extend_from_slice(&data);
                 line.extend_from_slice(b"}\n");
-                emit_export_line(emit, line).await?;
+                emit.line(line).await?;
             }
         }
         return Ok(());
@@ -938,19 +951,51 @@ fn json_string_into(out: &mut Vec<u8>, value: &str) -> Result<()> {
     })
 }
 
-async fn emit_export_line<Emit, EmitFuture>(emit: &mut Emit, line: Vec<u8>) -> Result<()>
-where
-    Emit: FnMut(Vec<u8>) -> EmitFuture,
-    EmitFuture: Future<Output = Result<()>>,
-{
-    for chunk in line.chunks(EXPORT_CHUNK_MAX_BYTES) {
-        emit(chunk.to_vec()).await?;
-    }
-    Ok(())
+/// One pending transport allocation, shared by consecutive JSON lines and
+/// tables. A full chunk moves into the callback before another buffer is
+/// allocated, so an awaited send never retains a second pending chunk here.
+struct ExportChunks<'a, Emit> {
+    emit: &'a mut Emit,
+    pending: Vec<u8>,
 }
 
-/// Rows rendered per writer call on export, so the first line leaves before a
-/// whole scanner batch is rendered.
+impl<Emit> ExportChunks<'_, Emit> {
+    async fn line<EmitFuture>(&mut self, line: Vec<u8>) -> Result<()>
+    where
+        Emit: FnMut(Vec<u8>) -> EmitFuture,
+        EmitFuture: Future<Output = Result<()>>,
+    {
+        let mut remaining = line.as_slice();
+        while !remaining.is_empty() {
+            if self.pending.capacity() == 0 {
+                self.pending = Vec::with_capacity(EXPORT_CHUNK_MAX_BYTES);
+            }
+            let count = remaining
+                .len()
+                .min(EXPORT_CHUNK_MAX_BYTES - self.pending.len());
+            self.pending.extend_from_slice(&remaining[..count]);
+            remaining = &remaining[count..];
+            if self.pending.len() == EXPORT_CHUNK_MAX_BYTES {
+                self.flush().await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn flush<EmitFuture>(&mut self) -> Result<()>
+    where
+        Emit: FnMut(Vec<u8>) -> EmitFuture,
+        EmitFuture: Future<Output = Result<()>>,
+    {
+        if !self.pending.is_empty() {
+            (self.emit)(std::mem::take(&mut self.pending)).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Rows rendered per JSON writer call before filling transport chunks, rather
+/// than rendering a whole scanner batch into one scratch allocation.
 const EXPORT_RENDER_ROWS: usize = 256;
 
 fn render_windows(rows: usize) -> impl Iterator<Item = std::ops::Range<usize>> {

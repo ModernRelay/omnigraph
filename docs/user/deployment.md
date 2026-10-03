@@ -10,7 +10,7 @@ deployment bundle.
 
 Servers use the v0.12 HTTP contract and open graph storage format v13. The
 cluster ledger has a separate version: explicitly converting it to v2 preserves
-graph data and history. See [offline deployments](clusters/index.md#durable-offline-deployments).
+graph data and history. See [cluster deployments](clusters/index.md).
 
 ## Binary
 
@@ -32,17 +32,19 @@ OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-service":"secret"}' \
 ```
 
 Use `GET /healthz` for process health and `GET /readyz` for readiness:
-`/readyz` reports `loading` (none ready while startup is pending), `serving`,
+`/readyz` reports `loading` (startup is still pending), `serving`,
 `degraded` (some graphs unavailable), `blocked` (none ready), or `draining`.
 It includes the applied `config_digest` it booted from
 (`booted_serving_digest`), the ledger revision, and `served_graph_count`,
 `ready_graph_count`, `loading_graph_count` and `blocked_graph_count`.
 `served_graph_count` counts the whole registry. Graphs closed for a transition also
-contribute to `blocked_graph_count`. Readiness returns 200 when at least one
-graph is ready or the applied inventory is empty, and 503 when all graphs are
-unavailable or shutdown has begun. The listener opens after configuration and
+contribute to `blocked_graph_count`. Readiness stays 503 while any graph is
+loading. Once startup finishes, it returns 200 when at least one graph is ready
+or the applied inventory is empty, and 503 when all graphs are unavailable or
+shutdown has begun. The listener opens after configuration and
 authorization validation, before graphs open. Healthy graphs become available
-as they finish loading. A nonempty cluster with no healthy graph exits with a
+as they finish loading, while readiness holds aggregate traffic until loading
+finishes. A nonempty cluster with no healthy graph exits with a
 startup error after its opening attempts finish. With `--require-all-graphs`,
 all graphs remain unavailable until every graph opens successfully; any failure
 stops the server. Wait for readiness before sending data requests: the printed
@@ -61,9 +63,11 @@ storage problem and restart; `wait_for_restart` describes shutdown.
 admission. It promises no retry time and does not trigger another open.
 `wait_for_transition` means that graph's admissions are closed while its owner
 finishes a transition. Wait for that owner, or restart if the transition was
-abandoned or expired; there is no promised retry time. The current transition
-can resume only the same serving bindings. Schema/query deployments still need
-an explicit restart. Ready entries use `none`. There is no separate `quarantined` list or automatic startup retry.
+abandoned or expired; there is no promised retry time. Other ready graphs can
+continue serving and transitioning. Server-owned deployments activate schema and
+stored-query changes through this transition; a proved pre-effect refusal restores
+the unchanged views. See [live deployment](clusters/index.md#deploy-without-restarting).
+Ready entries use `none`. There is no separate `quarantined` list or automatic startup retry.
 Known loading, blocked or transitioning graphs return 503 (`graph_unavailable`) to callers authorized to
 read `main` or list the management inventory; other callers cannot use this response to discover
 them. Unknown graphs return 404. A 503 does not authorize replaying a write.
@@ -131,7 +135,9 @@ configure both byte limits when setting an instance's input budget.
 Body timeouts above 86400 seconds also warn and use the 30-second default.
 Ingress reserves the route's maximum before reading, then reduces the reservation
 to the actual body size. Body collection limits remain 1 MiB for ordinary JSON
-requests, 32 MiB for bulk load/ingest and 64 KiB for MCP. MCP uses the read-body
+requests, 32 MiB for bulk load/ingest and 64 KiB for MCP. Cluster deployment POSTs
+allow 16 MiB plus 1 KiB for the request envelope; the captured bundle itself is
+limited to 16 MiB. MCP uses the read-body
 lane after authentication. Registered bulk routes alone
 receive the larger limit; a stored query named `load` or `ingest` keeps the
 ordinary JSON limit. Stored-query admission uses the registry's typed read/write
@@ -154,8 +160,8 @@ process allowance, permitting eight simultaneous reservations. Each response
 allows three outstanding 64 KiB chunks plus one pending producer chunk; at most
 two chunks wait in its queue. Yielded chunks, including retained clones and
 slices, keep their reservation until released. A new response waits at most
-250 ms for process capacity before HTTP 413. A producer waits at most 250 ms
-for exhausted chunk credits before failing the stream; ordinary queue
+250 ms for process capacity before HTTP 413. Once admitted, a producer waits
+for chunk capacity or disconnect without a per-chunk deadline; ordinary queue
 backpressure has no additional deadline. An interrupted baseline supplies no
 usable terminal cursor. Consumers must release each received server buffer to
 continue; an in-process consumer retaining every buffer can exhaust its lane.
@@ -213,8 +219,9 @@ Set `AWS_ALLOW_HTTP=true` only for a trusted local development endpoint. Do not
 put credentials in `cluster.yaml` or graph URIs.
 
 The same storage root must be visible to servers and out-of-band cluster or
-maintenance jobs. Apply changes before restarting servers; the root's applied
-revision is the deployment artifact.
+maintenance jobs. Submit schema/query changes and graph additions to the running
+server with `cluster apply --server`; the root's applied revision remains the
+deployment artifact. Direct apply requires ownership transfer before serving.
 
 ## Azure Blob preview
 
@@ -257,14 +264,21 @@ been identified and stopped.
 
 Run one mutation-capable writer process per cluster. This includes servers,
 direct CLI writes, deployments, branch controls, and maintenance. On a v2
-cluster, supported server and direct CLI paths acquire the same exclusive
-cluster admission before graph work and recheck the applied inventory. An
-outstanding deployment admits only reconciliation of its exact original ID.
+cluster, supported servers and direct CLI writers acquire the same exclusive
+cluster admission before writable graph work and recheck the applied inventory.
+CLI queries, exports, schema inspection/planning, lint and stored-query
+validation check the applied identity without acquiring or changing that lock;
+they refuse outstanding deployments or schema drift. Native maintenance,
+including `repair` preview, uses writer admission. An outstanding deployment
+admits only reconciliation of its exact original ID.
 Keep older binaries, raw storage tools and embedded writers outside this
 cooperating boundary stopped; the lock cannot fence their native storage I/O.
 
-Admission remains held after ordinary command success, a completed deployment,
-server shutdown, failure or abandonment. A finished response, zero active HTTP
+Admission remains held after an ordinary write command succeeds, a deployment
+completes, or server work ends without settlement proof. A completed read-only
+preflight refusal during new deployment, conversion or admission construction
+releases its admission. Recovery of accepted work, cancellation and uncertain
+effects retain it. A finished response, zero active HTTP
 requests, lock age or a stopped PID alone does not prove that previously
 accepted storage writes have settled. Before transferring ownership, stop the
 prior owner and establish that its graph work and control-store I/O are terminal.
@@ -273,9 +287,9 @@ finishes. Then start the next owner. Use the root-addressed
 [status and recovery commands](clusters/index.md#inspect-and-recover-a-deployment)
 to obtain the lock ID; unlocking never resolves an uncertain deployment.
 
-On a v1 cluster, the state lock still serializes control operations only;
-operators provide graph-writer exclusion. Convert explicitly before relying on
-the v2 admission behavior.
+A legacy v1 ledger refuses ordinary serving and writes. Stop its previous
+owners and explicitly [convert the ledger](clusters/index.md#direct-deployments-and-conversion)
+before using the current admission protocol.
 
 Read replicas and zero-downtime overlapping writer replicas are not currently a
 supported topology. Prefer stop-then-start replacement for a mutation-capable

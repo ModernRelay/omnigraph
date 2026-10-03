@@ -331,10 +331,10 @@ these cutovers:
 
 - **New graph ID in the same cluster.** Add (for example)
   `knowledge_next` with the desired schema, query, provider, and policy
-  bindings. Validate, plan, and apply so the cluster creates its derived root.
-  Load the export into `<cluster-root>/graphs/knowledge_next.omni`, restart,
-  verify the new ID, and move clients to it. Remove the old declaration only
-  after the retention window, using the normal approved-delete workflow.
+  bindings. Validate, plan, and submit `cluster apply --server` so the running
+  owner creates and activates its derived root. Load through that server, verify
+  the new ID, and move clients to it. Preserve the old declaration: graph deletion
+  is outside the current deployment class.
 - **Same graph ID in a parallel cluster root.** Copy the source bundle, set a
   new `storage` root, and keep the original cluster untouched. Validate, plan,
   and apply the new bundle; load the export into its derived graph root; then

@@ -24,7 +24,7 @@ The invariants behind these rules are in [invariants.md](invariants.md). Lance-d
 | `omnigraph-catalog` | In-source tests (52 today): `crates/omnigraph-catalog/src/tests.rs` for `__manifest` publication, state and lineage, plus in-file tests in `migrations.rs` and `retention.rs` | Module-local fixtures; `omnigraph-core`'s `test-util` helpers |
 | `omnigraph-engine` | `crates/omnigraph/tests/` plus focused in-source tests | `tests/helpers/` and `tests/fixtures/` |
 | `omnigraph-policy` | In-source Cedar policy parsing and evaluation tests | Module-local fixtures |
-| `omnigraph-cluster` | In-source lifecycle, offline deployment and admission tests; `tests/failpoints.rs`; `tests/identity_recovery.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
+| `omnigraph-cluster` | In-source lifecycle, deployment and admission tests; `tests/failpoints.rs`; `tests/identity_recovery.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
 | `omnigraph-server` | `crates/omnigraph-server/tests/` | `tests/support/mod.rs` |
 | `omnigraph-cli` | `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
 | `omnigraph-dst` | `crates/omnigraph-dst/tests/` (`scenarios.rs`, `lane_b.rs`, `torn_init.rs`) plus in-source proofs | Crate-local fixtures. Deterministic simulation; needs `--cfg tokio_unstable` (the workspace `.cargo/config.toml` sets it for every build; the default workspace gate excludes the crate by name). Run from `crates/omnigraph-dst`: its `[env]`-only `.cargo/config.toml` supplies the pool trio that `require_pool_env` asserts at process start. `#[ignore]`d tests are fleet/hunt instruments driven by the DST workflows |
@@ -122,6 +122,11 @@ The guards pin only substrate behavior OmniGraph actually depends on: version an
 
 ## Server and CLI ownership
 
+CLI `system_remote` runs the actual CLI, server and fault proxy in the ordinary
+workspace gate; its required-cell checks reject removed or ignored cases. The
+lost-delivery matrix covers disconnect, truncated response, proxy 504 and caller
+timeout without replaying a committed merge.
+
 Server suites are organized by public route: `auth_policy`, `data_routes`, `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings`, object-store coverage in `s3`, and the generated contract in `openapi`.
 
 Per-graph serving transitions extend these owners: in-source `registry` tests
@@ -129,11 +134,15 @@ own capture/close ordering, deadlines, schema identity and candidate bounds;
 `operations`, `ingress` and `mcp` own detached execution and output lifetimes.
 `stored_queries` parks a request before engine capture, `data_routes` retains
 disconnected writes and stream bytes, and `boot_settings`/`mcp` check authorized
-availability. These prove unchanged-view resumption, not native settlement.
+availability. The same owners cover coherent schema/query batch activation; these assertions
+are not generic native settlement. Server `boot_settings` exercises authenticated
+submission, parked requests, caller disconnect, pre-effect refusal and historical
+ID observation. CLI `cli_cluster_e2e` proves one PID/listener survives schema/query
+replacement and graph addition while an unaffected peer keeps serving.
 
 CLI suites own their named planes: cluster lifecycle, data commands, stored queries, schema/config, cross-version rebuild, embedded/remote parity, and local/remote system journeys. Keep `OMNIGRAPH_HOME` hermetic by using `tests/support::cli()` or `cli_process()`.
 
-Offline deployment tests extend these owners: cluster `tests.rs` pins no-reset
+Deployment tests extend these owners: cluster `tests.rs` pins no-reset
 ledger conversion, captured source bytes, exact-ID lookup, bounded results and
 exact applied schema identity after receipt eviction; `admission.rs` pins lifetime
 exclusion and exact reconciliation admission. Cluster `tests/failpoints.rs` owns
@@ -314,6 +323,107 @@ OMNIGRAPH_UPDATE_OPENAPI=1 \
 Commit the generated file with the API change. CI checks drift; it never updates the file.
 
 ## Cost tests and benchmarks
+
+The ignored `parity_matrix::http_soak::mixed_http_soak` instrument reuses the
+CLI parity fixture to drive a real HTTP server with light reads, unique writes,
+and export/baseline consumers that throttle, pause and abandon bodies. Run
+`OMNIGRAPH_HTTP_SOAK_SECONDS=60 cargo test -p omnigraph-cli --locked --test parity_matrix http_soak::mixed_http_soak -- --exact --ignored --nocapture`.
+The duration accepts 10–600 seconds; final requests have bounded deadlines.
+It checks complete snapshots, baseline cursors, exact final writes against
+received receipts, all three consumer modes and peer progress during admitted
+streams. A structured `stream_export_slots` refusal is counted as refused work;
+other unexpected failures remain failures. The final read-only export waits at
+most 20 seconds for that exact refusal after abandoned consumers, and reports
+its refusal count and admission wait; mutations are never retried.
+Its `HTTP_SOAK` JSON reports every attempt
+(including refusals, unknown outcomes and intentional abandonment), latency
+percentiles (including client delays and validation), isolated/recovery reads
+and sampled server RSS with quarter medians where available.
+This local, closed-loop diagnostic establishes neither capacity/fairness bounds,
+a memory envelope, backend qualification nor an authoritative benchmark record.
+
+`parity_matrix::http_bench::controlled_http_comparison` is the companion fixed-state
+diagnostic. Set `OMNIGRAPH_HTTP_BENCH_CONFIG` to a JSON file naming an empty output
+directory, explicit baseline/current server executables and fixture CLI, each
+with a release build receipt whose `binary_sha256` matches the executable.
+The config also declares `abba_blocks`, `query_samples` and `export_samples`
+(the full comparison uses 3, 500 and 8). It builds equal-content bulk,
+1,000-commit fragmented and publicly optimized fixtures, then restores identical
+bytes at one stable path for both servers. Every fresh process runs 25 query
+and two export warmups before serial timed requests; client verification is
+outside timing. Per-repetition JSON retains raw durations, validation counts,
+RSS phases, post-idle observations and physical/logical identities. The optimized
+state is a maintenance bundle, not an isolated compaction treatment. Copies,
+byte verification and warmups condition caches; OS cache residency is unproved.
+This local diagnostic is not an RFC 0039 archive record or a CI performance gate.
+Children clear the inherited environment and use an explicit 100 MiB Lance pool
+for both server arms and fixture preparation; the session records this environment.
+Do not compare its numbers directly with a Cargo-launched soak using the
+workspace's 1 GiB pool.
+
+For example, save this as `/tmp/http-comparison.json`, substituting absolute
+paths to the release binaries and their build receipts. Receipts also record
+clean source commit/tree, compiler and build command, features/profile,
+Cargo lock/config digests and Rust flags; the analyzer checks their consistency.
+The output directory must be new or empty. Build each revision in a clean
+checkout with identical settings, then preserve its binaries and receipt before
+building the other revision. Clear workspace test-only Rust flags for the SUT:
+
+```bash
+env -u CARGO_ENCODED_RUSTFLAGS RUSTFLAGS= cargo build --release --locked -p omnigraph-server -p omnigraph-cli
+```
+
+```json
+{
+  "output": "/tmp/http-comparison",
+  "baseline": {"binary": "/abs/baseline/omnigraph-server", "receipt": "/abs/baseline/server-build.json"},
+  "current": {"binary": "/abs/current/omnigraph-server", "receipt": "/abs/current/server-build.json"},
+  "fixture_cli": {"binary": "/abs/current/omnigraph", "receipt": "/abs/current/cli-build.json"},
+  "abba_blocks": 3,
+  "query_samples": 500,
+  "export_samples": 8
+}
+```
+
+```bash
+OMNIGRAPH_HTTP_BENCH_CONFIG=/tmp/http-comparison.json cargo test -p omnigraph-cli --locked --test parity_matrix http_bench::controlled_http_comparison -- --exact --ignored --nocapture
+python3 scripts/analyze-http-perf.py /tmp/http-comparison
+```
+
+Use `abba_blocks: 1`, `query_samples: 20`, `export_samples: 1` for a driver
+smoke check, with a separate output directory. Analysis writes `analysis.json`
+and `analysis.md` beside the raw records; smoke data is descriptive only.
+
+The separate `http_bench::retention::fixed_state_http_retention` instrument reuses
+a completed comparison's fragmented fixture and current executable. Its
+`OMNIGRAPH_HTTP_RETENTION_CONFIG` JSON contains `fixture_session`, a new empty
+`output`, `seconds` and `repetitions`; use 300 seconds and two repetitions
+(10 seconds and one repetition are allowed for smoke checks). Two serial readers
+run alongside one export/baseline consumer cycling fast, paused and abandoned
+responses, with no writes. Each fresh process records raw reader durations,
+stream outcomes, RSS timestamps, final snapshot admission wait, recovery reads
+and ten seconds of idle sampling. Both instruments fail on incomplete content
+or physical fixture changes. Retention samples describe this bounded workload;
+they do not establish a leak rate or memory bound.
+
+After the comparison completes, save `/tmp/http-retention.json`:
+
+```json
+{
+  "fixture_session": "/tmp/http-comparison",
+  "output": "/tmp/http-retention",
+  "seconds": 300,
+  "repetitions": 2
+}
+```
+
+```bash
+OMNIGRAPH_HTTP_RETENTION_CONFIG=/tmp/http-retention.json cargo test -p omnigraph-cli --locked --test parity_matrix http_bench::retention::fixed_state_http_retention -- --exact --ignored --nocapture
+python3 scripts/analyze-http-retention.py /tmp/http-retention
+```
+
+Keep the source fixture directory at its original path and run its consumers
+sequentially: both instruments restore the same active graph URI.
 
 Correctness tests may assert deterministic logical or object-store operation counts when the count is part of the design contract. Wall time and peak RSS depend on the host and belong in the `omnigraph-bench` scenario harness; benchmark results are evidence rather than pass/fail assertions. Declarative benchmark cases and suites live under `benchmarks/`; the engine's deterministic benchmark contracts remain in `crates/omnigraph/tests/`.
 

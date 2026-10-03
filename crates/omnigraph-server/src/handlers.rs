@@ -74,7 +74,8 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
 /// is serving or draining, the applied `config_digest` it booted from, the
 /// ledger revision and CAS it read, and registry/ready/loading/blocked counts. Graph
 /// ids stay behind authenticated catalog endpoints. Partial availability is
-/// ready but degraded; no available graph or shutdown returns 503. A valid
+/// ready but degraded after loading finishes; loading, no available graph or
+/// shutdown returns 503. A valid
 /// empty registry is ready. `/healthz` reports liveness independently.
 #[utoipa::path(
     get,
@@ -83,7 +84,7 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
     operation_id = "readiness",
     responses(
         (status = 200, description = "Serving", body = ReadinessOutput),
-        (status = 503, description = "No graph available or stopping", body = ReadinessOutput),
+        (status = 503, description = "Graphs loading, no graph available or stopping", body = ReadinessOutput),
     ),
 )]
 pub(crate) async fn server_ready(
@@ -102,16 +103,17 @@ pub(crate) async fn server_ready(
         .filter(|entry| matches!(entry, GraphEntry::Loading(_)))
         .count();
     let blocked_graph_count = served_graph_count - ready_graph_count - loading_graph_count;
-    let ready = !draining && (served_graph_count == 0 || ready_graph_count > 0);
+    let ready =
+        !draining && loading_graph_count == 0 && (served_graph_count == 0 || ready_graph_count > 0);
     let output = ReadinessOutput {
         ready,
         status: if draining {
             "draining"
-        } else if !ready && loading_graph_count > 0 {
+        } else if loading_graph_count > 0 {
             "loading"
         } else if !ready {
             "blocked"
-        } else if blocked_graph_count > 0 || loading_graph_count > 0 {
+        } else if blocked_graph_count > 0 {
             "degraded"
         } else {
             "serving"
@@ -307,6 +309,8 @@ const ALWAYS_FLAT_PATHS: &[&str] = &[
     "/readyz",
     "/graphs",
     "/graphs/discovery",
+    "/cluster/deployments",
+    "/cluster/deployments/{id}",
     "/.well-known/oauth-protected-resource",
 ];
 
@@ -645,7 +649,7 @@ pub(crate) fn authorize(
         //   return 403. Closes the "configured auth but forgot the
         //   policy file" trap from MR-723.
         // * Either of the above with a **server-scoped** action
-        //   (`graph_list`, future `graph_create`/`graph_delete`).
+        //   (`graph_list`, `config_manage`).
         //
         // Server-scoped actions are always denied here, regardless of
         // mode or actor presence. The management surface leaks server
@@ -656,25 +660,23 @@ pub(crate) fn authorize(
         // runtime state means the docstring contract on
         // `server_graphs_list` ("don't leak the registry until the
         // operator explicitly authorizes it") holds uniformly; the
-        // operator's only path to enabling it is configuring a
-        // cluster-scoped policy bundle, applying the cluster, and
-        // restarting the server.
+        // cluster must be bootstrapped with an explicit cluster-scoped
+        // policy bundle. This deployment class keeps that binding fixed.
         if request.action.resource_kind() == PolicyResourceKind::Server {
             return Ok(Authz::Denied(
-                "server-scoped actions require an explicit cluster policy bundle \
-                 applied with `omnigraph cluster apply` and served after restart — \
-                 the management surface is closed by default in every runtime state, \
-                 including --unauthenticated, so that server topology is never exposed \
-                 without operator opt-in."
+                "server-scoped actions require an applied cluster policy permit; \
+                 declare the cluster policy when bootstrapping. Existing policy bindings \
+                 cannot be changed by this deployment class. The management surface \
+                 is closed by default, including with --unauthenticated."
                     .to_string(),
             ));
         }
         if actor.is_some() && request.action != PolicyAction::Read {
             return Ok(Authz::Denied(
                 "server runs in default-deny mode (bearer tokens configured but no \
-                 applied policy bundle). Only `read` actions are permitted; configure \
-                 a graph or cluster policy bundle in the cluster config, run \
-                 `omnigraph cluster apply`, and restart the server to enable other actions."
+                 applied policy bundle). Only `read` actions are permitted. Other \
+                 actions require an applied graph policy; changing existing policy \
+                 bindings is outside the supported deployment class."
                     .to_string(),
             ));
         }
@@ -2106,7 +2108,7 @@ pub(crate) async fn server_schema_get(
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Schema apply is disabled for cluster-backed serving; use `omnigraph cluster apply` and restart", body = ErrorOutput),
+        (status = 409, description = "Use `omnigraph cluster apply --server <SERVER> --config <CONFIG>` for live schema deployment", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -2114,7 +2116,7 @@ pub(crate) async fn server_schema_get(
 /// Apply a schema migration.
 ///
 /// Cluster-backed servers reject this route with `409 Conflict`; operators
-/// must apply schema changes through `omnigraph cluster apply` and restart.
+/// submit schema changes with `omnigraph cluster apply --server <SERVER> --config <CONFIG>`.
 ///
 /// Diffs `schema_source` against the current schema and applies the resulting
 /// migration steps (add/drop type, add/drop property, etc.). **Destructive**:
@@ -2152,8 +2154,8 @@ pub(crate) async fn server_schema_apply(
     if state.routing().config_path.is_some() {
         return Err(ApiError::conflict(
             "server-side schema apply is disabled for cluster-backed serving; \
-             update the cluster config, run `omnigraph cluster apply`, and restart \
-             the server.",
+             update the cluster config and run \
+             `omnigraph cluster apply --server <SERVER> --config <CONFIG>`.",
         ));
     }
     let est_bytes = request.schema_source.len() as u64;
