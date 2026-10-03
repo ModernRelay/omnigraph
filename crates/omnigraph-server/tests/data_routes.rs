@@ -839,9 +839,22 @@ async fn export_route_returns_jsonl_for_branch_snapshot() {
         response.headers().get("content-type").unwrap(),
         "application/x-ndjson; charset=utf-8"
     );
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = consume_export(response.into_body()).await;
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert_eq!(text, expected);
+}
+
+// A network transport releases server-owned chunks as it copies them to the
+// client. BodyExt::collect retains every allocation and intentionally hits the
+// served-export outstanding-frame limit, so streaming assertions copy per frame.
+async fn consume_export(body: Body) -> Vec<u8> {
+    let mut stream = body.into_data_stream();
+    let mut copied = Vec::new();
+    while let Some(chunk) = stream.try_next().await.unwrap() {
+        assert!(chunk.len() <= omnigraph::db::EXPORT_CHUNK_MAX_BYTES);
+        copied.extend_from_slice(&chunk);
+    }
+    copied
 }
 
 fn export_request(type_names: Vec<String>) -> Request<Body> {
@@ -1011,9 +1024,39 @@ async fn stalled_export_refuses_a_second_cut_and_disconnect_releases_it() {
         })
         .await
         .expect("disconnect must promptly release served-export ownership");
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = consume_export(response.into_body()).await;
         assert!(!body.is_empty());
         drop(body);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), operations.wait_logical_owners())
+                .await
+                .unwrap()
+        );
+
+        // Retaining three yielded allocations exhausts this response's lane.
+        // Both real handlers report a stream error; baseline cannot append a
+        // usable cursor after snapshot production failed.
+        let response = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        let mut retained = Vec::new();
+        for _ in 0..3 {
+            let chunk = stream.try_next().await.unwrap().expect("snapshot record");
+            assert!(
+                !std::str::from_utf8(&chunk)
+                    .unwrap()
+                    .contains("\"baseline\":")
+            );
+            retained.push(chunk);
+        }
+        let error = tokio::time::timeout(Duration::from_secs(5), stream.try_next())
+            .await
+            .expect("retained transport frames must fail within their credit deadline")
+            .unwrap_err();
+        assert!(error.to_string().contains("stream_export_retained_chunks"));
+        assert!(stream.try_next().await.unwrap().is_none());
+        drop(stream);
+        drop(retained);
         assert!(
             tokio::time::timeout(Duration::from_secs(5), operations.wait_logical_owners())
                 .await
@@ -6499,7 +6542,7 @@ async fn change_baseline_streams_snapshot_then_terminal_cursor() {
             .and_then(|value| value.to_str().ok()),
         Some("application/x-ndjson; charset=utf-8")
     );
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = consume_export(response.into_body()).await;
     let text = String::from_utf8(body.to_vec()).unwrap();
     let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
     assert!(
@@ -6622,7 +6665,7 @@ async fn change_responses_carry_no_storage_vocabulary() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = consume_export(response.into_body()).await;
     let text = String::from_utf8(body.to_vec()).unwrap();
     let terminal: Value =
         serde_json::from_str(text.lines().rfind(|line| !line.is_empty()).unwrap()).unwrap();

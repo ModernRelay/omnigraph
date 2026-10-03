@@ -245,6 +245,15 @@ reads consume only read observers. Once HTTP connections and the remaining known
 logical owners finish, uncertain completion exits 2 immediately, with the original
 watchdog as the upper bound. This does not establish native-I/O settlement.
 
+Served export and baseline transport divide each existing process reservation
+into three outstanding frame credits and one sequential producer slot. The
+`Bytes` owner holds its payload, frame credit and process lease through the last
+clone or slice. Both routes share this sender; the baseline terminal record is
+encoded into one bounded pending chunk only after snapshot production succeeds.
+A credit timeout is a stream error, never a successful truncated baseline.
+[Deployment limits](../user/deployment.md#admission-limits) distinguish this
+transport allowance from engine encoding and native memory.
+
 A same-view transition can close one graph while other graphs keep serving.
 Preparation reserves bounded transition capacity before closing admission.
 Its graph lease follows body collection, owned execution, producers, retained
