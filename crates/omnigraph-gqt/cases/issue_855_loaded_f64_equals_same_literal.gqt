@@ -1,0 +1,64 @@
+# issue: 855
+# red_on: 2026-10-03, main @ bb1daeec: the literal filter kept only b (missed the JSONL row a); the param step, run alone, kept only a (missed the literal row b)
+# notes: The decimal 123456789.12345679 arrives as a JSONL seed row, a GQ literal insert and a JSON query parameter;
+# notes: row c spells the same double with 21 digits. All of them parse to the same double, so each filter keeps every row.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    x: F64
+}
+
+--- seed
+{"type":"Person","data":{"name":"a","x":123456789.12345679}}
+{"type":"Person","data":{"name":"c","x":123456789.123456789012}}
+
+--- mutate
+query insert_literal() {
+    insert Person { name: "b", x: 123456789.12345679 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query loaded_f64_equals_literal() {
+    match {
+        $p: Person
+        $p.x = 123456789.12345679
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "a"}
+{"p.name": "b"}
+{"p.name": "c"}
+
+--- expect shape
+p.name: String
+
+--- query
+query f64_param_equals_literal($v: F64) {
+    match {
+        $p: Person
+        $p.x = $v
+    }
+    return { $p.name }
+}
+
+--- params
+{"v": 123456789.12345679}
+
+--- expect unordered
+{"p.name": "a"}
+{"p.name": "b"}
+{"p.name": "c"}
+
+--- expect shape
+p.name: String
