@@ -224,13 +224,11 @@ node Doc implements Searchable {
 
 Most schemas are fine without interfaces. Reach for them only when 3+ node types need to share a property contract.
 
-## Design Principles (brief)
+## Design Principles
 
-- **Identity is explicit** — use `@key` on a semantic slug, not internal row IDs
-- **Narrow types** — `Date` over `String` for dates, `enum` over `String` for lifecycle states
-- **Edge semantics matter** — prefer `AuthoredBy` over `RelatedTo`
-- **Constraints live in the schema** — `@unique`, `@range`, `@card` keep invariants out of application code
-- **Schemas are reviewable** — clear names, explicit enums, obvious keys
+Design guidance (Gruber's criteria, identity, narrow types, edge semantics,
+constraints, provenance, `GraphPolicy` rules, and designing for many agents)
+lives in [`schema-design.md`](schema-design.md).
 
 ## Schema Evolution in Cluster Mode
 

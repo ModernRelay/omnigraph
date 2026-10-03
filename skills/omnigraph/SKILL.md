@@ -206,36 +206,37 @@ before using ambient targets or credentials.
 
 Pre-0.7.0 spellings (`read`/`change`/`ingest`, `--target`, positional `http://`) → [`references/migrations.md`](references/migrations.md).
 
-## Five Ontology Design Criteria (Gruber 1993)
+## Schema Design
 
-Omnigraph schemas are ontologies. The canonical design criteria from Gruber's *Toward Principles for the Design of Ontologies Used for Knowledge Sharing* (Int. J. Human-Computer Studies 43:907–928) apply directly when authoring `.pg` files.
+Omnigraph schemas are ontologies, and when many agents share one graph the
+schema is their coordinate system: it decides where a fact goes, what a stored
+value means, and which paths agents reason along. Design for **convergence**:
+two agents given the same input should write the same graph and read the same
+meaning back. Decide conservatively what to model; once modeled, constrain
+precisely, because tightening later is a rebuild (adding
+`@key`/`@unique`/`@range`/`@check`, changing cardinality, and `T?` → `T` are
+refused; only `@index` additions, nullable additions, enum widening, renames and
+drops apply in place).
 
-1. **Clarity** — definitions should communicate intended meaning unambiguously and be independent of social or computational context. In Omnigraph: precise type names, narrow enums over `String`, `@check`/`@range` for stated invariants. A reviewer should understand the domain from the schema alone.
-2. **Coherence** — inferences sanctioned by the schema must be consistent with the domain modeled. Gruber's trap: defining quantity as a `(magnitude, unit)` pair makes `6 feet ≠ 2 yards` even though they describe the same length. In Omnigraph: watch for `@card`, `@unique`, and edge directionality that let the schema distinguish things the domain treats as equal.
-3. **Extendibility** — the schema should support specialization without revising existing definitions. In Omnigraph: prefer interfaces for shared shape, leave enums open where the domain genuinely admits more, model identifiers via mapping functions rather than baking units/formats into the entity.
-4. **Minimal encoding bias** — representation choices made for notation or implementation convenience leak into the model. In Omnigraph: don't type dates as `String` because the source API returns strings; separate conceptual entities (a publication date, a person) from their surface encoding (a year integer, a name string) when both matter.
-5. **Minimal ontological commitment** — make as few claims about the world as the use case requires. In Omnigraph: don't add required properties, closed enums, or `@card(1..1)` "in case". Weaker schemas leave consumers room to specialize — but tightening later is a rebuild, not an in-place `schema apply` (adding `@key`/`@unique`/`@range`/`@check`, changing cardinality, and `T?` → `T` are refused; only `@index` additions, nullable additions, enum widening, renames, and drops apply in place), so decide deliberately.
-
-The criteria trade off against each other — Clarity wants tight definitions while Minimal Commitment wants weak ones. Gruber's resolution: *having decided a distinction is worth making, give it the tightest possible definition*. Decide what to model conservatively; once modeled, constrain precisely.
-
-## Schema Authoring Principles
-
-Twelve practical rules for `.pg` authoring — full text and examples in the bundled [`references/schema.md`](references/schema.md). In short: schema-is-the-contract · explicit identity via `@key` · model meaning not tables · strong intentional types · deliberate optionality · shared shape in interfaces · schema-level constraints (`@unique`/`@index`/`@range`/`@check`/`@card`) · search as a schema decision · edge semantics matter · reviewable schemas · intentional migrations (`@rename_from`) · domain clarity over ORM habits.
-
-Design flow: entities → stable keys → relationships worth their own edge → enum candidates → uniqueness/bounds/cardinality → search needs → shared shape into interfaces → evolution plan.
-
-## Provenance Is Structural (Multi-Agent Source of Truth)
-
-When Omnigraph serves as canonical truth across multiple agents, every assertion must answer *who said it, when, based on what evidence*. This is the runtime guarantee Gruber's criteria don't cover — his agents shared vocabulary; ours additionally must share attribution. Provenance belongs in the schema, not in logs.
-
-Without structural provenance, agents cannot reconcile contradictory assertions, retract facts when a source is discredited, replay graph state at a past timestamp, or distinguish high-evidence facts from speculation.
-
-**In Omnigraph:** model provenance as a `Claim` node linked by typed edges to
-the asserted fact, an `Actor`, and a `Source`. Keep scalar facts such as
-`asserted_at: DateTime` and optional `confidence: F64` on `Claim`; properties
-cannot be node-typed. Don't stash provenance into a free-text `source: String`
-or a metadata dump—structural provenance is queryable and migratable;
-free-form provenance is neither.
+In short: Gruber's five criteria (clarity · coherence · extendibility · minimal
+encoding bias · minimal commitment) · neither too loose (one meaning, many
+encodings) nor too tight (a meaning with no encoding): tight where agents must
+converge, open at declared extension points · write the questions as `.gq`
+first ·
+design identity first (`@key`, keyed edges, find before create) · kinds are
+types, roles are edges · put a fact on what determines it · keep attribution,
+justification, confidence and time on separate axes · provenance is structural
+(`Claim` → fact, `Actor`, `Source`), never a free-text `source` field · layer
+extracted and synthesized knowledge over raw spans, with lineage back to them ·
+store decisions, compute derived facts · narrow types and closed vocabularies ·
+constraints in the schema, and every other rule as a `GraphPolicy` node agents
+lint the graph against · compose around shared identities (modules add facets,
+never modify the core) from general primitives that combine · optimize
+retrieval: links for recall, specific edges, filters and answer-sized units for
+precision · write names, `@description` and `@instruction` for a reader without
+context · never repurpose a field · measure convergence with two independent
+encoders. Full text with Omnigraph
+mappings: [`references/schema-design.md`](references/schema-design.md).
 
 ## Storage & Credentials
 
@@ -370,6 +371,7 @@ For anything beyond the basics, load the relevant reference file. Each is self-c
 | Reference | When to load |
 |-----------|--------------|
 | [`references/schema.md`](references/schema.md) | Editing `.pg` files, running `schema plan`/`apply`, renaming types, backfilling required fields |
+| [`references/schema-design.md`](references/schema-design.md) | Designing or reviewing a schema: Gruber's criteria, design flow, identity, provenance, `GraphPolicy` rules, composition, and measuring convergence across agents |
 | [`references/queries.md`](references/queries.md) | Writing or linting `.gq` files, search functions, aggregations, multi-hop patterns |
 | [`references/data.md`](references/data.md) | Choosing between `mutate` and `load` (required `--mode`, `--from` to fork a review branch); branch review workflow; exact overwrite scope |
 | [`references/blobs.md`](references/blobs.md) | Writing and reading managed/external Blob values, selectors/ranges, security and lifecycle boundaries |
