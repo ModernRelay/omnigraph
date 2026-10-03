@@ -30,8 +30,8 @@ pub mod workload;
 pub use graph_id::GraphId;
 pub use identity::{AuthSource, AuthenticatedActor, GraphKey, ResolvedActor, Scope, TenantId};
 pub use registry::{
-    BlockedGraph, GraphEntry, GraphHandle, GraphRegistry, InsertError, RegistryLookup,
-    RegistrySnapshot, StartupFailure,
+    BlockedGraph, GraphEntry, GraphHandle, GraphRegistry, InsertError, LoadingGraph,
+    RegistryLookup, RegistrySnapshot, StartupFailure,
 };
 
 use crate::queries::{QueryRegistry, check, format_check_breakages};
@@ -345,7 +345,7 @@ pub struct GraphStartupConfig {
     /// Pre-resolved embedding config from an applied cluster provider profile.
     /// Legacy config paths leave this unset and continue to use env resolution.
     pub embedding: Option<omnigraph::embedding::EmbeddingConfig>,
-    /// Full applied external Blob policy. `open_single_graph` projects it to
+    /// Full applied external Blob policy. Startup preparation projects it to
     /// server-safe bases exactly once before engine injection.
     pub external_blob_policy: omnigraph::ExternalBlobPolicy,
     /// Per-graph stored-query registry, loaded and identity-checked at
@@ -2195,6 +2195,23 @@ mod external_blob_startup_tests {
                 assert!(matches!(error, InsertError::DuplicateUri(_)));
             }
         }
+        // The listener's disclosure authority and the eventual engine share
+        // the one captured policy, even if its source changes during loading.
+        Omnigraph::init(&cfg.uri, "node Doc { slug: String @key }")
+            .await
+            .unwrap();
+        let policy_path = temp.path().join("graph-policy.yaml");
+        fs::write(&policy_path, "version: 1\ngroups:\n  readers: [alice]\nrules:\n  - id: read\n    allow:\n      actors: {group: readers}\n      actions: [read]\n").unwrap();
+        let mut valid = cfg;
+        valid.policy = Some(PolicySource::File(policy_path.clone()));
+        let prepared = prepare_single_graph(valid, None).unwrap();
+        let captured_policy = prepared.pending.policy.clone().unwrap();
+        fs::write(policy_path, "invalid policy after preparation").unwrap();
+        let opened = open_prepared_graph(prepared).await.unwrap();
+        assert!(Arc::ptr_eq(
+            opened.handle.policy.as_ref().unwrap(),
+            &captured_policy
+        ));
     }
 }
 
@@ -2514,8 +2531,8 @@ async fn serve_config(
             // The first signal or uncertain owner fixes the one deadline.
             tokio::select! {
                 () = shutdown_signal() => {},
-                () = operations.fatal() => error!("owned write completion uncertain; containing process"),
-                () = listener_failed.notified() => error!("HTTP listener failed; containing admitted work"),
+                () = operations.fatal() => error!("owned completion uncertain; containing process"),
+                () = listener_failed.notified() => error!("listener or graph startup failed; containing admitted work"),
             }
             operations.close();
             draining.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2562,7 +2579,7 @@ async fn serve_config(
     }
 
     let bind = config.bind.clone();
-    let state = match config.mode {
+    let (state, prepared) = match config.mode {
         ServerConfigMode::Multi {
             graphs,
             config_path,
@@ -2575,12 +2592,11 @@ async fn serve_config(
                 config = %config_path.display(),
                 "serving omnigraph"
             );
-            open_multi_graph_state_admitted(
+            prepare_multi_graph_state(
                 graphs,
                 tokens,
                 server_policy.as_ref(),
                 config_path,
-                config.require_all_graphs,
                 config.cluster_admission,
             )
             .await?
@@ -2616,6 +2632,21 @@ async fn serve_config(
         )
         .with_process_defaults(process_defaults);
     let retained_admission = state.cluster_admission.clone();
+    let startup_owner = operations
+        .own_startup()
+        .map_err(|error| eyre!(error.message))?;
+    let startup_state = state.clone();
+    let startup_failed = Arc::clone(&listener_failed);
+    let startup = tokio::spawn(async move {
+        let result =
+            finish_graph_startup(startup_state.clone(), prepared, config.require_all_graphs).await;
+        if result.is_err() {
+            startup_state.operations.close();
+            startup_failed.notify_one();
+        }
+        startup_owner.finish();
+        result
+    });
     let mut shutdown_rx = shutdown_rx;
     let served = axum::serve(listener, build_app(state))
         .with_graceful_shutdown(async move {
@@ -2630,14 +2661,18 @@ async fn serve_config(
         operations.close();
         listener_failed.notify_one();
     }
+    // Never abort a graph-open future when HTTP shutdown finishes first. The
+    // one original process watchdog also bounds this retained startup owner.
+    let startup_result = startup.await;
     if !operations.wait_logical_owners().await {
         // All known logical owners have finished. Retain unresolved
         // reservations until this nonzero process exit; this is containment,
         // not a native-I/O settlement or reusable-engine drain proof.
-        error!("known owners drained after uncertain write; terminating process");
+        error!("known owners drained after uncertain completion; terminating process");
         std::process::exit(2);
     }
     served?;
+    startup_result.wrap_err("graph startup owner failed")??;
     if let Some(owner) = retained_admission {
         warn!(
             root = %omnigraph::storage::redacted_storage_uri(owner.canonical_root()),
@@ -2726,8 +2761,28 @@ async fn open_multi_graph_state_admitted(
     require_all_graphs: bool,
     admission: Option<omnigraph_cluster::ClusterAdmission>,
 ) -> Result<AppState> {
-    use futures::StreamExt;
+    let (state, prepared) =
+        prepare_multi_graph_state(graphs, tokens, server_policy_source, config_path, admission)
+            .await?;
+    let owner = state
+        .operations
+        .own_startup()
+        .map_err(|error| eyre!(error.message))?;
+    let result = finish_graph_startup(state.clone(), prepared, require_all_graphs).await;
+    owner.finish();
+    result?;
+    Ok(state)
+}
 
+/// Capture every fixed binding before exposing the startup inventory. Policy
+/// files are never re-read by a later graph-open completion.
+async fn prepare_multi_graph_state(
+    graphs: Vec<GraphStartupConfig>,
+    tokens: Vec<(String, String)>,
+    server_policy_source: Option<&PolicySource>,
+    config_path: PathBuf,
+    admission: Option<omnigraph_cluster::ClusterAdmission>,
+) -> Result<(AppState, Vec<PreparedGraphOpen>)> {
     let mut admission = match admission {
         Some(admission) => Some(admission),
         None => omnigraph_cluster::acquire_serving_admission(&config_path.to_string_lossy())
@@ -2797,45 +2852,93 @@ async fn open_multi_graph_state_admitted(
 
     // Capture each expected contract without opening engines. Contract checks
     // belong to each graph's startup outcome, alongside open and policy errors.
-    let graphs = graphs
-        .into_iter()
-        .map(|cfg| {
-            let expected = expected_server_schema_contract(admission.as_ref(), &cfg.uri)?;
-            Ok((cfg, expected))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let configured_graphs = graphs.len();
-    let results = futures::stream::iter(graphs)
-        .map(|(cfg, expected)| async move {
-            let key = GraphKey::cluster(
-                GraphId::try_from(cfg.graph_id.clone()).expect("validated startup graph id"),
-            );
-            let uri = cfg.uri.clone();
-            match open_single_graph(cfg, expected).await {
-                Ok(opened) => GraphEntry::ready(opened.handle),
-                Err(error) => {
-                    warn!(
-                        graph_id = %key.graph_id,
-                        error = %error,
-                        "graph blocked during startup"
-                    );
-                    GraphEntry::Blocked(Arc::new(BlockedGraph {
-                        key,
-                        uri,
-                        policy: error.policy,
-                        failure: error.failure,
-                    }))
-                }
+    let mut entries = Vec::with_capacity(graphs.len());
+    let mut prepared = Vec::with_capacity(graphs.len());
+    for cfg in graphs {
+        let expected = expected_server_schema_contract(admission.as_ref(), &cfg.uri)?;
+        let key = GraphKey::cluster(
+            GraphId::try_from(cfg.graph_id.clone()).expect("validated startup graph id"),
+        );
+        let uri = cfg.uri.clone();
+        match prepare_single_graph(cfg, expected) {
+            Ok(graph) => {
+                entries.push(GraphEntry::Loading(Arc::clone(&graph.pending)));
+                prepared.push(graph);
             }
-        })
-        .buffer_unordered(4)
-        .collect::<Vec<_>>()
-        .await;
-    let failed = results
+            Err(error) => entries.push(blocked_startup_graph(key, uri, error)),
+        }
+    }
+    let workload = workload::WorkloadController::from_env();
+    let mut state =
+        AppState::new_multi_entries(entries, tokens, server_policy, workload, Some(config_path))
+            .map_err(|err| eyre!("multi-graph registry: {err}"))?;
+    state.cluster_admission = admission;
+    Ok((state, prepared))
+}
+
+/// Exactly one owned startup pass. A stopped process drains already entered
+/// opens without starting replacements or installing a late serving handle.
+async fn finish_graph_startup(
+    state: AppState,
+    graphs: Vec<PreparedGraphOpen>,
+    require_all_graphs: bool,
+) -> Result<()> {
+    use futures::StreamExt;
+
+    let registry = &state.routing().registry;
+    let configured_graphs = registry.len();
+    let mut failed = registry
+        .entries()
         .iter()
         .filter(|entry| matches!(entry, GraphEntry::Blocked(_)))
         .count();
+    let mut strict_results = Vec::new();
+    let mut completion_failure = None;
+    let mut opens = futures::stream::iter(graphs)
+        .map(|prepared| {
+            let operations = state.operations.clone();
+            async move {
+                if operations.snapshot().closed {
+                    return None;
+                }
+                let pending = Arc::clone(&prepared.pending);
+                let result = match open_prepared_graph(prepared).await {
+                    Ok(opened) => GraphEntry::ready(opened.handle),
+                    Err(error) => {
+                        blocked_startup_graph(pending.key.clone(), pending.uri.clone(), error)
+                    }
+                };
+                Some((pending, result))
+            }
+        })
+        .buffer_unordered(4);
+    while let Some(result) = opens.next().await {
+        let Some((pending, result)) = result else {
+            continue;
+        };
+        let blocked = matches!(result, GraphEntry::Blocked(_));
+        failed += usize::from(blocked);
+        if require_all_graphs && !blocked {
+            strict_results.push((pending, result));
+        } else if !state.operations.snapshot().closed {
+            // Closure racing this check is expected; complete_startup performs
+            // the authoritative check under the process/registry boundary.
+            if let Err(error) =
+                registry.complete_startup(&state.operations, vec![(pending, result)])
+            {
+                if !state.operations.snapshot().closed {
+                    state.operations.contain_startup();
+                    completion_failure = Some(eyre!(error.message));
+                }
+            }
+        }
+    }
+    if let Some(error) = completion_failure {
+        return Err(error);
+    }
+    if state.operations.snapshot().closed {
+        return Ok(());
+    }
     if require_all_graphs && failed > 0 {
         bail!(
             "strict multi-graph startup requires every graph to open ({} configured, {} failed)",
@@ -2850,13 +2953,24 @@ async fn open_multi_graph_state_admitted(
             failed
         );
     }
+    if require_all_graphs {
+        if let Err(error) = registry.complete_startup(&state.operations, strict_results) {
+            if !state.operations.snapshot().closed {
+                return Err(eyre!(error.message));
+            }
+        }
+    }
+    Ok(())
+}
 
-    let workload = workload::WorkloadController::from_env();
-    let mut state =
-        AppState::new_multi_entries(results, tokens, server_policy, workload, Some(config_path))
-            .map_err(|err| eyre!("multi-graph registry: {err}"))?;
-    state.cluster_admission = admission;
-    Ok(state)
+fn blocked_startup_graph(key: GraphKey, uri: String, error: GraphOpenFailure) -> GraphEntry {
+    warn!(graph_id = %key.graph_id, error = %error, "graph blocked during startup");
+    GraphEntry::Blocked(Arc::new(BlockedGraph {
+        key,
+        uri,
+        policy: error.policy,
+        failure: error.failure,
+    }))
 }
 
 /// Detailed failure stays private; the registry retains only its classification
@@ -2882,12 +2996,25 @@ impl std::fmt::Display for GraphOpenFailure {
     }
 }
 
-/// Open one graph and wrap it in a `GraphHandle`. Fixed policy bindings are
-/// validated before the read-write open's local capability-probe effect.
+struct PreparedGraphOpen {
+    cfg: GraphStartupConfig,
+    pending: Arc<LoadingGraph>,
+    expected: Option<omnigraph::db::SchemaContractDigest>,
+}
+
+#[cfg(test)]
 async fn open_single_graph(
     cfg: GraphStartupConfig,
     expected: Option<omnigraph::db::SchemaContractDigest>,
 ) -> std::result::Result<OpenedGraph, GraphOpenFailure> {
+    open_prepared_graph(prepare_single_graph(cfg, expected)?).await
+}
+
+/// Validate and capture policy before the listener or any engine open.
+fn prepare_single_graph(
+    mut cfg: GraphStartupConfig,
+    expected: Option<omnigraph::db::SchemaContractDigest>,
+) -> std::result::Result<PreparedGraphOpen, GraphOpenFailure> {
     let initial_failure = |cause| GraphOpenFailure {
         failure: StartupFailure::OpenFailed,
         policy: None,
@@ -2933,7 +3060,7 @@ async fn open_single_graph(
     // Project the external-resource policy before the writable open. Startup
     // never publishes graph content; writable local open does probe filesystem
     // create-if-absent support and is therefore not an effect-free operation.
-    let external_blob_policy = cfg.external_blob_policy.server_safe_only().map_err(|err| {
+    cfg.external_blob_policy = cfg.external_blob_policy.server_safe_only().map_err(|err| {
         failure(
             StartupFailure::InvalidExternalBlobPolicy,
             eyre!(
@@ -2942,6 +3069,34 @@ async fn open_single_graph(
             ),
         )
     })?;
+    cfg.uri = uri.clone();
+    Ok(PreparedGraphOpen {
+        cfg,
+        pending: Arc::new(LoadingGraph {
+            key: GraphKey::cluster(graph_id),
+            uri,
+            policy,
+        }),
+        expected,
+    })
+}
+
+async fn open_prepared_graph(
+    prepared: PreparedGraphOpen,
+) -> std::result::Result<OpenedGraph, GraphOpenFailure> {
+    let PreparedGraphOpen {
+        cfg,
+        pending,
+        expected,
+    } = prepared;
+    let graph_id = &pending.key.graph_id;
+    let uri = pending.uri.clone();
+    let policy = pending.policy.clone();
+    let failure = |failure, cause| GraphOpenFailure {
+        failure,
+        policy: policy.clone(),
+        cause,
+    };
     let db = Omnigraph::open(&uri).await.map_err(|err| {
         failure(
             StartupFailure::OpenFailed,
@@ -2951,7 +3106,7 @@ async fn open_single_graph(
     verify_server_schema_contract(&db, expected.as_ref())
         .map_err(|cause| failure(StartupFailure::OpenFailed, cause))?;
     let db = db
-        .with_external_blob_policy(external_blob_policy)
+        .with_external_blob_policy(cfg.external_blob_policy)
         .map_err(|err| {
             failure(
                 StartupFailure::InvalidExternalBlobPolicy,
@@ -2978,7 +3133,7 @@ async fn open_single_graph(
 
     Ok(OpenedGraph {
         handle: Arc::new(GraphHandle {
-            key: GraphKey::cluster(graph_id),
+            key: pending.key.clone(),
             uri,
             engine: Arc::new(db),
             policy,

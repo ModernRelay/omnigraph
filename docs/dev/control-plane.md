@@ -150,7 +150,7 @@ I/O settlement. Azure writers also acquire the external admission lease through
 
 A directory lets the server resolve the storage root from `cluster.yaml`; a URI reads the applied deployment artifact directly. There is no single-graph positional boot, `--target`, or runtime graph add/remove API.
 
-Serving verifies ledger/resource digests, builds each graph's query registry and embedding provider, projects external-Blob policy to the server-safe subset, and binds at most one Cedar bundle per graph plus one cluster-level bundle. The registry retains actual startup outcomes as ready handles or blocked entries carrying sanitized failure categories and validated authorization context. Graph-local policy, open, external-Blob policy or query-registry failures block that graph while healthy graphs may continue. `--require-all-graphs` makes any blocked entry a startup failure; a nonempty inventory with zero healthy graphs always fails. The listener starts only after graph opening; no startup retry or online activation is implemented.
+Serving captures ledger/resource digests, graph identity, expected contracts and validated policies before binding the listener. The fixed registry initially contains loading or preflight-blocked entries, with the same captured policy later installed on the engine. One process-owned startup batch opens at most four graphs concurrently, checks accepted contracts, projects external-Blob policy, and validates stored queries. Each completed graph becomes ready or blocked through the process/registry admission boundary; shutdown prevents late activation and drains entered opens. Default startup admits healthy graphs individually. `--require-all-graphs` installs successful handles atomically only when every graph succeeds; any failure stops startup. A nonempty inventory with zero healthy graphs fails after the batch finishes. No attempt timeout, startup retry, reopen or native-settlement proof is introduced.
 
 Servers do not hot-reload applied graph configuration. Apply the new revision and restart every server that should serve it. Explicit OIDC public-admission snapshots have a separate bounded refresh contract below.
 
@@ -183,7 +183,7 @@ applied-policy ownership are described in
 [Identity credentials and applied policy authorization](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md).
 
 `GET /graphs/discovery` accepts only the verified identity profile and returns
-IDs and display names for the ready and blocked graph inventory captured
+IDs and display names for the loading, ready and blocked graph inventory captured
 at boot. It neither scans storage nor discloses availability, paths, policy,
 schema, or query definitions. It needs no policy membership. The separate
 `GET /graphs` uses the same registry with a `graph_list` gate and returns one
@@ -192,7 +192,7 @@ filtering remains an additional restriction. Neither inventory synthesizes graph
 entries from the boot witness. Discovery still discloses no availability.
 
 HTTP and MCP graph resolution apply credential graph scope before lookup and
-atomically capture a serving view with its graph-epoch lease. A blocked or
+atomically capture a serving view with its graph-epoch lease. A loading, blocked or
 transitioning graph yields 503 only after graph `read` authorization on `main` or
 management `graph_list` authorization; otherwise it remains undisclosed as 404.
 An invalid graph policy or configuration cannot authorize the graph-read fallback.
@@ -210,9 +210,9 @@ infers routing from an arbitrary bearer token's unverified shape.
 
 A replica reports what it booted from on `GET /readyz` (RFC 0049): the
 applied `config_digest` as `booted_serving_digest`, the ledger revision and
-CAS, and registry, ready and blocked graph counts. `served_graph_count` counts
-every registry entry; closed graph admissions contribute to the blocked count.
-Status is `serving`, `degraded`, `blocked` or `draining`;
+CAS, and registry, ready, loading and blocked graph counts. `served_graph_count`
+counts every registry entry; closed transitions contribute to the blocked count.
+Status is `loading`, `serving`, `degraded`, `blocked` or `draining`;
 readiness requires a ready graph or valid empty inventory and open admission.
 Graph IDs stay on the authenticated catalog routes under their respective
 disclosure contracts. Status reads registry snapshots without graph/storage I/O;

@@ -842,7 +842,8 @@ fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
                     serde_json::json!({
                         "branch":"main", "base_branch":null, "branch_created":false,
                         "mode":"append", "nodes":[{"name":"Person", "entities_loaded":1}],
-                        "edges":[], "total_entities":1, "actor_id":"legacy-actor", "commit":null
+                        "edges":[], "total_entities":1, "actor_id":"legacy-actor", "commit":null,
+                        "embedding_generation":null
                     })
                 };
                 let data = IntentApiFixture::graph(vec![IntentReply::json(200, reply)]);
@@ -972,7 +973,8 @@ fn managed_data_issue_633_direct_load_and_commit_preserve_ambient_targets() {
                     "load" => serde_json::json!({
                         "branch":"main", "base_branch":null, "branch_created":false,
                         "mode":"append", "nodes":[{"name":"Person", "entities_loaded":1}],
-                        "edges":[], "total_entities":1, "actor_id":"legacy-actor", "commit":null
+                        "edges":[], "total_entities":1, "actor_id":"legacy-actor", "commit":null,
+                        "embedding_generation":null
                     }),
                     "commit-list" => serde_json::json!({"commits":[commit.clone()]}),
                     _ => commit.clone(),

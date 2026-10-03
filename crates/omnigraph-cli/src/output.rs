@@ -25,6 +25,7 @@ pub(crate) struct LoadOutput {
     pub(crate) nodes: Vec<GraphBatchDeclarationOutput>,
     pub(crate) edges: Vec<GraphBatchDeclarationOutput>,
     pub(crate) total_entities: usize,
+    pub(crate) embedding_generation: Option<omnigraph_api_types::LoadEmbeddingGeneration>,
     pub(crate) commit: Option<CommitOutput>,
 }
 
@@ -42,6 +43,7 @@ pub(crate) fn load_output_from_graph_batch(
         nodes: output.nodes.clone(),
         edges: output.edges.clone(),
         total_entities: output.total_entities,
+        embedding_generation: output.embedding_generation,
         commit: output.commit.clone(),
     }
 }
@@ -57,6 +59,7 @@ pub(crate) fn load_output_from_receipt(
     branch: &str,
     mode: &'static str,
     receipt: &omnigraph::loader::LoadReceipt,
+    catalog: &omnigraph_compiler::catalog::Catalog,
 ) -> LoadOutput {
     let result = &receipt.result;
     let mut nodes = result
@@ -91,6 +94,9 @@ pub(crate) fn load_output_from_receipt(
         nodes,
         edges,
         total_entities,
+        embedding_generation: omnigraph_api_types::LoadEmbeddingGeneration::for_load(
+            catalog, result,
+        ),
         commit: Some(omnigraph_api_types::commit_output(&receipt.commit)),
     }
 }
@@ -563,6 +569,9 @@ pub(crate) fn print_load_human(payload: &LoadOutput) {
             println!("branch {} created from {}", payload.branch, base);
         }
     }
+    if let Some(diagnostic) = payload.embedding_generation {
+        println!("{}", diagnostic.message());
+    }
 }
 
 pub(crate) fn print_ingest_human(output: &IngestOutput) {
@@ -593,6 +602,9 @@ pub(crate) fn print_ingest_human(output: &IngestOutput) {
     }
     if let Some(actor_id) = &output.actor_id {
         println!("actor_id: {}", actor_id);
+    }
+    if let Some(diagnostic) = output.embedding_generation {
+        println!("{}", diagnostic.message());
     }
 }
 

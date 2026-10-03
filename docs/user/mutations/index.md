@@ -137,6 +137,10 @@ omnigraph load --data batch.jsonl --mode merge graph.omni
 One load request is one graph commit. Use `--branch <name> --from <base>` to
 create a missing review branch and load onto it in the same workflow.
 
+Loads preserve supplied embeddings and do not generate them. Results report
+`embedding_generation: "unsupported"` when a loaded node type declares
+`@embed`, or `null` otherwise; see [Embeddings](../search/embeddings.md).
+
 ## Limits and conflicts
 
 Insert/update mutations and incremental keyed loads are bounded to 8,192
