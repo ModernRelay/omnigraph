@@ -756,6 +756,8 @@ pub(crate) async fn server_snapshot(
             target_branch: None,
         },
     )?;
+    // One resolution: the stamp is read from the snapshot's own manifest
+    // version, so both halves of the response describe one graph version.
     let (snapshot, internal_schema_version) = {
         let db = &handle.engine;
         let snapshot = db
@@ -763,7 +765,7 @@ pub(crate) async fn server_snapshot(
             .await
             .map_err(ApiError::from_omni)?;
         let internal_schema_version = db
-            .internal_schema_version_of(ReadTarget::branch(branch.as_str()))
+            .internal_schema_version_at(&snapshot)
             .await
             .map_err(ApiError::from_omni)?;
         (snapshot, internal_schema_version)

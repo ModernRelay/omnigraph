@@ -1985,8 +1985,16 @@ impl Omnigraph {
     /// The on-disk internal-schema version of `target`'s branch (the storage-format
     /// version this graph is stamped at). Surfaced via `omnigraph snapshot`.
     pub async fn internal_schema_version_of(&self, target: impl Into<ReadTarget>) -> Result<u32> {
-        let branch = self.resolved_branch_of(target).await?;
-        crate::db::manifest::internal_schema_stamp_at(self.uri(), branch.as_deref())
+        let snapshot = self.snapshot_of(target).await?;
+        self.internal_schema_version_at(&snapshot).await
+    }
+
+    /// The internal-schema version stamped on `snapshot`'s own `__manifest`
+    /// version: the same version as the snapshot's tables and heads, read from
+    /// the manifest dataset the snapshot captured.
+    pub async fn internal_schema_version_at(&self, snapshot: &Snapshot) -> Result<u32> {
+        snapshot
+            .internal_schema_stamp(self.uri())
             .await?
             .ok_or_else(|| {
                 // Unreachable through this handle: every open path runs the

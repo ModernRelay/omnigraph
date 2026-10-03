@@ -3517,7 +3517,9 @@ fn packed_record_refuses_a_null_bit_beside_a_value() {
 
 /// A flat stamp-11 manifest reads as it is; a publish over it rewrites it packed at stamp 13
 /// with the same table state (no `schema_contract` row: the storage upgrade route adds that),
-/// and the pre-conversion version keeps its flat shape for time travel.
+/// and the pre-conversion version keeps its flat shape for time travel. A snapshot captured
+/// before the conversion keeps reporting stamp 11 after it, from its attached manifest
+/// dataset and from the fallback that opens the captured version.
 #[tokio::test]
 async fn stamp_11_manifest_converts_on_its_next_publish() {
     let dir = tempfile::tempdir().unwrap();
@@ -3547,6 +3549,10 @@ async fn stamp_11_manifest_converts_on_its_next_publish() {
             .is_none(),
         "a flat manifest has no schema_contract row"
     );
+
+    let held = ManifestCoordinator::snapshot_at(uri, None, flat_version)
+        .await
+        .unwrap();
 
     let live_rows = read_publish_scan(&flat).await.unwrap().live_rows;
     let empty_pending = live_rows[0].slice(0, 0);
@@ -3588,6 +3594,39 @@ async fn stamp_11_manifest_converts_on_its_next_publish() {
     assert_eq!(super::migrations::read_stamp(&historical), Some(11));
     assert!(historical.schema().field("base_objects").is_some());
     assert_eq!(logical_view(&historical).await, at_birth);
+
+    let stamp_of = |snapshot: Snapshot| async move {
+        ManifestCoordinator::internal_schema_stamp_for_snapshot(uri, &snapshot).await
+    };
+    assert!(held.manifest_dataset.is_some());
+    assert_eq!(stamp_of(held.clone()).await.unwrap(), Some(11));
+    let mut detached = held.clone();
+    detached.manifest_dataset = None;
+    assert_eq!(
+        stamp_of(detached.clone()).await.unwrap(),
+        Some(11),
+        "the fallback opens the captured version, not the converted head"
+    );
+    let current = ManifestCoordinator::snapshot_at(uri, None, converted.version().version)
+        .await
+        .unwrap();
+    assert_eq!(stamp_of(current).await.unwrap(), Some(13));
+    let elsewhere = tempfile::tempdir().unwrap();
+    let error = ManifestCoordinator::internal_schema_stamp_for_snapshot(
+        elsewhere.path().to_str().unwrap(),
+        &held,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("another root"), "{error}");
+    let mut unprovenanced = detached;
+    unprovenanced.graph_branch = Some("feature".to_string());
+    unprovenanced.native_branch = None;
+    let error = stamp_of(unprovenanced).await.unwrap_err();
+    assert!(
+        error.to_string().contains("lacks native branch provenance"),
+        "{error}"
+    );
 }
 
 fn replacement_contract() -> SchemaContractRow {
