@@ -599,6 +599,14 @@ Every cap names its resource, scope and lifetime. Count shared allocations once
 and release them after their last producer/user; request bytes are not an engine
 memory budget. Overload refuses before admission; this RFC adds no request queue.
 
+The implemented export/baseline transport retains its existing four-chunk,
+eight-response allowance through queued, yielded, cloned and sliced buffer
+ownership. Three outstanding frame credits leave one pending producer slot;
+exhausted credits cause a bounded stream failure without a baseline cursor.
+Existing transport and route owners cover retained allocations, final release
+and consuming streams. This qualifies transport payload ownership only, not
+full-row/Arrow encoding, native memory or RSS bounds.
+
 Reserve bounded execution, memory and local I/O for finishing admitted work,
 qualified completion, shutdown and status. Ordinary traffic cannot consume it,
 and completion cannot wait on permits held by work it must settle. Keep the small
@@ -926,6 +934,10 @@ Before enabling an affected increment, its owners must implement and qualify:
    cluster roots to v13 before rollout, under the storage-upgrade owner.
 
 ## Decision log
+
+- 2026-10-03: Resource bounds records export/baseline transport ownership through
+  retained chunks, clones and slices. The existing allowance now follows final
+  buffer destruction; broader encoding, native-memory and RSS gates remain open.
 
 - 2026-10-03: Extended T11.feed's existing HTTP continuation owner with a changed
   wide row, managed-Blob images and abandoned-delivery ownership/replay. The

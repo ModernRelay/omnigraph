@@ -149,6 +149,20 @@ consume only a read observer; slow
 reads cannot exhaust write-body or write-response capacity. Status routes bypass
 ordinary admission so they remain callable during saturation.
 
+Export and change-baseline responses reserve 256 KiB each from a fixed 2 MiB
+process allowance, permitting eight simultaneous reservations. Each response
+allows three outstanding 64 KiB chunks plus one pending producer chunk; at most
+two chunks wait in its queue. Yielded chunks, including retained clones and
+slices, keep their reservation until released. A new response waits at most
+250 ms for process capacity before HTTP 413. A producer waits at most 250 ms
+for exhausted chunk credits before failing the stream; ordinary queue
+backpressure has no additional deadline. An interrupted baseline supplies no
+usable terminal cursor. Consumers must release each received server buffer to
+continue; an in-process consumer retaining every buffer can exhaust its lane.
+An HTTP client may still collect its received response: those client buffers are
+separate from the server's transport buffers. These limits cover transport
+payload buffers, not engine row/Arrow encoding, native work or total process RSS.
+
 The engine separately limits retained keyed batches, keyed parse estimates
 and removed-ID collections across each operation's tables; see
 [mutation limits](mutations/index.md#limits-and-conflicts). These fixed limits

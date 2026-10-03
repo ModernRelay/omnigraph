@@ -1221,17 +1221,7 @@ pub(crate) async fn server_export(
             let data_tx = tx.clone();
             let export = cut.write_chunks(move |chunk| {
                 let data_tx = data_tx.clone();
-                async move {
-                    data_tx
-                        .send(export_transport::ExportFrame::Data(Bytes::from(chunk)))
-                        .await
-                        .map_err(|_| {
-                            OmniError::Io(std::io::Error::new(
-                                std::io::ErrorKind::BrokenPipe,
-                                "served export response closed",
-                            ))
-                        })
-                }
+                async move { data_tx.send_chunk(chunk).await }
             });
             tokio::pin!(export);
             tokio::select! {
@@ -1241,12 +1231,7 @@ pub(crate) async fn server_export(
                 }
                 (cut, result) = &mut export => {
                     let error = result.err().map(|error| std::io::Error::other(error.to_string()));
-                    let _ = tx
-                        .send(export_transport::ExportFrame::Terminal {
-                            cut: Box::new(cut),
-                            error,
-                        })
-                        .await;
+                    tx.finish(cut, error).await;
                 }
             }
         }
@@ -3965,15 +3950,6 @@ pub(crate) async fn server_changes_baseline(
         .capture_served_change_baseline_cut(&branch, &scope)
         .await
         .map_err(change_route_error)?;
-    let terminal_record = {
-        let mut line = serde_json::to_vec(&api::ChangeBaselineRecord {
-            baseline: api::change_baseline_output(&handshake),
-        })
-        .map_err(|error| ApiError::internal(format!("encode baseline record: {error}")))?;
-        line.push(b'\n');
-        Bytes::from(line)
-    };
-
     let producer_queue_lease = Arc::clone(&queue_lease);
     let (tx, body_stream) = export_transport::channel(queue_lease);
     tokio::spawn(
@@ -3988,17 +3964,7 @@ pub(crate) async fn server_changes_baseline(
             let data_tx = tx.clone();
             let export = cut.write_chunks(move |chunk| {
                 let data_tx = data_tx.clone();
-                async move {
-                    data_tx
-                        .send(export_transport::ExportFrame::Data(Bytes::from(chunk)))
-                        .await
-                        .map_err(|_| {
-                            OmniError::Io(std::io::Error::new(
-                                std::io::ErrorKind::BrokenPipe,
-                                "served baseline response closed",
-                            ))
-                        })
-                }
+                async move { data_tx.send_chunk(chunk).await }
             });
             tokio::pin!(export);
             tokio::select! {
@@ -4012,25 +3978,16 @@ pub(crate) async fn server_changes_baseline(
                     // interrupted stream carries no usable cursor.
                     let error = match result {
                         Ok(()) => {
-                            match tx
-                                .send(export_transport::ExportFrame::Data(terminal_record))
-                                .await
-                            {
-                                Ok(()) => None,
-                                Err(_) => Some(std::io::Error::new(
-                                    std::io::ErrorKind::BrokenPipe,
-                                    "served baseline response closed",
-                                )),
-                            }
+                            tx.send_json_line(&api::ChangeBaselineRecord {
+                                baseline: api::change_baseline_output(&handshake),
+                            })
+                            .await
+                            .err()
+                            .map(|error| std::io::Error::other(error.to_string()))
                         }
                         Err(error) => Some(std::io::Error::other(error.to_string())),
                     };
-                    let _ = tx
-                        .send(export_transport::ExportFrame::Terminal {
-                            cut: Box::new(cut),
-                            error,
-                        })
-                        .await;
+                    tx.finish(cut, error).await;
                 }
             }
         }
