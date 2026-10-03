@@ -1,6 +1,7 @@
-//! Cluster command surface: validate/plan/apply/approve/status/sync/force-unlock.
+//! Cluster command surface: validate/plan/apply/status/sync/force-unlock.
 //! Moved verbatim from tests/cli.rs in the modularization.
 
+use serde_json::Value;
 use std::fs;
 
 use tempfile::tempdir;
@@ -66,6 +67,116 @@ fn lifecycle_session(principal: &str, account: &str) -> serde_json::Value {
 
 fn lifecycle_fixture(replies: Vec<IntentReply>) -> IntentApiFixture {
     IntentApiFixture::with_session(replies, lifecycle_session("principal-one", "account-one"))
+}
+
+/// The source directory belongs to the caller; the file storage root belongs
+/// to the server. An absent client-side mount must not prevent HTTP submission.
+#[test]
+fn core_live_apply_captures_server_file_root_without_local_storage_access() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let remote_path = temp
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("server-only-storage");
+    let remote_root = format!("file://{}", remote_path.display());
+    let config = temp.path().join("cluster.yaml");
+    let source = fs::read_to_string(&config).unwrap();
+    fs::write(&config, format!("storage: {remote_root}\n{source}")).unwrap();
+    let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV:1:01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    let status = serde_json::json!({
+        "status": {"canonical_root":remote_root, "ledger_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "state_revision":1, "result_revision":0, "next_sequence":1,
+            "lock_id":"server-owner", "outstanding_id":null, "lookup":null},
+        "active":false
+    });
+    let schema = fs::read_to_string(temp.path().join("people.pg")).unwrap();
+    for declared_storage in [Some(remote_root.as_str()), None] {
+        let captured_config = match declared_storage {
+            Some(root) => format!("storage: {root}\n{source}"),
+            None => source.clone(),
+        };
+        fs::write(&config, &captured_config).unwrap();
+        let api = IntentApiFixture::graph(vec![
+            IntentReply::json(200, status.clone()),
+            // This fixture owns only the client boundary. A typed response proves
+            // POST reached it; actual activation remains the process E2E's job.
+            IntentReply::json(
+                409,
+                serde_json::json!({"error":"deployment_fixture_reached", "code":"conflict"}),
+            ),
+        ]);
+        let output = output_failure(
+            cli()
+                .env("OMNIGRAPH_BEARER_TOKEN", "capture-token")
+                .args([
+                    "cluster",
+                    "apply",
+                    "--server",
+                    &api.origin,
+                    "--deployment-id",
+                    id,
+                    "--config",
+                ])
+                .arg(temp.path())
+                .arg("--json"),
+        );
+        assert_eq!(
+            parse_stdout_json(&output)["error"],
+            "deployment_fixture_reached",
+            "{output:?}"
+        );
+        let requests = api.workflow_requests();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert_eq!(
+            (&*requests[0].method, &*requests[0].path),
+            ("GET", "/cluster/deployments")
+        );
+        assert_eq!(
+            (&*requests[1].method, &*requests[1].path),
+            ("POST", "/cluster/deployments")
+        );
+        for request in &requests {
+            assert_eq!(
+                request.headers.get("authorization").map(String::as_str),
+                Some("Bearer capture-token")
+            );
+        }
+        assert_eq!(requests[1].body["deployment_id"], id);
+        assert_eq!(
+            requests[1].body["deployment"]["canonical_root"],
+            remote_root
+        );
+        assert!(
+            requests[1].body["deployment"]["sources"]
+                .as_object()
+                .unwrap()
+                .values()
+                .any(|value| value.as_str() == Some(schema.as_str()))
+        );
+        assert!(!remote_path.exists());
+        assert_no_core_effects(temp.path());
+        api.assert_complete();
+    }
+
+    // A different declared root still refuses before POST; the server's status
+    // is binding evidence, never permission to silently retarget the bundle.
+    fs::write(&config, format!("storage: {remote_root}-other\n{source}")).unwrap();
+    let api = IntentApiFixture::graph(vec![IntentReply::json(200, status)]);
+    output_failure(
+        cli()
+            .env("OMNIGRAPH_BEARER_TOKEN", "capture-token")
+            .args(["cluster", "apply", "--server", &api.origin, "--config"])
+            .arg(temp.path())
+            .arg("--json"),
+    );
+    let requests = api.workflow_requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0].method, "GET");
+    assert!(!remote_path.exists());
+    assert_no_core_effects(temp.path());
+    api.assert_complete();
 }
 
 #[test]
@@ -1467,7 +1578,7 @@ fn managed_context_is_exact_directory_and_explicit_direct_preserves_core() {
     write_cluster_config_fixture(temp.path());
     write_managed_context(temp.path(), &api.origin);
     let unsupported = managed_cli(temp.path(), &api.origin)
-        .args(["refresh", "--json"])
+        .args(["observe", "--json"])
         .output()
         .unwrap();
     assert_eq!(unsupported.status.code(), Some(2));
@@ -1772,33 +1883,10 @@ fn cluster_validate_json_is_stable() {
 fn cluster_plan_json_reads_inferred_local_state() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
-    let state_dir = temp.path().join("__cluster");
-    fs::create_dir_all(&state_dir).unwrap();
-    fs::write(
-        state_dir.join("state.json"),
-        r#"
-{
-  "version": 1,
-  "applied_revision": {
-    "config_digest": "old",
-    "resources": {
-      "graph.knowledge": { "digest": "old-graph" },
-      "policy.old": { "digest": "old-policy" }
-    }
-  }
-}
-"#,
-    )
-    .unwrap();
-
-    let json = parse_stdout_json(&output_success(
-        cli()
-            .arg("cluster")
-            .arg("plan")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--json"),
-    ));
+    apply_cluster_fixture(temp.path());
+    fs::write(temp.path().join("people.gq"),
+        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name } }").unwrap();
+    let json = cluster_json(temp.path(), "plan");
     assert_eq!(json["ok"], true);
     assert_eq!(json["state_observations"]["state_found"], true);
     assert!(
@@ -1806,8 +1894,9 @@ fn cluster_plan_json_reads_inferred_local_state() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|change| change["resource"] == "policy.old" && change["operation"] == "delete"),
-        "plan should read state and delete stale resources: {json}"
+            .any(|change| change["resource"] == "query.knowledge.find_person"
+                && change["operation"] == "update"),
+        "{json}"
     );
 }
 
@@ -1918,35 +2007,16 @@ fn cluster_status_json_reports_extended_state() {
 fn cluster_plan_json_includes_state_cas_revision_and_lock_observation() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
-    let state_dir = temp.path().join("__cluster");
-    fs::create_dir_all(&state_dir).unwrap();
-    fs::write(
-        state_dir.join("state.json"),
-        r#"
-{
-  "version": 1,
-  "state_revision": 9,
-  "applied_revision": {
-    "config_digest": "old",
-    "resources": {
-      "graph.knowledge": { "digest": "old-graph" }
-    }
-  }
-}
-"#,
-    )
-    .unwrap();
-
-    let json = parse_stdout_json(&output_success(
-        cli()
-            .arg("cluster")
-            .arg("plan")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--json"),
-    ));
+    apply_cluster_fixture(temp.path());
+    let state_path = temp.path().join("__cluster/state.json");
+    let before = fs::read(&state_path).unwrap();
+    let state: Value = serde_json::from_slice(&before).unwrap();
+    let json = cluster_json(temp.path(), "plan");
     assert_eq!(json["ok"], true);
-    assert_eq!(json["state_observations"]["state_revision"], 9);
+    assert_eq!(
+        json["state_observations"]["state_revision"],
+        state["state_revision"]
+    );
     assert!(
         json["state_observations"]["state_cas"]
             .as_str()
@@ -1954,9 +2024,8 @@ fn cluster_plan_json_includes_state_cas_revision_and_lock_observation() {
             .starts_with("sha256:")
     );
     assert_eq!(json["state_observations"]["locked"], false);
-    assert_eq!(json["state_observations"]["lock_acquired"], true);
-    assert!(json["state_observations"]["acquired_lock_id"].is_string());
-    assert!(!state_dir.join("lock.json").exists());
+    assert!(!temp.path().join("__cluster/lock.json").exists());
+    assert_eq!(fs::read(&state_path).unwrap(), before);
 }
 
 #[test]
@@ -2088,206 +2157,6 @@ fn cluster_locked_plan_then_force_unlock_then_plan_succeeds() {
 }
 
 #[test]
-fn cluster_import_json_bootstraps_missing_state() {
-    let temp = tempdir().unwrap();
-    write_cluster_config_fixture(temp.path());
-    init_cluster_derived_graph(temp.path());
-
-    let json = parse_stdout_json(&output_success(
-        cli()
-            .arg("cluster")
-            .arg("import")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--json"),
-    ));
-    assert_eq!(json["ok"], true);
-    assert_eq!(json["operation"], "import");
-    assert_eq!(json["state_observations"]["state_revision"], 1);
-    assert!(
-        json["state_observations"]["state_cas"]
-            .as_str()
-            .unwrap()
-            .starts_with("sha256:")
-    );
-    assert_eq!(json["state_observations"]["locked"], false);
-    assert_eq!(json["state_observations"]["lock_acquired"], true);
-    assert!(json["state_observations"]["acquired_lock_id"].is_string());
-    assert!(json["observations"]["graph.knowledge"]["graph_manifest_version"].is_number());
-    assert_eq!(
-        json["resource_statuses"]["graph.knowledge"]["status"],
-        "applied"
-    );
-    assert!(temp.path().join("__cluster/state.json").exists());
-    assert!(!temp.path().join("__cluster/lock.json").exists());
-}
-
-#[test]
-fn cluster_refresh_json_updates_revision_cas_and_removes_lock() {
-    let temp = tempdir().unwrap();
-    write_cluster_config_fixture(temp.path());
-    init_cluster_derived_graph(temp.path());
-    let state_dir = temp.path().join("__cluster");
-    fs::create_dir_all(&state_dir).unwrap();
-    fs::write(
-        state_dir.join("state.json"),
-        r#"
-{
-  "version": 1,
-  "state_revision": 2,
-  "applied_revision": { "resources": {} }
-}
-"#,
-    )
-    .unwrap();
-
-    let json = parse_stdout_json(&output_success(
-        cli()
-            .arg("cluster")
-            .arg("refresh")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--json"),
-    ));
-    assert_eq!(json["ok"], true);
-    assert_eq!(json["operation"], "refresh");
-    assert_eq!(json["state_observations"]["state_revision"], 3);
-    assert!(
-        json["state_observations"]["state_cas"]
-            .as_str()
-            .unwrap()
-            .starts_with("sha256:")
-    );
-    assert_eq!(json["state_observations"]["locked"], false);
-    assert_eq!(json["state_observations"]["lock_acquired"], true);
-    assert!(json["state_observations"]["acquired_lock_id"].is_string());
-    assert!(!state_dir.join("lock.json").exists());
-}
-
-#[test]
-fn cluster_refresh_missing_state_exits_nonzero() {
-    let temp = tempdir().unwrap();
-    write_cluster_config_fixture(temp.path());
-
-    let output = output_failure(
-        cli()
-            .arg("cluster")
-            .arg("refresh")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--json"),
-    );
-    let json = parse_stdout_json(&output);
-    assert_eq!(json["ok"], false);
-    assert!(
-        json["diagnostics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|diagnostic| diagnostic["code"] == "state_missing"),
-        "missing state should produce a useful diagnostic: {json}"
-    );
-}
-
-#[test]
-fn cluster_import_existing_state_exits_nonzero() {
-    let temp = tempdir().unwrap();
-    write_cluster_config_fixture(temp.path());
-    let state_dir = temp.path().join("__cluster");
-    fs::create_dir_all(&state_dir).unwrap();
-    fs::write(
-        state_dir.join("state.json"),
-        r#"{"version":1,"applied_revision":{"resources":{}}}"#,
-    )
-    .unwrap();
-
-    let output = output_failure(
-        cli()
-            .arg("cluster")
-            .arg("import")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--json"),
-    );
-    let json = parse_stdout_json(&output);
-    assert_eq!(json["ok"], false);
-    assert!(
-        json["diagnostics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|diagnostic| diagnostic["code"] == "state_already_exists"),
-        "existing state should produce a useful diagnostic: {json}"
-    );
-}
-
-#[test]
-fn cluster_refresh_and_import_locked_state_exit_nonzero() {
-    let temp = tempdir().unwrap();
-    write_cluster_config_fixture(temp.path());
-    let state_dir = temp.path().join("__cluster");
-    fs::create_dir_all(&state_dir).unwrap();
-    fs::write(
-        state_dir.join("state.json"),
-        r#"{"version":1,"applied_revision":{"resources":{}}}"#,
-    )
-    .unwrap();
-    fs::write(
-        state_dir.join("lock.json"),
-        r#"{"version":1,"lock_id":"held-lock","operation":"refresh","created_at":"2026-06-08T00:00:00Z","pid":123}"#,
-    )
-    .unwrap();
-
-    let refresh = parse_stdout_json(&output_failure(
-        cli()
-            .arg("cluster")
-            .arg("refresh")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--json"),
-    ));
-    assert_eq!(refresh["state_observations"]["locked"], true);
-    assert_eq!(refresh["state_observations"]["lock_id"], "held-lock");
-    assert_eq!(refresh["state_observations"]["lock_acquired"], false);
-    assert!(
-        refresh["diagnostics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|diagnostic| diagnostic["code"] == "state_lock_held")
-    );
-
-    let temp = tempdir().unwrap();
-    write_cluster_config_fixture(temp.path());
-    let state_dir = temp.path().join("__cluster");
-    fs::create_dir_all(&state_dir).unwrap();
-    fs::write(
-        state_dir.join("lock.json"),
-        r#"{"version":1,"lock_id":"held-lock","operation":"import","created_at":"2026-06-08T00:00:00Z","pid":123}"#,
-    )
-    .unwrap();
-
-    let imported = parse_stdout_json(&output_failure(
-        cli()
-            .arg("cluster")
-            .arg("import")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--json"),
-    ));
-    assert_eq!(imported["state_observations"]["locked"], true);
-    assert_eq!(imported["state_observations"]["lock_id"], "held-lock");
-    assert_eq!(imported["state_observations"]["lock_acquired"], false);
-    assert!(
-        imported["diagnostics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|diagnostic| diagnostic["code"] == "state_lock_held")
-    );
-}
-
-#[test]
 fn cluster_validate_invalid_config_exits_nonzero() {
     let temp = tempdir().unwrap();
     fs::write(
@@ -2311,112 +2180,78 @@ fn cluster_validate_invalid_config_exits_nonzero() {
 fn cluster_apply_json_applies_query_and_policy() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
-    let validate = write_cluster_applyable_state(temp.path());
-    let seeded_state: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(temp.path().join("__cluster/state.json")).unwrap(),
-    )
-    .unwrap();
-    let seeded_graph = &seeded_state["applied_revision"]["resources"]["graph.knowledge"];
-    assert_eq!(seeded_graph["digest"].as_str().unwrap().len(), 64);
-    assert!(
-        seeded_graph.get("external_blob_policy").is_none(),
-        "the fixture must exercise the valid historical missing-policy => Deny shape"
-    );
-
-    let json = parse_stdout_json(&output_success(
-        cli()
-            .arg("cluster")
-            .arg("apply")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--json"),
-    ));
-    assert_eq!(json["ok"], true, "{json}");
-    assert_eq!(json["applied_count"], 2, "{json}");
-    assert_eq!(json["converged"], true, "{json}");
-    assert_eq!(json["state_written"], true, "{json}");
-    assert_eq!(
-        json["resource_statuses"]["query.knowledge.find_person"]["status"],
-        "applied"
-    );
-
+    let validate = cluster_json(temp.path(), "validate");
+    let json = apply_cluster_fixture(temp.path());
+    assert_eq!(json["result"]["graphs"]["knowledge"]["outcome"], "created");
+    let state: Value =
+        serde_json::from_slice(&fs::read(temp.path().join("__cluster/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["version"], 2);
+    for resource in ["query.knowledge.find_person", "policy.base"] {
+        assert_eq!(
+            state["applied_revision"]["resources"][resource]["digest"],
+            validate["resource_digests"][resource]
+        );
+    }
     let query_digest = validate["resource_digests"]["query.knowledge.find_person"]
         .as_str()
         .unwrap();
-    let payload = temp
-        .path()
-        .join("__cluster/resources/query/knowledge/find_person")
-        .join(format!("{query_digest}.gq"));
-    assert!(payload.exists(), "missing payload {}", payload.display());
-
-    let state: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(temp.path().join("__cluster/state.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(state["state_revision"], 2);
-    assert_eq!(
-        state["applied_revision"]["resources"]["query.knowledge.find_person"]["digest"],
-        *query_digest
+    assert!(
+        temp.path()
+            .join("__cluster/resources/query/knowledge/find_person")
+            .join(format!("{query_digest}.gq"))
+            .exists()
     );
 }
 
 #[test]
-fn cluster_apply_missing_state_exits_nonzero() {
+fn cluster_apply_bootstraps_v2_and_retains_exact_owner() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
-
-    let output = output_failure(
+    let output = output_success(
         cli()
-            .arg("cluster")
-            .arg("apply")
-            .arg("--config")
+            .args(["cluster", "apply", "--config"])
             .arg(temp.path())
             .arg("--json"),
     );
-    let json = parse_stdout_json(&output);
-    assert_eq!(json["ok"], false);
+    let receipt = parse_stdout_json(&output);
+    assert_eq!(receipt["status"], "complete");
+    assert_eq!(receipt["result"]["converged"], true);
     assert!(
-        json["diagnostics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|diagnostic| diagnostic["code"] == "state_missing"),
-        "{json}"
+        String::from_utf8_lossy(&output.stderr).contains(receipt["result"]["id"].as_str().unwrap())
     );
-    assert!(!temp.path().join("__cluster/resources").exists());
+    assert!(
+        temp.path()
+            .join("graphs/knowledge.omni/__manifest")
+            .exists()
+    );
+    assert!(temp.path().join("__cluster/lock.json").exists());
 }
 
 #[test]
 fn cluster_apply_locked_exits_nonzero() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
-    write_cluster_applyable_state(temp.path());
+    apply_cluster_fixture(temp.path());
+    let before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
     write_cluster_lock(temp.path(), "held-lock", "plan");
-
     let output = output_failure(
         cli()
-            .arg("cluster")
-            .arg("apply")
-            .arg("--config")
+            .args(["cluster", "apply", "--config"])
             .arg(temp.path())
             .arg("--json"),
     );
-    let json = parse_stdout_json(&output);
-    assert_eq!(json["ok"], false);
-    assert!(
-        json["diagnostics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|diagnostic| diagnostic["code"] == "state_lock_held"),
-        "{json}"
+    assert_eq!(
+        parse_stdout_json(&output)["diagnostics"][0]["code"],
+        "state_lock_held"
+    );
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        before
     );
     assert!(temp.path().join("__cluster/lock.json").exists());
-    assert!(!temp.path().join("__cluster/resources").exists());
 }
 
-/// RFC-011: the actor chain is `--as` > `operator.actor` > none. The CLI no
-/// longer reads omnigraph.yaml `cli.actor`.
 #[test]
 fn cluster_apply_uses_operator_actor_from_omnigraph_home() {
     let temp = tempdir().unwrap();
@@ -2424,119 +2259,28 @@ fn cluster_apply_uses_operator_actor_from_omnigraph_home() {
     let operator_home = tempdir().unwrap();
     fs::write(
         operator_home.path().join("config.yaml"),
-        "operator:\n  actor: act-operator\n",
+        "operator:
+  actor: act-operator
+",
     )
     .unwrap();
-
-    let output = cli()
-        .current_dir(temp.path())
-        .env("OMNIGRAPH_HOME", operator_home.path())
-        .arg("cluster")
-        .arg("import")
-        .arg("--config")
-        .arg(temp.path())
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-
-    let apply = |extra: &[&str]| {
-        let mut command = cli();
-        command
-            .current_dir(temp.path())
-            .env("OMNIGRAPH_HOME", operator_home.path());
-        for arg in extra {
-            command.arg(arg);
-        }
-        let output = command
-            .arg("cluster")
-            .arg("apply")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--json")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "cluster apply failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+    for (extra, expected) in [(vec![], "act-operator"), (vec!["--as", "andrew"], "andrew")] {
+        let output = output_success(
+            cli()
+                .current_dir(temp.path())
+                .env("OMNIGRAPH_HOME", operator_home.path())
+                .args(extra)
+                .args(["cluster", "apply", "--config"])
+                .arg(temp.path())
+                .arg("--json"),
         );
-        let json = parse_stdout_json(&output);
-        json["actor"].clone()
-    };
-
-    // No --as: the operator identity applies.
-    assert_eq!(
-        apply(&[]),
-        "act-operator",
-        "operator.actor is the no-flag default"
-    );
-    // --as still wins over the operator layer.
-    assert_eq!(apply(&["--as", "andrew"]), "andrew");
-}
-
-#[test]
-fn cluster_approve_uses_operator_actor_fallback() {
-    let temp = tempdir().unwrap();
-    write_cluster_config_fixture(temp.path());
-    let operator_home = tempdir().unwrap();
-    fs::write(
-        operator_home.path().join("config.yaml"),
-        "operator:\n  actor: act-operator\n",
-    )
-    .unwrap();
-    // Converge, then remove the graph so a gated delete is pending.
-    for subcommand in ["import", "apply"] {
-        let mut command = cli();
-        command
-            .current_dir(temp.path())
-            .env("OMNIGRAPH_HOME", operator_home.path())
-            .arg("cluster")
-            .arg(subcommand)
-            .arg("--config")
-            .arg(temp.path());
-        let output = command.output().unwrap();
-        assert!(output.status.success(), "cluster {subcommand} failed");
+        let receipt = parse_stdout_json(&output);
+        assert_eq!(
+            receipt["result"]["authority"]["actor"], expected,
+            "{receipt}"
+        );
+        unlock_cluster_fixture(temp.path());
     }
-    fs::write(temp.path().join("cluster.yaml"), "version: 1\ngraphs: {}\n").unwrap();
-
-    let output = cli()
-        .current_dir(temp.path())
-        .env("OMNIGRAPH_HOME", operator_home.path())
-        .arg("cluster")
-        .arg("approve")
-        .arg("graph.knowledge")
-        .arg("--config")
-        .arg(temp.path())
-        .arg("--json")
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-    let json: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
-    assert_eq!(json["approved_by"], "act-operator");
-
-    // With neither flag nor operator config: refused with the actionable
-    // message (an approval without an approver is meaningless).
-    let bare = tempdir().unwrap();
-    write_cluster_config_fixture(bare.path());
-    let bare_home = tempdir().unwrap();
-    let output = output_failure(
-        cli()
-            .current_dir(bare.path())
-            .env("OMNIGRAPH_HOME", bare_home.path())
-            .arg("cluster")
-            .arg("approve")
-            .arg("graph.knowledge")
-            .arg("--config")
-            .arg(bare.path()),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--as"), "{stderr}");
-    assert!(stderr.contains("operator.actor"), "{stderr}");
-    assert!(stderr.contains("config.yaml"), "{stderr}");
-    assert!(!stderr.contains("cli.actor"), "{stderr}");
-    assert!(!stderr.contains("omnigraph.yaml"), "{stderr}");
 }
 
 #[test]
@@ -2559,7 +2303,7 @@ fn cluster_commands_ignore_legacy_omnigraph_yaml() {
             .output()
             .unwrap();
         assert!(
-            output.status.success() || command == "plan", // plan warns state-missing pre-import; still must not config-error
+            output.status.success() || command == "plan", // plan warns state-missing before bootstrap; still must not config-error
             "cluster {command} affected by malformed omnigraph.yaml: {output:?}"
         );
         assert!(
@@ -2567,23 +2311,19 @@ fn cluster_commands_ignore_legacy_omnigraph_yaml() {
             "cluster {command} touched omnigraph.yaml"
         );
     }
-    // import + apply (no --as, no operator config): the legacy file is never
+    // Bootstrap apply (no --as, no operator config): the legacy file is never
     // loaded and the no-actor apply succeeds (actor defaults to none).
-    for command in ["import", "apply"] {
-        let output = cli()
-            .current_dir(temp.path())
-            .arg("cluster")
-            .arg(command)
-            .arg("--config")
-            .arg(temp.path())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "cluster {command} affected by malformed omnigraph.yaml: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    let output = cli()
+        .current_dir(temp.path())
+        .args(["cluster", "apply", "--config"])
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "cluster apply affected by malformed omnigraph.yaml: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -2636,15 +2376,11 @@ graphs:
 // ── RFC-010 Slice 3: cluster-managed maintenance addressing + init signpost ──
 
 /// Stand up an applied, served cluster with the `knowledge` graph and return
-/// its directory guard. Mirrors the e2e setup (fixture → init → import → apply).
+/// its directory guard. Uses the production v2 bootstrap and releases its completed fixture owner.
 fn applied_knowledge_cluster() -> tempfile::TempDir {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
-    init_cluster_derived_graph(temp.path());
-    let import = cluster_json(temp.path(), "import");
-    assert_eq!(import["ok"], true, "{import}");
-    let apply = cluster_json(temp.path(), "apply");
-    assert_eq!(apply["converged"], true, "{apply}");
+    apply_cluster_fixture(temp.path());
     temp
 }
 
@@ -2669,16 +2405,9 @@ fn optimize_resolves_a_cluster_graph_by_id() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn v2_root_admission_blocks_cli_read_write_and_native_control_doors() {
+async fn v2_root_admission_blocks_cli_write_and_native_control_doors() {
     let temp = applied_knowledge_cluster();
     let root = format!("file://{}", temp.path().display());
-    omnigraph_cluster::upgrade_deployment_ledger(
-        &root,
-        true,
-        &omnigraph_cluster::DeploymentCaller::storage_owner(Some("act-cluster-test".into())),
-    )
-    .await
-    .unwrap();
     let owner = omnigraph_cluster::acquire_cluster_admission(
         &root,
         omnigraph_cluster::ClusterAdmissionPurpose::Serve,
@@ -2689,7 +2418,6 @@ async fn v2_root_admission_blocks_cli_read_write_and_native_control_doors() {
     let graph = temp.path().join("graphs/knowledge.omni");
     let before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
     for args in [
-        vec!["schema", "show"],
         vec!["optimize", "--json"],
         vec!["cleanup", "--keep", "1", "--confirm", "--json"],
         vec!["branch", "create", "must-not-exist"],
@@ -2705,35 +2433,146 @@ async fn v2_root_admission_blocks_cli_read_write_and_native_control_doors() {
         before
     );
     owner.release_after_settlement().await.unwrap();
+
+    // A raw writer can leave text-equal but identity-different schema drift.
+    // Read-only opening must reject that state without acquiring a lock.
+    let db = omnigraph::db::Omnigraph::open(graph.to_str().unwrap())
+        .await
+        .unwrap();
+    let source = db.schema_source();
+    let original_contract = db.schema_contract_digest();
+    db.apply_schema("node Person { name: String @key }")
+        .await
+        .unwrap();
+    db.apply_schema(&source).await.unwrap();
+    assert_eq!(db.schema_source(), source);
+    assert_ne!(db.schema_contract_digest(), original_contract);
+    let refused = output_failure(cli().args(["schema", "show"]).arg(&graph));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("applied_schema_drift"),
+        "{refused:?}"
+    );
+    assert!(!temp.path().join("__cluster/lock.json").exists());
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        before
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn successful_v2_cli_read_retains_actionable_admission() {
+async fn successful_v2_cli_reads_preserve_admission_and_applied_state() {
     let temp = applied_knowledge_cluster();
     let root = format!("file://{}", temp.path().display());
-    omnigraph_cluster::upgrade_deployment_ledger(
-        &root,
-        true,
-        &omnigraph_cluster::DeploymentCaller::storage_owner(Some("act-cluster-test".into())),
+    let graph = temp.path().join("graphs/knowledge.omni");
+    let state_path = temp.path().join("__cluster/state.json");
+    let lock_path = temp.path().join("__cluster/lock.json");
+    let before = fs::read(&state_path).unwrap();
+    let schema = temp.path().join("people.pg");
+    let query = temp.path().join("people.gq");
+    for held in [false, true] {
+        let owner = if held {
+            omnigraph_cluster::acquire_cluster_admission(
+                &root,
+                omnigraph_cluster::ClusterAdmissionPurpose::Serve,
+            )
+            .await
+            .unwrap()
+        } else {
+            None
+        };
+        let before_lock = fs::read(&lock_path).ok();
+        let mut reads = vec![
+            vec!["schema", "show"],
+            vec!["schema", "plan", "--schema", schema.to_str().unwrap()],
+            vec!["lint", "--query", query.to_str().unwrap()],
+            vec!["branch", "list"],
+            vec!["commit", "list"],
+            vec!["export"],
+            vec![
+                "query",
+                "find_person",
+                "--query",
+                query.to_str().unwrap(),
+                "--params",
+                r#"{"name":"Alice"}"#,
+            ],
+        ];
+        for args in &mut reads {
+            args.extend(["--store", graph.to_str().unwrap()]);
+        }
+        reads.push(vec![
+            "queries",
+            "validate",
+            "--cluster",
+            temp.path().to_str().unwrap(),
+        ]);
+        for args in reads {
+            let output = output_success(cli().args(&args));
+            assert!(
+                !String::from_utf8_lossy(&output.stderr).contains("admission retained"),
+                "{args:?}: {output:?}"
+            );
+            assert_eq!(fs::read(&lock_path).ok(), before_lock, "{args:?}");
+            assert_eq!(fs::read(&state_path).unwrap(), before, "{args:?}");
+        }
+        if let Some(owner) = owner {
+            owner.release_after_settlement().await.unwrap();
+        }
+    }
+    // Stored-query validation must not combine an older registry with a newer
+    // ledger, and an observation cannot validate another graph's handle.
+    let snapshot = omnigraph_cluster::read_serving_snapshot_from_storage(&root)
+        .await
+        .unwrap();
+    let authority = omnigraph_cluster::GraphReadAuthority::capture(
+        graph.to_str().unwrap(),
+        snapshot.state_cas.as_deref(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let db = omnigraph::db::Omnigraph::open_read_only(graph.to_str().unwrap())
+        .await
+        .unwrap();
+    authority.validate_opened(&db).await.unwrap();
+    let mut changed: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    changed["state_revision"] = serde_json::json!(changed["state_revision"].as_u64().unwrap() + 1);
+    fs::write(&state_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+    assert_eq!(
+        authority.validate_opened(&db).await.unwrap_err().code,
+        "cluster_read_revision_changed"
+    );
+    assert_eq!(
+        omnigraph_cluster::GraphReadAuthority::capture(
+            graph.to_str().unwrap(),
+            snapshot.state_cas.as_deref(),
+        )
+        .await
+        .unwrap_err()
+        .code,
+        "cluster_read_revision_changed"
+    );
+    fs::write(&state_path, &before).unwrap();
+    let unrelated = tempdir().unwrap();
+    let other = omnigraph::db::Omnigraph::init(
+        unrelated.path().to_str().unwrap(),
+        &fs::read_to_string(&schema).unwrap(),
     )
     .await
     .unwrap();
-    let graph = temp.path().join("graphs/knowledge.omni");
-    let output = output_success(cli().args(["schema", "show"]).arg(&graph));
-    let lock: serde_json::Value =
-        serde_json::from_slice(&fs::read(temp.path().join("__cluster/lock.json")).unwrap())
-            .unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("cluster admission retained"), "{stderr}");
-    assert!(
-        stderr.contains(lock["lock_id"].as_str().unwrap()),
-        "{stderr}"
+    assert_eq!(other.schema_source(), db.schema_source());
+    assert_eq!(
+        authority.validate_opened(&other).await.unwrap_err().code,
+        "cluster_graph_root_mismatch"
     );
-    assert!(stderr.contains("force-unlock"), "{stderr}");
-    assert!(stdout_string(&output).contains("Person"));
-
-    let blocked = output_failure(cli().args(["optimize", "--json"]).arg(&graph));
-    assert!(String::from_utf8_lossy(&blocked.stderr).contains("state_lock_held"));
+    assert!(!lock_path.exists());
+    // Reads leave the writer door usable; writers still retain their own lock.
+    output_success(
+        cli()
+            .args(["branch", "create", "after-reads", "--store"])
+            .arg(&graph),
+    );
+    assert!(lock_path.exists());
 }
 
 #[cfg(unix)]
@@ -2741,13 +2580,6 @@ async fn successful_v2_cli_read_retains_actionable_admission() {
 async fn v2_graph_alias_cannot_bypass_server_admission() {
     let temp = applied_knowledge_cluster();
     let root = format!("file://{}", temp.path().display());
-    omnigraph_cluster::upgrade_deployment_ledger(
-        &root,
-        true,
-        &omnigraph_cluster::DeploymentCaller::storage_owner(Some("act-cluster-test".into())),
-    )
-    .await
-    .unwrap();
     let owner = omnigraph_cluster::acquire_cluster_admission(
         &root,
         omnigraph_cluster::ClusterAdmissionPurpose::Serve,
@@ -2758,10 +2590,41 @@ async fn v2_graph_alias_cannot_bypass_server_admission() {
     let alias_dir = tempdir().unwrap();
     let alias = alias_dir.path().join("arbitrary-name");
     std::os::unix::fs::symlink(temp.path().join("graphs/knowledge.omni"), &alias).unwrap();
-    let output = output_failure(cli().args(["schema", "show"]).arg(&alias));
+    let before_state = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+    let before_lock = fs::read(temp.path().join("__cluster/lock.json")).unwrap();
+    output_success(cli().args(["schema", "show"]).arg(&alias));
+    let output = output_failure(
+        cli()
+            .args(["branch", "create", "blocked", "--store"])
+            .arg(&alias),
+    );
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("state_lock_held"),
         "{output:?}"
+    );
+    let unknown = temp.path().join("graphs/unknown.omni");
+    fs::create_dir(&unknown).unwrap();
+    let escaped = temp.path().join("graphs/escaped.omni");
+    let outside = alias_dir.path().join("outside.omni");
+    fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &escaped).unwrap();
+    for (graph, code) in [
+        (&unknown, "graph_not_applied"),
+        (&escaped, "cluster_graph_root_mismatch"),
+    ] {
+        let output = output_failure(cli().args(["schema", "show"]).arg(graph));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(code),
+            "{output:?}"
+        );
+    }
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        before_state
+    );
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/lock.json")).unwrap(),
+        before_lock
     );
     owner.release_after_settlement().await.unwrap();
 }
@@ -2834,10 +2697,7 @@ policies:
 "#,
     )
     .unwrap();
-    init_named_cluster_graph(root, "knowledge", "people.pg");
-    init_named_cluster_graph(root, "archive", "people.pg");
-    assert_eq!(cluster_json(root, "import")["ok"], true);
-    assert_eq!(cluster_json(root, "apply")["converged"], true);
+    apply_cluster_fixture(root);
     temp
 }
 
@@ -2886,7 +2746,7 @@ fn init_refuses_a_cluster_managed_path_and_signposts_cluster_apply() {
 #[test]
 fn schema_apply_refuses_a_cluster_managed_graph_and_signposts_cluster_apply() {
     // RFC-011 Decision 10: a direct `schema apply` against a cluster-managed
-    // graph's storage root would bypass the ledger/recovery/approvals, so it is
+    // graph's storage root would bypass the deployment ledger, so it is
     // refused and points at `cluster apply` (mirrors `init`'s refusal).
     let temp = applied_knowledge_cluster();
     // A schema that WOULD change the graph (adds `bio`) — so the no-mutation

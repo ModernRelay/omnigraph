@@ -263,26 +263,44 @@ async fn dropped_native_cpu_futures_retain_each_captured_input_until_completion(
     assert!(inputs.iter().all(|input| input.upgrade().is_none()));
 }
 
-/// A dropped local read is harmless to graph contents, but is not resource
-/// settlement. Even with the engine/reader retained, native work can execute
-/// after all its caller futures have gone. `get_all` advances the shared file
-/// offset, giving an independent witness that the real native read ran late.
+/// The live deployment route retains its engine instead of disposing it. A
+/// cancelled native read may finish against the old immutable file after schema
+/// publication without publishing, reclaiming that file, or reverting the new
+/// catalog. This narrow qualification is not a native-resource settlement or
+/// a bound on retained bytes; the scheduler negative control below still applies.
 #[test]
 fn dropped_local_read_futures_still_execute_on_the_native_pool() {
     use lance_io::local::LocalObjectReader;
-    use object_store::path::Path;
 
-    let runtime = NativeIoProbeRuntime::new();
+    // Isolating the read pool lets the real schema apply complete while native
+    // reads remain parked. Both phases retain exactly the same engine instance.
+    let engine_runtime = NativeIoProbeRuntime::new();
+    let read_runtime = NativeIoProbeRuntime::new();
     let directory = tempfile::tempdir().unwrap();
-    let file = directory.path().join("read-tail.lance");
-    let payload = b"read-only native work retains a file and allocates a buffer";
-    std::fs::write(&file, payload).unwrap();
-    let path = Path::from_absolute_path(&file).unwrap();
+    let db = engine_runtime.block_on(init_and_load(&directory));
+    let engine = Arc::clone(db.db());
+    let before = engine_runtime.block_on(snapshot_main(&db)).unwrap();
+    let old_dataset = engine_runtime
+        .block_on(before.open_dataset("node:Person"))
+        .unwrap();
+    let old_rows = engine_runtime
+        .block_on(old_dataset.scan().try_into_stream())
+        .unwrap();
+    let old_rows = engine_runtime
+        .block_on(old_rows.try_collect::<Vec<_>>())
+        .unwrap();
+    let native_dataset =
+        engine_runtime.block_on(open_pinned_dataset_for_test(&db, "main", "node:Person"));
+    let path = native_dataset
+        .data_dir()
+        .join(native_dataset.fragments()[0].files[0].path.as_str());
+    let file = lance_io::local::to_local_path(&path);
+    let payload = std::fs::read(&file).unwrap();
+    assert!(!payload.is_empty());
 
-    runtime.block_on(async {
+    let (gate, untouched, readers) = read_runtime.block_on(async {
         // A future that never reaches native dispatch must not consume the
-        // offset. This control distinguishes abandonment from merely opening
-        // the same file or constructing a read future.
+        // offset. This control distinguishes abandonment from opening a file.
         let untouched = LocalObjectReader::open(&path, 4096, Some(payload.len()))
             .await
             .unwrap();
@@ -301,8 +319,31 @@ fn dropped_local_read_futures_still_execute_on_the_native_pool() {
             assert!(futures::poll!(&mut read).is_pending());
             drop(read);
         }
-        assert_eq!(std::fs::read(&file).unwrap(), payload);
+        (gate, untouched, readers)
+    });
 
+    let desired = helpers::TEST_SCHEMA.replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+    let contract_before = db.schema_contract_digest();
+    engine_runtime.block_on(db.apply_schema(&desired)).unwrap();
+    assert!(Arc::ptr_eq(db.db(), &engine));
+    let contract_after = db.schema_contract_digest();
+    assert_ne!(contract_after, contract_before);
+    assert!(db.catalog().property_id("Person", "nickname").is_some());
+    let published = engine_runtime.block_on(snapshot_main(&db)).unwrap();
+    let new_dataset = engine_runtime
+        .block_on(published.open_dataset("node:Person"))
+        .unwrap();
+    assert_ne!(
+        new_dataset.published_dataset_version(),
+        old_dataset.published_dataset_version(),
+        "schema apply must actually replace Person's accepted dataset pin"
+    );
+    assert_eq!(std::fs::read(&file).unwrap(), payload);
+
+    read_runtime.block_on(async {
         drop(gate);
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -318,7 +359,38 @@ fn dropped_local_read_futures_still_execute_on_the_native_pool() {
                 "the abandoned read must have consumed this reader's file offset"
             );
         }
-        assert_eq!(std::fs::read(&file).unwrap(), payload);
+    });
+    assert_eq!(std::fs::read(&file).unwrap(), payload);
+    engine_runtime.block_on(async {
+        let after_tail = snapshot_main(&db).await.unwrap();
+        assert_eq!(
+            after_tail.graph_manifest_version(),
+            published.graph_manifest_version()
+        );
+        assert_eq!(after_tail.graph_head(None), published.graph_head(None));
+        assert_eq!(db.schema_contract_digest(), contract_after);
+        assert!(db.catalog().property_id("Person", "nickname").is_some());
+        let old_after = old_dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            old_after, old_rows,
+            "the old immutable pin remains readable"
+        );
+        assert_eq!(
+            after_tail
+                .open_dataset("node:Person")
+                .await
+                .unwrap()
+                .published_dataset_version(),
+            new_dataset.published_dataset_version(),
+            "late native reads cannot restore the old table binding"
+        );
     });
 }
 

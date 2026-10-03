@@ -11,10 +11,10 @@ use omnigraph::db::{Omnigraph, ReadTarget, SchemaApplySettlement, SchemaNonPubli
 use omnigraph::seams::catalog;
 use omnigraph_cluster::seams::{FailScenario, catalog as cluster_seams};
 use omnigraph_cluster::{
-    ApplyOptions, AuthorityKind, DeploymentCaller, DeploymentLookup, GraphDeploymentResult,
-    IdentityAuthorization, PlanOptions, apply_config_dir, apply_config_dir_authorized,
-    apply_deployment, authorize_apply_plan, deployment_status, force_unlock_storage_root,
-    import_config_dir, plan_config_dir_authorized, reconcile_deployment, upgrade_deployment_ledger,
+    AuthorityKind, DeploymentCaller, DeploymentLookup, GraphDeploymentResult,
+    IdentityAuthorization, PlanOptions, apply_deployment, authorize_apply_plan, deployment_status,
+    force_unlock_storage_root, plan_config_dir_authorized, reconcile_deployment,
+    upgrade_deployment_ledger,
 };
 
 const SCHEMA: &str = "node Person { name: String @key }";
@@ -66,10 +66,7 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
         "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\npolicies:\n  graph:\n    file: ./graph.policy.yaml\n    applies_to: [knowledge]\n  management:\n    file: ./cluster.policy.yaml\n    applies_to: [cluster]\n",
     )
     .unwrap();
-    let imported = Box::pin(import_config_dir(dir.path())).await;
-    assert!(imported.ok, "{:?}", imported.diagnostics);
-    let applied = Box::pin(apply_config_dir(dir.path())).await;
-    assert!(applied.ok && applied.converged, "{:?}", applied.diagnostics);
+    bootstrap(dir.path()).await;
 
     fs::write(
         dir.path().join("people.pg"),
@@ -144,20 +141,17 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
             .await
             .is_err()
     );
-    let refused = Box::pin(apply_config_dir_authorized(
+    let refused = apply_deployment(
         dir.path(),
-        ApplyOptions::default(),
-        &caller,
-        &expected,
-    ))
+        None,
+        &DeploymentCaller::AuthenticatedIdentity(caller.clone()),
+        &BTreeMap::new(),
+        |_, _, _| {},
+    )
     .await;
     assert!(
-        !refused.apply.ok,
+        refused.is_err(),
         "pending data recovery must block schema apply"
-    );
-    assert!(
-        refused.authorization.is_none(),
-        "refusal must precede effects"
     );
     assert!(
         file_bytes(&graph) == before_graph,
@@ -171,18 +165,19 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
 
     // The explicit storage-holder path refuses the sidecar too: this build
     // cannot interpret one, and only the build that wrote it may resolve it.
-    let refused_legacy = Box::pin(apply_config_dir(dir.path())).await;
+    let owner = DeploymentCaller::storage_owner(Some("principal:schema".into()));
     assert!(
-        !refused_legacy.ok,
-        "the storage-holder path must refuse a legacy sidecar: {:?}",
-        refused_legacy.diagnostics
+        apply_deployment(dir.path(), None, &owner, &BTreeMap::new(), |_, _, _| {})
+            .await
+            .is_err()
     );
     fs::remove_file(graph.join("__recovery/01LEGACYSIDECAR.json")).unwrap();
-    let resolved = Box::pin(apply_config_dir(dir.path())).await;
+    let resolved = apply_deployment(dir.path(), None, &owner, &BTreeMap::new(), |_, _, _| {})
+        .await
+        .unwrap();
     assert!(
-        resolved.ok && resolved.converged,
-        "{:?}",
-        resolved.diagnostics
+        matches!(resolved, DeploymentLookup::Complete { ref result } if result.converged),
+        "{resolved:?}"
     );
     assert_eq!(fs::read_dir(graph.join("__recovery")).unwrap().count(), 0);
     let recovered = session(Box::pin(Omnigraph::open_read_only(uri)).await.unwrap());
@@ -222,10 +217,7 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
         dir.path().join("cluster.yaml"),
         "version: 1\ngraphs:\n  knowledge:\n    schema: people.pg\npolicies:\n  graph:\n    file: graph.policy.yaml\n    applies_to: [knowledge]\n  management:\n    file: cluster.policy.yaml\n    applies_to: [cluster]\n",
     ).unwrap();
-    let imported = Box::pin(import_config_dir(dir.path())).await;
-    assert!(imported.ok, "{imported:?}");
-    let applied = Box::pin(apply_config_dir(dir.path())).await;
-    assert!(applied.ok && applied.converged, "{applied:?}");
+    bootstrap(dir.path()).await;
     let graph = dir.path().join("graphs/knowledge.omni");
     let uri = graph.to_str().unwrap();
     let writer = session(Box::pin(Omnigraph::open(uri)).await.unwrap());
@@ -286,6 +278,7 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
             dir.path(),
             None,
             &original,
+            &Default::default(),
             |issued, _, _| id = issued.to_string(),
         ))
         .await
@@ -325,6 +318,25 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
     assert_eq!(fs::read(&ledger_path).unwrap(), ledger_before_denial);
     assert_eq!(file_bytes(&graph), graph_bytes);
 
+    // A storage-owning recovery without an actor still fails the installed
+    // engine policy. Preserve that bounded cause without losing original work.
+    let missing_actor = DeploymentCaller::storage_owner(None);
+    let error = Box::pin(reconcile_deployment(root, &id, true, &missing_actor))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "deployment_outcome_unknown");
+    assert!(error.message.contains("no actor"), "{error:?}");
+    assert!(error.message.len() <= 4096);
+    assert_eq!(fs::read(&ledger_path).unwrap(), ledger_before_denial);
+    assert_eq!(file_bytes(&graph), graph_bytes);
+    let lock = deployment_status(root, Some(&id), &original)
+        .await
+        .unwrap()
+        .lock_id
+        .unwrap();
+    assert!(error.message.contains(&lock));
+    force_unlock_storage_root(root, &lock).await.unwrap();
+
     {
         let _fail = cluster_seams::DEPLOYMENT_AFTER_SETTLEMENT_INTENT.fire_always();
         let error = Box::pin(reconcile_deployment(root, &id, true, &recovery))
@@ -354,6 +366,28 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
         .unwrap()
         .lock_id
         .unwrap();
+    force_unlock_storage_root(root, &lock).await.unwrap();
+    // Once a fence is persisted, invocation refusal must preserve its exact
+    // identity and expose the same policy cause rather than generic uncertainty.
+    let error = Box::pin(reconcile_deployment(root, &id, true, &missing_actor))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "deployment_outcome_unknown");
+    assert!(error.message.contains("no actor"), "{error:?}");
+    assert!(error.message.len() <= 4096);
+    let retained: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+    assert_eq!(
+        retained["outstanding"]["graphs"]["knowledge"]["settlement"],
+        fence
+    );
+    assert_eq!(file_bytes(&graph), graph_bytes);
+    let lock = deployment_status(root, Some(&id), &original)
+        .await
+        .unwrap()
+        .lock_id
+        .unwrap();
+    assert!(error.message.contains(&lock));
     force_unlock_storage_root(root, &lock).await.unwrap();
     fs::remove_file(dir.path().join("people.pg")).unwrap();
     fs::remove_file(dir.path().join("cluster.yaml")).unwrap();
@@ -441,4 +475,24 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
             .lock_id
             .is_some()
     );
+}
+
+async fn bootstrap(dir: &Path) {
+    let owner = DeploymentCaller::storage_owner(None);
+    let result = apply_deployment(dir, None, &owner, &BTreeMap::new(), |_, _, _| {})
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, DeploymentLookup::Complete { ref result } if result.converged),
+        "{result:?}"
+    );
+    if let Some(lock) = deployment_status(dir.to_str().unwrap(), None, &owner)
+        .await
+        .unwrap()
+        .lock_id
+    {
+        force_unlock_storage_root(dir.to_str().unwrap(), &lock)
+            .await
+            .unwrap();
+    }
 }

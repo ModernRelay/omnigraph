@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use omnigraph::db::Omnigraph;
+use omnigraph::db::{Omnigraph, SchemaContractDigest};
 use omnigraph::storage::normalize_root_uri;
 use tokio::time::Instant;
 
@@ -163,9 +163,15 @@ pub enum InsertError {
 
 struct RegistryState {
     snapshot: Arc<RegistrySnapshot>,
-    // One O(1) candidate per process registry. It retains the predecessor;
-    // graph entry kind is the sole open/closed state, not a second flag here.
-    candidate: Option<Arc<TransitionRecord>>,
+    // One active scheduling record per process registry. This record adds no
+    // engine instance or request capacity: the graph entry retains the predecessor
+    // after closure, including when the record expires or is abandoned.
+    candidate: Option<TransitionCandidate>,
+}
+
+struct TransitionCandidate {
+    record: Arc<TransitionRecord>,
+    closed: bool,
 }
 
 pub struct GraphRegistry {
@@ -310,36 +316,69 @@ impl GraphRegistry {
         key: &GraphKey,
         deadline: Instant,
     ) -> Result<PreparedTransition, ServingTransitionError> {
+        self.prepare_transition(operations, std::slice::from_ref(key), deadline)
+    }
+
+    /// Reserve all existing graphs affected by one durable deployment. An
+    /// empty set is valid for creation-only deployment; it still owns the one
+    /// candidate so concurrent activation cannot race inventory publication.
+    pub(crate) fn prepare_transition(
+        self: &Arc<Self>,
+        operations: &OperationRuntime,
+        keys: &[GraphKey],
+        deadline: Instant,
+    ) -> Result<PreparedTransition, ServingTransitionError> {
         operations.while_open(|| {
             let mut state = locked(&self.state);
             if Instant::now() >= deadline {
                 return Err(ServingTransitionError::DeadlineElapsed);
             }
+            // Expiry retires bookkeeping only. Closed graphs and every
+            // admitted descendant remain retained by their registry entries.
+            if state
+                .candidate
+                .as_ref()
+                .is_some_and(|candidate| Instant::now() >= candidate.record.deadline)
+            {
+                state.candidate = None;
+            }
             if state.candidate.is_some() {
                 return Err(ServingTransitionError::Busy);
             }
-            let predecessor = match state.snapshot.graphs.get(key) {
-                Some(GraphEntry::Ready(view)) => Arc::clone(view),
-                Some(
-                    GraphEntry::Loading(_) | GraphEntry::Transitioning(_) | GraphEntry::Blocked(_),
-                ) => {
-                    return Err(ServingTransitionError::Unavailable);
+            let mut seen = std::collections::HashSet::with_capacity(keys.len());
+            let mut predecessors = Vec::with_capacity(keys.len());
+            for key in keys {
+                if !seen.insert(key) {
+                    return Err(ServingTransitionError::InvalidBindings);
                 }
-                None => return Err(ServingTransitionError::Gone),
-            };
-            if !predecessor.contract_is_current() {
-                return Err(ServingTransitionError::SchemaChanged);
+                let predecessor = match state.snapshot.graphs.get(key) {
+                    Some(GraphEntry::Ready(view)) => Arc::clone(view),
+                    Some(
+                        GraphEntry::Loading(_)
+                        | GraphEntry::Transitioning(_)
+                        | GraphEntry::Blocked(_),
+                    ) => {
+                        return Err(ServingTransitionError::Unavailable);
+                    }
+                    None => return Err(ServingTransitionError::Gone),
+                };
+                if !predecessor.contract_is_current() {
+                    return Err(ServingTransitionError::SchemaChanged);
+                }
+                predecessor.epoch().successor()?;
+                predecessors.push(predecessor);
             }
-            // Reject identity exhaustion before closing a healthy epoch.
-            predecessor.epoch().successor()?;
             let record = Arc::new(TransitionRecord {
-                predecessor,
+                predecessors,
                 deadline,
             });
             if Instant::now() >= deadline {
                 return Err(ServingTransitionError::DeadlineElapsed);
             }
-            state.candidate = Some(Arc::clone(&record));
+            state.candidate = Some(TransitionCandidate {
+                record: Arc::clone(&record),
+                closed: false,
+            });
             Ok(PreparedTransition::new(
                 Arc::clone(self),
                 record,
@@ -354,24 +393,32 @@ impl GraphRegistry {
     ) -> Result<(), ServingTransitionError> {
         let mut state = locked(&self.state);
         validate_candidate(&state, record)?;
-        if !matches!(state.snapshot.graphs.get(&record.predecessor.key),
-            Some(GraphEntry::Ready(view)) if Arc::ptr_eq(view, &record.predecessor))
-        {
+        if state.candidate.as_ref().unwrap().closed {
             return Err(ServingTransitionError::StaleAttempt);
         }
-        if !record.predecessor.contract_is_current() {
-            return Err(ServingTransitionError::SchemaChanged);
+        for predecessor in &record.predecessors {
+            if !matches!(state.snapshot.graphs.get(&predecessor.key),
+                Some(GraphEntry::Ready(view)) if Arc::ptr_eq(view, predecessor))
+            {
+                return Err(ServingTransitionError::StaleAttempt);
+            }
+            if !predecessor.contract_is_current() {
+                return Err(ServingTransitionError::SchemaChanged);
+            }
         }
         let mut graphs = state.snapshot.graphs.clone();
-        graphs.insert(
-            record.predecessor.key.clone(),
-            GraphEntry::Transitioning(Arc::clone(&record.predecessor)),
-        );
+        for predecessor in &record.predecessors {
+            graphs.insert(
+                predecessor.key.clone(),
+                GraphEntry::Transitioning(Arc::clone(predecessor)),
+            );
+        }
         let snapshot = Arc::new(RegistrySnapshot::new(graphs));
         if Instant::now() >= record.deadline {
             return Err(ServingTransitionError::DeadlineElapsed);
         }
         state.snapshot = snapshot;
+        state.candidate.as_mut().unwrap().closed = true;
         Ok(())
     }
 
@@ -380,34 +427,206 @@ impl GraphRegistry {
         if state
             .candidate
             .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, record))
-            && matches!(state.snapshot.graphs.get(&record.predecessor.key),
-                Some(GraphEntry::Ready(view)) if Arc::ptr_eq(view, &record.predecessor))
+            .is_some_and(|candidate| Arc::ptr_eq(&candidate.record, record) && !candidate.closed)
         {
             state.candidate = None;
         }
+    }
+
+    /// Retire scheduling capacity without reopening or disposing closed views.
+    /// This supplies no native settlement evidence or lock-release authority.
+    pub(crate) fn discard_transition(&self, record: &Arc<TransitionRecord>) {
+        let mut state = locked(&self.state);
+        if state
+            .candidate
+            .as_ref()
+            .is_some_and(|candidate| Arc::ptr_eq(&candidate.record, record) && candidate.closed)
+        {
+            state.candidate = None;
+        }
+    }
+
+    pub(crate) fn check_drained(
+        &self,
+        record: &Arc<TransitionRecord>,
+    ) -> Result<(), ServingTransitionError> {
+        validate_closed(&locked(&self.state), record)
+    }
+
+    /// Reopen unchanged admission after the controller proves that no effect
+    /// began. Deadline and drainage are deliberately not preconditions here:
+    /// every older descendant remains in the successor's shared counter.
+    pub(crate) fn abort_before_effects(
+        &self,
+        record: &Arc<TransitionRecord>,
+    ) -> Result<HashMap<GraphKey, ServingEpoch>, ServingTransitionError> {
+        let mut state = locked(&self.state);
+        if !state
+            .candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.closed && Arc::ptr_eq(&candidate.record, record))
+        {
+            return Err(ServingTransitionError::StaleAttempt);
+        }
+        let mut graphs = state.snapshot.graphs.clone();
+        let mut epochs = HashMap::with_capacity(record.predecessors.len());
+        for predecessor in &record.predecessors {
+            if !matches!(graphs.get(&predecessor.key), Some(GraphEntry::Transitioning(view)) if Arc::ptr_eq(view, predecessor))
+            {
+                return Err(ServingTransitionError::StaleAttempt);
+            }
+            if !predecessor.contract_is_current() {
+                return Err(ServingTransitionError::SchemaChanged);
+            }
+            let epoch = predecessor.epoch().successor()?;
+            graphs.insert(
+                predecessor.key.clone(),
+                GraphEntry::Ready(Arc::new(predecessor.successor_retaining_requests(epoch))),
+            );
+            epochs.insert(predecessor.key.clone(), epoch);
+        }
+        let snapshot = Arc::new(RegistrySnapshot::new(graphs));
+        if record
+            .predecessors
+            .iter()
+            .any(|view| !view.contract_is_current())
+        {
+            return Err(ServingTransitionError::SchemaChanged);
+        }
+        state.snapshot = snapshot;
+        state.candidate = None;
+        Ok(epochs)
     }
 
     pub(crate) fn resume_same_view(
         &self,
         record: &Arc<TransitionRecord>,
     ) -> Result<ServingEpoch, ServingTransitionError> {
+        if record.predecessors.len() != 1 {
+            return Err(ServingTransitionError::InvalidBindings);
+        }
+        Ok(self.resume_same_views(record)?[&record.predecessors[0].key])
+    }
+
+    pub(crate) fn resume_same_views(
+        &self,
+        record: &Arc<TransitionRecord>,
+    ) -> Result<HashMap<GraphKey, ServingEpoch>, ServingTransitionError> {
+        let views = record
+            .predecessors
+            .iter()
+            .map(|view| Ok(Arc::new(view.successor(view.epoch().successor()?))))
+            .collect::<Result<Vec<_>, ServingTransitionError>>()?;
+        self.activate(record, views)
+    }
+
+    /// Compile the complete replacement set before entering the short final
+    /// publication boundary. The exact engine contract is checked both before
+    /// compilation and again by activate, so no query registry crosses schemas.
+    pub(crate) fn validate_activation(
+        &self,
+        record: &Arc<TransitionRecord>,
+        mut bindings: HashMap<GraphKey, (SchemaContractDigest, QueryRegistry)>,
+        additions: Vec<(Arc<GraphHandle>, SchemaContractDigest)>,
+    ) -> Result<Vec<Arc<ServingView>>, ServingTransitionError> {
+        self.check_drained(record)?;
+        if bindings.len() != record.predecessors.len() {
+            return Err(ServingTransitionError::InvalidBindings);
+        }
+        let mut views = Vec::with_capacity(bindings.len() + additions.len());
+        for predecessor in &record.predecessors {
+            let (contract, queries) = bindings
+                .remove(&predecessor.key)
+                .ok_or(ServingTransitionError::InvalidBindings)?;
+            if contract != predecessor.engine.schema_contract_digest() {
+                return Err(ServingTransitionError::SchemaChanged);
+            }
+            crate::validate_registry_against_catalog(
+                &queries,
+                &predecessor.engine.catalog(),
+                predecessor.key.graph_id.as_str(),
+            )
+            .map_err(|error| ServingTransitionError::InvalidQueries(error.to_string()))?;
+            let handle = Arc::new(GraphHandle {
+                key: predecessor.key.clone(),
+                uri: predecessor.uri.clone(),
+                engine: Arc::clone(&predecessor.engine),
+                policy: predecessor.policy.clone(),
+                queries: (!queries.is_empty()).then(|| Arc::new(queries)),
+            });
+            let view = Arc::new(ServingView::new(handle, predecessor.epoch().successor()?));
+            if view.schema_contract() != &contract {
+                return Err(ServingTransitionError::SchemaChanged);
+            }
+            views.push(view);
+        }
+        for (handle, contract) in additions {
+            let (_, handle) = canonicalize_handle_uri(handle)
+                .map_err(|error| ServingTransitionError::InvalidGraph(error.to_string()))?;
+            if contract != handle.engine.schema_contract_digest() {
+                return Err(ServingTransitionError::SchemaChanged);
+            }
+            if let Some(queries) = &handle.queries {
+                crate::validate_registry_against_catalog(
+                    queries,
+                    &handle.engine.catalog(),
+                    handle.key.graph_id.as_str(),
+                )
+                .map_err(|error| ServingTransitionError::InvalidQueries(error.to_string()))?;
+            }
+            let view = Arc::new(ServingView::new(handle, ServingEpoch::INITIAL));
+            if view.schema_contract() != &contract {
+                return Err(ServingTransitionError::SchemaChanged);
+            }
+            views.push(view);
+        }
+        Ok(views)
+    }
+
+    pub(crate) fn activate(
+        &self,
+        record: &Arc<TransitionRecord>,
+        views: Vec<Arc<ServingView>>,
+    ) -> Result<HashMap<GraphKey, ServingEpoch>, ServingTransitionError> {
         let mut state = locked(&self.state);
-        validate_candidate(&state, record)?;
-        if !matches!(state.snapshot.graphs.get(&record.predecessor.key),
-            Some(GraphEntry::Transitioning(view)) if Arc::ptr_eq(view, &record.predecessor))
-        {
-            return Err(ServingTransitionError::StaleAttempt);
-        }
-        if record.predecessor.request_count() != 0 {
-            return Err(ServingTransitionError::RequestsActive);
-        }
-        let epoch = record.predecessor.epoch().successor()?;
-        let successor = Arc::new(record.predecessor.successor(epoch));
+        validate_closed(&state, record)?;
         let mut graphs = state.snapshot.graphs.clone();
-        graphs.insert(record.predecessor.key.clone(), GraphEntry::Ready(successor));
+        let mut epochs = HashMap::with_capacity(views.len());
+        for view in &views {
+            if epochs.insert(view.key.clone(), view.epoch()).is_some() {
+                return Err(ServingTransitionError::InvalidBindings);
+            }
+            if let Some(predecessor) = record.predecessors.iter().find(|old| old.key == view.key) {
+                if !Arc::ptr_eq(&predecessor.engine, &view.engine)
+                    || predecessor.uri != view.uri
+                    || view.epoch() != predecessor.epoch().successor()?
+                {
+                    return Err(ServingTransitionError::InvalidBindings);
+                }
+            } else if graphs.contains_key(&view.key) {
+                return Err(ServingTransitionError::InvalidGraph(
+                    InsertError::DuplicateKey(view.key.clone()).to_string(),
+                ));
+            }
+            if graphs
+                .values()
+                .any(|entry| entry.key() != &view.key && entry.uri() == view.uri)
+            {
+                return Err(ServingTransitionError::InvalidGraph(
+                    InsertError::DuplicateUri(view.uri.clone()).to_string(),
+                ));
+            }
+            graphs.insert(view.key.clone(), GraphEntry::Ready(Arc::clone(view)));
+        }
+        if record
+            .predecessors
+            .iter()
+            .any(|view| !epochs.contains_key(&view.key))
+        {
+            return Err(ServingTransitionError::InvalidBindings);
+        }
         let snapshot = Arc::new(RegistrySnapshot::new(graphs));
-        if !record.predecessor.contract_is_current() {
+        if views.iter().any(|view| !view.contract_is_current()) {
             return Err(ServingTransitionError::SchemaChanged);
         }
         if Instant::now() >= record.deadline {
@@ -415,10 +634,10 @@ impl GraphRegistry {
         }
         state.snapshot = snapshot;
         state.candidate = None;
-        Ok(epoch)
+        Ok(epochs)
     }
 
-    /// Test-only inventory mutation; production inventory stays fixed.
+    /// Test fixture insertion. Production additions use the deployment activation boundary.
     #[cfg(test)]
     pub async fn insert(&self, handle: Arc<GraphHandle>) -> Result<(), InsertError> {
         let (canonical_uri, handle) = canonicalize_handle_uri(handle)?;
@@ -448,12 +667,33 @@ fn validate_candidate(
     if !state
         .candidate
         .as_ref()
-        .is_some_and(|current| Arc::ptr_eq(current, record))
+        .is_some_and(|candidate| Arc::ptr_eq(&candidate.record, record))
     {
         return Err(ServingTransitionError::StaleAttempt);
     }
     if Instant::now() >= record.deadline {
         return Err(ServingTransitionError::DeadlineElapsed);
+    }
+    Ok(())
+}
+
+fn validate_closed(
+    state: &RegistryState,
+    record: &Arc<TransitionRecord>,
+) -> Result<(), ServingTransitionError> {
+    validate_candidate(state, record)?;
+    if !state.candidate.as_ref().unwrap().closed {
+        return Err(ServingTransitionError::StaleAttempt);
+    }
+    for predecessor in &record.predecessors {
+        if !matches!(state.snapshot.graphs.get(&predecessor.key),
+            Some(GraphEntry::Transitioning(view)) if Arc::ptr_eq(view, predecessor))
+        {
+            return Err(ServingTransitionError::StaleAttempt);
+        }
+        if predecessor.request_count() != 0 {
+            return Err(ServingTransitionError::RequestsActive);
+        }
     }
     Ok(())
 }
@@ -1044,11 +1284,321 @@ mod tests {
         }
     }
 
+    fn activation_queries(property: &str) -> QueryRegistry {
+        QueryRegistry::from_specs(vec![crate::queries::RegistrySpec {
+            name: "people".to_owned(),
+            source: format!(
+                "query people() {{ match {{ $p: Person }} return {{ $p.{property} }} }}"
+            ),
+            expose: true,
+            tool_name: None,
+        }])
+        .unwrap()
+    }
+
     #[tokio::test]
-    async fn prepared_drop_releases_only_unclosed_capacity_and_closed_drop_stays_closed() {
+    async fn batch_activation_drains_all_affected_graphs_and_keeps_the_same_engines() {
+        let dir = TempDir::new().unwrap();
+        let alpha = build_handle("alpha", dir.path()).await;
+        let beta = build_handle("beta", dir.path()).await;
+        let peer = build_handle("peer", dir.path()).await;
+        let registry = Arc::new(
+            GraphRegistry::from_handles(vec![
+                Arc::clone(&alpha),
+                Arc::clone(&beta),
+                Arc::clone(&peer),
+            ])
+            .unwrap(),
+        );
+        let operations = OperationRuntime::new();
+        let before = registry.snapshot_ref();
+        let alpha_request = captured(&registry, &operations, &alpha.key);
+        let descendant = alpha_request.clone();
+        let beta_request = captured(&registry, &operations, &beta.key);
+        let prepared = registry
+            .prepare_transition(
+                &operations,
+                &[alpha.key.clone(), beta.key.clone()],
+                transition_deadline(),
+            )
+            .unwrap();
+        let transition = prepared.close().unwrap();
+        assert!(matches!(
+            transition.engines(),
+            Err(ServingTransitionError::RequestsActive)
+        ));
+        for key in [&alpha.key, &beta.key] {
+            assert!(matches!(
+                registry.capture(&operations, key).unwrap(),
+                RegistryCapture::Transitioning(_)
+            ));
+        }
+        let peer_epoch = captured(&registry, &operations, &peer.key).epoch();
+        {
+            let waiting = transition.wait_requests();
+            tokio::pin!(waiting);
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+            drop(alpha_request);
+            drop(beta_request);
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+            drop(descendant);
+            waiting.await.unwrap();
+        }
+        let engines = transition.engines().unwrap();
+        for handle in [&alpha, &beta] {
+            assert!(Arc::ptr_eq(&engines[&handle.key], &handle.engine));
+            engines[&handle.key]
+                .apply_schema("node Person { name: String @key nickname: String? }\n")
+                .await
+                .unwrap();
+        }
+        let added = build_handle("added", dir.path()).await;
+        let bindings = [&alpha, &beta]
+            .into_iter()
+            .map(|handle| {
+                (
+                    handle.key.clone(),
+                    (
+                        handle.engine.schema_contract_digest(),
+                        activation_queries("nickname"),
+                    ),
+                )
+            })
+            .collect();
+        let epochs = transition
+            .activate(
+                bindings,
+                vec![(Arc::clone(&added), added.engine.schema_contract_digest())],
+            )
+            .unwrap();
+        assert_eq!(epochs.len(), 3);
+        for handle in [&alpha, &beta] {
+            let request = captured(&registry, &operations, &handle.key);
+            assert_eq!(request.epoch(), epochs[&handle.key]);
+            assert!(Arc::ptr_eq(&request.engine, &handle.engine));
+            assert_eq!(
+                request.schema_contract(),
+                &handle.engine.schema_contract_digest()
+            );
+            assert!(
+                request
+                    .queries
+                    .as_ref()
+                    .unwrap()
+                    .lookup("people")
+                    .unwrap()
+                    .source
+                    .contains("nickname")
+            );
+            match before.graphs.get(&handle.key).unwrap() {
+                GraphEntry::Ready(old) => {
+                    assert_ne!(old.epoch(), request.epoch());
+                    assert!(old.queries.is_none());
+                    assert_ne!(old.schema_contract(), request.schema_contract());
+                }
+                _ => panic!("predecessor snapshot changed"),
+            }
+        }
+        assert!(Arc::ptr_eq(
+            &captured(&registry, &operations, &added.key).engine,
+            &added.engine
+        ));
+        assert_eq!(
+            captured(&registry, &operations, &peer.key).epoch(),
+            peer_epoch
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_activation_rejects_incomplete_invalid_or_duplicate_bindings_atomically() {
+        let dir = TempDir::new().unwrap();
+        let alpha = build_handle("alpha", dir.path()).await;
+        let beta = build_handle("beta", dir.path()).await;
+        for refusal in ["missing", "queries", "contract", "duplicate"] {
+            let registry = Arc::new(
+                GraphRegistry::from_handles(vec![Arc::clone(&alpha), Arc::clone(&beta)]).unwrap(),
+            );
+            let operations = OperationRuntime::new();
+            let transition = registry
+                .prepare_transition(
+                    &operations,
+                    &[alpha.key.clone(), beta.key.clone()],
+                    transition_deadline(),
+                )
+                .unwrap()
+                .close()
+                .unwrap();
+            transition.wait_requests().await.unwrap();
+            let mut bindings: HashMap<_, _> = [&alpha, &beta]
+                .into_iter()
+                .map(|handle| {
+                    (
+                        handle.key.clone(),
+                        (
+                            handle.engine.schema_contract_digest(),
+                            activation_queries("name"),
+                        ),
+                    )
+                })
+                .collect();
+            let additions = match refusal {
+                "missing" => {
+                    bindings.remove(&beta.key);
+                    Vec::new()
+                }
+                "queries" => {
+                    bindings.get_mut(&beta.key).unwrap().1 = activation_queries("nonexistent");
+                    Vec::new()
+                }
+                "contract" => {
+                    beta.engine
+                        .apply_schema(&format!("// changed\n{TEST_SCHEMA}"))
+                        .await
+                        .unwrap();
+                    Vec::new()
+                }
+                "duplicate" => vec![(Arc::clone(&alpha), alpha.engine.schema_contract_digest())],
+                _ => unreachable!(),
+            };
+            let error = transition.activate(bindings, additions).unwrap_err();
+            match refusal {
+                "queries" => assert!(matches!(error, ServingTransitionError::InvalidQueries(_))),
+                "contract" => assert_eq!(error, ServingTransitionError::SchemaChanged),
+                _ => assert_eq!(error, ServingTransitionError::InvalidBindings),
+            }
+            assert!(registry.list().is_empty());
+            assert_eq!(registry.len(), 2);
+            for key in [&alpha.key, &beta.key] {
+                assert!(matches!(
+                    registry.get(key),
+                    RegistryLookup::Transitioning(_)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_only_activation_and_unchanged_batch_resumption_share_the_candidate_boundary() {
+        let dir = TempDir::new().unwrap();
+        let alpha = build_handle("alpha", dir.path()).await;
+        let beta = build_handle("beta", dir.path()).await;
+        let registry = Arc::new(GraphRegistry::from_handles(vec![Arc::clone(&alpha)]).unwrap());
+        let operations = OperationRuntime::new();
+        let transition = registry
+            .prepare_transition(&operations, &[], transition_deadline())
+            .unwrap()
+            .close()
+            .unwrap();
+        assert!(matches!(
+            registry.prepare_same_view(&operations, &alpha.key, transition_deadline()),
+            Err(ServingTransitionError::Busy)
+        ));
+        transition.wait_requests().await.unwrap();
+        assert!(transition.engines().unwrap().is_empty());
+        assert_eq!(
+            transition
+                .activate(
+                    HashMap::new(),
+                    vec![(Arc::clone(&beta), beta.engine.schema_contract_digest())]
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+        let prior_alpha = captured(&registry, &operations, &alpha.key).epoch();
+        let prior_beta = captured(&registry, &operations, &beta.key).epoch();
+        let transition = registry
+            .prepare_transition(
+                &operations,
+                &[alpha.key.clone(), beta.key.clone()],
+                transition_deadline(),
+            )
+            .unwrap()
+            .close()
+            .unwrap();
+        transition.wait_requests().await.unwrap();
+        let resumed = transition.resume_same_views().unwrap();
+        assert_ne!(resumed[&alpha.key], prior_alpha);
+        assert_ne!(resumed[&beta.key], prior_beta);
+        assert_eq!(registry.list().len(), 2);
+
+        let transition = registry
+            .prepare_transition(&operations, &[], transition_deadline())
+            .unwrap()
+            .close()
+            .unwrap();
+        assert!(matches!(
+            transition.activate(
+                HashMap::new(),
+                vec![(Arc::clone(&alpha), alpha.engine.schema_contract_digest())]
+            ),
+            Err(ServingTransitionError::InvalidGraph(_))
+        ));
+        assert_eq!(registry.list().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn activation_final_boundary_rechecks_contract_and_process_closure() {
+        let dir = TempDir::new().unwrap();
+        let alpha = build_handle("alpha", dir.path()).await;
+        for refusal in ["contract", "shutdown"] {
+            let registry = Arc::new(GraphRegistry::from_handles(vec![Arc::clone(&alpha)]).unwrap());
+            let operations = OperationRuntime::new();
+            let transition = registry
+                .prepare_transition(
+                    &operations,
+                    std::slice::from_ref(&alpha.key),
+                    transition_deadline(),
+                )
+                .unwrap()
+                .close()
+                .unwrap();
+            transition.wait_requests().await.unwrap();
+            let record = Arc::clone(&locked(&registry.state).candidate.as_ref().unwrap().record);
+            let replacements = registry
+                .validate_activation(
+                    &record,
+                    HashMap::from([(
+                        alpha.key.clone(),
+                        (
+                            alpha.engine.schema_contract_digest(),
+                            activation_queries("name"),
+                        ),
+                    )]),
+                    vec![],
+                )
+                .unwrap();
+            let expected = if refusal == "contract" {
+                alpha
+                    .engine
+                    .apply_schema(&format!("// final-boundary\n{TEST_SCHEMA}"))
+                    .await
+                    .unwrap();
+                ServingTransitionError::SchemaChanged
+            } else {
+                operations.close();
+                ServingTransitionError::ProcessClosed
+            };
+            assert_eq!(
+                operations.while_open(|| registry.activate(&record, replacements)),
+                Err(expected)
+            );
+            assert!(matches!(
+                registry.get(&alpha.key),
+                RegistryLookup::Transitioning(_)
+            ));
+            drop(transition);
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_drop_releases_scheduling_capacity_and_closed_drop_stays_closed() {
         let dir = TempDir::new().unwrap();
         let handle = build_handle("alpha", dir.path()).await;
-        let registry = Arc::new(GraphRegistry::from_handles(vec![Arc::clone(&handle)]).unwrap());
+        let beta = build_handle("beta", dir.path()).await;
+        let registry = Arc::new(
+            GraphRegistry::from_handles(vec![Arc::clone(&handle), Arc::clone(&beta)]).unwrap(),
+        );
         let operations = OperationRuntime::new();
         let prepared = registry
             .prepare_same_view(&operations, &handle.key, transition_deadline())
@@ -1066,8 +1616,15 @@ mod tests {
         ));
         assert!(matches!(
             registry.prepare_same_view(&operations, &handle.key, transition_deadline()),
-            Err(ServingTransitionError::Busy)
+            Err(ServingTransitionError::Unavailable)
         ));
+        let other = registry
+            .prepare_same_view(&operations, &beta.key, transition_deadline())
+            .unwrap()
+            .close()
+            .unwrap();
+        other.wait_requests().await.unwrap();
+        other.resume_same_view().unwrap();
         assert!(matches!(
             GraphRegistry::from_entries(registry.entries()),
             Err(InsertError::Transitioning(_))
@@ -1183,11 +1740,104 @@ mod tests {
             registry.get(&alpha.key),
             RegistryLookup::Transitioning(_)
         ));
-        assert!(matches!(
-            registry.prepare_same_view(&operations, &beta.key, transition_deadline()),
-            Err(ServingTransitionError::Busy)
-        ));
+        let next = registry
+            .prepare_same_view(&operations, &beta.key, transition_deadline())
+            .unwrap()
+            .close()
+            .unwrap();
+        next.wait_requests().await.unwrap();
+        next.resume_same_view().unwrap();
         drop(captured(&registry, &operations, &beta.key));
+
+        let gamma = build_handle("gamma", dir.path()).await;
+        let registry = Arc::new(
+            GraphRegistry::from_handles(vec![Arc::clone(&beta), Arc::clone(&gamma)]).unwrap(),
+        );
+        let retained = captured(&registry, &operations, &beta.key);
+        let deadline = Instant::now() + std::time::Duration::from_millis(20);
+        let expired = registry
+            .prepare_same_view(&operations, &beta.key, deadline)
+            .unwrap()
+            .close()
+            .unwrap();
+        tokio::time::sleep_until(deadline).await;
+        let next = registry
+            .prepare_same_view(&operations, &gamma.key, transition_deadline())
+            .unwrap();
+        assert_eq!(
+            expired.resume_same_view(),
+            Err(ServingTransitionError::StaleAttempt)
+        );
+        // The obsolete ticket must not discard the new candidate, and neither
+        // expiry nor its disposal releases the old graph or its descendants.
+        assert!(
+            matches!(registry.get(&beta.key), RegistryLookup::Transitioning(view)
+            if view.request_count() == 1 && Arc::ptr_eq(&view.handle().engine, &beta.engine))
+        );
+        let next = next.close().unwrap();
+        next.wait_requests().await.unwrap();
+        next.resume_same_view().unwrap();
+        drop(retained);
+    }
+
+    #[tokio::test]
+    async fn pre_effect_abort_reopens_admission_and_retains_prior_descendants() {
+        let dir = TempDir::new().unwrap();
+        let handle = build_handle("alpha", dir.path()).await;
+        let registry = Arc::new(GraphRegistry::from_handles(vec![Arc::clone(&handle)]).unwrap());
+        let operations = OperationRuntime::new();
+        let parked = captured(&registry, &operations, &handle.key);
+        let descendant = parked.clone();
+        let original_epoch = parked.epoch();
+        let deadline = Instant::now() + std::time::Duration::from_millis(20);
+        let expired = registry
+            .prepare_same_view(&operations, &handle.key, deadline)
+            .unwrap()
+            .close()
+            .unwrap();
+        assert_eq!(
+            expired.wait_requests().await,
+            Err(ServingTransitionError::DeadlineElapsed)
+        );
+        let epochs = expired.abort_before_effects().unwrap();
+        assert_eq!(epochs[&handle.key], original_epoch.successor().unwrap());
+        let fresh = captured(&registry, &operations, &handle.key);
+        assert_ne!(fresh.epoch(), original_epoch);
+        assert!(Arc::ptr_eq(&fresh.engine, &handle.engine));
+        let next = registry
+            .prepare_same_view(&operations, &handle.key, transition_deadline())
+            .unwrap()
+            .close()
+            .unwrap();
+        {
+            let waiting = next.wait_requests();
+            tokio::pin!(waiting);
+            drop(fresh);
+            drop(parked);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), waiting.as_mut())
+                    .await
+                    .is_err(),
+                "the later transition must still await the old epoch's descendant"
+            );
+            drop(descendant);
+            waiting.await.unwrap();
+        }
+        next.resume_same_view().unwrap();
+        let closed = registry
+            .prepare_same_view(&operations, &handle.key, transition_deadline())
+            .unwrap()
+            .close()
+            .unwrap();
+        operations.close();
+        assert_eq!(
+            closed.abort_before_effects(),
+            Err(ServingTransitionError::ProcessClosed)
+        );
+        assert!(matches!(
+            registry.get(&handle.key),
+            RegistryLookup::Transitioning(_)
+        ));
     }
 
     #[tokio::test]
@@ -1195,7 +1845,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let alpha = build_handle("alpha", dir.path()).await;
         let beta = build_handle("beta", dir.path()).await;
-        for stage in ["prepare", "close", "resume"] {
+        for stage in ["prepare", "close", "resume", "abort"] {
             let registry = Arc::new(
                 GraphRegistry::from_handles(vec![Arc::clone(&alpha), Arc::clone(&beta)]).unwrap(),
             );
@@ -1205,7 +1855,7 @@ mod tests {
                     .prepare_same_view(&operations, &alpha.key, transition_deadline())
                     .unwrap()
             });
-            let (prepared, transition) = if stage == "resume" {
+            let (prepared, transition) = if matches!(stage, "resume" | "abort") {
                 (None, Some(prepared.unwrap().close().unwrap()))
             } else {
                 (prepared, None)
@@ -1226,6 +1876,10 @@ mod tests {
                     prepared.unwrap().close(),
                     Err(ServingTransitionError::SchemaChanged)
                 )),
+                "abort" => assert_eq!(
+                    transition.unwrap().abort_before_effects(),
+                    Err(ServingTransitionError::SchemaChanged)
+                ),
                 "resume" => {
                     let transition = transition.unwrap();
                     transition.wait_requests().await.unwrap();
@@ -1236,15 +1890,16 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            if stage == "resume" {
+            if matches!(stage, "resume" | "abort") {
                 assert!(matches!(
                     registry.get(&alpha.key),
                     RegistryLookup::Transitioning(_)
                 ));
-                assert!(matches!(
-                    registry.prepare_same_view(&operations, &beta.key, transition_deadline()),
-                    Err(ServingTransitionError::Busy)
-                ));
+                drop(
+                    registry
+                        .prepare_same_view(&operations, &beta.key, transition_deadline())
+                        .unwrap(),
+                );
             } else {
                 assert!(matches!(registry.get(&alpha.key), RegistryLookup::Ready(_)));
                 // Failure before closure did not take the sole candidate slot.
@@ -1269,7 +1924,7 @@ mod tests {
         let first = registry
             .prepare_same_view(&operations, &alpha.key, transition_deadline())
             .unwrap();
-        let stale = Arc::clone(locked(&registry.state).candidate.as_ref().unwrap());
+        let stale = Arc::clone(&locked(&registry.state).candidate.as_ref().unwrap().record);
         drop(first);
         let current = registry
             .prepare_same_view(&operations, &beta.key, transition_deadline())
@@ -1287,6 +1942,10 @@ mod tests {
         let transition = current.close().unwrap();
         assert_eq!(
             operations.while_open(|| registry.resume_same_view(&stale)),
+            Err(ServingTransitionError::StaleAttempt)
+        );
+        assert_eq!(
+            operations.while_open(|| registry.abort_before_effects(&stale)),
             Err(ServingTransitionError::StaleAttempt)
         );
         transition.wait_requests().await.unwrap();

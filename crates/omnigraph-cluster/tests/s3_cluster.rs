@@ -1,19 +1,17 @@
-//! Cluster-on-object-storage end-to-end (RFC-006/RFC-029): the full
-//! control-plane lifecycle with `storage: s3://…` and `storage: az://…` —
-//! import, apply (graph roots + catalog in the object store), serving
-//! snapshots from both the config dir and the bare storage URI, schema
-//! evolution, and the approved delete (prefix removal).
+//! Cluster ledger v2 on object storage: bootstrap, graph creation, catalog
+//! publication, serving snapshots from config and bare storage roots, schema
+//! evolution, exact admission handoff, and unsupported graph-deletion refusal.
 //!
 //! Each provider is independently gated. S3 skips unless
 //! `OMNIGRAPH_S3_TEST_BUCKET` is set; Azure skips unless
-//! `OMNIGRAPH_AZURE_TEST_CONTAINER` is set. CI runs them against containerized
-//! RustFS and Azurite respectively.
+//! `OMNIGRAPH_AZURE_TEST_CONTAINER` is set. CI runs them against disposable
+//! RustFS and Azurite services respectively. These are emulator contracts, not
+//! live-cloud lease-loss qualification.
 //!
-//! Runtime flavor is multi_thread on purpose: the state-lock guard's
-//! drop-time release uses block_in_place on object stores, which is the
-//! production (CLI) runtime shape — and the lock-release regression this
-//! suite pins (a spawned delete dying with a short-lived runtime) only
-//! reproduces realistically under it.
+//! The multi-thread runtime matches CLI execution. A completed direct deployment
+//! retains its exact admission; this fixture owns all writers and explicitly
+//! hands off that admission only after its operations have settled. Test names
+//! remain stable because CI requires these exact cells.
 
 #![recursion_limit = "256"]
 
@@ -23,15 +21,12 @@ use std::fs;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::LoadMode;
 use omnigraph_cluster::{
-    ApplyOptions, ClusterAdmissionPurpose, DeploymentCaller, DeploymentLookup,
-    acquire_cluster_admission, apply_config_dir_with_options, apply_deployment, deployment_status,
-    force_unlock_storage_root, import_config_dir, read_serving_snapshot,
-    read_serving_snapshot_from_storage, status_config_dir, upgrade_deployment_ledger,
-    validate_config_dir,
+    ClusterAdmissionPurpose, DeploymentCaller, DeploymentLookup, acquire_cluster_admission,
+    apply_deployment, deployment_status, force_unlock_storage_root, read_serving_snapshot,
+    read_serving_snapshot_from_storage, status_config_dir, validate_config_dir,
 };
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
-use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 const SCHEMA_V1: &str = "node Person {\n  name: String @key\n}\n";
@@ -89,10 +84,23 @@ policies:
     .unwrap();
 }
 
-fn e2e_apply_options() -> ApplyOptions {
-    ApplyOptions {
-        actor: Some("act-admin".to_string()),
+async fn deploy_fixture(dir: &std::path::Path, root: &str) -> omnigraph_cluster::DeploymentResult {
+    let caller = DeploymentCaller::storage_owner(Some("act-admin".into()));
+    let applied = apply_deployment(dir, None, &caller, &Default::default(), |_, _, _| {})
+        .await
+        .unwrap();
+    let DeploymentLookup::Complete { result } = applied else {
+        panic!("{applied:?}")
+    };
+    assert!(result.converged, "{result:?}");
+    if let Some(lock_id) = deployment_status(root, None, &caller)
+        .await
+        .unwrap()
+        .lock_id
+    {
+        force_unlock_storage_root(root, &lock_id).await.unwrap();
     }
+    result
 }
 
 fn person_params(name: &str) -> ParamMap {
@@ -148,23 +156,13 @@ async fn object_storage_cluster_full_lifecycle(root: &str, expected_scheme: &str
     let validate = validate_config_dir(dir.path());
     assert!(validate.ok, "{:?}", validate.diagnostics);
 
-    let import = import_config_dir(dir.path()).await;
-    assert!(import.ok, "{:?}", import.diagnostics);
-
-    // The lock-release regression (caught live on the first smoke): the
-    // guard's drop must COMPLETE its remote delete before the command
-    // returns — a follow-up command finding `state_lock_held` means the
-    // release was spawned into a dying runtime.
+    deploy_fixture(dir.path(), root).await;
     let status = status_config_dir(dir.path()).await;
     assert!(status.ok, "{:?}", status.diagnostics);
     assert!(
         !status.state_observations.locked,
-        "import leaked the state lock in object storage: {:?}",
-        status.state_observations
+        "settled fixture handoff must complete before returning"
     );
-
-    let apply = apply_config_dir_with_options(dir.path(), e2e_apply_options()).await;
-    assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
 
     // Nothing stored locally: the config dir holds only declared sources.
     assert!(!dir.path().join("__cluster").exists());
@@ -280,57 +278,36 @@ async fn object_storage_cluster_full_lifecycle(root: &str, expected_scheme: &str
 
     // Schema evolution converges in object storage.
     write_cluster_fixture(dir.path(), root, SCHEMA_V2);
-    let evolve = apply_config_dir_with_options(dir.path(), e2e_apply_options()).await;
-    assert!(evolve.ok && evolve.converged, "{:?}", evolve.diagnostics);
+    deploy_fixture(dir.path(), root).await;
     let ledger_path = format!("{root}/__cluster/state.json");
     let evolved: serde_json::Value =
         serde_json::from_str(&adapter.read_text(&ledger_path).await.unwrap()).unwrap();
     let evolved_revision = evolved["state_revision"].as_u64().unwrap();
 
-    // Approved delete: drop the graph from the config; the plan demands an
-    // approval, the approved apply prefix-deletes the graph root.
+    // Inventory deletion is an explicit refusal, never a recursive erase.
+    let before_delete = adapter.read_text(&ledger_path).await.unwrap();
     fs::write(
         dir.path().join("cluster.yaml"),
         format!("version: 1\nstorage: {root}\ngraphs: {{}}\n"),
     )
     .unwrap();
-    let plan = omnigraph_cluster::plan_config_dir(dir.path()).await;
-    assert!(plan.ok, "{:?}", plan.diagnostics);
-    let approval = plan
-        .approvals_required
-        .first()
-        .expect("graph delete requires approval");
-    let approve =
-        omnigraph_cluster::approve_config_dir(dir.path(), &approval.resource, "act-admin").await;
-    assert!(approve.ok, "{:?}", approve.diagnostics);
-    let delete = apply_config_dir_with_options(dir.path(), e2e_apply_options()).await;
-    assert!(delete.ok && delete.converged, "{:?}", delete.diagnostics);
-
-    let via_uri_after = read_serving_snapshot_from_storage(root)
-        .await
-        .expect("an applied empty revision serves with its exact witness");
-    let via_config_after = read_serving_snapshot(dir.path()).await.unwrap();
-    let ledger_text = adapter.read_text(&ledger_path).await.unwrap();
-    let ledger: serde_json::Value = serde_json::from_str(&ledger_text).unwrap();
-    let ledger_cas = format!("sha256:{:x}", Sha256::digest(ledger_text.as_bytes()));
-    for after in [&via_uri_after, &via_config_after] {
-        assert!(
-            after.graphs.is_empty()
-                && after.applied_graphs.is_empty()
-                && after.quarantined_graphs.is_empty(),
-            "an applied empty revision serves an empty inventory, got {after:?}"
-        );
-        assert_eq!(after.config_digest, delete.desired_revision.config_digest);
-        assert!(
-            after.state_revision > evolved_revision,
-            "the approved delete must publish a new ledger revision past {evolved_revision}, got {after:?}"
-        );
-        assert_eq!(
-            after.state_revision,
-            ledger["state_revision"].as_u64().unwrap()
-        );
-        assert_eq!(after.state_cas.as_deref(), Some(ledger_cas.as_str()));
-    }
+    let refused = apply_deployment(
+        dir.path(),
+        None,
+        &DeploymentCaller::storage_owner(Some("act-admin".into())),
+        &Default::default(),
+        |_, _, _| {},
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, "deployment_scope");
+    assert_eq!(
+        adapter.read_text(&ledger_path).await.unwrap(),
+        before_delete
+    );
+    let snapshot = read_serving_snapshot_from_storage(root).await.unwrap();
+    assert_eq!(snapshot.graphs.len(), 1);
+    assert_eq!(snapshot.state_revision, evolved_revision);
     adapter.delete_prefix(root).await.unwrap();
 }
 
@@ -339,10 +316,7 @@ async fn object_storage_cluster_full_lifecycle(root: &str, expected_scheme: &str
 async fn object_storage_offline_deployment(root: &str) {
     let dir = tempfile::tempdir().unwrap();
     write_cluster_fixture(dir.path(), root, SCHEMA_V1);
-    let imported = import_config_dir(dir.path()).await;
-    assert!(imported.ok, "{imported:?}");
-    let applied = apply_config_dir_with_options(dir.path(), e2e_apply_options()).await;
-    assert!(applied.ok && applied.converged, "{applied:?}");
+    deploy_fixture(dir.path(), root).await;
     let graph_root = format!("{root}/graphs/knowledge.omni");
     let db = session(Omnigraph::open(&graph_root).await.unwrap());
     db.load(
@@ -360,10 +334,8 @@ async fn object_storage_offline_deployment(root: &str) {
     let history = serde_json::to_value(db.list_commits(None).await.unwrap()).unwrap();
     drop(db);
     let caller = DeploymentCaller::storage_owner(Some("act-admin".to_string()));
-    let converted = upgrade_deployment_ledger(root, true, &caller)
-        .await
-        .unwrap();
-    assert_eq!(converted.next_sequence, 1);
+    let converted = deployment_status(root, None, &caller).await.unwrap();
+    assert_eq!(converted.next_sequence, 2);
     assert!(converted.lock_id.is_none());
     let db = session(Omnigraph::open_read_only(&graph_root).await.unwrap());
     assert_eq!(person_count(&db, "main", "Ada").await, 1);
@@ -384,13 +356,17 @@ async fn object_storage_offline_deployment(root: &str) {
     let query = FIND_PERSON_GQ.replace("return { $p.name }", "return { $p.name, $p.title }");
     fs::write(dir.path().join("queries/people.gq"), &query).unwrap();
     let mut reported = None;
-    let DeploymentLookup::Complete { result } =
-        apply_deployment(dir.path(), None, &caller, |id, _, lock| {
+    let DeploymentLookup::Complete { result } = apply_deployment(
+        dir.path(),
+        None,
+        &caller,
+        &Default::default(),
+        |id, _, lock| {
             reported = Some((id.to_string(), lock.to_string()));
-        })
-        .await
-        .unwrap()
-    else {
+        },
+    )
+    .await
+    .unwrap() else {
         panic!("expected durable deployment receipt");
     };
     let (id, lock) = reported.unwrap();
@@ -418,9 +394,13 @@ async fn object_storage_offline_deployment(root: &str) {
         Some(lock.as_str())
     );
     assert!(matches!(
-        apply_deployment(dir.path(), Some(&id), &caller, |_, _, _| panic!(
-            "same ID cannot execute twice"
-        ))
+        apply_deployment(
+            dir.path(),
+            Some(&id),
+            &caller,
+            &Default::default(),
+            |_, _, _| panic!("same ID cannot execute twice")
+        )
         .await
         .unwrap(),
         DeploymentLookup::Complete { .. }
@@ -459,7 +439,7 @@ async fn object_storage_offline_deployment(root: &str) {
     let ledger = adapter.read_text(&ledger_uri).await.unwrap();
     adapter.write_text(&bundle_uri, "{}").await.unwrap();
     assert_eq!(
-        apply_deployment(dir.path(), None, &caller, |_, _, _| {})
+        apply_deployment(dir.path(), None, &caller, &Default::default(), |_, _, _| {})
             .await
             .unwrap_err()
             .code,

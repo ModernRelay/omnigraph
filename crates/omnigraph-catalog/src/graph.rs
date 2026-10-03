@@ -37,7 +37,8 @@ const GENESIS_MANIFEST_VERSION: u64 = 1;
 /// birth.  The random commit id distinguishes this initialization attempt from
 /// another valid v1 manifest whose deterministic table identities happen to
 /// have the same numeric values.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GenesisManifestAttempt {
     lineage: GraphLineageRow,
     stamp: u32,
@@ -59,6 +60,32 @@ impl GenesisManifestAttempt {
             },
             stamp: stamp_for_system_columns(system_columns)?,
         })
+    }
+
+    /// Exact genesis identity carried by a durably prepared initialization.
+    pub fn graph_commit_id(&self) -> &str {
+        &self.lineage.graph_commit_id
+    }
+
+    /// Validate an untrusted serialized attempt before creating any datasets.
+    pub fn validate_for(&self, system_columns: SystemColumns) -> Result<()> {
+        let lineage = &self.lineage;
+        if self.stamp != stamp_for_system_columns(system_columns)?
+            || lineage.graph_manifest_version != GENESIS_MANIFEST_VERSION
+            || lineage.graph_branch.is_some()
+            || lineage.parent_commit_id.is_some()
+            || lineage.merged_parent_commit_id.is_some()
+            || lineage.actor_id.is_some()
+            || !lineage
+                .graph_commit_id
+                .parse::<ulid::Ulid>()
+                .is_ok_and(|id| id.to_string() == lineage.graph_commit_id)
+        {
+            return Err(OmniError::manifest_conflict(
+                "invalid prepared genesis attempt",
+            ));
+        }
+        Ok(())
     }
 
     fn lineage(&self) -> &GraphLineageRow {
@@ -125,6 +152,7 @@ pub(crate) async fn init_manifest_graph(
     control_session: &Arc<lance::session::Session>,
     attempt: &GenesisManifestAttempt,
 ) -> std::result::Result<Dataset, ManifestInitError> {
+    attempt.validate_for(catalog.system_columns)?;
     let root = root_uri.trim_end_matches('/');
     let (entries, version_metadata) = build_initial_entries(root, catalog, control_session).await?;
 

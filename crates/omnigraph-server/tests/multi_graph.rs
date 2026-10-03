@@ -403,7 +403,14 @@ async fn concurrent_branch_ops_morphological_matrix() {
 #[tokio::test]
 async fn cluster_boot_serves_applied_state() {
     let temp = converged_cluster_dir("").await;
-    let settings = cluster_settings(temp.path()).await.unwrap();
+    let mut settings = cluster_settings(temp.path()).await.unwrap();
+    settings
+        .cluster_admission
+        .take()
+        .unwrap()
+        .release_after_settlement()
+        .await
+        .unwrap();
     let omnigraph_server::ServerConfigMode::Multi {
         graphs,
         config_path,
@@ -777,10 +784,7 @@ graphs:
 "#,
     )
     .unwrap();
-    let import = omnigraph_cluster::import_config_dir(temp.path()).await;
-    assert!(import.ok, "{:?}", import.diagnostics);
-    let apply = omnigraph_cluster::apply_config_dir(temp.path()).await;
-    assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+    support::apply_cluster_fixture(temp.path()).await;
 
     let graph_uri = temp
         .path()
@@ -799,7 +803,14 @@ graphs:
         ("OPENAI_API_KEY", None),
         ("GEMINI_API_KEY", None),
     ]);
-    let settings = cluster_settings(temp.path()).await.unwrap();
+    let mut settings = cluster_settings(temp.path()).await.unwrap();
+    settings
+        .cluster_admission
+        .take()
+        .unwrap()
+        .release_after_settlement()
+        .await
+        .unwrap();
     let omnigraph_server::ServerConfigMode::Multi {
         graphs,
         config_path,
@@ -874,10 +885,7 @@ graphs:
 "#,
     )
     .unwrap();
-    let import = omnigraph_cluster::import_config_dir(temp.path()).await;
-    assert!(import.ok, "{:?}", import.diagnostics);
-    let apply = omnigraph_cluster::apply_config_dir(temp.path()).await;
-    assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+    support::apply_cluster_fixture(temp.path()).await;
 
     let _guard = EnvGuard::set(&[
         ("OG_TEST_MISSING_EMBED_KEY", None),
@@ -950,14 +958,18 @@ graphs:
             ),
         )
         .unwrap();
-        let import = omnigraph_cluster::import_config_dir(temp.path()).await;
-        assert!(import.ok, "{:?}", import.diagnostics);
-        let apply = omnigraph_cluster::apply_config_dir(temp.path()).await;
-        assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+        support::apply_cluster_fixture(temp.path()).await;
         temp
     };
 
-    let settings = cluster_settings(temp.path()).await.unwrap();
+    let mut settings = cluster_settings(temp.path()).await.unwrap();
+    settings
+        .cluster_admission
+        .take()
+        .unwrap()
+        .release_after_settlement()
+        .await
+        .unwrap();
     let omnigraph_server::ServerConfigMode::Multi {
         graphs,
         server_policy,
@@ -1005,9 +1017,13 @@ async fn cluster_boot_refusals() {
         err.to_string().contains("catalog_payload_digest_mismatch"),
         "{err}"
     );
-    assert!(err.to_string().contains("cluster refresh"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("restore its bytes from a trusted copy"),
+        "{err}"
+    );
 
-    // Missing state refuses with the import/apply remedy.
+    // Missing state refuses before acquiring serving admission.
     let empty = tempfile::tempdir().unwrap();
     let err = cluster_settings(empty.path()).await.unwrap_err();
     assert!(err.to_string().contains("cluster_state_missing"), "{err}");

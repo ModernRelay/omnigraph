@@ -249,18 +249,24 @@ post-publication install. The system-column upgrade uses the same publication
 boundary. See [Schema contract in the manifest](../rfcs/2026-09-30-schema-contract-in-manifest.md).
 
 `prepare_schema_apply_as` binds the canonical root and schema identity domain,
-exact main-branch authority, desired contract, actor and preallocated
-graph commit identity before table effects. `apply_prepared_schema_as` rechecks
-that authority and the current policy under the existing gates; a stale intent
-is refused rather than rebased. An effectful success returns the operation's own
-`GraphCommit` and contract identity, not a later head observation. The prepared
+exact main-branch authority, numeric manifest base, desired contract, actor and
+preallocated graph commit identity before table effects. Preparation supports a
+read-only handle: it captures authority and plans, without issuing native writes.
+`apply_prepared_schema_as` rechecks that authority and the current policy under
+the existing gates. Intent version 2 uses `ExactGraphVersion`: a base at `M` can
+publish only at `M + 1`, and metadata-only contention that preserves graph HEAD
+still refuses rather than rebasing. Version-1 intents are rejected; this is an
+internal protocol change, not a graph-storage format change. An effectful success
+returns the operation's own `GraphCommit` and contract identity, not a later head
+observation. The prepared
 value is execution input, not an authorization grant or a distributed writer
 fence.
 
 A schema no-op requires the exact source and accepted contract. Changed comments
 or formatting publish a replacement contract and lineage once while preserving
 every table pin. An empty migration plan alone cannot certify the desired
-source. The ordinary apply API uses the same preparation and execution path.
+source. The ordinary apply API uses the same preparation, execution and
+exact-version rule, including refusal on head-preserving metadata contention.
 
 `reconcile_schema_apply_as` only reads retained, exact publication evidence and
 returns `Committed`, `NoOp` or `Unknown`. It checks the single candidate manifest
@@ -269,9 +275,19 @@ evidence, including metadata-only interposition, stays unknown; a no-op requires
 the exact captured base still to be current. Reconciliation neither applies the
 schema nor authorizes replay. Callers still own durable intent recording,
 evidence retention and fencing the previous owner before they can establish
-terminal non-publication. This engine boundary does not enable online server
-activation; that deployment protocol remains in
-the [server runtime RFC](../rfcs/2026-09-29-server-runtime-and-online-deployment.md).
+terminal non-publication.
+
+For a durably accepted invocation, `prepare_schema_settlement_as` issues a
+separate neutral lineage intent bound to that original and its one `M + 1`.
+The caller persists it before `settle_prepared_schema_as` can publish its fence.
+A verified occupied candidate or exact fence receipt proves `NotPublished`;
+missing evidence remains `Unknown`. A stale no-op certificate is `NoOpRefused`.
+Settlement never replays the original schema, authorizes adopting a foreign
+contract into the achieved projection, or proves accepted native I/O has stopped. Prior-owner quiescence, current policy,
+exclusive admission and protected evidence remain caller obligations. These
+engine boundaries do not enable online server activation; the deployment
+protocol remains in the
+[server runtime RFC](../rfcs/2026-09-29-server-runtime-and-online-deployment.md).
 
 Branch merge follows it too. A merge onto main is a pointer switch: main's
 registration takes the source's pin, and the merge stages no fenced insert,

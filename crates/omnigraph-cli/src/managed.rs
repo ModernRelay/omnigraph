@@ -517,11 +517,8 @@ fn config_and_json(command: &ClusterCommand) -> (&Path, bool) {
         ClusterCommand::Validate { config, json }
         | ClusterCommand::Plan { config, json, .. }
         | ClusterCommand::Apply { config, json, .. }
-        | ClusterCommand::Approve { config, json, .. }
         | ClusterCommand::Status { config, json, .. }
         | ClusterCommand::Observe { config, json }
-        | ClusterCommand::Refresh { config, json }
-        | ClusterCommand::Import { config, json }
         | ClusterCommand::ForceUnlock { config, json, .. }
         | ClusterCommand::History { config, json, .. }
         | ClusterCommand::Cancel { config, json, .. }
@@ -573,6 +570,9 @@ async fn cluster_command(
             ..
         } | ClusterCommand::Apply {
             writers_stopped: true,
+            ..
+        } | ClusterCommand::Apply {
+            schema_correction: Some(_),
             ..
         } | ClusterCommand::Status {
             deployment_id: Some(_),

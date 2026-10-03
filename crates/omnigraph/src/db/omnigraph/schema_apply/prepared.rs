@@ -70,6 +70,11 @@ impl PreparedSchemaApply {
         self.actor.as_deref()
     }
 
+    /// The exact accepted contract against which this intent was prepared.
+    pub fn base_contract(&self) -> &SchemaContractDigest {
+        &self.base_contract
+    }
+
     pub fn desired_contract(&self) -> &SchemaContractDigest {
         &self.desired_contract
     }

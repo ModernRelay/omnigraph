@@ -1213,6 +1213,34 @@ pub async fn http_merge_decision(
     }
 }
 
+/// Bootstrap through the production v2 protocol and hand off a fully settled
+/// fixture to the server. These tests own every writer of the temporary root.
+pub async fn apply_cluster_fixture(config_dir: &Path) {
+    let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
+    let captured = omnigraph_cluster::capture_deployment(config_dir, &Default::default()).unwrap();
+    let applied = omnigraph_cluster::apply_deployment(
+        config_dir,
+        None,
+        &caller,
+        &Default::default(),
+        |_, _, _| {},
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(applied, omnigraph_cluster::DeploymentLookup::Complete { ref result } if result.converged),
+        "{applied:?}"
+    );
+    let status = omnigraph_cluster::deployment_status(captured.canonical_root(), None, &caller)
+        .await
+        .unwrap();
+    if let Some(lock_id) = status.lock_id {
+        omnigraph_cluster::force_unlock_storage_root(captured.canonical_root(), &lock_id)
+            .await
+            .unwrap();
+    }
+}
+
 pub async fn converged_cluster_dir(policies_yaml: &str) -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();
     fs::write(
@@ -1240,10 +1268,7 @@ graphs:
         ),
     )
     .unwrap();
-    let import = omnigraph_cluster::import_config_dir(temp.path()).await;
-    assert!(import.ok, "{:?}", import.diagnostics);
-    let apply = omnigraph_cluster::apply_config_dir(temp.path()).await;
-    assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+    apply_cluster_fixture(temp.path()).await;
     temp
 }
 

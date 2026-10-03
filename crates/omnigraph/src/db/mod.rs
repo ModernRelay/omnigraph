@@ -17,14 +17,14 @@ pub use manifest::{DatasetEntry, DatasetUpdate};
 pub use omnigraph::{
     CleanupPolicyOptions, CollectorCost, CollectorPathSnapshot, CollectorReport,
     CollectorRowSummary, DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats,
-    EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult, InitOptions, MergeOutcome,
-    MergeResult, Omnigraph, OpenMode, PendingIndex, PreparedSchemaApply, PreparedSchemaSettlement,
-    RebuiltFullTextIndex, RepairAction, RepairClassification, RepairOptions, RepairStats,
-    RetainedManifestVersions, SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyReconciliation,
-    SchemaApplyResult, SchemaApplySettlement, SchemaContractDigest, SchemaNonPublicationProof,
-    SkipReason, StagingVerdict, SystemColumnUpgradeFinding, SystemColumnUpgradeOptions,
-    SystemColumnUpgradeOutcome, SystemColumnUpgradeReport, TableCollectionPlan,
-    UnpublishedManifest,
+    EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult, GraphCreateReconciliation,
+    InitOptions, MergeOutcome, MergeResult, Omnigraph, OpenMode, PendingIndex, PreparedGraphCreate,
+    PreparedSchemaApply, PreparedSchemaSettlement, RebuiltFullTextIndex, RepairAction,
+    RepairClassification, RepairOptions, RepairStats, RetainedManifestVersions,
+    SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyReconciliation, SchemaApplyResult, SchemaApplySettlement,
+    SchemaContractDigest, SchemaNonPublicationProof, SkipReason, StagingVerdict,
+    SystemColumnUpgradeFinding, SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome,
+    SystemColumnUpgradeReport, TableCollectionPlan, UnpublishedManifest,
 };
 pub(crate) use omnigraph::{
     LogicalBlobValue, RangedExternalBlobs, export_blob_values, logical_row_image,

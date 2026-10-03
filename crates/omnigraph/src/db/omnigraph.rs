@@ -32,6 +32,7 @@ use crate::table_store::TableStore;
 pub(crate) mod collector;
 mod export;
 pub(crate) mod optimize;
+mod prepared_create;
 pub(crate) mod promotion;
 mod repair;
 pub(crate) mod schema_apply;
@@ -48,6 +49,8 @@ pub(crate) use export::{
     LogicalBlobValue, RangedExternalBlobs, export_blob_values, logical_row_image,
 };
 pub use optimize::{CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, SkipReason};
+use prepared_create::initial_schema_ir;
+pub use prepared_create::{GraphCreateReconciliation, PreparedGraphCreate};
 pub use repair::{
     DatasetRepairStats, RepairAction, RepairClassification, RepairOptions, RepairStats,
 };
@@ -440,6 +443,7 @@ impl Omnigraph {
             storage_for_uri(uri)?,
             InitOptions::default(),
             true,
+            None,
         )
         .await
     }
@@ -450,7 +454,7 @@ impl Omnigraph {
         storage: Arc<dyn StorageAdapter>,
         options: InitOptions,
     ) -> Result<Self> {
-        Self::init_with_storage_for_vintage(uri, schema_source, storage, options, false).await
+        Self::init_with_storage_for_vintage(uri, schema_source, storage, options, false, None).await
     }
 
     async fn init_with_storage_for_vintage(
@@ -459,6 +463,7 @@ impl Omnigraph {
         storage: Arc<dyn StorageAdapter>,
         options: InitOptions,
         legacy_system_columns: bool,
+        prepared: Option<&PreparedGraphCreate>,
     ) -> Result<Self> {
         let storage = crate::storage::decorate(storage);
         let root = normalize_root_uri(uri)?;
@@ -474,44 +479,35 @@ impl Omnigraph {
         } else {
             omnigraph_compiler::SYSTEM_COLUMNS_V3
         };
-        let schema_shape = read_schema_shape_for_vintage(schema_source, system_columns)?;
-        let domain = SchemaIdentityDomain::from_ulid(crate::dst_ids::new_ulid());
-        let resolution = if legacy_system_columns {
-            let empty_shape = read_schema_shape_from_source("")?;
-            let accepted = omnigraph_compiler::into_legacy_vintage(
-                initialize_schema_ir(domain, &empty_shape)
-                    .map_err(|error| OmniError::manifest(error.to_string()))?
-                    .schema_ir,
-            );
-            omnigraph_compiler::resolve_schema_ir(&accepted, &schema_shape)
-        } else {
-            initialize_schema_ir(domain, &schema_shape)
-        }
-        .map_err(|error| OmniError::manifest(error.to_string()))?;
-        for diagnostic in &resolution.diagnostics {
-            tracing::warn!(
-                target: "omnigraph::schema::identity",
-                kind = ?diagnostic.kind,
-                entity = %diagnostic.entity,
-                hint = %diagnostic.hint,
-                "schema identity hint is inert during graph initialization"
-            );
-        }
-        let schema_ir = resolution.schema_ir;
+        let schema_ir = match prepared {
+            Some(prepared) => prepared.validated_schema_ir()?,
+            None => initial_schema_ir(
+                schema_source,
+                system_columns,
+                SchemaIdentityDomain::from_ulid(crate::dst_ids::new_ulid()),
+                legacy_system_columns,
+            )?,
+        };
         let accepted_schema_ir_hash = omnigraph_compiler::schema_ir_hash(&schema_ir)
             .map_err(|error| OmniError::manifest(error.to_string()))?;
         let schema_identity_domain = schema_ir.schema_identity_domain.as_str().to_string();
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
         fixup_physical_schemas(&mut catalog)?;
         let manifest_contract = render_schema_contract(&schema_ir, schema_source)?;
+        if prepared.is_some() {
+            prepared_create::require_empty_create_target(&root, storage.as_ref()).await?;
+        }
         verify_local_create_if_absent(&root, storage.as_ref()).await?;
-        let init_claim = acquire_init_claim(&root, storage.as_ref()).await?;
+        let init_claim = acquire_init_claim(&root, storage.as_ref(), prepared).await?;
         if let Err(err) = preflight_init_target(&root, storage.as_ref(), options).await {
             best_effort_release_init_claim(&init_claim, storage.as_ref()).await;
             return Err(err);
         }
 
-        let genesis_attempt = match GenesisManifestAttempt::mint(catalog.system_columns) {
+        let genesis_attempt = match prepared
+            .map(|prepared| Ok(prepared.genesis().clone()))
+            .unwrap_or_else(|| GenesisManifestAttempt::mint(catalog.system_columns))
+        {
             Ok(attempt) => attempt,
             Err(err) => {
                 best_effort_release_init_claim(&init_claim, storage.as_ref()).await;
@@ -3555,13 +3551,20 @@ fn init_claim_uri(root: &str) -> String {
 /// primitive Lance relies on for manifest creation. A stale claim is never
 /// stolen automatically: without a distributed lease, a stopped initializer
 /// is indistinguishable from a slow live one.
-async fn acquire_init_claim(root: &str, storage: &dyn StorageAdapter) -> Result<InitClaim> {
+async fn acquire_init_claim(
+    root: &str,
+    storage: &dyn StorageAdapter,
+    prepared: Option<&PreparedGraphCreate>,
+) -> Result<InitClaim> {
     let uri = init_claim_uri(root);
-    let payload = serde_json::json!({
-        "version": INIT_CLAIM_PAYLOAD_VERSION,
-        "attempt_id": crate::dst_ids::new_ulid().to_string(),
-    })
-    .to_string();
+    let payload = match prepared {
+        Some(prepared) => prepared.claim_payload()?,
+        None => serde_json::json!({
+            "version": INIT_CLAIM_PAYLOAD_VERSION,
+            "attempt_id": crate::dst_ids::new_ulid().to_string(),
+        })
+        .to_string(),
+    };
     if !storage.write_text_if_absent(&uri, &payload).await? {
         return Err(OmniError::InitializationClaimed {
             uri: root.to_string(),

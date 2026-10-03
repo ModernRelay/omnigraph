@@ -241,6 +241,8 @@ macro_rules! write_surfaces {
 
 write_surfaces! {
     "db/omnigraph.rs" => WriteProtocol::Bootstrap => ["init", "init_with_options", "init_with_storage"],
+    "db/omnigraph/prepared_create.rs" => WriteProtocol::Bootstrap => ["apply_prepared_graph_create"],
+    "db/omnigraph/prepared_create.rs" => WriteProtocol::Exact("quiesced birth settlement: exact init claim, bounded original empty tables, no published manifest or refs") => ["settle_prepared_graph_create_after_quiescence"],
     "db/omnigraph.rs" => WriteProtocol::Composed("read-write admission + owned local-root create-if-absent capability probe") => ["open", "open_with_storage"],
     "exec/mutation.rs" => MUTATION_V9 => ["mutate", "mutate_with_receipt", "mutate_as", "mutate_as_with_receipt", "mutate_as_with_expected_head", "mutate_as_with_expected_head_receipt"],
     "loader/mod.rs" => LOAD_V9 => ["load_jsonl", "load_jsonl_file", "load", "load_with_receipt", "load_file", "load_graph_batch"],
@@ -267,6 +269,11 @@ write_surfaces! {
 // name-independent: a newly named `transact`, `publish`, or `vacuum` method
 // cannot evade discovery.
 const READ_ONLY_SURFACES: &[(&str, &str)] = &[
+    ("db/omnigraph/prepared_create.rs", "prepare_graph_create"),
+    (
+        "db/omnigraph/prepared_create.rs",
+        "reconcile_prepared_graph_create",
+    ),
     ("db/omnigraph.rs", "open_read_only"),
     ("db/omnigraph.rs", "refresh"),
     ("db/omnigraph.rs", "cleanup_plan"),
@@ -812,6 +819,11 @@ macro_rules! durable_calls {
 // manifest implementations are included; only standalone test-only sources
 // whose parent cfg is invisible to this file walker are excluded.
 durable_calls! {
+    // Exact token-owned unpublished birth only, after external native/control
+    // quiescence. The full bounded deletion set is authenticated first; claim
+    // deletion is last, so interrupted settlement can safely finish later.
+    ("db/omnigraph/prepared_create.rs", ".delete_prefix(", 2, WriteProtocol::Exact("quiesced token-owned empty birth tables and unpublished manifest files; never graph root or foreign refs")),
+    ("db/omnigraph/prepared_create.rs", ".delete(", 1, WriteProtocol::Exact("exact prepared init claim, removed only after all verified birth artifacts")),
     ("db/upgrade/legacy_schema_files.rs", ".delete(", 1, WriteProtocol::Exact("protocol 5: validate every converted branch, remove exact legacy contract files, then activate main")),
     ("db/upgrade.rs", "CommitBuilder::new(", 3, WriteProtocol::Exact("offline storage upgrade with main-owned intent")),
     ("db/upgrade.rs", "InsertBuilder::new(", 1, WriteProtocol::Exact("manifest-only conversion under durable upgrade ownership")),

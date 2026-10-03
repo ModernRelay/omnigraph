@@ -3,6 +3,7 @@
 
 pub mod api;
 mod blob_transport;
+mod deployment;
 mod export_transport;
 mod handlers;
 mod http_contract;
@@ -110,6 +111,9 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
     ),
     paths(
         mcp::resource_metadata,
+        deployment::status,
+        deployment::lookup,
+        deployment::apply,
         handlers::server_health,
         handlers::server_ready,
         handlers::server_graphs_list,
@@ -381,6 +385,7 @@ pub struct AppState {
     // All router/state clones retain the same root ownership. Normal HTTP
     // drain is not qualified native settlement, so the server never unlocks.
     cluster_admission: Option<omnigraph_cluster::ClusterAdmission>,
+    deployments: Arc<deployment::DeploymentRuntime>,
     /// Runtime routing and availability for every configured graph.
     /// Middleware injects an admitted `serving::GraphRequest` or refuses a blocked
     /// graph before collecting its request body.
@@ -756,6 +761,7 @@ impl AppState {
         );
         Self {
             cluster_admission: None,
+            deployments: Arc::new(deployment::DeploymentRuntime::default()),
             routing: GraphRouting {
                 registry,
                 config_path: None,
@@ -808,6 +814,7 @@ impl AppState {
         let registry = Arc::new(GraphRegistry::from_entries(entries)?);
         Ok(Self {
             cluster_admission: None,
+            deployments: Arc::new(deployment::DeploymentRuntime::default()),
             routing: GraphRouting {
                 registry,
                 config_path,
@@ -2470,10 +2477,29 @@ pub fn build_app(state: AppState) -> Router {
     // `resolve_graph_handle` — they operate on the registry directly.
     //
     // Runtime add/remove (`POST /graphs`, `DELETE /graphs/{id}`) is not
-    // exposed — operators run `cluster apply` and restart.
+    // exposed — inventory additions use the server-owned deployment route.
     let management = Router::new()
         .route("/graphs", get(server_graphs_list))
         .route("/graphs/discovery", get(server_graphs_discovery))
+        .route_layer(middleware::from_fn(http_contract::require_contract))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer_auth,
+        ));
+
+    let deployments = Router::new()
+        .route(
+            "/cluster/deployments",
+            get(deployment::status).post(deployment::apply),
+        )
+        .route("/cluster/deployments/{id}", get(deployment::lookup))
+        .layer(DefaultBodyLimit::max(deployment::REQUEST_BYTES))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            |State(state): State<AppState>, request: Request, next: Next| async move {
+                ingress::admit(&state, request, next).await
+            },
+        ))
         .route_layer(middleware::from_fn(http_contract::require_contract))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -2484,7 +2510,8 @@ pub fn build_app(state: AppState) -> Router {
     // `/graphs/{graph_id}/...`; there are no flat single-graph routes.
     let protected: Router<AppState> = Router::new()
         .nest("/graphs/{graph_id}", per_graph_protected)
-        .merge(management);
+        .merge(management)
+        .merge(deployments);
 
     let mut app = Router::new()
         .route("/healthz", get(server_health))
@@ -2572,8 +2599,9 @@ async fn serve_config(
         ServerRuntimeState::DefaultDeny => warn!(
             "bearer tokens are configured but no policy file is set — running in \
              default-deny mode (static credentials permit `read`; signed data \
-             credentials require an explicit policy permit). Configure a graph or cluster policy bundle in the cluster config, \
-             run `omnigraph cluster apply`, and restart to enable Cedar rules."
+             credentials require an explicit policy permit). Declare required policy \
+             bundles when bootstrapping; this deployment class keeps existing policy \
+             bindings fixed."
         ),
         ServerRuntimeState::PolicyEnabled => {}
     }

@@ -161,20 +161,14 @@ pub enum PlanOperation {
     Delete,
 }
 
-/// How `cluster apply` treats a planned change in the current stage.
-///
-/// `Applied` changes execute (config-only query/policy catalog writes).
-/// `Derived` marks a `graph.<id>` composite-digest update that converges
-/// automatically once its applied query digests land in state. `Deferred`
-/// changes need a later phase (graph/schema lifecycle or schema content).
-/// `Blocked` query/policy changes are gated by an unapplied or missing
-/// dependency.
+/// Expected disposition of a plan change; this is not an execution receipt.
+/// `Derived` is a graph composite that follows its accepted child resources;
+/// `Blocked` means v2 preflight forbids the complete proposed deployment.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplyDisposition {
     Applied,
     Derived,
-    Deferred,
     Blocked,
 }
 
@@ -219,15 +213,6 @@ pub struct BlastRadius {
     pub affected: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct ApprovalRequirement {
-    pub resource: String,
-    pub reason: String,
-    /// True when a valid (digest-matching, unconsumed) approval artifact is
-    /// pending for this change.
-    pub satisfied: bool,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanOutput {
     pub ok: bool,
@@ -240,7 +225,6 @@ pub struct PlanOutput {
     pub state_observations: StateObservations,
     pub changes: Vec<PlanChange>,
     pub blast_radius: Vec<BlastRadius>,
-    pub approvals_required: Vec<ApprovalRequirement>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -258,9 +242,7 @@ pub struct StatusOutput {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StateSyncOperation {
-    Refresh,
-    Import,
-    /// `refresh` without the lock, the sweep, or the write (RFC 0049).
+    /// Read-only current-state observation.
     Observe,
 }
 
@@ -306,73 +288,6 @@ pub struct ForceUnlockOutput {
     pub config_dir: String,
     pub state_observations: StateObservations,
     pub lock_removed: bool,
-    pub diagnostics: Vec<Diagnostic>,
-}
-
-/// Output of config-only `cluster apply`. "Applied" means recorded in the
-/// local cluster catalog (`__cluster/`); nothing applied here serves traffic —
-/// the server still boots from `omnigraph.yaml` until the server-boot stage.
-#[derive(Debug, Clone, Serialize)]
-pub struct ApplyOutput {
-    pub ok: bool,
-    pub config_dir: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub actor: Option<String>,
-    pub desired_revision: DesiredRevision,
-    pub state_observations: StateObservations,
-    /// Every planned change, with `disposition`/`reason` always populated.
-    pub changes: Vec<PlanChange>,
-    pub applied_count: usize,
-    /// Deferred + Blocked changes (Derived composite updates count as neither).
-    pub deferred_count: usize,
-    /// True when state matches the desired revision after this apply.
-    pub converged: bool,
-    /// False for a no-op re-apply: state bytes (and revision) were left untouched.
-    pub state_written: bool,
-    /// The statuses as persisted: post-apply on success, the pre-apply on-disk
-    /// snapshot when the state write fails (never unpersisted in-memory state).
-    pub resource_statuses: BTreeMap<String, ResourceStatusRecord>,
-    pub diagnostics: Vec<Diagnostic>,
-}
-
-/// A digest-bound human approval for an irreversible operation (RFC-004
-/// §D4). Written by `cluster approve`, consumed by apply. The file is never
-/// deleted on consumption — it is rewritten with `consumed_at` and also
-/// summarized into the state ledger's `approval_records`, so the audit fact
-/// survives the loss of either store (axiom 11).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ApprovalArtifact {
-    pub(crate) schema_version: u32,
-    pub(crate) approval_id: String,
-    pub(crate) resource: String,
-    pub(crate) operation: String,
-    pub(crate) reason: String,
-    pub(crate) bound_config_digest: String,
-    #[serde(default)]
-    pub(crate) bound_before_digest: Option<String>,
-    #[serde(default)]
-    pub(crate) bound_after_digest: Option<String>,
-    pub(crate) approved_by: String,
-    pub(crate) created_at: String,
-    #[serde(default)]
-    pub(crate) consumed_at: Option<String>,
-    #[serde(default)]
-    pub(crate) consumed_by_operation: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ApproveOutput {
-    pub ok: bool,
-    pub config_dir: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub approval_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resource: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub operation: Option<PlanOperation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub approved_by: Option<String>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -641,15 +556,13 @@ pub(crate) struct PolicyConfig {
     pub(crate) applies_to: Vec<String>,
 }
 
-// Stage 2A/2B accept these forward-compatible state sections so existing
-// ledgers won't churn while approval/recovery semantics are staged later.
+// Historical audit sections survive explicit v1 conversion as data only.
+// No approval or recovery sidecar authorizes a v2 operation.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ClusterState {
     pub(crate) version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) mode: Option<crate::deployment::DeploymentMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) ledger_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -752,20 +665,6 @@ pub(crate) enum RecoverySidecarKind {
     GraphCreate,
     SchemaApply,
     GraphDelete,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct SweepOutcome {
-    /// Graphs whose sidecar was kept (rows 5/6): graph-moving work for them
-    /// is blocked until the operator repairs and re-observes.
-    pub(crate) pending_graphs: BTreeSet<String>,
-    /// Sidecars whose outcome is recorded (rows 2/4): deleted only after the
-    /// command's state write lands, so a CAS failure re-sweeps them.
-    /// Store URIs (the storage layer addresses everything by URI).
-    pub(crate) completed_sidecars: Vec<String>,
-    /// Approval artifacts consumed by a roll-forward (delete row 7b): their
-    /// files are rewritten with consumed_at only after the state write lands.
-    pub(crate) consumed_approvals: Vec<String>,
 }
 
 #[cfg(test)]

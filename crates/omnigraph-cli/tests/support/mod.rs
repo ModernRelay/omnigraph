@@ -19,6 +19,9 @@ use tempfile::{NamedTempFile, TempDir, tempdir};
 /// exercising the operator layer override the var explicitly.
 pub const HERMETIC_OPERATOR_HOME: &str = "/nonexistent/omnigraph-test-home";
 
+/// Controlled diagnostics use the same explicit pool in fixture and SUT children.
+pub const HTTP_DIAGNOSTIC_LANCE_POOL_BYTES: &str = "104857600";
+
 /// Direct HTTP assertions exercise the current graph contract. CLI journeys
 /// still use the production client and its independent discovery gate.
 pub fn graph_http_client() -> Client {
@@ -37,6 +40,19 @@ pub fn cli() -> Command {
     command.env_remove("OMNIGRAPH_CONFIG");
     command.env_remove("OMNIGRAPH_CONTROL_TOKEN");
     command.env_remove("OMNIGRAPH_CONTROL_API");
+    command
+}
+
+/// Explicit executable for controlled diagnostics. Ordinary test discovery
+/// remains unchanged; no process-global environment mutation is needed.
+pub fn cli_at(binary: &Path) -> Command {
+    let mut command = Command::new(binary);
+    command.env_clear();
+    command.env("LANCE_MEM_POOL_SIZE", HTTP_DIAGNOSTIC_LANCE_POOL_BYTES);
+    command.env("OMNIGRAPH_HOME", HERMETIC_OPERATOR_HOME);
+    command.env("LANG", "C");
+    command.env("LC_ALL", "C");
+    command.timeout(Duration::from_secs(60));
     command
 }
 
@@ -219,6 +235,16 @@ pub struct TestServer {
 }
 
 impl TestServer {
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn stop(mut self) -> String {
+        let _ = self.child.kill();
+        self.child.wait().expect("reap test server");
+        read_stderr(&self.stderr_log)
+    }
+
     /// Everything the server wrote to stderr so far; the diagnostic of a
     /// request that died mid-stream lives here, not in the client's error.
     pub fn stderr(&self) -> String {
@@ -359,6 +385,23 @@ pub fn spawn_server_with_cluster_env(cluster_dir: &Path, envs: &[(&str, &str)]) 
     spawn_server_process(command)
 }
 
+/// The same cluster startup owner, with an explicit attested executable and
+/// a cleared environment for controlled cross-binary diagnostics.
+pub fn spawn_server_with_cluster_binary(cluster_dir: &Path, binary: &Path) -> TestServer {
+    let mut command = StdCommand::new(binary);
+    command.env_clear();
+    command.env("LANCE_MEM_POOL_SIZE", HTTP_DIAGNOSTIC_LANCE_POOL_BYTES);
+    command.env("OMNIGRAPH_HOME", HERMETIC_OPERATOR_HOME);
+    command.env("LANG", "C");
+    command.env("LC_ALL", "C");
+    command.env(
+        "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+        r#"{"act-parity":"parity-tok"}"#,
+    );
+    command.arg("--cluster").arg(cluster_dir);
+    spawn_server_process(command)
+}
+
 pub fn spawn_server_with_env(graph: &Path, envs: &[(&str, &str)]) -> TestServer {
     let mut command = server_process();
     command.arg(graph);
@@ -479,8 +522,7 @@ pub fn converged_loaded_cluster(graph_id: &str, policy_yaml: Option<&str>) -> Cl
     )
     .unwrap();
 
-    output_success(cli().arg("cluster").arg("import").arg("--config").arg(&dir));
-    output_success(cli().arg("cluster").arg("apply").arg("--config").arg(&dir));
+    apply_cluster_fixture(&dir);
 
     let served_root = dir.join("graphs").join(format!("{graph_id}.omni"));
     output_success(
@@ -493,6 +535,7 @@ pub fn converged_loaded_cluster(graph_id: &str, policy_yaml: Option<&str>) -> Cl
             .arg(&served_root),
     );
 
+    unlock_cluster_fixture(&dir);
     ClusterFixture { _temp: temp, dir }
 }
 
@@ -634,7 +677,7 @@ rules:
   - id: cluster-operators-change
     allow:
       actors: { group: cluster_operators }
-      actions: [change]
+      actions: [change, schema_apply]
 "#,
     )
     .unwrap();
@@ -662,22 +705,6 @@ policies:
     .unwrap();
 }
 
-pub fn init_cluster_derived_graph(root: &std::path::Path) {
-    init_named_cluster_graph(root, "knowledge", "people.pg");
-}
-
-pub fn init_named_cluster_graph(root: &std::path::Path, graph_id: &str, schema_file: &str) {
-    let graph_dir = root.join("graphs");
-    fs::create_dir_all(&graph_dir).unwrap();
-    output_success(
-        cli()
-            .arg("init")
-            .arg("--schema")
-            .arg(root.join(schema_file))
-            .arg(graph_dir.join(format!("{graph_id}.omni"))),
-    );
-}
-
 pub fn write_cluster_lock(root: &std::path::Path, lock_id: &str, operation: &str) {
     let state_dir = root.join("__cluster");
     fs::create_dir_all(&state_dir).unwrap();
@@ -690,68 +717,51 @@ pub fn write_cluster_lock(root: &std::path::Path, lock_id: &str, operation: &str
     .unwrap();
 }
 
-pub fn write_cluster_applyable_state(root: &std::path::Path) -> serde_json::Value {
-    // This helper fabricates a ledger with NO physical graph behind it.
-    let validate = parse_stdout_json(&output_success(
+/// Tests call this only after the fixture's direct CLI process has exited.
+/// The exact recorded identity is released before the next fixture owner starts.
+pub fn unlock_cluster_fixture(root: &Path) {
+    let lock_path = root.join("__cluster/lock.json");
+    if !lock_path.exists() {
+        return;
+    }
+    let lock: Value = serde_json::from_slice(&fs::read(&lock_path).unwrap()).unwrap();
+    output_success(cli().args([
+        "--cluster",
+        &format!("file://{}", root.display()),
+        "cluster",
+        "force-unlock",
+        lock["lock_id"].as_str().unwrap(),
+        "--json",
+    ]));
+}
+
+/// Bootstrap or advance a fixture through the production v2 deployment door.
+pub fn apply_cluster_fixture(root: &Path) -> Value {
+    let output = output_success(
         cli()
-            .arg("cluster")
-            .arg("validate")
-            .arg("--config")
+            .args(["--as", "act-cluster-test", "cluster", "apply", "--config"])
             .arg(root)
             .arg("--json"),
-    ));
-    let schema_digest = validate["resource_digests"]["schema.knowledge"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    // The fabricated state predates external Blob policy metadata and has no
-    // applied query child yet. Its graph resource must therefore bind exactly
-    // the historical graph + schema + default-Deny composite; a placeholder
-    // digest is not a valid old or current ledger shape.
-    let graph_digest = {
-        use sha2::{Digest, Sha256};
-
-        let input = format!("graph\0knowledge\0schema\0{schema_digest}\0");
-        let digest = Sha256::digest(input.as_bytes());
-        digest
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    };
-    let state_dir = root.join("__cluster");
-    fs::create_dir_all(&state_dir).unwrap();
-    fs::write(
-        state_dir.join("state.json"),
-        format!(
-            r#"{{
-  "version": 1,
-  "state_revision": 1,
-  "applied_revision": {{
-    "resources": {{
-      "graph.knowledge": {{ "digest": "{graph_digest}" }},
-      "schema.knowledge": {{ "digest": "{schema_digest}" }}
-    }}
-  }}
-}}
-"#
-        ),
-    )
-    .unwrap();
-    validate
+    );
+    let receipt = parse_stdout_json(&output);
+    assert_eq!(receipt["status"], "complete", "{receipt}");
+    assert_eq!(receipt["result"]["converged"], true, "{receipt}");
+    unlock_cluster_fixture(root);
+    receipt
 }
 
 pub fn cluster_json(root: &std::path::Path, command: &str) -> serde_json::Value {
-    let mut invocation = cli();
     if command == "apply" {
-        invocation.arg("--as").arg("act-cluster-test");
+        return apply_cluster_fixture(root);
     }
-    invocation
-        .arg("cluster")
-        .arg(command)
-        .arg("--config")
-        .arg(root);
-    invocation.arg("--json");
-    parse_stdout_json(&output_success(&mut invocation))
+    parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg(command)
+            .arg("--config")
+            .arg(root)
+            .arg("--json"),
+    ))
 }
 
 pub fn write_multi_graph_cluster_fixture(root: &std::path::Path) {
@@ -811,15 +821,6 @@ policies:
 "#,
     )
     .unwrap();
-}
-
-pub fn change_for<'j>(json: &'j serde_json::Value, resource: &str) -> &'j serde_json::Value {
-    json["changes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|change| change["resource"] == resource)
-        .unwrap_or_else(|| panic!("missing change for {resource}: {json}"))
 }
 
 pub fn write_seed_fixture(root: &std::path::Path) -> std::path::PathBuf {
@@ -1115,17 +1116,11 @@ policies:
     output_success(
         cli()
             .arg("cluster")
-            .arg("import")
-            .arg("--config")
-            .arg(&cluster_dir),
-    );
-    output_success(
-        cli()
-            .arg("cluster")
             .arg("apply")
             .arg("--config")
             .arg(&cluster_dir),
     );
+    unlock_cluster_fixture(&cluster_dir);
 
     let served_root = cluster_dir
         .join("graphs")
@@ -1263,6 +1258,25 @@ pub fn parity_configs(root: &Path, local_graph: &Path, _remote_graph: &Path) -> 
 /// The same parity setup with additional schema declarations. Seed data and
 /// policy remain shared with the ordinary parity fixture.
 pub fn parity_configs_with_schema(root: &Path, local_graph: &Path, schema: &Path) -> PathBuf {
+    parity_configs_using_cli(root, local_graph, schema, None)
+}
+
+pub fn parity_configs_with_cli(
+    root: &Path,
+    local_graph: &Path,
+    schema: &Path,
+    binary: &Path,
+) -> PathBuf {
+    parity_configs_using_cli(root, local_graph, schema, Some(binary))
+}
+
+fn parity_configs_using_cli(
+    root: &Path,
+    local_graph: &Path,
+    schema: &Path,
+    binary: Option<&Path>,
+) -> PathBuf {
+    let fixture_cli = || binary.map(cli_at).unwrap_or_else(cli);
     let policy = root.join("parity.policy.yaml");
     fs::write(&policy, parity_policy_yaml()).unwrap();
 
@@ -1296,24 +1310,18 @@ policies:
     // Converge the cluster (creates the empty graph at the derived root),
     // then seed it with the same fixture data the local twin holds.
     output_success(
-        cli()
-            .arg("cluster")
-            .arg("import")
-            .arg("--config")
-            .arg(&cluster_dir),
-    );
-    output_success(
-        cli()
+        fixture_cli()
             .arg("cluster")
             .arg("apply")
             .arg("--config")
             .arg(&cluster_dir),
     );
+    unlock_cluster_fixture(&cluster_dir);
     let served_root = cluster_dir
         .join("graphs")
         .join(format!("{PARITY_GRAPH_ID}.omni"));
     output_success(
-        cli()
+        fixture_cli()
             .arg("load")
             .arg("--data")
             .arg(fixture("test.jsonl"))
@@ -1321,6 +1329,8 @@ policies:
             .arg("overwrite")
             .arg(&served_root),
     );
+
+    unlock_cluster_fixture(&cluster_dir);
 
     // Mirror the seeded served graph into the local twin so both arms hold
     // identical ULIDs / commit ids (the served graph is authoritative).
