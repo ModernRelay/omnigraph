@@ -7,25 +7,23 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-09-15
-updated: 2026-09-15
+updated: 2026-09-30
 discussion: null
 supersedes: []
 superseded_by: []
 blocked_on:
-  - "RFC 0068 accepted: the pin shape this record carries and the promotion reconciler that consumes it."
   - "Cost instrument: object operations per publication and per current-state read flat at depths 10, 100, 1,000 and 10,000 on file, S3 and Azure, checked in under the existing cost owners."
   - "Concurrency evidence: the probe-14 race and lost-acknowledgement cases on the configured S3 and Azure suites, and DST scenarios for concurrent publishers, stale hints and missing checkpoints."
-  - "Conversion: a lossless offline route from the v10 `__manifest` journal to records and checkpoints, and the refusal fence for older binaries."
+  - "Conversion: a lossless offline route from the v11 `__manifest` journal to records and checkpoints, and the refusal fence for older binaries."
 ---
 
 # RFC 0068: Graph commit record
 
-> Number provisional: the registry names 0067 as next available at drafting
-> time; recheck when the PR opens.
-
 **Depends on:** [RFC 0067](0067-detached-table-commits.md) for private
-table effects, the three-field pin, and promotion. This RFC changes only
-where the graph commit is stored and how current state is read.
+table effects and the three-field pin, as amended by
+[RFC: Detached-only tables](2026-09-21-detached-only-tables.md), which
+removed promotion at storage stamp v11. This RFC changes only where the
+graph commit is stored and how current state is read.
 **Surveyed:** OmniGraph 0.11.0 on `main` at `d1dd8b97`; Lance 11.0.0 and
 12.0.0-rc.1; RFCs 0013, 0022, 0024, 0028, 0030, 0038, 0042, 0058, 0062,
 0063; Lance discussions #7176, #7222, #7260, #7264; object_store 0.14.1;
@@ -53,13 +51,12 @@ do not depend on it.
 The `__manifest` Lance dataset, its per-branch native refs, its journal fold,
 the registration clock of RFC 0062, and the clone adapter that repairs
 inherited index bases for it are retired. Graph branches become
-***streams*** of records with a metadata object each. Promotion under RFC
-0066 runs lazily, by the next writer or by `cleanup`, so a content write is
-staging, one detached commit per touched table in parallel, and one
-conditional create.
+***streams*** of records with a metadata object each. Nothing follows a
+publication (RFC: Detached-only tables), so a content write is staging, one
+detached commit per touched table in parallel, and one conditional create.
 
 What does not change: per-type Lance datasets, RFC 0067's detached staging
-and promotion, the query and merge semantics, policy enforcement, the HTTP
+as detached-only tables leave it, the query and merge semantics, policy enforcement, the HTTP
 and CLI contracts, and every public error type.
 
 ## Motivation
@@ -83,8 +80,8 @@ author proposed there (#7260), is a small immutable record published with
 put-if-not-exists. The maintainer objection to that proposal was that a log
 cannot fence external fast-path writers who never consult it. Inside the
 graph that objection does not apply: the record is the only publication door
-for graph state, and under RFC 0067 promotion is the only writer of a table's
-linear history.
+for graph state, and under RFC: Detached-only tables nothing writes a graph
+table's linear history after the table is created.
 
 RFC 0067 removes the recovery liability but leaves this cost in place. This
 RFC removes the cost and, with it, the last piece of engine-owned Lance
@@ -108,8 +105,10 @@ machinery that exists only to coordinate other Lance datasets.
   are visible to every process at once.
 - `cleanup` prunes records and checkpoints past the retention horizon that
   no retained checkpoint depends on, and protects table versions pinned by
-  any retained record or checkpoint, then runs the RFC 0067 steps. `--keep N`
-  keeps its meaning over graph commits.
+  any retained record or checkpoint: the tracing collector of RFC:
+  Detached-only tables takes its roots from retained records and checkpoints
+  instead of retained `__manifest` versions. `--keep N` keeps its meaning
+  over graph commits.
 - `repair` reports a hint behind the true latest, a missing checkpoint, and a
   record whose parent is not the previous record, and can rewrite the hint
   and checkpoint. It never rewrites a record.
@@ -192,7 +191,7 @@ invariant 7 and never publication authority.
    is success; a different one is the conflict; an absent object is a failed
    attempt with no effect.
 5. Write the hint and, on an interval boundary, the checkpoint, best effort.
-6. Promote pins under RFC 0067, best effort.
+   Nothing else follows the publication.
 
 The read set is arbitrated by the record name: two writers who captured the
 same sequence contend on the same object, and the object store admits one.
@@ -258,13 +257,13 @@ a projection cache that refreshes incrementally. Both derive the delta from
 Lance physical state on every call; the cost is flat in history only because
 of those caps.
 
-What the two RFCs already give. RFC 0067 makes every commit's effect on a
+What the RFCs already give. RFC 0067 makes every commit's effect on a
 table one recorded transaction with a uuid, an exact unit a change set can
-name, and its promotion by replay reproduces the linear row stamps, so the
-feed's pruned path stays valid on promoted twins; on a pending pin the
-stamps are detached garbage and the feed takes the exact path until
-promotion. This RFC's record already carries the pins of every table a
-commit touched, which alone removes the feed's table-discovery scan, turns
+name. RFC: Detached-only tables already derives each commit's change set
+from that transaction, its fragments for inserts and updates and
+`omnigraph.deleted_ids` for deletes, with the exact path as fallback, so
+the feed no longer prunes through row stamps. This RFC's record already
+carries the pins of every table a commit touched, which alone removes the feed's table-discovery scan, turns
 the first-parent walk into reading records by sequence, and makes the
 caught-up poll one hint read.
 
@@ -278,11 +277,12 @@ classified rows. The set is derived from what was actually committed and
 lands in the same conditional create as the pins, so it cannot drift from
 the commit it describes. Inserted and updated ids are also recoverable from
 the new fragments, so the record strictly needs only the deleted ids, which
-are what the stamps cannot give cheaply.
+the transaction already carries today; on the record they would be read
+without opening each table's transaction.
 
 What the consumers would become. The feed serves a page by reading records
 from the cursor forward and hydrating only the listed ids: no candidate
-scans, no dependence on stamps, and no dependence on promotion, with cost
+scans and no dependence on stamps, with cost
 proportional to the change volume on the page. Merge takes the union of
 change sets over the records on each side since the base, which is bounded
 by divergence and is exactly the set it must classify anyway, then hydrates
@@ -329,7 +329,8 @@ on the local filesystem.
 - 4 (publish once): one record per graph commit.
 - 5 (recovery is part of the commit protocol): publication has no
   pre-publication durable effect of its own; a lost acknowledgement is
-  resolved by read-back; promotion is RFC 0067's reconciler.
+  resolved by read-back; nothing follows the publication (RFC: Detached-only
+  tables).
 - 7 (physical acceleration is derived): checkpoints and hints are derived,
   rebuildable, and never authority.
 - 11 (bounded, observable): a current-state read is bounded by the
@@ -351,13 +352,13 @@ shadow copy, no process-local lock presented as fencing.
 ## Compatibility and reversibility
 
 - Wire: none.
-- Storage: stamp v11, on top of RFC 0067's v10. New graphs write records
-  only. Conversion of a v10 graph writes one record per `__manifest` version
+- Storage: the next storage stamp, v12, on top of detached-only tables' v11.
+  New graphs write records only. Conversion of a v11 graph writes one record per `__manifest` version
   on each branch, a checkpoint at each branch head, stream metadata for each
   live native ref, and then deletes the `__manifest` dataset; it runs
   offline under the same quiescence RFC 0064 requires of explicit upgrades.
   Export and rebuild remains the alternative.
-- Downgrade: refused by stamp. Reversal to v10 is a fold of the record
+- Downgrade: refused by stamp. Reversal to v11 is a fold of the record
   stream into a `__manifest` dataset, feasible because records are complete,
   and is provided by the conversion tool in both directions until this RFC's
   implementation reaches complete.
@@ -411,7 +412,7 @@ conditional-create tests pass on the memory and local backends.
 - `maintenance.rs`: retention of records and checkpoints, protection of
   pinned table versions, conversion round trip.
 - `failpoints.rs`: crash after the record and before the hint, before the
-  checkpoint, before promotion; lost acknowledgement resolved by read-back.
+  checkpoint; lost acknowledgement resolved by read-back.
 - DST: concurrent publishers on one stream, stale hints, missing and torn
   checkpoints, conversion under injected faults.
 - Server `s3.rs` and cluster `s3_cluster.rs`, and the Azure suites: the
@@ -431,12 +432,13 @@ conditional-create tests pass on the memory and local backends.
 
 ## Rollout
 
-1. RFC 0067 accepted and its pin shape and promotion reconciler landed.
-2. Record, checkpoint, hint and stream readers and writers behind stamp v11,
+1. RFC 0067 and RFC: Detached-only tables landed, with the pin shape this
+   record carries (done).
+2. Record, checkpoint, hint and stream readers and writers behind stamp v12,
    exercised on new graphs; the cost instrument checked in.
 3. Conversion tool in both directions with its round-trip evidence.
 4. Retire the `__manifest` publisher, state fold, namespace and layout
-   modules, the v6 to v9 upgrade routes for new graphs, native `__manifest`
+   modules, the `__manifest`-era upgrade routes for new graphs, native `__manifest`
    branches, and the clone adapter; update `writes.md`, `architecture.md`,
    `invariants.md` §12, `versioning.md`, `control-plane.md` where it names
    manifest objects, and the release notes.
@@ -451,9 +453,9 @@ Each stop leaves `main` shippable; the stamp gates activation.
   bounded listing as the primary latest lookup.
 - Whether stream metadata needs a graph-level index object, or listing the
   `streams/` prefix suffices for the branch counts the server expects.
-- Group commit at the branch gate becomes one record for several members;
-  whether lineage carries one commit id per member or one per record is a
-  separate decision.
+- Group commit at the branch gate: RFC: Group commit (draft, PR #785)
+  publishes a batch as one graph commit, so it would be one record
+  with one commit id. Decided there.
 - Whether the record carries per-table change sets (see Change sets on the
   record), and if so whether only deleted ids or the full inserted, updated
   and deleted sets, and at what size they spill to a delta object.
@@ -462,3 +464,16 @@ Each stop leaves `main` shippable; the stamp gates activation.
 
 - 2026-09-15: drafted as the sequel to RFC 0067 after the write-path
   investigation; probe 14 recorded as initial evidence.
+- 2026-09-30: consistency pass after RFC: Detached-only tables (storage stamp
+  v11), which removed promotion.
+  - Promotion is gone from the dependency, the summary, the publication
+    steps, the invariants, the test windows and the rollout.
+  - The stamp becomes v12, on top of v11, and conversion starts from a v11
+    journal.
+  - The change-set section now starts from the transaction-carried change
+    sets detached-only tables ship.
+  - The group-commit question points to RFC: Group commit.
+  - The stale "Number provisional" banner and a self-referential blocker
+    ("RFC 0068 accepted") are removed.
+
+  The record's design is unchanged.
