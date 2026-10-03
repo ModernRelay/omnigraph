@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-09-28
-updated: 2026-10-01
+updated: 2026-10-03
 discussion: "https://github.com/ModernRelay/omnigraph/pull/785"
 supersedes: []
 superseded_by: []
@@ -183,8 +183,8 @@ the field itself is gone. Keeping the ids is a prerequisite (Rollout).
     unreachable and gives its entries the typed conflict, not in doubt.
   - An in-doubt batch makes every entry in doubt. The server closes
     admission once, as it does for one in-doubt write today.
-  - An admitted entry whose batch outcome the engine did not observe (the
-    publisher task panicked, or dropped the batch) gets `Uncertain`, so the
+  - An admitted entry whose batch outcome the engine did not observe (its
+    leader's future panicked or was dropped) gets `Uncertain`, so the
     server closes admission as it does for a panicking write today. An
     entry not yet admitted has made no effect and is refused.
 - **Fewer conflicts.** Today any publication on the branch refuses every
@@ -203,8 +203,11 @@ the field itself is gone. Keeping the ids is a prerequisite (Rollout).
     its one deadline.
   - A caller that goes away before its entry is admitted is dropped from the
     queue.
-  - Once admitted, the publication runs to its outcome on the publisher's
-    task, whatever happens to any one caller.
+  - Once admitted, the publication runs on its leader's task. An HTTP
+    leader is an owned operation and is never dropped. If an embedded
+    caller drops a leader's future, the batch's entries are refused and
+    re-prepare when the leader had made no effect yet, and get `Uncertain`
+    otherwise; the next waiter is promoted either way.
   - A write whose caller disconnected after admission may land. That caller
     is in the same position as a lost acknowledgement today.
 - **Unchanged.**
@@ -285,12 +288,17 @@ Each written table is in one of two classes:
 
 ### The publisher
 
-Each process runs one publisher per graph root and branch. It lives in the
-process-global write-queue manager that already owns the gates
-(`db/write_queue.rs`, keyed by root). It starts at the first entry, ends
-when idle, and owns a coordinator for its branch.
+Each process keeps one publisher per graph root and branch: a queue and a
+leader flag in the process-global write-queue manager that already owns the
+gates (`db/write_queue.rs`, keyed by root). It spawns no task. The writers
+form a write group: an entry that arrives while no batch is publishing
+leads, publishes the batch that holds its own entry on its own task, then
+promotes the next waiting entry to lead the next batch, or clears the flag
+when none waits. A writer never publishes others' writes at the expense of
+its own next one, and every publication runs inside the owned operation of
+the writer leading it.
 
-It runs one batch at a time:
+A batch runs:
 
 1. **Gates.** Take the schema gate's shared side and the branch gate, which
    is what `commit_all` takes today. The per-table gates it also takes add
@@ -575,11 +583,12 @@ reclaims them.
   re-preparation.
 - **A timed batching window.** Adds latency at low load. Queuing while a
   publication is in flight batches without a timer.
-- **A leader-follower write group without a task**, the RocksDB write-thread
-  shape. The leader's future would own everyone's publication, so cancelling
-  one caller would abandon the others'. It would also keep publication
-  requests inside a session's future, where a `.gqt` concurrent block can
-  name them and `--measure` attributes them (see Unresolved questions).
+- **A dedicated publisher task.** A task the engine spawns is a child
+  producer no single owned operation owns ([Server runtime and online
+  deployment](2026-09-29-server-runtime-and-online-deployment.md), Operation
+  ownership). Its requests also fall outside every session's `--measure` row
+  and every `.gqt` `order:`. The spike measured nothing it would add over
+  the write group (decision log, 2026-10-03).
 - **Failing fast before revalidation.** Measured, and bounded by the
   single-writer ceiling (shared gate decision log).
 - **Batches across actors.** Needs per-write attribution in the commit row, a
@@ -656,7 +665,8 @@ reclaims them.
 - **DST: the concurrent universe with the publisher on.**
   - The writers already share the process-global manager, so batching
     happens.
-  - The seam scheduler needs the publisher task as an actor.
+  - Every publication runs on a writer's task, so the seam scheduler's
+    existing writer actors cover it.
   - Oracle: every acknowledged write is visible exactly once, and each
     commit has one actor.
   - The collector oracle runs with batches in flight.
@@ -698,19 +708,6 @@ Each step leaves `main` shippable.
 - **Where per-write attribution belongs.** It is needed for batches across
   actors and for #513's per-write idempotency key: in this format or in RFC
   0068's record. Decided when either is proposed.
-- **Where publication requests are attributed.**
-  - A request made on a task the engine spawns can never be named in a
-    `--- concurrent` block's `order:`.
-  - `--measure` puts such requests on the block's own row, not a session's
-    (GQT README, Concurrent block).
-  - A spawned publisher therefore moves every publication request out of a
-    test's reach, and out of the writer's measured cost.
-
-  Recommended: the publisher runs its batch on a task that carries the
-  batch's first entry's session identity for the harness, so an `order:`
-  can name the batch's manifest `put` and `--measure` attributes it to that
-  session. Decided in rollout step 2, with the DST seam scheduler's actor
-  mapping, which needs the same identity.
 - **The next lever after this one.** Once publication is amortized, a
   writer's cycle at +30 ms is dominated by preparation's own round trips.
   Since #834 one insert makes 13 requests: 6 writes, the key check, the
@@ -802,3 +799,21 @@ Each step leaves `main` shippable.
     schema-apply sentinel, so revalidation no longer reads it and an insert
     makes 13 requests instead of 20. The next-lever paragraph now cites
     #837.
+
+- 2026-10-03 — The publisher is a write group, not a spawned task.
+  - The spike posted on the PR ran a leader-follower write group and reached
+    the instrument gate: one writer unchanged, eight writers on one branch
+    at 9.23 against 0.87 commits/s at +30 ms, per-writer counts within 1.3×.
+    Its first version kept the leader leading while entries waited, which
+    published other writers' writes instead of the leader's next one; 2
+    writers ran below baseline and one run starved a writer. A writer now
+    leads only the batch that holds its own entry, then promotes the next.
+  - The alternative rejected earlier, cancellation abandoning followers,
+    narrows under the accepted server runtime RFC: an HTTP write is an owned
+    operation that a disconnect never drops. An embedded leader that is
+    dropped refuses its batch before any effect and reports `Uncertain`
+    after one, and promotes the next waiter.
+  - A spawned publisher would be a child producer no single owned operation
+    owns, so it moves to Alternatives, and the unresolved question of where
+    publication requests are attributed closes: they run on the leader's
+    own task.
