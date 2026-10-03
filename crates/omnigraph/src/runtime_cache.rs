@@ -3,6 +3,7 @@ use std::hash::Hash;
 use std::sync::{Arc, Weak};
 
 use lance::session::Session;
+use omnigraph_compiler::CheckedQuery;
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::QueryIR;
@@ -348,19 +349,32 @@ pub(crate) struct CompiledQueryKey {
     name: String,
 }
 
+/// A compiled read declaration: its IR, and the checked declaration the IR
+/// was lowered from, which plan acceptance derives the query's requirements
+/// from.
+#[derive(Clone)]
+pub(crate) struct CompiledQuery {
+    pub(crate) ir: Arc<QueryIR>,
+    pub(crate) checked: CheckedQuery,
+}
+
 /// A compiled read statement: a declaration the door runs for rows, or an
 /// `explain` statement over one, which the door answers with the plan.
 #[derive(Clone)]
 pub(crate) enum CompiledRead {
-    Query(Arc<QueryIR>),
-    Explain(Arc<QueryIR>),
+    Query(CompiledQuery),
+    Explain(CompiledQuery),
 }
 
 impl CompiledRead {
-    pub(crate) fn ir(&self) -> &Arc<QueryIR> {
+    pub(crate) fn query(&self) -> &CompiledQuery {
         match self {
-            Self::Query(ir) | Self::Explain(ir) => ir,
+            Self::Query(query) | Self::Explain(query) => query,
         }
+    }
+
+    pub(crate) fn ir(&self) -> &Arc<QueryIR> {
+        &self.query().ir
     }
 }
 
@@ -676,19 +690,22 @@ edge Likes: Person -> Person {}
         let (_, built) = db.capture_current_read_view().await.unwrap();
         let compile = |catalog: &Catalog, source: &str, name: &str| {
             let decl = omnigraph_compiler::find_named_query(source, name).unwrap();
-            let ctx =
-                omnigraph_compiler::query::typecheck::typecheck_query(catalog, &decl).unwrap();
-            CompiledRead::Query(Arc::new(
-                omnigraph_compiler::lower_query(catalog, &decl, &ctx).unwrap(),
-            ))
+            let checked = CheckedQuery::check(catalog, &decl).unwrap();
+            let ir =
+                omnigraph_compiler::lower_query(catalog, checked.decl(), checked.types()).unwrap();
+            CompiledRead::Query(CompiledQuery {
+                ir: Arc::new(ir),
+                checked,
+            })
         };
         let cache = CompiledQueryCache::default();
         let source = "query q() { match { $p: Person } return { $p.name } }";
         let key = CompiledQueryCache::key_for(source, "q");
 
         let first = Arc::new((*built).clone());
-        let ir = Arc::clone(compile(&first, source, "q").ir());
-        cache.insert(&first, key.clone(), CompiledRead::Query(Arc::clone(&ir)));
+        let compiled = compile(&first, source, "q");
+        let ir = Arc::clone(compiled.ir());
+        cache.insert(&first, key.clone(), compiled);
         assert!(Arc::ptr_eq(cache.get(&first, &key).unwrap().ir(), &ir));
 
         let equal = Arc::new((*built).clone());

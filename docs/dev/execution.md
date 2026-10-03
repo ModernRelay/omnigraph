@@ -10,11 +10,14 @@ A query runs against one resolved `ReadTarget`:
 
 1. Resolve the branch or graph snapshot once.
 2. Parse and type-check `.gq` source against that snapshot's accepted catalog.
-3. Lower the checked query to typed IR.
-4. Select any search mode and the edge types required by traversal or an
-   anti-join.
-5. Execute the IR against the same snapshot.
-6. Serialize result batches at the calling boundary.
+3. Lower the checked query to typed IR, keeping the checked declaration and
+   its type context beside it.
+4. Gather the planning inputs once: bound parameters (`now()` among them),
+   constants folded to their values, statistics, settings and the full-text
+   coverage of every ranked property.
+5. Plan the query and accept the plan (see [Plan acceptance](#plan-acceptance)).
+6. Bind the accepted plan's values and execute it against the same snapshot.
+7. Serialize result batches at the calling boundary.
 
 The executor never refreshes a mutable branch head midway through a query.
 Historical reads build from the requested immutable table versions; current
@@ -26,6 +29,7 @@ Stable code owners:
 |---|---|
 | Parser, type checker, lowering | `crates/omnigraph-compiler/src/query/`, `src/ir/` |
 | Read doors | `crates/omnigraph/src/exec/query_doors.rs` |
+| Plan acceptance | `crates/omnigraph-planner/src/validate/` |
 | Plan lowering, operators and context (engine v2) | `crates/omnigraph/src/engine/` |
 | Frozen engine v1, the GQT test reference | `crates/omnigraph-reference-engine/` |
 | Lance scan boundary | `crates/omnigraph/src/table_store.rs` |
@@ -613,6 +617,55 @@ truth: the engine's own recursion with its catch-all arm was a second list of
 handled variants beside the `PhysicalNode` enum, and it is gone. That is why
 no RFC accompanies it.
 
+## Plan acceptance
+
+Every read reaches execution through one door: `accept_query` plans the query
+and the planner's validator checks the plan against what the checked
+declaration requires; only that check constructs an `AcceptedPlan`, whose
+fields are private, and `bind` and `execute` take nothing else. The ordinary
+run, `Session::explain_query`, the `explain` statement and the inspected run
+share the path, so explain validates exactly what a run validates and reports
+the outcome as `validation.scope`.
+
+The requirements come from the declaration, its type context and the
+catalog, not from the IR: binding identity, search identity and its declared
+approximation, every eligibility conjunct (checked per `rrf` arm, since each
+arm copies the match), correlated blocks, the projection and the origin of
+every projected score, order and cut, and the policies the plan declares
+for its search. A matcher relates each written expression to the IR through
+the compiler's lowering patterns (property leaves on physical columns, `in`
+as a swapped `contains`, a bare search call as `= true`, a folded constant as
+the value the engine's evaluator gives it). The order check recomputes the
+root's order from the operators (`optimizer::derived_order`, typed
+`OrderKey`s) and accepts the planner's tie-break omissions that are
+comparator equivalences: a key already in the comparator, every key when the
+query returns only order keys, and identities of bindings the query does not
+name (anonymous endpoints, cycle temps) after every named one.
+
+A query of one binding, Boolean/integer/String eligibility, an optional
+leading `bm25()` over a String property, direct property sort keys, a limit
+and a projection of properties and the selected score is a member of the
+exact fragment (`validate/subset.rs`). For a member the optimizer records the
+rules it applies (`AbsorbScanFilter`, `PruneScanColumns`, `Lower`,
+`RankBm25Scan`) over arena references; the validator checks that the IR is
+the declaration's lowering, rebuilds the canonical chain
+`Limit(Sort(Project([Search](Filter(Scan)))))`, re-applies every rule
+against its precondition and requires the result to equal the plan. A member
+is accepted as `exact_subset`; every other plan as `invariants_only`.
+
+A fresh plan that fails a check is a planner defect (an internal error). A
+check that exhausts a `ValidationLimits` budget (evidence bytes, derivation
+nodes, rule applications, visits) is `ResourceLimitExceeded`; a refusal by
+design keeps its diagnostic and is a bad request. The replay door
+(`Session::replay_bound_plan`) takes a serialized `ReplayEnvelope`: the query
+source and name, the scope, the schema digest, the bound plan and a member's
+derivation. It checks the byte limit and the envelope's versions before
+decoding the plan, refuses another schema and a dataset the plan did not pin
+as conflicts, re-establishes every full-text coverage fact the plan records
+from the pinned snapshot, recompiles the query, and accepts the plan again; a
+recorded fact the snapshot contradicts, or a plan that fails a check, is
+invalid evidence, a bad request.
+
 ## Search and rank
 
 `nearest`, text search/BM25, and reciprocal-rank fusion are first-class
@@ -624,16 +677,27 @@ their ordered results.
 BM25 scans have no candidate cap. The final ordering applies the score,
 secondary keys and every binding's identity before the query limit; a full
 candidate window cannot prove that it contains the leading tied identities.
+A BM25 scan declares where it applies its eligibility (its pushed filter, a
+gate's eligible set and the members of its search predicates):
+`before_scoring`, Lance's prefilter, only when the property's full-text index
+covers every fragment at the pinned version, a fact the plan records in
+`Assumptions.full_text`; `after_scoring`, Lance's postfilter, otherwise.
+Lance scores uncovered fragments flat from statistics over the rows its
+prefilter admits, so filtering before scoring there would change scores.
 
 A `nearest` scan carries a probe cap per index delta (the `ann_nprobes`
 session setting, `request` scope, default 20, `0` is no cap; the process
-default is `OMNIGRAPH_ANN_NPROBES`). `execute_node_scan` runs a probe ladder: a capped scan short of
-`k` with partitions unread reruns at four times the cap, then uncapped. The
-stop rules (`ladder_step`) end the ladder on every other cause of a short
-scan, read from Lance's execution summary (`partitions_searched` /
-`partitions_ranked`) and from the `_distance = +inf` marker Lance emits when a
-prefilter admits fewer rows than `k`, which triggers one flat exact rescan; a
-missing summary fails closed into one uncapped rescan. Above the scan,
+default is `OMNIGRAPH_ANN_NPROBES`) and the adaptive policy the plan declares
+(`RankedAccess.policy`, `NearestPolicy`). `execute_node_scan` runs a probe
+ladder within it: a capped scan short of `k` with partitions unread reruns at
+`probe_factor` (4) times the cap, then uncapped. The stop rules
+(`ladder_step`) end the ladder on every other cause of a short scan, read
+from Lance's execution summary (`partitions_searched` / `partitions_ranked`)
+and from the `_distance = +inf` marker Lance emits when a prefilter admits
+fewer rows than `k`, which triggers one flat exact rescan; a missing summary
+fails closed into one uncapped rescan; a scan whose eligible set fits within
+`k` scores flat from its first attempt. Acceptance refuses a policy whose
+ladder cannot terminate or that drops either fallback. Above the scan,
 `execute` runs the overfetch ladder the plan declares
 (`RankedAccess.overfetch`): a full scan whose result is short of `limit`
 after later operators reruns with `k` times 4, then times 16, seeded with the
@@ -642,10 +706,15 @@ type's row count, no probe cap), so a short answer is never served while
 survivors exist; aggregate returns never overfetch. Before either, `nearest_prefilter_gate` runs the pre-pass the plan declares
 (`RankedAccess.prefilter`) for a standalone `nearest` constrained by a traversal and
 pushes the eligible ids into the scan as an `id IN (...)` prefilter; an empty
-eligible set proves the answer empty and runs no scan. The `rrf` gate is
-answer-preserving (its set over-approximates the survivors); the nearest gate
-is answer-changing by design (it ranks the eligible entities exactly instead
-of the global window's survivors).
+eligible set proves the answer empty and runs no scan (`Prefilter.on_empty`).
+The `rrf` gate is answer-preserving (its set over-approximates the
+survivors) and prefilters its bm25 arms only under the recorded full
+coverage (`Prefilter.coverage_admits`); the nearest gate is answer-changing
+by design (it ranks the eligible entities exactly instead of the global
+window's survivors). Acceptance checks that every hop of a pre-pass is a
+required first hop of the query. The execution report records each gate's
+verdict with the counts it read and each probe attempt per overfetch rung
+(`search` decisions), and a replay must record the same.
 
 Lance 11 still loses final KNN ordering metadata in one late payload-hydration
 shape, so OmniGraph requests one output partition for the affected nearest

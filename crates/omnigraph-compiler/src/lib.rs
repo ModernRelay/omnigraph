@@ -42,6 +42,7 @@ pub const GQ_LANGUAGE_VERSION: (u16, u16) = (2, 1);
 pub use ir::lower::{lower_mutation_query, lower_query};
 pub use lint::{DiagnosticCode, Family, SafetyTier, Severity};
 pub use query::ast::Literal;
+pub use query::checked::CheckedQuery;
 pub use query::descriptor::{
     QueryGraphFact, QueryGraphFactKind, QueryOperationDescriptor, QueryResultFieldDescriptor,
     QueryValueKind, describe_query_operation,

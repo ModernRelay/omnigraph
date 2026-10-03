@@ -1,0 +1,87 @@
+# issue: none
+# notes: A BM25 score is the retrieval's, not the filter's (RFC 0047, "Checked rewrites for exact
+# notes: search"). The seed is indexed, so the filter may run before scoring. The insert lands in a
+# notes: fragment no full-text segment covers, which Lance scores flat from statistics over the rows
+# notes: its prefilter admits; under that partial coverage the plan applies the filter after scoring,
+# notes: so `t1` scores the same with and without a filter that excludes `t2`, the other new row.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    text: String @index
+    year: I64
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","text":"graph engines","year":2020}}
+{"type":"Doc","data":{"slug":"d2","text":"graph search","year":2021}}
+{"type":"Doc","data":{"slug":"d3","text":"databases","year":2019}}
+
+--- query
+query covered() {
+    match { $d: Doc $d.year >= 2020 }
+    return { $d.slug, bm25($d.text, "graph") as score }
+    order { bm25($d.text, "graph") }
+}
+
+--- expect ordered
+{"d.slug":"d1","score":0.43445715}
+{"d.slug":"d2","score":0.43445715}
+
+--- expect shape
+d.slug: String
+score: F32
+
+--- expect plan
+scan Doc as $d: ranked bm25 eligibility before_scoring
+validation scope exact_subset
+
+--- mutate
+query tail() {
+    insert Doc { slug: "t1", text: "graph", year: 2022 }
+    insert Doc { slug: "t2", text: "graph graph graph graph graph graph graph graph", year: 1990 }
+}
+--- expect ok
+
+--- query
+query unfiltered() {
+    match { $d: Doc }
+    return { $d.slug, bm25($d.text, "graph") as score }
+    order { bm25($d.text, "graph") }
+}
+
+--- expect ordered
+{"d.slug":"t2","score":0.46573505}
+{"d.slug":"d1","score":0.43445715}
+{"d.slug":"d2","score":0.43445715}
+{"d.slug":"t1","score":0.3903352}
+
+--- expect shape
+d.slug: String
+score: F32
+
+--- query
+query filtered() {
+    match { $d: Doc $d.year >= 2000 }
+    return { $d.slug, bm25($d.text, "graph") as score }
+    order { bm25($d.text, "graph") }
+}
+
+--- expect ordered
+{"d.slug":"d1","score":0.43445715}
+{"d.slug":"d2","score":0.43445715}
+{"d.slug":"t1","score":0.3903352}
+
+--- expect shape
+d.slug: String
+score: F32
+
+--- expect plan
+scan Doc as $d: ranked bm25 eligibility after_scoring
+validation scope exact_subset

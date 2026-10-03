@@ -67,7 +67,14 @@ value), `fetch` (the candidates the index is asked for: the query's limit
 for `nearest`, `null` for `bm25`, which is uncapped), `nprobes` on a
 `nearest` scan (the `ann_nprobes` setting when the plan was built, the IVF
 partitions probed per index delta; `null` is no cap) and `scope` (`order`
-for the query's own order, `primary` or `secondary` for an arm of `rrf()`). A
+for the query's own order, `primary` or `secondary` for an arm of `rrf()`).
+A `nearest` scan's `policy` declares what the run may do when an attempt
+leaves it short: `probe_factor` (each rescan multiplies the probe cap),
+`flat_rescan_on_unreached`, `uncapped_on_missing_counters` and
+`flat_when_eligible_within_fetch`. A `bm25` scan's `eligibility` says where it
+applies its filter: `before_scoring` when the property's full-text index
+covers every fragment of the pinned version, `after_scoring` otherwise, so a
+filter never changes a BM25 score. A
 physical
 `RankFuse` row has two inputs, one subtree per arm, each with its own ranked
 `Scan`; it carries `arms` (binding and kind per arm), `k`, `limit` and
@@ -86,14 +93,23 @@ carries no `runtime_filter` key unless a `ContainsJoin` marked it. Then one
 `plan` row per optimizer pass that fired (`node` `pass`), and one per
 remaining field of the explain document: `route` (the engine route the plan
 describes), `logical_hash` (the structural hash of the logical plan),
-`explain_version`, `operation`, and the statistics used by planning. The
+`explain_version`, `operation`, and the statistics used by planning; then
+`validation`, what plan acceptance checked: `{"scope": "exact_subset"}` when
+the query is a member of the exact fragment (one binding, Boolean, integer and
+String filters, an optional leading `bm25()`, property sort keys, a limit and a
+projection of properties and the score) and every rewrite from its canonical
+form was checked, `{"scope": "invariants_only"}` when the plan was checked
+against the query's requirements alone. A plan that fails acceptance is never
+explained: the query fails as it would fail to run. The
 last `plan` row is `assumptions`, what the planner read to build the plan,
 as one JSON object: `params`, the names of the parameters it read (never a
 value); `settings`, each setting it read with its spelling (`traversal`,
 `ann_nprobes`); `env`, each environment variable it read with the value it
 resolved (`OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER`,
 `OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS`, when the query traverses); `gate_policy`,
-the `rrf_plan` mode and the prefilter gate's admission thresholds; and
+the `rrf_plan` mode and the prefilter gate's admission thresholds;
+`full_text`, the full-text coverage (`full`, `partial` or `absent`) of every
+property a `bm25` scan ranks, keyed `<table>.<property>`; and
 `memory_limit`, the query pool in bytes. Selector statements also capture
 `traversal_work_limit`, shared across the execution, and `has_wildcard_traversal`,
 retained through rewrites so historical replay can enforce the target rule. Query
@@ -105,8 +121,11 @@ ordering names `$p._distance asc` or `$p._score desc`, and the physical
 `Sort` above a search order leads its `keys` with that score key, followed by
 the query's plain keys; a fusion's ordering is `rrf($a, $b) desc` and it
 plans no `Sort`. A `Sort` row's `tiebreak` lists the metadata keys it appends after
-`keys` (`$p.@id`, and `$e.@type` plus `$e.@id` for selected bound edges), empty
-where equal rows are indistinguishable.
+`keys` (`$p.@id`, and `$e.@type` plus `$e.@id` for selected bound edges, the
+bindings the query declares in name order, then any binding the query does not
+name), empty where equal rows are indistinguishable; its `ordering` property
+is its whole comparator, those keys included as `$p.@id asc`, and a `Filter`
+keeps its input's ordering.
 
 The `datafusion` tree is the plan the query executes on the `v2` route: the
 physical tree lowered to operators, every read operator omnigraph's own
@@ -143,12 +162,19 @@ the node built:
 `ran` is `true` or `false` on an operator without a choice, and on the
 operator of a declared switch it is the side that ran: `hash_join` or
 `id_lookup` on the `HashJoinExec` of a `HashJoin`, `csr` or `indexed_scan`
-on the `ExpandExec` of an `Expand`, the mode the traversal ended on. Explain itself runs nothing and carries no `profile` row; the
+on the `ExpandExec` of an `Expand`, the mode the traversal ended on. After
+the node rows, one row per search decision the run took within its plan's
+declared policy: `node` `gate` (a pre-pass gate's `plan`, `prefilter`,
+`postfilter` or `proven_empty`, with its `fallback`, `forced`, `eligible` and
+`corpus`) or `probes` (a `nearest` scan's `attempts`, each with its
+`maximum_nprobes`, `flat` and `rows`), each with the node's `id` and the
+overfetch `rung`. Explain itself runs nothing and carries no `profile` row; the
 profile is returned beside the rows by the run that produced them
 (`Session::query_inspected`, the v2 inspection door, through
 `Executed::profile`). The row schema is `explain_version` 4. Saved physical
-plans use a `bound_plan_version: 1` envelope whose `body` contains `plan` and
-`values`. Older unversioned plans and unsupported versions are refused with a
+plans use a `bound_plan_version: 2` envelope whose `body` contains `plan` and
+`values`; version 2 types each node's ordering and declares ranked scans'
+eligibility and policy. Older unversioned plans and unsupported versions are refused with a
 regeneration instruction, including plans without traversal nodes.
 
 An `explain` statement is served by `omnigraph query` and `POST /query`. It

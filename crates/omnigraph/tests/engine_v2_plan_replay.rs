@@ -7,7 +7,7 @@
 mod helpers;
 
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::error::{ManifestErrorKind, OmniError};
+use omnigraph::error::OmniError;
 use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
@@ -81,9 +81,10 @@ async fn incomplete_rank_fuse_row_tiebreak_refuses_replay_issue_659() {
     let expected =
         vec![serde_json::json!({"edge_type":"Knows","edge_id":"shared","target":larger})];
     assert_eq!(rows_of(&first.result), expected);
-    let encoded = serde_json::to_value(&first.plan).unwrap();
-    let restored = serde_json::from_value(encoded.clone()).unwrap();
-    let replay = db.replay_bound_plan("main", restored).await.unwrap();
+    let encoded: Value =
+        serde_json::from_slice(&first.replay_envelope(query, "selected_page")).unwrap();
+    let restored = serde_json::to_vec(&encoded).unwrap();
+    let replay = db.replay_bound_plan("main", &restored).await.unwrap();
     assert_eq!(rows_of(&replay.result), expected);
     let type_key = serde_json::json!({"binding":"e","property":"@type"});
     let edge_key = serde_json::json!({"binding":"e","property":"@id"});
@@ -103,7 +104,7 @@ async fn incomplete_rank_fuse_row_tiebreak_refuses_replay_issue_659() {
         ),
     ] {
         let mut altered = encoded.clone();
-        let keys = altered["body"]["plan"]["slots"]
+        let keys = altered["plan"]["body"]["plan"]["slots"]
             .as_array_mut()
             .unwrap()
             .iter_mut()
@@ -113,8 +114,8 @@ async fn incomplete_rank_fuse_row_tiebreak_refuses_replay_issue_659() {
             .expect("the saved RankFuse carries a row_tiebreak list");
         assert_eq!(*keys, expected_keys);
         *keys = altered_keys;
-        let altered = serde_json::from_value(altered).unwrap();
-        let error = match db.replay_bound_plan("main", altered).await {
+        let altered = serde_json::to_vec(&altered).unwrap();
+        let error = match db.replay_bound_plan("main", &altered).await {
             Err(error) => error,
             Ok(replay) => panic!(
                 "{mutation}: incomplete RankFuse row_tiebreak must refuse; replay returned {:?}",
@@ -149,10 +150,17 @@ async fn wildcard_replay_keeps_captured_members_and_pins_every_member_issue_659(
     )
     .await
     .unwrap();
-    let captured: omnigraph_planner::BoundPlan =
-        serde_json::from_value(serde_json::to_value(&first.plan).unwrap()).unwrap();
-    let replay = db.replay_bound_plan("main", captured).await.unwrap();
-    assert_eq!(rows_of(&replay.result), rows_of(&first.result));
+    let captured = first.replay_envelope(WILDCARD_LIKES_QUERY, "selected");
+    let error = db
+        .replay_bound_plan("main", &captured)
+        .await
+        .err()
+        .expect("a plan accepted under the old schema is not replayed under the new one");
+    assert!(
+        matches!(&error, OmniError::Manifest(manifest) if manifest.kind == omnigraph::error::ManifestErrorKind::Conflict)
+            && error.to_string().contains("accepted under schema"),
+        "{error}"
+    );
     let fresh = db
         .query_inspected("main", WILDCARD_LIKES_QUERY, "selected", &ParamMap::new())
         .await
@@ -195,7 +203,10 @@ async fn wildcard_replay_keeps_captured_members_and_pins_every_member_issue_659(
     .await
     .unwrap();
     let error = db
-        .replay_bound_plan("main", fresh.plan)
+        .replay_bound_plan(
+            "main",
+            &fresh.replay_envelope(WILDCARD_LIKES_QUERY, "selected"),
+        )
         .await
         .err()
         .expect("every member is pinned");
@@ -409,23 +420,44 @@ async fn historical_replay_checks_marker_and_live_wildcards_issue_659() {
         .query_inspected("main", WILDCARD_LIKES_QUERY, "selected", &ParamMap::new())
         .await
         .unwrap();
+    let wildcard_envelope = |plan| {
+        omnigraph_planner::ReplayEnvelope::new(
+            WILDCARD_LIKES_QUERY,
+            "selected",
+            plan,
+            &wildcard.evidence,
+            wildcard.catalog.clone(),
+        )
+        .to_bytes()
+    };
     let mut live_only = wildcard.plan.clone();
     let mut assumptions = live_only.plan.assumptions().clone();
     assumptions.has_wildcard_traversal = false;
     live_only.plan.set_assumptions(assumptions);
-    let mut marker_only = db
+    let count = db
         .query_inspected("main", PEOPLE_QUERIES, "count_people", &ParamMap::new())
         .await
-        .unwrap()
-        .plan;
+        .unwrap();
+    let mut marker_only = count.plan.clone();
     let mut assumptions = marker_only.plan.assumptions().clone();
     assumptions.has_wildcard_traversal = true;
     assumptions.traversal_work_limit = wildcard.plan.plan.assumptions().traversal_work_limit;
     marker_only.plan.set_assumptions(assumptions);
-    for bound in [wildcard.plan, live_only, marker_only] {
-        let bound = serde_json::from_value(serde_json::to_value(bound).unwrap()).unwrap();
+    let marker_only = omnigraph_planner::ReplayEnvelope::new(
+        PEOPLE_QUERIES,
+        "count_people",
+        marker_only,
+        &count.evidence,
+        count.catalog.clone(),
+    )
+    .to_bytes();
+    for envelope in [
+        wildcard_envelope(wildcard.plan.clone()),
+        wildcard_envelope(live_only),
+        marker_only,
+    ] {
         let error = db
-            .replay_bound_plan(ReadTarget::Snapshot(snapshot.clone()), bound)
+            .replay_bound_plan(ReadTarget::Snapshot(snapshot.clone()), &envelope)
             .await
             .err()
             .expect("historical wildcard replay");
@@ -613,6 +645,15 @@ fn report_rows(report: &impl serde::Serialize) -> Vec<Value> {
         .clone()
 }
 
+/// The adaptive search decisions a run recorded: each gate's verdict with
+/// the counts it read, and each nearest scan's probe attempts per rung.
+fn search_decisions(report: &impl serde::Serialize) -> Vec<Value> {
+    serde_json::to_value(report).unwrap()["search"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// The rule a replay's trace is held to: `id`, `operator`, `status`, `rung`
 /// and `ran` repeat always; `actual_rows` repeats where both attempts were
 /// drained; `drained` itself is a scheduling fact and is not compared.
@@ -649,38 +690,44 @@ fn sides(rows: &[Value]) -> Vec<String> {
 }
 
 /// The first run and its replays: the result rows and the bound plan of the
-/// inspected run, and the report rows of the run and of the second replay.
+/// inspected run, its report rows and the search decisions it recorded.
 struct Replayed {
     result: Vec<Value>,
     plan: omnigraph_planner::BoundPlan,
     rows: Vec<Value>,
+    search: Vec<Value>,
 }
 
 /// One inspected run and two replays of its plan through the door (the plan
-/// read back through its mirrors); each returns the run's rows and trace, the
-/// second one proving the door's caches carry no state into a row.
+/// read back through its mirrors); each returns the run's rows, trace and
+/// search decisions (a gate re-establishes its verdict from the pins, and
+/// the ladder takes the same probe rungs), the second one proving the
+/// door's caches carry no state into a row.
 async fn replayed(db: &Session, source: &str, name: &str, params: &ParamMap) -> Replayed {
     let run = db
         .query_inspected(ReadTarget::branch("main"), source, name, params)
         .await
         .unwrap();
-    let serialized = serde_json::to_value(&run.plan).unwrap();
-    let bound: omnigraph_planner::BoundPlan = serde_json::from_value(serialized).unwrap();
-    assert_eq!(bound, run.plan, "the bound plan reads back equal");
+    let envelope = run.replay_envelope(source, name);
+    let read_back = omnigraph_planner::decode_replay(&envelope, Default::default()).unwrap();
+    assert_eq!(read_back.plan, run.plan, "the bound plan reads back equal");
     let result = rows_of(&run.result);
     let rows = report_rows(&run.report);
+    let search = search_decisions(&run.report);
     for _ in 0..2 {
         let replay = db
-            .replay_bound_plan(ReadTarget::branch("main"), bound.clone())
+            .replay_bound_plan(ReadTarget::branch("main"), &envelope)
             .await
             .unwrap();
         assert_eq!(rows_of(&replay.result), result);
         assert_same_trace(&rows, &report_rows(&replay.report));
+        assert_eq!(search_decisions(&replay.report), search);
     }
     Replayed {
         result,
         plan: run.plan,
         rows,
+        search,
     }
 }
 
@@ -712,8 +759,9 @@ async fn a_hash_join_traversal_replays_with_its_switches() {
 async fn a_contains_join_with_a_residual_replays_through_its_marked_scan() {
     let dir = tempfile::tempdir().unwrap();
     let db = citations(&dir).await;
-    let Replayed { result, plan, rows } =
-        replayed(&db, CITATION_QUERIES, "cited", &ParamMap::new()).await;
+    let Replayed {
+        result, plan, rows, ..
+    } = replayed(&db, CITATION_QUERIES, "cited", &ParamMap::new()).await;
     assert_eq!(
         result,
         [
@@ -782,11 +830,14 @@ async fn edited_replay_refusal(
         )
         .await
         .unwrap();
-    let mut serialized = serde_json::to_value(&run.plan).unwrap();
-    edit_objects(&mut serialized, edit);
-    let bound: omnigraph_planner::BoundPlan = serde_json::from_value(serialized).unwrap();
+    let mut serialized: Value =
+        serde_json::from_slice(&run.replay_envelope(CITATION_QUERIES, "cited")).unwrap();
+    edit_objects(&mut serialized["plan"], edit);
     match db
-        .replay_bound_plan(ReadTarget::branch("main"), bound)
+        .replay_bound_plan(
+            ReadTarget::branch("main"),
+            &serde_json::to_vec(&serialized).unwrap(),
+        )
         .await
     {
         Ok(replay) => panic!("the edited plan replays: {:?}", rows_of(&replay.result)),
@@ -817,23 +868,46 @@ async fn a_marker_that_disagrees_with_its_contains_join_refuses_the_replay() {
     }
 }
 
-/// A replayed plan whose `ContainsJoin` became a plain `CrossJoin` leaves a
-/// marked scan no join fills: the lowering refuses it instead of running it.
+/// A replayed plan whose `ContainsJoin` became a `CrossJoin` testing the same
+/// conjuncts passes acceptance but leaves a marked scan no join fills: the
+/// lowering refuses it instead of running it. The same rewrite dropping the
+/// conjunct is refused by acceptance, which finds the predicate gone.
 #[tokio::test]
 async fn a_marker_with_no_contains_join_refuses_the_replay() {
-    let error = edited_replay_refusal(&mut |object| {
-        if object.get("node") == Some(&Value::from("ContainsJoin")) {
+    use omnigraph_compiler::ir::IRExpr;
+    use omnigraph_compiler::query::ast::CompOp;
+    use omnigraph_planner::mirror::ExprMirror;
+    for keep_conjunct in [true, false] {
+        let error = edited_replay_refusal(&mut |object| {
+            if object.get("node") != Some(&Value::from("ContainsJoin")) {
+                return;
+            }
+            let side = |key: &str| {
+                let pair = object[key].as_array().unwrap();
+                IRExpr::PropAccess {
+                    variable: pair[0].as_str().unwrap().to_string(),
+                    property: pair[1].as_str().unwrap().to_string(),
+                }
+            };
+            let conjunct =
+                IRExpr::comparison(side("haystack"), CompOp::StringContains, side("needle"));
+            let mut filters = Vec::new();
+            if keep_conjunct {
+                filters.push(serde_json::to_value(ExprMirror::from(&conjunct)).unwrap());
+            }
+            filters.extend(object["residual"].as_array().cloned().unwrap_or_default());
             object.retain(|key, _| matches!(key.as_str(), "node" | "left" | "right"));
-            object.insert("node".to_string(), Value::from("CrossJoin"));
-        }
-    })
-    .await;
-    assert!(
-        error
-            .to_string()
-            .contains("carries a runtime filter no contains join fills"),
-        "{error}"
-    );
+            object.insert("node".to_string(), Value::from("FilteredCrossJoin"));
+            object.insert("filters".to_string(), Value::from(filters));
+        })
+        .await;
+        let expected = if keep_conjunct {
+            "carries a runtime filter no contains join fills"
+        } else {
+            "predicate retention: the plan tests no conjunct for `$p.text contains $m.number`"
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+    }
 }
 
 #[tokio::test]
@@ -841,9 +915,31 @@ async fn a_nearest_ladder_replays_the_same_rungs() {
     let dir = tempfile::tempdir().unwrap();
     let db = docs(&dir).await;
     let params = ParamMap::from([("q".to_string(), Literal::List(vec![Literal::Float(0.0); 4]))]);
-    let Replayed { result, plan, rows } =
-        replayed(&db, DOC_QUERIES, "nearest_with_edge", &params).await;
+    let Replayed {
+        result,
+        plan,
+        rows,
+        search,
+    } = replayed(&db, DOC_QUERIES, "nearest_with_edge", &params).await;
     assert_eq!(result.len(), 3);
+    let decided: Vec<(&str, u64)> = search
+        .iter()
+        .map(|decision| {
+            (
+                decision["decision"].as_str().unwrap(),
+                decision["rung"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        decided.first(),
+        Some(&("gate", 0)),
+        "the edge's pre-pass gate decides first: {search:#?}"
+    );
+    assert!(
+        decided.iter().filter(|(kind, _)| *kind == "probes").count() == 2,
+        "every rung records its probe attempts: {search:#?}"
+    );
     let rungs: Vec<usize> = rows[0]["attempts"]
         .as_array()
         .unwrap()
@@ -867,8 +963,16 @@ async fn a_fusion_replays() {
     let db = docs(&dir).await;
     let mut params = ParamMap::from([("t".to_string(), Literal::String("needle".to_string()))]);
     params.insert("q".to_string(), Literal::List(vec![Literal::Float(0.0); 4]));
-    let Replayed { result, .. } = replayed(&db, DOC_QUERIES, "fused", &params).await;
+    let Replayed { result, search, .. } = replayed(&db, DOC_QUERIES, "fused", &params).await;
     assert_eq!(result.len(), 3);
+    assert_eq!(
+        search
+            .iter()
+            .filter(|decision| decision["decision"] == "gate")
+            .count(),
+        1,
+        "the fusion's gate records one verdict: {search:#?}"
+    );
 }
 
 #[tokio::test]
@@ -953,7 +1057,10 @@ async fn an_edge_write_after_planning_refuses_the_replay() {
     .await
     .unwrap();
     let refused = db
-        .replay_bound_plan(ReadTarget::branch("main"), run.plan.clone())
+        .replay_bound_plan(
+            ReadTarget::branch("main"),
+            &run.replay_envelope(PEOPLE_QUERIES, "liked"),
+        )
         .await
         .err()
         .expect("the edge table moved");
@@ -987,17 +1094,21 @@ async fn a_write_to_an_unread_table_leaves_the_replay_accepted() {
     .await
     .unwrap();
     let replay = db
-        .replay_bound_plan(ReadTarget::branch("main"), run.plan.clone())
+        .replay_bound_plan(
+            ReadTarget::branch("main"),
+            &run.replay_envelope(PEOPLE_QUERIES, "count_people"),
+        )
         .await
         .expect("the counted table did not move");
     assert_eq!(rows_of(&replay.result), rows_of(&run.result));
 }
 
 /// The planner's refusal of a search order on a traversal destination is the
-/// caller's error (a bad request), not a planner defect: the HTTP door maps
-/// the kind, which no `.gqt` case observes.
+/// caller's error, a bad request carrying a plan diagnostic, on the ordinary
+/// door and the inspected one alike; the HTTP door maps the kind, which no
+/// `.gqt` case observes.
 #[tokio::test]
-async fn a_search_order_on_a_traversal_destination_is_a_bad_request() {
+async fn a_search_order_on_a_traversal_destination_is_a_typed_bad_request_issue_786() {
     let dir = tempfile::tempdir().unwrap();
     let db = docs(&dir).await;
     let source = r#"
@@ -1009,7 +1120,7 @@ query nearest_destination($q: Vector(4)) {
 }
 "#;
     let params = ParamMap::from([("q".to_string(), Literal::List(vec![Literal::Float(0.0); 4]))]);
-    let refused = db
+    let inspected = db
         .query_inspected(
             ReadTarget::branch("main"),
             source,
@@ -1018,14 +1129,66 @@ query nearest_destination($q: Vector(4)) {
         )
         .await
         .err()
-        .expect("the shape is refused");
-    assert!(
-        matches!(&refused, OmniError::Manifest(error) if error.kind == ManifestErrorKind::BadRequest),
+        .expect("the shape is refused on the inspected door");
+    let ordinary = db
+        .query(
+            ReadTarget::branch("main"),
+            source,
+            "nearest_destination",
+            &params,
+        )
+        .await
+        .expect_err("the shape is refused on the ordinary door");
+    for refused in [&inspected, &ordinary] {
+        let diagnostic = refused
+            .diagnostic()
+            .unwrap_or_else(|| panic!("a plan refusal carries its diagnostic: {refused:?}"));
+        assert_eq!(diagnostic.code.as_str(), "P001");
+        let stage = diagnostic
+            .stage
+            .as_deref()
+            .expect("a plan refusal names its stage");
+        assert_eq!(stage.name, "plan");
+        assert_eq!(
+            stage.expression.as_deref(),
+            Some("nearest($t.embedding, $q)")
+        );
+        assert_eq!(
+            diagnostic.fix.as_deref(),
+            Some("declare `$t` first in `match`, so the ranking starts the traversal")
+        );
+        assert!(
+            refused.to_string().contains("a traversal destination"),
+            "{refused}"
+        );
+    }
+
+    // A refusal raised while the query is resolved, before lowering, keeps
+    // its diagnostic too: the statistics pass that resolves the query first
+    // must not turn it into a planner defect. An edge wildcard refuses CSR
+    // traversal mode, which only a session pin selects.
+    let csr = with_traversal(&db, omnigraph_compiler::settings::Traversal::Csr);
+    let wildcard = r#"
+query wildcard() {
+    match { $a: Doc $b: Doc $a * $b }
+    return { $b.slug }
+}
+"#;
+    let refused = csr
+        .query(
+            ReadTarget::branch("main"),
+            wildcard,
+            "wildcard",
+            &ParamMap::new(),
+        )
+        .await
+        .expect_err("an edge wildcard refuses CSR traversal mode");
+    assert_eq!(
+        refused
+            .diagnostic()
+            .map(|diagnostic| diagnostic.code.as_str()),
+        Some("P004"),
         "{refused:?}"
-    );
-    assert!(
-        refused.to_string().contains("a traversal destination"),
-        "{refused}"
     );
 }
 
@@ -1077,7 +1240,10 @@ async fn an_insert_after_planning_refuses_the_replay_of_a_count() {
     .await
     .unwrap();
     let refused = db
-        .replay_bound_plan(ReadTarget::branch("main"), run.plan.clone())
+        .replay_bound_plan(
+            ReadTarget::branch("main"),
+            &run.replay_envelope(PEOPLE_QUERIES, "count_people"),
+        )
         .await
         .err()
         .expect("the counted table moved");
@@ -1147,15 +1313,14 @@ async fn sibling_plan_replay_is_refused(
         .await
         .unwrap();
     assert_ne!(rows_of(&run.result), rows_of(&other.result));
-    let bound: omnigraph_planner::BoundPlan =
-        serde_json::from_value(serde_json::to_value(&run.plan).unwrap()).unwrap();
+    let envelope = run.replay_envelope(PEOPLE_QUERIES, query_name);
     let same = db
-        .replay_bound_plan(ReadTarget::branch("left"), bound.clone())
+        .replay_bound_plan(ReadTarget::branch("left"), &envelope)
         .await
         .unwrap();
     assert_eq!(rows_of(&same.result), rows_of(&run.result));
     let refused = db
-        .replay_bound_plan(ReadTarget::branch("right"), bound)
+        .replay_bound_plan(ReadTarget::branch("right"), &envelope)
         .await
         .err()
         .expect("equal lineage counters must not admit a different detached pin");
@@ -1188,4 +1353,177 @@ async fn sibling_detached_edge_pins_refuse_traversal_plan_replay() {
         r#"{"edge":"Likes","from":"cyd","to":"d1"}"#,
     )
     .await;
+}
+
+/// A member of the exact fragment replays with its checked derivation; an
+/// envelope whose derivation was dropped or edited is refused as invalid
+/// evidence, before anything runs.
+#[tokio::test]
+async fn an_exact_subset_member_replays_only_with_its_derivation() {
+    const SOURCE: &str = r#"query elders($min: I64) {
+    match { $p: Person $p.age >= $min }
+    return { $p.name, $p.age as age }
+    order { $p.age desc }
+    limit 2
+}"#;
+    let dir = tempfile::tempdir().unwrap();
+    let db = people(&dir).await;
+    let params = ParamMap::from([("min".to_string(), Literal::Integer(30))]);
+    let run = db
+        .query_inspected(ReadTarget::branch("main"), SOURCE, "elders", &params)
+        .await
+        .unwrap();
+    assert_eq!(
+        run.evidence.scope(),
+        omnigraph_planner::ValidationScope::ExactSubset
+    );
+    let envelope = run.replay_envelope(SOURCE, "elders");
+    let replay = db
+        .replay_bound_plan(ReadTarget::branch("main"), &envelope)
+        .await
+        .unwrap();
+    assert_eq!(rows_of(&replay.result), rows_of(&run.result));
+    assert_eq!(
+        replay.evidence.scope(),
+        omnigraph_planner::ValidationScope::ExactSubset
+    );
+    let saved: Value = serde_json::from_slice(&envelope).unwrap();
+    let mut dropped = saved.clone();
+    dropped.as_object_mut().unwrap().remove("derivation");
+    let mut edited = saved.clone();
+    edited["derivation"]["steps"]
+        .as_array_mut()
+        .unwrap()
+        .remove(0);
+    for (case, altered) in [("dropped", dropped), ("edited", edited)] {
+        let error = db
+            .replay_bound_plan(
+                ReadTarget::branch("main"),
+                &serde_json::to_vec(&altered).unwrap(),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{case}: the replay must be refused"));
+        assert!(
+            matches!(&error, OmniError::Manifest(manifest)
+                if manifest.kind == omnigraph::error::ManifestErrorKind::BadRequest)
+                && error.to_string().contains("exact subset"),
+            "{case}: {error}"
+        );
+    }
+}
+
+/// An envelope of another format, rule catalogue or semantics version is
+/// refused before its plan is read, as a conflict that asks for the query
+/// again: a version change never reinterprets an old envelope.
+#[tokio::test]
+async fn an_envelope_of_another_version_asks_for_the_query_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = people(&dir).await;
+    let run = db
+        .query_inspected(
+            ReadTarget::branch("main"),
+            PEOPLE_QUERIES,
+            "liked",
+            &ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    let saved: Value =
+        serde_json::from_slice(&run.replay_envelope(PEOPLE_QUERIES, "liked")).unwrap();
+    for field in ["replay_version", "rules_version", "semantics_version"] {
+        let mut altered = saved.clone();
+        altered[field] = serde_json::json!(saved[field].as_u64().unwrap() + 1);
+        let error = db
+            .replay_bound_plan(
+                ReadTarget::branch("main"),
+                &serde_json::to_vec(&altered).unwrap(),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{field}: the replay must be refused"));
+        assert!(
+            matches!(&error, OmniError::Manifest(manifest)
+                if manifest.kind == omnigraph::error::ManifestErrorKind::Conflict)
+                && error.to_string().contains(field),
+            "{field}: {error}"
+        );
+    }
+}
+
+/// A replay re-establishes the full-text coverage its plan records from the
+/// pinned snapshot instead of trusting the envelope: an envelope claiming
+/// full coverage of a partially indexed property, with its bm25 scan and
+/// derivation switched to filter before scoring, is refused, since that run
+/// would change BM25 scores.
+#[tokio::test]
+async fn a_replay_rechecks_recorded_full_text_coverage() {
+    const SOURCE: &str = r#"query recent($t: String) {
+    match { $d: Doc $d.year >= 2000 }
+    return { $d.slug, bm25($d.text, $t) as score }
+    order { bm25($d.text, $t) }
+}"#;
+    let dir = tempfile::tempdir().unwrap();
+    let db = session(
+        Omnigraph::init(
+            dir.path().to_str().unwrap(),
+            "node Doc { slug: String @key text: String @index year: I64 }",
+        )
+        .await
+        .unwrap(),
+    );
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"d1","text":"graph engines","year":2020}}
+{"type":"Doc","data":{"slug":"d2","text":"databases","year":2019}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    db.ensure_indices().await.unwrap();
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"t1","text":"graph","year":2022}}
+{"type":"Doc","data":{"slug":"t2","text":"graph graph graph graph","year":1990}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    let params = ParamMap::from([("t".to_string(), Literal::String("graph".to_string()))]);
+    let run = db
+        .query_inspected(ReadTarget::branch("main"), SOURCE, "recent", &params)
+        .await
+        .unwrap();
+    let envelope = run.replay_envelope(SOURCE, "recent");
+    let honest = db
+        .replay_bound_plan(ReadTarget::branch("main"), &envelope)
+        .await
+        .unwrap();
+    assert_eq!(rows_of(&honest.result), rows_of(&run.result));
+    let mut forged: Value = serde_json::from_slice(&envelope).unwrap();
+    let mut placements = 0;
+    edit_objects(&mut forged, &mut |object| {
+        if object.get("eligibility") == Some(&Value::from("after_scoring")) {
+            object.insert("eligibility".to_string(), Value::from("before_scoring"));
+            placements += 1;
+        }
+        if let Some(Value::Object(coverage)) = object.get_mut("full_text") {
+            for recorded in coverage.values_mut() {
+                *recorded = Value::from("full");
+            }
+        }
+    });
+    assert_eq!(placements, 2, "the scan and its derivation step");
+    let error = db
+        .replay_bound_plan(
+            ReadTarget::branch("main"),
+            &serde_json::to_vec(&forged).unwrap(),
+        )
+        .await
+        .err()
+        .expect("a forged coverage claim must be refused");
+    assert!(
+        matches!(&error, OmniError::Manifest(manifest)
+            if manifest.kind == omnigraph::error::ManifestErrorKind::BadRequest)
+            && error.to_string().contains("full-text coverage"),
+        "{error}"
+    );
 }

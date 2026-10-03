@@ -15,7 +15,11 @@ use crate::mirror::BoundPlanMirror;
 use crate::physical::{NodeId, PhysicalPlan};
 
 /// Saved execution plans use a separate version from rendered explain output.
-pub const BOUND_PLAN_VERSION: u32 = 1;
+/// Version 2: a node's declared ordering is typed order keys (column,
+/// expression with direction and null placement, identity, fused rank)
+/// instead of their text; a ranked scan declares where it applies its
+/// eligibility, and the assumptions record full-text coverage.
+pub const BOUND_PLAN_VERSION: u32 = 2;
 
 /// The envelope omits top-level `plan` and `values` so unversioned readers reject it.
 #[derive(Serialize, Deserialize)]

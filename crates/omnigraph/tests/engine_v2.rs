@@ -896,3 +896,150 @@ query total($q: Vector(4)) {
         );
     }
 }
+
+/// Ordinary execution, the explain document, the `explain` statement and the
+/// inspected run accept one plan for one query: the same physical plan and
+/// validation scope, or the same refusal with the same diagnostic. Rust and
+/// not `.gqt`: a case reaches one door per step, and the claim is that the
+/// doors agree.
+#[tokio::test]
+async fn every_read_door_shares_one_acceptance() {
+    use arrow_array::StringArray;
+    use omnigraph::db::ReadTarget;
+
+    const SCHEMA: &str = r#"
+node Person {
+    name: String @key
+    age: I64
+}
+node Doc {
+    slug: String @key
+    title: String @index
+}
+edge Likes: Person -> Doc
+"#;
+    const ADULTS: &str = "query adults($min: I64) {
+    match { $p: Person $p.age >= $min }
+    return { $p.name }
+    order { $p.age desc }
+    limit 2
+}";
+    const RANKED: &str = "query ranked($q: String) {
+    match { $d: Doc }
+    return { $d.slug, bm25($d.title, $q) as score }
+    order { bm25($d.title, $q) }
+    limit 2
+}";
+    const LIKED: &str = "query liked() {
+    match { $p: Person $p likes $d }
+    return { $p.name, count($d) as n }
+    order { $p.name }
+}";
+    const RANKED_DESTINATION: &str = "query ranked_destination($q: String) {
+    match { $p: Person $p likes $d }
+    return { $d.slug }
+    order { bm25($d.title, $q) }
+}";
+    let dir = tempfile::tempdir().unwrap();
+    let db = session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(
+        r#"{"type":"Person","data":{"name":"ann","age":40}}
+{"type":"Person","data":{"name":"bob","age":20}}
+{"type":"Doc","data":{"slug":"d1","title":"graph engines"}}
+{"type":"Doc","data":{"slug":"d2","title":"graph graph search"}}
+{"edge":"Likes","from":"ann","to":"d1"}
+{"edge":"Likes","from":"bob","to":"d2"}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    db.ensure_indices().await.unwrap();
+    for (source, name, values) in [
+        (ADULTS, "adults", vec![("min", "18")]),
+        (RANKED, "ranked", vec![("q", "graph")]),
+        (LIKED, "liked", vec![]),
+    ] {
+        let params = params(&values);
+        let main = || ReadTarget::branch("main");
+        let document = db
+            .explain_query(main(), source, name, &params)
+            .await
+            .unwrap();
+        let run = db
+            .query_inspected(main(), source, name, &params)
+            .await
+            .unwrap();
+        let rendered = run.explain.to_value();
+        assert_eq!(
+            document["physical_plan"], rendered["physical_plan"],
+            "{name}"
+        );
+        assert_eq!(
+            document["validation"],
+            serde_json::json!({ "scope": run.evidence.scope().as_str() }),
+            "{name}"
+        );
+        assert_eq!(document["validation"], rendered["validation"], "{name}");
+        let ordinary = db.query(main(), source, name, &params).await.unwrap();
+        assert_eq!(
+            ordinary.concat_batches().unwrap(),
+            run.result.concat_batches().unwrap(),
+            "{name}"
+        );
+        let statement = db
+            .query(main(), &format!("explain {source}"), name, &params)
+            .await
+            .unwrap()
+            .concat_batches()
+            .unwrap();
+        let column = |name: &str| {
+            statement
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .clone()
+        };
+        let (nodes, details) = (column("node"), column("detail"));
+        let validation = (0..statement.num_rows())
+            .find(|row| nodes.value(*row) == "validation")
+            .map(|row| details.value(row).to_string());
+        let validation: serde_json::Value =
+            serde_json::from_str(&validation.expect("the statement reports its validation"))
+                .unwrap();
+        assert_eq!(validation, document["validation"], "{name}");
+    }
+    let params = params(&[("q", "graph")]);
+    let main = || ReadTarget::branch("main");
+    let refusals = [
+        db.explain_query(main(), RANKED_DESTINATION, "ranked_destination", &params)
+            .await
+            .err(),
+        db.query_inspected(main(), RANKED_DESTINATION, "ranked_destination", &params)
+            .await
+            .err(),
+        db.query(main(), RANKED_DESTINATION, "ranked_destination", &params)
+            .await
+            .err(),
+        db.query(
+            main(),
+            &format!("explain {RANKED_DESTINATION}"),
+            "ranked_destination",
+            &params,
+        )
+        .await
+        .err(),
+    ];
+    for refusal in refusals {
+        let refusal = refusal.expect("ranking a destination is refused at every door");
+        let diagnostic = refusal
+            .diagnostic()
+            .expect("a refusal by design carries its diagnostic");
+        assert_eq!(diagnostic.code.as_str(), "P001", "{refusal}");
+    }
+}

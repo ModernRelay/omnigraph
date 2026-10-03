@@ -191,6 +191,28 @@ pub trait PlanSource {
     fn gate_policy(&self) -> GatePolicy {
         GatePolicy::default()
     }
+
+    /// How far the full-text index of `property` covers the pinned table
+    /// `type_key` names. The default claims no coverage, the answer under
+    /// which every plan stays correct.
+    fn full_text_coverage(&self, _type_key: &str, _property: &str) -> FullTextCoverage {
+        FullTextCoverage::Absent
+    }
+}
+
+/// How far a property's full-text index covers the pinned dataset's
+/// fragments. Only full coverage makes a BM25 score independent of a filter
+/// applied before scoring: Lance scores the unindexed fragments flat, from
+/// statistics over the rows the filter admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FullTextCoverage {
+    /// Every fragment of the pinned version is in a full-text segment.
+    Full,
+    /// A full-text index exists; some fragment is not in it.
+    Partial,
+    /// The property has no full-text index.
+    Absent,
 }
 
 /// An in-memory [`PlanSource`] for planner tests and registry fixtures.
@@ -208,9 +230,21 @@ pub struct MemorySource {
     table_data_bytes: HashMap<String, u64>,
     column_data_bytes: HashMap<String, HashMap<String, u64>>,
     query_memory_pool_bytes: u64,
+    full_text: HashMap<(String, String), FullTextCoverage>,
 }
 
 impl MemorySource {
+    pub fn with_full_text_coverage(
+        mut self,
+        type_key: &str,
+        property: &str,
+        coverage: FullTextCoverage,
+    ) -> Self {
+        self.full_text
+            .insert((type_key.to_string(), property.to_string()), coverage);
+        self
+    }
+
     pub fn with_query_memory_pool_bytes(mut self, bytes: u64) -> Self {
         self.query_memory_pool_bytes = bytes;
         self
@@ -348,5 +382,12 @@ impl PlanSource for MemorySource {
 
     fn query_memory_pool_bytes(&self) -> u64 {
         self.query_memory_pool_bytes
+    }
+
+    fn full_text_coverage(&self, type_key: &str, property: &str) -> FullTextCoverage {
+        self.full_text
+            .get(&(type_key.to_string(), property.to_string()))
+            .copied()
+            .unwrap_or(FullTextCoverage::Absent)
     }
 }

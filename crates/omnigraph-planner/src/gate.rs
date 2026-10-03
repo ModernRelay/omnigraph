@@ -15,14 +15,18 @@ use crate::error::PlanError;
 use crate::explain::{EntrySummary, Explain, OperationSummary};
 use crate::logical::{Census, LogicalPlan};
 use crate::operation::Operation;
-use crate::optimizer::{Bounds, Optimized, physical_plan, resolve, rewrite};
+use crate::optimizer::{
+    Bounds, Optimized, physical_plan, physical_plan_with, resolve, rewrite, rewrite_with,
+};
 use crate::physical::{Assumptions, DatasetPin, GatePolicy, NodeId, PhysicalNode, PhysicalPlan};
 use crate::registry::{Coverage, Entry, Route, coverage, lookup};
 use crate::route::RouteOverride;
 use crate::source::{
     AdjacencyProof, EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics,
-    FragmentStat, NodeTypeSpec, PlanSource, SideId,
+    FragmentStat, FullTextCoverage, NodeTypeSpec, PlanSource, SideId,
 };
+use crate::validate::subset::{Derivation, Tracer};
+use crate::validate::{self, AcceptInput, AcceptedPlan, ValidationError};
 
 /// A `PlanSource` that records what the planner read through it: the
 /// parameter names of every filter it asked about and every setting, so the
@@ -159,6 +163,15 @@ impl PlanSource for Recorded<'_> {
     fn gate_policy(&self) -> GatePolicy {
         self.source.gate_policy()
     }
+
+    fn full_text_coverage(&self, type_key: &str, property: &str) -> FullTextCoverage {
+        let coverage = self.source.full_text_coverage(type_key, property);
+        self.read
+            .borrow_mut()
+            .full_text
+            .insert(Assumptions::full_text_key(type_key, property), coverage);
+        coverage
+    }
 }
 
 /// Every parameter name `expr` names.
@@ -229,8 +242,14 @@ pub enum Unrouted {
     /// planner defect. A read query fails with this message.
     PlannerError { message: String },
     /// A well-formed query shape the planner refuses by design
-    /// (`PlanError::Unsupported`); the caller's error, not a planner defect.
-    UnsupportedQuery { message: String },
+    /// (`PlanError::Unsupported`); the caller's error, not a planner defect,
+    /// with the diagnostic the caller answers with.
+    UnsupportedQuery {
+        diagnostic: Box<omnigraph_compiler::QueryDiagnostic>,
+    },
+    /// Plan acceptance ran out of a configured validation limit before it
+    /// finished: a resource outcome, not evidence the plan is invalid.
+    ValidationExhausted { limit: &'static str, value: u64 },
 }
 
 impl Unrouted {
@@ -238,7 +257,7 @@ impl Unrouted {
     /// everything else is a planner error.
     fn of(error: PlanError) -> Self {
         match error {
-            PlanError::Unsupported { detail } => Self::UnsupportedQuery { message: detail },
+            PlanError::Unsupported(diagnostic) => Self::UnsupportedQuery { diagnostic },
             other => Self::PlannerError {
                 message: other.to_string(),
             },
@@ -254,6 +273,7 @@ impl Unrouted {
             Self::Override => "override",
             Self::PlannerError { .. } => "planner_error",
             Self::UnsupportedQuery { .. } => "unsupported_query",
+            Self::ValidationExhausted { .. } => "validation_exhausted",
         }
     }
 
@@ -266,8 +286,14 @@ impl Unrouted {
             Self::RegistryRouteExecutor { entry } => json!({ "kind": self.kind(), "entry": entry }),
             Self::DeclaredBytesOverBound { node } => json!({ "kind": self.kind(), "node": node }),
             Self::Override => json!({ "kind": self.kind() }),
-            Self::PlannerError { message } | Self::UnsupportedQuery { message } => {
-                json!({ "kind": self.kind(), "message": message })
+            Self::PlannerError { message } => json!({ "kind": self.kind(), "message": message }),
+            Self::UnsupportedQuery { diagnostic } => json!({
+                "kind": self.kind(),
+                "code": diagnostic.code.as_str(),
+                "message": diagnostic.message,
+            }),
+            Self::ValidationExhausted { limit, value } => {
+                json!({ "kind": self.kind(), "limit": limit, "value": value })
             }
         }
     }
@@ -325,6 +351,98 @@ pub fn plan_query(
             optimized.physical
         })
         .map_err(Unrouted::of)
+}
+
+/// Plan a read query and accept the plan: the one path from a query to an
+/// executable plan, shared by ordinary execution and every explain.
+pub fn accept_query(
+    input: &AcceptInput<'_>,
+    source: &dyn PlanSource,
+    bounds: &Bounds,
+) -> Result<AcceptedPlan, Unrouted> {
+    plan_and_accept(input, source, bounds, false).map(|(accepted, _)| accepted)
+}
+
+/// [`accept_query`] with the explain document of the accepted plan, rendered
+/// from the same planning run.
+pub fn accept_query_explained(
+    input: &AcceptInput<'_>,
+    source: &dyn PlanSource,
+    bounds: &Bounds,
+) -> Result<(AcceptedPlan, Explain), Unrouted> {
+    let (accepted, explain) = plan_and_accept(input, source, bounds, true)?;
+    let explain = explain.ok_or_else(|| Unrouted::PlannerError {
+        message: "an explained acceptance rendered no document".to_string(),
+    })?;
+    Ok((accepted, explain))
+}
+
+/// One traced planning run of a read query: the rewritten logical plan, the
+/// optimized physical plan with its assumptions, the passes that fired, and
+/// the derivation the optimizer recorded for an exact-fragment chain.
+pub(crate) struct Traced {
+    pub logical: LogicalPlan,
+    pub optimized: Optimized,
+    pub fired: Vec<&'static str>,
+    pub derivation: Option<Derivation>,
+}
+
+pub(crate) fn plan_traced(
+    query: &QueryIR,
+    source: &dyn PlanSource,
+    bounds: &Bounds,
+) -> Result<Traced, Unrouted> {
+    let operation = Operation::Query(Box::new(query.clone()));
+    let recorded = Recorded::new(source, query.has_wildcard_traversal());
+    let mut logical = resolve(&operation, &recorded).map_err(Unrouted::of)?;
+    let mut tracer = Tracer::for_plan(&logical);
+    let fired = rewrite_with(&mut logical, &recorded, &mut tracer).map_err(Unrouted::of)?;
+    let mut optimized =
+        physical_plan_with(&mut logical, &recorded, bounds, fired.clone(), &mut tracer)
+            .map_err(Unrouted::of)?;
+    optimized
+        .physical
+        .set_assumptions(recorded.assumptions(bounds));
+    Ok(Traced {
+        logical,
+        optimized,
+        fired,
+        derivation: tracer.finish(),
+    })
+}
+
+fn plan_and_accept(
+    input: &AcceptInput<'_>,
+    source: &dyn PlanSource,
+    bounds: &Bounds,
+    explain: bool,
+) -> Result<(AcceptedPlan, Option<Explain>), Unrouted> {
+    let operation = Operation::Query(Box::new(input.ir.clone()));
+    let Traced {
+        logical,
+        optimized,
+        fired,
+        derivation,
+    } = plan_traced(input.ir, source, bounds)?;
+    let rendered = explain.then(|| {
+        LogicalView::of(&logical)
+            .explain(
+                OperationSummary::of(&operation),
+                RouteOverride::Registry,
+                None,
+                Some(&optimized),
+                &fired,
+            )
+            .engine()
+    });
+    let accepted = validate::accept(optimized.physical, input, derivation)
+        .map_err(ValidationError::into_unrouted)?;
+    let rendered = rendered.map(|mut explain| {
+        explain.pipelines = None;
+        explain.validation = Some(accepted.summary());
+        explain
+    });
+    Ok((accepted, rendered))
 }
 
 /// Decide the route of one operation. The census is computed from the
