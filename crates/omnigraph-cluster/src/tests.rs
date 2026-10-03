@@ -3283,7 +3283,7 @@ fn offline_deployment_graph_completion_reserve_covers_maximum_serialized_engine_
         let outcome = GraphDeploymentResult::Schema { result };
         let after = GraphDeployment {
             state: GraphDeploymentState::Settled {
-                result: outcome.clone(),
+                result: Box::new(outcome.clone()),
             },
             settlement: Some(settlement.clone()),
             recovery_executor: Some(authority.clone()),

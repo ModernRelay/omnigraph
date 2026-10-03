@@ -136,7 +136,7 @@ pub(crate) struct GraphDeployment {
 pub(crate) enum GraphDeploymentState {
     NotStarted,
     Started,
-    Settled { result: GraphDeploymentResult },
+    Settled { result: Box<GraphDeploymentResult> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

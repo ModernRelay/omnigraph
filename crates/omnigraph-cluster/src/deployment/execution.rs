@@ -452,7 +452,7 @@ fn result_from_pending(state: &ClusterState, pending: &OutstandingDeployment) ->
                 (
                     graph.clone(),
                     match &entry.state {
-                        GraphDeploymentState::Settled { result } => result.clone(),
+                        GraphDeploymentState::Settled { result } => result.as_ref().clone(),
                         _ => GraphDeploymentResult::NotAttempted,
                     },
                 )
@@ -851,7 +851,9 @@ pub async fn apply_deployment(
             .graphs
             .get_mut(&graph)
             .unwrap()
-            .state = GraphDeploymentState::Settled { result };
+            .state = GraphDeploymentState::Settled {
+            result: Box::new(result),
+        };
         cas = replace(&store, &mut state, &cas).await?;
     }
     let result = finish(&store, &mut state, &cas, &bundle).await?;
@@ -1131,7 +1133,9 @@ pub async fn reconcile_deployment(
             .graphs
             .get_mut(&graph)
             .unwrap()
-            .state = GraphDeploymentState::Settled { result };
+            .state = GraphDeploymentState::Settled {
+            result: Box::new(result),
+        };
         cas = replace(&store, &mut state, &cas).await?;
     }
     let result = finish(&store, &mut state, &cas, &bundle).await?;

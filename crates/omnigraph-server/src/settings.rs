@@ -10,7 +10,7 @@ use std::path::Path;
 /// catalog blob content, policy bundles from blob paths with their applied
 /// bindings. Always multi-graph routing.
 pub(crate) async fn load_cluster_settings(
-    cluster_dir: &PathBuf,
+    cluster_dir: &Path,
     cli_bind: Option<String>,
     cli_allow_unauthenticated: bool,
     cli_require_all_graphs: bool,
