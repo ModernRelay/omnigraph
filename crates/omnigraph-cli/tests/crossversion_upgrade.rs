@@ -1068,12 +1068,25 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
     let refusal = output_failure(cli().arg("snapshot").arg(&graph));
     let refusal_stderr = String::from_utf8_lossy(&refusal.stderr);
     assert!(
-        refusal_stderr.contains("0.9.x or 0.10.x"),
-        "the v6 refusal must name the release range that wrote internal schema v6, got: {refusal_stderr}",
+        refusal_stderr.contains("ledger_upgrade_required"),
+        "the CLI must refuse the legacy cluster ledger before opening its graph, got: {refusal_stderr}",
+    );
+
+    // The CLI's cluster gate precedes engine storage admission. Exercise the
+    // engine directly, read-only, to retain the genuine-v6 format fence too.
+    let storage_refusal = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Omnigraph::open_read_only(uri))
+        .err()
+        .expect("the engine must refuse the genuine v6 graph")
+        .to_string();
+    assert!(
+        storage_refusal.contains("0.9.x or 0.10.x"),
+        "the v6 refusal must name the release range that wrote internal schema v6, got: {storage_refusal}",
     );
     assert!(
-        refusal_stderr.contains("export"),
-        "the v6 refusal must direct the operator to export/import rebuild, got: {refusal_stderr}",
+        storage_refusal.contains("export"),
+        "the v6 refusal must direct the operator to export/import rebuild, got: {storage_refusal}",
     );
 
     output_success(
@@ -1237,6 +1250,9 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
             .any(|row| row["d.slug"] == "ml-intro" && row["d.title"] == "organism branch")
     );
     drop(server);
+    // The local server process is killed and reaped; release its retained
+    // admission by exact ID before this fixture starts the replacement.
+    unlock_cluster_fixture(&rebuilt_cluster);
     let reopened = spawn_server_with_cluster(&rebuilt_cluster);
     let remote = [
         "--server",
