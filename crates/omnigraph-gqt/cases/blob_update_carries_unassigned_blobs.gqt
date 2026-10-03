@@ -1,0 +1,110 @@
+# issue: none
+# notes: An update on a type with two Blob properties assigns one and carries the other.
+# notes: The scalars on both sides of each Blob keep their values on a committed row and on a row inserted in the same mutation.
+# notes: A null on a non-nullable scalar is refused when the predicate matches no row.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Doc {
+    slug: String @key
+    first: Blob?
+    title: String
+    second: Blob?
+    rank: I64
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"a","first":"base64:AQID","title":"alpha","second":"base64:BAUG","rank":1}}
+{"type":"Doc","data":{"slug":"b","title":"beta","second":"base64:BwgJ","rank":2}}
+
+--- mutate
+query assign_first_carry_second($slug: String, $first: Blob?) {
+    update Doc set { first: $first } where slug = $slug
+}
+
+--- params
+{"slug": "a", "first": "base64:CgsM"}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query clear_first_carry_second($slug: String, $first: Blob?) {
+    update Doc set { first: $first } where slug = $slug
+}
+
+--- params
+{"slug": "a", "first": null}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query assign_scalar_carry_both($slug: String) {
+    update Doc set { title: "renamed" } where slug = $slug
+}
+
+--- params
+{"slug": "b"}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query assign_both($slug: String, $first: Blob?, $second: Blob?) {
+    update Doc set { first: $first, second: $second } where slug = $slug
+}
+
+--- params
+{"slug": "b", "first": "base64:DQ4P", "second": null}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query insert_then_assign_second($first: Blob?, $second: Blob?) {
+    insert Doc { slug: "c", first: $first, title: "gamma", rank: 3 }
+    update Doc set { second: $second } where slug = "c"
+}
+
+--- params
+{"first": "base64:EBES", "second": "base64:ExQV"}
+
+--- expect affected: nodes=2 edges=0
+
+--- mutate
+query assign_scalar_over_null_and_stored_blobs() {
+    update Doc set { rank: 9 } where rank > 1
+}
+
+--- expect affected: nodes=2 edges=0
+
+--- query
+query scalars_after_blob_updates() {
+    match { $d: Doc }
+    return { $d.slug, $d.title, $d.rank }
+}
+
+--- expect unordered
+{"d.slug": "a", "d.title": "alpha", "d.rank": 1}
+{"d.slug": "b", "d.title": "renamed", "d.rank": 9}
+{"d.slug": "c", "d.title": "gamma", "d.rank": 9}
+
+--- expect shape
+d.slug: String
+d.title: String
+d.rank: I64
+
+--- mutate
+query null_on_non_nullable_scalar_matching_no_row($slug: String, $rank: I64?) {
+    update Doc set { rank: $rank } where slug = $slug
+}
+
+--- params
+{"slug": "nobody", "rank": null}
+
+--- expect error: cannot assign null to non-nullable property 'rank' of Doc

@@ -193,7 +193,9 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
             Control => matches!(
                 cmd,
                 Command::Cluster {
-                    command: ClusterCommand::Apply { .. } | ClusterCommand::Approve { .. },
+                    command: ClusterCommand::Apply { .. }
+                        | ClusterCommand::Approve { .. }
+                        | ClusterCommand::UpgradeLedger { .. },
                     ..
                 }
             ),
@@ -356,13 +358,15 @@ pub(crate) fn accepts_cluster_addressing(cmd: &Command) -> bool {
             // picks a graph's bundle/registry within it.
             | Command::Policy { .. }
             | Command::Queries { .. }
+            | Command::Cluster { command: ClusterCommand::Apply { .. } | ClusterCommand::Status { .. }
+                | ClusterCommand::ForceUnlock { .. } | ClusterCommand::UpgradeLedger { .. } }
     )
 }
 
 /// Commands that consume the global `--graph` selector, which is exactly the
 /// set that consumes global `--cluster` addressing.
 fn accepts_graph_selector(cmd: &Command) -> bool {
-    accepts_cluster_addressing(cmd)
+    accepts_cluster_addressing(cmd) && !matches!(cmd, Command::Cluster { .. })
 }
 
 /// Reject a scope-addressing flag (`--server`/`--cluster`/`--graph`) on a verb
@@ -512,19 +516,35 @@ mod tests {
                 [false, false, false, false, false, false],
             ),
             // Read-only control verbs never read the actor; `cluster
-            // apply`/`approve` do. The `cluster` family addresses its config
-            // with --config and never resolves a profile scope.
+            // apply`/`approve`/`upgrade-ledger` do. The cluster family accepts
+            // root addressing for durable deployment/recovery, without graph
+            // selection or profile scope.
             (
                 parse(&["omnigraph", "queries", "list"]),
                 [false, true, true, false, false, true],
             ),
             (
                 parse(&["omnigraph", "cluster", "status", "--config", "."]),
-                [false, false, false, false, false, false],
+                [false, true, false, false, false, false],
             ),
             (
                 parse(&["omnigraph", "cluster", "apply", "--config", "."]),
-                [false, false, false, false, true, false],
+                [false, true, false, false, true, false],
+            ),
+            (
+                parse(&["omnigraph", "cluster", "force-unlock", "lock-id"]),
+                [false, true, false, false, false, false],
+            ),
+            (
+                parse(&[
+                    "omnigraph",
+                    "cluster",
+                    "upgrade-ledger",
+                    "--cluster",
+                    "file:///cluster",
+                    "--writers-stopped",
+                ]),
+                [false, true, false, false, true, false],
             ),
             (
                 parse(&["omnigraph", "version"]),

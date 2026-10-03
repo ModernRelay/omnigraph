@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::error::Result;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GraphCommit {
     pub graph_commit_id: String,
     pub graph_branch: Option<String>,

@@ -171,4 +171,7 @@ when index coverage has not caught up, but some searches may scan them. Run
 `omnigraph optimize` after a large merge to restore efficient layout and index
 coverage.
 
+A merge that writes rows is also bounded by the Blob payload it copies; see
+[Blob limits](../blobs.md#limits).
+
 See [Branches, Commits, and History](index.md) for the complete branch workflow.

@@ -3674,6 +3674,31 @@ async fn genesis_writes_the_schema_contract_row_and_reads_it_back() {
     );
     let ds = open_manifest_dataset(uri, None).await.unwrap();
     assert_eq!(schema_contract_row_count(&ds).await, 1);
+    let genesis_id = mc.exact_graph_head().unwrap();
+    let evidence = read_schema_publication_at(uri, 1, &genesis_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(evidence.contract, expected);
+    assert_eq!(evidence.commit.graph_commit_id, genesis_id);
+    assert_eq!(evidence.commit.graph_manifest_version, 1);
+    assert_eq!(
+        evidence.branch_identifier,
+        lance::dataset::refs::BranchIdentifier::main()
+    );
+    let encoded = serde_json::to_string(&evidence.commit).unwrap();
+    assert_eq!(
+        serde_json::from_str::<crate::commit_graph::GraphCommit>(&encoded).unwrap(),
+        evidence.commit,
+    );
+    for (version, id) in [(1, ulid::Ulid::new().to_string()), (2, genesis_id)] {
+        assert!(
+            read_schema_publication_at(uri, version, &id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
     let batch = &read_publish_scan(&ds).await.unwrap().live_rows[0];
     let names: Vec<_> = batch
         .schema()
@@ -3707,13 +3732,27 @@ async fn publish_replaces_the_schema_contract_row_and_carries_it_forward() {
     let person_update = append_person_and_make_update(uri, &person_entry, "Ann").await;
 
     let replacement = replacement_contract();
+    let intent = LineageIntent {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        branch: None,
+        actor_id: Some("schema-author".to_string()),
+        merged_parent_commit_id: None,
+        created_at: lineage_now_micros(),
+    };
+    let parent = mc.exact_graph_head();
     let replaced_at = mc
-        .commit_changes(&[
-            ManifestChange::Update(person_update),
-            ManifestChange::SchemaContract(replacement.clone()),
-        ])
+        .commit_changes_with_lineage_and_precondition(
+            &[
+                ManifestChange::Update(person_update),
+                ManifestChange::SchemaContract(replacement.clone()),
+            ],
+            &ExpectedTableVersions::new(),
+            Some(&intent),
+            &PublishPrecondition::Any,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .version;
     assert_eq!(
         mc.known_state.schema_contract.as_ref(),
         Some(&replacement.head),
@@ -3739,6 +3778,22 @@ async fn publish_replaces_the_schema_contract_row_and_carries_it_forward() {
     assert_eq!(mc.read_schema_contract().await.unwrap(), replacement);
     let ds = open_manifest_dataset(uri, None).await.unwrap();
     assert_eq!(schema_contract_row_count(&ds).await, 1);
+    let evidence = read_schema_publication_at(uri, replaced_at, &intent.graph_commit_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(evidence.contract, replacement);
+    assert_eq!(evidence.commit.parent_commit_id, parent);
+    assert_eq!(evidence.commit.actor_id, intent.actor_id);
+    assert_eq!(evidence.commit.created_at, intent.created_at);
+    assert_eq!(evidence.commit.graph_manifest_version, replaced_at);
+    assert!(
+        read_schema_publication_at(uri, carried_at, &intent.graph_commit_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a carried commit and matching contract are not evidence at the commit's own version",
+    );
 
     assert_eq!(
         ManifestCoordinator::read_schema_contract_at(uri, None, genesis_version)
@@ -3764,6 +3819,22 @@ async fn publish_replaces_the_schema_contract_row_and_carries_it_forward() {
         .to_string();
     assert!(twice.contains("replaced twice"), "{twice}");
     assert_eq!(mc.version(), carried_at, "a refused batch advances nothing");
+
+    let published = ds.checkout_version(replaced_at).await.unwrap();
+    published
+        .object_store(None)
+        .await
+        .unwrap()
+        .delete(&published.manifest_location().path)
+        .await
+        .unwrap();
+    assert!(
+        read_schema_publication_at(uri, replaced_at, &intent.graph_commit_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "pruned exact evidence stays unknown despite a later retained lineage row",
+    );
 }
 
 #[tokio::test]
@@ -3887,6 +3958,37 @@ async fn refresh_observes_a_schema_contract_replaced_by_another_handle() {
         reader.known_state.schema_contract.as_ref(),
         Some(&replacement.head)
     );
+
+    // A retained main handle must not equate a manifest version with a root
+    // lifetime: main's native branch identity is fixed. This is the refresh
+    // boundary prepared schema no-op admission and reconciliation rely on.
+    reader.refresh_with_lineage().await.unwrap();
+    assert!(reader.projection.is_some());
+    let replacement_dir = tempfile::tempdir().unwrap();
+    let replacement_catalog = build_same_name_node_edge_catalog();
+    let replacement_contract = SchemaContractRow::for_test_catalog(&replacement_catalog).unwrap();
+    let mut other = ManifestCoordinator::init(
+        replacement_dir.path().to_str().unwrap(),
+        &replacement_catalog,
+    )
+    .await
+    .unwrap();
+    while other.version() < reader.version() {
+        other
+            .commit_changes(&[ManifestChange::SchemaContract(replacement_contract.clone())])
+            .await
+            .unwrap();
+    }
+    assert_eq!(other.version(), reader.version());
+    assert_ne!(reader.exact_graph_head(), other.exact_graph_head());
+    std::fs::remove_dir_all(dir.path()).unwrap();
+    std::fs::rename(replacement_dir.path(), dir.path()).unwrap();
+    reader.refresh_with_lineage().await.unwrap();
+    assert_eq!(
+        reader.read_schema_contract().await.unwrap(),
+        replacement_contract
+    );
+    assert_eq!(reader.exact_graph_head(), other.exact_graph_head());
 }
 
 #[tokio::test]
@@ -3946,6 +4048,17 @@ async fn cold_contract_capture_scans_once_and_refuses_reserved_id_aliases() {
     assert_eq!(
         error.message,
         "manifest row 'schema_contract' has object_type 'unknown_extension'"
+    );
+    let error = read_schema_publication_at(
+        uri,
+        writer.version() + 1,
+        &writer.exact_graph_head().unwrap(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("duplicate selected rows"),
+        "{error}"
     );
 }
 
@@ -4714,4 +4827,70 @@ async fn manifest_scan_keeps_raw_memory_binding_readable() {
             .unwrap();
         assert_eq!(values.values().as_ref(), &[31, 47]);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_version_publish_races_for_one_candidate_without_rebase() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let coordinator = ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let base = coordinator.version();
+    let head = coordinator.exact_graph_head();
+    let precondition = PublishPrecondition::ExactGraphVersion {
+        authority: GraphHeadExpectation::new(
+            None,
+            lance::dataset::refs::BranchIdentifier::main(),
+            head.clone(),
+        ),
+        version: base,
+    };
+    let original = LineageIntent {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        branch: None,
+        actor_id: Some("original".to_string()),
+        merged_parent_commit_id: None,
+        created_at: lineage_now_micros(),
+    };
+    let fence = LineageIntent {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        actor_id: Some("recovery".to_string()),
+        ..original.clone()
+    };
+    let left = GraphNamespacePublisher::new(uri, None);
+    let right = GraphNamespacePublisher::new(uri, None);
+    let expected = HashMap::new();
+    let (a, b) = tokio::join!(
+        left.publish_with_precondition(&[], &expected, Some(&original), &precondition),
+        right.publish_with_precondition(&[], &expected, Some(&fence), &precondition),
+    );
+    let (winner, loser) = match (a, b) {
+        (Ok(_), Err(error)) => (&original, error),
+        (Err(error), Ok(_)) => (&fence, error),
+        other => panic!("exactly one numeric candidate must win: {other:?}"),
+    };
+    assert!(matches!(loser, OmniError::Manifest(ManifestError {
+        details: Some(ManifestConflictDetails::ReadSetChanged { ref member, .. }), ..
+    }) if member == "prepared_schema_manifest_version"));
+    let candidate = read_schema_publication_candidate_at(
+        uri,
+        base + 1,
+        Some(&original.graph_commit_id),
+        Some(&fence.graph_commit_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(candidate.head.graph_commit_id, winner.graph_commit_id);
+    assert_eq!(candidate.head.parent_commit_id, head);
+    assert_ne!(candidate.original.is_some(), candidate.settlement.is_some());
+    assert_eq!(
+        open_manifest_dataset(uri, None)
+            .await
+            .unwrap()
+            .version()
+            .version,
+        base + 1
+    );
 }

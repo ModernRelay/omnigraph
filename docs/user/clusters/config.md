@@ -130,6 +130,28 @@ embedded host and may permit a local `file://` directory; it is not installed
 by the HTTP server or direct-store CLI. Bases must be absolute, non-overlapping,
 and free of credentials, query strings, fragments, and path traversal.
 
+A base must also name storage outside the cluster's storage root: the config
+directory when `storage` is omitted, or the `storage` URI. That root holds every
+graph and the applied state, and ingress reads with the process's own storage
+credentials, so a base over it would let any writer copy another graph's data
+or the cluster ledger into a readable Blob value. `cluster validate`, `plan`,
+and `apply` refuse such a base with `external_blob_base_overlaps_storage_root`,
+whatever its scope. Put external objects under a sibling prefix instead, for
+example `s3://company-assets/cluster-external/` beside
+`storage: s3://company-assets/cluster`. A server that finds an overlapping
+`server_safe` base in the applied state quarantines that graph and serves the
+others; if no applied graph is left to serve, startup fails with
+`cluster_no_healthy_graphs`. An embedded handle refuses a policy whose base
+overlaps its own graph root.
+
+A base is compared only with a storage root of its own kind: an `s3://` base
+with an `s3://` root, a `file://` base with a local root. When the root is
+spelled with a path component a base URI cannot express (an empty component
+such as `s3://bucket/a//cluster`, or a percent sign in a local path), a
+same-kind base is refused with `external_blob_storage_root_uncomparable`,
+because disjointness cannot be proven. Moving the base does not clear that
+code; the storage root spelling does.
+
 The allow-list controls which external objects an authorized writer may cause
 the process to inspect. Cedar policy separately decides who may write. See
 [Blob values](../blobs.md).
@@ -186,9 +208,43 @@ Prefer relative paths; they are what keep a bundle portable and hermetic.
 | `refresh` | state only | Refresh observations for declared graphs |
 | `import` | state only | Adopt existing declared resources |
 | `force-unlock` | yes | Remove one proven-stale lock by exact ID |
+| `upgrade-ledger` | state only | Convert an applied, stopped cluster to durable offline deployments |
 
-`apply` can create graphs, apply supported soft schema changes, publish query
+On a v1 ledger, `apply` can create graphs, apply supported schema changes, publish query
 and policy resources, and execute approved graph deletion. It does not load
-graph data, start servers, or perform hard schema drops.
+graph data or start servers. A schema drop removes the data from the branch
+head and reclaims nothing at apply; `omnigraph cleanup` is the step that makes
+it unrecoverable. The plan shows such a step as `drop_property` or `drop_type`,
+with no mode.
+
+After explicit conversion to a v2 ledger, apply supports only schema and stored
+query changes on existing graphs, and requires `state.lock: true`. Other
+bindings and inventory remain fixed. Root-addressed status, reconciliation and
+conversion do not use `cluster.yaml`; see [the deployment workflow](index.md#durable-offline-deployments).
+
+## Limits
+
+Configuration loading refuses limits before schema effects. Shared files with
+identical bytes count once toward the aggregate source limit.
+
+| Resource | Limit |
+|---|---:|
+| Each `cluster.yaml`, schema, query or policy source | 1 MiB |
+| Distinct source bytes in one captured bundle | 8 MiB |
+| Declared resources (each graph and schema count separately) | 4096 |
+| Query discovery paths plus directory entries, including ignored files | 4096 |
+| Encoded immutable deployment bundle | 16 MiB |
+| Encoded cluster ledger | 16 MiB |
+| Lock metadata read | 64 KiB |
+| Outstanding deployments | 1 |
+| Retained deployment results | 32 records, 4 MiB total, 1 MiB each |
+| Deployment actor / resource address / canonical root | 256 / 512 / 4096 UTF-8 bytes |
+
+Deployment admission checks the actual encoded prepared intents and reserves
+ledger/result space to record completion before accepting schema effects.
+JSON escaping and prepared state can make a deployment exceed its encoded limit
+even when raw source bytes fit. Result history may evict older completed records
+to admit a new deployment; outstanding authority is retained. These bounds do
+not cap graph data, native manifest-history scans or total process memory.
 
 See [Operating a cluster](index.md) for the end-to-end workflow.

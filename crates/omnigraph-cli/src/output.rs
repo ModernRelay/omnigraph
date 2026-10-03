@@ -25,6 +25,7 @@ pub(crate) struct LoadOutput {
     pub(crate) nodes: Vec<GraphBatchDeclarationOutput>,
     pub(crate) edges: Vec<GraphBatchDeclarationOutput>,
     pub(crate) total_entities: usize,
+    pub(crate) embedding_generation: Option<omnigraph_api_types::LoadEmbeddingGeneration>,
     pub(crate) commit: Option<CommitOutput>,
 }
 
@@ -42,6 +43,7 @@ pub(crate) fn load_output_from_graph_batch(
         nodes: output.nodes.clone(),
         edges: output.edges.clone(),
         total_entities: output.total_entities,
+        embedding_generation: output.embedding_generation,
         commit: output.commit.clone(),
     }
 }
@@ -57,6 +59,7 @@ pub(crate) fn load_output_from_receipt(
     branch: &str,
     mode: &'static str,
     receipt: &omnigraph::loader::LoadReceipt,
+    catalog: &omnigraph_compiler::catalog::Catalog,
 ) -> LoadOutput {
     let result = &receipt.result;
     let mut nodes = result
@@ -91,6 +94,9 @@ pub(crate) fn load_output_from_receipt(
         nodes,
         edges,
         total_entities,
+        embedding_generation: omnigraph_api_types::LoadEmbeddingGeneration::for_load(
+            catalog, result,
+        ),
         commit: Some(omnigraph_api_types::commit_output(&receipt.commit)),
     }
 }
@@ -109,7 +115,11 @@ pub(crate) fn print_schema_apply_human(output: &SchemaApplyOutput) {
     println!("applied: {}", if output.applied { "yes" } else { "no" });
     println!("graph_manifest_version: {}", output.graph_manifest_version);
     if output.steps.is_empty() {
-        println!("no schema changes");
+        if output.applied {
+            println!("schema source updated; no table migration steps");
+        } else {
+            println!("no schema changes");
+        }
         return;
     }
     for step in &output.steps {
@@ -559,6 +569,9 @@ pub(crate) fn print_load_human(payload: &LoadOutput) {
             println!("branch {} created from {}", payload.branch, base);
         }
     }
+    if let Some(diagnostic) = payload.embedding_generation {
+        println!("{}", diagnostic.message());
+    }
 }
 
 pub(crate) fn print_ingest_human(output: &IngestOutput) {
@@ -590,13 +603,16 @@ pub(crate) fn print_ingest_human(output: &IngestOutput) {
     if let Some(actor_id) = &output.actor_id {
         println!("actor_id: {}", actor_id);
     }
+    if let Some(diagnostic) = output.embedding_generation {
+        println!("{}", diagnostic.message());
+    }
 }
 
 pub(crate) fn print_schema_plan_human(uri: &str, plan: &SchemaMigrationPlan) {
     println!("schema plan for {}", uri);
     println!("supported: {}", if plan.supported { "yes" } else { "no" });
     if plan.steps.is_empty() {
-        println!("no schema changes");
+        println!("no table migration steps");
         return;
     }
     for step in &plan.steps {
@@ -692,28 +708,21 @@ pub(crate) fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
             type_name,
             render_annotations(annotations)
         ),
-        SchemaMigrationStep::DropType {
-            type_kind,
-            name,
-            mode,
-        } => format!(
-            "drop {} type '{}' ({} mode)",
+        SchemaMigrationStep::DropType { type_kind, name } => format!(
+            "drop {} type '{}'",
             schema_type_kind_label(*type_kind),
             name,
-            drop_mode_label(*mode),
         ),
         SchemaMigrationStep::DropProperty {
             type_kind,
             type_name,
             property_name,
-            mode,
         } => format!(
-            "drop property '{}.{}' of {} '{}' ({} mode)",
+            "drop property '{}.{}' of {} '{}'",
             type_name,
             property_name,
             schema_type_kind_label(*type_kind),
             type_name,
-            drop_mode_label(*mode),
         ),
         SchemaMigrationStep::UnsupportedChange { entity, reason, .. } => {
             // When a schema-lint code is attached, render code + tier
@@ -748,13 +757,6 @@ pub(crate) fn schema_lint_tier_label(tier: omnigraph_compiler::SafetyTier) -> &'
         omnigraph_compiler::SafetyTier::Safe => "safe",
         omnigraph_compiler::SafetyTier::Validated => "validated",
         omnigraph_compiler::SafetyTier::Destructive => "destructive",
-    }
-}
-
-pub(crate) fn drop_mode_label(mode: omnigraph_compiler::DropMode) -> &'static str {
-    match mode {
-        omnigraph_compiler::DropMode::Soft => "soft",
-        omnigraph_compiler::DropMode::Hard => "hard",
     }
 }
 

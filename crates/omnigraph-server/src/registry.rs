@@ -1,39 +1,27 @@
-//! `GraphRegistry` — the multi-graph routing substrate (MR-668).
+//! Configured graph identity and the single serving-admission authority.
 //!
-//! Holds the open `Arc<GraphHandle>` for every graph the server is currently
-//! serving. Lock-free reads via `ArcSwap<RegistrySnapshot>`; mutations
-//! serialize through `mutate: Mutex<()>` for read-modify-write atomicity.
-//!
-//! **Deletion is deferred** in v0.6.0 (MR-668 scope cut). The registry has
-//! no `tombstones` field, no `RegistryLookup::Tombstoned` variant, no
-//! `tombstone()` / `clear_tombstone()` methods. When `DELETE /graphs/{id}`
-//! lands in a follow-up release, those return without breaking caller
-//! signatures (`Gone` is the closest semantic — the graph is no longer
-//! in the registry).
-//!
-//! Engine instance survival across registry mutations:
-//! a request that grabbed `Arc<GraphHandle>` before a registry swap keeps
-//! the engine alive via its own `Arc` clone (see `server_export` at
-//! `lib.rs:1019-1033` for the spawn-and-clone pattern). The engine drops
-//! when the last `Arc<Omnigraph>` clone drops, regardless of the
-//! registry's current state.
+//! Snapshot readers retain one immutable view. Request capture and transitions
+//! use the same synchronous registry boundary under process admission.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use arc_swap::ArcSwap;
 use omnigraph::db::Omnigraph;
 use omnigraph::storage::normalize_root_uri;
-#[cfg(test)]
-use tokio::sync::Mutex;
+use tokio::time::Instant;
 
+use crate::ApiError;
 use crate::identity::GraphKey;
+use crate::operations::OperationRuntime;
 use crate::policy::PolicyEngine;
 use crate::queries::QueryRegistry;
+use crate::serving::{
+    GraphRequest, PreparedTransition, ServingEpoch, ServingTransitionError, ServingView,
+    TransitionRecord,
+};
 
-/// Open handle for a single graph in the registry. Cheap to clone (`Arc`-wrapped
-/// engine + policy). Cluster-mode handlers extract this via
-/// `Extension<Arc<GraphHandle>>` injected by the routing middleware.
+/// Fixed engine and effective bindings for one registered graph. Requests use
+/// a [`GraphRequest`] to retain these together with their admitted epoch.
 pub struct GraphHandle {
     /// Registry key. In Cluster mode `key.tenant_id` is always `None`.
     pub key: GraphKey,
@@ -55,29 +43,79 @@ pub struct GraphHandle {
     pub queries: Option<Arc<QueryRegistry>>,
 }
 
-/// Immutable snapshot of the registry's current state. Replaced atomically
-/// via `ArcSwap`; readers see a consistent view of all graphs without locking.
-///
-/// Derived state (`any_per_graph_policy`) is computed at snapshot
-/// construction so request-time middleware doesn't have to walk the
-/// graph map every call. Construct only via [`RegistrySnapshot::new`]
-/// (or `Default`) so the field stays in sync with `graphs`.
+pub use crate::api::GraphStartupFailure as StartupFailure;
+
+/// A configured graph whose startup failed. Invalid policy is not equivalent
+/// to absence of a policy when authorizing status disclosure.
+pub struct BlockedGraph {
+    pub key: GraphKey,
+    pub uri: String,
+    pub policy: Option<Arc<PolicyEngine>>,
+    pub failure: StartupFailure,
+}
+
+/// Captured startup identity and disclosure policy, before an engine exists.
+/// Its Arc identity also fences the sole startup completion for this entry.
+pub struct LoadingGraph {
+    pub key: GraphKey,
+    pub uri: String,
+    pub policy: Option<Arc<PolicyEngine>>,
+}
+
+#[derive(Clone)]
+pub enum GraphEntry {
+    Loading(Arc<LoadingGraph>),
+    Ready(Arc<ServingView>),
+    Transitioning(Arc<ServingView>),
+    Blocked(Arc<BlockedGraph>),
+}
+
+impl GraphEntry {
+    /// Startup input; the view grants no request admission on its own.
+    pub fn ready(handle: Arc<GraphHandle>) -> Self {
+        Self::Ready(Arc::new(ServingView::new(handle, ServingEpoch::INITIAL)))
+    }
+
+    pub fn key(&self) -> &GraphKey {
+        match self {
+            Self::Loading(graph) => &graph.key,
+            Self::Ready(view) | Self::Transitioning(view) => &view.key,
+            Self::Blocked(graph) => &graph.key,
+        }
+    }
+
+    pub fn uri(&self) -> &str {
+        match self {
+            Self::Loading(graph) => &graph.uri,
+            Self::Ready(view) | Self::Transitioning(view) => &view.uri,
+            Self::Blocked(graph) => &graph.uri,
+        }
+    }
+
+    pub fn policy(&self) -> Option<&Arc<PolicyEngine>> {
+        match self {
+            Self::Loading(graph) => graph.policy.as_ref(),
+            Self::Ready(view) | Self::Transitioning(view) => view.policy.as_ref(),
+            Self::Blocked(graph) => graph.policy.as_ref(),
+        }
+    }
+
+    fn requires_policy_auth(&self) -> bool {
+        self.policy().is_some()
+            || matches!(self, Self::Blocked(graph) if graph.failure == StartupFailure::InvalidPolicy)
+    }
+}
+
+/// One immutable inventory/availability snapshot. Its policy cache is derived
+/// on construction and remains valid while an epoch is transitioning.
 pub struct RegistrySnapshot {
-    pub graphs: HashMap<GraphKey, Arc<GraphHandle>>,
-    /// `true` iff any registered graph has a per-graph policy installed.
-    /// Used by `AppState::requires_bearer_auth` to decide whether the
-    /// auth middleware should challenge a request — a per-graph policy
-    /// implies bearer auth is required even when no server-level tokens
-    /// or policy are configured.
+    pub graphs: HashMap<GraphKey, GraphEntry>,
     pub any_per_graph_policy: bool,
 }
 
 impl RegistrySnapshot {
-    /// Build a snapshot from a graph map, deriving cached fields.
-    /// The only construction path — direct struct-literal use elsewhere
-    /// would let derived state drift from `graphs`.
-    pub fn new(graphs: HashMap<GraphKey, Arc<GraphHandle>>) -> Self {
-        let any_per_graph_policy = graphs.values().any(|h| h.policy.is_some());
+    pub fn new(graphs: HashMap<GraphKey, GraphEntry>) -> Self {
+        let any_per_graph_policy = graphs.values().any(GraphEntry::requires_policy_auth);
         Self {
             graphs,
             any_per_graph_policy,
@@ -91,148 +129,377 @@ impl Default for RegistrySnapshot {
     }
 }
 
-/// Result of a registry lookup. Two-valued — `Tombstoned` deferred with DELETE.
+/// Introspection only. Ready views do not admit requests or allow a caller to
+/// resume a closed epoch.
 pub enum RegistryLookup {
-    /// Graph is open and ready to serve.
-    Ready(Arc<GraphHandle>),
-    /// Graph is not in the registry (never existed, or was unregistered in a
-    /// future release). Handlers respond with 404.
+    Loading(Arc<LoadingGraph>),
+    Ready(Arc<ServingView>),
+    Transitioning(Arc<ServingView>),
+    Blocked(Arc<BlockedGraph>),
     Gone,
 }
 
-/// Why an `insert` was rejected.
+/// Coherent request capture, including the effective bindings required to
+/// authorize disclosure of an unavailable graph.
+pub(crate) enum RegistryCapture {
+    Loading(Arc<LoadingGraph>),
+    Ready(GraphRequest),
+    Transitioning(Arc<ServingView>),
+    Blocked(Arc<BlockedGraph>),
+    Gone,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum InsertError {
-    /// Another handle already exists for this `GraphKey`. Maps to HTTP 409.
     #[error("graph '{0}' is already registered")]
     DuplicateKey(GraphKey),
-    /// Another handle is open against this URI. Two graphs sharing a URI
-    /// would commit through the same Lance manifest and corrupt each other.
-    /// Maps to HTTP 409.
     #[error("URI '{0}' is already registered as another graph")]
     DuplicateUri(String),
-    /// A handle carried an invalid graph URI. Maps to startup failure.
     #[error("URI '{uri}' is invalid: {message}")]
     InvalidUri { uri: String, message: String },
+    #[error("graph '{0}' has a live serving transition and cannot initialize a new registry")]
+    Transitioning(GraphKey),
+}
+
+struct RegistryState {
+    snapshot: Arc<RegistrySnapshot>,
+    // One O(1) candidate per process registry. It retains the predecessor;
+    // graph entry kind is the sole open/closed state, not a second flag here.
+    candidate: Option<Arc<TransitionRecord>>,
 }
 
 pub struct GraphRegistry {
-    snapshot: ArcSwap<RegistrySnapshot>,
-    /// Serializes runtime mutations through [`GraphRegistry::insert`].
-    /// Gated with `insert` because they share a single contract — if
-    /// the consumer goes away, so does the lock. Re-introducing one
-    /// requires re-introducing the other.
-    #[cfg(test)]
-    mutate: Mutex<()>,
+    state: Mutex<RegistryState>,
+}
+
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl GraphRegistry {
-    /// Empty registry. Used as a placeholder before startup populates it.
     pub fn new() -> Self {
         Self {
-            snapshot: ArcSwap::from_pointee(RegistrySnapshot::default()),
-            #[cfg(test)]
-            mutate: Mutex::new(()),
+            state: Mutex::new(RegistryState {
+                snapshot: Arc::new(RegistrySnapshot::default()),
+                candidate: None,
+            }),
         }
     }
 
-    /// Build a registry from a startup-time list of open handles.
-    /// Rejects duplicate `GraphKey`s and duplicate URIs.
     pub fn from_handles(handles: Vec<Arc<GraphHandle>>) -> Result<Self, InsertError> {
-        let mut graphs: HashMap<GraphKey, Arc<GraphHandle>> = HashMap::with_capacity(handles.len());
-        let mut seen_uris: HashMap<String, GraphKey> = HashMap::with_capacity(handles.len());
-        for handle in handles {
-            let (canonical_uri, handle) = canonicalize_handle_uri(handle)?;
-            if graphs.contains_key(&handle.key) {
-                return Err(InsertError::DuplicateKey(handle.key.clone()));
+        Self::from_entries(handles.into_iter().map(GraphEntry::ready).collect())
+    }
+
+    pub fn from_entries(entries: Vec<GraphEntry>) -> Result<Self, InsertError> {
+        let mut graphs = HashMap::with_capacity(entries.len());
+        let mut seen_uris = HashMap::with_capacity(entries.len());
+        for entry in entries {
+            let entry = canonicalize_entry_uri(entry)?;
+            if graphs.contains_key(entry.key()) {
+                return Err(InsertError::DuplicateKey(entry.key().clone()));
             }
-            if seen_uris.contains_key(&canonical_uri) {
-                return Err(InsertError::DuplicateUri(handle.uri.clone()));
+            if seen_uris.contains_key(entry.uri()) {
+                return Err(InsertError::DuplicateUri(entry.uri().to_string()));
             }
-            seen_uris.insert(canonical_uri, handle.key.clone());
-            graphs.insert(handle.key.clone(), handle);
+            seen_uris.insert(entry.uri().to_string(), entry.key().clone());
+            graphs.insert(entry.key().clone(), entry);
         }
         Ok(Self {
-            snapshot: ArcSwap::from_pointee(RegistrySnapshot::new(graphs)),
-            #[cfg(test)]
-            mutate: Mutex::new(()),
+            state: Mutex::new(RegistryState {
+                snapshot: Arc::new(RegistrySnapshot::new(graphs)),
+                candidate: None,
+            }),
         })
     }
 
-    /// Lock-free snapshot read. Callers that need derived state cached
-    /// on the snapshot (e.g. `any_per_graph_policy`) go through here;
-    /// callers that only need values of `graphs` should use [`list`]
-    /// or [`get`].
-    pub fn snapshot_ref(&self) -> arc_swap::Guard<Arc<RegistrySnapshot>> {
-        self.snapshot.load()
+    pub fn snapshot_ref(&self) -> Arc<RegistrySnapshot> {
+        Arc::clone(&locked(&self.state).snapshot)
     }
 
-    /// Lock-free read. Returns `Ready` if the graph is in the current snapshot,
-    /// `Gone` otherwise.
     pub fn get(&self, key: &GraphKey) -> RegistryLookup {
-        let snapshot = self.snapshot.load();
-        match snapshot.graphs.get(key) {
-            Some(handle) => RegistryLookup::Ready(Arc::clone(handle)),
+        match self.snapshot_ref().graphs.get(key) {
+            Some(GraphEntry::Loading(graph)) => RegistryLookup::Loading(Arc::clone(graph)),
+            Some(GraphEntry::Ready(view)) => RegistryLookup::Ready(Arc::clone(view)),
+            Some(GraphEntry::Transitioning(view)) => {
+                RegistryLookup::Transitioning(Arc::clone(view))
+            }
+            Some(GraphEntry::Blocked(graph)) => RegistryLookup::Blocked(Arc::clone(graph)),
             None => RegistryLookup::Gone,
         }
     }
 
-    /// Snapshot the full set of currently-registered handles. Ordering
-    /// matches the underlying `HashMap` iteration (intentionally
-    /// non-deterministic — callers that need a stable order sort by
-    /// `handle.key.graph_id`).
-    pub fn list(&self) -> Vec<Arc<GraphHandle>> {
-        let snapshot = self.snapshot.load();
-        snapshot.graphs.values().cloned().collect()
+    pub fn list(&self) -> Vec<Arc<ServingView>> {
+        self.snapshot_ref()
+            .graphs
+            .values()
+            .filter_map(|entry| match entry {
+                GraphEntry::Ready(view) => Some(Arc::clone(view)),
+                GraphEntry::Loading(_) | GraphEntry::Transitioning(_) | GraphEntry::Blocked(_) => {
+                    None
+                }
+            })
+            .collect()
     }
 
-    /// Number of registered graphs (excluding any future tombstones).
+    pub fn entries(&self) -> Vec<GraphEntry> {
+        self.snapshot_ref().graphs.values().cloned().collect()
+    }
+
     pub fn len(&self) -> usize {
-        self.snapshot.load().graphs.len()
+        self.snapshot_ref().graphs.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Add a new handle. Async because the mutex is `tokio::sync::Mutex`
-    /// (a future managed-catalog flow may hold it across `.await` points
-    /// during atomic registry mutations). Rejects duplicate `GraphKey`
-    /// and duplicate `uri`.
-    ///
-    /// **Test-only surface.** No production code reaches this — startup
-    /// uses `from_handles`, and runtime add/remove is deferred. The
-    /// race-contract tests below pin the mutex linearization point so
-    /// that when a real consumer ships (managed cluster catalog), the
-    /// concurrency contract is already proven. Ungate by removing
-    /// `#[cfg(test)]` once that consumer is in scope.
-    ///
-    /// Race semantics (pinned by `concurrent_insert_same_key_exactly_one_succeeds`):
-    /// under N concurrent calls with the same key, exactly one returns
-    /// `Ok(())` and the rest return `Err(InsertError::DuplicateKey(_))`.
+    /// Process admission is always acquired before the registry lock. Only
+    /// AppState's HTTP/MCP boundary passes its actual process runtime here.
+    pub(crate) fn capture(
+        &self,
+        operations: &OperationRuntime,
+        key: &GraphKey,
+    ) -> Result<RegistryCapture, ApiError> {
+        operations.while_open(|| {
+            let state = locked(&self.state);
+            Ok(match state.snapshot.graphs.get(key) {
+                Some(GraphEntry::Loading(graph)) => RegistryCapture::Loading(Arc::clone(graph)),
+                Some(GraphEntry::Ready(view)) => RegistryCapture::Ready(view.capture()?),
+                Some(GraphEntry::Transitioning(view)) => {
+                    RegistryCapture::Transitioning(Arc::clone(view))
+                }
+                Some(GraphEntry::Blocked(graph)) => RegistryCapture::Blocked(Arc::clone(graph)),
+                None => RegistryCapture::Gone,
+            })
+        })
+    }
+
+    /// Install one startup result, or the complete strict-startup batch. The
+    /// process boundary fences shutdown; the captured entry fences stale work.
+    pub(crate) fn complete_startup(
+        &self,
+        operations: &OperationRuntime,
+        results: Vec<(Arc<LoadingGraph>, GraphEntry)>,
+    ) -> Result<(), ApiError> {
+        operations.while_open(|| {
+            let mut state = locked(&self.state);
+            for (pending, result) in &results {
+                if !matches!(state.snapshot.graphs.get(&pending.key),
+                    Some(GraphEntry::Loading(current)) if Arc::ptr_eq(current, pending))
+                    || result.key() != &pending.key
+                    || result.uri() != pending.uri
+                    || !matches!(result, GraphEntry::Ready(_) | GraphEntry::Blocked(_))
+                {
+                    return Err(ApiError::internal("stale graph startup completion"));
+                }
+            }
+            let mut graphs = state.snapshot.graphs.clone();
+            for (pending, result) in results {
+                graphs.insert(pending.key.clone(), result);
+            }
+            state.snapshot = Arc::new(RegistrySnapshot::new(graphs));
+            Ok(())
+        })
+    }
+
+    /// Reserve the sole candidate before closing healthy graph admission.
+    /// There is no query parsing, storage refresh, or engine effect here.
+    pub(crate) fn prepare_same_view(
+        self: &Arc<Self>,
+        operations: &OperationRuntime,
+        key: &GraphKey,
+        deadline: Instant,
+    ) -> Result<PreparedTransition, ServingTransitionError> {
+        operations.while_open(|| {
+            let mut state = locked(&self.state);
+            if Instant::now() >= deadline {
+                return Err(ServingTransitionError::DeadlineElapsed);
+            }
+            if state.candidate.is_some() {
+                return Err(ServingTransitionError::Busy);
+            }
+            let predecessor = match state.snapshot.graphs.get(key) {
+                Some(GraphEntry::Ready(view)) => Arc::clone(view),
+                Some(
+                    GraphEntry::Loading(_) | GraphEntry::Transitioning(_) | GraphEntry::Blocked(_),
+                ) => {
+                    return Err(ServingTransitionError::Unavailable);
+                }
+                None => return Err(ServingTransitionError::Gone),
+            };
+            if !predecessor.contract_is_current() {
+                return Err(ServingTransitionError::SchemaChanged);
+            }
+            // Reject identity exhaustion before closing a healthy epoch.
+            predecessor.epoch().successor()?;
+            let record = Arc::new(TransitionRecord {
+                predecessor,
+                deadline,
+            });
+            if Instant::now() >= deadline {
+                return Err(ServingTransitionError::DeadlineElapsed);
+            }
+            state.candidate = Some(Arc::clone(&record));
+            Ok(PreparedTransition::new(
+                Arc::clone(self),
+                record,
+                operations.clone(),
+            ))
+        })
+    }
+
+    pub(crate) fn close_prepared(
+        &self,
+        record: &Arc<TransitionRecord>,
+    ) -> Result<(), ServingTransitionError> {
+        let mut state = locked(&self.state);
+        validate_candidate(&state, record)?;
+        if !matches!(state.snapshot.graphs.get(&record.predecessor.key),
+            Some(GraphEntry::Ready(view)) if Arc::ptr_eq(view, &record.predecessor))
+        {
+            return Err(ServingTransitionError::StaleAttempt);
+        }
+        if !record.predecessor.contract_is_current() {
+            return Err(ServingTransitionError::SchemaChanged);
+        }
+        let mut graphs = state.snapshot.graphs.clone();
+        graphs.insert(
+            record.predecessor.key.clone(),
+            GraphEntry::Transitioning(Arc::clone(&record.predecessor)),
+        );
+        let snapshot = Arc::new(RegistrySnapshot::new(graphs));
+        if Instant::now() >= record.deadline {
+            return Err(ServingTransitionError::DeadlineElapsed);
+        }
+        state.snapshot = snapshot;
+        Ok(())
+    }
+
+    pub(crate) fn discard_prepared(&self, record: &Arc<TransitionRecord>) {
+        let mut state = locked(&self.state);
+        if state
+            .candidate
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, record))
+            && matches!(state.snapshot.graphs.get(&record.predecessor.key),
+                Some(GraphEntry::Ready(view)) if Arc::ptr_eq(view, &record.predecessor))
+        {
+            state.candidate = None;
+        }
+    }
+
+    pub(crate) fn resume_same_view(
+        &self,
+        record: &Arc<TransitionRecord>,
+    ) -> Result<ServingEpoch, ServingTransitionError> {
+        let mut state = locked(&self.state);
+        validate_candidate(&state, record)?;
+        if !matches!(state.snapshot.graphs.get(&record.predecessor.key),
+            Some(GraphEntry::Transitioning(view)) if Arc::ptr_eq(view, &record.predecessor))
+        {
+            return Err(ServingTransitionError::StaleAttempt);
+        }
+        if record.predecessor.request_count() != 0 {
+            return Err(ServingTransitionError::RequestsActive);
+        }
+        let epoch = record.predecessor.epoch().successor()?;
+        let successor = Arc::new(record.predecessor.successor(epoch));
+        let mut graphs = state.snapshot.graphs.clone();
+        graphs.insert(record.predecessor.key.clone(), GraphEntry::Ready(successor));
+        let snapshot = Arc::new(RegistrySnapshot::new(graphs));
+        if !record.predecessor.contract_is_current() {
+            return Err(ServingTransitionError::SchemaChanged);
+        }
+        if Instant::now() >= record.deadline {
+            return Err(ServingTransitionError::DeadlineElapsed);
+        }
+        state.snapshot = snapshot;
+        state.candidate = None;
+        Ok(epoch)
+    }
+
+    /// Test-only inventory mutation; production inventory stays fixed.
     #[cfg(test)]
     pub async fn insert(&self, handle: Arc<GraphHandle>) -> Result<(), InsertError> {
-        let _guard = self.mutate.lock().await;
-        let current = self.snapshot.load();
         let (canonical_uri, handle) = canonicalize_handle_uri(handle)?;
-        if current.graphs.contains_key(&handle.key) {
+        let mut state = locked(&self.state);
+        if state.snapshot.graphs.contains_key(&handle.key) {
             return Err(InsertError::DuplicateKey(handle.key.clone()));
         }
-        for existing in current.graphs.values() {
-            let existing_uri =
-                normalize_root_uri(&existing.uri).map_err(|err| InsertError::InvalidUri {
-                    uri: existing.uri.clone(),
-                    message: err.to_string(),
-                })?;
-            if existing_uri == canonical_uri {
-                return Err(InsertError::DuplicateUri(handle.uri.clone()));
+        if state
+            .snapshot
+            .graphs
+            .values()
+            .any(|entry| entry.uri() == canonical_uri)
+        {
+            return Err(InsertError::DuplicateUri(canonical_uri));
+        }
+        let mut graphs = state.snapshot.graphs.clone();
+        graphs.insert(handle.key.clone(), GraphEntry::ready(handle));
+        state.snapshot = Arc::new(RegistrySnapshot::new(graphs));
+        Ok(())
+    }
+}
+
+fn validate_candidate(
+    state: &RegistryState,
+    record: &Arc<TransitionRecord>,
+) -> Result<(), ServingTransitionError> {
+    if !state
+        .candidate
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, record))
+    {
+        return Err(ServingTransitionError::StaleAttempt);
+    }
+    if Instant::now() >= record.deadline {
+        return Err(ServingTransitionError::DeadlineElapsed);
+    }
+    Ok(())
+}
+
+fn canonicalize_entry_uri(entry: GraphEntry) -> Result<GraphEntry, InsertError> {
+    match entry {
+        GraphEntry::Loading(graph) => {
+            let uri = normalize_root_uri(&graph.uri).map_err(|err| InsertError::InvalidUri {
+                uri: graph.uri.clone(),
+                message: err.to_string(),
+            })?;
+            if uri == graph.uri {
+                Ok(GraphEntry::Loading(graph))
+            } else {
+                Ok(GraphEntry::Loading(Arc::new(LoadingGraph {
+                    key: graph.key.clone(),
+                    uri,
+                    policy: graph.policy.clone(),
+                })))
             }
         }
-        let mut new_graphs = current.graphs.clone();
-        new_graphs.insert(handle.key.clone(), handle);
-        self.snapshot
-            .store(Arc::new(RegistrySnapshot::new(new_graphs)));
-        Ok(())
+        GraphEntry::Ready(view) => {
+            let (_, handle) = canonicalize_handle_uri(Arc::clone(view.handle()))?;
+            if Arc::ptr_eq(&handle, view.handle()) {
+                Ok(GraphEntry::Ready(view))
+            } else {
+                Ok(GraphEntry::ready(handle))
+            }
+        }
+        GraphEntry::Transitioning(view) => Err(InsertError::Transitioning(view.key.clone())),
+        GraphEntry::Blocked(graph) => {
+            let uri = normalize_root_uri(&graph.uri).map_err(|err| InsertError::InvalidUri {
+                uri: graph.uri.clone(),
+                message: err.to_string(),
+            })?;
+            if uri == graph.uri {
+                Ok(GraphEntry::Blocked(graph))
+            } else {
+                Ok(GraphEntry::Blocked(Arc::new(BlockedGraph {
+                    key: graph.key.clone(),
+                    uri,
+                    policy: graph.policy.clone(),
+                    failure: graph.failure,
+                })))
+            }
+        }
     }
 }
 
@@ -304,9 +571,12 @@ mod tests {
 
         match registry.get(&handle.key) {
             RegistryLookup::Ready(found) => {
-                assert!(Arc::ptr_eq(&found, &handle));
+                assert!(Arc::ptr_eq(found.handle(), &handle));
             }
-            RegistryLookup::Gone => panic!("expected Ready, got Gone"),
+            RegistryLookup::Gone
+            | RegistryLookup::Loading(_)
+            | RegistryLookup::Blocked(_)
+            | RegistryLookup::Transitioning(_) => panic!("expected Ready"),
         }
     }
 
@@ -316,7 +586,10 @@ mod tests {
         let key = GraphKey::cluster(GraphId::try_from("ghost").unwrap());
         match registry.get(&key) {
             RegistryLookup::Gone => {}
-            RegistryLookup::Ready(_) => panic!("expected Gone"),
+            RegistryLookup::Ready(_)
+            | RegistryLookup::Loading(_)
+            | RegistryLookup::Blocked(_)
+            | RegistryLookup::Transitioning(_) => panic!("expected Gone"),
         }
     }
 
@@ -393,6 +666,132 @@ mod tests {
         ];
         let registry = GraphRegistry::from_handles(handles).unwrap();
         assert_eq!(registry.len(), 2);
+        assert!(!registry.snapshot_ref().any_per_graph_policy);
+
+        // Availability never removes configured identity. A refused policy
+        // must still require authentication even though no engine was opened.
+        let mut entries = registry.entries();
+        let blocked = Arc::new(BlockedGraph {
+            key: GraphKey::cluster(GraphId::try_from("blocked").unwrap()),
+            uri: dir.path().join("blocked").to_string_lossy().into_owned(),
+            policy: None,
+            failure: StartupFailure::InvalidPolicy,
+        });
+        entries.push(GraphEntry::Blocked(Arc::clone(&blocked)));
+        let registry = GraphRegistry::from_entries(entries).unwrap();
+        assert_eq!(registry.len(), 3);
+        assert_eq!(registry.entries().len(), 3);
+        assert_eq!(registry.list().len(), 2);
+        assert!(registry.snapshot_ref().any_per_graph_policy);
+        match registry.get(&blocked.key) {
+            RegistryLookup::Blocked(found) => {
+                assert_eq!(found.failure, StartupFailure::InvalidPolicy);
+                assert!(found.policy.is_none());
+                assert_eq!(found.uri, normalize_root_uri(&blocked.uri).unwrap());
+            }
+            RegistryLookup::Ready(_)
+            | RegistryLookup::Loading(_)
+            | RegistryLookup::Gone
+            | RegistryLookup::Transitioning(_) => {
+                panic!("expected Blocked")
+            }
+        }
+
+        let mut duplicate_key = registry.entries();
+        duplicate_key.push(GraphEntry::Blocked(Arc::clone(&blocked)));
+        assert!(matches!(
+            GraphRegistry::from_entries(duplicate_key),
+            Err(InsertError::DuplicateKey(_)),
+        ));
+        let mut duplicate_uri = registry.entries();
+        duplicate_uri.push(GraphEntry::Blocked(Arc::new(BlockedGraph {
+            key: GraphKey::cluster(GraphId::try_from("other").unwrap()),
+            uri: blocked.uri.clone(),
+            policy: None,
+            failure: StartupFailure::OpenFailed,
+        })));
+        assert!(matches!(
+            GraphRegistry::from_entries(duplicate_uri),
+            Err(InsertError::DuplicateUri(_)),
+        ));
+
+        // A strict startup installs the whole captured batch or none. A stale
+        // completion and process shutdown cannot admit either loading graph.
+        let handles = registry
+            .list()
+            .into_iter()
+            .map(|view| Arc::clone(view.handle()))
+            .collect::<Vec<_>>();
+        let loading = handles
+            .iter()
+            .map(|handle| {
+                Arc::new(LoadingGraph {
+                    key: handle.key.clone(),
+                    uri: handle.uri.clone(),
+                    policy: handle.policy.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let pending_registry =
+            GraphRegistry::from_entries(loading.iter().cloned().map(GraphEntry::Loading).collect())
+                .unwrap();
+        let operations = OperationRuntime::new();
+        assert!(matches!(
+            pending_registry
+                .capture(&operations, &handles[0].key)
+                .unwrap(),
+            RegistryCapture::Loading(_)
+        ));
+        assert!(pending_registry.list().is_empty());
+        let foreign = Arc::new(LoadingGraph {
+            key: loading[1].key.clone(),
+            uri: loading[1].uri.clone(),
+            policy: None,
+        });
+        assert!(
+            pending_registry
+                .complete_startup(
+                    &operations,
+                    vec![
+                        (
+                            Arc::clone(&loading[0]),
+                            GraphEntry::ready(Arc::clone(&handles[0]))
+                        ),
+                        (foreign, GraphEntry::ready(Arc::clone(&handles[1]))),
+                    ]
+                )
+                .is_err()
+        );
+        assert!(
+            pending_registry.list().is_empty(),
+            "partial strict install is forbidden"
+        );
+        let results = || {
+            loading
+                .iter()
+                .cloned()
+                .zip(handles.iter().cloned().map(GraphEntry::ready))
+                .collect()
+        };
+        pending_registry
+            .complete_startup(&operations, results())
+            .unwrap();
+        assert_eq!(pending_registry.list().len(), 2);
+        assert!(
+            pending_registry
+                .complete_startup(&operations, results())
+                .is_err()
+        );
+        let stopped_registry =
+            GraphRegistry::from_entries(loading.iter().cloned().map(GraphEntry::Loading).collect())
+                .unwrap();
+        operations.close();
+        assert!(
+            stopped_registry
+                .complete_startup(&operations, results())
+                .is_err()
+        );
+        assert!(stopped_registry.list().is_empty());
     }
 
     #[tokio::test]
@@ -444,7 +843,7 @@ mod tests {
     /// at `tests/server.rs:3596+`. Spawn N concurrent inserts with the
     /// same `GraphKey` (each constructing its own `GraphHandle` against
     /// its own tempdir). Exactly one must succeed; the others must
-    /// return `DuplicateKey`. No `unwrap` panic: the `Mutex<()>` +
+    /// return `DuplicateKey`. No `unwrap` panic: the registry mutex +
     /// in-mutex re-check is the linearization point.
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_insert_same_key_exactly_one_succeeds() {
@@ -522,7 +921,7 @@ mod tests {
     }
 
     /// Concurrent reads during a write must always see a consistent
-    /// snapshot (no torn state). With `ArcSwap`, the read either sees
+    /// snapshot (no torn state). The read either sees
     /// the old snapshot or the new one — never both, never neither.
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_reads_during_inserts_see_consistent_snapshots() {
@@ -553,8 +952,11 @@ mod tests {
                         RegistryLookup::Ready(found) => {
                             assert!(Arc::ptr_eq(&found, handle));
                         }
-                        RegistryLookup::Gone => panic!(
-                            "snapshot listed key {} but get() returned Gone",
+                        RegistryLookup::Gone
+                        | RegistryLookup::Loading(_)
+                        | RegistryLookup::Blocked(_)
+                        | RegistryLookup::Transitioning(_) => panic!(
+                            "snapshot listed ready key {} but get() did not return Ready",
                             handle.key.graph_id
                         ),
                     }
@@ -566,5 +968,353 @@ mod tests {
         writer.await.unwrap();
         reader.await.unwrap();
         assert_eq!(registry.len(), N_WRITES);
+    }
+
+    fn captured(
+        registry: &GraphRegistry,
+        operations: &OperationRuntime,
+        key: &GraphKey,
+    ) -> GraphRequest {
+        match registry.capture(operations, key).unwrap() {
+            RegistryCapture::Ready(request) => request,
+            _ => panic!("expected admitted ready graph"),
+        }
+    }
+
+    fn transition_deadline() -> Instant {
+        Instant::now() + std::time::Duration::from_secs(10)
+    }
+
+    #[tokio::test]
+    async fn same_view_transition_retains_descendants_and_allocates_a_fresh_epoch() {
+        let dir = TempDir::new().unwrap();
+        let alpha = build_handle("alpha", dir.path()).await;
+        let beta = build_handle("beta", dir.path()).await;
+        let registry = Arc::new(
+            GraphRegistry::from_handles(vec![Arc::clone(&alpha), Arc::clone(&beta)]).unwrap(),
+        );
+        let operations = OperationRuntime::new();
+        let request = captured(&registry, &operations, &alpha.key);
+        let descendant = request.clone();
+        let old_epoch = request.epoch();
+        let old_snapshot = registry.snapshot_ref();
+        let prepared = registry
+            .prepare_same_view(&operations, &alpha.key, transition_deadline())
+            .unwrap();
+        // Reserving the one candidate does not close healthy admission.
+        drop(captured(&registry, &operations, &alpha.key));
+        assert!(matches!(
+            registry.prepare_same_view(&operations, &beta.key, transition_deadline()),
+            Err(ServingTransitionError::Busy)
+        ));
+        let transition = prepared.close().unwrap();
+        assert!(matches!(
+            registry.capture(&operations, &alpha.key).unwrap(),
+            RegistryCapture::Transitioning(_)
+        ));
+        assert!(matches!(
+            registry.get(&alpha.key),
+            RegistryLookup::Transitioning(_)
+        ));
+        assert_eq!(registry.entries().len(), 2);
+        assert_eq!(registry.list().len(), 1);
+        drop(captured(&registry, &operations, &beta.key));
+        {
+            let waiting = transition.wait_requests();
+            tokio::pin!(waiting);
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+            drop(request);
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+            drop(descendant);
+            waiting.await.unwrap();
+        }
+        let fresh_epoch = transition.resume_same_view().unwrap();
+        assert_ne!(fresh_epoch, old_epoch);
+        let request = captured(&registry, &operations, &alpha.key);
+        assert_eq!(request.epoch(), fresh_epoch);
+        assert!(Arc::ptr_eq(&request.engine, &alpha.engine));
+        assert_eq!(
+            request.schema_contract(),
+            &alpha.engine.schema_contract_digest()
+        );
+        // Retaining an introspection snapshot cannot revive its old epoch.
+        match old_snapshot.graphs.get(&alpha.key).unwrap() {
+            GraphEntry::Ready(view) => assert_eq!(view.epoch(), old_epoch),
+            _ => panic!("the retained predecessor snapshot changed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_drop_releases_only_unclosed_capacity_and_closed_drop_stays_closed() {
+        let dir = TempDir::new().unwrap();
+        let handle = build_handle("alpha", dir.path()).await;
+        let registry = Arc::new(GraphRegistry::from_handles(vec![Arc::clone(&handle)]).unwrap());
+        let operations = OperationRuntime::new();
+        let prepared = registry
+            .prepare_same_view(&operations, &handle.key, transition_deadline())
+            .unwrap();
+        drop(prepared);
+        let transition = registry
+            .prepare_same_view(&operations, &handle.key, transition_deadline())
+            .unwrap()
+            .close()
+            .unwrap();
+        drop(transition);
+        assert!(matches!(
+            registry.capture(&operations, &handle.key).unwrap(),
+            RegistryCapture::Transitioning(_)
+        ));
+        assert!(matches!(
+            registry.prepare_same_view(&operations, &handle.key, transition_deadline()),
+            Err(ServingTransitionError::Busy)
+        ));
+        assert!(matches!(
+            GraphRegistry::from_entries(registry.entries()),
+            Err(InsertError::Transitioning(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn process_closure_revokes_the_original_transition_runtime() {
+        let dir = TempDir::new().unwrap();
+        let handle = build_handle("alpha", dir.path()).await;
+        for close_before_graph in [true, false] {
+            let registry =
+                Arc::new(GraphRegistry::from_handles(vec![Arc::clone(&handle)]).unwrap());
+            let operations = OperationRuntime::new();
+            let request = captured(&registry, &operations, &handle.key);
+            let prepared = registry
+                .prepare_same_view(&operations, &handle.key, transition_deadline())
+                .unwrap();
+            if close_before_graph {
+                operations.close();
+                assert!(matches!(
+                    prepared.close(),
+                    Err(ServingTransitionError::ProcessClosed)
+                ));
+            } else {
+                let transition = prepared.close().unwrap();
+                {
+                    let waiting = transition.wait_requests();
+                    tokio::pin!(waiting);
+                    assert!(futures::poll!(waiting.as_mut()).is_pending());
+                    operations.close();
+                    assert_eq!(waiting.await, Err(ServingTransitionError::ProcessClosed));
+                }
+                drop(request);
+                assert_eq!(
+                    transition.resume_same_view(),
+                    Err(ServingTransitionError::ProcessClosed)
+                );
+                assert!(matches!(
+                    registry.get(&handle.key),
+                    RegistryLookup::Transitioning(_)
+                ));
+                continue;
+            }
+            assert!(registry.capture(&operations, &handle.key).is_err());
+            drop(request);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn capture_racing_close_either_owns_predecessor_or_refuses() {
+        let dir = TempDir::new().unwrap();
+        let handle = build_handle("alpha", dir.path()).await;
+        let registry = Arc::new(GraphRegistry::from_handles(vec![Arc::clone(&handle)]).unwrap());
+        let operations = OperationRuntime::new();
+        let prepared = registry
+            .prepare_same_view(&operations, &handle.key, transition_deadline())
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let capture = {
+            let registry = Arc::clone(&registry);
+            let operations = operations.clone();
+            let key = handle.key.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                registry.capture(&operations, &key).unwrap()
+            })
+        };
+        barrier.wait().await;
+        let transition = prepared.close().unwrap();
+        match capture.await.unwrap() {
+            RegistryCapture::Ready(request) => {
+                let waiting = transition.wait_requests();
+                tokio::pin!(waiting);
+                assert!(futures::poll!(waiting.as_mut()).is_pending());
+                drop(request);
+                waiting.await.unwrap();
+            }
+            RegistryCapture::Transitioning(_) => transition.wait_requests().await.unwrap(),
+            _ => panic!("close/capture changed graph identity or startup state"),
+        }
+        transition.resume_same_view().unwrap();
+    }
+
+    #[tokio::test]
+    async fn final_resume_rechecks_elapsed_deadline_without_a_timer_callback() {
+        let dir = TempDir::new().unwrap();
+        let alpha = build_handle("alpha", dir.path()).await;
+        let beta = build_handle("beta", dir.path()).await;
+        let registry = Arc::new(
+            GraphRegistry::from_handles(vec![Arc::clone(&alpha), Arc::clone(&beta)]).unwrap(),
+        );
+        let operations = OperationRuntime::new();
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        let transition = registry
+            .prepare_same_view(&operations, &alpha.key, deadline)
+            .unwrap()
+            .close()
+            .unwrap();
+        transition.wait_requests().await.unwrap();
+        // Deliberately block this current-thread runtime: no timer callback
+        // or background expiry task can make the final predicate true for us.
+        std::thread::sleep(
+            deadline.saturating_duration_since(Instant::now())
+                + std::time::Duration::from_millis(1),
+        );
+        assert_eq!(
+            transition.resume_same_view(),
+            Err(ServingTransitionError::DeadlineElapsed)
+        );
+        assert!(matches!(
+            registry.get(&alpha.key),
+            RegistryLookup::Transitioning(_)
+        ));
+        assert!(matches!(
+            registry.prepare_same_view(&operations, &beta.key, transition_deadline()),
+            Err(ServingTransitionError::Busy)
+        ));
+        drop(captured(&registry, &operations, &beta.key));
+    }
+
+    #[tokio::test]
+    async fn schema_drift_refuses_at_prepare_close_and_final_resume() {
+        let dir = TempDir::new().unwrap();
+        let alpha = build_handle("alpha", dir.path()).await;
+        let beta = build_handle("beta", dir.path()).await;
+        for stage in ["prepare", "close", "resume"] {
+            let registry = Arc::new(
+                GraphRegistry::from_handles(vec![Arc::clone(&alpha), Arc::clone(&beta)]).unwrap(),
+            );
+            let operations = OperationRuntime::new();
+            let prepared = (stage != "prepare").then(|| {
+                registry
+                    .prepare_same_view(&operations, &alpha.key, transition_deadline())
+                    .unwrap()
+            });
+            let (prepared, transition) = if stage == "resume" {
+                (None, Some(prepared.unwrap().close().unwrap()))
+            } else {
+                (prepared, None)
+            };
+            // Deliberately bypass request admission to model foreign handle
+            // drift. Even a source-only change invalidates the exact binding.
+            alpha
+                .engine
+                .apply_schema(&format!("// foreign {stage} revision\n{TEST_SCHEMA}"))
+                .await
+                .unwrap();
+            match stage {
+                "prepare" => assert!(matches!(
+                    registry.prepare_same_view(&operations, &alpha.key, transition_deadline()),
+                    Err(ServingTransitionError::SchemaChanged)
+                )),
+                "close" => assert!(matches!(
+                    prepared.unwrap().close(),
+                    Err(ServingTransitionError::SchemaChanged)
+                )),
+                "resume" => {
+                    let transition = transition.unwrap();
+                    transition.wait_requests().await.unwrap();
+                    assert_eq!(
+                        transition.resume_same_view(),
+                        Err(ServingTransitionError::SchemaChanged)
+                    );
+                }
+                _ => unreachable!(),
+            }
+            if stage == "resume" {
+                assert!(matches!(
+                    registry.get(&alpha.key),
+                    RegistryLookup::Transitioning(_)
+                ));
+                assert!(matches!(
+                    registry.prepare_same_view(&operations, &beta.key, transition_deadline()),
+                    Err(ServingTransitionError::Busy)
+                ));
+            } else {
+                assert!(matches!(registry.get(&alpha.key), RegistryLookup::Ready(_)));
+                // Failure before closure did not take the sole candidate slot.
+                drop(
+                    registry
+                        .prepare_same_view(&operations, &beta.key, transition_deadline())
+                        .unwrap(),
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_preparation_and_epoch_exhaustion_cannot_revoke_current_authority() {
+        let dir = TempDir::new().unwrap();
+        let alpha = build_handle("alpha", dir.path()).await;
+        let beta = build_handle("beta", dir.path()).await;
+        let registry = Arc::new(
+            GraphRegistry::from_handles(vec![Arc::clone(&alpha), Arc::clone(&beta)]).unwrap(),
+        );
+        let operations = OperationRuntime::new();
+        let first = registry
+            .prepare_same_view(&operations, &alpha.key, transition_deadline())
+            .unwrap();
+        let stale = Arc::clone(locked(&registry.state).candidate.as_ref().unwrap());
+        drop(first);
+        let current = registry
+            .prepare_same_view(&operations, &beta.key, transition_deadline())
+            .unwrap();
+        registry.discard_prepared(&stale);
+        assert!(matches!(
+            registry.prepare_same_view(&operations, &alpha.key, transition_deadline()),
+            Err(ServingTransitionError::Busy)
+        ));
+        assert_eq!(
+            operations.while_open(|| registry.close_prepared(&stale)),
+            Err(ServingTransitionError::StaleAttempt)
+        );
+        assert!(matches!(registry.get(&alpha.key), RegistryLookup::Ready(_)));
+        let transition = current.close().unwrap();
+        assert_eq!(
+            operations.while_open(|| registry.resume_same_view(&stale)),
+            Err(ServingTransitionError::StaleAttempt)
+        );
+        transition.wait_requests().await.unwrap();
+        transition.resume_same_view().unwrap();
+
+        // The exhausted identity is a boundary-value fixture, not a publicly
+        // constructible epoch or a test-only activation capability.
+        {
+            let mut state = locked(&registry.state);
+            let mut graphs = state.snapshot.graphs.clone();
+            graphs.insert(
+                alpha.key.clone(),
+                GraphEntry::Ready(Arc::new(ServingView::new(
+                    Arc::clone(&alpha),
+                    ServingEpoch::MAX,
+                ))),
+            );
+            state.snapshot = Arc::new(RegistrySnapshot::new(graphs));
+        }
+        assert!(matches!(
+            registry.prepare_same_view(&operations, &alpha.key, transition_deadline()),
+            Err(ServingTransitionError::EpochExhausted)
+        ));
+        drop(captured(&registry, &operations, &alpha.key));
+        drop(
+            registry
+                .prepare_same_view(&operations, &beta.key, transition_deadline())
+                .unwrap(),
+        );
     }
 }

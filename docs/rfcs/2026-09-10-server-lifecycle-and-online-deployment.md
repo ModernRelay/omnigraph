@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - OmniGraph maintainers
 created: 2026-09-10
-updated: 2026-09-29
+updated: 2026-10-03
 discussion: https://github.com/ModernRelay/omnigraph/pull/697
 supersedes: []
 superseded_by:
@@ -18,7 +18,7 @@ blocked_on: []
 # RFC: Server lifecycle and online deployment
 
 > **Superseded on 2026-09-29** by [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md).
-> The replacement remains a draft and is not implemented. This document is
+> The replacement is accepted with implementation and qualification gates. This document is
 > retained as historical rationale; its obsolete mechanisms and dependencies
 > are not current implementation requirements.
 

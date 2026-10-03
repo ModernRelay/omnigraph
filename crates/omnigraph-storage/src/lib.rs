@@ -1096,6 +1096,15 @@ pub trait StorageAdapter: Debug + Send + Sync {
     /// the content). The token is opaque — valid only for
     /// `write_text_if_match` against the same adapter.
     async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)>;
+    /// Bounded existence-tolerant versioned read. The text and CAS token come
+    /// from the same GET (remote ETag, or local content hash), never a separate
+    /// HEAD/read pair. Metadata and streaming collection enforce the byte cap;
+    /// an existing empty object returns its empty text and valid token.
+    async fn read_text_versioned_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> Result<Option<(String, String)>>;
     /// Replace the object at `uri` only if its current version still matches
     /// `expected_version` (obtained from a prior versioned read/write on this
     /// adapter). Returns `Ok(Some(new_version))` on success and `Ok(None)`
@@ -2041,6 +2050,64 @@ impl StorageAdapter for ObjectStorageAdapter {
         Ok((text, version))
     }
 
+    async fn read_text_versioned_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> Result<Option<(String, String)>> {
+        let location = self.object_path(uri)?;
+        // A normal GET handles empty objects (an HTTP byte range cannot), and
+        // exposes the exact generation's size/token before body collection.
+        let result = match self.store.get(&location).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(err) => return Err(storage_backend_error("bounded_read", uri, err)),
+        };
+        let limit_error = |actual| StorageError::ResourceLimit {
+            resource: "storage_text_bytes".to_string(),
+            limit: max_bytes,
+            actual,
+            uri: uri.to_string(),
+        };
+        let expected_bytes = result.meta.size;
+        if expected_bytes > max_bytes {
+            return Err(limit_error(expected_bytes));
+        }
+        let etag = result.meta.e_tag.clone();
+        #[cfg(test)]
+        let etag = if self.omit_read_etag { None } else { etag };
+        let remote_token = if self.supports_conditional_update {
+            Some(required_remote_etag("bounded_read", uri, etag)?)
+        } else {
+            None
+        };
+        let mut stream = result.into_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream
+            .try_next()
+            .await
+            .map_err(|err| storage_backend_error("bounded_read", uri, err))?
+        {
+            let actual = (bytes.len() as u64).saturating_add(chunk.len() as u64);
+            if actual > max_bytes {
+                return Err(limit_error(actual));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len() as u64 != expected_bytes {
+            return Err(StorageError::backend(
+                StorageFailureKind::Permanent,
+                format!(
+                    "bounded storage read for '{}' expected {expected_bytes} bytes, received {}",
+                    redacted_storage_uri(uri),
+                    bytes.len()
+                ),
+            ));
+        }
+        let version = remote_token.unwrap_or_else(|| local_version_token(&bytes));
+        Ok(Some((decode_storage_text(uri, &bytes)?, version)))
+    }
+
     async fn write_text_if_match(
         &self,
         uri: &str,
@@ -2311,7 +2378,8 @@ fn is_windows_drive_path(value: &str) -> bool {
 /// filesystem. Required because `object_store::path::Path` rejects
 /// relative and dot segments, while callers (the CLI in particular) pass
 /// paths like `./graph.omni` verbatim.
-fn absolutize_lexically(path: PathBuf) -> Result<PathBuf> {
+#[doc(hidden)]
+pub fn absolutize_lexically(path: PathBuf) -> Result<PathBuf> {
     let joined = if path.is_absolute() {
         path
     } else {
@@ -3388,6 +3456,7 @@ mod tests {
         None,
         MissingHeadEtag,
         ChangeSourceBeforeSecondRange,
+        ChangeSourceAfterGet,
         FailPart(usize),
         FailComplete,
         FailList,
@@ -3396,6 +3465,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct AzureRenameProbe {
         ranges: Mutex<Vec<(Range<u64>, Option<String>)>>,
+        get_requests: std::sync::atomic::AtomicUsize,
+        head_requests: std::sync::atomic::AtomicUsize,
         multipart_creates: std::sync::atomic::AtomicUsize,
         aborts: Arc<std::sync::atomic::AtomicUsize>,
         completes: Arc<std::sync::atomic::AtomicUsize>,
@@ -3494,10 +3565,21 @@ mod tests {
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
             let is_head = options.head;
+            let prior_gets = if is_head {
+                self.probe
+                    .head_requests
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            } else {
+                self.probe
+                    .get_requests
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            };
             let bounded_range = match options.range.as_ref() {
                 Some(GetRange::Bounded(range)) => Some(range.clone()),
                 _ => None,
             };
+            let change_after_read =
+                !is_head && prior_gets == 0 && self.fault == AzureRenameFault::ChangeSourceAfterGet;
             if let Some(range) = bounded_range {
                 let change_source = {
                     let mut ranges = self.probe.ranges.lock().unwrap();
@@ -3514,6 +3596,9 @@ mod tests {
                 }
             }
             let mut result = self.inner.get_opts(location, options).await?;
+            if change_after_read {
+                self.inner.put(location, PutPayload::from("new")).await?;
+            }
             if is_head && self.fault == AzureRenameFault::MissingHeadEtag {
                 result.meta.e_tag = None;
             }
@@ -3681,6 +3766,34 @@ mod tests {
         adapter.write_text(&state, "s1").await.unwrap();
         let (text, v1) = adapter.read_text_versioned(&state).await.unwrap();
         assert_eq!(text, "s1");
+        assert_eq!(
+            adapter
+                .read_text_versioned_if_exists_bounded(&state, 2)
+                .await
+                .unwrap(),
+            Some((text, v1.clone())),
+            "bounded text and CAS token must identify the same complete object"
+        );
+        assert!(matches!(
+            adapter
+                .read_text_versioned_if_exists_bounded(&state, 1)
+                .await,
+            Err(StorageError::ResourceLimit {
+                limit: 1,
+                actual: 2,
+                ..
+            })
+        ));
+        assert_eq!(
+            adapter
+                .read_text_versioned_if_exists_bounded(
+                    &format!("{root}/contract/missing-versioned.json"),
+                    2,
+                )
+                .await
+                .unwrap(),
+            None
+        );
         let v2 = adapter
             .write_text_if_match(&state, "s2", &v1)
             .await
@@ -3701,6 +3814,22 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+
+        let empty = format!("{root}/contract/empty-versioned.json");
+        adapter.write_text(&empty, "").await.unwrap();
+        let (text, token) = adapter
+            .read_text_versioned_if_exists_bounded(&empty, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(text, "");
+        assert!(
+            adapter
+                .write_text_if_match(&empty, "filled", &token)
+                .await
+                .unwrap()
+                .is_some()
         );
 
         // rename: destination is replaced; source is gone.
@@ -4984,6 +5113,11 @@ mod tests {
             .await
             .expect_err("a remote versioned read without an ETag must fail closed");
         assert!(error.to_string().contains("omitted the required ETag"));
+        let error = missing_read
+            .read_text_versioned_if_exists_bounded(uri, 2)
+            .await
+            .expect_err("a bounded remote read must require its own ETag");
+        assert!(error.to_string().contains("omitted the required ETag"));
 
         let mut missing_write = ObjectStorageAdapter::in_memory();
         missing_write.write_text(uri, "v1").await.unwrap();
@@ -4999,6 +5133,40 @@ mod tests {
             "v2",
             "the error is post-effect ambiguity, never a claim that the write was absent"
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_versioned_read_keeps_the_fetched_generation() {
+        let (adapter, probe) = azure_rename_fault_adapter(AzureRenameFault::ChangeSourceAfterGet);
+        let uri = "az://container/state.json";
+        adapter.write_text(uri, "v1").await.unwrap();
+        let (text, token) = adapter
+            .read_text_versioned_if_exists_bounded(uri, 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(text, "v1");
+        assert_eq!(
+            probe
+                .get_requests
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            probe
+                .head_requests
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(adapter.read_text(uri).await.unwrap(), "new");
+        assert!(
+            adapter
+                .write_text_if_match(uri, "bad", &token)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(adapter.read_text(uri).await.unwrap(), "new");
     }
 
     /// Where hard links work the probe is negative and cleans up after

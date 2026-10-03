@@ -34,6 +34,13 @@ async fn synthetic_v6_fixture_with_branch(root: &str, create_branch: bool) {
     .await
     .unwrap();
     drop(db);
+    finish_synthetic_v6_fixture(root, create_branch).await;
+}
+
+/// Turn a freshly written graph into the synthetic v6 shape: settled pins, a
+/// merge-writer `__manifest` history stamped 6, old versions cleaned, and
+/// optionally a native `feature` branch.
+async fn finish_synthetic_v6_fixture(root: &str, create_branch: bool) {
     settle_fixture_pins(root).await;
     persist_legacy_schema_contract(root).await;
     replay_manifest_as_merge_writer(root).await;
@@ -59,6 +66,57 @@ async fn synthetic_v6_fixture_with_branch(root: &str, create_branch: bool) {
             .await
             .unwrap();
     }
+}
+
+/// A synthetic v6 graph whose `Document` table holds a null, a valid empty,
+/// an inline and a packed (above 64 KiB) managed Blob, and a whole-object
+/// external reference to `external_uri`, which `base` admits.
+async fn synthetic_v6_fixture_with_blobs(root: &str, external_uri: &str, base: &Path) {
+    use base64::Engine;
+    let policy = crate::blob::ExternalBlobPolicy::allow(vec![
+        crate::blob::ExternalBlobBase::new(
+            url::Url::from_directory_path(base).unwrap(),
+            crate::blob::ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let db = crate::Session::from_defaults(
+        std::sync::Arc::new(
+            Omnigraph::init_with_legacy_system_columns_for_tests(
+                root,
+                "node Document { title: String @key\n content: Blob? }",
+            )
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+        ),
+        omnigraph_compiler::settings::SessionSettings::default(),
+    );
+    let encode = |bytes: &[u8]| {
+        format!(
+            "base64:{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
+    };
+    let rows = [
+        serde_json::json!({"title": "null", "content": null}),
+        serde_json::json!({"title": "empty", "content": encode(b"")}),
+        serde_json::json!({"title": "inline", "content": encode(b"inline bytes")}),
+        serde_json::json!({"title": "packed", "content": encode(&vec![b'p'; 96 * 1024])}),
+        serde_json::json!({"title": "external", "content": external_uri}),
+    ]
+    .into_iter()
+    .map(|data| serde_json::json!({"type": "Document", "data": data}).to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    // Overwrite keeps the external reference as a descriptor, not its bytes.
+    db.load_jsonl(&rows, crate::loader::LoadMode::Overwrite)
+        .await
+        .unwrap();
+    drop(db);
+    finish_synthetic_v6_fixture(root, false).await;
 }
 
 /// Rebuild `__manifest` version by version with the merge-insert writer v6
@@ -1273,6 +1331,122 @@ async fn storage_upgrade_tracks_metadata_writes_and_no_payload_effects() {
             _ => {}
         }
     }
+}
+
+/// Upgrade validates Blob dependencies without contacting an external store:
+/// the external reference is reported by URI although its object is gone, and
+/// every managed value, the packed one included, is read back.
+#[tokio::test]
+async fn storage_upgrade_validates_managed_blobs_without_contacting_external_stores() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    let graph = tempfile::tempdir().unwrap();
+    let root = graph.path().to_str().unwrap();
+    let sources = tempfile::tempdir().unwrap();
+    let external_path = sources.path().join("external.bin");
+    std::fs::write(&external_path, b"external bytes").unwrap();
+    let external_uri = url::Url::from_file_path(&external_path)
+        .unwrap()
+        .to_string();
+    synthetic_v6_fixture_with_blobs(root, &external_uri, sources.path()).await;
+    // Admission stored the canonical spelling.
+    let stored_uri = url::Url::from_file_path(std::fs::canonicalize(&external_path).unwrap())
+        .unwrap()
+        .to_string();
+    std::fs::remove_file(&external_path).unwrap();
+
+    let tracker = lance_io::utils::tracking_store::IOTracker::default();
+    let probes = crate::instrumentation::QueryIoProbes {
+        manifest_wrapper: Some(Arc::new(tracker.clone())),
+        table_wrapper: Some(Arc::new(tracker.clone())),
+        ..Default::default()
+    };
+    let report = crate::instrumentation::with_query_io_probes(
+        probes,
+        upgrade_storage(
+            root,
+            UpgradeOptions {
+                check: false,
+                to_format: Some(8),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        report.outcome,
+        UpgradeOutcome::Completed,
+        "the external object is deleted, so any read of it fails the upgrade: {report:?}"
+    );
+    assert_eq!(
+        report.work.external_blob_exclusions,
+        BTreeSet::from([stored_uri]),
+        "{report:?}"
+    );
+    let stats = tracker.stats();
+    assert!(
+        stats
+            .requests
+            .iter()
+            .any(|request| request.path.as_ref().ends_with(".blob")),
+        "the packed managed value is read back from its sidecar: {stats:?}"
+    );
+}
+
+/// A managed Blob whose stored payload is shorter than its descriptor fails
+/// the upgrade before any effect.
+#[tokio::test]
+async fn storage_upgrade_refuses_a_truncated_managed_blob() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    let graph = tempfile::tempdir().unwrap();
+    let root = graph.path().to_str().unwrap();
+    let sources = tempfile::tempdir().unwrap();
+    let external_path = sources.path().join("external.bin");
+    std::fs::write(&external_path, b"external bytes").unwrap();
+    let external_uri = url::Url::from_file_path(&external_path)
+        .unwrap()
+        .to_string();
+    synthetic_v6_fixture_with_blobs(root, &external_uri, sources.path()).await;
+    let sidecars = stored_files(graph.path())
+        .into_keys()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "blob")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sidecars.len(), 1, "the packed value has one sidecar");
+    let sidecar = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&sidecars[0])
+        .unwrap();
+    sidecar.set_len(1024).unwrap();
+    drop(sidecar);
+    let before = stored_files(graph.path());
+
+    let report = upgrade_storage(
+        root,
+        UpgradeOptions {
+            check: false,
+            to_format: Some(8),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.outcome, UpgradeOutcome::CheckFailed, "{report:?}");
+    assert!(
+        report.findings.iter().any(|finding| {
+            finding.code == "preflight_failed"
+                && finding.message.contains("Invalid range 0..98304")
+                && finding.message.contains("for object of size 1024 bytes")
+        }),
+        "the refusal must come from the managed Blob read: {report:?}"
+    );
+    assert_eq!(
+        stored_files(graph.path()),
+        before,
+        "no effect before refusal"
+    );
 }
 
 #[tokio::test]
@@ -2809,4 +2983,340 @@ async fn storage_upgrade_then_cleanup_sweeps_linear_history_below_the_last_linea
         1,
         "the row still resolves through the permanent root"
     );
+}
+
+/// A Lance table with the given Blob-bearing schema and one row, written the
+/// way graph tables are (stable row IDs, file format 2.2).
+async fn blob_validation_table(
+    root: &Path,
+    schema: Arc<Schema>,
+    columns: Vec<arrow_array::ArrayRef>,
+) -> Dataset {
+    let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+    Dataset::write(
+        arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema),
+        root.to_str().unwrap(),
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            skip_auto_cleanup: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+fn one_blob(bytes: &[u8]) -> arrow_array::ArrayRef {
+    let mut builder = lance::blob::BlobArrayBuilder::new(1);
+    builder.push_bytes(bytes).unwrap();
+    builder.finish().unwrap()
+}
+
+/// A corrupt `u64::MAX` length costs one chunk of 64 requests, refused at its
+/// first short window; the windows of the values before it are exact and in
+/// order.
+#[tokio::test]
+async fn blob_validation_plans_one_bounded_chunk_for_a_huge_descriptor() {
+    let window = BLOB_VALIDATION_WINDOW_BYTES;
+    let managed = |row_id, length| ManagedBlob { row_id, length };
+    let mut chunks = Vec::new();
+    let error = drain_blob_validation_windows(
+        vec![managed(1, 3 * window + 5), managed(2, u64::MAX)],
+        |requests| {
+            let refuse = requests.iter().any(|request| request.row == 2);
+            chunks.push(requests);
+            async move {
+                if refuse {
+                    Err(invalid("truncated managed Blob dependency"))
+                } else {
+                    Ok(())
+                }
+            }
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("truncated managed Blob dependency"),
+        "{error}"
+    );
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].len(), BLOB_VALIDATION_REQUESTS_PER_READ);
+    let first_value = chunks[0]
+        .iter()
+        .take(4)
+        .map(|request| (request.row, request.range.offset, request.range.length))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        first_value,
+        vec![
+            (1, 0, window),
+            (1, window, window),
+            (1, 2 * window, window),
+            (1, 3 * window, 5)
+        ]
+    );
+    assert!(
+        chunks[0][4..]
+            .iter()
+            .all(|request| request.row == 2 && request.range.length == window)
+    );
+
+    // Values spanning several chunks are read chunk by chunk, every window once.
+    let mut read = Vec::new();
+    drain_blob_validation_windows(
+        vec![managed(3, 150 * window + 1), managed(4, 0), managed(5, 7)],
+        |requests| {
+            assert!(requests.len() <= BLOB_VALIDATION_REQUESTS_PER_READ);
+            read.extend(requests);
+            async { Ok(()) }
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(read.len(), 152);
+    assert_eq!(read[150].range.length, 1);
+    assert_eq!(
+        (
+            read[151].row,
+            read[151].range.offset,
+            read[151].range.length
+        ),
+        (5, 0, 7)
+    );
+}
+
+/// A managed value spanning several windows validates, and the same value
+/// over a truncated sidecar refuses.
+#[tokio::test]
+async fn blob_validation_reads_a_multi_window_value_and_refuses_it_truncated() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, false),
+        lance::blob::blob_field("content", true),
+    ]));
+    let payload = vec![b'w'; 5 * BLOB_VALIDATION_WINDOW_BYTES as usize + 3];
+    let table = blob_validation_table(
+        dir.path(),
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["large"])),
+            one_blob(&payload),
+        ],
+    )
+    .await;
+    let mut work = UpgradeWork::default();
+    validate_blobs(&table, &mut work).await.unwrap();
+    assert!(work.external_blob_exclusions.is_empty());
+
+    let sidecars = stored_files(dir.path())
+        .into_keys()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "blob")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sidecars.len(), 1, "the large value has one sidecar");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&sidecars[0])
+        .unwrap()
+        .set_len(1024)
+        .unwrap();
+    let table = Dataset::open(dir.path().to_str().unwrap()).await.unwrap();
+    let error = validate_blobs(&table, &mut UpgradeWork::default())
+        .await
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(
+        matches!(error, OmniError::Storage(_))
+            && text.contains("Invalid range 0..5242883")
+            && text.contains("for object of size 1024 bytes"),
+        "{error:?}"
+    );
+}
+
+/// A value of exactly one chunk of windows is read in one call of 64
+/// requests, and no empty second call follows.
+#[tokio::test]
+async fn blob_validation_reads_exactly_one_chunk_at_the_request_boundary() {
+    let window = BLOB_VALIDATION_WINDOW_BYTES;
+    let length = BLOB_VALIDATION_REQUESTS_PER_READ as u64 * window;
+    let mut chunks = Vec::new();
+    drain_blob_validation_windows(vec![ManagedBlob { row_id: 9, length }], |requests| {
+        chunks.push(requests);
+        async { Ok(()) }
+    })
+    .await
+    .unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].len(), BLOB_VALIDATION_REQUESTS_PER_READ);
+    let last = chunks[0].last().unwrap();
+    assert_eq!(
+        (last.row, last.range.offset, last.range.length),
+        (9, length - window, window)
+    );
+}
+
+/// A top-level Blob column in the legacy encoding is refused by name before
+/// any descriptor is read.
+#[tokio::test]
+async fn blob_validation_refuses_a_legacy_encoded_blob_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, false),
+        arrow_schema::Field::new("attachment", arrow_schema::DataType::LargeBinary, true)
+            .with_metadata(HashMap::from([(
+                "lance-encoding:blob".to_string(),
+                "true".to_string(),
+            )])),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["row"])),
+            Arc::new(arrow_array::LargeBinaryArray::from_vec(vec![b"legacy"])),
+        ],
+    )
+    .unwrap();
+    // Lance refuses the legacy encoding at file format 2.2 and above.
+    let table = Dataset::write(
+        arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema),
+        dir.path().to_str().unwrap(),
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let field = table.schema().field("attachment").unwrap();
+    assert!(field.is_blob() && !field.is_blob_v2(), "test precondition");
+    let error = validate_blobs(&table, &mut UpgradeWork::default())
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Blob column 'attachment' is not a Blob-v2 column"),
+        "{error}"
+    );
+}
+
+/// The external-dependency limit counts distinct URIs: at the limit, a row
+/// repeating a recorded URI passes and a row naming a new one is refused.
+#[tokio::test]
+async fn blob_validation_external_limit_counts_distinct_uris() {
+    async fn external_table(dir: &Path, name: &str) -> Dataset {
+        let object = dir.join(format!("{name}.bin"));
+        std::fs::write(&object, b"external bytes").unwrap();
+        let mut content = lance::blob::BlobArrayBuilder::new(1);
+        content
+            .push_uri(url::Url::from_file_path(&object).unwrap().as_str())
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, false),
+            lance::blob::blob_field("content", true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["row"])),
+                content.finish().unwrap(),
+            ],
+        )
+        .unwrap();
+        Dataset::write(
+            arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            dir.join(name).to_str().unwrap(),
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                allow_external_blob_outside_bases: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let recorded = external_table(dir.path(), "recorded").await;
+    let mut work = UpgradeWork::default();
+    validate_blobs(&recorded, &mut work).await.unwrap();
+    assert_eq!(work.external_blob_exclusions.len(), 1);
+    work.external_blob_exclusions
+        .extend((1..MAX_ROWS).map(|filler| format!("filler:{filler}")));
+    assert_eq!(work.external_blob_exclusions.len(), MAX_ROWS);
+
+    validate_blobs(&recorded, &mut work).await.unwrap();
+    assert_eq!(work.external_blob_exclusions.len(), MAX_ROWS);
+
+    let unrecorded = external_table(dir.path(), "unrecorded").await;
+    let error = validate_blobs(&unrecorded, &mut work).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("external Blob dependency limit exceeded"),
+        "{error}"
+    );
+}
+
+/// A nested Blob field fails closed whether or not the table also has a
+/// top-level Blob column; with only nested Blob fields there is no top-level
+/// column, and validation must not return early as if there were no Blob.
+#[tokio::test]
+async fn blob_validation_refuses_nested_blob_fields() {
+    let nested = |name: &str| {
+        let field = lance::blob::blob_field("inner", true);
+        let array = arrow_array::StructArray::new(
+            vec![Arc::new(field.clone())].into(),
+            vec![one_blob(b"nested")],
+            None,
+        );
+        (
+            arrow_schema::Field::new(name, array.data_type().clone(), true),
+            Arc::new(array) as arrow_array::ArrayRef,
+        )
+    };
+    let id = || {
+        (
+            arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, false),
+            Arc::new(StringArray::from(vec!["row"])) as arrow_array::ArrayRef,
+        )
+    };
+    let top = || {
+        (
+            lance::blob::blob_field("content", true),
+            one_blob(b"top-level"),
+        )
+    };
+    for (case, fields) in [
+        ("nested only", vec![id(), nested("meta")]),
+        ("mixed", vec![id(), top(), nested("meta")]),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (fields, columns): (Vec<_>, Vec<_>) = fields.into_iter().unzip();
+        let table = blob_validation_table(dir.path(), Arc::new(Schema::new(fields)), columns).await;
+        let before = stored_files(dir.path());
+        let error = validate_blobs(&table, &mut UpgradeWork::default())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("nested Blob field"),
+            "{case}: {error}"
+        );
+        assert_eq!(
+            stored_files(dir.path()),
+            before,
+            "{case}: no effect before refusal"
+        );
+    }
 }

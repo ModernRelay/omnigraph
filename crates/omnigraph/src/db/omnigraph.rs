@@ -7,14 +7,13 @@ use arrow_array::{Array, RecordBatch, StringArray, StructArray, UInt64Array, new
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::blob::{BlobArrayBuilder, blob_field};
-use lance::dataset::scanner::ColumnOrdering;
 use lance::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::types::{PropType, ScalarType};
 use omnigraph_compiler::{
-    DropMode, SchemaIR, SchemaIdentityDomain, SchemaMigrationPlan, SchemaMigrationStep,
-    SchemaShape, SchemaTypeKind, SystemColumns, build_catalog_from_ir, compile_schema_shape,
+    SchemaIR, SchemaIdentityDomain, SchemaMigrationPlan, SchemaMigrationStep, SchemaShape,
+    SchemaTypeKind, SystemColumns, build_catalog_from_ir, compile_schema_shape,
     initialize_schema_ir, plan_schema_migration,
 };
 
@@ -45,12 +44,17 @@ pub use collector::{
 };
 #[doc(hidden)]
 pub use export::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
-pub(crate) use export::{export_blob_values, logical_row_image};
+pub(crate) use export::{
+    LogicalBlobValue, RangedExternalBlobs, export_blob_values, logical_row_image,
+};
 pub use optimize::{CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, SkipReason};
 pub use repair::{
     DatasetRepairStats, RepairAction, RepairClassification, RepairOptions, RepairStats,
 };
-pub use schema_apply::SchemaApplyOptions;
+pub use schema_apply::{
+    PreparedSchemaApply, PreparedSchemaSettlement, SchemaApplyReconciliation,
+    SchemaApplySettlement, SchemaContractDigest, SchemaNonPublicationProof,
+};
 pub use system_column_upgrade::{
     SYSTEM_COLUMNS_PREFLIGHT, SystemColumnUpgradeFinding, SystemColumnUpgradeOptions,
     SystemColumnUpgradeOutcome, SystemColumnUpgradeReport,
@@ -91,6 +95,10 @@ pub struct SchemaApplyResult {
     pub applied: bool,
     pub graph_manifest_version: u64,
     pub steps: Vec<SchemaMigrationStep>,
+    /// The exact commit published by this invocation; absent for an exact no-op.
+    pub commit: Option<GraphCommit>,
+    /// Accepted source and stable schema identity of this invocation's result.
+    pub contract: SchemaContractDigest,
 }
 
 #[derive(Debug, Clone)]
@@ -835,6 +843,22 @@ impl Omnigraph {
         Arc::clone(&self.schema_view.load().source)
     }
 
+    /// Return the source and identity digest from one coherent handle-local
+    /// accepted schema view, including when the graph has named branches.
+    /// This does not refresh storage; callers comparing current durable
+    /// authority must open or refresh under their writer-exclusion boundary.
+    pub fn schema_contract_digest(&self) -> SchemaContractDigest {
+        use sha2::Digest;
+
+        let view = self.schema_view.load();
+        SchemaContractDigest {
+            source_hash: format!("{:x}", sha2::Sha256::digest(view.source.as_bytes())),
+            schema_ir_hash: view.schema_ir_hash.clone(),
+            schema_identity_domain: view.schema_identity_domain.clone(),
+            schema_identity_version: super::schema_state::SCHEMA_IDENTITY_VERSION,
+        }
+    }
+
     /// Publish one coherent handle-local projection after the durable schema
     /// contract is live. The catalog must be bound to the exact accepted IR;
     /// source, catalog, hash, and domain then move through one ArcSwap.
@@ -892,6 +916,14 @@ impl Omnigraph {
     /// The default on every initialized or opened handle is deny. This
     /// consuming builder validates deserialized configuration before replacing
     /// that default, so no writer can observe a partially configured policy.
+    /// A policy with a base that overlaps this handle's own graph root is
+    /// refused at install: ingress would otherwise copy the graph's manifest
+    /// and table bytes into cells readable as ordinary Blob values. This
+    /// install checks no other root. Cluster `validate`, `plan` and `apply`
+    /// compare every base in every scope with the cluster storage root, which
+    /// holds every graph and the ledger. Serve boot compares only the
+    /// server-safe projection of each applied policy with that root, so an
+    /// applied `embedded_only` base is not checked at boot.
     pub fn with_external_blob_policy(
         mut self,
         policy: crate::blob::ExternalBlobPolicy,
@@ -1119,38 +1151,74 @@ impl Omnigraph {
     }
 
     pub async fn plan_schema(&self, desired_schema_source: &str) -> Result<SchemaMigrationPlan> {
-        self.plan_schema_with_options(desired_schema_source, SchemaApplyOptions::default())
-            .await
+        schema_apply::plan_schema(self, desired_schema_source).await
     }
 
-    pub async fn plan_schema_with_options(
+    pub async fn preview_schema_apply(
         &self,
         desired_schema_source: &str,
-        options: SchemaApplyOptions,
-    ) -> Result<SchemaMigrationPlan> {
-        schema_apply::plan_schema(self, desired_schema_source, options).await
-    }
-
-    pub async fn preview_schema_apply_with_options(
-        &self,
-        desired_schema_source: &str,
-        options: SchemaApplyOptions,
     ) -> Result<SchemaApplyPreview> {
-        schema_apply::preview_schema_apply(self, desired_schema_source, options).await
+        schema_apply::preview_schema_apply(self, desired_schema_source).await
     }
 
     pub async fn apply_schema(&self, desired_schema_source: &str) -> Result<SchemaApplyResult> {
-        self.apply_schema_as(desired_schema_source, SchemaApplyOptions::default(), None)
-            .await
+        self.apply_schema_as(desired_schema_source, None).await
     }
 
-    pub async fn apply_schema_with_options(
+    /// Capture a serializable, exact-base schema intent without graph effects.
+    /// The caller must durably retain it before invoking effects if interrupted
+    /// outcomes must be reconciled. This does not reserve or fence the graph.
+    pub async fn prepare_schema_apply_as(
         &self,
         desired_schema_source: &str,
-        options: SchemaApplyOptions,
+        actor: Option<&str>,
+    ) -> Result<PreparedSchemaApply> {
+        schema_apply::prepare_schema_apply(self, desired_schema_source, actor).await
+    }
+
+    /// Execute an engine-issued intent against its exact captured authority.
+    /// A stale intent refuses before effects; it is never silently rebased.
+    pub async fn apply_prepared_schema_as(
+        &self,
+        prepared: &PreparedSchemaApply,
+        actor: Option<&str>,
     ) -> Result<SchemaApplyResult> {
-        self.apply_schema_as(desired_schema_source, options, None)
-            .await
+        schema_apply::apply_prepared_schema(self, prepared, actor).await
+    }
+
+    /// Read exact retained publication evidence, or revalidate a no-op's live
+    /// authority. Missing evidence is unknown and never permits replay. This
+    /// performs no writes and may be used on an `open_read_only` handle.
+    pub async fn reconcile_schema_apply_as(
+        &self,
+        prepared: &PreparedSchemaApply,
+        actor: Option<&str>,
+    ) -> Result<SchemaApplyReconciliation> {
+        schema_apply::reconcile_schema_apply(self, prepared, actor).await
+    }
+
+    /// Issue a serializable neutral settlement intent without graph effects.
+    /// Persist this token before settlement. Current policy authorizes its
+    /// author independently from the actor of the original schema intent.
+    pub async fn prepare_schema_settlement_as(
+        &self,
+        original: &PreparedSchemaApply,
+        actor: Option<&str>,
+    ) -> Result<PreparedSchemaSettlement> {
+        schema_apply::prepare_schema_settlement(self, original, actor).await
+    }
+
+    /// Settle a stopped owner's original schema intent without replaying it.
+    /// May publish the persisted neutral fence at the original candidate only.
+    /// The caller must exclude cleanup/other writers and establish prior native
+    /// and control-I/O quiescence. This grants no general runtime reuse proof.
+    pub async fn settle_prepared_schema_as(
+        &self,
+        original: &PreparedSchemaApply,
+        settlement: &PreparedSchemaSettlement,
+        actor: Option<&str>,
+    ) -> Result<SchemaApplySettlement> {
+        schema_apply::settle_prepared_schema(self, original, settlement, actor).await
     }
 
     /// Apply a schema migration with an explicit actor for engine-layer
@@ -1159,17 +1227,16 @@ impl Omnigraph {
     /// Branch("main"), actor)` before any apply work happens. Denial
     /// returns `OmniError::Policy` and leaves the manifest untouched.
     ///
-    /// The no-actor variants (`apply_schema`, `apply_schema_with_options`)
-    /// pass `None` here. They work fine without a policy; if a policy IS
-    /// installed and actor is None, enforcement intentionally fails to
-    /// prevent silent-bypass-via-forgetting-the-actor footguns.
+    /// The no-actor variant (`apply_schema`) passes `None` here. It works
+    /// without a policy; if a policy IS installed and actor is None,
+    /// enforcement intentionally fails to prevent
+    /// silent-bypass-via-forgetting-the-actor footguns.
     pub async fn apply_schema_as(
         &self,
         desired_schema_source: &str,
-        options: SchemaApplyOptions,
         actor: Option<&str>,
     ) -> Result<SchemaApplyResult> {
-        self.apply_schema_as_with_catalog_check(desired_schema_source, options, actor, |_| Ok(()))
+        self.apply_schema_as_with_catalog_check(desired_schema_source, actor, |_| Ok(()))
             .await
     }
 
@@ -1193,21 +1260,13 @@ impl Omnigraph {
     pub async fn apply_schema_as_with_catalog_check<F>(
         &self,
         desired_schema_source: &str,
-        options: SchemaApplyOptions,
         actor: Option<&str>,
         validate_catalog: F,
     ) -> Result<SchemaApplyResult>
     where
         F: FnOnce(&Catalog) -> Result<()>,
     {
-        schema_apply::apply_schema(
-            self,
-            desired_schema_source,
-            options,
-            actor,
-            validate_catalog,
-        )
-        .await
+        schema_apply::apply_schema(self, desired_schema_source, actor, validate_catalog).await
     }
 
     /// Engine-facing trait surface around `TableStore`.
@@ -1900,6 +1959,7 @@ impl Omnigraph {
         Ok(Snapshot::wrap(manifest.snapshot()))
     }
 
+    #[cfg(test)]
     pub(crate) async fn version(&self) -> u64 {
         self.coordinator.read().await.version()
     }
@@ -2617,6 +2677,12 @@ impl Omnigraph {
     /// return that head's commit id plus the cursor that resumes the feed
     /// immediately after it. A failed export returns `Err` — a usable cursor
     /// never outlives a broken snapshot.
+    ///
+    /// The snapshot uses export's line format, except that a ranged external
+    /// Blob reference, which export refuses, is described as
+    /// `{"uri", "offset", "length"}` as in change images: the consumer starts
+    /// from exactly this state, and refusing would leave the graph with no
+    /// baseline at all.
     pub async fn capture_change_baseline<W: Write>(
         &self,
         branch: &str,

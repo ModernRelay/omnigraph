@@ -17,6 +17,7 @@ use omnigraph_storage::{
     redacted_storage_uri, storage_handle_for_uri, storage_kind_for_uri,
 };
 
+use crate::deployment::{DeploymentBundle, MAX_BUNDLE_BYTES, MAX_LEDGER_BYTES, validate_state};
 use crate::state_lock::{StateLockAcquire, StateLockError, StateLockGuard, acquire_state_lock};
 use crate::{
     ApprovalArtifact, CLUSTER_APPROVALS_DIR, CLUSTER_LOCK_FILE, CLUSTER_RECOVERIES_DIR,
@@ -147,6 +148,16 @@ impl ClusterStore {
         &self.display_root
     }
 
+    /// A local store whose storage root reads as `display_root`. Serving
+    /// compares applied server-safe external Blob bases, which are `s3://`
+    /// only, with this root; a test can therefore reach that comparison
+    /// through the real snapshot reader without an object store.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) fn with_display_root(mut self, display_root: &str) -> Self {
+        self.display_root = display_root.to_string();
+        self
+    }
+
     /// Whether this root holds the cluster state ledger (`__cluster/state.json`)
     /// — i.e. is an actual cluster, not just any directory. Probed via the
     /// the backend (`file://`, `s3://`, or `az://`). Only a successful negative
@@ -164,18 +175,19 @@ impl ClusterStore {
         }
     }
 
-    /// `read_text_versioned`, returning None for a missing object (probed
-    /// via `exists` — the engine error type doesn't discriminate NotFound).
+    /// One bounded GET supplies both the exact bytes and their backend CAS
+    /// token. Missing objects are not probed separately.
     async fn read_versioned_opt(&self, uri: &str) -> Result<Option<(String, String)>, String> {
-        match self.adapter.exists(uri).await {
-            Ok(false) => return Ok(None),
-            Ok(true) => {}
-            Err(err) => return Err(err.to_string()),
-        }
         self.adapter
-            .read_text_versioned(uri)
+            .read_text_versioned_if_exists_bounded(
+                uri,
+                if uri == self.uri(CLUSTER_LOCK_FILE) {
+                    64 * 1024
+                } else {
+                    MAX_LEDGER_BYTES as u64
+                },
+            )
             .await
-            .map(Some)
             .map_err(|err| err.to_string())
     }
 
@@ -430,21 +442,23 @@ impl ClusterStore {
             return Ok(None);
         };
         let uri = self.uri(&relative);
-        match self.adapter.exists(&uri).await {
-            Ok(false) => return Ok(None),
-            Ok(true) => {}
-            Err(err) => return Err(err.to_string()),
-        }
-        self.adapter.read_text(&uri).await.map(Some).map_err(|err| {
-            format!(
-                "could not read catalog payload '{}': {err}",
-                self.display(&relative)
+        self.adapter
+            .read_text_versioned_if_exists_bounded(
+                &uri,
+                crate::config::MAX_CONFIG_SOURCE_BYTES as u64,
             )
-        })
+            .await
+            .map(|read| read.map(|(text, _)| text))
+            .map_err(|err| {
+                format!(
+                    "could not read catalog payload '{}': {err}",
+                    self.display(&relative)
+                )
+            })
     }
 
-    /// Idempotent content-addressed write: a payload already present at its
-    /// digest is by definition identical.
+    /// Immutable content-addressed write. Existing bytes must verify against
+    /// the expected content, not merely occupy its digest-named path.
     pub(crate) async fn write_payload(
         &self,
         kind: &ResourceKind,
@@ -454,15 +468,114 @@ impl ClusterStore {
         let Some(relative) = Self::payload_relative(kind, digest) else {
             return Err("resource kind has no payload".to_string());
         };
+        self.write_content_addressed(
+            &relative,
+            digest,
+            content,
+            crate::config::MAX_CONFIG_SOURCE_BYTES,
+        )
+        .await
+    }
+
+    async fn write_content_addressed(
+        &self,
+        relative: &str,
+        digest: &str,
+        content: &str,
+        max_bytes: usize,
+    ) -> Result<(), String> {
+        if content.len() > max_bytes {
+            return Err(format!("content exceeds encoded byte limit {max_bytes}"));
+        }
+        if sha256_hex(content.as_bytes()) != digest {
+            return Err("content does not match its declared digest".to_string());
+        }
+        let uri = self.uri(relative);
         if self
             .adapter
-            .exists(&self.uri(&relative))
+            .write_text_if_absent(&uri, content)
             .await
             .map_err(|err| err.to_string())?
         {
             return Ok(());
         }
-        self.put_json(&relative, content).await
+        let Some((existing, _)) = self
+            .adapter
+            .read_text_versioned_if_exists_bounded(&uri, max_bytes as u64)
+            .await
+            .map_err(|err| err.to_string())?
+        else {
+            return Err("existing immutable content disappeared during verification".to_string());
+        };
+        if sha256_hex(existing.as_bytes()) != digest || existing != content {
+            return Err(
+                "existing immutable content does not match its recorded digest".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn write_deployment_bundle(
+        &self,
+        bundle: &DeploymentBundle,
+    ) -> Result<String, Diagnostic> {
+        let text = encode_json_bounded(bundle, MAX_BUNDLE_BYTES, false).map_err(|err| {
+            Diagnostic::error("deployment_bundle_bounds", CLUSTER_RESOURCES_DIR, err)
+        })?;
+        let digest = sha256_hex(text.as_bytes());
+        let relative = format!("{CLUSTER_RESOURCES_DIR}/deployment/{digest}.json");
+        self.write_content_addressed(&relative, &digest, &text, MAX_BUNDLE_BYTES)
+            .await
+            .map_err(|err| {
+                Diagnostic::error("deployment_bundle_write", CLUSTER_RESOURCES_DIR, err)
+            })?;
+        Ok(digest)
+    }
+
+    pub(crate) async fn read_deployment_bundle(
+        &self,
+        digest: &str,
+    ) -> Result<DeploymentBundle, Diagnostic> {
+        if !crate::authorization::valid_digest(digest) {
+            return Err(Diagnostic::error(
+                "deployment_bundle_digest",
+                CLUSTER_RESOURCES_DIR,
+                "invalid bundle digest",
+            ));
+        }
+        let relative = format!("{CLUSTER_RESOURCES_DIR}/deployment/{digest}.json");
+        let text = self
+            .adapter
+            .read_text_if_exists_bounded(&self.uri(&relative), MAX_BUNDLE_BYTES as u64)
+            .await
+            .map_err(|err| {
+                Diagnostic::error(
+                    "deployment_bundle_read",
+                    CLUSTER_RESOURCES_DIR,
+                    err.to_string(),
+                )
+            })?
+            .ok_or_else(|| {
+                Diagnostic::error(
+                    "deployment_bundle_missing",
+                    CLUSTER_RESOURCES_DIR,
+                    "immutable bundle is absent",
+                )
+            })?;
+        if sha256_hex(text.as_bytes()) != digest {
+            return Err(Diagnostic::error(
+                "deployment_bundle_digest",
+                CLUSTER_RESOURCES_DIR,
+                "immutable bundle does not match its recorded digest",
+            ));
+        }
+        serde_json::from_str(&text).map_err(|err| {
+            Diagnostic::error(
+                "deployment_bundle_invalid",
+                CLUSTER_RESOURCES_DIR,
+                format!("could not decode immutable bundle: {err}"),
+            )
+        })
     }
 
     /// Read a catalog payload and verify it against its recorded digest.
@@ -586,16 +699,7 @@ impl ClusterStore {
             )
         })?;
 
-        if state.version != 1 {
-            return Err(Diagnostic::error(
-                "unsupported_state_version",
-                "state.version",
-                format!(
-                    "unsupported cluster state version {}; this build supports version 1",
-                    state.version
-                ),
-            ));
-        }
+        validate_state(&state)?;
 
         canonicalize_observation_coordinates(&mut state)?;
 
@@ -623,6 +727,11 @@ impl ClusterStore {
         expected_cas: Option<&str>,
         observations: &mut StateObservations,
     ) -> Result<(), Diagnostic> {
+        validate_state(state)?;
+        // V2 reservations count compact JSON bytes exactly. Keep v1's pretty
+        // JSON plus trailing newline unchanged for existing state consumers.
+        let payload = encode_json_bounded(state, MAX_LEDGER_BYTES, state.version == 1)
+            .map_err(|err| Diagnostic::error("state_write_error", CLUSTER_STATE_FILE, err))?;
         let state_uri = self.uri(CLUSTER_STATE_FILE);
         let current = self.read_versioned_opt(&state_uri).await.map_err(|err| {
             Diagnostic::error(
@@ -631,21 +740,25 @@ impl ClusterStore {
                 format!("could not read state file before write: {err}"),
             )
         })?;
+        if let Some((text, _)) = &current {
+            let previous: ClusterState = serde_json::from_str(text).map_err(|err| {
+                Diagnostic::error("invalid_state_json", CLUSTER_STATE_FILE, err.to_string())
+            })?;
+            validate_state(&previous)?;
+            if previous.version == 2 && state.version != 2 {
+                return Err(Diagnostic::error(
+                    "unsupported_state_version",
+                    CLUSTER_STATE_FILE,
+                    "ledger v2 cannot be downgraded",
+                ));
+            }
+        }
         let current_cas = current
             .as_ref()
             .map(|(text, _)| format!("sha256:{}", sha256_hex(text.as_bytes())));
         if current_cas.as_deref() != expected_cas {
             return Err(state_cas_mismatch());
         }
-
-        let mut payload = serde_json::to_string_pretty(state).map_err(|err| {
-            Diagnostic::error(
-                "state_write_error",
-                CLUSTER_STATE_FILE,
-                format!("could not encode state JSON: {err}"),
-            )
-        })?;
-        payload.push('\n');
 
         let written = match current {
             None => self
@@ -814,6 +927,49 @@ impl ClusterStore {
             }
         }
     }
+}
+
+/// Refuse during serialization, before an oversized encoded body is collected.
+/// Pretty mode includes v1's historical trailing newline in the same cap.
+fn encode_json_bounded<T: serde::Serialize>(
+    value: &T,
+    max_bytes: usize,
+    pretty: bool,
+) -> Result<String, String> {
+    struct BoundedJson {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+    impl std::io::Write for BoundedJson {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.limit - self.bytes.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::FileTooLarge,
+                    format!("encoded control object exceeds {} bytes", self.limit),
+                ));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = BoundedJson {
+        bytes: Vec::new(),
+        limit: max_bytes,
+    };
+    if pretty {
+        serde_json::to_writer_pretty(&mut writer, value)
+    } else {
+        serde_json::to_writer(&mut writer, value)
+    }
+    .map_err(|err| err.to_string())?;
+    if pretty {
+        std::io::Write::write_all(&mut writer, b"\n").map_err(|err| err.to_string())?;
+    }
+    String::from_utf8(writer.bytes).map_err(|err| err.to_string())
 }
 
 fn canonicalize_observation_coordinates(state: &mut ClusterState) -> Result<(), Diagnostic> {

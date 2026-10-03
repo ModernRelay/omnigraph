@@ -24,7 +24,7 @@ pub use catalog::schema_ir::{
     schema_shape_hash_from_ir, system_columns_for_features, validate_schema_ir,
 };
 pub use catalog::schema_plan::{
-    DropMode, SchemaMigrationPlan, SchemaMigrationStep, SchemaTypeKind, plan_schema_migration,
+    SchemaMigrationPlan, SchemaMigrationStep, SchemaTypeKind, plan_schema_migration,
 };
 pub use catalog::schema_shape::{
     EdgeShape, EmbedSourceShape, InterfaceShape, NodeShape, PropertyConstraintShape, PropertyShape,

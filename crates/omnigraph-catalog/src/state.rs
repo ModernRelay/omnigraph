@@ -921,7 +921,7 @@ fn finish_schema_contract_row(
 /// dedicated `read_graph_lineage` scan and the folded `collect_lineage` branch of
 /// `read_manifest_scan` — so the two cannot drift. The caller has already matched
 /// the object type; `row` indexes into the per-batch columns.
-fn decode_graph_commit_row(
+pub(crate) fn decode_graph_commit_row(
     object_ids: &StringArray,
     metadata: &StringArray,
     versions: &UInt64Array,
@@ -956,7 +956,7 @@ fn decode_graph_commit_row(
 /// Decode one `graph_head` row into its exact branch-key / commit-id pair.
 /// Shared by the dedicated lineage reader and the publisher's folded one-scan
 /// path so presence, absence, and malformed-row handling cannot drift.
-fn decode_graph_head_row(
+pub(crate) fn decode_graph_head_row(
     object_ids: &StringArray,
     metadata: &StringArray,
     row: usize,
@@ -1798,7 +1798,7 @@ pub(crate) fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'
         })
 }
 
-fn u64_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt64Array> {
+pub(crate) fn u64_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt64Array> {
     batch
         .column_by_name(name)
         .ok_or_else(|| {
@@ -1835,7 +1835,7 @@ fn required_table_identity(
     })
 }
 
-fn require_null_table_identity(
+pub(crate) fn require_null_table_identity(
     stable_table_ids: &UInt64Array,
     table_incarnation_ids: &UInt64Array,
     row: usize,

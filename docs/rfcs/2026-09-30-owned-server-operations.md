@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-09-30
-updated: 2026-09-30
+updated: 2026-10-02
 discussion: https://github.com/ModernRelay/omnigraph/pull/824
 supersedes: []
 superseded_by: []
@@ -59,6 +59,16 @@ absolute shutdown deadline and existing process watchdog. Cutoff exits nonzero;
 no renewed deadline, late success, old-epoch reopening or automatic replay is
 permitted.
 
+After complete bounded body collection, HTTP read handlers also execute in
+server-owned tasks. The admitted observer and input reservation survive loss
+of the result waiter. MCP tool execution separately retains its observer,
+input and concurrency permit, so its cancellation and 30-second deadline bound
+response waiting rather than engine execution. Completed delivery slots remain
+observed until consumed or abandoned. Read errors and panics remain nonfatal;
+the engine joins registered graph workers before propagating an execution
+panic. This does not own opaque native work beyond the engine future, and does
+not change export/baseline producer cancellation on body abandonment.
+
 A panic in an owned write, lost write ownership or an indeterminate effectful result closes
 admission and signals process shutdown. Keep unresolved operation reservations
 charged until process termination rather than recycling capacity on a false
@@ -70,14 +80,15 @@ validation refusals remain nonfatal; relaxing opaque errors requires typed engin
 proof rather than inspecting HTTP status or diagnostic text. The engine supplies
 operation-local `BeforeEffect` or `Uncertain` evidence separately from the typed
 cause. Only audited owning boundaries mint a pre-effect proof; preparation after
-pending schema completion or earlier attempts cannot inherit a sub-operation's
+earlier effects or attempts cannot inherit a sub-operation's
 proof. Recovery-required, initialization-indeterminate and publication-in-doubt
 outcomes dominate a nested pre-effect wrapper. A failed remainder after branch
 retirement publication or an injected post-publication merge failure likewise
 carries explicit uncertainty. Unwrapped opaque errors remain conservative.
 Native branch-name validation is an ordinary bad-request cause, independent of
-completion evidence. If pending schema completion succeeded first, strip the
-local pre-effect proof while retaining that nonfatal validation cause.
+completion evidence. Earlier effects strip a later sub-operation's pre-effect
+proof without turning an ordinary validation cause into an opaque failure.
+Schema contracts now publish atomically; there is no pending installation on open.
 
 The failure closes admission for all graphs in the process. Shutdown waits for
 the remaining known operations and response/producer owners, then exits 2 without
@@ -139,9 +150,9 @@ These additions belong to the CLI result envelope, not the HTTP `ErrorOutput`.
 
 This narrows the umbrella's initially proposed retry allowance: standalone
 embedded append/merge load preparation conflicts remain exit 1 until separately
-qualified. An embedded conditional mismatch also remains exit 1: opening writable
-storage may already have completed earlier work, so it cannot prove no whole-command
-effects. Neither an HTTP status alone nor error text proves safe retry. A
+qualified. An embedded conditional mismatch also remains exit 1 until its
+whole-command pre-effect proof is qualified. Neither an HTTP status alone nor
+error text proves safe retry. A
 response must satisfy the v0.12 wire contract and typed admission evidence before
 exit 75 is permitted. Classification adds no automatic retry and changes no
 precondition behind the caller's back.
@@ -161,8 +172,11 @@ It does not prove that every returned error or panic has no later storage effect
 Full B remains gated on independently observed ownership and settlement of native
 accepted I/O, protected completion memory/local-I/O capacity and workload bounds.
 That proof must cover local and supported cloud paths, including failure and
-blocking work, before a drained runtime can be reused for online activation.
-No storage format or graph publication protocol changes here.
+blocking work, before granting generic runtime disposal/reuse. The umbrella's
+proposed same-engine E1 transition has a separate qualification gate for coherent
+request bindings, interfering effects and retained resources. It cannot clear
+uncertainty or reopen fatal/shutdown admission. Neither transition is qualified
+by this foundation. No storage format or graph publication protocol changes here.
 
 ## Evidence and rollout
 
@@ -172,7 +186,7 @@ assertions rather than new query semantics or GQT grammar.
 | Owner | Required evidence |
 |---|---|
 | Server `data_routes`, `auth_policy`, `schema_routes`, `stored_queries` | Disconnect an admitted request waiting at an engine gate; join the cancelled waiter before releasing the gate, retain capacity, finish once and permit a same-process sentinel write. Merge plus optional source deletion must both finish after waiter cancellation. Separately inject owner panic before/after publication and require fail-stop. Refused bodies/admissions have no effects. Native branch validation and read-only namespace failures preserve subsequent read/write admission. Pre-effect deletion storage failures preserve admission, exact merge receipts and a sentinel write under slow reads. |
-| Workload/runtime/ingress unit owners; server `mcp` | Atomic close/acquire race, aggregate and per-actor caps, actor-cardinality bound, no early permit release, body/Bytes/producer lifetimes, authenticated MCP admission, panic closes admission, and bounded result delivery. |
+| Workload/runtime/ingress unit owners; server `mcp` | Atomic close/acquire race, aggregate and per-actor caps, actor-cardinality bound, no early permit release, body/Bytes/producer lifetimes, authenticated MCP admission, write panic closes admission, and bounded result delivery. Read disconnect and MCP cancellation/deadline retain execution/input capacity and delay shutdown; read error/panic remains nonfatal; an unconsumed completed result keeps its observer. |
 | Server `boot_settings` and existing process support | Real TCP disconnect and process shutdown with an admitted write; no new admission, one deadline, nonzero cutoff and early fatal containment before/after publication; remaining known owners finish before a nonclean drain. The actual export/baseline producer and response lifetimes are verified separately in `data_routes`. |
 | CLI `cli_data`, `parity_matrix`, `system_remote` | Typed 429 versus generic/malformed errors, exact Retry-After, compound earlier effects, conditional outcomes and one-submission census after uncertain delivery. |
 | Engine/core error, `lifecycle`, `branching`, `failpoints`, loader/schema owners | Initial read refusals across write families retain typed causes and pre-effect evidence; pending completion or prior work cannot leak that proof. Explicit uncertainty dominates ordinary causes after failed release or publication, while validation after successful completion remains nonfatal. |
@@ -219,6 +233,20 @@ Existing data and cluster state require no migration. Server restart remains nec
 schema/stored-query deployment until the separate online-deployment gates pass.
 
 ## Decision log
+
+- 2026-10-02: Extended Ownership and shutdown to read handler execution and
+  MCP tool execution after caller loss, including retained delivery slots.
+  Evidence now distinguishes nonfatal read failures from write uncertainty.
+  Registered graph-worker joins also cover execution and destructor panics;
+  opaque native read tails remain outside this implemented boundary.
+
+- 2026-10-02: Ownership and Whole-command failure outcomes replace the pending
+  schema-installation examples and writable-open completion rationale with the
+  unchanged rule that a sub-operation's proof cannot establish whole-command
+  safety. Substrate boundary replaces "before a drained runtime can be reused
+  for online activation" with generic disposal/reuse qualification and the
+  umbrella's separately proposed same-engine E1 gate. Atomic contract publication
+  removes installation work, not uncertain-write containment or retry boundaries.
 
 - 2026-09-30: Accepted the broader server-owned operation and CLI outcome slice
   on the maintainer's instruction to proceed. Ownership, bounded admission and
