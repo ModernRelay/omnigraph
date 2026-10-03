@@ -7,7 +7,7 @@
 mod helpers;
 
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::error::{ManifestErrorKind, OmniError};
+use omnigraph::error::OmniError;
 use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
@@ -994,10 +994,11 @@ async fn a_write_to_an_unread_table_leaves_the_replay_accepted() {
 }
 
 /// The planner's refusal of a search order on a traversal destination is the
-/// caller's error (a bad request), not a planner defect: the HTTP door maps
-/// the kind, which no `.gqt` case observes.
+/// caller's error, a bad request carrying a plan diagnostic, on the ordinary
+/// door and the inspected one alike; the HTTP door maps the kind, which no
+/// `.gqt` case observes.
 #[tokio::test]
-async fn a_search_order_on_a_traversal_destination_is_a_bad_request() {
+async fn a_search_order_on_a_traversal_destination_is_a_typed_bad_request_issue_786() {
     let dir = tempfile::tempdir().unwrap();
     let db = docs(&dir).await;
     let source = r#"
@@ -1009,7 +1010,7 @@ query nearest_destination($q: Vector(4)) {
 }
 "#;
     let params = ParamMap::from([("q".to_string(), Literal::List(vec![Literal::Float(0.0); 4]))]);
-    let refused = db
+    let inspected = db
         .query_inspected(
             ReadTarget::branch("main"),
             source,
@@ -1018,14 +1019,66 @@ query nearest_destination($q: Vector(4)) {
         )
         .await
         .err()
-        .expect("the shape is refused");
-    assert!(
-        matches!(&refused, OmniError::Manifest(error) if error.kind == ManifestErrorKind::BadRequest),
+        .expect("the shape is refused on the inspected door");
+    let ordinary = db
+        .query(
+            ReadTarget::branch("main"),
+            source,
+            "nearest_destination",
+            &params,
+        )
+        .await
+        .expect_err("the shape is refused on the ordinary door");
+    for refused in [&inspected, &ordinary] {
+        let diagnostic = refused
+            .diagnostic()
+            .unwrap_or_else(|| panic!("a plan refusal carries its diagnostic: {refused:?}"));
+        assert_eq!(diagnostic.code.as_str(), "P001");
+        let stage = diagnostic
+            .stage
+            .as_deref()
+            .expect("a plan refusal names its stage");
+        assert_eq!(stage.name, "plan");
+        assert_eq!(
+            stage.expression.as_deref(),
+            Some("nearest($t.embedding, $q)")
+        );
+        assert_eq!(
+            diagnostic.fix.as_deref(),
+            Some("declare `$t` first in `match`, so the ranking starts the traversal")
+        );
+        assert!(
+            refused.to_string().contains("a traversal destination"),
+            "{refused}"
+        );
+    }
+
+    // A refusal raised while the query is resolved, before lowering, keeps
+    // its diagnostic too: the statistics pass that resolves the query first
+    // must not turn it into a planner defect. An edge wildcard refuses CSR
+    // traversal mode, which only a session pin selects.
+    let csr = with_traversal(&db, omnigraph_compiler::settings::Traversal::Csr);
+    let wildcard = r#"
+query wildcard() {
+    match { $a: Doc $b: Doc $a * $b }
+    return { $b.slug }
+}
+"#;
+    let refused = csr
+        .query(
+            ReadTarget::branch("main"),
+            wildcard,
+            "wildcard",
+            &ParamMap::new(),
+        )
+        .await
+        .expect_err("an edge wildcard refuses CSR traversal mode");
+    assert_eq!(
+        refused
+            .diagnostic()
+            .map(|diagnostic| diagnostic.code.as_str()),
+        Some("P004"),
         "{refused:?}"
-    );
-    assert!(
-        refused.to_string().contains("a traversal destination"),
-        "{refused}"
     );
 }
 
