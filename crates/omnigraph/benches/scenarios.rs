@@ -83,6 +83,14 @@ mod fixture_controls;
 #[cfg(unix)]
 mod concurrent_writes;
 
+#[path = "scenarios/concurrent_merges.rs"]
+#[cfg(unix)]
+mod concurrent_merges;
+
+#[path = "scenarios/run_target.rs"]
+#[cfg(unix)]
+mod run_target;
+
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::sync::Arc;
@@ -405,7 +413,7 @@ fn main() {
     if args.scenario.is_empty() {
         eprintln!(
             "usage: --scenario <merge-all-changed|nearest-prefilter|ann-probe-budget|fenced-small-upsert|\
-             fenced-adopt-all-new|general-merge-updates|branch-create|branch-create-from|branch-list|branch-delete|branch-pointer-adopt-lazy|branch-pointer-adopt-owned|branch-first-write|branch-cleanup|rrf-gate|concurrent-writes> [--rows N] [--dims D] \
+             fenced-adopt-all-new|general-merge-updates|branch-create|branch-create-from|branch-list|branch-delete|branch-pointer-adopt-lazy|branch-pointer-adopt-owned|branch-first-write|branch-cleanup|rrf-gate|concurrent-writes|concurrent-merges> [--rows N] [--dims D] \
              [--seed S] [--runs K] [--selectivity F] [--k K] [--ann-partitions N] \
              [--ann-probes N] [--text-bytes B] [--delta-rows N] \
              [--source-mode update|insert] [--branches N] [--tables N] [--memory-cap-mb M] \
@@ -414,6 +422,8 @@ fn main() {
              concurrent-writes only: [--writers N] [--duration-secs W] [--warmup-secs W] \
              [--write-branches B] [--target-uri s3://…] [--keep-fixture] [--no-probes] \
              [--tokio-workers N]\n\
+             concurrent-merges only: [--writers N (concurrent merges)] [--delta-rows N] \
+             [--target-uri s3://…] [--keep-fixture] [--tokio-workers N]\n\
              Age flags apply only to branch controls, general-merge-updates and concurrent-writes."
         );
         // `cargo bench` with no args must exit 0 so the target stays inert in
@@ -428,6 +438,8 @@ fn main() {
         branch_control::validate_args(&args)
     } else if concurrent_writes::is_scenario(&args.scenario) {
         concurrent_writes::validate_args(&args)
+    } else if concurrent_merges::is_scenario(&args.scenario) {
+        concurrent_merges::validate_args(&args)
     } else {
         rfc023_scenarios::validate_args(&args)
     };
@@ -1007,6 +1019,7 @@ fn run_child(args: &Args) {
             ("rrf-gate", None) => rrf_gate(args).await,
             ("fenced-small-upsert", None) => rfc023_scenarios::fenced_small_upsert(args).await,
             ("concurrent-writes", None) => concurrent_writes::run(args).await,
+            ("concurrent-merges", None) => concurrent_merges::run(args).await,
             (other, phase) => panic!("unknown scenario/phase '{other}/{phase:?}'"),
         }
     });

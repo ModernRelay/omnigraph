@@ -713,9 +713,13 @@ fn concurrent_writes_is_closed_loop_labeled_probe_covered_and_verified() {
         "a failed readback query must surface its error, never read as zero rows"
     );
 
-    // 4. Refusals and invalidation.
-    assert!(source.contains("std::process::exit(78)"));
-    assert!(source.contains("std::process::exit(75)"));
+    // 4. Refusals and invalidation. The run root's reachability refusal (78)
+    //    and the watchdog (75) live in the shared run-target module.
+    let run_target = include_str!("../benches/scenarios/run_target.rs");
+    assert!(run_target.contains("std::process::exit(78)"));
+    assert!(run_target.contains("std::process::exit(75)"));
+    assert!(source.contains(r#"RunTarget::prepare(args, "cw")"#));
+    assert!(source.contains(r#"spawn_watchdog("concurrent-writes""#));
     assert!(judge.contains("concurrent-writes run invalid"));
 
     // Registration: the harness routes the scenario through the single-child
@@ -743,4 +747,54 @@ fn concurrent_writes_is_closed_loop_labeled_probe_covered_and_verified() {
     }
     let rfc023 = include_str!("../benches/scenarios/rfc023.rs");
     assert!(rfc023.contains("super::concurrent_writes::is_scenario(&args.scenario)"));
+}
+
+/// The concurrent-merges scenario's contract: it labels itself as one-shot
+/// overlap evidence, not a claim; it releases the batch through a barrier
+/// with the batch clock started before the release; it refuses an unusable
+/// store and bounds its runtime through the shared run target; and it fails
+/// the child on any merge error or verification mismatch, verifying exact
+/// row counts on a fresh handle and every merge's publication receipt.
+#[test]
+fn concurrent_merges_is_one_shot_labeled_and_verified() {
+    let source = include_str!("../benches/scenarios/concurrent_merges.rs");
+
+    // 1. Self-labeling.
+    assert!(source.contains(r#""driver": "one-shot-batch""#));
+    assert!(source.contains(r#""claim_grade": false"#));
+    assert!(source.contains(r#""last_over_single""#));
+
+    // 2. The batch: released together, clock started before the release.
+    let (_, batch) = source
+        .split_once("async fn merge_batch")
+        .expect("batch region");
+    assert!(batch.contains("tokio::sync::Barrier::new(pairs.len() + 1)"));
+    let (before_release, _) = batch
+        .split_once("\n    barrier.wait().await;\n")
+        .expect("the batch's own barrier wait");
+    assert!(
+        before_release.contains("let batch_start = Instant::now();"),
+        "the batch clock starts before the barrier releases the merges"
+    );
+
+    // 3. Verification: a fresh handle, exact rows, and receipts.
+    let (_, verification) = source
+        .split_once("// ---- Verification on a fresh handle")
+        .expect("verification region");
+    assert!(verification.contains("open_session(&target.root_uri)"));
+    assert!(verification.contains("count_rows_branch"));
+    assert!(verification.contains("merged_parent_commit_id"));
+    assert!(verification.contains("receipts_checked"));
+    assert!(source.contains("concurrent-merges run invalid"));
+
+    // 4. Refusals and the watchdog through the shared run target.
+    assert!(source.contains(r#"RunTarget::prepare(args, "cm")"#));
+    assert!(source.contains(r#"spawn_watchdog("concurrent-merges""#));
+
+    // Registration.
+    let harness = include_str!("../benches/scenarios.rs");
+    assert!(
+        harness.contains(r#"("concurrent-merges", None) => concurrent_merges::run(args).await"#)
+    );
+    assert!(harness.contains("concurrent_merges::validate_args(&args)"));
 }
