@@ -262,7 +262,7 @@ its implementation and backend qualification remain E0 shipping gates.
 | Field | Meaning |
 |---|---|
 | `version`, `mode`, `ledger_id`, `state_revision`, `next_sequence` | Strict encoding/mode; immutable ledger incarnation (ULID); checked monotonic replacement and deployment counters. A canonical deployment ID is `<ledger_id>:<sequence>:<nonce_ULID>`; sequences start at 1. |
-| `applied_revision` | Serving-sufficient resource projection and `result_revision`; this revision advances only when achieved configuration changes. Full convergence alone sets `config_digest`. |
+| `applied_revision` | Serving-sufficient resource projection, an exact-inventory `schema_contracts` map, and `result_revision`; this revision advances only when achieved configuration changes. Full convergence alone sets `config_digest`. |
 | `outstanding` | Null or one immutable input/base/authority identity, per-graph prepared intents and mutable exact outcomes, optional persisted settlement intents, and reserved completion capacity. |
 | `deployment_results` | Bounded terminal records: original ID/input/base, exact outcomes, achieved-result reference, initiating actor and recovery executors. No offline activation witness. |
 
@@ -283,12 +283,23 @@ can be accepted again, even with a new nonce or after result eviction. A lost
 acceptance acknowledgement is resolved by the original full ID; it never grants
 permission to allocate another one.
 
-The achieved base is `{ result_revision, resource_digests, capture_cas }`.
+The achieved base is `{ result_revision, resource_digests, schema_contracts, capture_cas }`.
 The CAS records capture provenance; later progress records use fresh CAS values
 without invalidating an unchanged achieved projection. Applied and active are
 distinct: E0 records no activation, and a settled partial result is a valid base
 for a corrective deployment. No operator must edit the ledger to get past an
 inactive or partially converged predecessor.
+
+Each applied `schema_contracts` entry retains the engine-issued source hash,
+accepted IR hash, schema identity domain and identity version for that graph.
+Conversion captures these from one coherent accepted engine view; successful
+schema outcomes advance them with the resource projection. Refusal and
+not-attempted outcomes preserve them. Bind the same map in the achieved base,
+reserve its encoded capacity, and compare the full identity before serving or
+accepting query-only work, including after terminal receipt eviction. Matching
+source text alone cannot adopt a recreated graph or different accepted IR.
+Explicit authorized schema correction may establish a new exact contract;
+status and boot never manufacture one from a matching text digest.
 
 The immutable input contains normalized configuration semantics and exact schema
 and stored-query bytes, including query deletions. Persist and verify their
