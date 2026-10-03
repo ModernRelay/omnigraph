@@ -24,14 +24,16 @@ five more changes like this one?**
 
 2. **There is one graph-content publication door.** A graph change becomes
    authoritative through one `__manifest` publication containing every
-   visible table pointer and graph-lineage update. A writer never moves a
-   table's linear HEAD: its effects are detached commits the `__manifest`
+   visible table pointer, accepted schema contract and graph-lineage update.
+   A write to an existing registered table never moves its linear HEAD: its effects are detached commits the `__manifest`
    pin `(published_dataset_version, staged_version, transaction_uuid)`
    names, every pin is a detached version that opens, and the pin is the
    table's version for its whole life. A graph table's linear HEAD stays at
    its creation version, recorded per registration as
-   `omnigraph.last_linear_version`, and only `repair` reads it. Per-table
-   publication is never graph publication.
+   `omnigraph.last_linear_version`; `repair` reads it for drift. Added-type
+   admission may also inspect an unregistered deterministic path, but accepts
+   only its qualified original empty version 1, never an advanced HEAD.
+   Per-table publication is never graph publication.
 
 3. **Every operation uses one coherent accepted view.** A read holds one
    immutable snapshot for its lifetime. A writer captures schema, catalog,
@@ -49,10 +51,9 @@ five more changes like this one?**
    staged file nothing references, which a retry ignores. `cleanup`'s
    collector reclaims such a version only when the publication authority
    its transaction properties record is provably gone; age does not prove
-   abandonment. A published table effect is complete at publication and
-   nothing finishes it. The one published effect with work left, a staged
-   schema contract, carries its publishing commit in the manifest itself.
-   There is no side record to classify. The collector holds two properties
+   abandonment. Published table effects and the accepted schema contract
+   are complete in one manifest publication; no contract-file installation
+   remains. There is no side record to classify. The collector holds two properties
    on every run: safety, that every pin of every retained `__manifest`
    version on every live branch still opens and every path its manifest
    lists still exists after the run; and progress, that a table version no
@@ -137,24 +138,22 @@ different:
 ## Current support boundaries
 
 - The server is cluster-only. Runtime graph add/remove is performed by
-  `cluster apply` followed by restart, not an HTTP mutation.
+  v1 `cluster apply` followed by restart, not an HTTP mutation. Explicit
+  stopped-writer conversion to ledger v2 freezes inventory and bindings;
+  offline schema/query deployments use one outstanding durable authority and
+  retain exclusive cluster admission through completion and recovery. Server
+  activation still requires restart. Generic drain does not prove native-I/O
+  settlement or authorize lock release; older/raw/embedded writers outside
+  participating admission remain operator-excluded.
 - Azure writes require the admission wrapper and remain a qualification preview
   pending the adversarial live-Azure matrix. The narrower managed-identity
   smoke proof is complete.
-- The open-time decisions about a schema apply another process may still be
-  running retain a one-mutation-process boundary: a read-write open discards
-  an unpublished staged schema contract and reclaims a schema-apply sentinel,
-  fenced only by process-local gates. A live apply in another process loses
-  its staging and then installs its contract from memory, so within that
-  boundary the graph does not tear, and its sentinel no longer excludes other
-  writers. The residual the boundary carries: if a concurrent read-write open
-  discards a live apply's staging and that apply then lands its manifest commit
-  but dies before installing from memory, the published outcome is paired with
-  the old contract with no staging left to install, so a same-identity
-  contract change can serve stale until the next apply. Add/drop and
-  identity-changing shapes still fail loudly; only a same-identity rewrite is
-  silent, and only outside the single-process boundary. Table effects carry no
-  such boundary: a detached commit needs no takeover.
+- Schema apply retains its main-only, single-live-branch restriction and
+  process-local gate ordering. Its contract and table references publish
+  together; the removed file-installation protocol supplies no distributed
+  lock. Branch creation/deletion and cleanup retain their existing
+  single-writer-process control boundary. Explicit storage conversion
+  requires operator-enforced quiescence.
 - Physical index reconciliation is explicit; there is no background scheduler
   whose queue is a second authority.
 
@@ -166,10 +165,9 @@ code, tests, guide, and—when irreversible—RFC.
 - Does one snapshot or authority token cover the whole operation?
 - Is graph visibility still one manifest publication?
 - Is every pre-publication durable effect unreachable until the manifest names
-  it, is a published table effect complete at its pin, and does a staged
-  contract carry what finishing it needs?
-- Does the change read a table's linear HEAD anywhere but `repair`, or
-  rebuild a registration row without carrying
+  it, and are the table pins and accepted contract complete in that publication?
+- Does it read linear HEAD outside `repair` or qualified original-version
+  admission for an unregistered added-type path, or rebuild a row without carrying
   `omnigraph.last_linear_version` forward?
 - Does the collector's mark set still cover every retained pin, and does its
   sweep still reach every unretained published version?

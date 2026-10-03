@@ -175,13 +175,30 @@ pub struct PlanReadAuthorization {
 }
 
 pub(crate) struct AppliedPolicies {
-    cluster: PolicyEngine,
+    cluster: Option<PolicyEngine>,
     graphs: BTreeMap<String, Arc<PolicyEngine>>,
-    digests: BTreeMap<String, String>,
+    pub(crate) digests: BTreeMap<String, String>,
 }
 
 impl AppliedPolicies {
     pub(crate) async fn load(
+        backend: &ClusterStore,
+        state: &ClusterState,
+    ) -> Result<Self, Diagnostic> {
+        let policies = Self::load_optional(backend, state).await?;
+        if policies.cluster.is_none() {
+            return Err(refusal(
+                "cluster_policy_required",
+                "cluster",
+                "identity-authorized operations require an applied cluster management policy; migrate existing clusters explicitly",
+            ));
+        }
+        Ok(policies)
+    }
+
+    /// Storage owners need no management policy, but every installed graph
+    /// policy is still loaded and enforced by the engine.
+    pub(crate) async fn load_optional(
         backend: &ClusterStore,
         state: &ClusterState,
     ) -> Result<Self, Diagnostic> {
@@ -260,15 +277,21 @@ impl AppliedPolicies {
             digests.insert(address.clone(), entry.digest.clone());
         }
         Ok(Self {
-            cluster: cluster.ok_or_else(|| refusal("cluster_policy_required", "cluster", "identity-authorized operations require an applied cluster management policy; migrate existing clusters explicitly"))?,
+            cluster,
             graphs,
             digests,
         })
     }
 
-    fn check_cluster(&self, actor: &str) -> Result<(), Diagnostic> {
+    pub(crate) fn check_cluster(&self, actor: &str) -> Result<(), Diagnostic> {
         check(
-            &self.cluster,
+            self.cluster.as_ref().ok_or_else(|| {
+                refusal(
+                    "cluster_policy_required",
+                    "cluster",
+                    "identity-authorized operations require an applied cluster policy",
+                )
+            })?,
             actor,
             PolicyAction::ConfigManage,
             "cluster",
@@ -277,7 +300,7 @@ impl AppliedPolicies {
         )
     }
 
-    fn check_graph(
+    pub(crate) fn check_graph(
         &self,
         actor: &str,
         graph: &str,
@@ -756,7 +779,7 @@ pub async fn authorize_apply_plan(
     Ok(authorization)
 }
 
-fn valid_digest(value: &str) -> bool {
+pub(crate) fn valid_digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()

@@ -24,7 +24,7 @@ The invariants behind these rules are in [invariants.md](invariants.md). Lance-d
 | `omnigraph-catalog` | In-source tests (52 today): `crates/omnigraph-catalog/src/tests.rs` for `__manifest` publication, state and lineage, plus in-file tests in `migrations.rs` and `retention.rs` | Module-local fixtures; `omnigraph-core`'s `test-util` helpers |
 | `omnigraph-engine` | `crates/omnigraph/tests/` plus focused in-source tests | `tests/helpers/` and `tests/fixtures/` |
 | `omnigraph-policy` | In-source Cedar policy parsing and evaluation tests | Module-local fixtures |
-| `omnigraph-cluster` | In-source lifecycle tests; `tests/failpoints.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
+| `omnigraph-cluster` | In-source lifecycle, offline deployment and admission tests; `tests/failpoints.rs`; `tests/identity_recovery.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
 | `omnigraph-server` | `crates/omnigraph-server/tests/` | `tests/support/mod.rs` |
 | `omnigraph-cli` | `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
 | `omnigraph-dst` | `crates/omnigraph-dst/tests/` (`scenarios.rs`, `lane_b.rs`, `torn_init.rs`) plus in-source proofs | Crate-local fixtures. Deterministic simulation; needs `--cfg tokio_unstable` (the workspace `.cargo/config.toml` sets it for every build; the default workspace gate excludes the crate by name). Run from `crates/omnigraph-dst`: its `[env]`-only `.cargo/config.toml` supplies the pool trio that `require_pool_env` asserts at process start. `#[ignore]`d tests are fleet/hunt instruments driven by the DST workflows |
@@ -33,7 +33,7 @@ The invariants behind these rules are in [invariants.md](invariants.md). Lance-d
 
 Do not copy server or CLI process setup into a new suite. Their support modules own hermetic configuration, binary startup, temporary roots, and common assertions.
 
-Test helpers that live in `omnigraph-core` or `omnigraph-catalog` and are reached by another crate's tests are gated `#[cfg(any(test, feature = "test-util"))]`. A plain `#[cfg(test)]` is not enough: `cfg(test)` is set per crate, so a dependent crate's test build compiles the base crate without it and cannot see the helper. The engine enables `test-util` on both crates through its dev-dependencies in `crates/omnigraph/Cargo.toml`, so the helpers exist only in test builds and never in a release artifact.
+Test helpers that live in `omnigraph-core` or `omnigraph-catalog` and are reached by another crate's tests are gated `#[cfg(any(test, feature = "test-util"))]`. A plain `#[cfg(test)]` is not enough: `cfg(test)` is set per crate, so a dependent crate's test build compiles the base crate without it and cannot see the helper. The engine enables `test-util` on both crates through its dev-dependencies in `crates/omnigraph/Cargo.toml`, so the helpers exist only in test builds and never in a release artifact. `omnigraph-cluster` follows the same pattern: the server enables its `test-util` feature through its dev-dependencies to read a local cluster's serving snapshot with the storage root spelled as an `s3://` prefix, which is how the server's strict-boot test reaches the external Blob base overlap quarantine without an object store. `forbidden_apis.rs::split_crate_test_util_is_enabled_only_by_dev_dependencies` refuses a production enable of any of the three crates' `test-util` (`SPLIT_CRATE_PACKAGES` plus `TEST_UTIL_SEAM_PACKAGES`).
 
 `tests/forbidden_apis.rs` walks the engine, `omnigraph-core` and `omnigraph-catalog` sources; a line that carries the sentinel comment `// forbidden-api-allow: <reason>`, on the line itself or the line above, is exempt from the lexical deny-list only (the structural graph-write guard still counts it), so every exemption shows up in review.
 
@@ -58,10 +58,10 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Maintenance and substrate fences | `maintenance.rs`, `lance_surface_guards.rs`, `lance_version_columns.rs`, `forbidden_apis.rs` |
 | Export and lineage | `export.rs`, `lineage_projection.rs` |
 | Legacy-vintage graphs (`id`/`src`/`dst` spellings, born at the current stamp) | `legacy_columns.rs` — load, query, export round trip, evolution; needs `--features failpoints` |
-| System-column upgrade (RFC 0040 step 3: respelling in place on a supported standalone graph; vintage is independent of the storage stamp) | `system_column_upgrade.rs` — check and execute, preflight refusals, every window before the manifest commit leaving no residue, a post-commit failure finished by the next read-write open or the same handle's next write, the control-object cost; needs `--features failpoints`. Route composition and the default target: `upgrade/tests.rs` |
-| Cost and benchmark contracts | `write_cost.rs`, `write_cost_s3.rs`, `warm_read_cost.rs`, `branch_control_cost.rs`, `merge_cost.rs`, `changes_cost.rs`, the checkpoint/head lookup instruments, the ignored `manifest_history_curve.rs` instrument (requests, bytes and retained `__manifest` bytes as history grows), and `benchmark_scenario_contract.rs` |
+| System-column upgrade (RFC 0040 step 3: respelling in place on a supported standalone graph; vintage is independent of the storage stamp) | `system_column_upgrade.rs`: check and execute, preflight refusals, every window before the manifest commit leaving no residue, a complete contract and table state after a post-commit failure, same-handle retry, the control-object cost; needs `--features failpoints`. Route composition and the default target: `upgrade/tests.rs` |
+| Cost and benchmark contracts | `write_cost.rs`, `write_cost_s3.rs`, `warm_read_cost.rs`, `branch_control_cost.rs`, `merge_cost.rs`, `changes_cost.rs`, the checkpoint/head lookup instruments, the ignored `manifest_history_curve.rs` instruments (requests, bytes and retained `__manifest` bytes across history and independent schema-source/IR sizes), the ignored `compaction_memory.rs` instrument (peak heap allocation of Blob-table compaction), and `benchmark_scenario_contract.rs` |
 
-Use `tests/helpers/mod.rs` for the standard graph, snapshots, row reads, Blob selectors, and bounded Blob collection. Recovery helpers belong in `tests/helpers/recovery.rs`; object-store counters belong in `tests/helpers/cost.rs`.
+Use `tests/helpers/mod.rs` for the standard graph, snapshots, row reads, Blob selectors, and bounded Blob collection. Recovery helpers belong in `tests/helpers/recovery.rs`; object-store counters belong in `tests/helpers/cost.rs`; graphs whose rows trip the ordered-scan sorter cap belong in `tests/helpers/wide_rows.rs`.
 
 `changes_cost.rs` owns the change-feed cost boundary: transaction-footprint
 candidate scans, bounded page work, and caught-up versus backlog polling curves.
@@ -72,7 +72,7 @@ Crash tests must cover the writer and the user-visible reopening behavior:
 
 - `tests/failpoints.rs` owns crash windows around durable effects: after a detached effect and before publication, where the graph is unchanged, and after publication, where the pin is complete;
 - `tests/detached_commit_matrix.rs` owns the writer × window × fault × recovery-actor matrix under one oracle;
-- `tests/recovery.rs` owns what is left of open-time recovery: a clean open creates nothing, a sidecar from an older build refuses a read-write open and not a read-only one, and a read-only open never touches schema staging;
+- `tests/recovery.rs` owns manifest-only contract admission, ignored orphan schema artifacts and read-only opens without writes; a sidecar from an older build refuses read-write but not read-only open. Read-write open of a local root retains its temporary create-if-absent capability probe;
 - `tests/lance_surface_guards.rs` owns the Lance detached-commit facts the pin and the collector depend on;
 - the writer's normal integration owner proves pre-effect failures leave no residue.
 
@@ -103,6 +103,7 @@ When adding a new writer, update all of these layers. See [recovery.md](recovery
 Blob coverage is deliberately split:
 
 - engine `end_to_end.rs`, `branching.rs`, and in-source Blob tests own logical cell selection, snapshots, integrity, ranges, external classification, and write admission;
+- engine `maintenance.rs` owns Blob compaction (the batch derived from a row's summed Blob columns, fragments with deleted rows, per-task sizing in `maintenance.rs::optimize_sizes_each_compaction_task_from_its_own_fragments`, external references counting nothing in `maintenance.rs::optimize_does_not_size_a_blob_batch_by_external_references`), and `db/upgrade/tests.rs` owns the storage upgrade's source Blob validation (window chunks, the legacy-encoding and nested refusals, the distinct-URI external limit);
 - cluster tests own persisted external-source policy and serving projections;
 - server `data_routes.rs`, `auth_policy.rs`, and `openapi.rs` own GET/HEAD, auth, conditions, ranges, redirects, backpressure, and schema drift;
 - CLI `cli_data.rs` owns `blob get/stat`; `parity_matrix.rs` compares embedded and remote results.
@@ -123,7 +124,29 @@ The guards pin only substrate behavior OmniGraph actually depends on: version an
 
 Server suites are organized by public route: `auth_policy`, `data_routes`, `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings`, object-store coverage in `s3`, and the generated contract in `openapi`.
 
+Per-graph serving transitions extend these owners: in-source `registry` tests
+own capture/close ordering, deadlines, schema identity and candidate bounds;
+`operations`, `ingress` and `mcp` own detached execution and output lifetimes.
+`stored_queries` parks a request before engine capture, `data_routes` retains
+disconnected writes and stream bytes, and `boot_settings`/`mcp` check authorized
+availability. These prove unchanged-view resumption, not native settlement.
+
 CLI suites own their named planes: cluster lifecycle, data commands, stored queries, schema/config, cross-version rebuild, embedded/remote parity, and local/remote system journeys. Keep `OMNIGRAPH_HOME` hermetic by using `tests/support::cli()` or `cli_process()`.
+
+Offline deployment tests extend these owners: cluster `tests.rs` pins no-reset
+ledger conversion, captured source bytes, exact-ID lookup, bounded results and
+exact applied schema identity after receipt eviction; `admission.rs` pins lifetime
+exclusion and exact reconciliation admission. Cluster `tests/failpoints.rs` owns
+interruption windows, killed-process recovery and corrective successors;
+`tests/identity_recovery.rs` owns current-actor authorization and adoption of a
+persisted settlement without replacing its author. CLI
+`tests/cli_cluster_e2e.rs` owns the root-only deployment round trip, and
+`tests/cli_cluster.rs` owns CLI admission. Engine `tests/schema_apply.rs` owns
+strict prepared publication and settlement proofs, with actor checks in
+`tests/policy_engine_chassis.rs`; catalog tests own numeric CAS. The storage
+in-source contract owns bounded same-GET bytes/tokens, and cluster
+`tests/s3_cluster.rs` owns the shared S3/Azure backend journey. Passing Azurite is
+not qualification of live Azure lease-loss or delayed accepted writes.
 
 The cross-version rebuild owner, `crossversion_upgrade.rs`, skips each predecessor case when its binary is not configured, so a local `cargo test -p omnigraph-cli --test crossversion_upgrade` is green even while CI's `V5 ↔ V10 Format Fence` is red. To run the fence locally, build the predecessor CLI from the commit `ci.yml` pins as `FINAL_INTERNAL_V5_COMMIT` (`git worktree add <dir> <sha>`, then `cargo build --locked -p omnigraph-cli --bin omnigraph` inside it) and run the exact case with that binary:
 
@@ -134,20 +157,44 @@ OMNIGRAPH_V5_BIN=<dir>/target/debug/omnigraph cargo test --locked -p omnigraph-c
 The older seams work the same way with released binaries: `OMNIGRAPH_OLD_BIN` (0.7.2) and `OMNIGRAPH_PREVIOUS_BIN` (0.8.1). `OMNIGRAPH_V6_BIN` (the 0.10.0 release) owns the v6↔v10 fence. RFC 0062 introduced v7's registration clock, RFC 0042's native-ref retirement metadata requires v8, RFC 0040's system columns stamped new graphs v9, and RFC 0067's detached table commits stamp every graph v10. The v0.9 journey is a different case, a fully exercised v6 graph — branches, edges, vectors, full-text and blobs — that the current binary refuses and that is rebuilt from a 0.9 export; `Test Workspace` runs both on every pull request that changes engine input, with the releases it installs.
 
 The separate `Storage Upgrade Compatibility` CI job requires genuine v0.9 and
-v0.10 local standalone journeys: the v6 → v7 → v8 route with `--to-format 8`
-first, then the default route to v10 on the same branched fixture, which the
-journey asserts keeps every branch and every table byte. It fails
-missing predecessor binaries, missing cases and skipped required cases. Engine
-storage-upgrade tests own direct v7 → v8 conversion, exact pending v6 → v7
-recovery before composition, explicit target 7, deferred check reporting,
-v8 no-op admission with retained retired refs, the v8 and v9 → v10 stamp
-step (`storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v10`,
-`storage_upgrade_default_route_takes_a_v9_graph_to_v10`) and the synthetic
-v6/v7 → v10 composition (`storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v10`;
-no genuine predecessor binary executes that step yet). Keep the normal-open
-format fences: explicit conversion does not grant serving support for
-v6/v7/v8/v9.
-See the [support matrix](versioning.md#storage-upgrade-support-matrix).
+v0.10 local standalone journeys. Each first takes v6 → v7 → v8 with
+`--to-format 8`, then the default v8 → v10 → v11 → v13 route on the same
+branched fixture. The owners compare exports, table payload files, branch
+ancestry, commit IDs, numeric snapshots and Blob bytes, and verify that the
+accepted source/IR text moves into each branch's contract row before the root
+files disappear. Missing predecessors, missing cases, empty runs and skipped
+required cases fail the job; a local environment-gated skip is not evidence.
+
+For local storage-upgrade journeys, put verified released executables at
+`target/storage-upgrade-binaries/v0.9.0/omnigraph` and
+`target/storage-upgrade-binaries/v0.10.0/omnigraph` in the workspace, then run:
+
+```bash
+cargo test --workspace --locked --test crossversion_upgrade --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints storage_upgrade -- --test-threads=1
+```
+
+The existing CI environment inputs take precedence. Without those inputs,
+the presence of `target/storage-upgrade-binaries` requires both local fixtures;
+a missing file or unexpected exact release version fails. The harness logs
+the selected executable, and `check-storage-upgrade-ci.py --check-log
+crossversion <log>` rejects a skipped required journey.
+
+`db/upgrade/tests.rs` owns route composition and intermediate targets, deferred
+check reporting, intent recovery, retired ancestry, v10 pin promotion and
+cleanup, and the v13 conversion protocol. Its fixtures must include actual
+flat-v11 and packed-v12 sources without contract rows, both mixed branch
+directions, zero-effect checks, exact contract identity and text digests,
+foreign movement and every interruption boundary, including each legacy-file
+delete. The upgrade-only v10 constructor must not admit ordinary opens while
+its handle exists, even for an unexpectedly row-bearing source. Current-v13
+no-op cases preserve ignored orphan files/staging and allow the former
+sentinel name as a user branch. Keep ordinary-open refusal for all pre-v13
+stamps; an explicit intermediate stop does not grant serving support.
+`schema_apply.rs`, `system_column_upgrade.rs` and historical-read owners cover
+atomic contract publication, first-touch retry and current-contract historical
+reads. The catalog tests own row uniqueness, projection and validation;
+`lance_surface_guards.rs` owns the filtered packed-record scan. See the
+[support matrix](versioning.md#storage-upgrade-support-matrix).
 
 The system tests start workspace binaries on ephemeral localhost ports. Set `OMNIGRAPH_SKIP_SYSTEM_E2E=1` only in constrained local sandboxes; CI's configured owners must not skip.
 

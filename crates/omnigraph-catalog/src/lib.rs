@@ -18,6 +18,11 @@ pub mod commit_graph;
 
 mod commit;
 mod record;
+mod schema_publication;
+pub use schema_publication::{
+    SchemaPublicationCandidate, SchemaPublicationEvidence, read_schema_publication_at,
+    read_schema_publication_candidate_at,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -78,10 +83,11 @@ use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome}
 pub use state::DatasetEntry;
 #[cfg(test)]
 use state::string_column;
-pub use state::{GraphLineageRow, read_graph_lineage};
+pub use state::{GraphLineageRow, SchemaContractHead, SchemaContractRow, read_graph_lineage};
 use state::{
     ManifestState, ProjectionAccumulator, fold_projection_delta, read_manifest_projection,
-    read_manifest_state, read_object_identities_at_offsets,
+    read_manifest_projection_with_contract, read_manifest_state, read_object_identities_at_offsets,
+    read_schema_contract_row,
 };
 
 /// The maximum supported storage-format stamp, the one this binary writes; the
@@ -107,6 +113,14 @@ pub const OBJECT_TYPE_GRAPH_HEAD: &str = "graph_head";
 /// `object_id` prefix of the head rows — one constant for row minting, row
 /// decode, and the incremental fold's dead-row classification.
 pub(crate) const GRAPH_HEAD_OBJECT_ID_PREFIX: &str = "graph_head:";
+/// The one live schema-contract row of main's `__manifest` (stamp 13): the
+/// `.pg` source and the IR text in the `schema_source` and `schema_ir`
+/// columns, the IR hash and the identity version and domain in `metadata`
+/// ([`SchemaContractHead`]). A schema apply's publish replaces it in the same
+/// commit as the table rows and the head, the way `graph_head:<branch>` moves.
+pub const OBJECT_TYPE_SCHEMA_CONTRACT: &str = "schema_contract";
+/// The fixed `object_id` of the `schema_contract` row.
+pub const SCHEMA_CONTRACT_OBJECT_ID: &str = "schema_contract";
 
 /// Stable head-key segment for the main branch in `graph_head:<branch>` rows.
 /// `table_branch`/`manifest_branch` encode main as null, but `object_id` must be
@@ -149,6 +163,12 @@ pub async fn read_supported_internal_schema_version(root_uri: &str) -> Result<u3
     migrations::guard_stamp(&dataset)
 }
 
+/// Metadata-only capture of main's served-format manifest, consumed once after admission.
+pub struct PreparedManifestOpen {
+    root_uri: String,
+    dataset: Dataset,
+}
+
 /// Whether the selected graph-manifest dataset depends on files outside its
 /// own dataset root.
 ///
@@ -180,10 +200,15 @@ pub struct Snapshot {
     /// resolving the head separately (e.g. via `CommitGraph`) could pair this
     /// snapshot's datasets with a different version's head.
     pub graph_heads: HashMap<String, String>,
+    /// The `schema_contract` row's head from this SAME pinned manifest
+    /// version (see `ManifestState::schema_contract`).
+    schema_contract: Option<SchemaContractHead>,
+    manifest_dataset: Option<Dataset>,
+    captured_contract: Option<Arc<SchemaContractRow>>,
     /// Logical graph branch used to capture this snapshot, including historical reads.
     graph_branch: Option<String>,
     /// Native ref of the live branch coordinator; named writes record it as fork owner.
-    /// `None` on main, time-travel reads, and directly built test snapshots.
+    /// `None` on main and directly built test snapshots.
     native_branch: Option<String>,
     /// Per-graph read caches (shared `Session` + held-handle cache), injected by
     /// `Omnigraph::resolved_target` for live Branch reads so dataset opens reuse
@@ -462,6 +487,30 @@ impl Snapshot {
     pub fn graph_head(&self, branch: Option<&str>) -> Option<&str> {
         let branch_key = branch.unwrap_or(MAIN_BRANCH_HEAD_KEY);
         self.graph_heads.get(branch_key).map(String::as_str)
+    }
+
+    /// The schema contract's head (IR hash, identity version and domain) from
+    /// this snapshot's own pinned manifest version. `None` only for a version
+    /// written before the contract lived in `__manifest` (a time-travel read
+    /// of a stamp-12 version) or a directly built test snapshot.
+    pub fn schema_contract(&self) -> Option<&SchemaContractHead> {
+        self.schema_contract.as_ref()
+    }
+
+    /// Whether both snapshots captured the same immutable manifest image.
+    pub fn same_manifest_image(&self, other: &Self) -> bool {
+        self.root_uri == other.root_uri
+            && self.version == other.version
+            && self.native_branch == other.native_branch
+            && self.schema_contract == other.schema_contract
+            && match (&self.manifest_dataset, &other.manifest_dataset) {
+                (Some(left), Some(right)) => publisher::manifest_image_matches(
+                    left.manifest(),
+                    left.manifest_location(),
+                    right,
+                ),
+                _ => false,
+            }
     }
 
     /// Bind the current accepted catalog's aliases onto a historical snapshot
@@ -863,6 +912,7 @@ impl CollectorBranch {
         );
         snapshot.graph_branch = self.branch.clone();
         snapshot.native_branch = self.dataset.manifest().branch.clone();
+        snapshot.manifest_dataset = Some(self.dataset.clone());
         Ok(snapshot)
     }
 }
@@ -886,6 +936,9 @@ pub enum ManifestChange {
     RegisterTable(TableRegistration),
     RenameTable(TableRename),
     Tombstone(TableTombstone),
+    /// Replace the live `schema_contract` row with this contract, in the same
+    /// publish as the batch's table rows and head. At most one per batch.
+    SchemaContract(SchemaContractRow),
 }
 
 /// One table-version authority assertion supplied to a publish attempt.
@@ -1012,6 +1065,7 @@ async fn fragment_deletion_offsets(
 pub struct ManifestCoordinator {
     root_uri: String,
     dataset: Dataset,
+    captured_contract: Option<Arc<SchemaContractRow>>,
     pub known_state: ManifestState,
     active_branch: Option<String>,
     /// The native Lance ref `active_branch` resolved to at open time
@@ -1059,6 +1113,7 @@ impl ManifestCoordinator {
         Self {
             root_uri: self.root_uri.clone(),
             dataset: self.dataset.clone(),
+            captured_contract: self.captured_contract.clone(),
             known_state: self.known_state.clone(),
             active_branch: self.active_branch.clone(),
             native_branch: self.native_branch.clone(),
@@ -1098,6 +1153,7 @@ impl ManifestCoordinator {
             root_uri: root_uri.trim_end_matches('/').to_string(),
             dataset,
             known_state,
+            captured_contract: None,
             active_branch,
             native_branch,
             branch_identifier,
@@ -1137,6 +1193,9 @@ impl ManifestCoordinator {
                 .map(|entry| (entry.type_key.clone(), entry))
                 .collect(),
             graph_heads: state.graph_heads,
+            schema_contract: state.schema_contract,
+            manifest_dataset: None,
+            captured_contract: None,
             graph_branch: None,
             native_branch: None,
             read_caches: None,
@@ -1160,7 +1219,8 @@ impl ManifestCoordinator {
 
     /// Test-only composition of the two init halves; production init goes
     /// through them separately so the commit point is a caller-visible
-    /// boundary (issue #495).
+    /// boundary (issue #495). The genesis `schema_contract` row carries
+    /// [`SchemaContractRow::for_test_catalog`].
     #[cfg(any(test, feature = "test-util"))]
     pub async fn init_with_lineage(
         root_uri: &str,
@@ -1168,26 +1228,113 @@ impl ManifestCoordinator {
         control_session: &Arc<lance::session::Session>,
     ) -> Result<(Self, Vec<GraphLineageRow>)> {
         let attempt = GenesisManifestAttempt::mint(catalog.system_columns)?;
-        let dataset = Self::init_commit(root_uri, catalog, control_session, &attempt).await?;
+        let contract = SchemaContractRow::for_test_catalog(catalog)?;
+        let dataset =
+            Self::init_commit(root_uri, catalog, &contract, control_session, &attempt).await?;
         Self::finish_init(root_uri, dataset).await
     }
 
     /// Commit half of manifest init; ends at the `__manifest` Create commit
-    /// (assembled in `init_manifest_graph`).
+    /// (assembled in `init_manifest_graph`), which carries `contract` as the
+    /// genesis `schema_contract` row.
     #[doc(hidden)]
     pub async fn init_commit(
         root_uri: &str,
         catalog: &Catalog,
+        contract: &SchemaContractRow,
         control_session: &Arc<lance::session::Session>,
         attempt: &GenesisManifestAttempt,
     ) -> std::result::Result<Dataset, ManifestInitError> {
         init_manifest_graph(
             root_uri.trim_end_matches('/'),
             catalog,
+            contract,
             control_session,
             attempt,
         )
         .await
+    }
+
+    /// The `schema_contract` row at this coordinator's pinned manifest
+    /// version, texts included: captured content or one filtered scan,
+    /// checked against the head folded from the same version.
+    pub async fn read_schema_contract(&self) -> Result<SchemaContractRow> {
+        if let Some(row) = &self.captured_contract
+            && self.known_state.schema_contract.as_ref() == Some(&row.head)
+        {
+            return Ok((**row).clone());
+        }
+        if let Some(batch) = self.publisher.cached_rows(&self.dataset) {
+            return state::schema_contract_from_batch(
+                &self.dataset,
+                &batch,
+                self.known_state.schema_contract.as_ref(),
+            );
+        }
+        read_schema_contract_row(&self.dataset, self.known_state.schema_contract.as_ref()).await
+    }
+
+    /// Read contract content from the exact native branch and version already
+    /// captured by a live snapshot. A retained retired ref returns its original
+    /// contract; a missing captured ref fails without selecting a replacement.
+    pub async fn read_schema_contract_for_snapshot(
+        root_uri: &str,
+        snapshot: &Snapshot,
+    ) -> Result<SchemaContractRow> {
+        if root_uri.trim_end_matches('/') != snapshot.root_uri {
+            return Err(OmniError::manifest(
+                "schema-contract snapshot belongs to another root",
+            ));
+        }
+        if let Some(row) = &snapshot.captured_contract
+            && snapshot.schema_contract() == Some(&row.head)
+        {
+            return Ok((**row).clone());
+        }
+        if let Some(dataset) = &snapshot.manifest_dataset {
+            return read_schema_contract_row(dataset, snapshot.schema_contract()).await;
+        }
+        if snapshot.graph_branch().is_some() && snapshot.native_branch().is_none() {
+            return Err(OmniError::manifest(
+                "named schema-contract snapshot lacks native branch provenance",
+            ));
+        }
+        let control_session = crate::lance_access::control_session();
+        let dataset = open_manifest_dataset_native_with_session(
+            root_uri.trim_end_matches('/'),
+            snapshot.native_branch(),
+            &control_session,
+        )
+        .await?;
+        let dataset = dataset
+            .checkout_version(snapshot.graph_manifest_version())
+            .await
+            .map_err(OmniError::storage)?;
+        read_schema_contract_row(&dataset, snapshot.schema_contract()).await
+    }
+
+    /// The `schema_contract` row of `branch` (main when `None`) at `version`,
+    /// texts included, read from a fresh open without a coordinator. The row
+    /// is checked against the head folded from a state read of that same
+    /// version, so the read is two scans.
+    pub async fn read_schema_contract_at(
+        root_uri: &str,
+        branch: Option<&str>,
+        version: u64,
+    ) -> Result<SchemaContractRow> {
+        let control_session = crate::lance_access::control_session();
+        let dataset = open_manifest_dataset_with_session(
+            root_uri.trim_end_matches('/'),
+            branch,
+            &control_session,
+        )
+        .await?;
+        let dataset = dataset
+            .checkout_version(version)
+            .await
+            .map_err(OmniError::storage)?;
+        let state = read_manifest_state(&dataset).await?;
+        read_schema_contract_row(&dataset, state.schema_contract.as_ref()).await
     }
 
     /// Probe an acknowledgement-unknown manifest Create and accept only the
@@ -1298,19 +1445,125 @@ impl ManifestCoordinator {
         // `refresh_with_lineage`: this body now builds the projection
         // accumulators and is awaited inside merge authority capture and
         // publication.
-        Box::pin(Self::open_with_lineage_inner(
+        let (coordinator, lineage, _) = Box::pin(Self::open_with_lineage_inner(
             root_uri,
             branch,
             control_session,
+            false,
         ))
-        .await
+        .await?;
+        Ok((coordinator, lineage))
+    }
+
+    /// Capture state, lineage and contract from one pinned image. Content errors are
+    /// returned separately so callers can refresh before admitting that image.
+    pub async fn open_with_lineage_and_contract(
+        root_uri: &str,
+        branch: Option<&str>,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<(Self, Vec<GraphLineageRow>, Result<SchemaContractRow>)> {
+        let (coordinator, lineage, contract) = Box::pin(Self::open_with_lineage_inner(
+            root_uri,
+            branch,
+            control_session,
+            true,
+        ))
+        .await?;
+        Ok((
+            coordinator,
+            lineage,
+            contract.expect("contract projection returns its complete schema row"),
+        ))
+    }
+
+    /// Check the held image against ordinary serving bounds, independently of conversion admission.
+    pub fn validate_serving_format(&self) -> Result<()> {
+        migrations::refuse_if_stamp_unsupported(migrations::guard_stamp(&self.dataset)?)
+    }
+
+    /// Validate ordinary serving before the schema queue without discarding the opened dataset.
+    pub async fn prepare_open_with_contract(
+        root_uri: &str,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<PreparedManifestOpen> {
+        let root = root_uri.trim_end_matches('/');
+        let dataset = open_manifest_dataset_with_session(root, None, control_session).await?;
+        migrations::refuse_if_stamp_unsupported(migrations::guard_stamp(&dataset)?)?;
+        Ok(PreparedManifestOpen {
+            root_uri: root.to_string(),
+            dataset,
+        })
+    }
+
+    /// Consume the admitted main image; retry a failed old scan only after proving it changed.
+    pub async fn open_prepared_with_lineage_and_contract(
+        root_uri: &str,
+        prepared: PreparedManifestOpen,
+    ) -> Result<(Self, Vec<GraphLineageRow>, Result<SchemaContractRow>)> {
+        let root = root_uri.trim_end_matches('/');
+        if prepared.root_uri != root {
+            return Err(OmniError::manifest_internal(
+                "prepared manifest belongs to a different graph root",
+            ));
+        }
+        let dataset = prepared.dataset;
+        let control_session = dataset.session();
+        let captured_manifest = dataset.manifest().clone();
+        let captured_location = dataset.manifest_location().clone();
+        let captured = Box::pin(Self::project_opened_with_lineage(
+            root,
+            None,
+            dataset,
+            lance::dataset::refs::BranchIdentifier::main(),
+            None,
+            true,
+        ))
+        .await;
+        let (coordinator, lineage, contract) = match captured {
+            Ok(captured) => captured,
+            Err(error) => {
+                let current =
+                    open_manifest_dataset_with_session(root, None, &control_session).await?;
+                let location = current.manifest_location();
+                if captured_location.path == location.path
+                    && captured_location.version == location.version
+                    && captured_location.naming_scheme == location.naming_scheme
+                    && captured_location.e_tag == location.e_tag
+                    && captured_location.size == location.size
+                    && &captured_manifest == current.manifest()
+                    && captured_manifest.schema.metadata == current.schema().metadata
+                {
+                    return Err(error);
+                }
+                migrations::refuse_if_stamp_unsupported(migrations::guard_stamp(&current)?)?;
+                Box::pin(Self::project_opened_with_lineage(
+                    root,
+                    None,
+                    current,
+                    lance::dataset::refs::BranchIdentifier::main(),
+                    None,
+                    true,
+                ))
+                .await?
+            }
+        };
+        Ok((
+            coordinator,
+            lineage,
+            contract.expect("contract projection returns its complete schema row"),
+        ))
     }
 
     async fn open_with_lineage_inner(
         root_uri: &str,
         branch: Option<&str>,
         control_session: &Arc<lance::session::Session>,
-    ) -> Result<(Self, Vec<GraphLineageRow>)> {
+        read_contract: bool,
+    ) -> Result<(
+        Self,
+        Vec<GraphLineageRow>,
+        Option<Result<SchemaContractRow>>,
+    )> {
         let root = root_uri.trim_end_matches('/');
         let branch = branch.filter(|branch| *branch != "main");
         // Retain the fold accumulators alongside the state (the incremental merge-authority projection): the
@@ -1318,7 +1571,39 @@ impl ManifestCoordinator {
         // deltas into, instead of a sunk cost repeated per refresh.
         let (dataset, branch_identifier, native_branch) =
             open_manifest_branch_with_identifier(root, branch, control_session).await?;
-        let (known_state, projection, lineage_rows) = read_manifest_projection(&dataset).await?;
+        Self::project_opened_with_lineage(
+            root,
+            branch,
+            dataset,
+            branch_identifier,
+            native_branch,
+            read_contract,
+        )
+        .await
+    }
+
+    async fn project_opened_with_lineage(
+        root: &str,
+        branch: Option<&str>,
+        dataset: Dataset,
+        branch_identifier: lance::dataset::refs::BranchIdentifier,
+        native_branch: Option<String>,
+        read_contract: bool,
+    ) -> Result<(
+        Self,
+        Vec<GraphLineageRow>,
+        Option<Result<SchemaContractRow>>,
+    )> {
+        let (known_state, projection, lineage_rows, contract) = if read_contract
+            || migrations::read_stamp(&dataset) == Some(INTERNAL_MANIFEST_SCHEMA_VERSION)
+        {
+            let (state, projection, lineage, contract) =
+                read_manifest_projection_with_contract(&dataset).await?;
+            (state, projection, lineage, Some(contract))
+        } else {
+            let (state, projection, lineage) = read_manifest_projection(&dataset).await?;
+            (state, projection, lineage, None)
+        };
         let projection_version = dataset.version().version;
         let mut coordinator = Self::from_parts_with_default_publisher(
             root,
@@ -1329,7 +1614,11 @@ impl ManifestCoordinator {
             branch_identifier,
         );
         coordinator.projection = Some((projection_version, projection));
-        Ok((coordinator, lineage_rows))
+        coordinator.captured_contract = contract
+            .as_ref()
+            .and_then(|row| row.as_ref().ok())
+            .map(|row| Arc::new(row.clone()));
+        Ok((coordinator, lineage_rows, contract))
     }
 
     pub async fn snapshot_at(
@@ -1338,8 +1627,10 @@ impl ManifestCoordinator {
         version: u64,
     ) -> Result<Snapshot> {
         let root = root_uri.trim_end_matches('/');
-        let mut snapshot =
-            Self::snapshot_from_state(root, snapshot_state_at(root, branch, version).await?);
+        let (dataset, state) = snapshot_state_at(root, branch, version).await?;
+        let mut snapshot = Self::snapshot_from_state(root, state);
+        snapshot.native_branch = dataset.manifest().branch.clone();
+        snapshot.manifest_dataset = Some(dataset);
         snapshot.graph_branch = branch
             .filter(|branch| *branch != "main")
             .map(str::to_string);
@@ -1381,6 +1672,8 @@ impl ManifestCoordinator {
         let mut snapshot = Self::snapshot_from_state(&self.root_uri, self.known_state.clone());
         snapshot.native_branch = self.native_branch.clone();
         snapshot.graph_branch = self.active_branch.clone();
+        snapshot.manifest_dataset = Some(self.dataset.clone());
+        snapshot.captured_contract = self.captured_contract.clone();
         snapshot
     }
 
@@ -1420,9 +1713,11 @@ impl ManifestCoordinator {
             &control_session,
         )
         .await?;
-        let (known_state, projection, lineage_rows) = read_manifest_projection(&dataset).await?;
+        let (known_state, projection, lineage_rows, contract) =
+            read_manifest_projection_with_contract(&dataset).await?;
         let projection_version = dataset.version().version;
         self.dataset = dataset;
+        self.captured_contract = contract.ok().map(Arc::new);
         self.known_state = known_state;
         self.branch_identifier = branch_identifier;
         self.native_branch = native_branch;
@@ -1469,6 +1764,17 @@ impl ManifestCoordinator {
             return Ok(None);
         }
         if new_dataset.version().version == self.dataset.version().version {
+            // Main's native branch identifier and numeric version can survive
+            // replacement of the root. Reuse the projection only when the
+            // complete immutable manifest image still matches its held pin.
+            if !publisher::manifest_image_matches(
+                self.dataset.manifest(),
+                self.dataset.manifest_location(),
+                &new_dataset,
+            ) {
+                tracing::debug!("projection refresh: manifest image changed; full scan");
+                return Ok(None);
+            }
             crate::instrumentation::record_projection_incremental_refresh();
             return Ok(Some(Vec::new()));
         }
@@ -1535,6 +1841,10 @@ impl ManifestCoordinator {
                 return Ok(None);
             }
             for (object_type, object_id) in identities {
+                if object_type == OBJECT_TYPE_SCHEMA_CONTRACT {
+                    folded.remove_schema_contract();
+                    continue;
+                }
                 if object_type != OBJECT_TYPE_GRAPH_HEAD {
                     // A deleted row this fold does not model (retention,
                     // repair, future machinery): the append assumption is
@@ -1573,6 +1883,7 @@ impl ManifestCoordinator {
         crate::instrumentation::record_projection_incremental_refresh();
         let projection_version = new_dataset.version().version;
         self.dataset = new_dataset;
+        self.captured_contract = None;
         self.known_state = known_state;
         self.projection = Some((projection_version, folded));
         Ok(Some(lineage_rows))
@@ -1605,7 +1916,7 @@ impl ManifestCoordinator {
             &control_session,
         )
         .await?;
-        let known_state = read_manifest_state(&dataset).await?;
+        let (known_state, contract) = state::read_manifest_state_with_contract(&dataset).await?;
         let branch_key = self
             .active_branch
             .as_deref()
@@ -1622,6 +1933,7 @@ impl ManifestCoordinator {
         self.known_state = known_state;
         self.branch_identifier = branch_identifier;
         self.native_branch = native_branch;
+        self.captured_contract = contract.ok().map(Arc::new);
         // Same staleness rule as the post-publish fold: this refresh advances
         // `dataset` without folding the projection accumulators, so they must
         // not survive it.
@@ -1748,6 +2060,18 @@ impl ManifestCoordinator {
         // RFC-013 PR2 #1b: the publisher folded the new visible state in-memory
         // (byte-identical to a re-scan via the shared `assemble_manifest_state`),
         // so adopt it directly instead of an O(fragments) `read_manifest_state`.
+        self.captured_contract = self
+            .publisher
+            .cached_rows(&dataset)
+            .and_then(|batch| {
+                state::schema_contract_from_batch(
+                    &dataset,
+                    &batch,
+                    known_state.schema_contract.as_ref(),
+                )
+                .ok()
+            })
+            .map(Arc::new);
         self.dataset = dataset;
         self.known_state = known_state;
         // Until the caller has adopted the committed lineage, refresh must
@@ -1920,10 +2244,6 @@ impl ManifestCoordinator {
             .await
             .map_err(OmniError::before_effect)?;
         crate::branch_control::retire_branch_recoverably(&ds, &native, expected_identifier).await
-    }
-
-    pub async fn schema_apply_locked(&self) -> Result<bool> {
-        crate::branch_control::schema_apply_locked(&self.dataset).await
     }
 
     /// Logical graph branches, `main` first. Each live native ref maps to

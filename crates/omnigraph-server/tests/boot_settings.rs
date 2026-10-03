@@ -42,6 +42,209 @@ async fn cluster_management_policy_can_boot_beside_legacy_catalog_rules() {
     );
 }
 
+#[tokio::test]
+async fn v2_settings_capture_holds_admission_across_drop_and_refuses_another_server() {
+    let temp = converged_cluster_dir("").await;
+    let root = format!("file://{}", temp.path().display());
+    omnigraph_cluster::upgrade_deployment_ledger(
+        &root,
+        true,
+        &omnigraph_cluster::DeploymentCaller::storage_owner(None),
+    )
+    .await
+    .unwrap();
+    let state_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+    let settings = cluster_settings(temp.path()).await.unwrap();
+    let owner = settings.cluster_admission.as_ref().unwrap();
+    let lock_id = owner.lock_id().to_string();
+    assert_eq!(
+        owner.canonical_root(),
+        format!(
+            "file://{}",
+            fs::canonicalize(temp.path()).unwrap().display()
+        )
+    );
+    let blocked = cluster_settings(temp.path()).await.unwrap_err();
+    assert!(blocked.to_string().contains("state_lock_held"), "{blocked}");
+    drop(settings);
+    let lock: Value =
+        serde_json::from_slice(&fs::read(temp.path().join("__cluster/lock.json")).unwrap())
+            .unwrap();
+    assert_eq!(lock["lock_id"], lock_id);
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        state_before
+    );
+    let graph = temp.path().join("graphs/knowledge.omni");
+    let blocked = AppState::open_with_bearer_tokens(graph.to_string_lossy(), Vec::new()).await;
+    assert!(
+        blocked
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("state_lock_held")
+    );
+}
+
+#[tokio::test]
+async fn v2_direct_server_open_keeps_the_lock_after_all_router_clones_drop() {
+    let temp = converged_cluster_dir("").await;
+    let root = format!("file://{}", temp.path().display());
+    omnigraph_cluster::upgrade_deployment_ledger(
+        &root,
+        true,
+        &omnigraph_cluster::DeploymentCaller::storage_owner(None),
+    )
+    .await
+    .unwrap();
+    let graph = temp.path().join("graphs/knowledge.omni");
+    let state = AppState::open_with_bearer_tokens(graph.to_string_lossy(), Vec::new())
+        .await
+        .unwrap();
+    let app = build_app(state.clone());
+    drop(state);
+    let blocked = cluster_settings(temp.path()).await.unwrap_err();
+    assert!(blocked.to_string().contains("state_lock_held"), "{blocked}");
+    drop(app);
+    assert!(temp.path().join("__cluster/lock.json").exists());
+}
+
+#[tokio::test]
+async fn v2_startup_blocks_only_graphs_with_unavailable_or_changed_accepted_contracts() {
+    use omnigraph_server::{GraphId, GraphKey, RegistryLookup, ServerConfigMode};
+
+    for fault in ["missing", "replacement", "source_change"] {
+        let temp = converged_cluster_dir("  healthy:\n    schema: ./people.pg\n").await;
+        let root = format!("file://{}", temp.path().display());
+        let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
+        omnigraph_cluster::upgrade_deployment_ledger(&root, true, &caller)
+            .await
+            .unwrap();
+        // Model a storage holder outside supported admission. Only knowledge
+        // is damaged; the achieved healthy graph must remain serviceable.
+        let graph = temp.path().join("graphs/knowledge.omni");
+        let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+        let original = db.schema_contract_digest();
+        if fault == "source_change" {
+            db.apply_schema_as("node Person {\n  name: String @key\n  age: I32?\n}\n", None)
+                .await
+                .unwrap();
+        }
+        drop(db);
+        if fault != "source_change" {
+            fs::remove_dir_all(&graph).unwrap();
+        }
+        if fault == "replacement" {
+            let source = fs::read_to_string(temp.path().join("people.pg")).unwrap();
+            let replacement = Omnigraph::init(graph.to_str().unwrap(), &source)
+                .await
+                .unwrap();
+            let replaced = replacement.schema_contract_digest();
+            assert_eq!(replaced.source_hash, original.source_hash);
+            assert_ne!(
+                replaced.schema_identity_domain,
+                original.schema_identity_domain
+            );
+        }
+        let ledger = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+        let mut settings = cluster_settings(temp.path()).await.unwrap();
+        // Metadata-only settings capture has opened no engine. Explicitly
+        // release that test owner so the public startup helper acquires its own.
+        settings
+            .cluster_admission
+            .take()
+            .unwrap()
+            .release_after_settlement()
+            .await
+            .unwrap();
+        let ServerConfigMode::Multi {
+            graphs,
+            config_path,
+            server_policy,
+        } = settings.mode;
+        let state = omnigraph_server::open_multi_graph_state(
+            graphs.clone(),
+            Vec::new(),
+            server_policy.as_ref(),
+            config_path.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                state
+                    .routing()
+                    .registry
+                    .get(&GraphKey::cluster(GraphId::try_from("healthy").unwrap())),
+                RegistryLookup::Ready(_)
+            ),
+            "{fault}"
+        );
+        assert!(
+            matches!(
+                state
+                    .routing()
+                    .registry
+                    .get(&GraphKey::cluster(GraphId::try_from("knowledge").unwrap())),
+                RegistryLookup::Blocked(_)
+            ),
+            "{fault}"
+        );
+        let app = build_app(state);
+        let (status, readiness) = json_response(&app, get_request("/readyz", "")).await;
+        assert_eq!(status, StatusCode::OK, "{fault}: {readiness}");
+        assert_eq!(readiness["status"], "degraded");
+        assert_eq!(readiness["ready_graph_count"], 1);
+        assert_eq!(readiness["blocked_graph_count"], 1);
+        for (id, expected) in [
+            ("healthy", StatusCode::OK),
+            ("knowledge", StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let (status, _) =
+                json_response(&app, get_request(&format!("/graphs/{id}/snapshot"), "")).await;
+            assert_eq!(status, expected, "{fault}: {id}");
+        }
+        drop(app);
+        let status = omnigraph_cluster::deployment_status(&root, None, &caller)
+            .await
+            .unwrap();
+        omnigraph_cluster::force_unlock_storage_root(&root, status.lock_id.as_deref().unwrap())
+            .await
+            .unwrap();
+
+        let error = omnigraph_server::open_multi_graph_state(
+            graphs,
+            Vec::new(),
+            server_policy.as_ref(),
+            config_path,
+            true,
+        )
+        .await
+        .err()
+        .expect("strict startup must refuse the blocked graph");
+        assert!(
+            error.to_string().contains("strict multi-graph startup"),
+            "{fault}: {error}"
+        );
+        let status = omnigraph_cluster::deployment_status(&root, None, &caller)
+            .await
+            .unwrap();
+        omnigraph_cluster::force_unlock_storage_root(&root, status.lock_id.as_deref().unwrap())
+            .await
+            .unwrap();
+        let healthy = temp.path().join("graphs/healthy.omni");
+        let direct = AppState::open_with_bearer_tokens(healthy.to_string_lossy(), Vec::new())
+            .await
+            .unwrap();
+        drop(direct);
+        assert_eq!(
+            fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+            ledger
+        );
+    }
+}
+
 /// External consumers may construct and exhaustively destructure the legacy
 /// public settings and identity records without opting into managed trust.
 #[test]
@@ -59,6 +262,7 @@ fn legacy_public_struct_literals_and_destructuring_compile() {
         require_all_graphs,
         witness,
         shutdown_grace,
+        cluster_admission,
     } = ServerConfig {
         mode: ServerConfigMode::Multi {
             graphs: vec![],
@@ -70,12 +274,15 @@ fn legacy_public_struct_literals_and_destructuring_compile() {
         require_all_graphs: false,
         witness: BootWitness::default(),
         shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
+        cluster_admission: None,
     };
     assert!(matches!(mode, ServerConfigMode::Multi { .. }));
     assert_eq!(bind, "127.0.0.1:0");
     assert!(allow_unauthenticated && !require_all_graphs);
-    assert!(witness.applied_graphs.is_empty());
+    assert!(witness.booted_serving_digest.is_none() && witness.state_cas.is_none());
+    assert_eq!(witness.state_revision, 0);
     assert_eq!(shutdown_grace, DEFAULT_SHUTDOWN_GRACE);
+    assert!(cluster_admission.is_none());
 
     let ServingSnapshot {
         graphs,
@@ -122,34 +329,43 @@ fn legacy_public_struct_literals_and_destructuring_compile() {
 
 #[tokio::test]
 async fn data_trust_root_mismatch_refuses_before_recovery_open() {
-    let tokens = data_tokens::DataTokens::new();
-    let temp = converged_cluster_dir("").await;
-    let graph = temp.path().join("graphs/knowledge.omni");
-    let schema = fs::read_to_string(temp.path().join("people.pg")).unwrap();
-    // A read-write engine open normally cleans matching no-op schema staging.
-    // Wrong public trust must refuse before even that recovery effect.
-    let staging = graph.join("_schema.pg.staging");
-    fs::write(&staging, &schema).unwrap();
-    let trust_path = temp.path().join("trust.json");
-    fs::write(&trust_path, serde_json::to_vec(&tokens.document).unwrap()).unwrap();
-    let result = omnigraph_server::load_server_settings_with_data_token_trust(
-        Some(&temp.path().to_path_buf()),
-        Some("127.0.0.1:0".into()),
-        true,
-        true,
-        &trust_path,
-    )
-    .await;
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("serving-root binding")
-    );
-    assert!(
-        staging.exists(),
-        "invalid trust must not open the graph for recovery"
-    );
+    for v2 in [false, true] {
+        let tokens = data_tokens::DataTokens::new();
+        let temp = converged_cluster_dir("").await;
+        if v2 {
+            omnigraph_cluster::upgrade_deployment_ledger(
+                &format!("file://{}", temp.path().display()),
+                true,
+                &omnigraph_cluster::DeploymentCaller::storage_owner(None),
+            )
+            .await
+            .unwrap();
+        }
+        let graph = temp.path().join("graphs/knowledge.omni");
+        let recovery = graph.join("__recovery");
+        fs::create_dir_all(&recovery).unwrap();
+        fs::write(recovery.join("unresolved.json"), "malformed sidecar").unwrap();
+        assert!(matches!(
+            Omnigraph::open(graph.to_str().unwrap()).await,
+            Err(omnigraph::error::OmniError::RecoveryRequired { .. })
+        ));
+        let trust_path = temp.path().join("trust.json");
+        fs::write(&trust_path, serde_json::to_vec(&tokens.document).unwrap()).unwrap();
+        let result = omnigraph_server::load_server_settings_with_data_token_trust(
+            Some(&temp.path().to_path_buf()),
+            Some("127.0.0.1:0".into()),
+            true,
+            true,
+            &trust_path,
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("serving-root binding")
+        );
+    }
 }
 
 #[tokio::test]
@@ -159,8 +375,14 @@ async fn oidc_root_mismatch_refuses_even_beside_valid_native_trust_before_recove
     use serde_json::json;
 
     let temp = converged_cluster_dir("").await;
-    let staging = temp.path().join("graphs/knowledge.omni/_schema.pg.staging");
-    fs::copy(temp.path().join("people.pg"), &staging).unwrap();
+    let graph = temp.path().join("graphs/knowledge.omni");
+    let recovery = graph.join("__recovery");
+    fs::create_dir_all(&recovery).unwrap();
+    fs::write(recovery.join("unresolved.json"), "malformed sidecar").unwrap();
+    assert!(matches!(
+        Omnigraph::open(graph.to_str().unwrap()).await,
+        Err(omnigraph::error::OmniError::RecoveryRequired { .. })
+    ));
     let root = format!(
         "file://{}",
         fs::canonicalize(temp.path()).unwrap().display()
@@ -198,10 +420,6 @@ async fn oidc_root_mismatch_refuses_even_beside_valid_native_trust_before_recove
         refused
             .to_string()
             .contains("OIDC identity snapshot or serving-root binding")
-    );
-    assert!(
-        staging.exists(),
-        "OIDC failure opened the graph for recovery"
     );
 }
 
@@ -255,12 +473,12 @@ async fn managed_settings_bind_the_applied_store_not_the_config_directory() {
     let legacy = cluster_settings(&config_path).await.unwrap();
     assert_eq!(managed.canonical_root(), canonical_root);
     assert_eq!(managed.config().witness.state_cas, legacy.witness.state_cas);
-    assert_eq!(managed.config().witness.applied_graphs, vec!["knowledge"]);
     assert_eq!(
         managed.config().shutdown_grace,
         std::time::Duration::from_secs(7)
     );
     let omnigraph_server::ServerConfigMode::Multi { graphs, .. } = &managed.config().mode;
+    assert_eq!(graphs.len(), 1);
     assert_eq!(graphs[0].graph_id, "knowledge");
     assert!(graphs[0].uri.contains("/graphs/knowledge.omni"));
 
@@ -326,7 +544,6 @@ async fn applied_empty_cluster_still_requires_exact_data_trust_root() {
         settings.config().witness.booted_serving_digest,
         applied.desired_revision.config_digest
     );
-    assert!(settings.config().witness.applied_graphs.is_empty());
     let omnigraph_server::ServerConfigMode::Multi { graphs, .. } = &settings.config().mode;
     assert!(graphs.is_empty());
     assert!(!temp.path().join("graphs").exists());
@@ -340,6 +557,7 @@ mod multi_graph_startup {
 
     async fn build_multi_mode_state(
         graph_ids: &[&str],
+        blocked_ids: &[&str],
         policy: Option<omnigraph_policy::PolicyEngine>,
     ) -> (Vec<tempfile::TempDir>, AppState) {
         let mut dirs = Vec::with_capacity(graph_ids.len());
@@ -359,37 +577,45 @@ mod multi_graph_startup {
             dirs.push(dir);
         }
         let workload = omnigraph_server::workload::WorkloadController::from_env();
-        let state = AppState::new_multi(handles, Vec::new(), policy, workload, None).unwrap();
+        let mut entries: Vec<_> = handles
+            .into_iter()
+            .map(omnigraph_server::registry::GraphEntry::ready)
+            .collect();
+        for id in blocked_ids {
+            let dir = tempfile::tempdir().unwrap();
+            entries.push(omnigraph_server::registry::GraphEntry::Blocked(Arc::new(
+                omnigraph_server::registry::BlockedGraph {
+                    key: GraphKey::cluster(GraphId::try_from(*id).unwrap()),
+                    uri: dir.path().join(id).to_string_lossy().into_owned(),
+                    policy: None,
+                    failure: omnigraph_server::api::GraphStartupFailure::OpenFailed,
+                },
+            )));
+            dirs.push(dir);
+        }
+        let state =
+            AppState::new_multi_entries(entries, Vec::new(), policy, workload, None).unwrap();
         (dirs, state)
     }
 
     async fn build_multi_mode_app(graph_ids: &[&str]) -> (Vec<tempfile::TempDir>, Router) {
-        let (dirs, state) = build_multi_mode_state(graph_ids, None).await;
+        let (dirs, state) = build_multi_mode_state(graph_ids, &[], None).await;
         (dirs, build_app(state))
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn signed_registry_lists_only_granted_served_and_quarantined_graphs() {
+    async fn signed_registry_lists_only_granted_ready_and_blocked_graphs() {
         let tokens = data_tokens::DataTokens::new();
         let policy = omnigraph_policy::PolicyEngine::load_server_from_source(&format!(
             "version: 1\ngroups:\n  viewers: [\"{}\"]\nrules:\n  - id: list\n    allow:\n      actors: {{group: viewers}}\n      actions: [graph_list]\n",tokens.actor
         )).unwrap();
-        let (_dirs, state) = build_multi_mode_state(&["alpha", "beta"], Some(policy)).await;
-        let state = state
-            .with_data_token_trust(tokens.trust.clone())
-            .with_boot_witness(
-                omnigraph_server::BootWitness {
-                    applied_graphs: vec![
-                        "alpha".into(),
-                        "beta".into(),
-                        "ghost-allowed".into(),
-                        "ghost-hidden".into(),
-                    ],
-                    ..Default::default()
-                },
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                omnigraph_server::DEFAULT_SHUTDOWN_GRACE,
-            );
+        let (_dirs, state) = build_multi_mode_state(
+            &["alpha", "beta"],
+            &["ghost-allowed", "ghost-hidden"],
+            Some(policy),
+        )
+        .await;
+        let state = state.with_data_token_trust(tokens.trust.clone());
         let app = build_app(state);
         let token = tokens.token(serde_json::json!([
             {"graph_id":"alpha","actions":["graph_list"]},
@@ -398,9 +624,20 @@ mod multi_graph_startup {
         ]));
         let (status, body) = json_response(&app, get_request("/graphs", &token)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["graphs"].as_array().unwrap().len(), 1);
+        assert_eq!(body["graphs"].as_array().unwrap().len(), 2);
         assert_eq!(body["graphs"][0]["graph_id"], "alpha");
-        assert_eq!(body["quarantined"], serde_json::json!(["ghost-allowed"]));
+        assert_eq!(body["graphs"][0]["state"], "ready");
+        assert_eq!(body["graphs"][1]["graph_id"], "ghost-allowed");
+        assert_eq!(body["graphs"][1]["state"], "blocked");
+        assert!(body.get("quarantined").is_none());
+        for (id, expected) in [
+            ("ghost-allowed", StatusCode::SERVICE_UNAVAILABLE),
+            ("ghost-hidden", StatusCode::FORBIDDEN),
+        ] {
+            let (status, _) =
+                json_response(&app, get_request(&format!("/graphs/{id}/snapshot"), &token)).await;
+            assert_eq!(status, expected);
+        }
         let read = tokens.token(serde_json::json!([{"graph_id":"alpha","actions":["read"]}]));
         let (status, _) = json_response(&app, get_request("/graphs", &read)).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
@@ -497,7 +734,7 @@ mod multi_graph_startup {
             (
                 Method::POST,
                 "/graphs/alpha/schema/apply",
-                Some(r#"{"schema_source":"","allow_data_loss":false}"#),
+                Some(r#"{"schema_source":""}"#),
             ),
             (Method::POST, "/graphs/alpha/ingest", Some(r#"{"data":""}"#)),
             (
@@ -940,11 +1177,10 @@ mod readiness_witness {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// `/readyz` reports the boot witness and counts only, turns off while
-    /// draining, and leaves `/healthz` alone; the quarantined ids are on the
-    /// gated `GET /graphs`, derived from the applied set minus the registry
-    /// (RFC 0049).
+    /// draining, and leaves `/healthz` alone. Both counts and gated graph
+    /// availability come from the startup registry, not boot-witness inference.
     #[tokio::test(flavor = "multi_thread")]
-    async fn readyz_reports_counts_and_graphs_names_the_quarantined() {
+    async fn readyz_and_inventory_report_ready_blocked_and_stopping() {
         let dir = tempfile::tempdir().unwrap();
         let graph_uri = dir.path().join("alpha").to_str().unwrap().to_string();
         let schema = fs::read_to_string(fixture("test.pg")).unwrap();
@@ -977,29 +1213,42 @@ rules:
         let tokens = vec![("act-test".to_string(), "secret".to_string())];
         let workload = omnigraph_server::workload::WorkloadController::from_env();
         let draining = Arc::new(AtomicBool::new(false));
-        let state = AppState::new_multi(vec![handle], tokens, Some(server_policy), workload, None)
-            .unwrap()
-            .with_boot_witness(
-                BootWitness {
-                    booted_serving_digest: Some("digest-1".to_string()),
-                    state_revision: 42,
-                    state_cas: Some("sha256:abc".to_string()),
-                    applied_graphs: vec!["alpha".to_string(), "beta".to_string()],
-                },
-                Arc::clone(&draining),
-                std::time::Duration::from_secs(7),
-            );
-        let app = build_app(state);
+        let blocked = Arc::new(omnigraph_server::registry::BlockedGraph {
+            key: GraphKey::cluster(GraphId::try_from("beta").unwrap()),
+            uri: dir.path().join("beta").to_string_lossy().into_owned(),
+            policy: None,
+            failure: omnigraph_server::api::GraphStartupFailure::OpenFailed,
+        });
+        let entries = vec![
+            omnigraph_server::registry::GraphEntry::ready(handle),
+            omnigraph_server::registry::GraphEntry::Blocked(Arc::clone(&blocked)),
+        ];
+        let state =
+            AppState::new_multi_entries(entries, tokens, Some(server_policy), workload, None)
+                .unwrap()
+                .with_boot_witness(
+                    BootWitness {
+                        booted_serving_digest: Some("digest-1".to_string()),
+                        state_revision: 42,
+                        state_cas: Some("sha256:abc".to_string()),
+                    },
+                    Arc::clone(&draining),
+                    std::time::Duration::from_secs(7),
+                );
+        let app = build_app(state.clone());
 
         let (status, body) = json_response(&app, get_request("/readyz", "")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["ready"], true);
-        assert_eq!(body["status"], "serving");
+        assert_eq!(body["status"], "degraded");
         assert_eq!(body["booted_serving_digest"], "digest-1");
         assert_eq!(body["state_revision"], 42);
         assert_eq!(body["state_cas"], "sha256:abc");
-        assert_eq!(body["served_graph_count"], 1);
-        assert_eq!(body["quarantined_graph_count"], 1);
+        assert_eq!(body["served_graph_count"], 2);
+        assert_eq!(body["ready_graph_count"], 1);
+        assert_eq!(body["loading_graph_count"], 0);
+        assert_eq!(body["blocked_graph_count"], 1);
+        assert!(body.get("quarantined_graph_count").is_none());
         assert_eq!(body["shutdown_grace_seconds"], 7);
         assert!(
             body.get("served_graphs").is_none() && body.get("quarantined_graphs").is_none(),
@@ -1012,27 +1261,123 @@ rules:
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let (status, body) = json_response(&app, get_request("/graphs", "secret")).await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["graphs"].as_array().unwrap().len(), 2);
         assert_eq!(body["graphs"][0]["graph_id"], "alpha");
-        assert_eq!(body["quarantined"], serde_json::json!(["beta"]));
+        assert_eq!(body["graphs"][0]["state"], "ready");
+        assert_eq!(body["graphs"][0]["action"], "none");
+        assert_eq!(body["graphs"][0]["read_available"], true);
+        assert_eq!(body["graphs"][0]["write_available"], true);
+        assert!(body["graphs"][0].get("failure").is_none());
+        assert_eq!(body["graphs"][1]["graph_id"], "beta");
+        assert_eq!(body["graphs"][1]["state"], "blocked");
+        assert_eq!(body["graphs"][1]["failure"], "open_failed");
+        assert_eq!(body["graphs"][1]["action"], "restart_after_correction");
+        assert_eq!(body["graphs"][1]["read_available"], false);
+        assert_eq!(body["graphs"][1]["write_available"], false);
+        assert!(body.get("quarantined").is_none());
 
+        let key = GraphKey::cluster(GraphId::try_from("alpha").unwrap());
+        let transition = state
+            .prepare_same_view(
+                &key,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+            )
+            .unwrap()
+            .close()
+            .unwrap();
+        let (status, body) = json_response(&app, get_request("/readyz", "")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "blocked");
+        assert_eq!(body["ready_graph_count"], 0);
+        assert_eq!(body["blocked_graph_count"], 2);
+        let (status, inventory) = json_response(&app, get_request("/graphs", "secret")).await;
+        assert_eq!(status, StatusCode::OK);
+        let graph = &inventory["graphs"][0];
+        assert_eq!(graph["state"], "transitioning");
+        assert_eq!(graph["action"], "wait_for_transition");
+        assert_eq!(graph["read_available"], false);
+        assert_eq!(graph["write_available"], false);
+        assert!(graph.get("failure").is_none());
+        let (status, unavailable) =
+            json_response(&app, get_request("/graphs/alpha/snapshot", "secret")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable["code"], "graph_unavailable");
+        transition.wait_requests().await.unwrap();
+        transition.resume_same_view().unwrap();
+        let (status, body) = json_response(&app, get_request("/readyz", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["ready_graph_count"], 1);
+
+        // A completed graph wait cannot override later process shutdown.
+        let transition = state
+            .prepare_same_view(
+                &key,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+            )
+            .unwrap()
+            .close()
+            .unwrap();
+        transition.wait_requests().await.unwrap();
+        state.operation_runtime().close();
+        assert!(transition.resume_same_view().is_err());
         draining.store(true, Ordering::SeqCst);
         let (status, body) = json_response(&app, get_request("/readyz", "")).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["ready"], false);
         assert_eq!(body["status"], "draining");
+        let (_, inventory) = json_response(&app, get_request("/graphs", "secret")).await;
+        for graph in inventory["graphs"].as_array().unwrap() {
+            assert_eq!(graph["state"], "stopping");
+            assert_eq!(graph["action"], "wait_for_restart");
+            assert_eq!(graph["read_available"], false);
+            assert_eq!(graph["write_available"], false);
+        }
         let (status, _) = json_response(&app, get_request("/healthz", "")).await;
         assert_eq!(
             status,
             StatusCode::OK,
             "liveness is unchanged while draining"
         );
+        for (entries, expected, phase) in [
+            (vec![], StatusCode::OK, "serving"),
+            (
+                vec![omnigraph_server::GraphEntry::Loading(Arc::new(
+                    omnigraph_server::LoadingGraph {
+                        key: blocked.key.clone(),
+                        uri: blocked.uri.clone(),
+                        policy: None,
+                    },
+                ))],
+                StatusCode::SERVICE_UNAVAILABLE,
+                "loading",
+            ),
+            (
+                vec![omnigraph_server::registry::GraphEntry::Blocked(blocked)],
+                StatusCode::SERVICE_UNAVAILABLE,
+                "blocked",
+            ),
+        ] {
+            let app = build_app(
+                AppState::new_multi_entries(
+                    entries,
+                    vec![],
+                    None,
+                    omnigraph_server::workload::WorkloadController::with_defaults(),
+                    None,
+                )
+                .unwrap(),
+            );
+            let (status, body) = json_response(&app, get_request("/readyz", "")).await;
+            assert_eq!(status, expected);
+            assert_eq!(body["status"], phase);
+            assert_eq!(body["ready"], expected == StatusCode::OK);
+        }
     }
 }
 
-/// Exercise the production listener and shutdown driver in a contained process.
-/// A no-op schema pass holds the engine's schema gate so the HTTP write
-/// parks at an async acquire; a blocking HTTP seam would keep the connection
-/// alive by itself and could hide missing request ownership.
+/// Exercise production shutdown while a schema refresh holds the exclusive gate.
+/// The HTTP write parks asynchronously so a disconnected client can be observed.
 #[cfg(unix)]
 mod owned_shutdown {
     use super::*;
@@ -1070,6 +1415,77 @@ mod owned_shutdown {
         }
     }
 
+    fn spawn_owned_child(
+        root: &Path,
+        mode: &str,
+    ) -> (ContainedChild, String, std::thread::JoinHandle<()>) {
+        let mut child = ContainedChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "owned_shutdown::owned_server_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(ROOT, root)
+                .env(MODE, mode)
+                .env(
+                    "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+                    if mode.starts_with("startup-") {
+                        r#"{"startup-operator":"startup-secret"}"#
+                    } else {
+                        "{}"
+                    },
+                )
+                .env_remove("OMNIGRAPH_SERVER_BEARER_TOKEN")
+                .env_remove("OMNIGRAPH_SERVER_BEARER_TOKENS_FILE")
+                .env_remove("OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET")
+                .env("OMNIGRAPH_PER_ACTOR_INFLIGHT_MAX", "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let stdout = child.0.stdout.take().unwrap();
+        let (listen_tx, listen_rx) = std::sync::mpsc::channel();
+        let output_thread = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(address) = line.strip_prefix(omnigraph_server::LISTEN_ADDR_PREFIX) {
+                    let _ = listen_tx.send(address.to_string());
+                }
+            }
+        });
+        let address = listen_rx
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap_or_else(|error| panic!("{mode}: production listener did not start: {error}"));
+        (child, address, output_thread)
+    }
+
+    async fn wait_ready(address: &str, child: &mut Child, phase: &str) {
+        let client = reqwest::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let response = client
+                .get(format!("http://{address}/readyz"))
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .unwrap();
+            if response.status().is_success() {
+                let body: Value = response.json().await.unwrap();
+                if body["status"] == phase {
+                    return;
+                }
+            }
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "server exited before readiness"
+            );
+            assert!(Instant::now() < deadline, "server never became ready");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     fn send_mutation(address: &str, name: &str) -> TcpStream {
         let mut socket = TcpStream::connect(address).unwrap();
         socket
@@ -1098,6 +1514,7 @@ mod owned_shutdown {
                     uri: graph.to_string_lossy().into_owned(),
                     policy: None,
                     embedding: None,
+                    startup_failure: None,
                     external_blob_policy: Default::default(),
                     queries: Default::default(),
                 }],
@@ -1109,6 +1526,7 @@ mod owned_shutdown {
             require_all_graphs: true,
             witness: Default::default(),
             shutdown_grace: grace,
+            cluster_admission: None,
         }
     }
 
@@ -1119,6 +1537,99 @@ mod owned_shutdown {
             return;
         };
         let mode = std::env::var(MODE).unwrap();
+        if mode.starts_with("startup-") {
+            let mut config = server_config(
+                &root,
+                Duration::from_secs(if mode == "startup-cutoff" { 2 } else { 10 }),
+            );
+            config.require_all_graphs = mode.starts_with("startup-strict");
+            let omnigraph_server::ServerConfigMode::Multi { server_policy, .. } = &mut config.mode;
+            *server_policy = Some(omnigraph_server::PolicySource::Inline(
+                "version: 1\ngroups:\n  operators: [startup-operator]\nrules:\n  - id: startup-inventory\n    allow:\n      actors: {group: operators}\n      actions: [graph_list]\n".into(),
+            ));
+            if mode == "startup-panic" {
+                let fault_root = root.clone();
+                let _guard = omnigraph::seams::catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ.observe(
+                    move || {
+                        fs::write(fault_root.join("fault-reached"), b"reached").unwrap();
+                        panic!("contained startup engine panic");
+                    },
+                );
+                let _ = omnigraph_server::serve(config).await;
+                fs::write(root.join("serve-returned"), b"unexpected").unwrap();
+                std::process::exit(91);
+            }
+            if mode == "startup-all-failed" {
+                let omnigraph_server::ServerConfigMode::Multi { graphs, .. } = &mut config.mode;
+                graphs[0].uri = root.join("missing.omni").to_string_lossy().into_owned();
+                let result = omnigraph_server::serve(config).await;
+                assert!(result.is_err());
+                fs::write(root.join("serve-returned"), b"failed").unwrap();
+                std::process::exit(1);
+            }
+            if matches!(
+                mode.as_str(),
+                "startup-progress" | "startup-strict" | "startup-strict-failed"
+            ) {
+                let omnigraph_server::ServerConfigMode::Multi { graphs, .. } = &mut config.mode;
+                let mut sibling = graphs[0].clone();
+                sibling.graph_id = "sibling".into();
+                sibling.uri = root
+                    .join(if mode == "startup-strict-failed" {
+                        "missing.omni"
+                    } else {
+                        "sibling.omni"
+                    })
+                    .to_string_lossy()
+                    .into_owned();
+                graphs.push(sibling);
+            }
+            // The held refresh owns only this graph's async schema gate. The
+            // startup batch can poll its sibling while this open is parked.
+            let direct = Omnigraph::open(graph_path(&root).to_str().unwrap())
+                .await
+                .unwrap();
+            let (guard, hold) =
+                omnigraph::seams::catalog::SCHEMA_RELOAD_BEFORE_CONTRACT_READ.hold();
+            let holder = tokio::spawn(async move {
+                direct.refresh().await.unwrap();
+            });
+            hold.wait_until_reached();
+            fs::write(root.join("holder-reached"), b"held").unwrap();
+            let control_root = root.clone();
+            let control_hold = hold.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while !control_root.join("release").exists() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                control_hold.release();
+            });
+            let result = omnigraph_server::serve(config).await;
+            fs::write(
+                root.join("serve-returned"),
+                if result.is_ok() { b"okay" } else { b"fail" },
+            )
+            .unwrap();
+            holder.await.unwrap();
+            assert!(!hold.timed_out());
+            drop(guard);
+            std::process::exit(i32::from(result.is_err()));
+        }
+        if mode.starts_with("v2-") {
+            let mut config = omnigraph_server::load_server_settings(
+                Some(&root),
+                Some("127.0.0.1:0".into()),
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+            config.shutdown_grace = Duration::from_secs(5);
+            omnigraph_server::serve(config).await.unwrap();
+            fs::write(root.join("serve-returned"), b"returned").unwrap();
+            std::process::exit(0);
+        }
         let cutoff = mode == "cutoff";
         if mode.starts_with("panic-") {
             use omnigraph::seams::catalog::{
@@ -1134,24 +1645,23 @@ mod owned_shutdown {
                 fs::write(fault_root.join("fault-reached"), b"reached").unwrap();
                 panic!("contained owned-server engine panic");
             });
-            let _ = omnigraph_server::serve(server_config(&root, Duration::from_secs(10))).await;
+            if let Err(error) =
+                omnigraph_server::serve(server_config(&root, Duration::from_secs(10))).await
+            {
+                eprintln!("{mode}: production server failed: {error:?}");
+            }
             fs::write(root.join("serve-returned"), b"returned").unwrap();
             std::process::exit(91);
         }
         let graph = graph_path(&root);
         let direct = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
         use omnigraph::seams::catalog::{
-            MUTATION_POST_STAGE_PRE_EFFECT_GATE, SCHEMA_APPLY_POST_SENTINEL,
+            MUTATION_POST_STAGE_PRE_EFFECT_GATE, SCHEMA_RELOAD_BEFORE_CONTRACT_READ,
         };
-        let (hold_guard, hold) = SCHEMA_APPLY_POST_SENTINEL.hold();
+        let (hold_guard, hold) = SCHEMA_RELOAD_BEFORE_CONTRACT_READ.hold();
         let observed_root = root.clone();
         let staged_hold = hold.clone();
         let stage_guard = MUTATION_POST_STAGE_PRE_EFFECT_GATE.observe(move || {
-            // Stage against the accepted snapshot first, then interleave a
-            // no-op schema pass. It takes the exclusive gate without changing
-            // HEAD, so the HTTP write parks asynchronously on that gate after
-            // this callback returns. Blocking the HTTP worker itself would
-            // hide cancellation behind a connection that never gets polled.
             fs::write(observed_root.join("start-holder"), b"start").unwrap();
             staged_hold.wait_until_reached();
             fs::write(observed_root.join("http-staged"), b"reached").unwrap();
@@ -1172,11 +1682,7 @@ mod owned_shutdown {
             while !direct_root.join("start-holder").exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            let result = direct
-                .apply_schema(&fs::read_to_string(fixture("test.pg")).unwrap())
-                .await
-                .unwrap();
-            assert!(!result.applied, "the gate holder must not move graph HEAD");
+            direct.refresh().await.unwrap();
         });
         let signal_root = root.clone();
         let mut terminate =
@@ -1190,6 +1696,9 @@ mod owned_shutdown {
             Duration::from_secs(if cutoff { 2 } else { 10 }),
         ))
         .await;
+        if let Err(error) = &result {
+            eprintln!("{mode}: production server failed: {error:?}");
+        }
         // Immediate exit makes a premature serve return observable even if a
         // blocked runtime worker would otherwise delay Tokio's destructor.
         fs::write(root.join("serve-returned"), b"returned").unwrap();
@@ -1204,13 +1713,237 @@ mod owned_shutdown {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn disconnected_write_and_shutdown_share_ownership() {
-        for mode in ["finish", "cutoff", "panic-before", "panic-after"] {
-            let cutoff = mode == "cutoff";
-            let panic = mode.starts_with("panic-");
+    async fn startup_listener_reports_progress_and_retains_open_ownership() {
+        for mode in [
+            "startup-progress",
+            "startup-strict",
+            "startup-finish",
+            "startup-cutoff",
+            "startup-panic",
+            "startup-strict-failed",
+            "startup-all-failed",
+        ] {
             let temp = init_loaded_graph().await;
             let root = temp.path();
+            let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+            Omnigraph::init(root.join("sibling.omni").to_str().unwrap(), &schema)
+                .await
+                .unwrap();
             let graph = graph_path(root);
+            let before = Omnigraph::open_read_only(graph.to_str().unwrap())
+                .await
+                .unwrap()
+                .list_commits(None)
+                .await
+                .unwrap();
+            let (mut child, address, output_thread) = spawn_owned_child(root, mode);
+            let started = Instant::now();
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_static("Bearer startup-secret"),
+            );
+            let client = reqwest::Client::builder()
+                .default_headers(headers)
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap();
+            if mode == "startup-panic" {
+                wait_marker(&root.join("fault-reached"), &mut child.0);
+            } else if mode != "startup-all-failed" {
+                wait_marker(&root.join("holder-reached"), &mut child.0);
+                assert_eq!(
+                    client
+                        .get(format!("http://{address}/healthz"))
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    StatusCode::OK
+                );
+                if mode == "startup-progress" {
+                    wait_ready(&address, &mut child.0, "degraded").await;
+                }
+                let readiness = client
+                    .get(format!("http://{address}/readyz"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    readiness.status(),
+                    if mode == "startup-progress" {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    },
+                    "{mode}"
+                );
+                let readiness: Value = readiness.json().await.unwrap();
+                assert_eq!(
+                    readiness["status"],
+                    if mode == "startup-progress" {
+                        "degraded"
+                    } else {
+                        "loading"
+                    },
+                    "{mode}: {readiness}"
+                );
+                assert_eq!(
+                    readiness["ready_graph_count"],
+                    usize::from(mode == "startup-progress")
+                );
+                assert!(readiness["loading_graph_count"].as_u64().unwrap() > 0);
+                assert!(readiness.get("graphs").is_none());
+                let inventory = client
+                    .get(format!("http://{address}/graphs"))
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(inventory.status(), StatusCode::OK, "{mode}: inventory");
+                let inventory: Value = inventory.json().await.unwrap();
+                let owned = &inventory["graphs"][0];
+                assert_eq!(owned["graph_id"], "owned");
+                assert_eq!(owned["state"], "loading");
+                assert_eq!(owned["action"], "wait_for_startup");
+                assert_eq!(owned["read_available"], false);
+                assert_eq!(owned["write_available"], false);
+                assert!(owned.get("failure").is_none());
+                let response = client
+                    .get(format!("http://{address}/graphs/owned/snapshot"))
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert!(!response.headers().contains_key("retry-after"));
+                let unknown = client
+                    .get(format!("http://{address}/graphs/unknown/snapshot"))
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+                if matches!(mode, "startup-progress" | "startup-strict") {
+                    let sibling = client
+                        .get(format!("http://{address}/graphs/sibling/snapshot"))
+                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        sibling.status(),
+                        if mode == "startup-progress" {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        }
+                    );
+                    fs::write(root.join("release"), b"release").unwrap();
+                    wait_ready(&address, &mut child.0, "serving").await;
+                    let readiness: Value = client
+                        .get(format!("http://{address}/readyz"))
+                        .send()
+                        .await
+                        .unwrap()
+                        .json()
+                        .await
+                        .unwrap();
+                    assert_eq!(readiness["status"], "serving");
+                    assert_eq!(readiness["ready_graph_count"], 2);
+                    assert_eq!(readiness["loading_graph_count"], 0);
+                }
+                if mode == "startup-strict-failed" {
+                    fs::write(root.join("release"), b"release").unwrap();
+                } else {
+                    assert_eq!(
+                        unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) },
+                        0
+                    );
+                    if matches!(mode, "startup-finish" | "startup-cutoff") {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        assert!(
+                            !root.join("serve-returned").exists(),
+                            "startup owner was dropped at shutdown"
+                        );
+                        assert!(child.0.try_wait().unwrap().is_none());
+                        if mode == "startup-finish" {
+                            fs::write(root.join("release"), b"release").unwrap();
+                        }
+                    }
+                }
+            }
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let status = loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{mode}: startup shutdown exceeded bound"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert_eq!(
+                status.code(),
+                Some(match mode {
+                    "startup-cutoff" | "startup-panic" => 2,
+                    "startup-strict-failed" | "startup-all-failed" => 1,
+                    _ => 0,
+                }),
+                "{mode}"
+            );
+            if mode == "startup-panic" {
+                assert!(started.elapsed() < Duration::from_secs(5));
+                assert!(!root.join("serve-returned").exists());
+            }
+            output_thread.join().unwrap();
+            let after = Omnigraph::open_read_only(graph.to_str().unwrap())
+                .await
+                .unwrap()
+                .list_commits(None)
+                .await
+                .unwrap();
+            assert_eq!(
+                after, before,
+                "startup must not publish graph content: {mode}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_write_and_shutdown_share_ownership() {
+        for mode in [
+            "finish",
+            "cutoff",
+            "panic-before",
+            "panic-after",
+            "v2-finish",
+            "v2-crash",
+        ] {
+            let cutoff = mode == "cutoff";
+            let panic = mode.starts_with("panic-");
+            let v2 = mode.starts_with("v2-");
+            let temp = if v2 {
+                let temp = converged_cluster_dir("").await;
+                omnigraph_cluster::upgrade_deployment_ledger(
+                    &format!("file://{}", temp.path().display()),
+                    true,
+                    &omnigraph_cluster::DeploymentCaller::storage_owner(None),
+                )
+                .await
+                .unwrap();
+                temp
+            } else {
+                init_loaded_graph().await
+            };
+            let root = temp.path();
+            let graph = if v2 {
+                root.join("graphs/knowledge.omni")
+            } else {
+                graph_path(root)
+            };
+            let ledger_before = v2.then(|| fs::read(root.join("__cluster/state.json")).unwrap());
             let before = Omnigraph::open_read_only(graph.to_str().unwrap())
                 .await
                 .unwrap()
@@ -1218,40 +1951,21 @@ mod owned_shutdown {
                 .await
                 .unwrap()
                 .len();
-            let mut child = ContainedChild(
-                Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "owned_shutdown::owned_server_child",
-                        "--ignored",
-                        "--nocapture",
-                    ])
-                    .env(ROOT, root)
-                    .env(MODE, mode)
-                    .env("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", "{}")
-                    .env_remove("OMNIGRAPH_SERVER_BEARER_TOKEN")
-                    .env_remove("OMNIGRAPH_SERVER_BEARER_TOKENS_FILE")
-                    .env_remove("OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET")
-                    .env("OMNIGRAPH_PER_ACTOR_INFLIGHT_MAX", "1")
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::inherit())
-                    .spawn()
-                    .unwrap(),
-            );
-            let stdout = child.0.stdout.take().unwrap();
-            let (listen_tx, listen_rx) = std::sync::mpsc::channel();
-            let output_thread = std::thread::spawn(move || {
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                    if let Some(address) = line.strip_prefix(omnigraph_server::LISTEN_ADDR_PREFIX) {
-                        let _ = listen_tx.send(address.to_string());
-                    }
-                }
-            });
-            let address = listen_rx
-                .recv_timeout(Duration::from_secs(15))
-                .expect("production listener did not start");
+            let (mut child, address, output_thread) = spawn_owned_child(root, mode);
+            wait_ready(&address, &mut child.0, "serving").await;
             let fault_started = Instant::now();
-            if panic {
+            let retained_lock = v2.then(|| fs::read(root.join("__cluster/lock.json")).unwrap());
+            if v2 {
+                let signal = if mode == "v2-crash" {
+                    libc::SIGKILL
+                } else {
+                    libc::SIGTERM
+                };
+                assert_eq!(
+                    unsafe { libc::kill(child.0.id() as libc::pid_t, signal) },
+                    0
+                );
+            } else if panic {
                 let mut response = String::new();
                 // The response may be lost as fatal shutdown begins; the
                 // fault marker and process exit are the independent oracle.
@@ -1297,6 +2011,27 @@ mod owned_shutdown {
                 );
                 std::thread::sleep(Duration::from_millis(10));
             };
+            if v2 {
+                if mode == "v2-finish" {
+                    assert_eq!(status.code(), Some(0));
+                    assert!(root.join("serve-returned").exists());
+                } else {
+                    use std::os::unix::process::ExitStatusExt;
+                    assert_eq!(status.signal(), Some(libc::SIGKILL));
+                }
+                output_thread.join().unwrap();
+                assert_eq!(
+                    fs::read(root.join("__cluster/lock.json")).unwrap(),
+                    retained_lock.unwrap()
+                );
+                assert_eq!(
+                    fs::read(root.join("__cluster/state.json")).unwrap(),
+                    ledger_before.unwrap()
+                );
+                let refusal = cluster_settings(root).await.unwrap_err();
+                assert!(refusal.to_string().contains("state_lock_held"), "{refusal}");
+                continue;
+            }
             assert_eq!(
                 status.code(),
                 Some(if mode == "finish" { 0 } else { 2 }),

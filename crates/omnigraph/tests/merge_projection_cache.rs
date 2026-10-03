@@ -1,6 +1,6 @@
 //! Structural gates for the incremental merge-authority projection cache: a
 //! repeated merge reuses acknowledged local publication views and refreshes
-//! foreign changes through an incremental projection fold, retains at most
+//! foreign changes through a checked projection refresh, retains at most
 //! one non-bound branch's complete authority, and a
 //! delete/recreate of a cached branch must be fenced to a full re-read, never
 //! a stale reuse. The explicit fold-vs-full correctness oracle lives with the
@@ -106,10 +106,10 @@ async fn diverge(db: &Session, round: i64) {
 }
 
 /// Acknowledged local publishes retain exact projections; an external publish
-/// still requires the physical-address incremental fold. Both paths avoid a
-/// full history rebuild and must preserve the merged payload.
+/// still requires a refresh of the replaced manifest fragment. The local path
+/// performs no projection rebuild; both paths must preserve the merged payload.
 #[test]
-fn repeated_merge_refreshes_projection_incrementally() {
+fn repeated_merge_reuses_local_projection_and_refreshes_foreign() {
     on_big_stack(|| async {
         cost_harness(async {
             let dir = tempfile::tempdir().unwrap();
@@ -126,12 +126,9 @@ fn repeated_merge_refreshes_projection_incrementally() {
 
             let (outcome, io) = measure(db.branch_merge("feature", "main")).await;
             assert_eq!(outcome.unwrap().outcome, MergeOutcome::Merged);
-            assert!(
-                io.projection_incremental_refreshes >= 1,
-                "the repeated merge must refresh at least one cached branch authority \
-                 through the incremental projection fold (incremental {}, full {})",
-                io.projection_incremental_refreshes,
-                io.projection_full_refreshes,
+            assert_eq!(
+                io.projection_incremental_refreshes, 0,
+                "acknowledged local publication needs only an incarnation probe, not a projection fold",
             );
             eprintln!("local publication reuse: {io:?}");
             assert_eq!(
@@ -151,7 +148,7 @@ fn repeated_merge_refreshes_projection_incrementally() {
                 "the ground-truth object-store tracker must measure returned bytes"
             );
             eprintln!(
-                "incremental repeated merge: manifest_reads={} manifest_read_bytes={}",
+                "local projection reuse: manifest_reads={} manifest_read_bytes={}",
                 io.manifest_reads, io.manifest_read_bytes,
             );
             // Keep a fixed ground-truth request ceiling alongside the
@@ -160,7 +157,7 @@ fn repeated_merge_refreshes_projection_incrementally() {
             // full coordinator reopen to multiply the measured reads.
             assert!(
                 io.manifest_reads <= 32,
-                "incremental repeated merge used {} manifest object reads; hidden full scans must not ride the measured path",
+                "local projection reuse used {} manifest object reads; hidden full scans must not ride the measured path",
                 io.manifest_reads,
             );
 
@@ -185,7 +182,7 @@ fn repeated_merge_refreshes_projection_incrementally() {
             assert!(foreign_io.manifest_reads > 0 && foreign_io.manifest_read_bytes > 0);
             assert!(
                 foreign_io.manifest_reads <= 40,
-                "foreign-source merge input protection and incremental refresh used {} manifest reads",
+                "foreign-source merge input protection and projection refresh used {} manifest reads",
                 foreign_io.manifest_reads,
             );
 

@@ -498,43 +498,15 @@ async fn repeated_loads_do_not_accumulate_branches() {
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
 }
 
-/// After MR-770, `__run__*` is an ordinary branch name — the Run state machine
-/// and its `is_internal_run_branch` guard are gone. The surviving internal-ref
-/// guard still rejects the active `__schema_apply_lock__` branch on the public
-/// create/merge APIs.
 #[tokio::test]
-async fn public_branch_apis_reject_internal_system_refs() {
+async fn public_branch_apis_accept_former_system_names() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
-
-    // `__run__*` is no longer reserved — creating it now succeeds.
-    db.branch_create("__run__formerly_reserved")
-        .await
-        .expect("__run__ prefix is a normal branch name post-MR-770");
-
-    // The schema-apply lock branch is still rejected on public branch APIs.
-    let create_err = db.branch_create("__schema_apply_lock__").await.unwrap_err();
-    let OmniError::Manifest(err) = create_err else {
-        panic!("expected Manifest error");
-    };
-    assert!(
-        err.message.contains("internal system ref"),
-        "unexpected error: {}",
-        err.message
-    );
-
-    let merge_err = db
-        .branch_merge("__schema_apply_lock__", "main")
-        .await
-        .unwrap_err();
-    let OmniError::Manifest(err) = merge_err else {
-        panic!("expected Manifest error");
-    };
-    assert!(
-        err.message.contains("internal system refs"),
-        "unexpected error: {}",
-        err.message
-    );
+    for name in ["__run__formerly_reserved", "__schema_apply_lock__"] {
+        db.branch_create(name).await.unwrap();
+        db.branch_merge(name, "main").await.unwrap();
+        db.branch_delete(name).await.unwrap();
+    }
 }
 
 // ─── Staged-write rewire — additional contract tests ───────────────────────
@@ -698,6 +670,387 @@ async fn mutation_keyed_write_row_cap_accepts_limit_and_rejects_one_over_pre_eff
     );
 }
 
+const OPERATION_BYTES: u64 = 32 * 1024 * 1024;
+const KEYED_BATCH_BYTES: &str = "retained keyed batch bytes per operation";
+const REMOVED_ID_BYTES: &str = "retained removed-id bytes per operation";
+
+fn operation_refusal(error: &OmniError, label: &str) -> bool {
+    matches!(
+        error,
+        OmniError::ResourceLimitExceeded { resource, limit: OPERATION_BYTES, actual }
+            if resource == label && *actual > OPERATION_BYTES
+    )
+}
+
+fn files_under(root: &std::path::Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+    let mut files = std::collections::BTreeSet::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.insert(path);
+            }
+        }
+    }
+    files
+}
+
+async fn native_heads(db: &Omnigraph, table_keys: &[&str]) -> Vec<u64> {
+    let snapshot = snapshot_main(db).await.unwrap();
+    let mut heads = Vec::with_capacity(table_keys.len());
+    for key in table_keys {
+        let entry = snapshot.dataset(key).unwrap();
+        let uri = format!(
+            "{}/{}",
+            db.uri().trim_end_matches('/'),
+            entry.dataset_path.trim_start_matches('/')
+        );
+        heads.push(Dataset::open(&uri).await.unwrap().version().version);
+    }
+    heads
+}
+
+/// Each table fits its own byte limit; the sum over tables is what refuses.
+/// Rust, not GQT: 17 MiB payloads and the stage-write probe are outside the case format.
+#[tokio::test]
+async fn keyed_bytes_summed_across_tables_refuse_mutation_and_every_load_door_before_staging() {
+    const SCHEMA: &str = "node Thing { key: String @key payload: String? }\nnode Other { key: String @key payload: String? }\n";
+    const TABLES: [&str; 2] = ["node:Thing", "node:Other"];
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let before_manifest = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let before_heads = native_heads(&db, &TABLES).await;
+
+    let payload = "x".repeat(17 * 1024 * 1024);
+    let probes = StageWriteProbes::rendezvous(1);
+    let error = with_stage_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            r#"query wide($payload: String) {
+                insert Thing { key: "one", payload: $payload }
+                insert Other { key: "two", payload: $payload }
+            }"#,
+            "wide",
+            &params(&[("$payload", &payload)]),
+        ),
+    )
+    .await
+    .expect_err("retained keyed batches must be bounded across tables");
+    assert_eq!(
+        probes.entered(),
+        0,
+        "aggregate admission must precede any table staging call"
+    );
+    assert!(
+        operation_refusal(&error, KEYED_BATCH_BYTES),
+        "unexpected aggregate refusal: {error:?}"
+    );
+    let input = format!(
+        "{}\n{}",
+        serde_json::json!({"type":"Thing","data":{"key":"one","payload":payload}}),
+        serde_json::json!({"type":"Other","data":{"key":"two","payload":payload}}),
+    );
+    drop(payload);
+    for mode in [LoadMode::Append, LoadMode::Merge] {
+        for strict in [false, true] {
+            let outcome = if strict {
+                with_stage_write_probes(probes.clone(), db.load_graph_batch("main", &input, mode))
+                    .await
+            } else {
+                with_stage_write_probes(probes.clone(), db.load_jsonl(&input, mode)).await
+            };
+            let error =
+                outcome.expect_err("every keyed load door must bound its complete parse spool");
+            assert!(
+                operation_refusal(&error, "keyed parsed entity bytes per operation"),
+                "unexpected load refusal (strict={strict}, mode={mode:?}): {error:?}"
+            );
+            assert_eq!(
+                probes.entered(),
+                0,
+                "load refusal must precede fragment staging"
+            );
+        }
+    }
+    drop(input);
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        before_manifest
+    );
+    assert_eq!(
+        native_heads(&db, &TABLES).await,
+        before_heads,
+        "an aggregate refusal must precede every Lance table effect"
+    );
+    assert_eq!(count_rows(&db, "node:Thing").await, 0);
+    assert_eq!(count_rows(&db, "node:Other").await, 0);
+    let recovery_dir = dir.path().join("__recovery");
+    assert!(
+        !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
+        "an aggregate refusal must precede the recovery sidecar"
+    );
+    let accepted = db
+        .mutate(
+            "main",
+            r#"query small() {
+            insert Thing { key: "one", payload: "fits" }
+            insert Other { key: "two", payload: "fits" }
+        }"#,
+            "small",
+            &params(&[]),
+        )
+        .await
+        .expect("a rejected wide request must not prevent a bounded multi-table write");
+    assert_eq!(accepted.affected_nodes, 2);
+    assert_eq!(count_rows(&db, "node:Thing").await, 1);
+    assert_eq!(count_rows(&db, "node:Other").await, 1);
+}
+
+/// The JSON estimate charges a null vector nothing; its Arrow column is ~8 KiB a row.
+/// Rust, not GQT: 4,400 generated rows per door and the stage-write probe are outside the case format.
+#[tokio::test]
+async fn prepared_arrow_bytes_summed_across_types_refuse_each_load_door_before_later_types_are_built()
+ {
+    const SCHEMA: &str = "\
+node WideA { key: String @key embedding: Vector(2048)? }
+node WideB { key: String @key embedding: Vector(2048)? }
+node Zed { key: String @key n: I32? }
+edge LinkA: Zed -> Zed { embedding: Vector(2048)? }
+edge LinkB: Zed -> Zed { embedding: Vector(2048)? }
+edge LinkZ: Zed -> Zed { n: I32? }
+";
+    const ROWS: usize = 2200;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let before_manifest = snapshot_main(&db).await.unwrap().graph_manifest_version();
+
+    let mut nodes = String::new();
+    let mut edges = String::new();
+    for row in 0..ROWS {
+        for wide in ["A", "B"] {
+            nodes.push_str(&format!(
+                "{{\"type\":\"Wide{wide}\",\"data\":{{\"key\":\"k{row}\"}}}}\n"
+            ));
+            edges.push_str(&format!(
+                "{{\"edge\":\"Link{wide}\",\"from\":\"a\",\"to\":\"b\"}}\n"
+            ));
+        }
+    }
+    nodes.push_str("{\"type\":\"Zed\",\"data\":{\"key\":\"z\",\"n\":4294967296}}\n");
+    edges
+        .push_str("{\"edge\":\"LinkZ\",\"from\":\"a\",\"to\":\"b\",\"data\":{\"n\":4294967296}}\n");
+
+    let probes = StageWriteProbes::rendezvous(1);
+    let mut refusals = Vec::new();
+    for input in [&nodes, &edges] {
+        for strict in [false, true] {
+            let error = if strict {
+                with_stage_write_probes(
+                    probes.clone(),
+                    db.load_graph_batch("main", input, LoadMode::Append),
+                )
+                .await
+                .err()
+            } else {
+                with_stage_write_probes(probes.clone(), db.load_jsonl(input, LoadMode::Append))
+                    .await
+                    .err()
+            };
+            refusals.push(match error {
+                Some(error) if operation_refusal(&error, KEYED_BATCH_BYTES) => {
+                    KEYED_BATCH_BYTES.to_string()
+                }
+                other => format!("{other:?}"),
+            });
+        }
+    }
+    assert_eq!(
+        refusals,
+        vec![KEYED_BATCH_BYTES; 4],
+        "doors are nodes/lenient, nodes/strict, edges/lenient, edges/strict; each must refuse \
+         at the second wide type, before the out-of-range I32 of the last type is converted"
+    );
+    assert_eq!(probes.entered(), 0, "refusal must precede fragment staging");
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        before_manifest
+    );
+}
+
+/// 24 MiB of external payload plus 10 MiB of retained rows fit per type, not together.
+/// Rust, not GQT: MiB-scale inputs and the payload-read probe are outside the case format.
+#[tokio::test]
+async fn external_blob_bytes_join_the_operation_allowance_before_any_payload_read() {
+    const SCHEMA: &str = "\
+node Document { title: String @key content: Blob? note: String? }
+node Image { title: String @key content: Blob? note: String? }
+";
+
+    let dir = tempfile::tempdir().unwrap();
+    let external_path = dir.path().join("payload.blob");
+    let file = std::fs::File::create(&external_path).unwrap();
+    file.set_len(12 * 1024 * 1024).unwrap();
+    drop(file);
+    let external_uri = format!("file://{}", external_path.display());
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(dir.path()).expect("external blob base is absolute"),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_dir = tempfile::tempdir().unwrap();
+    let graph_path = graph_dir.path().join("graph");
+    let db = helpers::session(
+        Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
+    let before_manifest = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let files = files_under(&graph_path);
+
+    let note = "x".repeat(5 * 1024 * 1024);
+    let stage_probes = StageWriteProbes::rendezvous(1);
+    let read_probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let error = with_stage_write_probes(
+        stage_probes.clone(),
+        omnigraph::instrumentation::with_merge_write_probes(
+            read_probes.clone(),
+            db.mutate(
+                "main",
+                r#"query wide($uri: String, $note: String) {
+                    insert Document { title: "one", content: $uri, note: $note }
+                    insert Image { title: "two", content: $uri, note: $note }
+                }"#,
+                "wide",
+                &params(&[("$uri", &external_uri), ("$note", &note)]),
+            ),
+        ),
+    )
+    .await
+    .expect_err("external payloads and retained rows must share one operation allowance");
+    assert!(
+        operation_refusal(&error, KEYED_BATCH_BYTES),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(
+        read_probes.blob_payload_read_calls(),
+        0,
+        "aggregate admission must precede every external payload read"
+    );
+    assert_eq!(read_probes.blob_managed_batch_read_calls(), 0);
+    assert_eq!(stage_probes.entered(), 0);
+    assert_eq!(files_under(&graph_path), files);
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        before_manifest
+    );
+    let accepted = db
+        .mutate(
+            "main",
+            r#"query small($uri: String) {
+                insert Document { title: "one", content: $uri }
+            }"#,
+            "small",
+            &params(&[("$uri", &external_uri)]),
+        )
+        .await
+        .expect("one 12 MiB external payload fits after the refusal");
+    assert_eq!(accepted.affected_nodes, 1);
+}
+
+/// Three equal payloads leave a LargeBinary buffer at 4/3 of its content: predicted
+/// 24.4 MiB, materialized 32.5 MiB. Rust, not GQT: MiB-scale inputs, builder capacity.
+#[tokio::test]
+async fn materialized_blob_batches_are_rechecked_against_the_operation_allowance_before_staging() {
+    const SCHEMA: &str = "\
+node Document { title: String @key content: Blob? }
+node Image { title: String @key content: Blob? }
+";
+
+    let dir = tempfile::tempdir().unwrap();
+    let external_path = dir.path().join("payload.blob");
+    let file = std::fs::File::create(&external_path).unwrap();
+    file.set_len(4 * 1024 * 1024 + 64 * 1024).unwrap();
+    drop(file);
+    let external_uri = format!("file://{}", external_path.display());
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(dir.path()).expect("external blob base is absolute"),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_dir = tempfile::tempdir().unwrap();
+    let graph_path = graph_dir.path().join("graph");
+    let db = helpers::session(
+        Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
+    let before_manifest = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let files = files_under(&graph_path);
+
+    let stage_probes = StageWriteProbes::rendezvous(1);
+    let read_probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let error = with_stage_write_probes(
+        stage_probes.clone(),
+        omnigraph::instrumentation::with_merge_write_probes(
+            read_probes.clone(),
+            db.mutate(
+                "main",
+                r#"query thrice($uri: String) {
+                    insert Document { title: "a", content: $uri }
+                    insert Document { title: "b", content: $uri }
+                    insert Document { title: "c", content: $uri }
+                    insert Image { title: "a", content: $uri }
+                    insert Image { title: "b", content: $uri }
+                    insert Image { title: "c", content: $uri }
+                }"#,
+                "thrice",
+                &params(&[("$uri", &external_uri)]),
+            ),
+        ),
+    )
+    .await
+    .expect_err("materialized batches must be summed across tables before staging");
+    assert!(
+        operation_refusal(&error, KEYED_BATCH_BYTES),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(
+        read_probes.blob_payload_read_calls(),
+        2,
+        "the pre-read estimate admits this operation; only the re-check after reading refuses"
+    );
+    assert_eq!(stage_probes.entered(), 0);
+    assert_eq!(files_under(&graph_path), files);
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        before_manifest
+    );
+}
+
 /// Update predicate matching is itself a bounded allocation. The committed
 /// side must stream and charge rows before it is retained/concatenated, rather
 /// than first collecting an arbitrarily wide match set and relying on the
@@ -821,7 +1174,9 @@ query update_note($note: String) {
     ])
     .unwrap();
 
-    let graph_path = dir.path().join("graph");
+    // The graph root must lie outside every external base.
+    let graph_dir = tempfile::tempdir().unwrap();
+    let graph_path = graph_dir.path().join("graph");
     let db = helpers::session(
         Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
             .await
@@ -868,7 +1223,7 @@ query update_note($note: String) {
                 ref resource,
                 limit: LIMIT,
                 actual,
-            } if resource == "keyed entity bytes for node:Document" && actual > LIMIT
+            } if resource == "retained keyed batch bytes per operation" && actual > LIMIT
         ),
         "oversized update blob must be rejected before payload read, got {error:?}"
     );
@@ -877,6 +1232,7 @@ query update_note($note: String) {
         0,
         "BlobFile::size must reject the update before BlobFile::read"
     );
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0);
     let after = snapshot_main(&db).await.unwrap();
     assert_eq!(after.graph_manifest_version(), before_manifest);
     assert_eq!(
@@ -895,6 +1251,349 @@ query update_note($note: String) {
     assert!(
         !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
         "oversized update must fail before writing a recovery sidecar"
+    );
+
+    const REPLACE: &str = r#"
+query replace_content($c: Blob) {
+    update Document set { content: $c } where title = "wide"
+}
+"#;
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let result = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            REPLACE,
+            "replace_content",
+            &params(&[("$c", "base64:AQID")]),
+        ),
+    )
+    .await
+    .expect("assigning the oversized Blob is not charged for its old bytes");
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(probes.external_blob_probe_calls(), 0);
+    assert_eq!(probes.external_blob_payload_read_calls(), 0);
+    assert_eq!(
+        probes.blob_payload_read_calls(),
+        0,
+        "assigning the oversized Blob never reads its old cell"
+    );
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0);
+    let bytes = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "wide", "content"),
+    )
+    .await;
+    assert_eq!(&bytes[..], &[1, 2, 3]);
+}
+
+/// A predicate update carrying many rows' Blob cells reads the managed ones in
+/// one batched read and the external one through its admitted object, and
+/// rewrites each exactly; the null stays null and the external becomes managed.
+#[tokio::test]
+async fn mutation_update_carries_mixed_blob_rows_through_batched_managed_read() {
+    use base64::Engine;
+
+    const SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    shelf: String
+    content: Blob?
+    note: String?
+}
+"#;
+    const UPDATE: &str = r#"
+query update_shelf($note: String) {
+    update Document set { note: $note } where shelf = "a"
+}
+"#;
+
+    let sources = tempfile::tempdir().unwrap();
+    let external_path = sources.path().join("carried.bin");
+    std::fs::write(&external_path, b"carried external bytes").unwrap();
+    let external_uri = url::Url::from_file_path(&external_path)
+        .unwrap()
+        .to_string();
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(sources.path()).unwrap(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    // The graph root must lie outside every external base.
+    let graph_dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(graph_dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
+
+    let managed: Vec<(&str, Vec<u8>)> = vec![
+        ("inline", b"inline bytes".to_vec()),
+        ("packed", vec![b'p'; 96 * 1024]),
+        ("empty", Vec::new()),
+        ("packed-two", vec![b'q'; 70 * 1024]),
+    ];
+    let mut lines = managed
+        .iter()
+        .map(|(title, bytes)| {
+            serde_json::json!({
+                "type": "Document",
+                "data": {
+                    "title": title,
+                    "shelf": "a",
+                    "content": format!(
+                        "base64:{}",
+                        base64::engine::general_purpose::STANDARD.encode(bytes)
+                    ),
+                },
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>();
+    lines.push(
+        serde_json::json!({"type": "Document", "data": {"title": "null", "shelf": "a", "content": null}})
+            .to_string(),
+    );
+    lines.push(
+        serde_json::json!({"type": "Document", "data": {"title": "external", "shelf": "a", "content": external_uri}})
+            .to_string(),
+    );
+    lines.push(
+        serde_json::json!({"type": "Document", "data": {"title": "other-shelf", "shelf": "b", "content": "base64:AQID"}})
+            .to_string(),
+    );
+    // A full-table overwrite keeps the admitted external reference as a descriptor.
+    db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let result = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            UPDATE,
+            "update_shelf",
+            &params(&[("$note", "moved")]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.affected_nodes, 6);
+    assert_eq!(probes.external_blob_payload_read_calls(), 1);
+    assert_eq!(
+        probes.blob_payload_read_calls() - probes.external_blob_payload_read_calls(),
+        managed.len() as u64,
+        "one payload read per carried managed value"
+    );
+    assert_eq!(
+        probes.blob_managed_batch_read_calls(),
+        1,
+        "the managed values are read through one batched read, not one read per value"
+    );
+
+    for (title, bytes) in &managed {
+        let actual = read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", *title, "content"),
+        )
+        .await;
+        assert!(actual == *bytes, "{title} changed through the update");
+    }
+    assert_eq!(
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "external", "content"),
+        )
+        .await,
+        b"carried external bytes",
+        "the carried external reference is copied into a managed value"
+    );
+    let null = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "null", "content"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(null, OmniError::Manifest(ref error) if error.kind == omnigraph::error::ManifestErrorKind::NotFound),
+        "the null cell stays null, got {null:?}"
+    );
+}
+
+/// Carrying an unassigned stored external reference needs the graph's policy
+/// to admit its source; under Deny the refusal names the row and property, and
+/// assigning the property (a new value or null) replaces it without reading it.
+#[tokio::test]
+async fn mutation_update_replaces_stored_external_reference_under_deny() {
+    const SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    note: String?
+}
+"#;
+    const MUTATIONS: &str = r#"
+query update_note($note: String) {
+    update Document set { note: $note } where title = "doc"
+}
+
+query set_content($c: Blob?) {
+    update Document set { content: $c } where title = "doc"
+}
+"#;
+
+    let root = tempfile::tempdir().unwrap();
+    let source_dir = root.path().join("sources");
+    std::fs::create_dir(&source_dir).unwrap();
+    let source = source_dir.join("stored.bin");
+    std::fs::write(&source, b"stored external bytes").unwrap();
+    let source_uri = url::Url::from_file_path(&source).unwrap().to_string();
+    let allow = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(&source_dir).unwrap(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_path = root.path().join("graph");
+    let uri = graph_path.to_str().unwrap().to_string();
+    {
+        let seeding = helpers::session(
+            Omnigraph::init(&uri, SCHEMA)
+                .await
+                .unwrap()
+                .with_external_blob_policy(allow)
+                .unwrap(),
+        );
+        let row = serde_json::json!({
+            "type": "Document",
+            "data": {"title": "doc", "content": source_uri, "note": "before"},
+        });
+        seeding
+            .load_jsonl(&row.to_string(), LoadMode::Overwrite)
+            .await
+            .unwrap();
+    }
+
+    let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    let cell = || node_blob_cell("Document", "doc", "content");
+    let stored = db
+        .read_blob_at(ReadTarget::branch("main"), cell())
+        .await
+        .unwrap();
+    let omnigraph::BlobContent::External(stored) = stored.content else {
+        panic!("overwrite load must retain the external descriptor");
+    };
+    let before = snapshot_main(&db).await.unwrap();
+    let before_manifest = before.graph_manifest_version();
+    let before_table = before
+        .dataset("node:Document")
+        .unwrap()
+        .published_dataset_version;
+    let before_head = head_commit_id(&uri).await;
+
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let error = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            MUTATIONS,
+            "update_note",
+            &params(&[("$note", "after")]),
+        ),
+    )
+    .await
+    .unwrap_err();
+    match &error {
+        OmniError::StoredExternalBlobDenied {
+            type_key,
+            entity_id,
+            property,
+            uri,
+            ..
+        } => {
+            assert_eq!(type_key, "node:Document");
+            assert_eq!(entity_id, "doc");
+            assert_eq!(property, "content");
+            assert_eq!(uri, &stored.uri);
+        }
+        other => panic!("expected StoredExternalBlobDenied, got {other:?}"),
+    }
+    assert!(error.to_string().contains("assign 'content'"), "{error}");
+    assert_eq!(probes.external_blob_probe_calls(), 0);
+    assert_eq!(probes.external_blob_payload_read_calls(), 0);
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(after.graph_manifest_version(), before_manifest);
+    assert_eq!(
+        after
+            .dataset("node:Document")
+            .unwrap()
+            .published_dataset_version,
+        before_table
+    );
+    assert_eq!(head_commit_id(&uri).await, before_head);
+
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let result = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            MUTATIONS,
+            "set_content",
+            &params(&[("$c", "base64:AQID")]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(
+        probes.external_blob_probe_calls(),
+        0,
+        "assigning managed bytes replaces the reference without reading it"
+    );
+    assert_eq!(probes.external_blob_payload_read_calls(), 0);
+    let bytes = read_managed_blob_bytes(&db, ReadTarget::branch("main"), cell()).await;
+    assert_eq!(&bytes[..], &[1, 2, 3]);
+
+    let mut null_params = omnigraph_compiler::ir::ParamMap::new();
+    null_params.insert(
+        "c".to_string(),
+        omnigraph_compiler::query::ast::Literal::Null,
+    );
+    let result = db
+        .mutate("main", MUTATIONS, "set_content", &null_params)
+        .await
+        .unwrap();
+    assert_eq!(result.affected_nodes, 1);
+    let cleared = db
+        .read_blob_at(ReadTarget::branch("main"), cell())
+        .await
+        .unwrap_err();
+    assert!(cleared.to_string().contains("is null"), "{cleared}");
+
+    let error = db
+        .mutate(
+            "main",
+            MUTATIONS,
+            "set_content",
+            &params(&[("$c", url::Url::from_file_path(&source).unwrap().as_str())]),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, OmniError::ExternalBlobPolicy { .. }),
+        "new external input stays a policy refusal, got {error:?}"
     );
 }
 
@@ -996,6 +1695,194 @@ async fn overlapping_delete_predicates_do_not_double_count_affected() {
         1,
         "only Bob→Globex remains",
     );
+}
+
+/// Overwrite seeds the wide ids because bulk replacement has no keyed row or byte cap.
+/// Rust, not GQT: 16 MiB ids, the on-disk file listing and the stage-write probe.
+#[tokio::test]
+async fn removed_ids_summed_across_types_refuse_delete_and_overwrite_before_staging() {
+    const SCHEMA: &str = "node Person { name: String @key }\nnode Company { name: String @key }\n";
+    const TABLES: [&str; 2] = ["node:Person", "node:Company"];
+    const CLEAR: &str = r#"query clear() {
+        delete Person where name != ""
+        delete Company where name != ""
+    }"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let wide = "x".repeat(16 * 1024 * 1024);
+    let input = format!(
+        "{}\n{}",
+        serde_json::json!({"type":"Person","data":{"name":wide}}),
+        serde_json::json!({"type":"Company","data":{"name":wide}}),
+    );
+    db.load_jsonl(&input, LoadMode::Overwrite).await.unwrap();
+    drop(input);
+    drop(wide);
+    let before_manifest = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let before_heads = native_heads(&db, &TABLES).await;
+    let files = files_under(dir.path());
+
+    let error = db
+        .mutate("main", CLEAR, "clear", &params(&[]))
+        .await
+        .expect_err("delete ids must share an operation byte allowance");
+    assert!(
+        operation_refusal(&error, REMOVED_ID_BYTES),
+        "unexpected delete refusal: {error:?}"
+    );
+    assert_eq!(
+        files_under(dir.path()),
+        files,
+        "a refused delete must leave no staged deletion file"
+    );
+
+    let probes = StageWriteProbes::rendezvous(1);
+    let error = with_stage_write_probes(
+        probes.clone(),
+        db.load_jsonl(
+            "{\"type\":\"Person\",\"data\":{\"name\":\"small\"}}\n{\"type\":\"Company\",\"data\":{\"name\":\"small\"}}",
+            LoadMode::Overwrite,
+        ),
+    )
+    .await
+    .expect_err("overwrite removals must share the same bounded id scan");
+    assert!(
+        operation_refusal(&error, REMOVED_ID_BYTES),
+        "unexpected overwrite refusal: {error:?}"
+    );
+    assert_eq!(
+        probes.entered(),
+        0,
+        "a refused overwrite must precede every table staging call"
+    );
+    assert_eq!(
+        files_under(dir.path()),
+        files,
+        "a refused overwrite must leave no staged fragment"
+    );
+
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        before_manifest
+    );
+    assert_eq!(native_heads(&db, &TABLES).await, before_heads);
+    assert_eq!(count_rows(&db, "node:Person").await, 1);
+    assert_eq!(count_rows(&db, "node:Company").await, 1);
+
+    with_stage_write_probes(
+        probes.clone(),
+        db.load_jsonl(
+            "{\"type\":\"Person\",\"data\":{\"name\":\"small\"}}",
+            LoadMode::Append,
+        ),
+    )
+    .await
+    .expect("a small write must succeed after both refusals");
+    assert_eq!(
+        probes.entered(),
+        1,
+        "the same probe must observe the staging call of an accepted load"
+    );
+    assert_ne!(
+        files_under(dir.path()),
+        files,
+        "the file listing must observe an accepted write"
+    );
+    let removed = db
+        .mutate(
+            "main",
+            r#"query one() { delete Person where name = "small" }"#,
+            "one",
+            &params(&[]),
+        )
+        .await
+        .expect("a delete that fits the allowance must succeed after the refusals");
+    assert_eq!(removed.affected_nodes, 1);
+    assert_eq!(count_rows(&db, "node:Person").await, 1);
+}
+
+/// The node id costs 27 bytes; each cascaded edge id costs 17 MiB + 24 and fits alone.
+/// Rust, not GQT: two 17 MiB edge ids and the on-disk file listing are outside the case format.
+#[tokio::test]
+async fn cascaded_edge_ids_share_the_removed_id_allowance_with_the_deleted_node() {
+    const SCHEMA: &str = "\
+node Hub { name: String @key }
+node Leaf { name: String @key }
+edge Left: Hub -> Leaf
+edge Right: Hub -> Leaf
+";
+    const TABLES: [&str; 4] = ["node:Hub", "node:Leaf", "edge:Left", "edge:Right"];
+    const WIDE: usize = 17 * 1024 * 1024;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let wide = "x".repeat(WIDE);
+    let input = format!(
+        "{}\n{}\n{}\n{}",
+        serde_json::json!({"type":"Hub","data":{"name":"hub"}}),
+        serde_json::json!({"type":"Leaf","data":{"name":"leaf"}}),
+        serde_json::json!({"edge":"Left","id":wide,"from":"hub","to":"leaf"}),
+        serde_json::json!({"edge":"Right","id":wide,"from":"hub","to":"leaf"}),
+    );
+    db.load_jsonl(&input, LoadMode::Overwrite).await.unwrap();
+    drop(input);
+    drop(wide);
+    let before_manifest = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let before_heads = native_heads(&db, &TABLES).await;
+    let files = files_under(dir.path());
+
+    let error = db
+        .mutate(
+            "main",
+            r#"query drop_hub() { delete Hub where name = "hub" }"#,
+            "drop_hub",
+            &params(&[]),
+        )
+        .await
+        .expect_err("cascaded edge ids must be charged to the mutation's one allowance");
+    let charged = (2 * (WIDE + 24) + "hub".len() + 24) as u64;
+    assert!(
+        matches!(
+            error,
+            OmniError::ResourceLimitExceeded { ref resource, limit: OPERATION_BYTES, actual }
+                if resource == REMOVED_ID_BYTES && actual == charged
+        ),
+        "the refusal must count the node id and both edge ids ({charged} bytes): {error:?}"
+    );
+    assert_eq!(
+        files_under(dir.path()),
+        files,
+        "a refused cascade must leave no staged deletion file"
+    );
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        before_manifest
+    );
+    assert_eq!(native_heads(&db, &TABLES).await, before_heads);
+    for table in TABLES {
+        assert_eq!(count_rows(&db, table).await, 1, "{table}");
+    }
+
+    let accepted = db
+        .mutate(
+            "main",
+            r#"query add() { insert Leaf { name: "after" } }"#,
+            "add",
+            &params(&[]),
+        )
+        .await
+        .expect("a small write must succeed after the refused cascade");
+    assert_eq!(accepted.affected_nodes, 1);
+    assert_eq!(count_rows(&db, "node:Leaf").await, 2);
 }
 
 /// The overlap-exclusion filter must use SQL `IS NOT TRUE`, not `NOT`: a prior
@@ -1804,7 +2691,9 @@ query insert_then_replace_blob(
 "#;
 
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
+    // The graph root must lie outside every external base.
+    let graph_dir = tempfile::tempdir().unwrap();
+    let uri = graph_dir.path().to_str().unwrap();
     let allowed_path = dir.path().join("allowed-source.bin");
     std::fs::write(&allowed_path, b"last write wins").unwrap();
     let allowed_uri = url::Url::from_file_path(&allowed_path)
@@ -1914,6 +2803,126 @@ query insert_then_replace_blob(
     )
     .await;
     assert_eq!(&blob[..], b"last write wins");
+}
+
+/// Two Blob properties interleaved with scalars: an update assigns one Blob and
+/// carries the other, on a committed row and on a row the same mutation
+/// inserted. Carried bytes and scalars keep their values on both rows.
+#[tokio::test]
+async fn update_assigning_one_of_two_blobs_carries_the_other_byte_identical() {
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    first: Blob?
+    title: String
+    second: Blob?
+    rank: I64
+}
+"#;
+    const MUTATIONS: &str = r#"
+query insert_then_set_first(
+    $slug: String, $a: Blob, $title: String, $b: Blob, $rank: I64, $first: Blob
+) {
+    insert Doc { slug: $slug, first: $a, title: $title, second: $b, rank: $rank }
+    update Doc set { first: $first } where rank > 0
+}
+
+query clear_second($second: Blob?) {
+    update Doc set { second: $second } where rank > 0
+}
+"#;
+    const SCALARS: &str = r#"
+query scalars() {
+    match { $d: Doc }
+    return { $d.slug, $d.title, $d.rank }
+    order { $d.slug asc }
+}
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"kept","first":"base64:AQID","title":"kept title","second":"base64:BAUG","rank":3}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+
+    let result = db
+        .mutate(
+            "main",
+            MUTATIONS,
+            "insert_then_set_first",
+            &mixed_params(
+                &[
+                    ("$slug", "fresh"),
+                    ("$a", "base64:BwgJ"),
+                    ("$title", "fresh title"),
+                    ("$b", "base64:CgsM"),
+                    ("$first", "base64:DQ4P"),
+                ],
+                &[("$rank", 7)],
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.affected_nodes, 3,
+        "one insert, then the committed row and the inserted row updated"
+    );
+
+    let blob = async |slug: &str, property: &str| {
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Doc", slug, property),
+        )
+        .await
+    };
+    let scalars = async || {
+        db.query(ReadTarget::branch("main"), SCALARS, "scalars", &params(&[]))
+            .await
+            .unwrap()
+            .to_rust_json()
+            .unwrap()
+    };
+    let unchanged_scalars = serde_json::json!([
+        {"d.slug": "fresh", "d.title": "fresh title", "d.rank": 7},
+        {"d.slug": "kept", "d.title": "kept title", "d.rank": 3},
+    ]);
+
+    assert_eq!(blob("kept", "first").await, [13, 14, 15]);
+    assert_eq!(blob("kept", "second").await, [4, 5, 6]);
+    assert_eq!(blob("fresh", "first").await, [13, 14, 15]);
+    assert_eq!(blob("fresh", "second").await, [10, 11, 12]);
+    assert_eq!(scalars().await, unchanged_scalars);
+
+    let mut null_second = omnigraph_compiler::ir::ParamMap::new();
+    null_second.insert(
+        "second".to_string(),
+        omnigraph_compiler::query::ast::Literal::Null,
+    );
+    let result = db
+        .mutate("main", MUTATIONS, "clear_second", &null_second)
+        .await
+        .unwrap();
+    assert_eq!(result.affected_nodes, 2);
+    for slug in ["kept", "fresh"] {
+        assert_eq!(blob(slug, "first").await, [13, 14, 15], "{slug}");
+        let cleared = db
+            .read_blob_at(
+                ReadTarget::branch("main"),
+                node_blob_cell("Doc", slug, "second"),
+            )
+            .await
+            .unwrap_err();
+        assert!(cleared.to_string().contains("is null"), "{slug}: {cleared}");
+    }
+    assert_eq!(scalars().await, unchanged_scalars);
 }
 
 /// MR-920 regression: two sequential `update T set {f:v} where x=y`

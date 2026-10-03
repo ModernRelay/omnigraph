@@ -27,7 +27,7 @@ use crate::error::{OmniError, Result, missing_graph_type_at_snapshot};
 use crate::exec::staging::{MutationStaging, PendingMode};
 use crate::seams::{catalog, decide_seam, fail};
 use crate::session::Session;
-use crate::storage_layer::KEYED_WRITE_MAX_BYTES;
+use crate::storage_layer::{DeletedIdBudget, KEYED_WRITE_MAX_BYTES, retain_keyed_batch};
 
 /// Result of a load operation.
 #[derive(Debug, Clone, Default)]
@@ -115,7 +115,6 @@ impl Omnigraph {
         branch: &str,
         base: Option<&str>,
     ) -> Result<(Option<String>, Option<String>)> {
-        crate::db::ensure_public_branch_ref(branch, "load")?;
         // Branch convention: `None` represents `main`. A requested base keeps
         // the explicit "main" spelling because it is also returned in the DTO.
         let requested = Self::normalize_branch_name(branch)?;
@@ -356,10 +355,6 @@ impl Omnigraph {
         input_shape: LoadInputShape,
         stage_write_concurrency: usize,
     ) -> Result<LoadReceipt> {
-        // The pending schema-contract install precedes both an implicit
-        // target-branch fork and data staging.
-        let completed_prior_work = self.settle_pending_schema_install().await?;
-
         // Schema/catalog authority is captured once via the `WriteTxn` (plus its
         // cheap trailing identity-marker fence); the only second full validation
         // is the required pre-effect recheck under gates. Per-table resolution
@@ -371,13 +366,7 @@ impl Omnigraph {
             let exists = self
                 .branch_list()
                 .await
-                .map_err(|error| {
-                    if completed_prior_work {
-                        error.without_pre_effect_evidence()
-                    } else {
-                        error.before_effect()
-                    }
-                })?
+                .map_err(OmniError::before_effect)?
                 .iter()
                 .any(|name| name == target);
             if !exists {
@@ -392,14 +381,7 @@ impl Omnigraph {
                     target,
                     actor_id,
                 )
-                .await
-                .map_err(|error| {
-                    if completed_prior_work {
-                        error.without_pre_effect_evidence()
-                    } else {
-                        error
-                    }
-                })?;
+                .await?;
                 branch_created = true;
                 // DST window (loader walk D1 → D2): the implicit fork is
                 // durable, the load has not begun.
@@ -420,7 +402,7 @@ impl Omnigraph {
             )
             .await
             .map_err(|error| {
-                if completed_prior_work || branch_created {
+                if branch_created {
                     error.without_pre_effect_evidence()
                 } else {
                     error
@@ -574,7 +556,7 @@ async fn load_jsonl_data(
                     branch = branch.unwrap_or("main"),
                     "prepared load authority changed before effects; repreparing"
                 );
-                db.refresh_for_reprepare().await?;
+                db.refresh_coordinator_only().await?;
             }
             result => return result,
         }
@@ -610,7 +592,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     let mut node_rows: HashMap<String, Vec<JsonValue>> = HashMap::new();
     let mut edge_rows: HashMap<String, Vec<(String, String, JsonValue)>> = HashMap::new();
     let mut strict_rows = StrictGraphRows::default();
-    let mut keyed_input_budget: HashMap<String, (usize, u64)> = HashMap::new();
+    let mut keyed_input_budget = KeyedInputBudget::default();
     // Strict syntax is independent of the keyed-write transaction ceiling.
     // Append/Merge route through the bounded keyed adapter; Overwrite stages a
     // Lance replacement transaction and must retain the bulk-replacement
@@ -777,20 +759,24 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // Phase 2a: build and validate every node batch up front. Cheap and
     // synchronous — surfaces validation errors before any S3 traffic.
     let mut node_id_remap = TypedNodeIdRemap::default();
+    let mut prepared_keyed_bytes = 0;
     let mut prepared_nodes: Vec<(String, String, Vec<RecordBatch>, usize)> =
         Vec::with_capacity(node_rows.len().saturating_add(strict_nodes.len()));
-    let mut __dst_nr: Vec<_> = node_rows.iter().collect();
-    __dst_nr.sort_by(|a, b| a.0.cmp(b.0));
+    let mut __dst_nr: Vec<_> = node_rows.into_iter().collect();
+    __dst_nr.sort_by(|a, b| a.0.cmp(&b.0));
     for (type_name, rows) in __dst_nr {
-        let node_type = &catalog.node_types[type_name];
-        let batch = build_node_batch(node_type, rows, &mut node_id_remap, catalog.system_columns)?;
+        let node_type = &catalog.node_types[&type_name];
+        let batch = build_node_batch(node_type, &rows, &mut node_id_remap, catalog.system_columns)?;
+        if bounded_keyed_input {
+            prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, &batch)?;
+        }
         // Validation (value/enum/unique) runs end-of-load via the evaluator.
         let loaded_count = batch.num_rows();
         let table_key = format!("node:{}", type_name);
         let _entry = snapshot
             .dataset(&table_key)
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
-        prepared_nodes.push((type_name.clone(), table_key, vec![batch], loaded_count));
+        prepared_nodes.push((type_name, table_key, vec![batch], loaded_count));
     }
     let mut __dst_sn: Vec<_> = strict_nodes.into_iter().collect();
     __dst_sn.sort_by(|a, b| a.0.cmp(&b.0));
@@ -800,6 +786,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
             .dataset(&table_key)
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
         let batch = normalize_strict_json_rows(&catalog, &table_key, &rows)?;
+        if bounded_keyed_input {
+            prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, &batch)?;
+        }
         let loaded_count = batch.num_rows();
         prepared_nodes.push((type_name, table_key, vec![batch], loaded_count));
     }
@@ -835,18 +824,21 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // runs end-of-load via the unified evaluator, below.
     let mut prepared_edges: Vec<(String, String, Vec<RecordBatch>, usize)> =
         Vec::with_capacity(edge_rows.len().saturating_add(strict_edges.len()));
-    let mut __dst_er: Vec<_> = edge_rows.iter().collect();
-    __dst_er.sort_by(|a, b| a.0.cmp(b.0));
+    let mut __dst_er: Vec<_> = edge_rows.into_iter().collect();
+    __dst_er.sort_by(|a, b| a.0.cmp(&b.0));
     for (edge_name, rows) in __dst_er {
-        let edge_type = &catalog.edge_types[edge_name];
-        let batch = build_edge_batch(edge_type, rows, &node_id_remap, catalog.system_columns)?;
+        let edge_type = &catalog.edge_types[&edge_name];
+        let batch = build_edge_batch(edge_type, &rows, &node_id_remap, catalog.system_columns)?;
+        if bounded_keyed_input {
+            prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, &batch)?;
+        }
         // Validation (enum/unique, edge-RI, @card) runs end-of-load via the evaluator.
         let loaded_count = batch.num_rows();
         let table_key = format!("edge:{}", edge_name);
         let _entry = snapshot
             .dataset(&table_key)
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
-        prepared_edges.push((edge_name.clone(), table_key, vec![batch], loaded_count));
+        prepared_edges.push((edge_name, table_key, vec![batch], loaded_count));
     }
     let mut __dst_se: Vec<_> = strict_edges.into_iter().collect();
     __dst_se.sort_by(|a, b| a.0.cmp(&b.0));
@@ -856,6 +848,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
             .dataset(&table_key)
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
         let batch = normalize_strict_json_rows(&catalog, &table_key, &rows)?;
+        if bounded_keyed_input {
+            prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, &batch)?;
+        }
         let loaded_count = batch.num_rows();
         prepared_edges.push((edge_name, table_key, vec![batch], loaded_count));
     }
@@ -900,6 +895,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // Bob while a retained `edge:Knows(Alice->Bob)` would otherwise publish an
     // orphan. (Per-table, like the rest of Overwrite handling.)
     if mode == LoadMode::Overwrite {
+        let mut removed_id_budget = DeletedIdBudget::default();
         let keys: Vec<String> = changeset.keys().cloned().collect();
         for table_key in keys {
             let removed = crate::validate::overwrite_removed_ids(
@@ -907,6 +903,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
                 &table_key,
                 changeset.get(&table_key).expect("key from this changeset"),
                 catalog.system_columns,
+                |id| removed_id_budget.retain(id),
             )
             .await?;
             if !removed.is_empty() {
@@ -1175,7 +1172,7 @@ fn parse_strict_graph_rows<R: BufRead>(
     mut reader: R,
     catalog: &Catalog,
     bounded_keyed_input: bool,
-    keyed_input_budget: &mut HashMap<String, (usize, u64)>,
+    keyed_input_budget: &mut KeyedInputBudget,
 ) -> Result<StrictGraphRows> {
     let mut rows = StrictGraphRows::default();
     let mut line_number = 0_usize;
@@ -1413,28 +1410,37 @@ fn take_object_or_empty(
     }
 }
 
-/// Account a keyed JSON record before retaining it in the per-table parse
-/// spool. This is a conservative lower bound on the Arrow payload (string and
-/// decoded blob bytes, scalar widths, and list offsets); the exact accumulated
-/// Arrow check in `MutationStaging::append_batch` remains the final authority.
-/// The early counter prevents an unbounded JSON spool and catches base64 by its
-/// decoded size before the decoder allocates a second copy.
+#[derive(Default)]
+struct KeyedInputBudget {
+    tables: HashMap<String, KeyedTableInput>,
+    bytes: u64,
+}
+
+#[derive(Default)]
+struct KeyedTableInput {
+    rows: usize,
+    bytes: u64,
+}
+
+/// Charge a keyed JSON record before the parse spool retains it: a lower bound
+/// on its Arrow payload per table and across tables, taken before base64 is
+/// decoded. Not a JSON DOM bound; `MutationStaging::append_batch` is the authority.
 fn account_keyed_json_row(
     table_key: &str,
     data: &JsonValue,
     structural_string_bytes: usize,
-    budgets: &mut HashMap<String, (usize, u64)>,
+    budgets: &mut KeyedInputBudget,
 ) -> Result<()> {
-    let entry = budgets.entry(table_key.to_string()).or_insert((0, 0));
-    entry.0 = entry
-        .0
+    let entry = budgets.tables.entry(table_key.to_string()).or_default();
+    entry.rows = entry
+        .rows
         .checked_add(1)
         .ok_or_else(|| OmniError::manifest_internal("keyed input entity count overflow"))?;
-    if entry.0 > crate::storage_layer::KEYED_WRITE_MAX_ROWS {
+    if entry.rows > crate::storage_layer::KEYED_WRITE_MAX_ROWS {
         return Err(OmniError::resource_limit(
             format!("keyed entities for {table_key}"),
             crate::storage_layer::KEYED_WRITE_MAX_ROWS as u64,
-            entry.0 as u64,
+            entry.rows as u64,
         ));
     }
     let row_bytes = estimate_json_arrow_bytes(data)?
@@ -1443,17 +1449,28 @@ fn account_keyed_json_row(
                 .map_err(|_| OmniError::manifest_internal("keyed string bytes exceed u64"))?,
         )
         .ok_or_else(|| OmniError::manifest_internal("keyed input entity bytes overflow"))?;
-    entry.1 = entry
-        .1
+    entry.bytes = entry
+        .bytes
         .checked_add(row_bytes)
         .ok_or_else(|| OmniError::manifest_internal("keyed parsed byte count overflow"))?;
-    if entry.1 > KEYED_WRITE_MAX_BYTES {
+    if entry.bytes > KEYED_WRITE_MAX_BYTES {
         return Err(OmniError::resource_limit(
             format!("keyed parsed entity bytes for {table_key}"),
             KEYED_WRITE_MAX_BYTES,
-            entry.1,
+            entry.bytes,
         ));
     }
+    let total = budgets.bytes.checked_add(row_bytes).ok_or_else(|| {
+        OmniError::manifest_internal("keyed parsed operation byte count overflow")
+    })?;
+    if total > KEYED_WRITE_MAX_BYTES {
+        return Err(OmniError::resource_limit(
+            "keyed parsed entity bytes per operation",
+            KEYED_WRITE_MAX_BYTES,
+            total,
+        ));
+    }
+    budgets.bytes = total;
     Ok(())
 }
 
@@ -3861,6 +3878,37 @@ edge WorksAt: Person -> Company
             } if resource == "graph_batch_json_structural_slots"
                 && actual == GRAPH_BATCH_JSON_MAX_STRUCTURAL_SLOTS + 1
         ));
+    }
+
+    #[test]
+    fn operation_byte_allowances_span_graph_types_and_include_their_ceiling() {
+        let row = serde_json::json!({"payload": "x".repeat(17 * 1024 * 1024)});
+        let mut budget = KeyedInputBudget::default();
+        account_keyed_json_row("node:Person", &row, 0, &mut budget).unwrap();
+        let error = account_keyed_json_row("node:Company", &row, 0, &mut budget)
+            .expect_err("keyed parse bytes must be aggregated across types");
+        assert!(matches!(error,
+            OmniError::ResourceLimitExceeded { ref resource, limit: KEYED_WRITE_MAX_BYTES, actual }
+                if resource == "keyed parsed entity bytes per operation"
+                    && actual > KEYED_WRITE_MAX_BYTES
+        ));
+
+        assert_eq!(
+            crate::storage_layer::retained_keyed_bytes(KEYED_WRITE_MAX_BYTES - 1, 1).unwrap(),
+            KEYED_WRITE_MAX_BYTES
+        );
+        assert!(crate::storage_layer::retained_keyed_bytes(KEYED_WRITE_MAX_BYTES, 1).is_err());
+        let id =
+            &row["payload"].as_str().unwrap()[..16 * 1024 * 1024 - std::mem::size_of::<String>()];
+        let mut removed = DeletedIdBudget::default();
+        removed.retain(id).unwrap();
+        removed
+            .retain(id)
+            .expect("the exact retained-ID byte ceiling is inclusive");
+        assert!(
+            removed.retain("").is_err(),
+            "even an empty ID owns one String slot"
+        );
     }
 
     #[tokio::test]

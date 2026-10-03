@@ -2,6 +2,7 @@
 //! boots from (moved verbatim from lib.rs in the modularization).
 
 use super::*;
+use crate::config::storage_root_conflict_code;
 
 /// One graph in a serving snapshot: its id and on-disk root.
 #[derive(Debug, Clone)]
@@ -34,6 +35,14 @@ pub struct ServingPolicy {
     pub applies_to: Vec<String>,
 }
 
+/// An applied graph refused by snapshot safety checks. Preserve its exact
+/// configured storage root without loading rejected policies or graph data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServingBlockedGraph {
+    pub graph_id: String,
+    pub root: PathBuf,
+}
+
 /// Everything a server needs to boot from the cluster catalog (RFC-005 §D2).
 #[derive(Debug, Clone)]
 pub struct ServingSnapshot {
@@ -49,10 +58,11 @@ pub struct ServingSnapshot {
     pub state_cas: Option<String>,
     /// Every graph the applied revision names, sorted.
     pub applied_graphs: Vec<String>,
-    /// Applied graphs this snapshot does not serve because pending recovery
-    /// quarantined them, sorted. A sidecar for a graph the revision does not
-    /// name is not in this list.
-    pub quarantined_graphs: Vec<String>,
+    /// Applied graphs this snapshot does not serve, sorted: pending recovery
+    /// quarantined them, or their applied external Blob policy has a
+    /// server-safe base overlapping the cluster storage root. A sidecar for a
+    /// graph the revision does not name is not in this list.
+    pub quarantined_graphs: Vec<ServingBlockedGraph>,
 }
 
 /// A serving snapshot paired with the canonical root of the same opened store.
@@ -79,6 +89,74 @@ impl RootBoundServingSnapshot {
     pub fn into_snapshot(self) -> ServingSnapshot {
         self.snapshot
     }
+}
+
+/// Serving input captured while holding the v2 cluster's lifetime admission.
+/// V1 carries no admission and preserves its existing startup contract.
+#[derive(Debug, Clone)]
+pub struct AdmittedServingSnapshot {
+    snapshot: ServingSnapshot,
+    canonical_root: String,
+    admission: Option<crate::admission::ClusterAdmission>,
+}
+
+impl AdmittedServingSnapshot {
+    pub fn canonical_root(&self) -> &str {
+        &self.canonical_root
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        ServingSnapshot,
+        String,
+        Option<crate::admission::ClusterAdmission>,
+    ) {
+        (self.snapshot, self.canonical_root, self.admission)
+    }
+}
+
+/// Acquire v2 admission before capturing the applied serving input. The caller
+/// must retain the admission through graph opening and the server's lifetime.
+/// A bare path resolves `cluster.yaml`'s storage root; a URI is config-free.
+pub async fn admit_serving_snapshot(
+    cluster: &str,
+) -> Result<AdmittedServingSnapshot, Vec<Diagnostic>> {
+    let store = if cluster.contains("://") {
+        ClusterStore::for_storage_root(cluster).map_err(|diagnostic| vec![diagnostic])?
+    } else {
+        store_for_serving_snapshot(Path::new(cluster))?
+    };
+    let admission = crate::admission::acquire_with_store(
+        &store,
+        crate::admission::ClusterAdmissionPurpose::Serve,
+    )
+    .await
+    .map_err(|diagnostic| vec![diagnostic])?;
+    let snapshot = read_snapshot_with_store(&store).await?;
+    let canonical_root = store
+        .canonical_root()
+        .map_err(|diagnostic| vec![diagnostic])?;
+    Ok(AdmittedServingSnapshot {
+        snapshot,
+        canonical_root,
+        admission,
+    })
+}
+
+/// Acquire lifetime admission for a server config directory or storage URI.
+/// This resolves the root only; serving input must be captured under the guard.
+pub async fn acquire_serving_admission(
+    cluster: &str,
+) -> Result<Option<crate::admission::ClusterAdmission>, Vec<Diagnostic>> {
+    let store = if cluster.contains("://") {
+        ClusterStore::for_storage_root(cluster).map_err(|diagnostic| vec![diagnostic])?
+    } else {
+        store_for_serving_snapshot(Path::new(cluster))?
+    };
+    crate::admission::acquire_with_store(&store, crate::admission::ClusterAdmissionPurpose::Serve)
+        .await
+        .map_err(|diagnostic| vec![diagnostic])
 }
 
 /// Read the applied revision as a serving snapshot — the read-only loader for
@@ -129,6 +207,18 @@ pub async fn read_serving_snapshot_from_storage(
     read_snapshot_with_store(&backend).await
 }
 
+/// Test support: read a local cluster's serving snapshot through the
+/// production reader while its storage root reads as `display_root` (see
+/// `ClusterStore::with_display_root`). Graph roots derive from it too.
+#[cfg(any(test, feature = "test-util"))]
+pub async fn read_serving_snapshot_with_display_root(
+    config_dir: impl AsRef<Path>,
+    display_root: &str,
+) -> Result<ServingSnapshot, Vec<Diagnostic>> {
+    let backend = ClusterStore::for_config_dir(config_dir.as_ref()).with_display_root(display_root);
+    read_snapshot_with_store(&backend).await
+}
+
 /// Read an applied snapshot and its canonical store root for managed boot trust.
 /// Ordinary snapshot reads do not perform this extra canonicalization step.
 pub async fn read_root_bound_serving_snapshot(
@@ -166,23 +256,37 @@ async fn read_root_bound_snapshot_with_store(
 /// `init` into a cluster-managed location — graphs there are created by
 /// `cluster apply`, not `init`.
 ///
-/// Cheap by construction: a URI that does not match the `<root>/graphs/<id>.omni`
-/// shape returns `None` without any I/O, so ordinary `init` targets
-/// (`./kb.omni`, `s3://bucket/kb.omni`, `az://container/kb.omni`) never probe
-/// storage. Works for `file://`, `s3://`, and `az://` via the storage adapter.
+/// Local aliases are resolved before testing the layout. Non-cluster-shaped
+/// remote URIs never probe storage. Works for `file://`, `s3://`, and `az://`.
 pub async fn cluster_root_for_graph_uri(graph_uri: &str) -> Result<Option<String>, Diagnostic> {
-    let Some(root) = cluster_root_of_graph_layout(graph_uri) else {
-        return Ok(None);
-    };
-    let store = ClusterStore::for_storage_root(&root)?;
-    let has_state = store.has_state().await.map_err(|error| {
-        Diagnostic::error(
-            "cluster_state_probe_error",
-            omnigraph_storage::redacted_storage_uri(&root),
-            format!("could not inspect cluster state: {error}"),
-        )
+    // Resolve aliases before deciding that a graph is standalone. A symlink to
+    // a managed graph can have any filename. Also inspect the lexical layout
+    // so a managed graph symlink escaping the root is refused by v2 admission.
+    let canonical = crate::admission::canonical_graph_uri(graph_uri)?;
+    let lexical = omnigraph_storage::normalize_root_uri(graph_uri).map_err(|error| {
+        Diagnostic::error("cluster_graph_uri_error", "graph", error.to_string())
     })?;
-    Ok(has_state.then(|| store.display_root().to_string()))
+    let mut roots = BTreeSet::new();
+    for uri in [&canonical, &lexical] {
+        let Some(root) = cluster_root_of_graph_layout(uri) else {
+            continue;
+        };
+        if !roots.insert(root.clone()) {
+            continue;
+        }
+        let store = ClusterStore::for_storage_root(&root)?;
+        let has_state = store.has_state().await.map_err(|error| {
+            Diagnostic::error(
+                "cluster_state_probe_error",
+                omnigraph_storage::redacted_storage_uri(&root),
+                format!("could not inspect cluster state: {error}"),
+            )
+        })?;
+        if has_state {
+            return Ok(Some(store.display_root().to_string()));
+        }
+    }
+    Ok(None)
 }
 
 /// Resolve a graph's **storage URI** (`<root>/graphs/<id>.omni`) from a cluster's
@@ -279,7 +383,7 @@ fn cluster_root_of_graph_layout(graph_uri: &str) -> Option<String> {
     Some(root.to_string())
 }
 
-async fn read_snapshot_with_store(
+pub(crate) async fn read_snapshot_with_store(
     backend: &ClusterStore,
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
@@ -348,6 +452,29 @@ async fn read_snapshot_with_store(
     let boot_state_revision = state.state_revision;
     let boot_state_cas = observations.state_cas.clone();
     let boot_applied_graphs = applied_graph_ids(&state);
+    let recovery_pending = boot_applied_graphs
+        .iter()
+        .any(|graph_id| quarantined_graphs.contains(graph_id));
+    for (graph_id, conflict) in
+        overlapping_served_external_blob_policies(&state, backend.display_root())
+    {
+        quarantined_graphs.insert(graph_id.clone());
+        let remedy = match conflict {
+            omnigraph::StorageRootConflict::UncomparableRoot { .. } => {
+                "serving cannot prove the base lies outside the cluster storage root; remove the graph's server-safe bases with `cluster apply`, or serve from a storage root without empty, dot or percent-encoded path components, and restart"
+            }
+            _ => {
+                "move the base to a prefix outside the cluster storage root, run `cluster apply`, and restart"
+            }
+        };
+        startup_diagnostics.push(Diagnostic::warning(
+            storage_root_conflict_code(&conflict),
+            graph_address(&graph_id),
+            format!(
+                "graph `{graph_id}` is quarantined because its applied external Blob policy is unsafe to serve: {conflict}; {remedy}"
+            ),
+        ));
+    }
 
     let required_embedding_providers: BTreeSet<String> = state
         .applied_revision
@@ -514,7 +641,11 @@ async fn read_snapshot_with_store(
         if saw_applied_graph {
             diagnostics.push(Diagnostic::error(
                 "cluster_no_healthy_graphs",
-                CLUSTER_RECOVERIES_DIR,
+                if recovery_pending {
+                    CLUSTER_RECOVERIES_DIR
+                } else {
+                    CLUSTER_STATE_FILE
+                },
                 "all applied graphs are quarantined by startup safety checks; resolve the graph-specific diagnostics, then retry",
             ));
         } else if boot_state_revision == 0
@@ -552,9 +683,48 @@ async fn read_snapshot_with_store(
         quarantined_graphs: quarantined_graphs
             .into_iter()
             .filter(|graph_id| boot_applied_graphs.contains(graph_id))
+            .map(|graph_id| ServingBlockedGraph {
+                root: PathBuf::from(backend.graph_root(&graph_id)),
+                graph_id,
+            })
             .collect(),
         applied_graphs: boot_applied_graphs,
     })
+}
+
+/// Applied graphs whose server-safe external Blob bases overlap, or cannot be
+/// compared with, the cluster storage root, with the conflict. The ledger is
+/// checked as read, not trusted to have passed `cluster validate`. A policy
+/// that does not project or validate is left to the server's install to
+/// refuse, and an entry whose composite digest does not bind its policy to the
+/// boot-fatal `external_blob_policy_digest_mismatch` check.
+pub(crate) fn overlapping_served_external_blob_policies(
+    state: &ClusterState,
+    storage_root: &str,
+) -> Vec<(String, omnigraph::StorageRootConflict)> {
+    state
+        .applied_revision
+        .resources
+        .iter()
+        .filter_map(|(address, entry)| {
+            let ResourceKind::Graph(graph_id) = resource_kind(address) else {
+                return None;
+            };
+            if expected_state_graph_resource_digest(state, &graph_id, entry) != entry.digest {
+                return None;
+            }
+            let policy = entry
+                .external_blob_policy
+                .clone()
+                .unwrap_or_default()
+                .server_safe_only()
+                .ok()?;
+            match policy.ensure_disjoint_from_storage_root(storage_root) {
+                Ok(()) | Err(omnigraph::StorageRootConflict::InvalidPolicy(_)) => None,
+                Err(conflict) => Some((graph_id, conflict)),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

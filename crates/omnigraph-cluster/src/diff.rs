@@ -317,7 +317,8 @@ pub(crate) fn classify_changes(
                 }
                 PlanOperation::Update if !pending_recovery.contains(&graph) => {
                     // Stage 4B: schema updates execute via the engine's
-                    // schema apply (soft drops only; allow_data_loss is 4C).
+                    // schema apply. A drop reclaims nothing at apply, so no
+                    // schema change needs an approval artifact.
                     (ApplyDisposition::Applied, None)
                 }
                 PlanOperation::Create | PlanOperation::Update => {

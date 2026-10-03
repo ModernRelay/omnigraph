@@ -7,24 +7,21 @@
 //!
 //! Two dials:
 //!
-//! * `optimize_all_datasets` — Lance `compact_files` on every dataset. Rewrites
-//!   small fragments into fewer large ones, then **publishes the compacted
-//!   versions together in one `__manifest` batch** so each persisted
-//!   `table_version` column tracks the compacted Lance HEAD (reads pin the
-//!   published dataset version, so without the publish compaction would be invisible to readers and would break the
-//!   HEAD-vs-manifest precondition of schema apply / strict writes). Compaction
-//!   is content-preserving (Lance `Operation::Rewrite` "reorganizes data
-//!   without semantic modification"), so old fragments remain reachable via
-//!   older dataset versions until `cleanup` runs.
-//! * `cleanup_all_datasets` — Lance `cleanup_old_versions` on every dataset.
-//!   Removes manifests (and their unique fragments) older than the configured
-//!   retention, capped at the oldest main-dataset version inherited by any live
-//!   lazy graph branch. Destructive to unreferenced version history — callers
-//!   should gate this behind an explicit confirm flag at the CLI layer.
-//!
-//! Both orchestrate the graph's node + edge datasets from main authority;
-//! cleanup preserves both Lance-referenced native branch history and the
-//! graph-level lazy-branch references Lance cannot observe.
+//! * `optimize_all_datasets` — stages Lance compaction on every dataset as
+//!   detached commits and **publishes them together in one `__manifest`
+//!   batch**, so each registration's pin names the compacted version (reads
+//!   pin the published dataset version, so without the publish compaction
+//!   would be invisible to readers). Compaction is content-preserving (Lance
+//!   `Operation::Rewrite` "reorganizes data without semantic modification"),
+//!   so old fragments remain reachable through older `__manifest` versions
+//!   until `cleanup` stops retaining them.
+//! * `cleanup_all_datasets` — the engine's tracing collector
+//!   (`collector.rs`); stock `cleanup_old_versions` is never called on a
+//!   graph table. `--keep` / `--older-than` choose the retained `__manifest`
+//!   versions per live branch; the collector keeps every file those
+//!   versions, tags and merge bases reach and deletes the rest. Destructive
+//!   to unreferenced version history — callers should gate this behind an
+//!   explicit confirm flag at the CLI layer.
 
 use std::time::Duration;
 
@@ -224,7 +221,6 @@ decide_seam! {
 pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimizeStats>> {
     let _export_exclusion = db.reserve_export_destructive_control()?;
     db.ensure_schema_state_valid().await?;
-    db.ensure_schema_apply_idle("optimize").await?;
 
     // Capture complete graph authority before entering any writer gate, then
     // revalidate it after schema -> main -> table acquisition. A concurrent
@@ -238,7 +234,6 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
     // under the same schema gate as schema apply and the exact RFC-022 writers.
     let schema_permit = db.write_queue().acquire_schema_shared().await;
     db.refresh_coordinator_only().await?;
-    db.ensure_schema_apply_not_locked("optimize").await?;
     let catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
 
     // Optimize's one visibility point advances main's graph head, so its
@@ -830,10 +825,11 @@ decide_seam! {
     pub static CLEANUP_PRE_GATES = ("cleanup.pre_gates", Unreachable, [Fail]);
 }
 
-/// Run Lance `cleanup_old_versions` on every node + edge dataset on `main`,
-/// using [`CleanupPolicyOptions`]. The latest manifest is always preserved
-/// regardless (Lance invariant), and the requested cutoff is capped at the
-/// oldest main-dataset version inherited by a live lazy graph branch.
+/// Reclaim unretained table versions with the engine collector
+/// (`collector.rs`), never stock `cleanup_old_versions`. [`CleanupPolicyOptions`]
+/// chooses the `__manifest` versions each live branch retains (every branch
+/// head always among them); the collector keeps every file a retained
+/// version, tag or merge base reaches and deletes the rest.
 pub async fn cleanup_all_datasets(
     db: &Omnigraph,
     options: CleanupPolicyOptions,
@@ -846,7 +842,6 @@ pub async fn cleanup_all_datasets(
 
     let _export_exclusion = db.reserve_export_destructive_control()?;
     db.ensure_schema_state_valid().await?;
-    db.ensure_schema_apply_idle("cleanup").await?;
     fail(&CLEANUP_PRE_GATES)?;
 
     // GC must be bound to one accepted graph view. Capture before acquiring
@@ -856,7 +851,6 @@ pub async fn cleanup_all_datasets(
 
     let _cleanup_schema_permit = db.write_queue().acquire_schema_shared().await;
     db.refresh_coordinator_only().await?;
-    db.ensure_schema_apply_not_locked("cleanup").await?;
     let cleanup_catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
     let snapshot = db.revalidate_write_txn(&authority_txn).await?;
 
@@ -1402,7 +1396,6 @@ fn native_table_retention_roots(
             .iter()
             .filter(|native| {
                 native.as_str() == "main"
-                    || crate::db::is_internal_system_branch(native)
                     || collector_retains_native_tree(plan, full_path, object_base, native)
                     || crate::branch_names::retain_unpublished_table_fork(native, |incarnation| {
                         plan.live_branch_incarnations.contains(incarnation)

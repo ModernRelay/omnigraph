@@ -16,14 +16,18 @@
 //! version publication against a managed namespace manifest.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use lance::Dataset;
 use lance::Error as LanceError;
+use lance_core::deepsize::DeepSizeOf;
 use lance_namespace::NamespaceError;
 #[cfg(any(test, feature = "test-util"))]
 use lance_namespace::models::CreateTableVersionRequest;
+use lance_table::format::Manifest;
+use lance_table::io::commit::ManifestLocation;
 
 use crate::error::{OmniError, Result};
 
@@ -34,16 +38,18 @@ use super::layout::{
     open_manifest_dataset_with_session, table_object_id, tombstone_object_id, version_object_id,
 };
 use super::metadata::{TableVersionMetadata, parse_namespace_version_request};
-use super::migrations::guard_stamp;
+use super::migrations::{INTERNAL_MANIFEST_SCHEMA_VERSION, guard_stamp, read_stamp};
 use super::state::{
-    GraphLineageRow, GraphLineageRowPart, ManifestState, ProjectionAccumulator,
-    assemble_manifest_projection, graph_head_object_id, graph_lineage_row_parts, head_lineage_row,
-    manifest_rows_batch, read_manifest_state, read_publish_scan,
+    GraphLineageRow, GraphLineageRowPart, ManifestState, ProjectionAccumulator, SchemaContractHead,
+    assemble_manifest_projection, decode_publish_batch, graph_head_object_id,
+    graph_lineage_row_parts, head_lineage_row, manifest_rows_batch, read_manifest_state,
+    read_publish_scan, schema_contract_metadata_json,
 };
 use super::{
     DatasetEntry, ExpectedTableVersions, MAIN_BRANCH_HEAD_KEY, ManifestChange, ManifestIncarnation,
-    NativeRefPin, OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION,
-    TableIdentity, TableRegistration, TableRename, TableTombstone, WinnerRef,
+    NativeRefPin, OBJECT_TYPE_SCHEMA_CONTRACT, OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE,
+    OBJECT_TYPE_TABLE_VERSION, SCHEMA_CONTRACT_OBJECT_ID, TableIdentity, TableRegistration,
+    TableRename, TableTombstone, WinnerRef,
 };
 use crate::seams::{contention, decide_seam, fail};
 
@@ -116,10 +122,18 @@ impl GraphHeadExpectation {
 /// check detects delete/recreate ABA on every attempt; it is not a distributed
 /// ref-control fence (Lance branch create/delete still lacks conditional CAS),
 /// so branch control remains within the documented single-writer-process bound.
+/// `ExactGraphVersion` additionally fixes the numeric base on every retry,
+/// including metadata-only contention that preserves graph HEAD.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PublishPrecondition {
     Any,
     ExactGraphHead(GraphHeadExpectation),
+    /// A prepared schema publication or its settlement fence may consume only
+    /// `version + 1`. Even head-preserving metadata contention must not rebase it.
+    ExactGraphVersion {
+        authority: GraphHeadExpectation,
+        version: u64,
+    },
 }
 
 /// The result of a manifest publish that may have folded in a graph commit.
@@ -147,6 +161,11 @@ pub struct PublishOutcome {
 
 #[async_trait]
 pub trait ManifestBatchPublisher: Send + Sync {
+    /// Acknowledged rows only when their immutable image matches the capture.
+    fn cached_rows(&self, _dataset: &Dataset) -> Option<RecordBatch> {
+        None
+    }
+
     /// Publish without a graph-head precondition. Every production writer
     /// calls `publish_with_precondition`; only the publisher's own tests use
     /// this shorthand.
@@ -179,6 +198,63 @@ pub struct GraphNamespacePublisher {
     root_uri: String,
     branch: Option<String>,
     control_session: Arc<lance::session::Session>,
+    published_rows: Mutex<Option<PublishedRows>>,
+}
+
+pub(crate) const PUBLISHED_ROWS_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug)]
+struct PublishedRows {
+    manifest: Manifest,
+    location: ManifestLocation,
+    batch: RecordBatch,
+}
+
+impl PublishedRows {
+    fn new(dataset: &Dataset, batch: RecordBatch) -> Option<Self> {
+        let manifest = dataset.manifest();
+        let location = dataset.manifest_location();
+        let bytes = batch
+            .get_array_memory_size()
+            .saturating_add(manifest.deep_size_of())
+            .saturating_add(location.path.as_ref().len())
+            .saturating_add(location.e_tag.as_ref().map_or(0, String::capacity))
+            .saturating_add(std::mem::size_of::<Self>());
+        if bytes > PUBLISHED_ROWS_CACHE_BYTES
+            || read_stamp(dataset) != Some(INTERNAL_MANIFEST_SCHEMA_VERSION)
+            || manifest
+                .schema
+                .fields_pre_order()
+                .any(|field| field.dictionary.is_some())
+        {
+            return None;
+        }
+        Some(Self {
+            manifest: manifest.clone(),
+            location: location.clone(),
+            batch,
+        })
+    }
+
+    fn matches(&self, dataset: &Dataset) -> bool {
+        manifest_image_matches(&self.manifest, &self.location, dataset)
+    }
+}
+
+pub(crate) fn manifest_image_matches(
+    manifest: &Manifest,
+    location: &ManifestLocation,
+    dataset: &Dataset,
+) -> bool {
+    let other = dataset.manifest_location();
+    location.path == other.path
+        && location.version == other.version
+        && location.naming_scheme == other.naming_scheme
+        && !matches!((&location.e_tag, &other.e_tag), (Some(a), Some(b)) if a != b)
+        && !matches!((location.size, other.size), (Some(a), Some(b)) if a != b)
+        && manifest == dataset.manifest()
+        // Lance Schema equality compares fields but omits schema metadata.
+        && manifest.schema.metadata == dataset.schema().metadata
 }
 
 #[derive(Debug)]
@@ -192,6 +268,8 @@ struct PendingVersionRow {
     table_version: Option<u64>,
     table_branch: Option<String>,
     row_count: Option<u64>,
+    /// `(source, ir)` texts, present on the `schema_contract` row alone.
+    schema_content: Option<(String, String)>,
 }
 
 /// Everything one CAS attempt needs out of a single `__manifest` scan
@@ -208,6 +286,9 @@ struct LoadedPublishState {
     existing_tombstones: HashMap<(TableIdentity, u64), u64>,
     lineage_rows: Vec<GraphLineageRow>,
     graph_heads: HashMap<String, String>,
+    /// The live `schema_contract` row's head, carried forward by the fold
+    /// unless the batch replaces the row.
+    schema_contract: Option<SchemaContractHead>,
     /// The scanned rows, the input of the copy-on-write publish.
     live_rows: Vec<arrow_array::RecordBatch>,
 }
@@ -256,7 +337,11 @@ impl GraphNamespacePublisher {
         precondition: &PublishPrecondition,
     ) -> Option<ManifestIncarnation> {
         let branch_identifier = match precondition {
-            PublishPrecondition::ExactGraphHead(expected) => expected.branch_identifier.clone(),
+            PublishPrecondition::ExactGraphHead(expected)
+            | PublishPrecondition::ExactGraphVersion {
+                authority: expected,
+                ..
+            } => expected.branch_identifier.clone(),
             PublishPrecondition::Any if self.branch.is_none() => {
                 lance::dataset::refs::BranchIdentifier::main()
             }
@@ -288,6 +373,7 @@ impl GraphNamespacePublisher {
                 .filter(|branch| *branch != "main")
                 .map(ToOwned::to_owned),
             control_session,
+            published_rows: Mutex::new(None),
         }
     }
 
@@ -307,13 +393,11 @@ impl GraphNamespacePublisher {
         contention(&PUBLISH_LOAD_STATE)?;
         let dataset = self.dataset().await?;
         guard_stamp(&dataset)?;
-        // ONE `__manifest` scan for everything the publish needs: table
-        // locations, version entries, tombstones, `graph_commit` lineage rows
-        // for parent resolution, AND exact `graph_head` rows for OCC (RFC-013
-        // P2 / RFC-022). Extraction rides this pass instead of a second
-        // `read_graph_lineage` scan; the per-attempt re-read is preserved because
-        // `load_publish_state` runs once per CAS attempt.
-        let scan = read_publish_scan(&dataset).await?;
+        let cached = self.cached_rows(&dataset);
+        let scan = match cached {
+            Some(batch) => decode_publish_batch(&dataset, batch).await?,
+            None => read_publish_scan(&dataset).await?,
+        };
         let existing_versions = scan
             .version_entries
             .iter()
@@ -327,6 +411,7 @@ impl GraphNamespacePublisher {
             existing_tombstones,
             lineage_rows: scan.lineage_rows,
             graph_heads: scan.graph_heads,
+            schema_contract: scan.schema_contract,
             live_rows: scan.live_rows,
         })
     }
@@ -396,6 +481,7 @@ impl GraphNamespacePublisher {
                         table_version: None,
                         table_branch: None,
                         row_count: None,
+                        schema_content: None,
                     });
                 }
                 ManifestChange::RenameTable(TableRename {
@@ -459,15 +545,39 @@ impl GraphNamespacePublisher {
                         table_version: None,
                         table_branch: None,
                         row_count: None,
+                        schema_content: None,
                     });
                 }
-                ManifestChange::Update(_) | ManifestChange::Tombstone(_) => {}
+                ManifestChange::Update(_)
+                | ManifestChange::Tombstone(_)
+                | ManifestChange::SchemaContract(_) => {}
             }
         }
 
+        let mut schema_contract_claimed = false;
         for change in changes {
             match change {
                 ManifestChange::RegisterTable(_) | ManifestChange::RenameTable(_) => {}
+                ManifestChange::SchemaContract(contract) => {
+                    if std::mem::replace(&mut schema_contract_claimed, true) {
+                        return Err(OmniError::manifest(
+                            "the schema contract is replaced twice in one publish request"
+                                .to_string(),
+                        ));
+                    }
+                    rows.push(PendingVersionRow {
+                        object_id: SCHEMA_CONTRACT_OBJECT_ID.to_string(),
+                        object_type: OBJECT_TYPE_SCHEMA_CONTRACT.to_string(),
+                        location: None,
+                        metadata: Some(schema_contract_metadata_json(&contract.head)?),
+                        table_key: String::new(),
+                        identity: None,
+                        table_version: None,
+                        table_branch: None,
+                        row_count: None,
+                        schema_content: Some((contract.source.clone(), contract.ir.clone())),
+                    });
+                }
                 ManifestChange::Update(update) => {
                     update.identity.validate()?;
                     let request = update.to_create_table_version_request();
@@ -520,6 +630,7 @@ impl GraphNamespacePublisher {
                         table_version: Some(table_version),
                         table_branch,
                         row_count: Some(row_count),
+                        schema_content: None,
                     });
                 }
                 ManifestChange::Tombstone(TableTombstone {
@@ -572,6 +683,7 @@ impl GraphNamespacePublisher {
                         table_version: Some(*tombstone_version),
                         table_branch: None,
                         row_count: None,
+                        schema_content: None,
                     });
                 }
             }
@@ -634,6 +746,8 @@ impl GraphNamespacePublisher {
         let mut table_versions: Vec<Option<u64>> = Vec::with_capacity(rows.len());
         let mut table_branches = Vec::with_capacity(rows.len());
         let mut row_counts: Vec<Option<u64>> = Vec::with_capacity(rows.len());
+        let mut schema_sources = Vec::with_capacity(rows.len());
+        let mut schema_irs = Vec::with_capacity(rows.len());
 
         for row in rows {
             object_ids.push(row.object_id);
@@ -645,6 +759,9 @@ impl GraphNamespacePublisher {
             table_versions.push(row.table_version);
             table_branches.push(row.table_branch);
             row_counts.push(row.row_count);
+            let (source, ir) = row.schema_content.unzip();
+            schema_sources.push(source);
+            schema_irs.push(ir);
         }
 
         manifest_rows_batch(
@@ -657,6 +774,8 @@ impl GraphNamespacePublisher {
             table_versions,
             table_branches,
             row_counts,
+            schema_sources,
+            schema_irs,
         )
     }
 
@@ -889,8 +1008,19 @@ impl GraphNamespacePublisher {
         graph_heads: &HashMap<String, String>,
         precondition: &PublishPrecondition,
     ) -> Result<()> {
-        let PublishPrecondition::ExactGraphHead(expected) = precondition else {
-            return Ok(());
+        let expected = match precondition {
+            PublishPrecondition::Any => return Ok(()),
+            PublishPrecondition::ExactGraphHead(expected) => expected,
+            PublishPrecondition::ExactGraphVersion { authority, version } => {
+                if dataset.version().version != *version {
+                    return Err(OmniError::manifest_read_set_changed(
+                        "prepared_schema_manifest_version",
+                        Some(version.to_string()),
+                        Some(dataset.version().version.to_string()),
+                    ));
+                }
+                authority
+            }
         };
 
         let expected_branch = expected
@@ -965,7 +1095,7 @@ impl GraphNamespacePublisher {
         dataset: Dataset,
         rows: Vec<PendingVersionRow>,
         live_rows: Vec<arrow_array::RecordBatch>,
-    ) -> Result<Dataset> {
+    ) -> Result<(Dataset, Option<RecordBatch>)> {
         fail(&PUBLISH_PRE_MERGE)?;
         let pending = Self::pending_rows_to_batch(rows)?;
         let new_dataset = commit::overwrite(dataset, pending, live_rows).await?;
@@ -1027,6 +1157,7 @@ fn lineage_part_to_pending(part: GraphLineageRowPart) -> PendingVersionRow {
         table_version: part.table_version,
         table_branch: part.table_branch,
         row_count: None,
+        schema_content: None,
     }
 }
 
@@ -1070,6 +1201,15 @@ fn publish_outcome_in_doubt(
 
 #[async_trait]
 impl ManifestBatchPublisher for GraphNamespacePublisher {
+    fn cached_rows(&self, dataset: &Dataset) -> Option<RecordBatch> {
+        self.published_rows
+            .lock()
+            .expect("published rows cache lock poisoned")
+            .as_ref()
+            .filter(|rows| rows.matches(dataset))
+            .map(|rows| rows.batch.clone())
+    }
+
     async fn publish_with_precondition(
         &self,
         changes: &[ManifestChange],
@@ -1116,13 +1256,10 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 existing_tombstones,
                 lineage_rows,
                 graph_heads,
+                schema_contract,
                 live_rows,
             } = loaded;
 
-            // Exact logical authority is checked on EVERY attempt from this
-            // attempt's single manifest scan. In particular, a CAS retry after
-            // another writer creates or advances `graph_head:<branch>` fails
-            // here instead of transparently re-parenting the prepared intent.
             self.check_publish_precondition(&dataset, &graph_heads, precondition)
                 .await?;
             let base_incarnation = self.checked_base_incarnation(&dataset, precondition);
@@ -1167,6 +1304,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                     existing_versions.into_values().collect(),
                     existing_tombstones.into_keys(),
                     graph_heads,
+                    schema_contract,
                 )?;
                 return Ok(PublishOutcome {
                     dataset,
@@ -1198,6 +1336,13 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                     intent.graph_commit_id.clone(),
                 );
             }
+            let fold_schema_contract = changes
+                .iter()
+                .find_map(|change| match change {
+                    ManifestChange::SchemaContract(contract) => Some(contract.head.clone()),
+                    _ => None,
+                })
+                .or(schema_contract);
             // Validate the complete post-batch fold before the physical merge.
             // In particular, alias collisions must fail without advancing
             // `__manifest`; discovering one after `merge_rows` would be an
@@ -1208,10 +1353,11 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 fold_entries,
                 fold_tombstones,
                 fold_graph_heads,
+                fold_schema_contract,
             )?;
 
             match self.merge_rows(dataset.clone(), rows, live_rows).await {
-                Ok(new_dataset) => {
+                Ok((new_dataset, retained)) => {
                     if new_dataset.version().version != new_manifest_version {
                         return Err(OmniError::manifest_internal(format!(
                             "manifest commit at version {} is durable but its rows carry manifest \
@@ -1220,6 +1366,11 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                             new_manifest_version
                         )));
                     }
+                    *self
+                        .published_rows
+                        .lock()
+                        .expect("published rows cache lock poisoned") =
+                        retained.and_then(|batch| PublishedRows::new(&new_dataset, batch));
                     known_state.version = new_dataset.version().version;
                     return Ok(PublishOutcome {
                         dataset: new_dataset,

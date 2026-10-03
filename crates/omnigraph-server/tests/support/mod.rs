@@ -301,12 +301,6 @@ pub fn get_request(uri: &str, token: &str) -> Request<Body> {
         .unwrap()
 }
 
-pub fn drifted_test_schema() -> String {
-    fs::read_to_string(fixture("test.pg"))
-        .unwrap()
-        .replace("age: I32?", "age: I64?")
-}
-
 pub async fn manifest_dataset_version(graph: &Path) -> u64 {
     Omnigraph::open(graph.to_string_lossy().as_ref())
         .await
@@ -501,7 +495,7 @@ pub fn additive_schema_with_nickname() -> String {
 
 pub fn schema_without_age() -> String {
     // Drop the nullable `age` column from the test schema. Used by the
-    // HTTP soft/hard drop tests below.
+    // HTTP drop tests.
     fs::read_to_string(fixture("test.pg"))
         .unwrap()
         .replace("    age: I32?\n", "")

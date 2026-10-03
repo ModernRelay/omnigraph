@@ -3,6 +3,7 @@
 
 use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::convert::Infallible;
+use std::fmt::Write;
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -838,9 +839,22 @@ async fn export_route_returns_jsonl_for_branch_snapshot() {
         response.headers().get("content-type").unwrap(),
         "application/x-ndjson; charset=utf-8"
     );
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = consume_export(response.into_body()).await;
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert_eq!(text, expected);
+}
+
+// A network transport releases server-owned chunks as it copies them to the
+// client. BodyExt::collect retains every allocation and intentionally hits the
+// served-export outstanding-frame limit, so streaming assertions copy per frame.
+async fn consume_export(body: Body) -> Vec<u8> {
+    let mut stream = body.into_data_stream();
+    let mut copied = Vec::new();
+    while let Some(chunk) = stream.try_next().await.unwrap() {
+        assert!(chunk.len() <= omnigraph::db::EXPORT_CHUNK_MAX_BYTES);
+        copied.extend_from_slice(&chunk);
+    }
+    copied
 }
 
 fn export_request(type_names: Vec<String>) -> Request<Body> {
@@ -971,7 +985,8 @@ async fn stalled_export_refuses_a_second_cut_and_disconnect_releases_it() {
             .await
             .unwrap();
         let operations = state.operation_runtime().clone();
-        let app = build_app(state);
+        let view = state.routing().registry.list().pop().unwrap();
+        let app = build_app(state.clone());
         let request = || match door {
             "/export" => export_request(Vec::new()),
             _ => json_post(door, &json!({"branch": "main"})),
@@ -1009,7 +1024,7 @@ async fn stalled_export_refuses_a_second_cut_and_disconnect_releases_it() {
         })
         .await
         .expect("disconnect must promptly release served-export ownership");
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = consume_export(response.into_body()).await;
         assert!(!body.is_empty());
         drop(body);
         assert!(
@@ -1017,6 +1032,74 @@ async fn stalled_export_refuses_a_second_cut_and_disconnect_releases_it() {
                 .await
                 .unwrap()
         );
+
+        // Retaining three yielded allocations exhausts this response's lane.
+        // Both real handlers report a stream error; baseline cannot append a
+        // usable cursor after snapshot production failed.
+        let response = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        let mut retained = Vec::new();
+        for _ in 0..3 {
+            let chunk = stream.try_next().await.unwrap().expect("snapshot record");
+            assert!(
+                !std::str::from_utf8(&chunk)
+                    .unwrap()
+                    .contains("\"baseline\":")
+            );
+            retained.push(chunk);
+        }
+        let error = tokio::time::timeout(Duration::from_secs(5), stream.try_next())
+            .await
+            .expect("retained transport frames must fail within their credit deadline")
+            .unwrap_err();
+        assert!(error.to_string().contains("stream_export_retained_chunks"));
+        assert!(stream.try_next().await.unwrap().is_none());
+        drop(stream);
+        drop(retained);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), operations.wait_logical_owners())
+                .await
+                .unwrap()
+        );
+
+        // A graph transition must retain the same body/producer/transport-byte
+        // owners without closing the process or replacing the engine.
+        let response = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        let first_chunk = stream.try_next().await.unwrap().expect("snapshot record");
+        let transition = state
+            .prepare_same_view(
+                &view.key,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap()
+            .close()
+            .unwrap();
+        {
+            let wait = transition.wait_requests();
+            tokio::pin!(wait);
+            assert!(
+                futures::poll!(&mut wait).is_pending(),
+                "{door}: unread body owns the graph"
+            );
+            drop(stream);
+            assert!(
+                futures::poll!(&mut wait).is_pending(),
+                "{door}: yielded bytes own the graph"
+            );
+            drop(first_chunk);
+            tokio::time::timeout(Duration::from_secs(5), wait)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let next_epoch = transition.resume_same_view().unwrap();
+        assert_ne!(next_epoch, view.epoch());
+        let resumed = state.routing().registry.list().pop().unwrap();
+        assert!(Arc::ptr_eq(resumed.handle(), view.handle()));
+        assert!(!operations.snapshot().closed);
 
         // Exercise the actual streaming handlers through the process-close
         // boundary. Both response bodies and already-yielded transport chunks
@@ -1511,7 +1594,7 @@ impl omnigraph::seams::Decide for MergeReturnHold {
 #[tokio::test(flavor = "multi_thread")]
 async fn disconnected_writes_keep_admission_until_the_original_operation_finishes() {
     use omnigraph::seams::catalog::{
-        BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE, SCHEMA_APPLY_POST_SENTINEL,
+        BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE, SCHEMA_RELOAD_BEFORE_CONTRACT_READ,
     };
     const ATOMIC: &str = r#"query atomic() {
         insert Person { name: "Owned", age: 41 }
@@ -1552,7 +1635,8 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
         )
         .unwrap();
         let operations = state.operation_runtime().clone();
-        let app = build_app(state);
+        let view = state.routing().registry.list().pop().unwrap();
+        let app = build_app(state.clone());
         let harness = matrix::Harness {
             _temp: temp,
             app: app.clone(),
@@ -1585,12 +1669,7 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
                         // schema gate, without publishing a main graph commit.
                         holder_db.branch_create("gate-holder").await.unwrap();
                     } else {
-                        let unchanged_schema = fs::read_to_string(fixture("test.pg")).unwrap();
-                        let result = holder_db.apply_schema(&unchanged_schema).await.unwrap();
-                        assert!(
-                            !result.applied,
-                            "the holder must not alter the victim's authority"
-                        );
+                        holder_db.refresh().await.unwrap();
                     }
                 });
         });
@@ -1598,7 +1677,7 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
         let seam = if door == "/branches/merge" {
             &BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE
         } else {
-            &SCHEMA_APPLY_POST_SENTINEL
+            &SCHEMA_RELOAD_BEFORE_CONTRACT_READ
         };
         let guard = seam.install(Arc::new(MergeReturnHold {
             thread: holder_thread.thread().id(),
@@ -1645,6 +1724,24 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
             workload.snapshot().ingress_bytes > 0,
             "disconnect cannot release the retained input budget"
         );
+        let transition = state
+            .prepare_same_view(
+                &view.key,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap()
+            .close()
+            .unwrap();
+        {
+            let wait = transition.wait_requests();
+            tokio::pin!(wait);
+            assert!(
+                futures::poll!(&mut wait).is_pending(),
+                "{door}: the detached write must still own its graph root"
+            );
+        }
+        let (status, _) = json_response(&app, get_request(&g("/snapshot"), "")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         hold.release();
         holder_thread.join().unwrap();
         assert!(
@@ -1659,6 +1756,12 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
         assert_eq!(workload.snapshot().operation_count, 0);
         assert_eq!(workload.snapshot().ingress_count, 0);
         assert_eq!(workload.snapshot().ingress_bytes, 0);
+        tokio::time::timeout(Duration::from_secs(10), transition.wait_requests())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(transition.resume_same_view().unwrap(), view.epoch());
+        assert!(!operations.snapshot().closed);
         let after = db.list_commits(None).await.unwrap();
         assert_eq!(
             after.len(),
@@ -1728,7 +1831,16 @@ async fn engine_panics_close_admission_without_fabricating_rollback() {
             .await
             .unwrap();
         let operations = state.operation_runtime().clone();
-        let app = build_app(state);
+        let view = state.routing().registry.list().pop().unwrap();
+        // Preparing cannot close healthy admission; later uncertainty must
+        // invalidate this reserved attempt before it can close or resume.
+        let prepared = state
+            .prepare_same_view(
+                &view.key,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap();
+        let app = build_app(state.clone());
         let history = || {
             Request::builder()
                 .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
@@ -1756,6 +1868,19 @@ async fn engine_panics_close_admission_without_fabricating_rollback() {
         assert!(operations.snapshot().closed);
         assert_eq!(operations.snapshot().uncertain_writes, 1);
         assert!(!operations.wait_logical_owners().await);
+        assert!(
+            prepared.close().is_err(),
+            "uncertainty must defeat an earlier prepared transition"
+        );
+        assert!(
+            state
+                .prepare_same_view(
+                    &view.key,
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                )
+                .is_err(),
+            "uncertainty must refuse a new transition"
+        );
         let (status, refusal) = json_response(&app, json_post("/mutate", &json!({"query": MUTATION_QUERIES, "name": "insert_person", "params": {"name": "MustNotRun", "age": 1}}))).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refusal}");
         // The closed serving epoch cannot provide the oracle. Use a
@@ -3542,6 +3667,213 @@ async fn load_endpoint_loads_into_existing_branch() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn loads_report_unsupported_embedding_generation_without_changing_vectors() {
+    use futures::FutureExt;
+    use std::sync::atomic::AtomicUsize;
+
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    body: String
+    embedding: Vector(2)? @embed(body)
+}
+node RequiredDoc {
+    slug: String @key
+    body: String
+    embedding: Vector(2) @embed(body)
+}
+node Plain { slug: String @key }
+"#;
+    // Count every provider request independently of the load response, including
+    // unexpected paths. Positive controls prove that this endpoint is reachable
+    // and the real embedding client is using it throughout the load matrix.
+    let provider_requests = Arc::new(AtomicUsize::new(0));
+    let received = Arc::clone(&provider_requests);
+    let provider = axum::Router::new().fallback(move |request: Request<Body>| {
+        let received = Arc::clone(&received);
+        async move {
+            received.fetch_add(1, Ordering::SeqCst);
+            if to_bytes(request.into_body(), 4096).await.is_ok() {
+                (
+                    StatusCode::OK,
+                    axum::Json(json!({"data": [{"index": 0, "embedding": [1.0, 0.0]}]})),
+                )
+            } else {
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    axum::Json(
+                        json!({"error": {"message": "provider request body exceeded test bound"}}),
+                    ),
+                )
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let mut provider_tasks = tokio::task::JoinSet::new();
+    provider_tasks.spawn(async move {
+        axum::serve(listener, provider)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let config = omnigraph::embedding::EmbeddingConfig::from_parts(
+        Some("openai-compatible"),
+        Some(base_url),
+        Some("diagnostics-test".to_string()),
+        "diagnostics-key".to_string(),
+    )
+    .unwrap();
+    let client = omnigraph::embedding::EmbeddingClient::new(config.clone()).unwrap();
+    // Always signal and join the provider, including after an assertion panic or
+    // a stalled request; dropping JoinSet aborts it if graceful shutdown stalls.
+    let exercise = async {
+        assert_eq!(
+            client
+                .embed_document_text("positive control before loads", 2)
+                .await
+                .unwrap(),
+            vec![1.0, 0.0]
+        );
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
+        for path in ["/load", "/load/ndjson", "/ingest"] {
+            let temp = init_graph_with_schema(SCHEMA).await;
+            let graph = graph_path(temp.path());
+            let db = Omnigraph::open(graph.to_str().unwrap())
+                .await
+                .unwrap()
+                .with_embedding_config(Arc::new(config.clone()));
+            let app = build_app(AppState::new(graph.to_string_lossy().to_string(), db));
+            let request = |data: &str| {
+                if path == "/load/ndjson" {
+                    Request::builder()
+                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                        .uri(g("/load/ndjson?branch=main&mode=merge"))
+                        .method(Method::POST)
+                        .header("content-type", "application/x-ndjson")
+                        .body(Body::from(data.to_owned()))
+                        .unwrap()
+                } else {
+                    json_post(
+                        path,
+                        &json!({"branch": "main", "mode": "merge", "data": data}),
+                    )
+                }
+            };
+            let (status, body) = json_response(
+            &app,
+            request(concat!(
+                r#"{"type":"Doc","data":{"slug":"omitted","body":"missing vector"}}"#,
+                "\n",
+                r#"{"type":"Doc","data":{"slug":"supplied","body":"keep vector","embedding":[0.25,0.75]}}"#,
+            )),
+        )
+        .await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(body["embedding_generation"], "unsupported", "{path}");
+
+            let (status, body) = json_response(
+            &app,
+            json_post("/query", &json!({"query": "query docs() { match { $d: Doc } return { $d.slug, $d.embedding } order { $d.slug asc } }"})),
+        )
+        .await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(
+                body["rows"],
+                json!([
+                    {"d.slug": "omitted"},
+                    {"d.slug": "supplied", "d.embedding": [0.25, 0.75]},
+                ]),
+                "{path}"
+            );
+            // JSON query projection omits null cells. Independently verify the
+            // durable Arrow column so an omitted output key is not our null oracle.
+            let persisted = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+            let snapshot = persisted
+                .snapshot_of(ReadTarget::branch("main"))
+                .await
+                .unwrap();
+            let batches: Vec<_> = snapshot
+                .open_dataset("node:Doc")
+                .await
+                .unwrap()
+                .scan()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                2
+            );
+            assert_eq!(
+                batches
+                    .iter()
+                    .map(|batch| batch.column_by_name("embedding").unwrap().null_count())
+                    .sum::<usize>(),
+                1
+            );
+
+            // This is a capability diagnostic, even when every vector is supplied.
+            let (status, body) = json_response(
+            &app,
+            request(r#"{"type":"Doc","data":{"slug":"all-supplied","body":"also keep","embedding":[1,0]}}"#),
+        )
+        .await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(body["embedding_generation"], "unsupported", "{path}");
+
+            let (status, body) = json_response(
+                &app,
+                request(
+                    r#"{"type":"RequiredDoc","data":{"slug":"missing","body":"requires vector"}}"#,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+            let (status, body) =
+                json_response(&app, request(r#"{"type":"Plain","data":{"slug":"plain"}}"#)).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(
+                body.get("embedding_generation"),
+                Some(&Value::Null),
+                "{path}"
+            );
+            assert_eq!(
+                provider_requests.load(Ordering::SeqCst),
+                1,
+                "{path} must not call the embedding provider"
+            );
+        }
+        assert_eq!(
+            client
+                .embed_document_text("positive control after loads", 2)
+                .await
+                .unwrap(),
+            vec![1.0, 0.0]
+        );
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 2);
+    };
+    let exercise = std::panic::AssertUnwindSafe(exercise).catch_unwind();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), exercise).await;
+    let _ = shutdown.send(());
+    tokio::time::timeout(Duration::from_secs(2), provider_tasks.join_next())
+        .await
+        .expect("embedding provider shutdown timed out")
+        .expect("embedding provider task exists")
+        .expect("embedding provider task panicked")
+        .expect("embedding provider server failed");
+    if let Err(panic) = outcome.expect("embedding load matrix timed out") {
+        std::panic::resume_unwind(panic);
+    }
+    assert_eq!(provider_requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn raw_graph_batch_load_publishes_mixed_declarations_in_one_commit() {
     let (temp, app) = app_for_loaded_graph().await;
     let graph = graph_path(temp.path());
@@ -4457,8 +4789,17 @@ async fn pre_effect_delete_failure_preserves_receipt_and_write_capacity_under_sl
             .unwrap();
         assert_eq!(held_read.status(), StatusCode::OK);
         assert_eq!(operations.snapshot().active_reads, 1);
-        let schema = graph.join("_schema.pg");
-        let saved = graph.join("schema-held.pg");
+        let mut branch_refs = fs::read_dir(graph.join("__manifest/_refs/branches"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(branch_refs.len(), 1, "the fixture has one named branch");
+        let branch_ref = branch_refs.pop().unwrap();
+        let saved = fs::read(&branch_ref).unwrap();
         let (status, output) = if compound {
             let request_app = app.clone();
             let (start, started) = std::sync::mpsc::channel();
@@ -4477,11 +4818,10 @@ async fn pre_effect_delete_failure_preserves_receipt_and_write_capacity_under_sl
                     ))
             });
             let thread = request.thread().id();
-            let source = schema.clone();
-            let destination = saved.clone();
+            let source = branch_ref.clone();
             let guard = BRANCH_MERGE_PRE_RETURN.observe(move || {
                 if std::thread::current().id() == thread {
-                    fs::rename(&source, &destination).unwrap();
+                    fs::write(&source, b"{").unwrap();
                 }
             });
             start.send(()).unwrap();
@@ -4489,7 +4829,7 @@ async fn pre_effect_delete_failure_preserves_receipt_and_write_capacity_under_sl
             drop(guard);
             result
         } else {
-            fs::rename(&schema, &saved).unwrap();
+            fs::write(&branch_ref, b"{").unwrap();
             json_response(
                 &app,
                 Request::builder()
@@ -4501,7 +4841,7 @@ async fn pre_effect_delete_failure_preserves_receipt_and_write_capacity_under_sl
             )
             .await
         };
-        fs::rename(&saved, &schema).unwrap();
+        fs::write(&branch_ref, &saved).unwrap();
         if compound {
             assert_eq!(status, StatusCode::OK, "{output}");
             assert_eq!(output["outcome"], "fast_forward");
@@ -4518,7 +4858,7 @@ async fn pre_effect_delete_failure_preserves_receipt_and_write_capacity_under_sl
         }
         assert!(
             !operations.snapshot().closed,
-            "a proven schema read failure has no deletion effects"
+            "a proven manifest read failure has no deletion effects"
         );
         assert_eq!(workload.snapshot().ingress_count, 0);
         let (status, sentinel) = json_response(
@@ -4802,6 +5142,175 @@ async fn change_concurrent_inserts_same_key_serialize_without_409() {
         SEED_PERSON_ROWS + N as u64,
         person_rows,
     );
+}
+
+/// The wire body fits the 1 MiB route limit; one reused parameter expands to over
+/// 32 MiB of retained Arrow across two individually legal tables, so the engine's
+/// operation bound makes the refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aggregate_mutation_memory_refusal_keeps_graph_and_admission_usable() {
+    let temp = init_graph_with_schema_and_data(
+        "node First { name: String @key payload: String }\n\
+         node Second { name: String @key payload: String }",
+        "",
+    )
+    .await;
+    let graph = graph_path(temp.path());
+    let state = AppState::open(graph.to_string_lossy().to_string())
+        .await
+        .unwrap();
+    let operations = state.operation_runtime().clone();
+    let app = build_app(state);
+    let history = || {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/commits"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (_, before) = json_response(&app, history()).await;
+
+    let mut query = String::from("query wide($payload: String) {\n");
+    for table in ["First", "Second"] {
+        for row in 0..32 {
+            writeln!(
+                query,
+                "insert {table} {{ name: \"row{row}\", payload: $payload }}"
+            )
+            .unwrap();
+        }
+    }
+    query.push('}');
+    let request = json!({"query": query, "params": {"payload": "x".repeat(600_000)}});
+    assert!(serde_json::to_vec(&request).unwrap().len() < 1024 * 1024);
+    let (status, output) = json_response(&app, json_post("/mutate", &request)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{output}");
+    let error: ErrorOutput = serde_json::from_value(output).unwrap();
+    let refusal = error.resource_limit.expect("engine resource refusal");
+    assert_eq!(refusal.resource, "retained keyed batch bytes per operation");
+    assert_eq!(refusal.limit, 32 * 1024 * 1024);
+    assert!(refusal.actual > refusal.limit);
+    assert_eq!(operations.snapshot().uncertain_writes, 0);
+    assert!(!operations.snapshot().closed);
+    let (_, after) = json_response(&app, history()).await;
+    assert_eq!(after, before, "refusal must publish no graph commit");
+
+    for table in ["First", "Second"] {
+        let (status, rows) = json_response(
+            &app,
+            json_post(
+                "/query",
+                &json!({"query": format!(
+                    "query rows() {{ match {{ $n: {table} }} return {{ $n.name }} }}"
+                )}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+        assert_eq!(rows["row_count"], 0);
+    }
+    let (status, output) = json_response(
+        &app,
+        json_post(
+            "/mutate",
+            &json!({"query":
+                "query small() { insert First { name: \"ok\", payload: \"ok\" } }"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_receipt_commit_matches_get(&app, &output).await;
+}
+
+/// Two 16 MiB ids are seeded through the engine (no route carries them); a `/mutate`
+/// delete and a `/load` overwrite must each refuse the removed-id sum as a certain 413.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removed_id_memory_refusals_keep_graph_and_admission_usable() {
+    let wide = "x".repeat(16 * 1024 * 1024);
+    let temp = init_graph_with_schema_and_data(
+        "node First { name: String @key tag: String? }\n\
+         node Second { name: String @key tag: String? }",
+        &format!(
+            "{}\n{}",
+            json!({"type": "First", "data": {"name": wide}}),
+            json!({"type": "Second", "data": {"name": wide}}),
+        ),
+    )
+    .await;
+    drop(wide);
+    let graph = graph_path(temp.path());
+    let state = AppState::open(graph.to_string_lossy().to_string())
+        .await
+        .unwrap();
+    let operations = state.operation_runtime().clone();
+    let app = build_app(state);
+    let history = || {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/commits"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (_, before) = json_response(&app, history()).await;
+
+    for (door, request) in [
+        (
+            "/mutate",
+            json!({"query": "query clear() {\n\
+                delete First where name != \"\"\n\
+                delete Second where name != \"\"\n\
+            }"}),
+        ),
+        (
+            "/load",
+            json!({
+                "mode": "overwrite",
+                "data": "{\"type\":\"First\",\"data\":{\"name\":\"small\"}}\n\
+                         {\"type\":\"Second\",\"data\":{\"name\":\"small\"}}",
+            }),
+        ),
+    ] {
+        let (status, output) = json_response(&app, json_post(door, &request)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{door}: {output}");
+        let error: ErrorOutput = serde_json::from_value(output).unwrap();
+        let refusal = error.resource_limit.expect("engine resource refusal");
+        assert_eq!(
+            refusal.resource, "retained removed-id bytes per operation",
+            "{door}"
+        );
+        assert_eq!(refusal.limit, 32 * 1024 * 1024, "{door}");
+        assert!(refusal.actual > refusal.limit, "{door}");
+        assert_eq!(operations.snapshot().uncertain_writes, 0, "{door}");
+        assert!(!operations.snapshot().closed, "{door}");
+        let (_, after) = json_response(&app, history()).await;
+        assert_eq!(after, before, "{door} refusal must publish no graph commit");
+    }
+
+    for table in ["First", "Second"] {
+        let (status, rows) = json_response(
+            &app,
+            json_post(
+                "/query",
+                &json!({"query": format!(
+                    "query rows() {{ match {{ $n: {table} }} return {{ $n.tag }} }}"
+                )}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+        assert_eq!(rows["row_count"], 1);
+    }
+    let (status, output) = json_response(
+        &app,
+        json_post(
+            "/mutate",
+            &json!({"query": "query small() { insert First { name: \"ok\" } }"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_receipt_commit_matches_get(&app, &output).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5761,7 +6270,41 @@ async fn change_routes_report_a_missing_branch_without_storage_detail() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn change_feed_poll_advances_cursor_only_after_complete_commits() {
-    let (_temp, app) = app_for_loaded_graph().await;
+    let schema = r#"
+node Document {
+    title: String @key
+    body: String?
+    content: Blob?
+}
+"#;
+    // A real changed row exceeds the HTTP feed's default packing target;
+    // both images and managed-Blob base64 must remain complete. The engine's
+    // issue_705 tests separately own the wider-than-sort-cap scan regression.
+    let before_body = "x".repeat(4 * 1024 * 1024 + 1);
+    let after_body = "y".repeat(before_body.len());
+    let before_blob = repeated_zero_blob_input(64 * 1024 + 1);
+    let after_blob = repeated_zero_blob_input(64 * 1024 + 2);
+    let row = |title: &str, body: &str, content: Option<&str>| {
+        json!({"type": "Document", "data": {
+            "title": title, "body": body, "content": content,
+        }})
+        .to_string()
+    };
+    let temp = init_graph_with_schema_and_data(
+        schema,
+        &[
+            row("A-small", "before", None),
+            row("B-wide", &before_body, Some(&before_blob)),
+            row("C-tail", "before", None),
+        ]
+        .join("\n"),
+    )
+    .await;
+    let state = AppState::open(graph_path(temp.path()).to_string_lossy().to_string())
+        .await
+        .unwrap();
+    let view = state.routing().registry.list().pop().unwrap();
+    let app = build_app(state.clone());
 
     // `start=now` captures the head: no replay, a caught-up durable cursor.
     let (status, now) = get_json(&app, g("/changes?start=now")).await;
@@ -5772,31 +6315,143 @@ async fn change_feed_poll_advances_cursor_only_after_complete_commits() {
 
     let commit_id = load_commit(
         &app,
-        concat!(
-            r#"{"type":"Person","data":{"name":"Feed A","age":1}}"#,
-            "\n",
-            r#"{"type":"Person","data":{"name":"Feed B","age":2}}"#,
-        ),
+        &[
+            row("A-small", "after", None),
+            row("B-wide", &after_body, Some(&after_blob)),
+            row("C-tail", "after", None),
+        ]
+        .join("\n"),
     )
     .await;
 
-    // A mid-block page carries only a page token — no cursor to checkpoint.
-    let (status, partial) = get_json(&app, g(&format!("/changes?cursor={c0}&limit=1"))).await;
+    // Bytes, not the row limit, split this commit. An initial small change
+    // leaves positive space but cannot grant the wide change a second page's
+    // solo-overflow allowance. No mid-block cursor is safe to checkpoint.
+    let (status, partial) = get_json(&app, g(&format!("/changes?cursor={c0}&limit=100"))).await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(partial["blocks"].as_array().unwrap().len(), 1);
+    assert_eq!(partial["blocks"][0]["changes"].as_array().unwrap().len(), 1);
     assert_eq!(
         partial["blocks"][0]["cause"]["graph_commit_id"],
         commit_id.as_str()
     );
-    assert_eq!(partial["blocks"][0]["changes"][0]["id"], "Feed A");
+    assert_eq!(partial["blocks"][0]["changes"][0]["id"], "A-small");
+    assert_eq!(partial["blocks"][0]["changes"][0]["op"], "update");
     assert!(partial["cursor"].is_null(), "no durable cursor mid-block");
     let token = partial["next_page_token"].as_str().expect("page token");
+    assert!(token.len() <= 4 * 1024);
 
-    let (status, resumed) = get_json(&app, g(&format!("/changes?page_token={token}"))).await;
+    // A later commit cannot enter this page token's captured cut. It must be
+    // reached by the next durable-cursor poll after the original block ends.
+    let sentinel_commit = load_commit(&app, &row("D-sentinel", "later", None)).await;
+
+    let wide_uri = g(&format!("/changes?page_token={token}"));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .uri(&wide_uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let transition = state
+        .prepare_same_view(
+            &view.key,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap()
+        .close()
+        .unwrap();
+    {
+        let wait = transition.wait_requests();
+        tokio::pin!(wait);
+        assert!(
+            futures::poll!(&mut wait).is_pending(),
+            "unpolled wide response owns the graph"
+        );
+        let mut stream = response.into_body().into_data_stream();
+        let chunk = stream.try_next().await.unwrap().expect("wide feed page");
+        assert!(!chunk.is_empty());
+        let retained = chunk.slice(..1);
+        drop(chunk);
+        drop(stream);
+        assert!(
+            futures::poll!(&mut wait).is_pending(),
+            "a yielded byte slice still owns the abandoned response"
+        );
+        drop(retained);
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert_ne!(transition.resume_same_view().unwrap(), view.epoch());
+    let resumed_view = state.routing().registry.list().pop().unwrap();
+    assert!(Arc::ptr_eq(resumed_view.handle(), view.handle()));
+
+    // Abandoning delivery does not advance a checkpoint. Replaying its exact
+    // token returns the complete wide change again, then continuation visits
+    // every authored change exactly once in the completed checkpoint walk.
+    let (status, resumed) = get_json(&app, wide_uri).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(resumed["blocks"][0]["changes"][0]["id"], "Feed B");
-    let c1 = resumed["cursor"].as_str().expect("boundary cursor");
+    assert_eq!(resumed["blocks"].as_array().unwrap().len(), 1);
+    assert_eq!(resumed["blocks"][0]["changes"].as_array().unwrap().len(), 1);
+    assert_eq!(resumed["blocks"][0]["cause"]["graph_commit_id"], commit_id);
+    let wide = &resumed["blocks"][0]["changes"][0];
+    assert_eq!(wide["id"], "B-wide");
+    assert_eq!(wide["op"], "update");
+    assert_eq!(wide["before"]["properties"]["body"], before_body);
+    assert_eq!(wide["after"]["properties"]["body"], after_body);
+    assert_eq!(wide["before"]["properties"]["content"], before_blob);
+    assert_eq!(wide["after"]["properties"]["content"], after_blob);
+    assert!(
+        serde_json::to_vec(wide).unwrap().len()
+            > omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES as usize
+    );
+    assert!(resumed["cursor"].is_null());
+    let token = resumed["next_page_token"]
+        .as_str()
+        .expect("tail page token");
+    assert!(token.len() <= 4 * 1024);
 
-    let (status, caught_up) = get_json(&app, g(&format!("/changes?cursor={c1}"))).await;
+    let (status, tail) = get_json(&app, g(&format!("/changes?page_token={token}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tail["blocks"].as_array().unwrap().len(), 1);
+    assert_eq!(tail["blocks"][0]["changes"].as_array().unwrap().len(), 1);
+    assert_eq!(tail["blocks"][0]["cause"]["graph_commit_id"], commit_id);
+    assert_eq!(tail["blocks"][0]["changes"][0]["id"], "C-tail");
+    assert_eq!(tail["blocks"][0]["changes"][0]["op"], "update");
+    assert!(tail["next_page_token"].is_null());
+    assert_eq!(
+        tail["caught_up"], false,
+        "later commit remains outside the cut"
+    );
+    let c1 = tail["cursor"].as_str().expect("boundary cursor");
+
+    let (status, sentinel) = get_json(&app, g(&format!("/changes?cursor={c1}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(sentinel["blocks"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        sentinel["blocks"][0]["changes"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        sentinel["blocks"][0]["cause"]["graph_commit_id"],
+        sentinel_commit
+    );
+    assert_eq!(sentinel["blocks"][0]["changes"][0]["id"], "D-sentinel");
+    assert_eq!(sentinel["blocks"][0]["changes"][0]["op"], "insert");
+    assert!(sentinel["next_page_token"].is_null());
+    assert_eq!(sentinel["caught_up"], true);
+    let c2 = sentinel["cursor"]
+        .as_str()
+        .expect("sentinel boundary cursor");
+
+    let (status, caught_up) = get_json(&app, g(&format!("/changes?cursor={c2}"))).await;
     assert_eq!(status, StatusCode::OK);
     assert!(caught_up["blocks"].as_array().unwrap().is_empty());
     assert_eq!(caught_up["caught_up"], true);
@@ -5887,7 +6542,7 @@ async fn change_baseline_streams_snapshot_then_terminal_cursor() {
             .and_then(|value| value.to_str().ok()),
         Some("application/x-ndjson; charset=utf-8")
     );
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = consume_export(response.into_body()).await;
     let text = String::from_utf8(body.to_vec()).unwrap();
     let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
     assert!(
@@ -6010,7 +6665,7 @@ async fn change_responses_carry_no_storage_vocabulary() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = consume_export(response.into_body()).await;
     let text = String::from_utf8(body.to_vec()).unwrap();
     let terminal: Value =
         serde_json::from_str(text.lines().rfind(|line| !line.is_empty()).unwrap()).unwrap();

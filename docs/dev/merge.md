@@ -86,7 +86,8 @@ compares their results.
 
 The fallback is an ordered three-way cursor merge. Each cursor streams one
 snapshot's rows in `id` order in two phases so no payload column ever reaches
-a SortExec input:
+a SortExec input. The change feed and export's `id` order walk tables through
+the same cursor (`crates/omnigraph/src/ordered_cursor.rs`):
 
 - a narrow ordered scan sorts only `id` + `_rowid` + `_rowaddr` (8,192 rows
   and 32 MiB per decoded batch as targets — a few dozen bytes per sorted row);

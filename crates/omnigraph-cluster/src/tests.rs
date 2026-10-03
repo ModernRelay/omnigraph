@@ -1145,7 +1145,10 @@ fn external_blob_config_normalizes_once_and_defaults_to_deny() {
     assert_eq!(warning.path, "graphs.knowledge.external_blobs");
     assert_eq!(warning.severity, DiagnosticSeverity::Warning);
 
-    let embedded = dir.path().join("external-assets");
+    // External sources live outside the cluster storage root (here the
+    // config directory), never under it.
+    let external = tempdir().unwrap();
+    let embedded = external.path().join("external-assets");
     fs::create_dir(&embedded).unwrap();
     fs::write(
         dir.path().join(CLUSTER_CONFIG_FILE),
@@ -1243,6 +1246,535 @@ graphs:
         codes.contains("invalid_external_blob_policy"),
         "{:?}",
         out.diagnostics
+    );
+}
+
+fn overlap_diagnostic_paths(outcome: &LoadOutcome) -> Vec<String> {
+    outcome
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "external_blob_base_overlaps_storage_root")
+        .inspect(|diagnostic| {
+            assert_eq!(diagnostic.severity, DiagnosticSeverity::Error);
+            assert!(
+                diagnostic
+                    .message
+                    .contains("overlaps an OmniGraph storage root"),
+                "{diagnostic:?}"
+            );
+        })
+        .map(|diagnostic| diagnostic.path.clone())
+        .collect()
+}
+
+/// A base over the cluster storage root would let any writer copy another
+/// graph's tables or the cluster ledger into a readable Blob cell. Every
+/// scope is refused at validation, before plan or apply can record it.
+#[test]
+fn external_blob_config_rejects_bases_overlapping_storage_root() {
+    let dir = fixture();
+    let other_graph = dir.path().join(CLUSTER_GRAPHS_DIR).join("other.omni");
+    fs::create_dir_all(&other_graph).unwrap();
+    let file_base = |path: &Path| format!("file://{}/", path.display());
+    let local_config = |root_base: &str, graph_base: &str| {
+        format!(
+            r#"
+version: 1
+graphs:
+  knowledge:
+    schema: ./people.pg
+    external_blobs:
+      allow:
+        - base: {root_base}
+          scope: embedded_only
+  second:
+    schema: ./people.pg
+    external_blobs:
+      allow:
+        - base: {graph_base}
+          scope: embedded_only
+"#
+        )
+    };
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        local_config(&file_base(dir.path()), &file_base(&other_graph)),
+    )
+    .unwrap();
+    let outcome = load_desired(dir.path());
+    assert_eq!(
+        overlap_diagnostic_paths(&outcome),
+        vec![
+            "graphs.knowledge.external_blobs.allow[0].base".to_string(),
+            "graphs.second.external_blobs.allow[0].base".to_string(),
+        ],
+        "{:?}",
+        outcome.diagnostics
+    );
+
+    let validated = validate_config_dir(dir.path());
+    assert!(!validated.ok, "{:?}", validated.diagnostics);
+
+    // A declared object-store root is the one prefix every graph and the
+    // ledger live under; only a sibling prefix is admitted. This is pure
+    // validation and never reaches the bucket.
+    let s3_config = |base: &str| {
+        format!(
+            r#"
+version: 1
+storage: s3://assets/cluster
+graphs:
+  knowledge:
+    schema: ./people.pg
+    external_blobs:
+      allow:
+        - base: {base}
+          scope: server_safe
+"#
+        )
+    };
+    for base in [
+        "s3://assets/",
+        "s3://assets/cluster/graphs/knowledge.omni/",
+        "s3://ASSETS/cluster/__cluster/",
+    ] {
+        fs::write(dir.path().join(CLUSTER_CONFIG_FILE), s3_config(base)).unwrap();
+        let outcome = load_desired(dir.path());
+        assert_eq!(
+            overlap_diagnostic_paths(&outcome),
+            vec!["graphs.knowledge.external_blobs.allow[0].base".to_string()],
+            "{base}: {:?}",
+            outcome.diagnostics
+        );
+        let desired = outcome.desired.unwrap();
+        assert_eq!(
+            desired.graphs[0].external_blob_policy,
+            omnigraph::ExternalBlobPolicy::Deny
+        );
+    }
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        s3_config("s3://assets/cluster-external/"),
+    )
+    .unwrap();
+    let outcome = load_desired(dir.path());
+    assert!(
+        overlap_diagnostic_paths(&outcome).is_empty(),
+        "{:?}",
+        outcome.diagnostics
+    );
+    assert_eq!(
+        outcome.desired.unwrap().graphs[0]
+            .external_blob_policy
+            .bases()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn external_blob_base_overlapping_storage_root_refuses_apply_over_existing_state() {
+    let dir = fixture();
+    apply_identity_fixture(dir.path()).await;
+    let ledger = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let config = fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        config.replace(
+            "    schema: ./people.pg\n",
+            &format!(
+                "    schema: ./people.pg\n    external_blobs:\n      allow:\n        - base: {}\n          scope: embedded_only\n",
+                format!("file://{}/", dir.path().join(CLUSTER_GRAPHS_DIR).display())
+            ),
+        ),
+    )
+    .unwrap();
+
+    let refused = apply_config_dir(dir.path()).await;
+    assert!(!refused.ok, "{refused:?}");
+    assert!(
+        refused
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "external_blob_base_overlaps_storage_root"),
+        "{:?}",
+        refused.diagnostics
+    );
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger
+    );
+    let planned = plan_config_dir(dir.path()).await;
+    assert!(!planned.ok, "{:?}", planned.diagnostics);
+}
+
+#[test]
+fn serving_quarantines_applied_policies_overlapping_storage_root() {
+    let overlapping = json!({
+        "mode": "allow",
+        "bases": [{ "uri": "s3://assets/", "scope": "server_safe" }]
+    });
+    let embedded = json!({
+        "mode": "allow",
+        "bases": [{
+            "uri": "file:///definitely/not/present/omnigraph-blob-base/",
+            "scope": "embedded_only"
+        }]
+    });
+    let bound_digest = |graph_id: &str, policy: &serde_json::Value| {
+        graph_digest_with_external_blob_policy(
+            graph_id,
+            None,
+            Some(&BTreeMap::new()),
+            None,
+            None,
+            &serde_json::from_value(policy.clone()).unwrap(),
+        )
+    };
+    let state: ClusterState = serde_json::from_value(json!({
+        "version": 1,
+        "state_revision": 1,
+        "applied_revision": {
+            "resources": {
+                "graph.knowledge": {
+                    "digest": bound_digest("knowledge", &overlapping),
+                    "external_blob_policy": overlapping
+                },
+                "graph.local": {
+                    "digest": bound_digest("local", &embedded),
+                    "external_blob_policy": embedded
+                },
+                "graph.plain": { "digest": graph_digest("plain", None, Some(&BTreeMap::new()), None, None) },
+                "graph.unbound": {
+                    "digest": graph_digest("unbound", None, Some(&BTreeMap::new()), None, None),
+                    "external_blob_policy": overlapping
+                }
+            }
+        }
+    }))
+    .unwrap();
+    let quarantined =
+        serve::overlapping_served_external_blob_policies(&state, "s3://assets/cluster");
+    assert_eq!(
+        quarantined
+            .iter()
+            .map(|(graph_id, _)| graph_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["knowledge"],
+        "`unbound` carries the overlapping policy under a digest that does not bind it, so the digest check owns it"
+    );
+    assert!(matches!(
+        quarantined[0].1,
+        omnigraph::StorageRootConflict::Overlap { .. }
+    ));
+    let uncomparable =
+        serve::overlapping_served_external_blob_policies(&state, "s3://assets/a//cluster");
+    assert_eq!(uncomparable.len(), 1);
+    assert_eq!(uncomparable[0].0, "knowledge");
+    assert!(matches!(
+        uncomparable[0].1,
+        omnigraph::StorageRootConflict::UncomparableRoot { .. }
+    ));
+    // Embedded-only bases are never served, so they cannot quarantine a
+    // graph, and a disjoint root quarantines nothing.
+    assert!(
+        serve::overlapping_served_external_blob_policies(&state, "/definitely/not/present")
+            .is_empty()
+    );
+    assert!(
+        serve::overlapping_served_external_blob_policies(&state, "s3://other/cluster").is_empty()
+    );
+}
+
+/// The serving snapshot reader quarantines a graph whose applied server-safe
+/// base overlaps the storage root and keeps serving a healthy sibling; with no
+/// healthy graph left, it refuses. Server-safe bases are `s3://` only, so the
+/// ledger lives in a local directory and the store reports an `s3://` root
+/// through `ClusterStore::with_display_root`: the reader, the comparison and
+/// the quarantine are the production ones, only the root spelling is forged.
+#[tokio::test]
+async fn serving_snapshot_quarantines_graph_whose_applied_base_overlaps_storage_root() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n  archive:\n    schema: ./people.pg\n",
+    )
+    .unwrap();
+    let desired = validate_config_dir(dir.path());
+    assert!(desired.ok, "{:?}", desired.diagnostics);
+    let schema_digest = desired.resource_digests["schema.knowledge"].clone();
+    let empty_queries = BTreeMap::new();
+    let policy = omnigraph::ExternalBlobPolicy::allow(vec![
+        omnigraph::ExternalBlobBase::new(
+            "s3://assets/cluster/graphs/",
+            omnigraph::ExternalBlobExecutionScope::ServerSafe,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let knowledge_digest = graph_digest_with_external_blob_policy(
+        "knowledge",
+        Some(&schema_digest),
+        Some(&empty_queries),
+        None,
+        None,
+        &policy,
+    );
+    let archive_digest = graph_digest(
+        "archive",
+        Some(&schema_digest),
+        Some(&empty_queries),
+        None,
+        None,
+    );
+    let write_ledger = |with_archive: bool| {
+        let mut resources = vec![
+            ("graph.knowledge", knowledge_digest.as_str()),
+            ("schema.knowledge", schema_digest.as_str()),
+        ];
+        if with_archive {
+            resources.push(("graph.archive", archive_digest.as_str()));
+            resources.push(("schema.archive", schema_digest.as_str()));
+        }
+        write_state_resources(dir.path(), &resources);
+        let mut state = read_state_json(dir.path());
+        state["applied_revision"]["resources"]["graph.knowledge"]["external_blob_policy"] =
+            serde_json::to_value(&policy).unwrap();
+        fs::write(
+            dir.path().join(CLUSTER_STATE_FILE),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap()
+    };
+    let overlapping_root =
+        || store::ClusterStore::for_config_dir(dir.path()).with_display_root("s3://assets/cluster");
+
+    let ledger = write_ledger(true);
+    // Against the local root the base is disjoint, and the ledger's digests
+    // hold: both graphs serve.
+    let control = read_serving_snapshot(dir.path()).await.unwrap();
+    assert_eq!(control.graphs.len(), 2);
+    assert!(control.quarantined_graphs.is_empty());
+
+    let snapshot = serve::read_snapshot_with_store(&overlapping_root())
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .graphs
+            .iter()
+            .map(|graph| graph.graph_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["archive"]
+    );
+    assert_eq!(
+        snapshot.quarantined_graphs,
+        vec![ServingBlockedGraph {
+            graph_id: "knowledge".to_string(),
+            root: PathBuf::from("s3://assets/cluster/graphs/knowledge.omni"),
+        }],
+    );
+    assert_eq!(
+        snapshot.applied_graphs,
+        vec!["archive".to_string(), "knowledge".to_string()]
+    );
+    assert!(snapshot.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "external_blob_base_overlaps_storage_root"
+            && diagnostic.path == "graph.knowledge"
+            && diagnostic.severity == DiagnosticSeverity::Warning
+    }));
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger
+    );
+
+    // With every applied graph quarantined the reader refuses to serve.
+    let ledger = write_ledger(false);
+    let refused = serve::read_snapshot_with_store(&overlapping_root())
+        .await
+        .unwrap_err();
+    assert!(
+        refused.iter().any(|diagnostic| {
+            diagnostic.code == "cluster_no_healthy_graphs" && diagnostic.path == CLUSTER_STATE_FILE
+        }),
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .iter()
+            .any(|diagnostic| diagnostic.code == "external_blob_base_overlaps_storage_root"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger
+    );
+
+    let refused = serve::read_snapshot_with_store(
+        &store::ClusterStore::for_config_dir(dir.path())
+            .with_display_root("s3://assets/a//cluster"),
+    )
+    .await
+    .unwrap_err();
+    let uncomparable = refused
+        .iter()
+        .find(|diagnostic| diagnostic.code == "external_blob_storage_root_uncomparable")
+        .unwrap_or_else(|| panic!("{refused:?}"));
+    assert_eq!(uncomparable.path, "graph.knowledge");
+    assert!(
+        uncomparable
+            .message
+            .contains("storage root cannot be compared")
+            && !uncomparable.message.contains("move the base"),
+        "{uncomparable:?}"
+    );
+    assert!(
+        refused
+            .iter()
+            .all(|diagnostic| diagnostic.code != "external_blob_base_overlaps_storage_root"),
+        "{refused:?}"
+    );
+}
+
+/// A ledger whose policy field names an overlapping server-safe base under a
+/// digest that does not bind it is refused at boot, healthy sibling or not:
+/// the quarantine acts only on a policy the ledger vouches for.
+#[tokio::test]
+async fn serving_snapshot_refuses_overlapping_policy_its_digest_does_not_bind() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n  archive:\n    schema: ./people.pg\n",
+    )
+    .unwrap();
+    let desired = validate_config_dir(dir.path());
+    assert!(desired.ok, "{:?}", desired.diagnostics);
+    let schema_digest = desired.resource_digests["schema.knowledge"].clone();
+    let empty_queries = BTreeMap::new();
+    let deny_digest = |graph_id: &str| {
+        graph_digest(
+            graph_id,
+            Some(&schema_digest),
+            Some(&empty_queries),
+            None,
+            None,
+        )
+    };
+    write_state_resources(
+        dir.path(),
+        &[
+            ("graph.knowledge", deny_digest("knowledge").as_str()),
+            ("schema.knowledge", schema_digest.as_str()),
+            ("graph.archive", deny_digest("archive").as_str()),
+            ("schema.archive", schema_digest.as_str()),
+        ],
+    );
+    let mut state = read_state_json(dir.path());
+    state["applied_revision"]["resources"]["graph.knowledge"]["external_blob_policy"] = json!({
+        "mode": "allow",
+        "bases": [{ "uri": "s3://assets/cluster/graphs/", "scope": "server_safe" }]
+    });
+    fs::write(
+        dir.path().join(CLUSTER_STATE_FILE),
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .unwrap();
+    let ledger = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+
+    let refused = serve::read_snapshot_with_store(
+        &store::ClusterStore::for_config_dir(dir.path()).with_display_root("s3://assets/cluster"),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused.iter().any(|diagnostic| {
+            diagnostic.code == "external_blob_policy_digest_mismatch"
+                && diagnostic.path == "graph.knowledge"
+                && diagnostic.severity == DiagnosticSeverity::Error
+        }),
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .iter()
+            .all(|diagnostic| diagnostic.code != "external_blob_base_overlaps_storage_root"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger
+    );
+}
+
+/// A storage root that cannot be rendered for comparison refuses a same-kind
+/// base under its own code; a base in a scheme that cannot name the root's
+/// storage kind is admitted without the root being rendered.
+#[test]
+fn external_blob_config_reports_uncomparable_storage_root_under_its_own_code() {
+    let dir = fixture();
+    let config = |storage: &str| {
+        format!(
+            r#"
+version: 1
+storage: {storage}
+graphs:
+  knowledge:
+    schema: ./people.pg
+    external_blobs:
+      allow:
+        - base: s3://elsewhere/assets/
+          scope: server_safe
+"#
+        )
+    };
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        config("s3://assets/a//cluster"),
+    )
+    .unwrap();
+    let outcome = load_desired(dir.path());
+    let uncomparable = outcome
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "external_blob_storage_root_uncomparable")
+        .unwrap_or_else(|| panic!("{:?}", outcome.diagnostics));
+    assert_eq!(uncomparable.severity, DiagnosticSeverity::Error);
+    assert_eq!(
+        uncomparable.path,
+        "graphs.knowledge.external_blobs.allow[0].base"
+    );
+    assert!(
+        uncomparable
+            .message
+            .contains("storage root cannot be compared")
+            && !uncomparable.message.contains("overlaps"),
+        "{uncomparable:?}"
+    );
+    assert!(overlap_diagnostic_paths(&outcome).is_empty());
+    assert!(!validate_config_dir(dir.path()).ok);
+
+    let percent_root = dir.path().join("a%b");
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        config(percent_root.to_str().unwrap()),
+    )
+    .unwrap();
+    let outcome = load_desired(dir.path());
+    assert!(
+        outcome.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != "external_blob_storage_root_uncomparable"
+                && diagnostic.code != "external_blob_base_overlaps_storage_root"
+        }),
+        "{:?}",
+        outcome.diagnostics
+    );
+    assert_eq!(
+        outcome.desired.unwrap().graphs[0]
+            .external_blob_policy
+            .bases()
+            .len(),
+        1
     );
 }
 
@@ -1779,6 +2311,1032 @@ async fn external_state_backend_plan_rejected() {
             .iter()
             .any(|diagnostic| diagnostic.code == "unsupported_state_backend")
     );
+}
+
+#[tokio::test]
+async fn durable_store_pins_ledger_encoding_validation_and_size_boundaries() {
+    let dir = fixture();
+    let store = ClusterStore::for_config_dir(dir.path());
+    let desired = config::load_desired(dir.path()).desired.unwrap();
+    let mut state = config::initial_import_state(&desired);
+    let mut observations = store.observations();
+    store
+        .write_state(&state, None, &mut observations)
+        .await
+        .unwrap();
+    let path = dir.path().join(CLUSTER_STATE_FILE);
+    let legacy = fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        legacy,
+        format!("{}\n", serde_json::to_string_pretty(&state).unwrap())
+    );
+    let legacy_cas = observations.state_cas.clone();
+
+    state.version = 2;
+    state.mode = Some(deployment::DeploymentMode::Offline);
+    state.ledger_id = Some(Ulid::new().to_string());
+    state.next_sequence = Some(1);
+    state.deployment_results = Some(Vec::new());
+    state.applied_revision.result_revision = Some(0);
+    assert!(state.applied_revision.resources.is_empty());
+    state.applied_revision.schema_contracts = Some(BTreeMap::new());
+    store
+        .write_state(&state, legacy_cas.as_deref(), &mut observations)
+        .await
+        .unwrap();
+    let compact = fs::read_to_string(&path).unwrap();
+    assert_eq!(compact, serde_json::to_string(&state).unwrap());
+    let cas = observations.state_cas.clone();
+    assert_eq!(
+        store
+            .read_state(&mut store.observations())
+            .await
+            .unwrap()
+            .state_cas,
+        cas
+    );
+
+    let mut invalid = state.clone();
+    invalid.version = 1;
+    assert_eq!(
+        store
+            .write_state(&invalid, cas.as_deref(), &mut observations)
+            .await
+            .unwrap_err()
+            .code,
+        "invalid_state_version"
+    );
+    let legacy_state = config::initial_import_state(&desired);
+    assert_eq!(
+        store
+            .write_state(&legacy_state, cas.as_deref(), &mut observations)
+            .await
+            .unwrap_err()
+            .code,
+        "unsupported_state_version"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), compact);
+
+    state.observations.insert(
+        "oversized".to_string(),
+        json!("x".repeat(deployment::MAX_LEDGER_BYTES)),
+    );
+    assert_eq!(
+        store
+            .write_state(&state, cas.as_deref(), &mut observations)
+            .await
+            .unwrap_err()
+            .code,
+        "state_write_error"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), compact);
+    fs::write(&path, "x".repeat(deployment::MAX_LEDGER_BYTES + 1)).unwrap();
+    assert_eq!(
+        store
+            .read_state(&mut store.observations())
+            .await
+            .unwrap_err()
+            .code,
+        "state_read_error"
+    );
+    fs::write(&path, serde_json::to_string(&invalid).unwrap()).unwrap();
+    assert_eq!(
+        store
+            .read_state(&mut store.observations())
+            .await
+            .unwrap_err()
+            .code,
+        "invalid_state_version"
+    );
+}
+
+#[tokio::test]
+async fn durable_store_verifies_immutable_bundle_bytes_and_encoded_bound() {
+    let dir = fixture();
+    let store = ClusterStore::for_config_dir(dir.path());
+    let source_digest = sha256_hex(SCHEMA.as_bytes());
+    let mut bundle = deployment::DeploymentBundle {
+        version: 2,
+        canonical_root: store.canonical_root().unwrap(),
+        config_digest: sha256_hex(b"configuration"),
+        config_semantics: "configuration".to_string(),
+        resources: BTreeMap::new(),
+        sources: BTreeMap::from([(source_digest.clone(), SCHEMA.to_string())]),
+    };
+    let digest = store.write_deployment_bundle(&bundle).await.unwrap();
+    let path = dir
+        .path()
+        .join(CLUSTER_RESOURCES_DIR)
+        .join("deployment")
+        .join(format!("{digest}.json"));
+    let encoded = fs::read_to_string(&path).unwrap();
+    assert_eq!(sha256_hex(encoded.as_bytes()), digest);
+    assert_eq!(encoded, serde_json::to_string(&bundle).unwrap());
+    assert_eq!(
+        store.read_deployment_bundle(&digest).await.unwrap().sources[&source_digest],
+        SCHEMA
+    );
+    assert_eq!(
+        store.write_deployment_bundle(&bundle).await.unwrap(),
+        digest
+    );
+
+    fs::write(&path, "{}").unwrap();
+    assert_eq!(
+        store
+            .read_deployment_bundle(&digest)
+            .await
+            .unwrap_err()
+            .code,
+        "deployment_bundle_digest"
+    );
+    assert_eq!(
+        store
+            .write_deployment_bundle(&bundle)
+            .await
+            .unwrap_err()
+            .code,
+        "deployment_bundle_write"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), "{}");
+    assert_eq!(
+        store
+            .read_deployment_bundle("../invalid")
+            .await
+            .unwrap_err()
+            .code,
+        "deployment_bundle_digest"
+    );
+
+    // Encoded JSON expansion, not raw source length, owns this bound.
+    bundle.sources.insert(
+        source_digest,
+        "\u{0000}".repeat(deployment::MAX_BUNDLE_BYTES / 6),
+    );
+    assert_eq!(
+        store
+            .write_deployment_bundle(&bundle)
+            .await
+            .unwrap_err()
+            .code,
+        "deployment_bundle_bounds"
+    );
+    assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    fs::write(&path, "x".repeat(deployment::MAX_BUNDLE_BYTES + 1)).unwrap();
+    assert_eq!(
+        store
+            .read_deployment_bundle(&digest)
+            .await
+            .unwrap_err()
+            .code,
+        "deployment_bundle_read"
+    );
+}
+
+#[tokio::test]
+async fn offline_deployment_upgrade_preserves_data_history_and_applied_facts() {
+    let dir = identity_fixture();
+    apply_identity_fixture(dir.path()).await;
+    let root = dir.path().to_str().unwrap();
+    let graph_uri = derived_graph_uri(dir.path(), "knowledge");
+    let db = omnigraph::Session::from_defaults(
+        std::sync::Arc::new(Omnigraph::open(&graph_uri).await.unwrap()),
+        omnigraph::settings::SessionSettings::default(),
+    );
+    db.load_jsonl(
+        r#"{"type":"Person","data":{"name":"Ada","age":37}}"#,
+        omnigraph::loader::LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.branch_create("feature").await.unwrap();
+    let rows = db.export_jsonl("main", &[]).await.unwrap();
+    let history = serde_json::to_value(db.list_commits(None).await.unwrap()).unwrap();
+    let main_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .graph_manifest_version();
+    let branch_version = db
+        .snapshot_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap()
+        .graph_manifest_version();
+    drop(db);
+    let before = read_state_json(dir.path());
+    let caller = DeploymentCaller::AuthenticatedIdentity(
+        IdentityAuthorization::authenticated("principal:owner").unwrap(),
+    );
+    let state_bytes = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    assert_eq!(
+        upgrade_deployment_ledger(root, false, &caller)
+            .await
+            .unwrap_err()
+            .code,
+        "writers_stopped_required"
+    );
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        state_bytes
+    );
+    // Root-addressed conversion must not parse desired configuration.
+    fs::remove_file(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
+    fs::remove_file(dir.path().join("people.pg")).unwrap();
+    let status = upgrade_deployment_ledger(root, true, &caller)
+        .await
+        .unwrap();
+    assert_eq!(status.next_sequence, 1);
+    assert_eq!(status.result_revision, 0);
+    assert!(status.lock_id.is_none());
+    let after = read_state_json(dir.path());
+    assert_eq!(
+        after["applied_revision"]["resources"],
+        before["applied_revision"]["resources"]
+    );
+    assert_eq!(
+        after["applied_revision"]["config_digest"],
+        before["applied_revision"]["config_digest"]
+    );
+    assert_eq!(after["observations"], before["observations"]);
+    assert_eq!(after["resource_statuses"], before["resource_statuses"]);
+    let db = Omnigraph::open_read_only(&graph_uri).await.unwrap();
+    assert_eq!(db.export_jsonl("main", &[]).await.unwrap(), rows);
+    assert_eq!(
+        serde_json::to_value(db.list_commits(None).await.unwrap()).unwrap(),
+        history
+    );
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .graph_manifest_version(),
+        main_version
+    );
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("feature"))
+            .await
+            .unwrap()
+            .graph_manifest_version(),
+        branch_version
+    );
+    assert_eq!(db.schema_source().as_str(), SCHEMA);
+    let bytes = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    assert_eq!(
+        upgrade_deployment_ledger(root, true, &caller)
+            .await
+            .unwrap()
+            .ledger_id,
+        status.ledger_id
+    );
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        bytes
+    );
+}
+
+#[tokio::test]
+async fn offline_deployment_captures_schema_queries_and_retains_original_lookup() {
+    let dir = identity_fixture();
+    apply_identity_fixture(dir.path()).await;
+    let root = dir.path().to_str().unwrap();
+    let caller = DeploymentCaller::AuthenticatedIdentity(
+        IdentityAuthorization::authenticated("principal:owner").unwrap(),
+    );
+    upgrade_deployment_ledger(root, true, &caller)
+        .await
+        .unwrap();
+    let before_version = identity_manifest_version(dir.path()).await;
+    expand_identity_schema(dir.path());
+    let schema = fs::read_to_string(dir.path().join("people.pg")).unwrap();
+    let query = QUERY.replace("$p.name, $p.age", "$p.name, $p.age, $p.email");
+    fs::write(dir.path().join("people.gq"), &query).unwrap();
+    let mut exposed = None;
+    let outcome = apply_deployment(dir.path(), None, &caller, |id, canonical_root, lock_id| {
+        assert!(read_state_json(dir.path()).get("outstanding").is_none());
+        assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
+        exposed = Some((
+            id.to_string(),
+            canonical_root.to_string(),
+            lock_id.to_string(),
+        ));
+        // Capture preceded ID exposure; effects must use those exact bytes.
+        fs::write(dir.path().join("people.pg"), "invalid schema").unwrap();
+        fs::write(dir.path().join("people.gq"), "invalid query").unwrap();
+    })
+    .await
+    .unwrap();
+    let DeploymentLookup::Complete { result } = outcome else {
+        panic!("expected complete deployment");
+    };
+    let (id, canonical_root, lock_id) = exposed.unwrap();
+    assert_eq!(result.id, id);
+    assert!(result.converged && result.restart_required);
+    assert_eq!(result.result_revision, 1);
+    assert_eq!(result.authority.actor.as_deref(), Some("principal:owner"));
+    assert_eq!(result.authority.kind, AuthorityKind::AuthenticatedIdentity);
+    let denied = DeploymentCaller::AuthenticatedIdentity(
+        IdentityAuthorization::authenticated("principal:reader").unwrap(),
+    );
+    assert!(deployment_status(root, Some(&id), &denied).await.is_err());
+    assert!(matches!(
+        result.graphs["knowledge"],
+        GraphDeploymentResult::Schema {
+            result: omnigraph::db::SchemaApplySettlement::Committed { .. }
+        }
+    ));
+    assert_eq!(
+        identity_manifest_version(dir.path()).await,
+        before_version + 1
+    );
+    let state = read_state_json(dir.path());
+    assert!(state.get("outstanding").is_none());
+    assert_eq!(
+        state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
+        sha256_hex(schema.as_bytes())
+    );
+    let query_digest = sha256_hex(query.as_bytes());
+    assert_eq!(
+        fs::read_to_string(query_payload_path(dir.path(), &query_digest)).unwrap(),
+        query
+    );
+    assert_eq!(
+        acquire_cluster_admission(root, ClusterAdmissionPurpose::GraphOperation)
+            .await
+            .unwrap_err()
+            .code,
+        "state_lock_held"
+    );
+    assert!(
+        force_unlock_storage_root(root, "wrong-lock-id")
+            .await
+            .is_err()
+    );
+    assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
+
+    // Repeating the same full ID with exact input observes while admission is
+    // still held; changed input refuses instead of reusing its receipt.
+    fs::write(dir.path().join("people.pg"), &schema).unwrap();
+    fs::write(dir.path().join("people.gq"), &query).unwrap();
+    assert!(matches!(
+        apply_deployment(dir.path(), Some(&id), &caller, |_, _, _| panic!(
+            "lookup cannot invoke"
+        ))
+        .await
+        .unwrap(),
+        DeploymentLookup::Complete { .. }
+    ));
+    fs::write(dir.path().join("people.gq"), format!("{query}\n")).unwrap();
+    assert_eq!(
+        apply_deployment(dir.path(), Some(&id), &caller, |_, _, _| panic!(
+            "mismatch cannot invoke"
+        ))
+        .await
+        .unwrap_err()
+        .code,
+        "deployment_input_mismatch"
+    );
+    fs::remove_file(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
+    fs::remove_file(dir.path().join("people.pg")).unwrap();
+    fs::remove_file(dir.path().join("people.gq")).unwrap();
+    let lookup = deployment_status(&canonical_root, Some(&id), &caller)
+        .await
+        .unwrap();
+    assert_eq!(lookup.lock_id.as_deref(), Some(lock_id.as_str()));
+    assert!(
+        matches!(lookup.lookup, Some(DeploymentLookup::Complete { result: observed }) if observed.id == id && observed.input_digest == result.input_digest)
+    );
+    assert!(matches!(
+        reconcile_deployment(&canonical_root, &id, false, &caller)
+            .await
+            .unwrap(),
+        DeploymentLookup::Complete { .. }
+    ));
+    assert_eq!(
+        identity_manifest_version(dir.path()).await,
+        before_version + 1
+    );
+    force_unlock_storage_root(&canonical_root, &lock_id)
+        .await
+        .unwrap();
+    let serving = read_serving_snapshot_from_storage(&canonical_root)
+        .await
+        .unwrap();
+    assert_eq!(serving.queries[0].source, query);
+}
+
+#[tokio::test]
+async fn offline_deployment_query_only_preserves_branched_graph_history() {
+    let dir = identity_fixture();
+    apply_identity_fixture(dir.path()).await;
+    let root = dir.path().to_str().unwrap();
+    let uri = derived_graph_uri(dir.path(), "knowledge");
+    let db = Omnigraph::open(&uri).await.unwrap();
+    db.branch_create("feature").await.unwrap();
+    let main = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .graph_manifest_version();
+    let branch = db
+        .snapshot_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap()
+        .graph_manifest_version();
+    let history = serde_json::to_value(db.list_commits(None).await.unwrap()).unwrap();
+    drop(db);
+    let caller = DeploymentCaller::storage_owner(Some("principal:owner".into()));
+    upgrade_deployment_ledger(root, true, &caller)
+        .await
+        .unwrap();
+    let config_path = dir.path().join(CLUSTER_CONFIG_FILE);
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        config.replace(
+            "    queries:\n      find_person:\n        file: ./people.gq\n",
+            "",
+        ),
+    )
+    .unwrap();
+    let DeploymentLookup::Complete { result } =
+        apply_deployment(dir.path(), None, &caller, |_, _, _| {})
+            .await
+            .unwrap()
+    else {
+        panic!("expected query deployment");
+    };
+    assert!(result.converged);
+    assert!(
+        matches!(result.graphs["knowledge"], GraphDeploymentResult::QueryOnly { graph_manifest_version, .. } if graph_manifest_version == main)
+    );
+    let state = read_state_json(dir.path());
+    assert!(
+        state["applied_revision"]["resources"]
+            .get("query.knowledge.find_person")
+            .is_none()
+    );
+    assert!(
+        state["resource_statuses"]
+            .get("query.knowledge.find_person")
+            .is_none()
+    );
+    let db = Omnigraph::open_read_only(&uri).await.unwrap();
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .graph_manifest_version(),
+        main
+    );
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("feature"))
+            .await
+            .unwrap()
+            .graph_manifest_version(),
+        branch
+    );
+    assert_eq!(
+        serde_json::to_value(db.list_commits(None).await.unwrap()).unwrap(),
+        history
+    );
+    let achieved_contract = db.schema_contract_digest();
+    drop(db);
+    let status = deployment_status(root, Some(&result.id), &caller)
+        .await
+        .unwrap();
+    force_unlock_storage_root(root, status.lock_id.as_deref().unwrap())
+        .await
+        .unwrap();
+
+    // Retention may discard every terminal receipt. The achieved projection
+    // still has to detect a graph recreated with identical source bytes and
+    // fresh schema identities; neither serving nor a query-only change may
+    // silently adopt the replacement. The separate eviction test owns order.
+    let mut retained = read_state_json(dir.path());
+    retained["deployment_results"] = json!([]);
+    fs::write(
+        dir.path().join(CLUSTER_STATE_FILE),
+        serde_json::to_vec(&retained).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        deployment_status(root, Some(&result.id), &caller)
+            .await
+            .unwrap()
+            .lookup,
+        Some(DeploymentLookup::ResultExpired { .. })
+    ));
+    fs::remove_dir_all(dir.path().join("graphs/knowledge.omni")).unwrap();
+    let replacement = Omnigraph::init(&uri, SCHEMA).await.unwrap();
+    let replaced_contract = replacement.schema_contract_digest();
+    assert_eq!(replaced_contract.source_hash, achieved_contract.source_hash);
+    assert_ne!(
+        replaced_contract.schema_identity_domain,
+        achieved_contract.schema_identity_domain
+    );
+    let replacement_version = replacement
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .graph_manifest_version();
+    drop(replacement);
+    let ledger_before = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let (_, _, admission) = admit_serving_snapshot(root).await.unwrap().into_parts();
+    let admission = admission.unwrap();
+    // Admission captures the achieved contract without opening graph engines.
+    // Server startup compares each opened handle separately after trust checks.
+    assert_eq!(
+        admission.expected_serving_schema_contract(&uri).unwrap(),
+        &achieved_contract
+    );
+    assert_ne!(
+        admission.expected_serving_schema_contract(&uri).unwrap(),
+        &replaced_contract
+    );
+    drop(admission);
+    let status = deployment_status(root, None, &caller).await.unwrap();
+    force_unlock_storage_root(root, status.lock_id.as_deref().unwrap())
+        .await
+        .unwrap();
+
+    fs::write(&config_path, config).unwrap(); // Re-add the stored query only.
+    let error = apply_deployment(dir.path(), None, &caller, |_, _, _| {})
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "applied_schema_drift");
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger_before
+    );
+    assert_eq!(
+        identity_manifest_version(dir.path()).await,
+        replacement_version
+    );
+    let status = deployment_status(root, None, &caller).await.unwrap();
+    force_unlock_storage_root(root, status.lock_id.as_deref().unwrap())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn offline_deployment_ids_survive_result_eviction_without_aliasing_or_replay() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        "version: 1\ngraphs: {}\n",
+    )
+    .unwrap();
+    apply_identity_fixture(dir.path()).await;
+    let root = dir.path().to_str().unwrap();
+    let caller = DeploymentCaller::storage_owner(None);
+    let upgraded = upgrade_deployment_ledger(root, true, &caller)
+        .await
+        .unwrap();
+    let mut first_id = String::new();
+    for sequence in 1..=deployment::MAX_RESULTS + 1 {
+        let id = format!("{}:{sequence}:{}", upgraded.ledger_id, Ulid::new());
+        let DeploymentLookup::Complete { result } =
+            apply_deployment(dir.path(), Some(&id), &caller, |reported, _, _| {
+                assert_eq!(reported, id)
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected no-op deployment receipt");
+        };
+        assert_eq!(result.id, id);
+        assert!(result.converged && result.graphs.is_empty());
+        let status = deployment_status(root, Some(&id), &caller).await.unwrap();
+        let alias = format!("{}:{sequence}:{}", upgraded.ledger_id, Ulid::new());
+        assert!(matches!(
+            deployment_status(root, Some(&alias), &caller)
+                .await
+                .unwrap()
+                .lookup,
+            Some(DeploymentLookup::IdentityMismatch)
+        ));
+        assert!(matches!(
+            apply_deployment(dir.path(), Some(&alias), &caller, |_, _, _| panic!(
+                "alias cannot execute"
+            ))
+            .await
+            .unwrap(),
+            DeploymentLookup::IdentityMismatch
+        ));
+        if sequence == 1 {
+            first_id = id;
+        }
+        force_unlock_storage_root(root, status.lock_id.as_deref().unwrap())
+            .await
+            .unwrap();
+    }
+    let before = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    assert_eq!(
+        deployment_status(root, Some(&"x".repeat(76)), &caller)
+            .await
+            .unwrap_err()
+            .code,
+        "deployment_id_invalid"
+    );
+    assert_eq!(
+        read_state_json(dir.path())["deployment_results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        deployment::MAX_RESULTS
+    );
+    for id in [
+        &first_id,
+        &format!("{}:1:{}", upgraded.ledger_id, Ulid::new()),
+    ] {
+        assert!(matches!(
+            deployment_status(root, Some(id), &caller)
+                .await
+                .unwrap()
+                .lookup,
+            Some(DeploymentLookup::ResultExpired {
+                acceptance: "unknown",
+                outcome: "unknown"
+            })
+        ));
+        assert!(matches!(
+            apply_deployment(dir.path(), Some(id), &caller, |_, _, _| panic!(
+                "expired ID cannot execute"
+            ))
+            .await
+            .unwrap(),
+            DeploymentLookup::ResultExpired { .. }
+        ));
+    }
+    let future_id = format!("{}:999:{}", upgraded.ledger_id, Ulid::new());
+    assert!(matches!(
+        deployment_status(root, Some(&future_id), &caller)
+            .await
+            .unwrap()
+            .lookup,
+        Some(DeploymentLookup::NotRecorded)
+    ));
+    assert_eq!(
+        apply_deployment(dir.path(), Some(&future_id), &caller, |_, _, _| panic!(
+            "future sequence cannot execute"
+        ))
+        .await
+        .unwrap_err()
+        .code,
+        "deployment_id_stale"
+    );
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn offline_deployment_reserves_created_query_projection_before_schema_effects() {
+    let dir = identity_fixture();
+    apply_identity_fixture(dir.path()).await;
+    let root = dir.path().to_str().unwrap();
+    let caller = DeploymentCaller::storage_owner(Some("principal:owner".into()));
+    upgrade_deployment_ledger(root, true, &caller)
+        .await
+        .unwrap();
+    let version = identity_manifest_version(dir.path()).await;
+
+    // The existing audit history must survive conversion/deployment. Leave room
+    // for acceptance and its effect list, but not the larger achieved query
+    // projection: every new address also appears in resource_statuses.
+    let mut state = read_state_json(dir.path());
+    state["approval_records"]["retained_audit"] = json!("");
+    let headroom = 240 * 1024;
+    let target_bytes = deployment::MAX_LEDGER_BYTES - headroom;
+    let padding = target_bytes - serde_json::to_vec(&state).unwrap().len();
+    state["approval_records"]["retained_audit"] = json!("a".repeat(padding));
+    let before = serde_json::to_vec(&state).unwrap();
+    assert_eq!(before.len(), target_bytes);
+    fs::write(dir.path().join(CLUSTER_STATE_FILE), &before).unwrap();
+
+    expand_identity_schema(dir.path());
+    let mut config = fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
+    let mut declarations = String::new();
+    let mut projected_growth = 0;
+    for index in 0..256 {
+        let name = format!("query_{index:03}_{}", "x".repeat(480));
+        let address = config::query_address("knowledge", &name);
+        assert!(address.len() <= 512);
+        let source = QUERY.replace("find_person", &name);
+        let file = format!("created_{index}.gq");
+        fs::write(dir.path().join(&file), &source).unwrap();
+        declarations.push_str(&format!("      {name}:\n        file: ./{file}\n"));
+        projected_growth += serde_json::to_vec(&json!({
+            address.clone(): {"digest": sha256_hex(source.as_bytes())}
+        }))
+        .unwrap()
+        .len();
+        projected_growth += serde_json::to_vec(&json!({
+            address: {"status": "applied"}
+        }))
+        .unwrap()
+        .len();
+    }
+    assert!(projected_growth > headroom);
+    config = config.replace("policies:\n", &format!("{declarations}policies:\n"));
+    fs::write(dir.path().join(CLUSTER_CONFIG_FILE), config).unwrap();
+    let captured = config::capture_desired(dir.path());
+    assert!(
+        !captured
+            .outcome
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error),
+        "{:?}",
+        captured.outcome.diagnostics
+    );
+
+    let error = apply_deployment(dir.path(), None, &caller, |_, _, _| {})
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "deployment_bounds", "{error:?}");
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        before
+    );
+    assert_eq!(identity_manifest_version(dir.path()).await, version);
+    assert!(read_state_json(dir.path()).get("outstanding").is_none());
+    let status = deployment_status(root, None, &caller).await.unwrap();
+    assert_eq!(status.next_sequence, 1);
+    force_unlock_storage_root(root, status.lock_id.as_deref().unwrap())
+        .await
+        .unwrap();
+}
+
+#[test]
+fn offline_deployment_reserves_partial_projection_resource_count() {
+    use deployment::{
+        DeploymentAuthorization, DeploymentBundle, DeploymentMode, GraphDeployment,
+        GraphDeploymentState, OutstandingDeployment,
+    };
+
+    // Isolate capacity from source parsing and engine setup. Each input fits
+    // 4,096 resources, but accepting additions on a before refusing deletions
+    // on z would leave 4,098 resources in the achieved partial projection.
+    let resource = StateResource {
+        digest: "f".repeat(64),
+        applies_to: None,
+        embedding_provider: None,
+        embedding_profile: None,
+        external_blob_policy: None,
+    };
+    let resources: BTreeMap<_, _> = ["graph.a", "schema.a", "graph.z", "schema.z"]
+        .into_iter()
+        .map(|address| (address.to_owned(), resource.clone()))
+        .chain((0..2047).map(|index| (format!("query.z.old_{index}"), resource.clone())))
+        .collect();
+    let ledger_id = Ulid::new().to_string();
+    let authority = DeploymentAuthority {
+        kind: AuthorityKind::StorageOwner,
+        actor: None,
+    };
+    let mut state = ClusterState {
+        version: 2,
+        mode: Some(DeploymentMode::Offline),
+        ledger_id: Some(ledger_id.clone()),
+        next_sequence: Some(2),
+        state_revision: 1,
+        applied_revision: AppliedRevisionState {
+            schema_contracts: Some(
+                ["a", "z"]
+                    .into_iter()
+                    .map(|graph| {
+                        (
+                            graph.to_owned(),
+                            omnigraph::db::SchemaContractDigest {
+                                source_hash: "f".repeat(64),
+                                schema_ir_hash: format!("sha256:{}", "f".repeat(64)),
+                                schema_identity_domain: Ulid::new().to_string(),
+                                schema_identity_version: 2,
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            result_revision: Some(0),
+            config_digest: Some("f".repeat(64)),
+            resources,
+        },
+        outstanding: None,
+        deployment_results: Some(Vec::new()),
+        resource_statuses: BTreeMap::new(),
+        approval_records: BTreeMap::new(),
+        recovery_records: BTreeMap::new(),
+        observations: BTreeMap::new(),
+    };
+    let pending = OutstandingDeployment {
+        id: format!("{ledger_id}:1:{}", Ulid::new()),
+        input_digest: "f".repeat(64),
+        authorization: DeploymentAuthorization {
+            version: 2,
+            ledger_id,
+            authority,
+            base: AchievedDeploymentBase {
+                schema_contracts: state.applied_revision.schema_contracts.clone().unwrap(),
+                result_revision: 0,
+                resource_digests: state_resource_digests(&state),
+                capture_cas: format!("sha256:{}", "f".repeat(64)),
+            },
+            input_digest: "f".repeat(64),
+            policy_digests: BTreeMap::new(),
+            effects: Vec::new(),
+        },
+        graphs: ["a", "z"]
+            .into_iter()
+            .map(|graph| {
+                (
+                    graph.to_string(),
+                    GraphDeployment {
+                        intent: None,
+                        observed_manifest_version: 1,
+                        state: GraphDeploymentState::NotStarted,
+                        settlement: None,
+                        recovery_executor: None,
+                    },
+                )
+            })
+            .collect(),
+        reserved_ledger_bytes: 0,
+        reserved_result_bytes: 0,
+    };
+    state.outstanding = Some(pending);
+    for (target, fits) in [("a", false), ("z", true)] {
+        let mut attempt = state.clone();
+        let mut desired = state.applied_revision.resources.clone();
+        desired.retain(|address, _| !address.starts_with("query."));
+        for index in 0..2047 {
+            desired.insert(format!("query.{target}.new_{index}"), resource.clone());
+        }
+        assert!(desired.len() <= deployment::MAX_RESOURCES);
+        let bundle = DeploymentBundle {
+            version: 2,
+            canonical_root: "file:///capacity-only".into(),
+            config_digest: "e".repeat(64),
+            config_semantics: "{}".into(),
+            resources: desired,
+            sources: BTreeMap::new(),
+        };
+        let reserved = deployment::reserve_completion(&mut attempt, &bundle);
+        if fits {
+            // Same-graph replacement cannot retain old and new bindings
+            // simultaneously; a union-count guard would reject it needlessly.
+            reserved.unwrap();
+        } else {
+            assert_eq!(reserved.unwrap_err().code, "deployment_bounds");
+        }
+    }
+}
+
+#[test]
+fn offline_deployment_graph_completion_reserve_covers_maximum_serialized_engine_evidence() {
+    use deployment::{GraphDeployment, GraphDeploymentState};
+    use omnigraph::db::{
+        GraphCommit, PreparedSchemaSettlement, SchemaApplySettlement, SchemaContractDigest,
+        SchemaNonPublicationProof,
+    };
+
+    // Quotes need the maximum escaping admitted for a 256-byte actor: control
+    // characters are refused at the boundary. IDs and hashes are fixed width.
+    let actor = "\"".repeat(256);
+    let authority = DeploymentAuthority {
+        kind: AuthorityKind::AuthenticatedIdentity,
+        actor: Some(actor.clone()),
+    };
+    let id = "7ZZZZZZZZZZZZZZZZZZZZZZZZZ".to_string();
+    let parent = "00000000000000000000000000".to_string();
+    let contract = SchemaContractDigest {
+        source_hash: "f".repeat(64),
+        schema_ir_hash: format!("sha256:{}", "f".repeat(64)),
+        schema_identity_domain: id.clone(),
+        schema_identity_version: u32::MAX,
+    };
+    let commit = GraphCommit {
+        graph_commit_id: id.clone(),
+        graph_branch: None,
+        graph_manifest_version: u64::MAX,
+        parent_commit_id: Some(parent.clone()),
+        merged_parent_commit_id: None,
+        actor_id: Some(actor.clone()),
+        created_at: i64::MIN,
+    };
+    // Decode the engine's opaque type, so a new serialized token field makes
+    // this bound review fail instead of silently remaining absent from a mock.
+    let settlement: PreparedSchemaSettlement = serde_json::from_value(json!({
+        "version": 2,
+        "original_digest": "f".repeat(64),
+        "lineage": {
+            "graph_commit_id": id,
+            "branch": null,
+            "actor_id": actor,
+            "merged_parent_commit_id": null,
+            "created_at": i64::MIN
+        }
+    }))
+    .unwrap();
+    let before = GraphDeployment {
+        // Prepared intent bytes are already charged at acceptance and never
+        // change. Null cancels that same term in both sides of this comparison.
+        intent: None,
+        observed_manifest_version: u64::MAX,
+        state: GraphDeploymentState::NotStarted,
+        settlement: None,
+        recovery_executor: None,
+    };
+    let before_bytes = serde_json::to_vec(&before).unwrap().len();
+    let graph = "g".repeat(505); // schema.<id> is at most 512 bytes.
+    let result_before = json!({
+        "graphs": {graph.clone(): GraphDeploymentResult::NotAttempted},
+        "recovery_executors": {}
+    });
+    let result_before_bytes = serde_json::to_vec(&result_before).unwrap().len();
+    for result in [
+        SchemaApplySettlement::Committed {
+            commit: commit.clone(),
+            contract: contract.clone(),
+        },
+        SchemaApplySettlement::NotPublished {
+            proof: SchemaNonPublicationProof::Fence {
+                commit,
+                contract: contract.clone(),
+            },
+        },
+        SchemaApplySettlement::NotPublished {
+            proof: SchemaNonPublicationProof::Occupied {
+                graph_manifest_version: u64::MAX,
+                head_commit_id: Some(parent.clone()),
+                contract: contract.clone(),
+            },
+        },
+        SchemaApplySettlement::NoOp {
+            graph_manifest_version: u64::MAX,
+            head_commit_id: Some(parent),
+            contract,
+        },
+        SchemaApplySettlement::NoOpRefused,
+    ] {
+        let outcome = GraphDeploymentResult::Schema { result };
+        let after = GraphDeployment {
+            state: GraphDeploymentState::Settled {
+                result: Box::new(outcome.clone()),
+            },
+            settlement: Some(settlement.clone()),
+            recovery_executor: Some(authority.clone()),
+            ..before.clone()
+        };
+        assert!(
+            serde_json::to_vec(&after).unwrap().len() - before_bytes
+                <= deployment::GRAPH_COMPLETION_RESERVE_BYTES
+        );
+        let result_after = json!({
+            "graphs": {graph.clone(): outcome},
+            "recovery_executors": {graph.clone(): authority.clone()}
+        });
+        assert!(
+            serde_json::to_vec(&result_after).unwrap().len() - result_before_bytes
+                <= deployment::GRAPH_COMPLETION_RESERVE_BYTES
+        );
+    }
+}
+
+#[tokio::test]
+async fn offline_deployment_ledger_refuses_legacy_mutation_doors() {
+    let dir = identity_fixture();
+    apply_identity_fixture(dir.path()).await;
+    let caller = DeploymentCaller::storage_owner(Some("principal:owner".into()));
+    upgrade_deployment_ledger(dir.path().to_str().unwrap(), true, &caller)
+        .await
+        .unwrap();
+    let before = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let version = identity_manifest_version(dir.path()).await;
+    let apply = apply_config_dir(dir.path()).await;
+    let refresh = refresh_config_dir(dir.path()).await;
+    let import = import_config_dir(dir.path()).await;
+    let approval = approve_config_dir(dir.path(), "graph.knowledge", "principal:owner").await;
+    for diagnostics in [
+        &apply.diagnostics,
+        &refresh.diagnostics,
+        &import.diagnostics,
+        &approval.diagnostics,
+    ] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "offline_deployment_required"),
+            "{diagnostics:?}"
+        );
+    }
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        before
+    );
+    assert_eq!(identity_manifest_version(dir.path()).await, version);
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
 }
 
 #[tokio::test]
@@ -2717,6 +4275,23 @@ async fn apply_schema_update_and_dependent_query_in_one_run() {
                 .next()
                 .is_none()
     );
+
+    // An empty table-migration plan is not a source no-op. Cluster convergence
+    // must certify the exact schema bytes that reopening the graph accepts.
+    let source_only = format!("// Updated schema documentation.\n{SCHEMA_V2}");
+    fs::write(dir.path().join("people.pg"), &source_only).unwrap();
+    let out = apply_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(out.converged, "{out:?}");
+    let db = Omnigraph::open_read_only(&derived_graph_uri(dir.path(), "knowledge"))
+        .await
+        .unwrap();
+    assert_eq!(db.schema_source().as_str(), source_only);
+    let state = read_state_json(dir.path());
+    assert_eq!(
+        state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
+        sha256_hex(db.schema_source().as_bytes()),
+    );
 }
 
 #[tokio::test]
@@ -2977,11 +4552,9 @@ async fn apply_creates_graph_and_unblocks_dependents() {
 async fn apply_create_failure_blocks_dependents_and_keeps_sidecar() {
     let dir = fixture();
     write_state_resources(dir.path(), &[]);
-    // Make the init fail its strict preflight: a junk _schema.pg already
-    // sits at the derived root (the engine refuses to overwrite it).
     let root = dir.path().join(CLUSTER_GRAPHS_DIR).join("knowledge.omni");
     fs::create_dir_all(&root).unwrap();
-    fs::write(root.join("_schema.pg"), "junk").unwrap();
+    fs::write(root.join("__init_claim.json"), "incomplete initializer").unwrap();
 
     let out = apply_config_dir(dir.path()).await;
     assert!(!out.ok);
@@ -3300,6 +4873,18 @@ graphs:
     .unwrap();
     write_applyable_state(dir.path());
 
+    // The CLI probes the durable executor before routing an unconverted
+    // ledger to v1. A v2-only lock requirement must not swallow that routing.
+    let error = apply_deployment(
+        dir.path(),
+        None,
+        &DeploymentCaller::storage_owner(None),
+        |_, _, _| {},
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "ledger_upgrade_required");
+
     let out = apply_config_dir(dir.path()).await;
     assert!(out.ok, "{:?}", out.diagnostics);
     assert!(out.state_written);
@@ -3447,6 +5032,55 @@ graphs:
 }
 
 // ---- catalog payload verification (Stage 3B) ----
+
+#[tokio::test]
+async fn durable_store_payload_writes_verify_existing_bytes_without_overwrite() {
+    let dir = fixture();
+    let store = ClusterStore::for_config_dir(dir.path());
+    let kind = ResourceKind::Query {
+        graph: "knowledge".to_string(),
+        name: "find_person".to_string(),
+    };
+    let digest = sha256_hex(QUERY.as_bytes());
+    assert!(
+        store
+            .write_payload(&kind, &digest, "different")
+            .await
+            .is_err()
+    );
+    assert!(!dir.path().join(CLUSTER_RESOURCES_DIR).exists());
+    store.write_payload(&kind, &digest, QUERY).await.unwrap();
+    store.write_payload(&kind, &digest, QUERY).await.unwrap();
+    assert_eq!(
+        store.read_payload(&kind, &digest).await.unwrap().as_deref(),
+        Some(QUERY)
+    );
+    let path = query_payload_path(dir.path(), &digest);
+    fs::write(&path, "corrupt").unwrap();
+    assert!(store.write_payload(&kind, &digest, QUERY).await.is_err());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "corrupt");
+    let oversized = "x".repeat(config::MAX_CONFIG_SOURCE_BYTES + 1);
+    let oversized_digest = sha256_hex(oversized.as_bytes());
+    assert!(
+        store
+            .write_payload(&kind, &oversized_digest, &oversized)
+            .await
+            .is_err()
+    );
+    assert!(!query_payload_path(dir.path(), &oversized_digest).exists());
+
+    let empty_digest = sha256_hex(b"");
+    store.write_payload(&kind, &empty_digest, "").await.unwrap();
+    store.write_payload(&kind, &empty_digest, "").await.unwrap();
+    assert_eq!(
+        store
+            .read_payload(&kind, &empty_digest)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("")
+    );
+}
 
 /// Converge a fixture dir and return the query blob path.
 async fn converge_fixture(config_dir: &Path) -> std::path::PathBuf {
@@ -4805,7 +6439,8 @@ async fn serving_snapshot_uses_applied_embedding_provider_profile() {
 #[tokio::test]
 async fn serving_snapshot_uses_applied_server_safe_external_blob_policy() {
     let dir = fixture();
-    let embedded = dir.path().join("external-assets");
+    let external = tempdir().unwrap();
+    let embedded = external.path().join("external-assets");
     fs::create_dir(&embedded).unwrap();
     fs::write(
         dir.path().join(CLUSTER_CONFIG_FILE),
@@ -5031,8 +6666,10 @@ async fn serving_snapshot_refuses_pending_recovery() {
 
     let err = read_serving_snapshot(dir.path()).await.unwrap_err();
     assert!(
-        err.iter()
-            .any(|diagnostic| diagnostic.code == "cluster_no_healthy_graphs"),
+        err.iter().any(|diagnostic| {
+            diagnostic.code == "cluster_no_healthy_graphs"
+                && diagnostic.path == CLUSTER_RECOVERIES_DIR
+        }),
         "{err:?}"
     );
     assert!(
@@ -5277,6 +6914,145 @@ fn queries_directory_discovers_every_declaration() {
         .filter_map(|address| address.strip_prefix("query.knowledge."))
         .collect();
     assert_eq!(names, vec!["all_people", "count_people", "find_person"]);
+
+    let captured = config::capture_desired(dir.path());
+    assert!(!has_errors(&captured.outcome.diagnostics));
+    let desired = captured.outcome.desired.unwrap();
+    assert_eq!(desired.resource_digests, out.resource_digests);
+    assert_eq!(captured.sources.len(), 4, "YAML, schema, two query files");
+    let original = fs::read_to_string(dir.path().join("queries/people.gq")).unwrap();
+    let query_digest = &desired.resource_digests["query.knowledge.find_person"];
+    assert_eq!(
+        query_digest, &desired.resource_digests["query.knowledge.all_people"],
+        "shared declarations retain the same immutable file"
+    );
+    fs::remove_dir_all(dir.path().join("queries")).unwrap();
+    fs::remove_file(dir.path().join("people.pg")).unwrap();
+    fs::remove_file(dir.path().join("cluster.yaml")).unwrap();
+    assert_eq!(captured.sources[query_digest].as_ref(), original);
+    for (digest, source) in &captured.sources {
+        assert_eq!(digest, &sha256_hex(source.as_bytes()));
+    }
+}
+
+#[test]
+fn captured_configuration_enforces_source_and_resource_bounds() {
+    for name in [
+        CLUSTER_CONFIG_FILE,
+        "people.pg",
+        "people.gq",
+        "base.policy.yaml",
+    ] {
+        let dir = fixture();
+        fs::write(
+            dir.path().join(name),
+            vec![b' '; config::MAX_CONFIG_SOURCE_BYTES + 1],
+        )
+        .unwrap();
+        let captured = config::capture_desired(dir.path());
+        assert!(
+            captured
+                .outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "config_source_limit"),
+            "{name}: {:?}",
+            captured.outcome.diagnostics
+        );
+        assert!(!dir.path().join(CLUSTER_STATE_FILE).exists());
+    }
+
+    let dir = fixture();
+    let mut yaml = "version: 1\ngraphs:\n".to_string();
+    // Two resources per graph. Refuse before opening any referenced source.
+    for index in 0..=config::MAX_CONFIG_RESOURCES / 2 {
+        yaml.push_str(&format!("  g{index}: {{ schema: missing.pg }}\n"));
+    }
+    fs::write(dir.path().join(CLUSTER_CONFIG_FILE), yaml).unwrap();
+    let captured = config::capture_desired(dir.path());
+    assert!(captured.outcome.desired.is_none());
+    assert_eq!(captured.outcome.diagnostics.len(), 1);
+    assert_eq!(
+        captured.outcome.diagnostics[0].code,
+        "config_resource_limit"
+    );
+    assert_eq!(captured.sources.len(), 1, "only configuration was read");
+}
+
+#[test]
+fn captured_configuration_deduplicates_sources_and_bounds_aggregate_bytes() {
+    let dir = tempdir().unwrap();
+    let mut yaml = "version: 1\ngraphs:\n".to_string();
+    // Different paths with identical bytes consume the distinct-byte budget once.
+    let source = format!(
+        "{SCHEMA}{}",
+        " ".repeat(config::MAX_CONFIG_SOURCE_BYTES - SCHEMA.len())
+    );
+    for index in 0..9 {
+        fs::write(dir.path().join(format!("schema{index}.pg")), &source).unwrap();
+        yaml.push_str(&format!("  g{index}: {{ schema: schema{index}.pg }}\n"));
+    }
+    fs::write(dir.path().join(CLUSTER_CONFIG_FILE), &yaml).unwrap();
+    let captured = config::capture_desired(dir.path());
+    assert!(
+        !has_errors(&captured.outcome.diagnostics),
+        "{:?}",
+        captured.outcome.diagnostics
+    );
+    assert_eq!(captured.sources.len(), 2);
+
+    // Keep each source within its cap but give it distinct valid schema bytes.
+    for index in 0..9 {
+        let schema = format!("node Person{index} {{ name: String @key }}\n");
+        let padded = format!(
+            "{schema}{}",
+            " ".repeat(config::MAX_CONFIG_SOURCE_BYTES - schema.len())
+        );
+        fs::write(dir.path().join(format!("schema{index}.pg")), padded).unwrap();
+    }
+    let captured = config::capture_desired(dir.path());
+    assert!(
+        captured
+            .outcome
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "config_source_limit")
+    );
+    assert!(
+        captured
+            .sources
+            .values()
+            .map(|source| source.len())
+            .sum::<usize>()
+            <= config::MAX_CONFIG_TOTAL_BYTES
+    );
+}
+
+#[test]
+fn query_discovery_bounds_all_directory_entries_before_source_reads() {
+    let dir = fixture();
+    fs::create_dir(dir.path().join("queries")).unwrap();
+    for index in 0..config::MAX_CONFIG_RESOURCES {
+        fs::write(dir.path().join(format!("queries/{index}.txt")), "ignored").unwrap();
+    }
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        "version: 1\ngraphs:\n  knowledge:\n    schema: people.pg\n    queries: queries/\n",
+    )
+    .unwrap();
+    let captured = config::capture_desired(dir.path());
+    assert!(
+        captured
+            .outcome
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "config_discovery_limit")
+    );
+    assert_eq!(
+        captured.sources.len(),
+        2,
+        "non-query directory entries are counted but never read"
+    );
 }
 
 #[test]

@@ -9,11 +9,10 @@ use crate::error::{OmniError, Result};
 use crate::storage::{StorageAdapter, normalize_root_uri};
 
 use super::commit_graph::{CommitGraph, CommitGraphSnapshot, FirstParentEdge, GraphCommit};
-use super::is_internal_system_branch;
 use super::manifest::{
     CapturedManifestProbe, DatasetUpdate, ExpectedTableVersions, GenesisManifestAttempt,
     LineageIntent, LineageRefresh, ManifestChange, ManifestCoordinator, ManifestIncarnation,
-    ManifestInitError, PublishPrecondition,
+    ManifestInitError, PublishPrecondition, SchemaContractRow,
 };
 use super::snapshot::Snapshot;
 use crate::seams::{decide_seam, fail};
@@ -139,6 +138,7 @@ impl GraphCoordinator {
     pub(crate) async fn init_commit_with_session(
         root_uri: &str,
         catalog: &Catalog,
+        contract: &SchemaContractRow,
         control_session: &Arc<lance::session::Session>,
         attempt: &GenesisManifestAttempt,
     ) -> std::result::Result<Dataset, ManifestInitError> {
@@ -146,7 +146,7 @@ impl GraphCoordinator {
         // The genesis graph commit is folded into the manifest init write, so
         // `__manifest` is the single source of graph lineage from version one
         // (RFC-013 Phase 7).
-        ManifestCoordinator::init_commit(&root, catalog, control_session, attempt).await
+        ManifestCoordinator::init_commit(&root, catalog, contract, control_session, attempt).await
     }
 
     /// Reopen an acknowledgement-unknown manifest Create and construct a
@@ -225,6 +225,40 @@ impl GraphCoordinator {
     ) -> Result<Self> {
         let control_session = crate::lance_access::control_session();
         Self::open_branch_with_session(root_uri, branch, storage, &control_session).await
+    }
+
+    pub(crate) async fn open_with_contract(
+        root_uri: &str,
+        storage: Arc<dyn StorageAdapter>,
+        prepared: crate::db::manifest::PreparedManifestOpen,
+    ) -> Result<(Self, SchemaContractRow)> {
+        let root = normalize_root_uri(root_uri)?;
+        let (manifest, lineage_rows, contract) =
+            ManifestCoordinator::open_prepared_with_lineage_and_contract(&root, prepared).await?;
+        let commit_graph = CommitGraph::from_manifest_rows(&root, None, lineage_rows);
+        let mut coordinator = Self {
+            root_uri: root,
+            storage,
+            manifest,
+            commit_graph,
+            bound_branch: None,
+        };
+        let contract = coordinator.refresh_contract_capture(contract).await?;
+        Ok((coordinator, contract))
+    }
+
+    async fn refresh_contract_capture(
+        &mut self,
+        contract: Result<SchemaContractRow>,
+    ) -> Result<SchemaContractRow> {
+        let captured = self.snapshot();
+        self.refresh().await?;
+        self.manifest.validate_serving_format()?;
+        if self.snapshot().same_manifest_image(&captured) {
+            contract
+        } else {
+            self.read_schema_contract().await
+        }
     }
 
     pub(crate) async fn open_branch_with_session(
@@ -318,6 +352,12 @@ impl GraphCoordinator {
         Snapshot::wrap(self.manifest.snapshot())
     }
 
+    /// Read the contract of the same pinned manifest image as [`Self::snapshot`],
+    /// using captured content when available and a filtered scan otherwise.
+    pub(crate) async fn read_schema_contract(&self) -> Result<SchemaContractRow> {
+        self.manifest.read_schema_contract().await
+    }
+
     pub fn current_branch(&self) -> Option<&str> {
         self.bound_branch.as_deref()
     }
@@ -370,16 +410,7 @@ impl GraphCoordinator {
     }
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {
-        self.manifest.list_graph_branches().await.map(|branches| {
-            branches
-                .into_iter()
-                .filter(|branch| !is_internal_system_branch(branch))
-                .collect()
-        })
-    }
-
-    pub(crate) async fn schema_apply_locked(&self) -> Result<bool> {
-        self.manifest.schema_apply_locked().await
+        self.manifest.list_graph_branches().await
     }
 
     pub(crate) async fn all_branches(&self) -> Result<Vec<String>> {
@@ -403,23 +434,9 @@ impl GraphCoordinator {
         self.manifest.create_branch(&branch).await
     }
 
-    pub(crate) async fn branch_delete(&mut self, name: &str) -> Result<()> {
-        let branch = normalize_branch_name(name)?
-            .ok_or_else(|| OmniError::manifest("cannot delete branch 'main'".to_string()))?;
-        if self.current_branch() == Some(branch.as_str()) {
-            return Err(OmniError::manifest_conflict(format!(
-                "cannot delete currently active branch '{}'",
-                branch
-            )));
-        }
-
-        self.manifest.delete_branch(&branch).await
-    }
-
     /// Delete the branch represented by an operation-local post-gate capture.
     ///
-    /// Unlike [`Self::branch_delete`], this permits the disposable coordinator
-    /// itself to be bound to `name`. The exact captured BranchIdentifier fences
+    /// The disposable coordinator may be bound to `name`. Its captured BranchIdentifier fences
     /// delete/recreate ABA; the caller discards this coordinator after the
     /// native authority change.
     pub(crate) async fn branch_delete_captured(
@@ -449,33 +466,48 @@ impl GraphCoordinator {
 
     pub async fn resolve_snapshot_id(&self, branch: &str) -> Result<SnapshotId> {
         let normalized = normalize_branch_name(branch)?;
-        let other = match normalized.as_deref() {
-            Some(branch) => {
-                GraphCoordinator::open_branch_with_session(
-                    self.root_uri(),
-                    branch,
-                    Arc::clone(&self.storage),
-                    &self.manifest.control_session(),
-                )
+        let opened;
+        let coordinator = if normalized.as_deref() == self.current_branch()
+            && self
+                .probe_latest_incarnation()
                 .await?
-            }
-            None => {
-                GraphCoordinator::open_with_session(
-                    self.root_uri(),
-                    Arc::clone(&self.storage),
-                    &self.manifest.control_session(),
-                )
-                .await?
-            }
+                .matches(&self.manifest_incarnation())
+        {
+            self
+        } else {
+            opened = match normalized.as_deref() {
+                Some(branch) => {
+                    GraphCoordinator::open_branch_with_session(
+                        self.root_uri(),
+                        branch,
+                        Arc::clone(&self.storage),
+                        &self.manifest.control_session(),
+                    )
+                    .await?
+                }
+                None => {
+                    GraphCoordinator::open_with_session(
+                        self.root_uri(),
+                        Arc::clone(&self.storage),
+                        &self.manifest.control_session(),
+                    )
+                    .await?
+                }
+            };
+            &opened
         };
 
-        Ok(other.head_commit_id().await?.unwrap_or_else(|| {
-            SnapshotId::synthetic(
-                other.current_branch(),
-                other.version(),
-                other.manifest_incarnation().e_tag.as_deref(),
-            )
-        }))
+        Ok(coordinator
+            .effective_graph_head()
+            .await?
+            .map(SnapshotId::new)
+            .unwrap_or_else(|| {
+                SnapshotId::synthetic(
+                    coordinator.current_branch(),
+                    coordinator.version(),
+                    coordinator.manifest_incarnation().e_tag.as_deref(),
+                )
+            }))
     }
 
     pub async fn resolve_target(&self, target: &ReadTarget) -> Result<ResolvedTarget> {
@@ -582,6 +614,11 @@ impl GraphCoordinator {
             "commit '{}' not found",
             snapshot_id
         )))
+    }
+
+    /// The captured branch projection only, with no branch fanout on a miss.
+    pub(crate) fn captured_commit(&self, commit_id: &str) -> Option<GraphCommit> {
+        self.commit_graph.get_commit(commit_id)
     }
 
     /// Resolve both endpoints and classify direct first-parent adjacency from
@@ -759,9 +796,7 @@ impl GraphCoordinator {
 
     /// Publish a pre-minted lineage intent under an explicit authority
     /// precondition. The intent's identity and timestamp remain stable across
-    /// publisher retries and can also be persisted by the caller before this
-    /// method is invoked (schema apply records the commit id in its staged
-    /// contract).
+    /// publisher retries.
     pub(crate) async fn commit_changes_with_intent_and_expected(
         &mut self,
         changes: &[ManifestChange],
@@ -885,6 +920,125 @@ fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn cold_open_refresh_uses_content_only_from_the_held_image() {
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
+        const CAPTURE_ERROR: &str = "captured contract content error";
+        for advance in [false, true] {
+            for captured_error in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path().to_str().unwrap();
+                let _owner = crate::db::Omnigraph::init(root, "node Person { name: String }")
+                    .await
+                    .unwrap();
+                let session = crate::lance_access::control_session();
+                let (manifest, lineage, captured) =
+                    ManifestCoordinator::open_with_lineage_and_contract(root, None, &session)
+                        .await
+                        .unwrap();
+                let mut expected = captured.unwrap();
+                let old_head = expected.head.clone();
+                let old_version = manifest.version();
+                let mut reader = GraphCoordinator {
+                    root_uri: normalize_root_uri(root).unwrap(),
+                    storage: crate::storage::storage_for_uri(root).unwrap(),
+                    manifest,
+                    commit_graph: CommitGraph::from_manifest_rows(root, None, lineage),
+                    bound_branch: None,
+                };
+                let captured = if captured_error {
+                    Err(OmniError::manifest_internal(CAPTURE_ERROR))
+                } else {
+                    Ok(expected.clone())
+                };
+                let expected_version = if advance {
+                    expected.source = format!("\n{}\n", expected.source);
+                    expected.ir = format!("\n{}\n", expected.ir);
+                    assert_eq!(expected.head, old_head);
+                    let mut writer = ManifestCoordinator::open_with_session(root, &session)
+                        .await
+                        .unwrap();
+                    let version = writer
+                        .commit_changes(&[ManifestChange::SchemaContract(expected.clone())])
+                        .await
+                        .unwrap();
+                    assert!(version > old_version);
+                    version
+                } else {
+                    old_version
+                };
+                let probes = crate::instrumentation::QueryIoProbes::default();
+                let scans = Arc::clone(&probes.manifest_scan_count);
+                let result = crate::instrumentation::with_query_io_probes(
+                    probes,
+                    reader.refresh_contract_capture(captured),
+                )
+                .await;
+                assert_eq!(reader.version(), expected_version);
+                assert_eq!(
+                    reader.manifest.snapshot().schema_contract(),
+                    Some(&old_head)
+                );
+                if captured_error && !advance {
+                    match result.unwrap_err() {
+                        OmniError::Manifest(error) => {
+                            assert_eq!(error.kind, crate::error::ManifestErrorKind::Internal);
+                            assert_eq!(error.message, CAPTURE_ERROR);
+                            assert!(error.details.is_none());
+                            assert!(!error.publication_in_doubt);
+                        }
+                        error => panic!("unexpected capture error: {error:?}"),
+                    }
+                } else {
+                    assert_eq!(result.unwrap(), expected);
+                }
+                let scans = scans.load(std::sync::atomic::Ordering::Relaxed);
+                if advance {
+                    assert!(scans > 0, "the replacement must read its pinned content");
+                } else {
+                    assert_eq!(scans, 0, "unchanged success/error must reuse the capture");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_cold_open_refreshes_content_published_after_admission() {
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let _owner = crate::db::Omnigraph::init(root, "node Person { name: String }")
+            .await
+            .unwrap();
+        let session = crate::lance_access::control_session();
+        let prepared = ManifestCoordinator::prepare_open_with_contract(root, &session)
+            .await
+            .unwrap();
+        let mut writer = ManifestCoordinator::open_with_session(root, &session)
+            .await
+            .unwrap();
+        let mut expected = writer.read_schema_contract().await.unwrap();
+        let old_head = expected.head.clone();
+        expected.source = format!("\n{}\n", expected.source);
+        expected.ir = format!("\n{}\n", expected.ir);
+        let version = writer
+            .commit_changes(&[ManifestChange::SchemaContract(expected.clone())])
+            .await
+            .unwrap();
+        let (reader, contract) = GraphCoordinator::open_with_contract(
+            root,
+            crate::storage::storage_for_uri(root).unwrap(),
+            prepared,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reader.version(), version);
+        assert_eq!(contract.head, old_head);
+        assert_eq!(contract, expected);
+    }
+
     fn commit(
         id: &str,
         parent_commit_id: Option<&str>,
@@ -940,5 +1094,69 @@ mod tests {
             classify_commit_range(right, merge),
             ResolvedCommitRange::Arbitrary { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn prepared_cold_open_refuses_a_legacy_stamp_published_after_admission() {
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
+        for admit_conversion in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().to_str().unwrap();
+            let _owner = crate::db::Omnigraph::init(root, "node Person { name: String }")
+                .await
+                .unwrap();
+            let session = crate::lance_access::control_session();
+            let prepared = ManifestCoordinator::prepare_open_with_contract(root, &session)
+                .await
+                .unwrap();
+            let mut dataset = crate::db::manifest::layout::open_manifest_dataset_with_session(
+                root, None, &session,
+            )
+            .await
+            .unwrap();
+            let captured_version = dataset.version().version;
+            crate::db::manifest::migrations::set_stamp_for_test(&mut dataset, 12)
+                .await
+                .unwrap();
+            assert!(dataset.version().version > captured_version);
+            assert_eq!(
+                crate::db::manifest::migrations::read_stamp(&dataset),
+                Some(12)
+            );
+            let _admission = admit_conversion
+                .then(|| crate::db::manifest::migrations::admit_conversion_source(root, 12));
+            let probes = crate::instrumentation::QueryIoProbes::default();
+            let opens = Arc::clone(&probes.internal_open_count);
+            let result = crate::instrumentation::with_query_io_probes(
+                probes,
+                GraphCoordinator::open_with_contract(
+                    root,
+                    crate::storage::storage_for_uri(root).unwrap(),
+                    prepared,
+                ),
+            )
+            .await;
+            assert_eq!(opens.load(std::sync::atomic::Ordering::Relaxed), 1);
+            let error = result
+                .err()
+                .expect("final refreshed image must still be served format");
+            let OmniError::Manifest(error) = error else {
+                panic!("expected typed format refusal: {error:?}");
+            };
+            assert_eq!(error.kind, crate::error::ManifestErrorKind::BadRequest);
+            assert!(
+                error.message.contains("internal schema v12"),
+                "{}",
+                error.message
+            );
+            assert!(
+                error.message.contains("reads only v13"),
+                "{}",
+                error.message
+            );
+            assert!(error.details.is_none());
+            assert!(!error.publication_in_doubt);
+        }
     }
 }

@@ -157,6 +157,245 @@ async fn server_boots_with_a_valid_stored_query_registry() {
     );
 }
 
+/// E1 qualification probe, not a supported deployment path: a raw engine apply
+/// cannot replace the serving contract captured before body collection. The
+/// negative control deliberately bypasses cluster admission. The positive
+/// control uses the production same-view transition on the same router before
+/// the separate, deliberately unqualified schema/query replacement probe.
+/// This needs HTTP body scheduling and handle identity, which GQT cannot express.
+#[tokio::test(flavor = "multi_thread")]
+async fn parked_stored_invocation_requires_a_serving_transition_barrier() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::body::Bytes;
+    use axum::http::Request;
+    use omnigraph_server::{GraphHandle, build_app, workload::WorkloadController};
+    use omnigraph_server::{graph_id::GraphId, identity::GraphKey};
+    use tower::ServiceExt;
+
+    fn request(body: Body) -> Request<Body> {
+        Request::post(g("/queries/find_person"))
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap()
+    }
+
+    for finish_before_apply in [false, true] {
+        let temp = init_loaded_graph().await;
+        let state = AppState::open_single_with_queries(
+            graph_path(temp.path()).to_string_lossy().into_owned(),
+            vec![],
+            None,
+            stored_query_registry(&[("find_person", FIND_PERSON_GQ, true)]),
+        )
+        .await
+        .unwrap();
+        let handle = Arc::clone(state.routing().registry.list().pop().unwrap().handle());
+        let sibling_temp = init_loaded_graph().await;
+        let sibling = Arc::new(GraphHandle {
+            key: GraphKey::cluster(GraphId::try_from("sibling").unwrap()),
+            uri: graph_path(sibling_temp.path())
+                .to_string_lossy()
+                .into_owned(),
+            engine: Arc::new(
+                omnigraph::db::Omnigraph::open(graph_path(sibling_temp.path()).to_str().unwrap())
+                    .await
+                    .unwrap(),
+            ),
+            policy: None,
+            queries: None,
+        });
+        let state = AppState::new_multi(
+            vec![Arc::clone(&handle), sibling],
+            vec![],
+            None,
+            WorkloadController::with_defaults(),
+            None,
+        )
+        .unwrap();
+        let operations = state.operation_runtime().clone();
+        let original_epoch = state
+            .routing()
+            .registry
+            .list()
+            .into_iter()
+            .find(|view| view.key == handle.key)
+            .unwrap()
+            .epoch();
+        let original_contract = handle.engine.schema_contract_digest();
+        let original_head = handle.engine.list_commits(None).await.unwrap()[0]
+            .graph_commit_id
+            .clone();
+        let app = build_app(state.clone());
+        let (polled, body_polled) = tokio::sync::oneshot::channel();
+        let (release, body_released) = tokio::sync::oneshot::channel();
+        let body = Body::from_stream(futures::stream::once(async move {
+            polled.send(()).unwrap();
+            body_released.await.unwrap();
+            Ok::<_, std::io::Error>(Bytes::from_static(br#"{"params":{"name":"Alice"}}"#))
+        }));
+        let invocation_app = app.clone();
+        let invocation =
+            tokio::spawn(async move { json_response(&invocation_app, request(body)).await });
+        tokio::time::timeout(Duration::from_secs(10), body_polled)
+            .await
+            .expect("body collection must reach the deterministic parking point")
+            .unwrap();
+        assert_eq!(operations.snapshot().active_reads, 1);
+        assert!(!invocation.is_finished());
+
+        let transition = if finish_before_apply {
+            let transition = state
+                .prepare_same_view(
+                    &handle.key,
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                )
+                .unwrap()
+                .close()
+                .unwrap();
+            {
+                let wait = transition.wait_requests();
+                tokio::pin!(wait);
+                assert!(
+                    futures::poll!(&mut wait).is_pending(),
+                    "body collection must retain the graph root before engine snapshot capture"
+                );
+            }
+            let refused = app
+                .clone()
+                .oneshot(request(Body::from(r#"{"params":{"name":"Alice"}}"#)))
+                .await
+                .unwrap();
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!refused.headers().contains_key("retry-after"));
+            drop(refused);
+            let (status, ready) = json_response(&app, get_request("/readyz", "")).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(ready["status"], "degraded");
+            assert_eq!(ready["ready_graph_count"], 1);
+            assert_eq!(ready["blocked_graph_count"], 1);
+            let (status, _) =
+                json_response(&app, get_request("/graphs/sibling/snapshot", "")).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "an unrelated graph remains available"
+            );
+            Some(transition)
+        } else {
+            None
+        };
+
+        if !finish_before_apply {
+            // Deliberately unsafe composition: this is not cluster apply or the
+            // guarded HTTP schema route, which validates the current registry.
+            handle
+                .engine
+                .apply_schema(&renamed_age_schema())
+                .await
+                .unwrap();
+        }
+        release.send(()).unwrap();
+        let (status, output) = tokio::time::timeout(Duration::from_secs(10), invocation)
+            .await
+            .expect("released invocation must finish")
+            .unwrap();
+        // Result delivery can precede the producer's final observer drop.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), operations.wait_logical_owners())
+                .await
+                .expect("released invocation's logical owners must settle")
+        );
+        assert_eq!(operations.snapshot().active_reads, 0);
+        if finish_before_apply {
+            assert_eq!(status, StatusCode::OK, "{output}");
+            assert_eq!(output["rows"], json!([{ "p.age": 30 }]));
+            let transition = transition.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), transition.wait_requests())
+                .await
+                .unwrap()
+                .unwrap();
+            let next_epoch = transition.resume_same_view().unwrap();
+            assert_ne!(next_epoch, original_epoch);
+            let resumed = state
+                .routing()
+                .registry
+                .list()
+                .into_iter()
+                .find(|view| view.key == handle.key)
+                .unwrap();
+            assert_eq!(resumed.epoch(), next_epoch);
+            assert!(Arc::ptr_eq(resumed.handle(), &handle));
+            assert_eq!(resumed.schema_contract(), &original_contract);
+            assert_eq!(handle.engine.schema_contract_digest(), original_contract);
+            assert_eq!(
+                handle.engine.list_commits(None).await.unwrap()[0].graph_commit_id,
+                original_head
+            );
+            let (status, output) =
+                json_response(&app, request(Body::from(r#"{"params":{"name":"Alice"}}"#))).await;
+            assert_eq!(status, StatusCode::OK, "{output}");
+            assert_eq!(output["rows"], json!([{ "p.age": 30 }]));
+            assert!(!operations.snapshot().closed);
+            handle
+                .engine
+                .apply_schema(&renamed_age_schema())
+                .await
+                .unwrap();
+        } else {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{output}");
+            assert!(
+                output["error"].as_str().unwrap().contains("age"),
+                "{output}"
+            );
+        }
+
+        // Updating the engine does not update the immutable serving binding.
+        // Even refresh cannot repair the stale stored-query source.
+        handle.engine.refresh().await.unwrap();
+        let old_queries = handle.queries.as_ref().unwrap();
+        assert_eq!(
+            old_queries.lookup("find_person").unwrap().source.as_ref(),
+            FIND_PERSON_GQ
+        );
+        assert!(
+            omnigraph_server::queries::check(old_queries, &handle.engine.catalog()).has_breakages()
+        );
+
+        let new_source = FIND_PERSON_GQ.replace("$p.age", "$p.years");
+        let new_queries = stored_query_registry(&[("find_person", &new_source, true)]);
+        assert!(
+            !omnigraph_server::queries::check(&new_queries, &handle.engine.catalog())
+                .has_breakages()
+        );
+        let replacement = Arc::new(GraphHandle {
+            key: handle.key.clone(),
+            uri: handle.uri.clone(),
+            engine: Arc::clone(&handle.engine),
+            policy: None,
+            queries: Some(Arc::new(new_queries)),
+        });
+        assert!(Arc::ptr_eq(&replacement.engine, &handle.engine));
+        let state = AppState::new_multi(
+            vec![replacement],
+            vec![],
+            None,
+            WorkloadController::with_defaults(),
+            None,
+        )
+        .unwrap();
+        let (status, output) = json_response(
+            &build_app(state),
+            request(Body::from(r#"{"params":{"name":"Alice"}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{output}");
+        assert_eq!(output["rows"], json!([{ "p.years": 30 }]));
+    }
+}
+
 #[tokio::test]
 async fn server_refuses_boot_on_type_broken_stored_query() {
     // A stored query referencing a type not in the schema (`Widget`)

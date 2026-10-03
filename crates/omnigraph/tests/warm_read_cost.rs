@@ -37,14 +37,14 @@ async fn warm_same_branch_read_does_no_resolution_opens() {
         // Deep history: warm-read resolution cost must be flat in commit count.
         commit_many(&db, 20).await;
 
-        let (out, io) = measure(db.query(
+        let (out, io) = measure(db.query_with_head(
             ReadTarget::branch("main"),
             TEST_QUERIES,
             "total_people",
             &params(&[]),
         ))
         .await;
-        out.unwrap();
+        let (_, head) = out.unwrap();
 
         // A warm same-branch read opens nothing from the internal tables, even at
         // commit-history depth. Fix 1 reuses the coordinator (no re-open: 0
@@ -60,6 +60,15 @@ async fn warm_same_branch_read_does_no_resolution_opens() {
             io.version_probes, 1,
             "warm same-branch read performs exactly one version probe"
         );
+        for branch in ["main", " main "] {
+            let (resolved, io) = measure(db.resolve_snapshot(branch)).await;
+            let resolved = resolved.unwrap();
+            assert_eq!(Some(resolved.as_str()), head.as_deref());
+            assert_eq!(io.internal_open_count, 0);
+            assert_eq!(io.manifest_scan_count, 0);
+            assert_eq!(io.version_probes, 1);
+        }
+        assert!(db.resolve_snapshot(" ").await.is_err());
     })
     .await;
 }
@@ -104,6 +113,7 @@ async fn external_commit_observed_by_warm_reader() {
     let reader = Omnigraph::open(uri).await.unwrap();
 
     let before = count_rows(&reader, "node:Person").await;
+    let old_head = reader.resolve_snapshot("main").await.unwrap();
 
     // External commit through a separate handle.
     mutate_main(
@@ -115,6 +125,10 @@ async fn external_commit_observed_by_warm_reader() {
     .await
     .unwrap();
 
+    let resolved = reader.resolve_snapshot("main").await.unwrap();
+    assert_ne!(resolved, old_head);
+    assert_eq!(resolved, writer.resolve_snapshot("main").await.unwrap());
+
     let after = count_rows(&reader, "node:Person").await;
     assert_eq!(
         after,
@@ -123,20 +137,179 @@ async fn external_commit_observed_by_warm_reader() {
     );
 }
 
-// ── Finding A: drop the redundant per-query schema validation ─────────────────
-//
-// Every query runs `ensure_schema_state_valid`. It ran TWICE per query (once in
-// query()/run_query_at, once again in resolved_target/snapshot_at_graph_manifest_version), each
-// reading 3 contract files + 2 existence probes (~10 storage ops). Finding A
-// removes the redundant caller, so validation runs once. (A cheaper source-only
-// probe was rejected: the codebase requires per-call detection of IR/state drift
-// on long-lived handles -- lifecycle::long_lived_handle_rejects_schema_ir_drift
-// -- which a source-only compare would miss.) Measured at the StorageAdapter
-// boundary with the counting decorator.
+#[tokio::test]
+async fn cold_open_admits_contract_and_state_in_one_scan() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        drop(init_and_load(&dir).await);
+        let uri = dir.path().to_str().unwrap();
+        for read_only in [false, true] {
+            let (opened, io) = measure(async {
+                if read_only {
+                    Omnigraph::open_read_only(uri).await
+                } else {
+                    Omnigraph::open(uri).await
+                }
+            })
+            .await;
+            let db = opened.unwrap();
+            assert_eq!(db.schema_source().as_str(), TEST_SCHEMA);
+            assert_eq!(io.manifest_scan_count, 1, "read_only={read_only}: {io:?}");
+            assert_eq!(io.internal_open_count, 2, "read_only={read_only}: {io:?}");
+            assert!(io.manifest_reads > 0);
+            let db = session(db);
+            let (rows, query_io) = measure(db.query(
+                ReadTarget::branch("main"),
+                TEST_QUERIES,
+                "get_person",
+                &params(&[("$name", "Alice")]),
+            ))
+            .await;
+            assert_eq!(rows.unwrap().num_rows(), 1);
+            assert_eq!(query_io.manifest_scan_count, 0);
+        }
+    })
+    .await;
+}
 
-/// A warm query validates the schema contract exactly once (3 reads + 2 exists),
-/// not twice. Fails before finding A, where query() and resolved_target each
-/// validate (6 read_text + 4 exists).
+#[tokio::test]
+async fn named_read_borrows_write_capture_and_rejects_recreated_branch() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
+        let writer = session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
+        db.branch_create("feature").await.unwrap();
+        mutate_branch(
+            &db,
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "OldFeature")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap();
+        let old_head = db.resolve_snapshot("feature").await.unwrap();
+        let old_version = db
+            .graph_manifest_version_of(ReadTarget::branch("feature"))
+            .await
+            .unwrap();
+        let (rows, io) = measure(db.query_with_head(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "OldFeature")]),
+        ))
+        .await;
+        let (rows, head) = rows.unwrap();
+        assert_eq!(rows.num_rows(), 1);
+        assert_eq!(head.as_deref(), Some(old_head.as_str()));
+        assert_eq!(io.manifest_scan_count, 0);
+        assert_eq!(io.version_probes, 1);
+
+        writer.branch_delete("feature").await.unwrap();
+        mutate_main(
+            &writer,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Replacement")], &[("$age", 44)]),
+        )
+        .await
+        .unwrap();
+        let head = writer.resolve_snapshot("main").await.unwrap();
+        writer.branch_create("feature").await.unwrap();
+        assert_eq!(
+            writer
+                .graph_manifest_version_of(ReadTarget::branch("feature"))
+                .await
+                .unwrap(),
+            old_version,
+        );
+        for _ in 0..2 {
+            let (rows, io) = measure(db.query_with_head(
+                ReadTarget::branch("feature"),
+                TEST_QUERIES,
+                "get_person",
+                &params(&[("$name", "Replacement")]),
+            ))
+            .await;
+            let (rows, served_head) = rows.unwrap();
+            assert_eq!(rows.num_rows(), 1);
+            assert_eq!(served_head.as_deref(), Some(head.as_str()));
+            assert_eq!(
+                io.manifest_scan_count, 1,
+                "reads must not refill the write cache"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn branch_delete_reuses_only_a_current_write_capture() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
+        let writer = session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
+        for foreign in ["none", "write", "recreate"] {
+            db.branch_create("feature").await.unwrap();
+            mutate_branch(
+                &db,
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Local")], &[("$age", 22)]),
+            )
+            .await
+            .unwrap();
+            if foreign == "write" {
+                mutate_branch(
+                    &writer,
+                    "feature",
+                    MUTATION_QUERIES,
+                    "insert_person",
+                    &mixed_params(&[("$name", "Foreign")], &[("$age", 33)]),
+                )
+                .await
+                .unwrap();
+            }
+            if foreign == "recreate" {
+                let old_version = writer
+                    .graph_manifest_version_of(ReadTarget::branch("feature"))
+                    .await
+                    .unwrap();
+                writer.branch_delete("feature").await.unwrap();
+                mutate_main(
+                    &writer,
+                    MUTATION_QUERIES,
+                    "insert_person",
+                    &mixed_params(&[("$name", "NewMain")], &[("$age", 44)]),
+                )
+                .await
+                .unwrap();
+                writer.branch_create("feature").await.unwrap();
+                assert_eq!(
+                    writer
+                        .graph_manifest_version_of(ReadTarget::branch("feature"))
+                        .await
+                        .unwrap(),
+                    old_version,
+                );
+            }
+            let main_rows = count_rows(&writer, "node:Person").await;
+            let (deleted, io) = measure(db.branch_delete("feature")).await;
+            deleted.unwrap();
+            assert_eq!(io.manifest_scan_count, u64::from(foreign != "none"));
+            assert_eq!(io.version_probes, 1);
+            assert!(io.manifest_reads > 0);
+            assert!(db.resolve_snapshot("feature").await.is_err());
+            assert_eq!(count_rows(&db, "node:Person").await, main_rows);
+        }
+    })
+    .await;
+}
+
+/// A warm query performs no contract read: 0 `read_text` and 0 `exists`
+/// (before the row: 3 reads + 2 exists per query, the three contract files).
 #[tokio::test]
 async fn warm_query_validates_schema_contract_once() {
     use omnigraph::instrumentation::CountingStorageAdapter;
@@ -164,45 +337,59 @@ async fn warm_query_validates_schema_contract_once() {
 
     assert_eq!(
         counts.read_text() - before_read_text,
-        3,
-        "warm query should validate the schema contract once (3 reads), not twice"
+        0,
+        "a warm query reads no schema contract file"
     );
     assert_eq!(
         counts.exists() - before_exists,
-        2,
-        "warm query should probe contract-file existence once (2 probes), not twice"
+        0,
+        "a warm query probes no schema contract file"
     );
 }
 
-/// The cheap source-compare must still detect that the on-disk schema source has
-/// drifted from the validated contract and fail the read, rather than serving the
-/// stale-but-cached schema. Passes before and after finding A (regression guard
-/// for the documented weaker per-query guard).
+/// A handle serving 1,000 queries after open performs zero `StorageAdapter`
+/// reads of any kind: the unchanged captured manifest image reuses its
+/// validated contract row and accepted catalog.
 #[tokio::test]
-async fn schema_source_drift_is_caught_on_read() {
+async fn thousand_warm_queries_read_no_schema_contract() {
+    use omnigraph::instrumentation::CountingStorageAdapter;
+    use omnigraph::storage::storage_for_uri;
+
     let dir = tempfile::tempdir().unwrap();
-    let _writer = init_and_load(&dir).await;
+    let _ = init_and_load(&dir).await;
     let uri = dir.path().to_str().unwrap();
-    let reader = session(Omnigraph::open(uri).await.unwrap());
+    let (adapter, counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
+    let db = session(Omnigraph::open_with_storage(uri, adapter).await.unwrap());
 
-    // Drift the on-disk schema source behind the reader's back.
-    std::fs::write(
-        dir.path().join("_schema.pg"),
-        "this is not a valid schema {{{",
-    )
-    .unwrap();
-
-    let result = reader
-        .query(
+    let before = [
+        counts.read_text(),
+        counts.read_text_if_exists(),
+        counts.read_bytes_if_exists(),
+        counts.exists(),
+        counts.read_text_versioned(),
+        counts.list_dir(),
+    ];
+    for _ in 0..1_000 {
+        db.query(
             ReadTarget::branch("main"),
             TEST_QUERIES,
             "total_people",
             &params(&[]),
         )
-        .await;
-    assert!(
-        result.is_err(),
-        "a query must fail when the on-disk schema source has drifted from the validated contract"
+        .await
+        .unwrap();
+    }
+    let after = [
+        counts.read_text(),
+        counts.read_text_if_exists(),
+        counts.read_bytes_if_exists(),
+        counts.exists(),
+        counts.read_text_versioned(),
+        counts.list_dir(),
+    ];
+    assert_eq!(
+        after, before,
+        "1,000 warm queries must perform no StorageAdapter read (read_text, read_text_if_exists, read_bytes_if_exists, exists, read_text_versioned, list_dir)"
     );
 }
 
@@ -223,7 +410,18 @@ async fn warm_branch_read_uses_one_ref_witness_without_manifest_scan() {
         // The branch snapshot must stay warm and bounded at realistic history
         // depth; a shallow fixture would hide a cold manifest scan.
         commit_many(&db, 20).await;
+        let inherited_head = db.resolve_snapshot("main").await.unwrap();
         db.branch_create("feature").await.unwrap();
+        db.sync_branch("feature").await.unwrap();
+        let (resolved, io) = measure(db.resolve_snapshot("feature")).await;
+        assert_eq!(resolved.unwrap(), inherited_head);
+        assert_eq!(io.version_probes, 1);
+        assert_eq!(io.internal_open_count, 0);
+        assert_eq!(io.manifest_scan_count, 0);
+        assert_eq!(io.manifest_reads, 1);
+        let reads = last_manifest_reads();
+        assert_eq!(reads.len(), 1);
+        assert!(reads[0].contains("_refs/branches/feature") && reads[0].ends_with(".json"));
         // Write to the branch so its tables are branch-owned (under tree/feature).
         db.mutate(
             "feature",
@@ -607,8 +805,8 @@ async fn assert_cached_borrower_survives_branch_delete(
             io.manifest_scan_count,
             io.version_probes
         ),
-        (2, 1, 0),
-        "cached table-borrower deletion must stay within its measured control cost"
+        (1, 0, 1),
+        "cached table-borrower deletion must validate and reuse its current capture"
     );
 
     assert!(
@@ -807,6 +1005,11 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
     assert_eq!(
         new_version, old_version,
         "test setup must exercise branch incarnation reuse at one Lance version"
+    );
+
+    assert_eq!(
+        reader.resolve_snapshot("feature").await.unwrap(),
+        replacement_inherited_head,
     );
 
     let (new_feature, io) = measure(reader.query_with_head(

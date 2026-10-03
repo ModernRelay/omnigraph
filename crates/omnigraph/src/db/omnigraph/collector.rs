@@ -646,8 +646,10 @@ fn incarnation_key(identifier: &lance::dataset::refs::BranchIdentifier) -> Resul
     })
 }
 
-/// The `__manifest` versions `keep` and `cutoff` retain (the per-table rule of
-/// `cleanup_old_versions` per branch), HEAD always among them and, with
+/// The `__manifest` versions `keep` and `cutoff` retain: the newest-N /
+/// newer-than rule of Lance's `cleanup_old_versions`, applied to graph commits
+/// (`__manifest` versions) per branch rather than to a table's Lance versions.
+/// HEAD is always among them and, with
 /// `keep_base` (a graph branch, deleting), its oldest: the fork-point merge base.
 fn retained_versions(
     versions: &[lance::dataset::Version],
@@ -840,12 +842,6 @@ pub(crate) async fn plan_collection(
     let registry = main.clone();
     let mut main = Some(main);
     for branch in branches {
-        if branch
-            .as_deref()
-            .is_some_and(crate::db::is_internal_system_branch)
-        {
-            continue;
-        }
         let opened = match branch {
             None => main.take().ok_or_else(|| {
                 OmniError::manifest_internal("collector captured main more than once")

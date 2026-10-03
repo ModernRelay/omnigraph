@@ -27,7 +27,19 @@ Write input uses one String representation:
 
 There is no `blob put` or `blob clear`; use the normal atomic graph write path.
 Blob payloads count toward write limits. `export` writes Blob cells in the same
-`base64:`/URI spelling, so exported lines reload as-is.
+`base64:`/URI spelling, so exported lines reload as-is. The exception is a
+stored reference to a byte range of an object, which only a writer outside
+OmniGraph creates: a bare URI would reload as the whole object, so export
+refuses it. Change-feed images, the change-feed baseline and entity reads by id
+describe it as `{"uri", "offset", "length"}` instead; such a baseline does not
+reload with `load`.
+
+An `update` never reads the old value of a Blob it assigns, and a null assigned
+to a nullable Blob clears it. Every other Blob of a matched row is carried
+(read and rewritten as managed bytes), so carrying a stored external reference
+needs the graph's external Blob policy to admit its source; otherwise the
+update fails with a 400 naming the type, id, and property. Assign that property
+in the same update to replace or clear the reference without reading it.
 
 ## External-reference policy and ownership
 
@@ -40,8 +52,8 @@ Ownership depends on the write:
 - `load --mode overwrite` preserves an allowed external reference;
 - insert, update, append/merge load, and branch merge copy allowed source bytes
   into graph-managed storage;
-- a previously stored external reference remains readable/exportable if new
-  external ingress is later disabled.
+- a previously stored external reference remains readable if new external
+  ingress is later disabled, and exportable when it names its whole object.
 
 OmniGraph never deletes the external source object.
 
@@ -82,10 +94,10 @@ in `Location`; it does not fetch, sign, authorize, or proxy the object.
 ## Lifecycle
 
 A reader stays pinned to the snapshot selected when it opens. Explicit
-`cleanup` (including table forks left by a deleted branch) and
-`schema apply --allow-data-loss` can reclaim bytes needed by a long read, so
-quiesce such readers first; branch deletion alone defers reclamation to
-`cleanup`. Blob-aware compaction is supported.
+`cleanup` (including table forks left by a deleted branch) can reclaim bytes
+needed by a long read, so quiesce such readers first; branch deletion and
+schema drops alone defer reclamation to `cleanup`. Blob-aware compaction is
+supported.
 
 Historical identity fails closed: if a rename, drop/re-add, or branch lifetime
 does not prove that a historical property is the same logical Blob property,
