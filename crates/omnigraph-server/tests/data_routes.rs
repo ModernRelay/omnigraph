@@ -3625,6 +3625,9 @@ async fn load_endpoint_loads_into_existing_branch() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn loads_report_unsupported_embedding_generation_without_changing_vectors() {
+    use futures::FutureExt;
+    use std::sync::atomic::AtomicUsize;
+
     const SCHEMA: &str = r#"
 node Doc {
     slug: String @key
@@ -3638,38 +3641,85 @@ node RequiredDoc {
 }
 node Plain { slug: String @key }
 "#;
-    for path in ["/load", "/load/ndjson", "/ingest"] {
-        let temp = init_graph_with_schema(SCHEMA).await;
-        let graph = graph_path(temp.path());
-        let config = omnigraph::embedding::EmbeddingConfig::from_parts(
-            Some("mock"),
-            None,
-            Some("diagnostics-test".to_string()),
-            String::new(),
-        )
-        .unwrap();
-        let db = Omnigraph::open(graph.to_str().unwrap())
-            .await
-            .unwrap()
-            .with_embedding_config(Arc::new(config));
-        let app = build_app(AppState::new(graph.to_string_lossy().to_string(), db));
-        let request = |data: &str| {
-            if path == "/load/ndjson" {
-                Request::builder()
-                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                    .uri(g("/load/ndjson?branch=main&mode=merge"))
-                    .method(Method::POST)
-                    .header("content-type", "application/x-ndjson")
-                    .body(Body::from(data.to_owned()))
-                    .unwrap()
+    // Count every provider request independently of the load response, including
+    // unexpected paths. Positive controls prove that this endpoint is reachable
+    // and the real embedding client is using it throughout the load matrix.
+    let provider_requests = Arc::new(AtomicUsize::new(0));
+    let received = Arc::clone(&provider_requests);
+    let provider = axum::Router::new().fallback(move |request: Request<Body>| {
+        let received = Arc::clone(&received);
+        async move {
+            received.fetch_add(1, Ordering::SeqCst);
+            if to_bytes(request.into_body(), 4096).await.is_ok() {
+                (
+                    StatusCode::OK,
+                    axum::Json(json!({"data": [{"index": 0, "embedding": [1.0, 0.0]}]})),
+                )
             } else {
-                json_post(
-                    path,
-                    &json!({"branch": "main", "mode": "merge", "data": data}),
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    axum::Json(
+                        json!({"error": {"message": "provider request body exceeded test bound"}}),
+                    ),
                 )
             }
-        };
-        let (status, body) = json_response(
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let mut provider_tasks = tokio::task::JoinSet::new();
+    provider_tasks.spawn(async move {
+        axum::serve(listener, provider)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let config = omnigraph::embedding::EmbeddingConfig::from_parts(
+        Some("openai-compatible"),
+        Some(base_url),
+        Some("diagnostics-test".to_string()),
+        "diagnostics-key".to_string(),
+    )
+    .unwrap();
+    let client = omnigraph::embedding::EmbeddingClient::new(config.clone()).unwrap();
+    // Always signal and join the provider, including after an assertion panic or
+    // a stalled request; dropping JoinSet aborts it if graceful shutdown stalls.
+    let exercise = async {
+        assert_eq!(
+            client
+                .embed_document_text("positive control before loads", 2)
+                .await
+                .unwrap(),
+            vec![1.0, 0.0]
+        );
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
+        for path in ["/load", "/load/ndjson", "/ingest"] {
+            let temp = init_graph_with_schema(SCHEMA).await;
+            let graph = graph_path(temp.path());
+            let db = Omnigraph::open(graph.to_str().unwrap())
+                .await
+                .unwrap()
+                .with_embedding_config(Arc::new(config.clone()));
+            let app = build_app(AppState::new(graph.to_string_lossy().to_string(), db));
+            let request = |data: &str| {
+                if path == "/load/ndjson" {
+                    Request::builder()
+                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                        .uri(g("/load/ndjson?branch=main&mode=merge"))
+                        .method(Method::POST)
+                        .header("content-type", "application/x-ndjson")
+                        .body(Body::from(data.to_owned()))
+                        .unwrap()
+                } else {
+                    json_post(
+                        path,
+                        &json!({"branch": "main", "mode": "merge", "data": data}),
+                    )
+                }
+            };
+            let (status, body) = json_response(
             &app,
             request(concat!(
                 r#"{"type":"Doc","data":{"slug":"omitted","body":"missing vector"}}"#,
@@ -3678,77 +3728,106 @@ node Plain { slug: String @key }
             )),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{path}: {body}");
-        assert_eq!(body["embedding_generation"], "unsupported", "{path}");
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(body["embedding_generation"], "unsupported", "{path}");
 
-        let (status, body) = json_response(
+            let (status, body) = json_response(
             &app,
             json_post("/query", &json!({"query": "query docs() { match { $d: Doc } return { $d.slug, $d.embedding } order { $d.slug asc } }"})),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{path}: {body}");
-        assert_eq!(
-            body["rows"],
-            json!([
-                {"d.slug": "omitted"},
-                {"d.slug": "supplied", "d.embedding": [0.25, 0.75]},
-            ]),
-            "{path}"
-        );
-        // JSON query projection omits null cells. Independently verify the
-        // durable Arrow column so an omitted output key is not our null oracle.
-        let persisted = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
-        let snapshot = persisted
-            .snapshot_of(ReadTarget::branch("main"))
-            .await
-            .unwrap();
-        let batches: Vec<_> = snapshot
-            .open_dataset("node:Doc")
-            .await
-            .unwrap()
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
-        assert_eq!(
-            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
-            2
-        );
-        assert_eq!(
-            batches
-                .iter()
-                .map(|batch| batch.column_by_name("embedding").unwrap().null_count())
-                .sum::<usize>(),
-            1
-        );
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(
+                body["rows"],
+                json!([
+                    {"d.slug": "omitted"},
+                    {"d.slug": "supplied", "d.embedding": [0.25, 0.75]},
+                ]),
+                "{path}"
+            );
+            // JSON query projection omits null cells. Independently verify the
+            // durable Arrow column so an omitted output key is not our null oracle.
+            let persisted = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+            let snapshot = persisted
+                .snapshot_of(ReadTarget::branch("main"))
+                .await
+                .unwrap();
+            let batches: Vec<_> = snapshot
+                .open_dataset("node:Doc")
+                .await
+                .unwrap()
+                .scan()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                2
+            );
+            assert_eq!(
+                batches
+                    .iter()
+                    .map(|batch| batch.column_by_name("embedding").unwrap().null_count())
+                    .sum::<usize>(),
+                1
+            );
 
-        // This is a capability diagnostic, even when every vector is supplied.
-        let (status, body) = json_response(
+            // This is a capability diagnostic, even when every vector is supplied.
+            let (status, body) = json_response(
             &app,
             request(r#"{"type":"Doc","data":{"slug":"all-supplied","body":"also keep","embedding":[1,0]}}"#),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{path}: {body}");
-        assert_eq!(body["embedding_generation"], "unsupported", "{path}");
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(body["embedding_generation"], "unsupported", "{path}");
 
-        let (status, body) = json_response(
-            &app,
-            request(r#"{"type":"RequiredDoc","data":{"slug":"missing","body":"requires vector"}}"#),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
-        let (status, body) =
-            json_response(&app, request(r#"{"type":"Plain","data":{"slug":"plain"}}"#)).await;
-        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            let (status, body) = json_response(
+                &app,
+                request(
+                    r#"{"type":"RequiredDoc","data":{"slug":"missing","body":"requires vector"}}"#,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+            let (status, body) =
+                json_response(&app, request(r#"{"type":"Plain","data":{"slug":"plain"}}"#)).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(
+                body.get("embedding_generation"),
+                Some(&Value::Null),
+                "{path}"
+            );
+            assert_eq!(
+                provider_requests.load(Ordering::SeqCst),
+                1,
+                "{path} must not call the embedding provider"
+            );
+        }
         assert_eq!(
-            body.get("embedding_generation"),
-            Some(&Value::Null),
-            "{path}"
+            client
+                .embed_document_text("positive control after loads", 2)
+                .await
+                .unwrap(),
+            vec![1.0, 0.0]
         );
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 2);
+    };
+    let exercise = std::panic::AssertUnwindSafe(exercise).catch_unwind();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), exercise).await;
+    let _ = shutdown.send(());
+    tokio::time::timeout(Duration::from_secs(2), provider_tasks.join_next())
+        .await
+        .expect("embedding provider shutdown timed out")
+        .expect("embedding provider task exists")
+        .expect("embedding provider task panicked")
+        .expect("embedding provider server failed");
+    if let Err(panic) = outcome.expect("embedding load matrix timed out") {
+        std::panic::resume_unwind(panic);
     }
+    assert_eq!(provider_requests.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]

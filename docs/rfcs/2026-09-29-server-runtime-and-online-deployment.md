@@ -786,11 +786,15 @@ it does not itself qualify that scan repair, native settlement, RSS bounds or
 provider request counts.
 
 The embedding diagnostic has focused HTTP regression coverage in `data_routes`
-with a configured mock provider, exact supplied vectors, durable Arrow nulls,
-required-vector refusal and unannotated loads, plus CLI load/ingest output parity
-in `parity_matrix`. This does not complete T11.embed qualification: the independent
-provider-request census and GQT load/result evidence remain required by its test
-owner. It adds no native-lifetime or automatic-generation qualification.
+with a counted OpenAI-compatible endpoint, successful embedding calls before and
+after the load matrix, and zero provider requests attributable to loads. The
+same test checks exact supplied vectors, durable Arrow nulls, required-vector
+refusal and unannotated loads; `parity_matrix` covers CLI load/ingest output.
+T11.embed remains incomplete: [RFC 0045](0045-gq-logic-tests.md)
+explicitly excludes `@embed` schemas, and GQT has no load step with outcome
+expectations. Setup-only seed loading cannot supply that evidence. Changing
+those accepted format boundaries requires its own decision; this work adds no
+GQT protocol, native-lifetime or automatic-generation qualification.
 
 E0 qualification extends engine `schema_apply.rs` and `detached_commit_matrix.rs`,
 cluster lifecycle/failpoint tests, and CLI cluster lifecycle/system journeys. Prove
@@ -930,8 +934,9 @@ Before enabling an affected increment, its owners must implement and qualify:
 
 - 2026-10-03: Implemented explicit load embedding capability diagnostics across
   HTTP and CLI output. Availability and Rollout record the implementation;
-  Qualification retains T11.embed's independent provider-request and GQT gates.
-  Nullable loads remain successful and automatic generation stays outside scope.
+  Qualification records independent provider-request evidence and retains
+  T11.embed's GQT format gate. Nullable loads remain successful and automatic
+  generation stays outside scope.
 
 - 2026-10-03: Implemented early listener and initial loading visibility. One owned
   batch retains at most four concurrent opens through shutdown; captured policy
