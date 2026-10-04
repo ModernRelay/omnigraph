@@ -98,6 +98,26 @@ Branch protection currently requires these reporting contexts:
 - `Storage Upgrade Compatibility`
 - `Dependency Guard (cargo deny)`
 
+`Storage Upgrade Compatibility` (`storage_upgrade_compatibility` in `ci.yml`)
+runs on every change and in the merge queue. It builds the genuine stamp-13
+CLI from the immutable `STAMP_13_SOURCE_COMMIT` in a detached worktree into
+the job's target directory, copies the binary out, cleans the path-package
+artifacts through both manifests (the predecessor and current packages share
+names and versions) and exports `OMNIGRAPH_V13_BIN`. With
+`OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS=1` a missing binary fails
+`genuine_v13_storage_upgrade_preserves_history` instead of skipping it. Four
+scopes then run, each checked against its log by
+`scripts/check-storage-upgrade-ci.py --check-log`: the `storage_upgrade`
+cases of `crossversion_upgrade.rs`, the engine `db::upgrade::tests`,
+`lance_version_columns` and `forbidden_apis`. The script's `--self-test` pins
+the scopes, the predecessor build script (compared exactly) and the required
+case names, so removing or altering one fails `Check Workflow Action Pins` and
+this job. The 90-minute budget covers two cold builds into one target
+directory: the predecessor CLI alone (one package, one bin, no test features),
+then the current tree's test targets, whose dev-dependency features (lance-io
+defaults and `test-util`) differ, so only dependency artifacts with matching
+features are reused.
+
 `GQ Logic Tests` (`gq-logic-tests.yml`) owns the complete `.gqt` corpus as a
 required context aggregating three qualification jobs. `GQT (ordinary)` checks
 unit tests and unavailable-DST refusal under an empty `RUSTFLAGS`, then runs

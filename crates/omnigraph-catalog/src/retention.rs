@@ -15,16 +15,26 @@ use crate::branch_names::{MERGE_INPUT_PREFIX, encode_head, is_merge_input_tag};
 pub use crate::branch_names::{MergeInputOwner, merge_input_owner};
 use crate::commit_graph::{CommitGraph, GraphCommit, HistoryCache};
 use crate::error::{OmniError, Result};
+use crate::history::{ExtentCache, HistoryRecord};
+use crate::legacy::{LegacyAt, RetiredHead};
 use crate::staging::StagingWitness;
 
 pub fn incarnation_digest(incarnation: &str) -> String {
     format!("{:x}", Sha256::digest(incarnation.as_bytes()))
 }
 
+/// Where the head of a pinned manifest version is read: the rows of the
+/// version, or the record the legacy history of an upgraded root holds for it.
+enum PinnedHead {
+    Manifest,
+    Legacy(Box<HistoryRecord>),
+}
+
 /// Exact native manifest coordinates and their reduced graph snapshot.
 pub struct PinnedGraphManifest {
     pub dataset: Dataset,
     pub snapshot: Snapshot,
+    head: PinnedHead,
 }
 
 impl PinnedGraphManifest {
@@ -35,28 +45,63 @@ impl PinnedGraphManifest {
         root_uri: &str,
         history: &HistoryCache,
     ) -> Result<CommitGraph> {
-        let rows = crate::state::read_manifest_rows_projected(&self.dataset).await?;
+        let (head, buffer) = match &self.head {
+            PinnedHead::Manifest => {
+                let rows = crate::state::read_manifest_rows_projected(&self.dataset).await?;
+                (rows.head, rows.buffer)
+            }
+            PinnedHead::Legacy(record) => (record.commit.clone(), Default::default()),
+        };
         Ok(CommitGraph::from_head(
             root_uri,
             self.dataset.session(),
-            rows.head,
-            rows.buffer.commits(),
+            head,
+            buffer.commits(),
             history.clone(),
         ))
     }
 
     async fn from_dataset(root_uri: &str, dataset: Dataset) -> Result<Self> {
-        let native = dataset.manifest().branch.clone();
-        let mut snapshot = ManifestCoordinator::snapshot_from_state(
+        let located = crate::legacy::at_version(
             root_uri,
-            super::read_manifest_state(&dataset).await?,
-        );
-        snapshot.graph_branch = native
-            .as_deref()
-            .map(crate::branch_names::logical_branch_name)
-            .map(str::to_string);
-        snapshot.native_branch = native;
-        Ok(Self { dataset, snapshot })
+            &dataset.session(),
+            &ExtentCache::default(),
+            &dataset,
+        )
+        .await?;
+        let Some(located) = located else {
+            let native = dataset.manifest().branch.clone();
+            let mut snapshot = ManifestCoordinator::snapshot_from_state(
+                root_uri,
+                super::read_manifest_state(&dataset).await?,
+            );
+            snapshot.graph_branch = native
+                .as_deref()
+                .map(crate::branch_names::logical_branch_name)
+                .map(str::to_string);
+            snapshot.native_branch = native;
+            return Ok(Self {
+                dataset,
+                snapshot,
+                head: PinnedHead::Manifest,
+            });
+        };
+        let version = dataset.version().version;
+        let record = located.served(dataset.manifest().branch.as_deref(), version)?;
+        Self::legacy(root_uri, dataset, record)
+    }
+
+    fn legacy(root_uri: &str, dataset: Dataset, record: HistoryRecord) -> Result<Self> {
+        let snapshot = record.snapshot_as(
+            root_uri,
+            dataset.version().version,
+            dataset.manifest().branch.as_deref(),
+        )?;
+        Ok(Self {
+            dataset,
+            snapshot,
+            head: PinnedHead::Legacy(Box::new(record)),
+        })
     }
 }
 
@@ -219,6 +264,7 @@ impl ManifestCoordinator {
             &crate::lance_access::control_session(),
         )
         .await?;
+        let legacy = ExtentCache::default();
         let mut candidates = Vec::new();
         match commit.graph_branch.as_deref() {
             None | Some("main") => candidates.push(None),
@@ -247,13 +293,26 @@ impl ManifestCoordinator {
                 Err(error) if error.is_not_found() => continue,
                 Err(error) => return Err(OmniError::storage(error)),
             };
-            let head = crate::state::read_manifest_rows_projected(&dataset)
-                .await?
-                .head;
+            let located =
+                crate::legacy::at_version(root_uri, &dataset.session(), &legacy, &dataset).await?;
+            let head = match &located {
+                None => {
+                    crate::state::read_manifest_rows_projected(&dataset)
+                        .await?
+                        .head
+                }
+                Some(LegacyAt::Exact(record)) => record.commit.clone(),
+                Some(LegacyAt::Nearest(_) | LegacyAt::PreGenesis) => continue,
+            };
             if crate::commit_graph::graph_commit_from_manifest_row(head) != *commit {
                 continue;
             }
-            return PinnedGraphManifest::from_dataset(root_uri, dataset).await;
+            return match located {
+                Some(LegacyAt::Exact(record)) => {
+                    PinnedGraphManifest::legacy(root_uri, dataset, record)
+                }
+                _ => PinnedGraphManifest::from_dataset(root_uri, dataset).await,
+            };
         }
         Err(OmniError::manifest_not_found(format!(
             "merge base '{}' has no matching retained native manifest at version {}",
@@ -284,14 +343,20 @@ impl ManifestCoordinator {
                 .checkout_version(Ref::Version(Some(native.clone()), None))
                 .await
                 .map_err(OmniError::storage)?;
-            let rows = crate::state::read_manifest_rows_projected(&dataset).await?;
-            let graph = CommitGraph::from_head(
-                root_uri,
-                dataset.session(),
-                rows.head,
-                rows.buffer.commits(),
-                history.clone(),
-            );
+            let session = dataset.session();
+            let (head, buffer) =
+                match crate::legacy::retired_head(root_uri, &session, history.objects(), &dataset)
+                    .await?
+                {
+                    RetiredHead::Rows => {
+                        let rows = crate::state::read_manifest_rows_projected(&dataset).await?;
+                        (rows.head, rows.buffer)
+                    }
+                    RetiredHead::Commit(head) => (*head, Default::default()),
+                    RetiredHead::Commitless => continue,
+                };
+            let graph =
+                CommitGraph::from_head(root_uri, session, head, buffer.commits(), history.clone());
             graphs.push((native, graph));
         }
         Ok(graphs)

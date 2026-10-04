@@ -79,14 +79,42 @@ do not introduce historical schema-language semantics. See
 
 ## Pending storage conversion
 
-A storage conversion sets `UPGRADE_PENDING_KEY`
-(`omnigraph:storage_upgrade_pending`) on main's `__manifest` while it runs.
-This build never writes the key and holds no conversion. Ordinary open refuses
-a graph that carries it with `recovery_guidance`, and `omnigraph upgrade`
-reports `recovery_required`. Stop all writers and maintenance, keep the graph
-and its backup, and finish the conversion with the executable that started
-it; never remove the key by hand. The separate recovery-sidecar admission rule
-below still applies.
+The offline stamp-13 to stamp-14 upgrade sets `UPGRADE_PENDING_KEY`
+(`omnigraph:storage_upgrade_pending`) on main's `__manifest` from its fence
+commit to its activation commit; the value is the `UpgradeIntent`. Ordinary
+open, read-only included, refuses a graph that carries it with
+`recovery_guidance`. Only main is fenced: a stamp-13 process opened before the
+fence can still publish on an unconverted named ref, which is why the upgrade
+requires every process stopped and refuses a moved ref (`verify_source_head`)
+instead of adopting it. Never remove the key by hand.
+
+The upgrade owns its own recovery; no other writer resumes it. Every durable
+effect is either create-only under `__history/` (`put_if_absent`, equal bytes
+accepted again) or one zero-retry Lance commit on one ref, and the intent
+binds the whole plan before the first of them, so a rerun reads where the
+attempt stopped:
+
+| Stopped after | Durable state | The next run |
+|---|---|---|
+| before the fence | at most main's schema archive under `__history/schemas/` | an ordinary run |
+| `UPGRADE_AFTER_FENCE`, `UPGRADE_BETWEEN_LEGACY_FILES` | main fenced, some legacy objects | reruns the census at the pinned versions under the intent's `LegacyLayout`; the directory it plans must hash to the intent's `directory_sha256`, else `legacy_plan_changed` |
+| `UPGRADE_AFTER_LEGACY` | the directory and everything it lists | runs no census: the directory is the plan and each head record is read through the locator |
+| `UPGRADE_AFTER_STAGE` | staged, uncommitted conversion files | stages again; the next commit at that version supersedes them |
+| `UPGRADE_AFTER_BRANCH` | that ref converted, with its receipt | skips the ref (`branch_completed`) |
+| `UPGRADE_BEFORE_ACTIVATION` | every ref converted | validates again, then activates |
+| `UPGRADE_AFTER_ACTIVATION` | the key gone | `already_current` |
+
+The report names the action. `pending_upgrade` (from `--check`) and
+`upgrade_interrupted` are rerun with the same executable.
+`unknown_upgrade_ownership` (an intent this build cannot read, another route's
+or another layout version's) and `fence_publication_attempted` (the fence
+commit did not report its outcome) preserve the root and are diagnosed with
+`--check`. `legacy_plan_changed` and `legacy_objects_differ` mean the legacy
+objects or their plan are not the ones this executable makes: finish with the
+executable that fenced, or restore the backup when an object under
+`__history/legacy/` was modified. The separate recovery-sidecar admission
+rule below still applies: a root with a sidecar reports
+`source_recovery_required` before any upgrade effect.
 
 ## Sidecars from older builds
 
@@ -193,8 +221,11 @@ The v8 storage fence keeps older binaries from exposing retired branches.
 - `crates/omnigraph/tests/schema_apply.rs` and `system_column_upgrade.rs` own
   atomic contract publication, pre-publication refusal and complete published
   outcomes, including later errors.
-- `crates/omnigraph/src/db/upgrade/tests.rs` owns the `recovery_required`
-  report for a graph carrying a pending conversion marker.
+- `crates/omnigraph/src/db/upgrade/tests.rs` owns the storage upgrade's
+  crash windows: every seam above interrupted and rerun with no mixed
+  visibility, a partial legacy write completed on retry, a resume after the
+  directory running no census, and the `recovery_required` reports for a
+  foreign intent, a changed source and a modified legacy object.
 - `crates/omnigraph/tests/recovery.rs` owns manifest-only contract admission,
   ignored orphan schema artifacts, read-only opens without writes, and legacy
   sidecars refusing read-write but not read-only open.

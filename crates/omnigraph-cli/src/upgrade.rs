@@ -7,6 +7,7 @@ pub(crate) async fn run(
     check: bool,
     to_format: Option<u32>,
     json: bool,
+    quiet: bool,
 ) -> Result<()> {
     let target = scope::resolve_scope(
         &operator::load_operator_config()?,
@@ -47,6 +48,9 @@ pub(crate) async fn run(
             "upgrade refuses graph `{uri}` inside cluster `{root}`; a qualified cluster upgrade operation is required"
         );
     }
+    if !check {
+        echo_write_target(quiet, "upgrade", &uri, false);
+    }
     let report =
         omnigraph::db::upgrade_storage(&uri, omnigraph::db::UpgradeOptions { check, to_format })
             .await?;
@@ -71,6 +75,10 @@ fn print_human(report: &omnigraph::db::UpgradeReport) -> Result<()> {
         mode.as_str().unwrap_or("unknown")
     );
     println!(
+        "graph identity: {}",
+        report.graph_identity.as_deref().unwrap_or("unknown")
+    );
+    println!(
         "format: {} -> {}{}",
         report
             .observed_format
@@ -82,14 +90,66 @@ fn print_human(report: &omnigraph::db::UpgradeReport) -> Result<()> {
             ""
         }
     );
+    println!("route: {}", joined(&report.route, " -> "));
+    println!(
+        "completed handlers: {}",
+        joined(&report.completed_handlers, ", ")
+    );
+    println!(
+        "last durable completed boundary: {}",
+        report
+            .last_durable_completed_boundary
+            .as_deref()
+            .unwrap_or("none")
+    );
+    let work = &report.work;
+    println!(
+        "source: {} live refs, {} retired refs, {} orphan writers, {} legacy commits, \
+         {} bookkeeping versions, {} absent parents",
+        work.live_refs,
+        work.retired_refs,
+        work.orphan_writers,
+        work.legacy_commits,
+        work.bookkeeping_versions,
+        work.absent_parents
+    );
+    println!(
+        "legacy objects: {} data files, {} id shards, {} writer shards, {} schema contents, \
+         {} bytes",
+        work.data_files,
+        work.id_shards,
+        work.writer_shards,
+        work.schema_contents,
+        work.legacy_bytes
+    );
+    println!(
+        "census: {} reads, {} cells",
+        work.census_reads, work.census_cells
+    );
     for finding in &report.findings {
         println!("{}: {}", finding.code, finding.message);
     }
     if let Some(recovery) = &report.recovery {
+        println!("failed handler: {}", recovery.failed_handler);
         println!("recovery executable: {}", recovery.executable_compatibility);
         println!("recovery action: {}", recovery.action);
     }
+    if matches!(report.mode, omnigraph::db::UpgradeMode::Check) {
+        println!(
+            "Check is advisory. Keep the graph offline: stop all readers, writers and \
+             maintenance, retain a verified backup of the whole root, then run `omnigraph \
+             upgrade <graph>` without `--check`."
+        );
+    }
     Ok(())
+}
+
+fn joined(items: &[String], separator: &str) -> String {
+    if items.is_empty() {
+        "none".to_owned()
+    } else {
+        items.join(separator)
+    }
 }
 
 #[cfg(test)]
@@ -104,12 +164,12 @@ mod tests {
             "graph.omni",
             "--check",
             "--to-format",
-            "8",
+            "14",
             "--json",
         ])
         .unwrap();
         assert!(
-            matches!(&cli.command, Command::Upgrade { uri: Some(uri), check: true, to_format: Some(8), json: true } if uri == "graph.omni")
+            matches!(&cli.command, Command::Upgrade { uri: Some(uri), check: true, to_format: Some(14), json: true } if uri == "graph.omni")
         );
         assert_eq!(
             planes::command_capability(&cli.command),

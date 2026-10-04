@@ -9445,7 +9445,7 @@
           "internal_schema_version": {
             "type": "integer",
             "format": "int32",
-            "description": "The internal-schema (storage-format) version this binary writes, the\ntop of the range it serves (v11 and v12 today; a v11 branch converts on\nits next publish); a graph outside that range is refused until an\nexplicit upgrade.",
+            "description": "The internal-schema (storage-format) version this binary writes and\nthe only one it serves; a graph at any other version is refused until\nit is upgraded offline or rebuilt.",
             "minimum": 0
           },
           "source_version": {
@@ -10357,7 +10357,7 @@
           "internal_schema_version": {
             "type": "integer",
             "format": "int32",
-            "description": "The on-disk internal-schema (storage-format) version this graph's branch\nis stamped at. Branches of one graph can differ (v11 beside v12) while a\nv11 graph converts branch by branch on publish.",
+            "description": "The on-disk internal-schema (storage-format) version this graph's branch\nis stamped at. This binary serves only its own storage-format version; a\ngraph at any other version is refused until it is upgraded offline or rebuilt.",
             "minimum": 0
           }
         }

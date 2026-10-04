@@ -1,38 +1,103 @@
 # Upgrading OmniGraph
 
-Normal open accepts storage format v14 and never migrates a graph. This build
-has no in-place storage conversion: a graph at any other format is refused,
-and the path with this binary is the [export/import rebuild](#rebuild) with the
-binary of the release that wrote the graph.
+Normal open accepts storage format v14 and never migrates a graph. A
+standalone v13 graph is converted in place by the offline
+[storage upgrade](#storage-upgrade). A graph at any other format, and every
+cluster-managed graph below v14, is refused and takes the
+[export/import rebuild](#rebuild) with the binary that wrote the graph.
 Check the [release notes](../../releases/) for storage and index compatibility.
 
-## Storage format report
+## Storage upgrade
 
-`omnigraph upgrade` reports a standalone graph's storage format against the
-one this binary serves. It writes nothing, with or without `--check`:
+`omnigraph upgrade` converts a standalone v13 graph to v14 in place. Branches,
+commit ids, commit history and table data are kept; no table row is rewritten.
+v13 was written only by main development builds from 2026-10-01 to 2026-10-04.
+
+The upgrade is offline, and it cannot verify that itself:
+
+1. Stop every server, embedded reader or writer and maintenance process that
+   has the graph open, and keep them stopped until the upgrade reports
+   `completed`. A v13 process opened earlier can still write to a branch; the
+   upgrade then stops and the root is restored from the backup.
+2. Take and verify a backup of the whole graph root. There is no reverse
+   conversion: rollback is restoring that backup with the old binary.
+3. Check, then convert, then verify with the new binary:
 
 ```bash
 omnigraph upgrade ./graph.omni --check --json
+omnigraph upgrade ./graph.omni --json
+omnigraph commit list ./graph.omni --json
 ```
 
-| Graph | `outcome` | Finding | Exit |
-|---|---|---|---|
-| v14 | `already_current` | none | 0 |
-| any other format | `check_failed` | `unsupported_source`, with the refusal text of normal open | 1 |
-| `--to-format` other than 14 | `check_failed` | `unsupported_target` | 1 |
-| pending conversion marker | `recovery_required` | `pending_upgrade` | 1 |
+`--check` writes nothing. A run without `--check` first marks the graph as
+pending, which every normal open refuses, writes the pre-upgrade commits as
+immutable objects under `__history/legacy/`, converts each live branch,
+validates what it wrote and only then removes the marker. A run that stops
+after the marker is resumed by running the same command again with the same
+executable. Never delete the marker or anything under `__history/`.
 
-The refusal text names the release line that wrote the graph and the rebuild
-commands. Data, vectors and blobs are preserved by a rebuild; commit history
-and branches are not.
+| `outcome` | Meaning | Exit |
+|---|---|---|
+| `check_passed` | v13 graph, every check passed, nothing written | 0 |
+| `already_current` | v14 graph, nothing to do | 0 |
+| `completed` | converted, validated and served as v14 | 0 |
+| `check_failed` | a finding below; nothing was written | 1 |
+| `recovery_required` | the graph is pending or holds leftover recovery files; follow `recovery.action` | 1 |
 
-A graph carrying a pending conversion marker stays refused by normal open.
-Stop all writers and maintenance, keep the graph and its backup, and finish
-the conversion with the executable that started it. Never delete the marker.
+The report's `work` object counts what the run read and writes: `live_refs`,
+`retired_refs` (deleted branches whose commits are kept), `orphan_writers`,
+`legacy_commits`, `bookkeeping_versions`, `absent_parents`, `data_files`,
+`id_shards`, `writer_shards`, `schema_contents`, `census_reads`,
+`census_cells` and `legacy_bytes`. A resumed run that finds the legacy objects
+complete reads no history again and reports `retired_refs`, `orphan_writers`,
+`bookkeeping_versions`, `schema_contents`, `census_reads`, `census_cells` and
+`legacy_bytes` as zero.
+
+| Finding | Names | What to do |
+|---|---|---|
+| `unsupported_target` | the target | `--to-format` accepts 14 only |
+| `newer_than_binary` | the format | upgrade the binary |
+| `unsupported_source` | the format, layout or over-budget branch | [rebuild](#rebuild) with the build that wrote the graph. For a retired branch, instead of rebuilding run `cleanup` with a retention option and `--confirm` using that build, then run `upgrade --check` again; rebuild only when the retired branch stays |
+| `source_recovery_required` | leftover recovery files | open the graph read-write with the build that wrote them, then check again |
+| `history_objects_present` | object keys | restore the whole root, `__history/` included, from the backup of the earlier attempt |
+| `legacy_lineage_incomplete`, `legacy_lineage_corrupt` | up to 20 commit ids or branches | rebuild |
+| `legacy_record_over_bound`, `legacy_census_over_bound`, `legacy_directory_over_bound` | the measured value and its limit | rebuild |
+| `legacy_uncommitted_change`, `legacy_head_record_mismatch` | the branch, version and field | report it; rebuild meanwhile |
+| `preflight_failed` | the error | fix the cause and check again; nothing was written. Above the live-branch limit: rebuild |
+| `pending_upgrade`, `upgrade_interrupted` | the attempt | rerun without `--check` with the same executable |
+| `unknown_upgrade_ownership`, `fence_publication_attempted` | the marker state | keep the root, run `--check`, finish with the executable that started the attempt |
+| `legacy_plan_changed`, `legacy_objects_differ` | digests | finish with the executable that marked the graph; restore the backup if an object under `__history/legacy/` was changed |
+
+Limits, checked before anything is written: 1,024 live branches including
+main and 1,024 retired branches; 1,000,000 catalog rows or 64 MiB per branch
+head, live or retired; 256 KiB of commit fields and 16 MiB per commit record;
+a history-read budget that refuses a single branch line above about
+75,000 commits; and a history-memory budget of 1 GiB that admits about
+3.8 million table entries, counted for each branch as its commits plus its
+head, times the tables of its head (10,000 commits over 383 tables, or
+1,000 commits over 3,800). That count multiplies every commit of a branch by
+the tables of its head, so a graph whose tables were added late is
+over-counted. The budget counts only the fixed-size part of each table
+entry: table names and paths are not counted and planning holds a second
+copy, so the process needs several times 1 GiB of memory. A graph over a
+limit is rebuilt. A retired branch over a limit cannot shrink: `cleanup`
+with the build that wrote the graph removes it when no live branch, merge
+base or tag needs it. Cleanup without `--confirm` is a dry run, so pass a
+retention option and `--confirm` (for example
+`omnigraph cleanup --keep 10 --confirm ./graph.omni`, see
+[maintenance](maintenance.md)), then run `upgrade --check` again.
+
+After the upgrade, commit ids from before it resolve as before, and commit
+listing, the change feed, merges and `cleanup` read across the upgrade. A
+snapshot addressed by a catalog version below the upgrade serves the commit
+at that version, or the nearest commit below it. A v14 development build
+older than this upgrade reports pre-upgrade commit ids as not found and
+refuses full-history reads on an upgraded graph: upgrade every binary first.
 
 Server and cluster selectors, cluster profiles and recognized cluster-layout
-roots are refused. Local paths, file URIs and symlink aliases are resolved
-before the cluster ownership check.
+roots are refused: a cluster-managed graph is exported with the build that
+wrote it and [rebuilt](#rebuild). Local paths, file URIs and symlink aliases
+are resolved before the cluster ownership check.
 
 ## v0.9 to v0.10
 
@@ -163,7 +228,8 @@ mapping is:
 | v5 | the exact unreleased development build that wrote it |
 | v6 | latest 0.10.x (the refusal names 0.9.x or 0.10.x) |
 | v7 | the exact unreleased development build that wrote it |
-| v8 to v13 | the 0.11.x line; the refusal names the build variant (v8: legacy system column spellings; v10: detached table commits; v11: detached-only tables; v12: packed catalog record; v13: schema contract in manifest) |
+| v8, v9 | latest 0.11.x (v8: legacy system column spellings) |
+| v10 to v13 | the main development build that wrote it; the refusal names its build dates. A standalone v13 graph takes the [storage upgrade](#storage-upgrade) instead |
 | v14 | current binary; entity export/import is not required within this storage generation |
 
 If the graph's generation is newer than the binary, upgrade the binary instead.

@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - Azim Afroozeh
 created: 2026-09-09
-updated: 2026-09-13
+updated: 2026-10-04
 discussion: null
 supersedes: []
 superseded_by: []
@@ -460,4 +460,17 @@ Release maintainer verifies production qualification before shipping.
 
 ## Decision log
 
-No maintainer decision recorded yet.
+No maintainer decision on the questions above is recorded yet.
+
+- 2026-10-04: the route `history-lance-files-v13-to-v14` (intent protocol 6)
+  is the one route the binary registers, for local standalone roots. It
+  follows this RFC's contract: a read-only `--check` that reports its work,
+  an intent on main before any effect, create-only objects and zero-retry
+  commits, per-ref receipts, validation before activation, and a rerun that
+  resumes its own attempt and refuses another's. Its fence is the early
+  format fence: it stamps main with the target format, so the source
+  executable refuses a fenced root. Its legacy area is argued in
+  [RFC 0068](0068-graph-commit-record.md#amendment-legacy-commits-of-the-stamp-13-upgrade).
+  The v6 to v9 routes described above were removed with their source
+  decoders; those stamps are rebuilt. Cluster entry and object-store
+  qualification stay open.

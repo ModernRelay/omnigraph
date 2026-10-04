@@ -861,6 +861,15 @@ async fn scan_manifest_rows(
     with_content: bool,
 ) -> Result<(ManifestRows, Option<OmniError>)> {
     guard_row_layout(dataset)?;
+    scan_rows_unguarded(dataset, with_content).await
+}
+
+/// [`scan_manifest_rows`] without the stamp and pending-key guard, which the
+/// caller has answered for.
+async fn scan_rows_unguarded(
+    dataset: &Dataset,
+    with_content: bool,
+) -> Result<(ManifestRows, Option<OmniError>)> {
     crate::instrumentation::record_manifest_scan();
     let mut scanner = dataset.scan();
     scanner
@@ -1134,6 +1143,35 @@ pub async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestState> {
         dataset.version().version,
         dataset.manifest().branch.as_deref(),
     )
+}
+
+/// The visible state and the schema contract of a version the offline storage
+/// upgrade wrote, from one scan. Unlike every other reader it reads through
+/// the pending key main's conversion carries, so the upgrade can compare and
+/// validate what it converted before it activates the root. The stamp must
+/// still be one this build serves, and the version must hold the contract.
+#[doc(hidden)]
+pub async fn read_converted_state(dataset: &Dataset) -> Result<(ManifestState, SchemaContractRow)> {
+    let version = dataset.version().version;
+    let stamp = read_stamp(dataset).ok_or_else(|| {
+        OmniError::manifest(format!(
+            "__manifest version {version} carries no internal-schema stamp that is a version \
+             number; a converted version is stamped"
+        ))
+    })?;
+    crate::migrations::refuse_if_stamp_unsupported(stamp)?;
+    require_schema_content(dataset)?;
+    let (rows, content_error) = scan_rows_unguarded(dataset, true).await?;
+    if let Some(error) = content_error {
+        return Err(error);
+    }
+    let state = rows.state(version, dataset.manifest().branch.as_deref())?;
+    let contract = finish_schema_contract_row(
+        rows.schema_contract,
+        rows.schema_contract_head.as_ref(),
+        version,
+    )?;
+    Ok((state, contract))
 }
 
 /// The visible table state of `dataset`'s version and the rows it was read

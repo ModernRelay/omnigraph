@@ -894,11 +894,11 @@ pub(crate) async fn plan_collection(
                 record_roots(db, &snapshot, &mut roots, &mut tables);
                 continue;
             }
-            let pinned =
-                ManifestCoordinator::snapshot_at(db.root_uri(), branch.as_deref(), *version)
-                    .await?;
+            let pinned = opened.snapshot_at(*version, &db.history).await?;
             report.cost.manifest_snapshots += 1;
-            record_roots(db, &pinned, &mut roots, &mut tables);
+            if let Some(pinned) = pinned {
+                record_roots(db, &pinned, &mut roots, &mut tables);
+            }
         }
         views.push(BranchView {
             branch: branch.clone(),

@@ -494,18 +494,35 @@ impl CommitGraph {
     /// The lineage of the head. Reads the lineage columns of `__history`
     /// unless the head and the buffer name no parent outside them, or the
     /// cache holds every such parent, which its closure under parents makes
-    /// the whole ancestry.
+    /// the whole ancestry. A merged parent the legacy directory lists as absent
+    /// counts as held: the storage upgrade found no ref holding it. The
+    /// directory is requested only for a parent the read of `__history` lacks.
     pub async fn lineage(&self) -> Result<Lineage> {
         let outside: Vec<&str> = self.held.outside_parents().collect();
-        let holds = |settled: &SettledCommits| outside.iter().all(|id| settled.contains_key(*id));
-        let settled = match self.history.held().filter(holds) {
-            Some(settled) => settled,
+        let missing = |settled: &SettledCommits| -> Vec<&str> {
+            outside
+                .iter()
+                .copied()
+                .filter(|id| !settled.contains_key(*id))
+                .collect()
+        };
+        let held = self.history.held();
+        let complete = held.as_ref().is_some_and(|settled| {
+            let directory = self.history.objects().known_legacy_directory();
+            missing(settled).into_iter().all(|id| {
+                directory
+                    .as_ref()
+                    .is_some_and(|directory| directory.lists_absent(id))
+            })
+        });
+        let settled = match held {
+            Some(settled) if complete => settled,
             None if outside.is_empty() => {
                 let settled = SettledCommits::default();
                 self.history.replace(Arc::clone(&settled));
                 settled
             }
-            None => {
+            _ => {
                 crate::instrumentation::record_projection_full_refresh();
                 let settled: SettledCommits = Arc::new(
                     history::read_lineage_in(&self.root_uri, &self.session, self.history.objects())
@@ -518,13 +535,30 @@ impl CommitGraph {
                 settled
             }
         };
-        if let Some(parent) = outside.iter().find(|id| !settled.contains_key(**id)) {
+        if let Some(parent) = self.unlisted_absent(&missing(&settled)).await? {
             return Err(missing_parent(parent));
         }
         Ok(Lineage {
             held: self.held.clone(),
             settled,
         })
+    }
+
+    /// The first of `ids` the legacy directory does not list as an absent
+    /// merged parent, every one of them when the root has no directory;
+    /// `None` when it lists them all. No ids read nothing.
+    async fn unlisted_absent<'a>(&self, ids: &[&'a str]) -> Result<Option<&'a str>> {
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let directory =
+            history::legacy_directory(&self.root_uri, &self.session, Some(self.history.objects()))
+                .await?;
+        Ok(ids.iter().copied().find(|id| {
+            !directory
+                .as_ref()
+                .is_some_and(|directory| directory.lists_absent(id))
+        }))
     }
 
     /// The commits of the branch in [`GraphCommit::lineage_key`] order.
