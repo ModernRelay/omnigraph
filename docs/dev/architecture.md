@@ -104,8 +104,9 @@ alias is reused. See [invariants.md](invariants.md) and
   pin, accepted schema and lineage change in one manifest CAS. See [writes.md](writes.md) and
   [recovery.md](recovery.md).
 - A merge performs a graph-level three-way comparison, validates the selected
-  result, stages its table effects, and uses the same publication boundary. See
-  [merge.md](merge.md).
+  result, stages its table effects, and uses the same publication boundary. A
+  fast forward that only inserts nodes of types with no `@unique`, `@range`,
+  `@check` or enum property skips the validation. See [merge.md](merge.md).
 - Blob cells use an engine-owned, snapshot-bound facade; callers never receive
   a raw Lance `BlobFile` or physical placement. See [blob.md](blob.md).
 - Cluster apply converges definitions and graph topology into a CAS-protected

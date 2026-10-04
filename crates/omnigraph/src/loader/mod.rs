@@ -2993,7 +2993,9 @@ fn parse_date64_json_value(property: &str, value: &JsonValue) -> Result<Option<i
         return Ok(Some(checked_date64(ms)?));
     }
     if let Some(value) = value.as_str() {
-        return parse_date64_literal(value)
+        return omnigraph_compiler::check_datetime_literal(value)
+            .map_err(OmniError::manifest)
+            .and_then(|()| parse_date64_literal(value))
             .map(Some)
             .map_err(|e| OmniError::manifest(format!("property '{property}': {e}")));
     }
@@ -3698,6 +3700,49 @@ edge WorksAt: Person -> Company
             version_before,
             "a refused load leaves no commit behind"
         );
+    }
+
+    /// The load surface refuses a `DateTime` string with a non-zero digit past the
+    /// millisecond, scalar and list item; Rust because a `.gqt` seed refusal is a harness
+    /// failure. Params and literals: `cases/issue_857_datetime_sub_millisecond_digits_refused.gqt`.
+    #[tokio::test]
+    async fn load_refuses_datetime_string_with_sub_millisecond_digits() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let schema = "node Event { name: String @key at: DateTime? ats: [DateTime]? }";
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, schema).await.unwrap()),
+            SessionSettings::default(),
+        );
+        let version_before = db.version().await;
+
+        for rows in [
+            r#"{"type": "Event", "data": {"name": "a", "at": "2024-01-01T00:00:00.123456Z"}}"#,
+            r#"{"type": "Event", "data": {"name": "a", "ats": ["2024-01-01T00:00:00.123Z", "2024-01-01T00:00:00.123456Z"]}}"#,
+        ] {
+            let err = db
+                .load_jsonl(rows, LoadMode::Overwrite)
+                .await
+                .expect_err("a sub-millisecond digit fails the load, scalar and list item");
+            assert!(
+                err.to_string().contains(
+                    "invalid DateTime literal '2024-01-01T00:00:00.123456Z': a DateTime has millisecond precision; fractional-second digits past the third must be zero"
+                ),
+                "{rows}: {err}"
+            );
+        }
+        assert_eq!(
+            db.version().await,
+            version_before,
+            "a refused load leaves no commit behind"
+        );
+
+        db.load_jsonl(
+            r#"{"type": "Event", "data": {"name": "a", "at": "2024-01-01T00:00:00.123000000Z", "ats": ["2024-01-01T00:00:00.1230Z"]}}"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .expect("zero padding past the millisecond loads");
     }
 
     /// Pins the premise the refusal rests on: arrow's `Utf8 -> Date32` cast
