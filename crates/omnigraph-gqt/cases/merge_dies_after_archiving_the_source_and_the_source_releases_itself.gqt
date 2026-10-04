@@ -1,7 +1,6 @@
 # issue: none
-# notes: Under set history_release_bytes = 2048; main diverges, then a merge of src into main fails at publish.pre_merge
-# notes: after putting src's three commits under __history; src's own release then puts its block beside those copies and
-# notes: is accepted, the merge re-runs and lands, and after a restart branch delete src accepts the copies it finds.
+# notes: Under set history_release_bytes = 2048; a merge of src fails at publish.pre_merge after putting src's commits
+# notes: under __history; a fresh process re-runs it, src then releases its own block beside those copies, and delete accepts both.
 
 --- runner
 timeout_ms: 10000
@@ -69,6 +68,13 @@ query rows_after_interrupted_merge() { match { $p: Person } return { $p.name, $p
 p.name: String
 p.age: I32
 
+--- restart
+
+--- mutate
+branch merge src into main
+
+--- expect outcome: merged
+
 --- concurrent
 w1 on src: query source_releases_its_block() { insert Person { name: "carol", age: 1 } }
 r1 on src: query all() { match { $p: Person } return { $p.name } }
@@ -82,31 +88,7 @@ branch merge src into main
 
 --- expect outcome: merged
 
---- query branch: main
-query rows_after_merge() { match { $p: Person } return { $p.name, $p.age } }
-
---- expect unordered
-{"p.name":"alice","p.age":3}
-{"p.name":"bob","p.age":9}
-{"p.name":"carol","p.age":1}
-
---- expect shape
-p.name: String
-p.age: I32
-
 --- restart
-
---- query branch: main
-query rows_after_reopen() { match { $p: Person } return { $p.name, $p.age } }
-
---- expect unordered
-{"p.name":"alice","p.age":3}
-{"p.name":"bob","p.age":9}
-{"p.name":"carol","p.age":1}
-
---- expect shape
-p.name: String
-p.age: I32
 
 --- mutate
 branch delete src

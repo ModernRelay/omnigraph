@@ -1,6 +1,6 @@
 # issue: none
-# notes: Under set history_release_bytes = 2048; publish.pre_merge fails the releasing insert after its __history put; a
-# notes: fresh process reads the buffer, the retry puts the block again, and a second fresh process merges s on that block.
+# notes: Under set history_release_bytes = 2048; a second insert on b starts while the first is parked at its __history
+# notes: put; it lands after the release without a second put, and a fresh process merges s on the released block.
 
 --- runner
 timeout_ms: 10000
@@ -51,37 +51,13 @@ query bump_alice($n: I32) {
 --- expect affected: nodes=1 edges=0
 --- endloop
 
---- seam
-at: publish.pre_merge
-occurrence: 1
-action: fail
-scope: next_step
-
---- mutate branch: b
-query interrupted_releasing_publish() { insert Person { name: "carol", age: 1 } }
-
---- expect error: injected failpoint triggered: publish.pre_merge
-
---- restart
-
---- query branch: b
-query rows_from_the_buffer_before_the_retry() { match { $p: Person } return { $p.name, $p.age } }
-
---- expect unordered
-{"p.name":"alice","p.age":3}
-{"p.name":"bob","p.age":0}
-
---- expect shape
-p.name: String
-p.age: I32
-
 --- concurrent
-w1 on b: query retried_releasing_publish() { insert Person { name: "carol", age: 1 } }
-r1 on b: query all() { match { $p: Person } return { $p.name } }
-order: w1 park put __history/blocks/, r1 start, r1, w1 put __history/blocks/, w1
+w1 on b: query releasing_publish() { insert Person { name: "carol", age: 1 } }
+w2 on b: query queued_publish() { insert Person { name: "dave", age: 2 } }
+order: w1 park put __history/blocks/, w2 start, w1 put __history/blocks/, w1, w2
 --- expect
 w1: ok
-r1: ok
+w2: ok
 
 --- restart
 
@@ -97,6 +73,7 @@ query rows_after_cold_merge() { match { $p: Person } return { $p.name, $p.age } 
 {"p.name":"alice","p.age":3}
 {"p.name":"bob","p.age":7}
 {"p.name":"carol","p.age":1}
+{"p.name":"dave","p.age":2}
 
 --- expect shape
 p.name: String

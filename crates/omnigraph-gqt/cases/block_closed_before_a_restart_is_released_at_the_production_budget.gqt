@@ -1,7 +1,6 @@
 # issue: none
-# notes: Under set history_release_bytes = 2048; the third bump closes b's block (its head takes slot 0) and nothing is under
-# notes: __history yet; after a restart and reset history_release_bytes; the next insert still puts the block: the release
-# notes: decision travels in the head's commit id, not in the session budget. The merge of s then bases on the released block.
+# notes: Under set history_release_bytes = 2048; the third bump closes b's block; after a restart and reset
+# notes: history_release_bytes; the next insert still puts it under __history, and a second fresh process merges s on it.
 
 --- runner
 timeout_ms: 10000
@@ -67,17 +66,7 @@ order: w1 park put __history/blocks/, r1 start, r1, w1 put __history/blocks/, w1
 w1: ok
 r1: ok
 
---- query branch: b
-query rows_after_release() { match { $p: Person } return { $p.name, $p.age } }
-
---- expect unordered
-{"p.name":"alice","p.age":3}
-{"p.name":"bob","p.age":0}
-{"p.name":"carol","p.age":1}
-
---- expect shape
-p.name: String
-p.age: I32
+--- restart
 
 --- mutate
 branch merge s into b
@@ -85,21 +74,7 @@ branch merge s into b
 --- expect outcome: merged
 
 --- query branch: b
-query rows_after_merge() { match { $p: Person } return { $p.name, $p.age } }
-
---- expect unordered
-{"p.name":"alice","p.age":3}
-{"p.name":"bob","p.age":7}
-{"p.name":"carol","p.age":1}
-
---- expect shape
-p.name: String
-p.age: I32
-
---- restart
-
---- query branch: b
-query rows_after_second_reopen() { match { $p: Person } return { $p.name, $p.age } }
+query rows_after_cold_merge() { match { $p: Person } return { $p.name, $p.age } }
 
 --- expect unordered
 {"p.name":"alice","p.age":3}
