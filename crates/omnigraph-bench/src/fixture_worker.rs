@@ -790,6 +790,20 @@ mod tests {
         validate_case(definition).into_result().unwrap()
     }
 
+    fn aged_case(mut definition: CaseV1) -> ValidatedCase {
+        definition.fixture.preparation =
+            Some(crate::case::FixturePreparation::ReversibleUpdatesV1 {
+                additional_commits: 8,
+                rows_per_commit: 3,
+                seed: 42,
+                maintenance: crate::case::PreparationMaintenance::None,
+            });
+        definition.fixture.state.aging = crate::case::Aging::SmallCommits;
+        definition.fixture.state.deletion_history = crate::case::DeletionHistory::ReversibleUpdates;
+        definition.fixture.state.history_depth += 8;
+        validate_case(definition).into_result().unwrap()
+    }
+
     fn script(body: &str) -> (tempfile::TempDir, PathBuf) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("fixture-worker-stub");
@@ -894,28 +908,35 @@ mod tests {
 
     #[test]
     fn hanging_fixture_worker_is_killed_and_reaped() {
-        let (_script_directory, executable) = script("sleep 300\n");
-        let workspace = tempfile::tempdir().unwrap();
-        let active = workspace.path().join("active");
-        let template = workspace.path().join("template");
-        std::fs::create_dir(&active).unwrap();
-        let started = Instant::now();
+        for case in [test_case(), aged_case(test_case().definition)] {
+            let (_script_directory, executable) = script("sleep 300\n");
+            let workspace = tempfile::tempdir().unwrap();
+            let active = workspace.path().join("active");
+            let template = workspace.path().join("template");
+            std::fs::create_dir(&active).unwrap();
+            let started = Instant::now();
 
-        let error = supervise_fixture_build(
-            &executable,
-            &test_case(),
-            &active,
-            &template,
-            workspace.path(),
-            Duration::from_millis(200),
-        )
-        .unwrap_err();
+            let error = supervise_fixture_build(
+                &executable,
+                &case,
+                &active,
+                &template,
+                workspace.path(),
+                Duration::from_millis(200),
+            )
+            .unwrap_err();
 
-        assert_eq!(error.code, "fixture_build_watchdog_exceeded");
-        let evidence = error.context.child_process.unwrap();
-        assert!(evidence.direct_child_reaped, "{evidence:?}");
-        assert!(evidence.process_group_gone, "{evidence:?}");
-        assert!(started.elapsed() < Duration::from_secs(5));
+            assert_eq!(error.code, "fixture_build_watchdog_exceeded");
+            let evidence = error.context.child_process.unwrap();
+            assert!(evidence.direct_child_reaped, "{evidence:?}");
+            assert!(evidence.process_group_gone, "{evidence:?}");
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert!(
+                !template.exists(),
+                "a timed-out setup must not hand off a frozen fixture"
+            );
+            assert!(!workspace.path().join("fixture-result-v1.json").exists());
+        }
     }
 
     #[test]
@@ -1041,7 +1062,7 @@ mod tests {
         assert!(error.context.child_process.is_some(), "{error:?}");
     }
 
-    async fn assert_fixture_request_round_trip(reset: ResetMode) {
+    async fn assert_fixture_request_round_trip(reset: ResetMode, age: bool) {
         let workspace = tempfile::tempdir().unwrap();
         let active = workspace.path().join("active");
         let template = workspace.path().join("template");
@@ -1049,6 +1070,11 @@ mod tests {
         std::fs::create_dir(&active).unwrap();
         std::fs::create_dir(&fixture_scratch_root).unwrap();
         let case = tiny_case(reset);
+        let case = if age {
+            aged_case(case.definition)
+        } else {
+            case
+        };
         let result_path = workspace.path().join("result.json");
         let request = FixtureRequestV1 {
             protocol_version: FIXTURE_PROTOCOL_VERSION,
@@ -1072,8 +1098,14 @@ mod tests {
             } => {
                 assert_eq!(point_id, case.point_id);
                 assert_eq!(case_digest, case.case_digest);
-                assert_eq!(handoff.summary.source_history_depth, 6);
-                assert_eq!(handoff.summary.target_history_depth, 6);
+                assert_eq!(
+                    handoff.summary.source_history_depth,
+                    case.definition.fixture.state.history_depth
+                );
+                assert_eq!(
+                    handoff.summary.target_history_depth,
+                    case.definition.fixture.state.history_depth
+                );
                 assert!(!active.exists());
                 assert!(template.is_dir());
                 let physical = handoff.physical.clone();
@@ -1110,11 +1142,15 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn clonefile_fixture_request_revalidates_and_returns_checked_identity() {
-        assert_fixture_request_round_trip(ResetMode::LocalClonefile).await;
+        for age in [false, true] {
+            assert_fixture_request_round_trip(ResetMode::LocalClonefile, age).await;
+        }
     }
 
     #[tokio::test]
     async fn plain_copy_fixture_request_revalidates_and_returns_checked_identity() {
-        assert_fixture_request_round_trip(ResetMode::PlainCopy).await;
+        for age in [false, true] {
+            assert_fixture_request_round_trip(ResetMode::PlainCopy, age).await;
+        }
     }
 }

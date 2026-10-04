@@ -1126,11 +1126,12 @@ fn validate_stamped_fixture(
     if logical.builder != run_spec.fixture.builder
         || logical.data != run_spec.fixture.data
         || logical.state != run_spec.fixture.state
+        || logical.preparation != run_spec.fixture.preparation
     {
         return Err(RecordError::new(
             "logical_fixture_identity_mismatch",
             "fixture.manifest.logical",
-            "fixture builder, Data, or State differs from the canonical run spec",
+            "fixture builder, Data, State, or preparation differs from the canonical run spec",
         ));
     }
     Ok(())
@@ -1818,6 +1819,8 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
                     expected_history_depth: 1,
                     estimated_max_entries: 1_000,
                     required_scratch_bytes: 2_000_000,
+                    preparation_commits: 0,
+                    retained_history_allowance_bytes: 0,
                 },
                 stamp: fixture_stamp(run),
                 base_load_commits: 1,
@@ -1899,6 +1902,7 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
                 data: run.case.definition.fixture.data.clone(),
                 state: run.case.definition.fixture.state.clone(),
                 logical_content_sha256: "1".repeat(64),
+                preparation: run.case.definition.fixture.preparation,
             },
             physical: PhysicalFixtureIdentityV1 {
                 digest_algorithm: PHYSICAL_TREE_DIGEST_ALGORITHM.to_string(),
@@ -2185,6 +2189,32 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
         assert_eq!(
             parse_canonical_record(&non_canonical).unwrap_err().code,
             "non_canonical_record"
+        );
+
+        let mut run = resolved_run();
+        let mut definition = run.case.definition.clone();
+        definition.fixture.preparation =
+            Some(crate::case::FixturePreparation::ReversibleUpdatesV1 {
+                additional_commits: 64,
+                rows_per_commit: 1,
+                seed: 42,
+                maintenance: crate::case::PreparationMaintenance::None,
+            });
+        definition.fixture.state.aging = crate::case::Aging::SmallCommits;
+        definition.fixture.state.deletion_history = crate::case::DeletionHistory::ReversibleUpdates;
+        definition.fixture.state.history_depth += 64;
+        run.case = crate::validate_case(definition).into_result().unwrap();
+        let execution = execution(&run);
+        let aged = build_run_record(&run, &execution, input(&run, &execution)).unwrap();
+        let encoded = canonical_record_bytes(&aged).unwrap();
+        assert_eq!(parse_canonical_record(&encoded).unwrap(), aged);
+        assert!(!aged.claim_eligible());
+        let mut mismatched = aged.clone();
+        mismatched.fixture.manifest.logical.preparation = None;
+        mismatched.fixture = StampedFixtureManifestV1::stamp(mismatched.fixture.manifest).unwrap();
+        assert_eq!(
+            validate_run_record(&mismatched).unwrap_err().code,
+            "logical_fixture_identity_mismatch"
         );
     }
 
