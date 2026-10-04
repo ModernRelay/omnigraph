@@ -96,7 +96,7 @@ ariadne = "0.4"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 object_store = { version = "0.13.2", default-features = false, features = ["aws", "azure", "fs"] }
-time = { version = "0.3", features = ["formatting"] }
+time = { version = "0.3.47", features = ["formatting"] }
 axum = { version = "0.8", features = ["json", "macros"] }
 utoipa = { version = "5", features = ["axum_extras"] }
 url = "2"

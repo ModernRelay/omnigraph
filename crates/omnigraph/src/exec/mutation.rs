@@ -1743,12 +1743,16 @@ fn concat_match_batches_to_schema(
 
 fn enrich_mutation_params(params: &ParamMap) -> Result<ParamMap> {
     let mut resolved = params.clone();
-    if !resolved.contains_key(NOW_PARAM_NAME) {
-        let now = OffsetDateTime::from(crate::dst_clock::system_time_now())
-            .format(&Rfc3339)
-            .map_err(|e| OmniError::manifest(format!("failed to format now(): {}", e)))?;
-        resolved.insert(NOW_PARAM_NAME.to_string(), Literal::DateTime(now));
+    if resolved.contains_key(NOW_PARAM_NAME) {
+        return Err(OmniError::manifest(format!(
+            "param '{NOW_PARAM_NAME}': reserved for now() and cannot be bound"
+        )));
     }
+    let now = OffsetDateTime::from(crate::dst_clock::system_time_now())
+        .truncate_to_millisecond()
+        .format(&Rfc3339)
+        .map_err(|e| OmniError::manifest(format!("failed to format now(): {}", e)))?;
+    resolved.insert(NOW_PARAM_NAME.to_string(), Literal::DateTime(now));
     Ok(resolved)
 }
 

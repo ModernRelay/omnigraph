@@ -96,8 +96,10 @@ predecessor export into a new graph, relocate its identity as described in
 [migration guidance](migrations.md).
 
 `Date` accepts integer day counts or calendar-date strings; a datetime string is
-refused. `DateTime` accepts integer millisecond counts or datetime strings.
-Whole-number floats (`19723.0`), booleans, objects, and counts outside the
+refused. `DateTime` accepts integer millisecond counts or datetime strings; a
+string with a non-zero digit past the third fractional digit (`.123456`) is
+refused, here and in `mutate --params`, and trailing zeros (`.123000`) are
+accepted. Whole-number floats (`19723.0`), booleans, objects, and counts outside the
 renderable calendar range are refused; `mutate --params` takes date strings
 only. Rows stored with out-of-range counts by an earlier release fail reads and
 exports of that column until corrected.
