@@ -2462,8 +2462,9 @@ node Ghost {
     .await
     .unwrap();
 
-    // (a) A property add rewrites the table: the two pinned endpoints of the
-    // schema-apply commit no longer share one user schema.
+    // (a) A property add changes the table's user schema (metadata-only, no
+    // row rewritten): the two pinned endpoints of the schema-apply commit no
+    // longer share one user schema.
     db.apply_schema(
         r#"
 node Person {
@@ -2488,6 +2489,64 @@ node Ghost {
         OmniError::ChangeSchemaBoundary { type_name, .. } => assert_eq!(type_name, "Person"),
         other => panic!("expected a typed schema boundary, got: {other:?}"),
     }
+
+    // The add kept every data file: Alice's fragment physically lacks `note`
+    // and reads it as null. Later commits name only the rows they wrote, and
+    // the net diff since the add is exactly those rows, never every row of a
+    // fragment that lacks the added column.
+    let after_add = snapshot_id(&db, "main").await.unwrap();
+    db.load_with_receipt(
+        "main",
+        r#"{"type":"Person","data":{"name":"Bob","age":40}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let set_note = db
+        .mutate_with_receipt(
+            "main",
+            r#"
+query set_note($name: String, $note: String) {
+    update Person set { note: $note } where name = $name
+}
+"#,
+            "set_note",
+            &params(&[("$name", "Alice"), ("$note", "hello")]),
+        )
+        .await
+        .unwrap()
+        .commit
+        .expect("the update publishes");
+    let page = db
+        .commit_changes_page(&set_note.graph_commit_id, &scope, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.block
+            .changes
+            .iter()
+            .map(|change| (change.id.as_str(), change.op))
+            .collect::<Vec<_>>(),
+        [("Alice", omnigraph::changes::ChangeOpKind::Update)]
+    );
+    let since_add = diff_since_branch(&db, "main", after_add, &ChangeFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        change_tuples(&since_add),
+        [
+            (
+                "node:Person".to_string(),
+                "Alice".to_string(),
+                ChangeOp::Update
+            ),
+            (
+                "node:Person".to_string(),
+                "Bob".to_string(),
+                ChangeOp::Insert
+            ),
+        ]
+    );
 
     // (b) Dropping a type that still holds data is schema evolution with data
     // present — refused, never synthesized into entity deletes.

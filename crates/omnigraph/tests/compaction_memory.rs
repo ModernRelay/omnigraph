@@ -1,4 +1,4 @@
-//! Peak allocation of Blob-table compaction.
+//! Peak allocation of Blob-table compaction and schema apply.
 //!
 //! Lance 11 compaction materializes every managed Blob payload of one scanner
 //! batch, and a batch reads up to a whole fragment by default. `optimize`
@@ -9,9 +9,11 @@
 //! of a stock Lance compaction at the default and at the derived batch size,
 //! then asserts the engine's `optimize` peaks within the budget plus the two
 //! named allowances on fragments twice as wide as the derived batch. Every
-//! value is 1 MiB, a packed placement. It is ignored by default: the
-//! allocator counts the whole process, so the measurement needs the test
-//! binary to itself.
+//! value is 1 MiB, a packed placement. A second instrument measures schema
+//! apply's peak over Blob tables of two sizes: its column changes are
+//! metadata-only, so the peak must not grow with the table's Blob bytes.
+//! Both are ignored by default: the allocator counts the whole process, so a
+//! measurement needs the test binary to itself (`--exact`).
 
 mod helpers;
 
@@ -236,5 +238,70 @@ async fn compaction_peak_allocation_on_blob_tables() {
     assert!(
         peak <= bound,
         "optimize allocated {peak} bytes at its peak, above the {bound}-byte bound"
+    );
+}
+
+/// Schema apply on a Doc table of `rows` 1 MiB Blob values: one apply adds a
+/// nullable property and renames another, a second drops it. Returns the peak
+/// heap above the level at entry across both applies.
+async fn schema_apply_peak(rows: usize) -> usize {
+    let graph = tempfile::tempdir().unwrap();
+    let uri = graph.path().to_str().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(
+            uri,
+            "node Doc {\n    slug: String @key\n    content: Blob?\n    label: String?\n}\n",
+        )
+        .await
+        .unwrap(),
+    );
+    for (load, start) in (0..rows).step_by(16).enumerate() {
+        let mode = if load == 0 {
+            LoadMode::Overwrite
+        } else {
+            LoadMode::Merge
+        };
+        load_rows(&db, start..(start + 16).min(rows), mode).await;
+    }
+    let (applied, peak) = peak_above_baseline(async {
+        db.apply_schema(
+            "node Doc {\n    slug: String @key\n    content: Blob?\n    \
+             name: String? @rename_from(\"label\")\n    note: String?\n}\n",
+        )
+        .await?;
+        db.apply_schema("node Doc {\n    slug: String @key\n    content: Blob?\n}\n")
+            .await
+    })
+    .await;
+    assert!(applied.unwrap().applied);
+    peak
+}
+
+/// Everything schema apply allocates that is not table data: plan, catalog,
+/// manifest reads and publication. An allowance, not a derived figure.
+const SCHEMA_APPLY_ALLOWANCE: usize = 16 * MIB;
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "instrument: schema apply peak allocation is flat in a table's Blob bytes"]
+async fn schema_apply_peak_allocation_is_flat_in_blob_bytes() {
+    let small_rows = 2 * DERIVED_ROWS;
+    let large_rows = 4 * DERIVED_ROWS;
+    let small = schema_apply_peak(small_rows).await;
+    let large = schema_apply_peak(large_rows).await;
+    for (rows, peak) in [(small_rows, small), (large_rows, large)] {
+        eprintln!(
+            "schema apply (add + rename, then drop) on {rows} rows of 1 MiB Blob: \
+             peak {:.1} MiB (allowance {:.1} MiB)",
+            peak as f64 / MIB as f64,
+            SCHEMA_APPLY_ALLOWANCE as f64 / MIB as f64
+        );
+    }
+    assert!(
+        large <= SCHEMA_APPLY_ALLOWANCE,
+        "schema apply allocated {large} bytes at its peak over {large_rows} MiB of Blob values"
+    );
+    assert!(
+        large <= small + 4 * MIB,
+        "schema apply's peak grew with the table's Blob bytes: {small} -> {large}"
     );
 }

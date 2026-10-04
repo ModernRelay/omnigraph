@@ -1,6 +1,7 @@
 mod helpers;
 
 use base64::Engine;
+use std::collections::HashMap;
 #[cfg(feature = "failpoints")]
 use std::sync::Arc;
 
@@ -1639,6 +1640,403 @@ node Document {
         ),
         "retired Blob property lifetime must fail closed; got {lifetime_error:?}"
     );
+}
+
+/// Adding, renaming and dropping properties is metadata-only, on a Blob table
+/// (rename + drop + adds: a Project then a Merge) and a plain table (rename +
+/// drop: one Project): no row or payload is read, every data file stays the
+/// table's data, field ids, stable property markers and index coverage
+/// survive, the historical snapshot keeps its shape, one graph commit
+/// publishes it, and keyed writes, queries and optimize work afterwards.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn apply_schema_column_changes_keep_data_files_ids_and_index_coverage() {
+    use lance::index::DatasetIndexExt;
+
+    const MARKER: &str = "omnigraph.stable_property_id";
+
+    async fn fields(db: &Omnigraph, table_key: &str) -> Vec<(String, i32, Option<String>)> {
+        helpers::open_pinned_dataset_for_test(db, "main", table_key)
+            .await
+            .schema()
+            .fields
+            .iter()
+            .map(|field| {
+                (
+                    field.name.clone(),
+                    field.id,
+                    field.metadata.get(MARKER).cloned(),
+                )
+            })
+            .collect()
+    }
+
+    async fn coverage(db: &Omnigraph, table_key: &str) -> Vec<(Vec<i32>, Vec<u32>)> {
+        let mut coverage = helpers::open_pinned_dataset_for_test(db, "main", table_key)
+            .await
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| !lance_index::is_system_index(index))
+            .map(|index| {
+                (
+                    index.fields.clone(),
+                    index
+                        .fragment_bitmap
+                        .as_ref()
+                        .map(|bitmap| bitmap.iter().collect())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        coverage.sort();
+        coverage
+    }
+
+    fn field<'a>(
+        fields: &'a [(String, i32, Option<String>)],
+        name: &str,
+    ) -> &'a (String, i32, Option<String>) {
+        fields
+            .iter()
+            .find(|(field, _, _)| field == name)
+            .unwrap_or_else(|| panic!("no field '{name}' in {fields:?}"))
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let initial = r#"
+node Document {
+    title: String @key
+    rank: I32? @index
+    note: String?
+    content: Blob?
+}
+
+node Tag {
+    name: String @key
+    weight: I32? @index
+    color: String?
+}
+"#;
+    let db = helpers::session(Omnigraph::init(uri, initial).await.unwrap());
+    let packed = base64::engine::general_purpose::STANDARD.encode(vec![b'p'; 96 * 1024]);
+    let dedicated = base64::engine::general_purpose::STANDARD.encode(vec![b'd'; 5 * 1024 * 1024]);
+    let rows = [
+        serde_json::json!({"type": "Document", "data": {"title": "inline", "rank": 1, "note": "n1", "content": "base64:SW5saW5l"}}),
+        serde_json::json!({"type": "Document", "data": {"title": "packed", "rank": 2, "note": "n2", "content": format!("base64:{packed}")}}),
+        serde_json::json!({"type": "Document", "data": {"title": "dedicated", "rank": 3, "note": "n3", "content": format!("base64:{dedicated}")}}),
+        serde_json::json!({"type": "Document", "data": {"title": "empty", "rank": 4, "note": "n4", "content": "base64:"}}),
+        serde_json::json!({"type": "Document", "data": {"title": "null", "rank": 5, "note": "n5", "content": null}}),
+        serde_json::json!({"type": "Tag", "data": {"name": "red", "weight": 7, "color": "crimson"}}),
+        serde_json::json!({"type": "Tag", "data": {"name": "blue", "weight": 9, "color": "navy"}}),
+    ]
+    .iter()
+    .map(|row| row.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    db.load_jsonl(&rows, LoadMode::Overwrite).await.unwrap();
+    db.ensure_indices().await.unwrap();
+
+    let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let before_snapshot = db.resolve_snapshot("main").await.unwrap();
+    let mut before_state = HashMap::new();
+    for table in ["node:Document", "node:Tag"] {
+        let coverage_before = coverage(&db, table).await;
+        assert!(
+            coverage_before.len() >= 2,
+            "{table} needs its id and property indexes: {coverage_before:?}"
+        );
+        before_state.insert(
+            table,
+            (
+                data_file_paths(&db, table).await,
+                fields(&db, table).await,
+                coverage_before,
+            ),
+        );
+    }
+
+    let desired = r#"
+node Document {
+    title: String @key
+    score: I32? @rename_from("rank") @index
+    content: Blob?
+    summary: String?
+    thumb: Blob?
+}
+
+node Tag {
+    name: String @key
+    strength: I32? @rename_from("weight") @index
+}
+"#;
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let result = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.apply_schema(desired),
+    )
+    .await
+    .unwrap();
+    assert!(result.applied);
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0);
+    assert_eq!(probes.blob_payload_read_calls(), 0);
+    assert_eq!(probes.external_blob_payload_read_calls(), 0);
+    let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(
+        after.graph_manifest_version(),
+        before.graph_manifest_version() + 1,
+        "one graph commit publishes every table's evolution and the contract"
+    );
+    for table in ["node:Document", "node:Tag"] {
+        let entry = after.dataset(table).unwrap();
+        assert_eq!(
+            entry.published_dataset_version,
+            before.dataset(table).unwrap().published_dataset_version + 1
+        );
+        assert_eq!(
+            entry.entity_count,
+            before.dataset(table).unwrap().entity_count
+        );
+    }
+
+    for (table, renamed, from, dropped) in [
+        ("node:Document", "score", "rank", "note"),
+        ("node:Tag", "strength", "weight", "color"),
+    ] {
+        let (files_before, fields_before, coverage_before) = &before_state[table];
+        assert_eq!(
+            &data_file_paths(&db, table).await,
+            files_before,
+            "{table}: no data file is written or dropped"
+        );
+        let fields_after = fields(&db, table).await;
+        let (_, from_id, from_marker) = field(fields_before, from);
+        let (_, renamed_id, renamed_marker) = field(&fields_after, renamed);
+        assert_eq!(renamed_id, from_id, "{table}: a rename keeps the field id");
+        assert_eq!(
+            renamed_marker, from_marker,
+            "{table}: and the property identity"
+        );
+        assert!(from_marker.is_some());
+        assert!(fields_after.iter().all(|(name, _, _)| name != dropped));
+        for (name, id, marker) in fields_before {
+            if name != from && name != dropped {
+                assert_eq!(
+                    field(&fields_after, name),
+                    &(name.clone(), *id, marker.clone()),
+                    "{table}: an untouched column keeps its id and identity"
+                );
+            }
+        }
+        assert_eq!(
+            &coverage(&db, table).await,
+            coverage_before,
+            "{table}: every index keeps its field and fragment coverage"
+        );
+    }
+    for table in ["node:Document", "node:Tag"] {
+        helpers::assert_stable_property_markers(&db, table).await;
+        assert_exact_id_primary_key(&db, table).await;
+    }
+    let document_fields = fields(&db, "node:Document").await;
+    let max_before = before_state["node:Document"]
+        .1
+        .iter()
+        .map(|(_, id, _)| *id)
+        .max()
+        .unwrap();
+    for added in ["summary", "thumb"] {
+        let (_, id, marker) = field(&document_fields, added);
+        assert!(*id > max_before, "{added} takes a fresh field id");
+        assert!(marker.is_some(), "{added} carries its property identity");
+    }
+    assert_eq!(
+        document_fields
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["__id", "content", "score", "summary", "thumb", "title"],
+        "the physical column order follows the catalog, which orders properties by name"
+    );
+
+    // Payloads read back unchanged; the added Blob reads as null.
+    for (title, expected) in [
+        ("inline", b"Inline".to_vec()),
+        ("packed", vec![b'p'; 96 * 1024]),
+        ("dedicated", vec![b'd'; 5 * 1024 * 1024]),
+        ("empty", Vec::new()),
+    ] {
+        let bytes = read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", title, "content"),
+        )
+        .await;
+        assert!(bytes == expected, "{title}: payload changed");
+    }
+    for (title, property) in [("null", "content"), ("inline", "thumb")] {
+        let error = db
+            .read_blob_at(
+                ReadTarget::branch("main"),
+                node_blob_cell("Document", title, property),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OmniError::Manifest(ref error) if error.kind == ManifestErrorKind::NotFound),
+            "{title}.{property} reads as null, got {error:?}"
+        );
+    }
+
+    // The pre-apply snapshot keeps its own shape and values.
+    let historical = db
+        .snapshot_at_graph_manifest_version(before.graph_manifest_version())
+        .await
+        .unwrap()
+        .open_dataset("node:Document")
+        .await
+        .unwrap();
+    let historical_names = historical
+        .schema()
+        .fields
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<Vec<_>>();
+    assert!(historical_names.contains(&"note".to_string()));
+    assert!(historical_names.contains(&"rank".to_string()));
+    assert!(!historical_names.contains(&"score".to_string()));
+    assert_eq!(
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::snapshot(before_snapshot),
+            node_blob_cell("Document", "packed", "content"),
+        )
+        .await,
+        vec![b'p'; 96 * 1024]
+    );
+
+    // Keyed writes, filtered queries and optimize work on the evolved tables.
+    db.load_jsonl(
+        &serde_json::json!({
+            "type": "Document",
+            "data": {"title": "new", "score": 6, "summary": "fresh", "thumb": "base64:VGh1bWI="},
+        })
+        .to_string(),
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let writes = r#"
+query set_summary($title: String, $summary: String) {
+    update Document set { summary: $summary } where title = $title
+}
+
+query set_strength($name: String, $strength: I32) {
+    update Tag set { strength: $strength } where name = $name
+}
+"#;
+    mutate_main(
+        &db,
+        writes,
+        "set_summary",
+        &params(&[("$title", "dedicated"), ("$summary", "big")]),
+    )
+    .await
+    .unwrap();
+    mutate_main(
+        &db,
+        writes,
+        "set_strength",
+        &mixed_params(&[("$name", "red")], &[("$strength", 8)]),
+    )
+    .await
+    .unwrap();
+    let reads = r#"
+query scored($min: I32) {
+    match {
+        $d: Document
+        $d.score >= $min
+    }
+    return { $d.title }
+}
+
+query summarized() {
+    match {
+        $d: Document
+        $d.summary != ""
+    }
+    return { $d.title }
+}
+
+query strong($min: I32) {
+    match {
+        $t: Tag
+        $t.strength >= $min
+    }
+    return { $t.name }
+}
+"#;
+    let scored = query_main(&db, reads, "scored", &int_params(&[("$min", 3)]))
+        .await
+        .unwrap();
+    assert_eq!(
+        first_column_sorted(&scored),
+        ["dedicated", "empty", "new", "null"]
+    );
+    let summarized = query_main(&db, reads, "summarized", &params(&[]))
+        .await
+        .unwrap();
+    assert_eq!(first_column_sorted(&summarized), ["dedicated", "new"]);
+    let strong = query_main(&db, reads, "strong", &int_params(&[("$min", 8)]))
+        .await
+        .unwrap();
+    assert_eq!(first_column_sorted(&strong), ["blue", "red"]);
+    assert_eq!(
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "new", "thumb"),
+        )
+        .await,
+        b"Thumb"
+    );
+    assert_eq!(
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "dedicated", "content"),
+        )
+        .await,
+        vec![b'd'; 5 * 1024 * 1024],
+        "an update carries the untouched Blob of an evolved row"
+    );
+
+    db.optimize().await.unwrap();
+    assert_eq!(
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "packed", "content"),
+        )
+        .await,
+        vec![b'p'; 96 * 1024]
+    );
+    let scored = query_main(&db, reads, "scored", &int_params(&[("$min", 3)]))
+        .await
+        .unwrap();
+    assert_eq!(
+        first_column_sorted(&scored),
+        ["dedicated", "empty", "new", "null"]
+    );
+    let exported = db
+        .export_jsonl("main", &["Document".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(exported.lines().count(), 6);
+    assert!(exported.contains("\"score\":3"), "{exported}");
+    assert!(!exported.contains("\"rank\"") && !exported.contains("\"note\""));
 }
 
 /// A ranged external Blob descriptor survives a schema change on its table:
