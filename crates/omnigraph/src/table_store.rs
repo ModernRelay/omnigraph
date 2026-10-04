@@ -643,18 +643,6 @@ pub struct TableState {
     pub(crate) version_metadata: TableVersionMetadata,
 }
 
-/// Outcome of replaying a detached transaction at its linear target.
-#[derive(Debug)]
-pub enum PromotionCommit {
-    /// The twin landed at the target with the expected uuid.
-    Landed(Box<Dataset>),
-    /// Lance's conflict pass refused the replay: a racing promoter landed
-    /// first, or a foreign commit occupies the target. The caller rechecks.
-    Refused,
-    /// The replay must not run or did not land where it should.
-    Unsafe(String),
-}
-
 /// A Lance write that has produced fragment files on object storage but is
 /// not yet committed to the dataset's manifest. The staged-write primitives
 /// are consumed by `MutationStaging` (`exec/staging.rs`,
@@ -3741,85 +3729,6 @@ impl TableStore {
                 ds.uri()
             ))
         })
-    }
-
-    /// Replay the transaction recorded in `staged` linearly on `base`, so the
-    /// linear history gains an identical twin at `target` (RFC 0067). The
-    /// replay runs with zero retries; a twin that a racing promoter already
-    /// landed is refused by Lance's conflict pass for every kind the engine
-    /// stages detached (the self-conflict rule pinned in
-    /// `lance_surface_guards`) and reported as `Refused` for the caller to
-    /// recheck. A bare `Append` never replays: it would rebase over its twin
-    /// and duplicate rows.
-    pub async fn promote_detached(
-        &self,
-        base: Arc<Dataset>,
-        staged: &Dataset,
-        target: u64,
-        expected_uuid: &str,
-    ) -> Result<PromotionCommit> {
-        let mut transaction = match staged
-            .read_transaction()
-            .await
-            .map_err(OmniError::storage)?
-        {
-            Some(transaction) if transaction.uuid == expected_uuid => transaction,
-            _ => {
-                return Ok(PromotionCommit::Unsafe(
-                    "staged version carries no matching transaction".to_string(),
-                ));
-            }
-        };
-        // Refuse the operation kinds whose replay would rebase over an
-        // existing twin (landing a stray duplicate commit) instead of
-        // conflicting with it, plus the kinds that must never be replayed onto
-        // linear history at all. The engine stages none of these detached
-        // (merge-insert/keyed writes are `Update`, deletes `Delete`, index
-        // builds `CreateIndex`, compaction `Rewrite`, first-touch `Overwrite`,
-        // renames `Project` — every one self-conflicts with its twin). Rejecting
-        // them BEFORE the commit executes keeps a corrupt or hand-crafted pin
-        // from landing a stray effect that the post-commit landed==target
-        // backstop would only catch after the fact.
-        if let Some(kind) = match transaction.operation {
-            Operation::Append { .. } => Some("Append"),
-            Operation::ReserveFragments { .. } => Some("ReserveFragments"),
-            Operation::UpdateConfig { .. } => Some("UpdateConfig"),
-            Operation::Restore { .. } => Some("Restore"),
-            Operation::Clone { .. } => Some("Clone"),
-            _ => None,
-        } {
-            return Ok(PromotionCommit::Unsafe(format!(
-                "operation {kind} is not replay-safe; the engine never stages one detached"
-            )));
-        }
-        if base.version().version + 1 != target {
-            return Ok(PromotionCommit::Unsafe(format!(
-                "base {} is not the predecessor of target {target}",
-                base.version().version
-            )));
-        }
-        transaction.read_version = target - 1;
-        match CommitBuilder::new(base)
-            .with_max_retries(0)
-            .with_skip_auto_cleanup(true)
-            .execute(transaction)
-            .await
-        {
-            Ok(dataset) => {
-                let landed = dataset.version().version;
-                let uuid_matches = StagedTransactionIdentity::recorded_by(&dataset)
-                    .is_some_and(|identity| identity.uuid == expected_uuid);
-                if landed == target && uuid_matches {
-                    Ok(PromotionCommit::Landed(Box::new(dataset)))
-                } else {
-                    Ok(PromotionCommit::Unsafe(format!(
-                        "replay landed at {landed} for target {target} (uuid match {uuid_matches})"
-                    )))
-                }
-            }
-            Err(lance::Error::RetryableCommitConflict { .. }) => Ok(PromotionCommit::Refused),
-            Err(error) => Err(OmniError::storage(error)),
-        }
     }
 
     /// Commit a staged first-touch dataset creation with no conflict retry.

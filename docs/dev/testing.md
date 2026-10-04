@@ -58,8 +58,8 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Maintenance and substrate fences | `maintenance.rs`, `lance_surface_guards.rs`, `lance_version_columns.rs`, `forbidden_apis.rs` |
 | Export and lineage | `export.rs`, `lineage_projection.rs` |
 | Legacy-vintage graphs (`id`/`src`/`dst` spellings, born at the current stamp) | `legacy_columns.rs` — load, query, export round trip, evolution; needs `--features failpoints` |
-| System-column upgrade (RFC 0040 step 3: respelling in place on a supported standalone graph; vintage is independent of the storage stamp) | `system_column_upgrade.rs`: check and execute, preflight refusals, every window before the manifest commit leaving no residue, a complete contract and table state after a post-commit failure, same-handle retry, the control-object cost; needs `--features failpoints`. Route composition and the default target: `upgrade/tests.rs` |
-| Cost and benchmark contracts | `write_cost.rs`, `write_cost_s3.rs`, `warm_read_cost.rs`, `branch_control_cost.rs`, `merge_cost.rs`, `changes_cost.rs`, the checkpoint/head lookup instruments, the ignored `manifest_history_curve.rs` instruments (requests, bytes and retained `__manifest` bytes across history and independent schema-source/IR sizes), the ignored `compaction_memory.rs` instrument (peak heap allocation of Blob-table compaction), and `benchmark_scenario_contract.rs` |
+| System-column upgrade (RFC 0040 step 3: respelling in place on a supported standalone graph; vintage is independent of the storage stamp) | `system_column_upgrade.rs`: check and execute, preflight refusals, every window before the manifest commit leaving no residue, a complete contract and table state after a post-commit failure, same-handle retry, the control-object cost; needs `--features failpoints` |
+| Cost and benchmark contracts | `write_cost.rs`, `write_cost_s3.rs`, `warm_read_cost.rs`, `branch_control_cost.rs`, `merge_cost.rs`, `changes_cost.rs`, the checkpoint/head lookup instruments, the ignored `manifest_history_curve.rs` instruments (requests, bytes and retained `__manifest` and `__history` bytes across history and independent schema-source/IR sizes), the ignored `compaction_memory.rs` instrument (peak heap allocation of Blob-table compaction), and `benchmark_scenario_contract.rs` |
 
 Use `tests/helpers/mod.rs` for the standard graph, snapshots, row reads, Blob selectors, and bounded Blob collection. Recovery helpers belong in `tests/helpers/recovery.rs`; object-store counters belong in `tests/helpers/cost.rs`; graphs whose rows trip the ordered-scan sorter cap belong in `tests/helpers/wide_rows.rs`.
 
@@ -103,7 +103,7 @@ When adding a new writer, update all of these layers. See [recovery.md](recovery
 Blob coverage is deliberately split:
 
 - engine `end_to_end.rs`, `branching.rs`, and in-source Blob tests own logical cell selection, snapshots, integrity, ranges, external classification, and write admission;
-- engine `maintenance.rs` owns Blob compaction (the batch derived from a row's summed Blob columns, fragments with deleted rows, per-task sizing in `maintenance.rs::optimize_sizes_each_compaction_task_from_its_own_fragments`, external references counting nothing in `maintenance.rs::optimize_does_not_size_a_blob_batch_by_external_references`), and `db/upgrade/tests.rs` owns the storage upgrade's source Blob validation (window chunks, the legacy-encoding and nested refusals, the distinct-URI external limit);
+- engine `maintenance.rs` owns Blob compaction (the batch derived from a row's summed Blob columns, fragments with deleted rows, per-task sizing in `maintenance.rs::optimize_sizes_each_compaction_task_from_its_own_fragments`, external references counting nothing in `maintenance.rs::optimize_does_not_size_a_blob_batch_by_external_references`);
 - cluster tests own persisted external-source policy and serving projections;
 - server `data_routes.rs`, `auth_policy.rs`, and `openapi.rs` own GET/HEAD, auth, conditions, ranges, redirects, backpressure, and schema drift;
 - CLI `cli_data.rs` owns `blob get/stat`; `parity_matrix.rs` compares embedded and remote results.
@@ -165,40 +165,22 @@ OMNIGRAPH_V5_BIN=<dir>/target/debug/omnigraph cargo test --locked -p omnigraph-c
 
 The older seams work the same way with released binaries: `OMNIGRAPH_OLD_BIN` (0.7.2) and `OMNIGRAPH_PREVIOUS_BIN` (0.8.1). `OMNIGRAPH_V6_BIN` (the 0.10.0 release) owns the v6↔v10 fence. RFC 0062 introduced v7's registration clock, RFC 0042's native-ref retirement metadata requires v8, RFC 0040's system columns stamped new graphs v9, and RFC 0067's detached table commits stamp every graph v10. The v0.9 journey is a different case, a fully exercised v6 graph — branches, edges, vectors, full-text and blobs — that the current binary refuses and that is rebuilt from a 0.9 export; `Test Workspace` runs both on every pull request that changes engine input, with the releases it installs.
 
-The separate `Storage Upgrade Compatibility` CI job requires genuine v0.9 and
-v0.10 local standalone journeys. Each first takes v6 → v7 → v8 with
-`--to-format 8`, then the default v8 → v10 → v11 → v13 route on the same
-branched fixture. The owners compare exports, table payload files, branch
-ancestry, commit IDs, numeric snapshots and Blob bytes, and verify that the
-accepted source/IR text moves into each branch's contract row before the root
-files disappear. Missing predecessors, missing cases, empty runs and skipped
-required cases fail the job; a local environment-gated skip is not evidence.
-
-For local storage-upgrade journeys, put verified released executables at
-`target/storage-upgrade-binaries/v0.9.0/omnigraph` and
-`target/storage-upgrade-binaries/v0.10.0/omnigraph` in the workspace, then run:
+The separate `Storage Upgrade Compatibility` CI job requires the
+`storage_upgrade` cases of `crossversion_upgrade.rs` (the `omnigraph upgrade`
+report on a fresh graph and the cluster-path refusal), `lance_version_columns`
+and `forbidden_apis`. They need no predecessor binary. Missing cases, empty
+runs and skipped required cases fail the job. To run the crossversion scope
+locally:
 
 ```bash
 cargo test --workspace --locked --test crossversion_upgrade --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints storage_upgrade -- --test-threads=1
 ```
 
-The existing CI environment inputs take precedence. Without those inputs,
-the presence of `target/storage-upgrade-binaries` requires both local fixtures;
-a missing file or unexpected exact release version fails. The harness logs
-the selected executable, and `check-storage-upgrade-ci.py --check-log
-crossversion <log>` rejects a skipped required journey.
-
-`db/upgrade/tests.rs` owns route composition and intermediate targets, deferred
-check reporting, intent recovery, retired ancestry, v10 pin promotion and
-cleanup, and the v13 conversion protocol. Its fixtures must include actual
-flat-v11 and packed-v12 sources without contract rows, both mixed branch
-directions, zero-effect checks, exact contract identity and text digests,
-foreign movement and every interruption boundary, including each legacy-file
-delete. The upgrade-only v10 constructor must not admit ordinary opens while
-its handle exists, even for an unexpectedly row-bearing source. Current-v13
-no-op cases preserve ignored orphan files/staging and allow the former
-sentinel name as a user branch. Keep ordinary-open refusal for all pre-v13
-stamps; an explicit intermediate stop does not grant serving support.
+`db/upgrade/tests.rs` owns the `upgrade_storage` report: `already_current`
+with no write on a fresh graph, `unsupported_source` with the open guard's
+text for another stamp, `unsupported_target` for another `--to-format`, and
+`recovery_required` for a pending conversion marker. Keep ordinary-open
+refusal for all pre-v14 stamps.
 `schema_apply.rs`, `system_column_upgrade.rs` and historical-read owners cover
 atomic contract publication, first-touch retry and current-contract historical
 reads. The catalog tests own row uniqueness, projection and validation;

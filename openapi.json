@@ -10270,6 +10270,12 @@
               "v2"
             ]
           },
+          "history_release_bytes": {
+            "type": "integer",
+            "description": "the byte budget of a branch's buffer of unreleased commits; a mutate, load or branch merge of this session whose buffer and head reach it closes a history block and the publish after it writes the block under `__history`; query results never change, only where settled commits are stored and how many requests a publish makes",
+            "maximum": 262144,
+            "minimum": 1024
+          },
           "merge_lineage": {
             "type": "string",
             "description": "how a merge finds the entities it classifies: the full-scan walk, the lineage path, or both compared",

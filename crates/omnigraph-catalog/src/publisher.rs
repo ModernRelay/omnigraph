@@ -9,47 +9,49 @@
 //!
 //! Until Lance exposes that operation directly, this publisher owns only:
 //! - validating batch publish invariants against the current `__manifest` state
-//! - atomically inserting immutable `table_version` rows into `__manifest`
+//! - appending the commits a full buffer holds, and the records of a merged
+//!   branch, to `__history`
+//! - atomically replacing the `table` rows, the head commit's record and the
+//!   buffer in `__manifest`
 //! - returning the refreshed manifest dataset that defines the visible graph
 //!
 //! This module should disappear once Lance Rust can do branch-aware batch table
 //! version publication against a managed namespace manifest.
 
-use std::collections::HashMap;
+use arrow_array::RecordBatch;
+use lance_core::deepsize::DeepSizeOf;
+use lance_table::format::Manifest;
+use lance_table::io::commit::ManifestLocation;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use lance::Dataset;
 use lance::Error as LanceError;
-use lance_core::deepsize::DeepSizeOf;
 use lance_namespace::NamespaceError;
 #[cfg(any(test, feature = "test-util"))]
 use lance_namespace::models::CreateTableVersionRequest;
-use lance_table::format::Manifest;
-use lance_table::io::commit::ManifestLocation;
+use omnigraph_core::graph_commit_id::{
+    HISTORY_BLOCK_SLOTS, HistoryBlockId, canonical_ulid, parse_history_block_id,
+};
 
 use crate::error::{OmniError, Result};
 
 #[cfg(any(test, feature = "test-util"))]
 use super::DatasetUpdate;
 use super::commit;
-use super::layout::{
-    open_manifest_dataset_with_session, table_object_id, tombstone_object_id, version_object_id,
-};
-use super::metadata::{TableVersionMetadata, parse_namespace_version_request};
+use super::history;
+use super::layout::open_manifest_dataset_with_session;
+use super::metadata::parse_namespace_version_request;
 use super::migrations::{INTERNAL_MANIFEST_SCHEMA_VERSION, guard_stamp, read_stamp};
 use super::state::{
-    GraphLineageRow, GraphLineageRowPart, ManifestState, ProjectionAccumulator, SchemaContractHead,
-    assemble_manifest_projection, decode_publish_batch, graph_head_object_id,
-    graph_lineage_row_parts, head_lineage_row, manifest_rows_batch, read_manifest_state,
-    read_publish_scan, schema_contract_metadata_json,
+    BranchRecords, CommitBuffer, GraphLineageRow, HeldRecord, ManifestRows, ManifestState,
+    ReplacedRow, ReplacedTable, TablePin, TableRow, TableState, exact_head, manifest_state,
+    read_manifest_rows,
 };
 use super::{
-    DatasetEntry, ExpectedTableVersions, MAIN_BRANCH_HEAD_KEY, ManifestChange, ManifestIncarnation,
-    NativeRefPin, OBJECT_TYPE_SCHEMA_CONTRACT, OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE,
-    OBJECT_TYPE_TABLE_VERSION, SCHEMA_CONTRACT_OBJECT_ID, TableIdentity, TableRegistration,
-    TableRename, TableTombstone, WinnerRef,
+    ExpectedTableVersions, HistoryReleaseBytes, MAIN_BRANCH_HEAD_KEY, ManifestChange, NativeRefPin,
+    TableIdentity, TableRename, TableTombstone,
 };
 use crate::seams::{contention, decide_seam, fail};
 
@@ -59,29 +61,70 @@ use crate::seams::{contention, decide_seam, fail};
 const PUBLISHER_RETRY_BUDGET: u32 = 5;
 
 /// The graph-lineage commit to record atomically with a manifest publish
-/// (RFC-013 Phase 7). One logical commit per publish: the `graph_commit_id` is
-/// minted once by the caller and stays stable across the publisher's CAS
-/// retries. Legacy [`PublishPrecondition::Any`] publishes re-resolve the parent
+/// (RFC-013 Phase 7). One logical intent per publish: its nonce is minted once
+/// by the caller. The physical commit ID is allocated against each CAS attempt's
+/// captured head and returned by publication. [`PublishPrecondition::Any`] publishes re-resolve the parent
 /// per attempt. An exact-head publish instead rejects a retry once that authority
 /// changed, so a prepared write can never be silently re-parented.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LineageIntent {
-    /// ULID minted once before the publish loop; the graph commit's identity.
+    /// Stable intent nonce. A canonical ULID is wrapped in the attempted block
+    /// address; explicit opaque test identities remain singleton records.
     pub graph_commit_id: String,
-    /// The branch this commit lands on (`None` = main). Selects the
-    /// `graph_head:<branch>` pointer row that gets updated.
+    /// The branch this commit lands on (`None` = main).
     pub branch: Option<String>,
     /// Authoring actor, or `None` for unauthored / system writes.
     pub actor_id: Option<String>,
-    /// The merged-in source head — `Some` only for a branch-merge commit.
-    pub merged_parent_commit_id: Option<String>,
+    /// The records of the merged-in source branch, `Some` only for a
+    /// branch-merge commit: the commits its `__manifest` buffers and its head.
+    /// The publish appends them to `__history` before its CAS, so a reader of
+    /// the target finds the merge commit's second parent and its ancestors in
+    /// `__history` whatever the source branch does next. A serialized intent
+    /// names the merged head only, and one that names any does not read back.
+    #[serde(
+        rename = "merged_parent_commit_id",
+        serialize_with = "serialize_merged_head",
+        deserialize_with = "deserialize_no_merged_head"
+    )]
+    pub merged_parent: Option<BranchRecords>,
     /// Commit timestamp (microseconds since the UNIX epoch).
     pub created_at: i64,
+    /// The byte budget of the target's buffer for this publish:
+    /// [`crate::HISTORY_RELEASE_BYTES`] unless the session lowered it with
+    /// `history_release_bytes`. Every attempt of one publish reads the same
+    /// value, so the slot the commit id records, the records appended and the
+    /// buffer emptied agree. Not serialized: a prepared token reads the
+    /// production budget back.
+    #[serde(skip, default)]
+    pub history_release_bytes: HistoryReleaseBytes,
 }
 
-/// The exact mutable graph-head authority a prepared write observed. A missing
-/// row is first-class: a freshly-created named branch inherits lineage commits
-/// but has no `graph_head:<its-name>` until its first graph commit.
+fn serialize_merged_head<S: serde::Serializer>(
+    merged_parent: &Option<BranchRecords>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(
+        &merged_parent
+            .as_ref()
+            .map(|records| records.head.commit.graph_commit_id.as_str()),
+        serializer,
+    )
+}
+
+fn deserialize_no_merged_head<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<BranchRecords>, D::Error> {
+    match <Option<String> as serde::Deserialize>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(_) => Err(serde::de::Error::custom(
+            "a serialized lineage intent cannot carry the records of a merged branch",
+        )),
+    }
+}
+
+/// The exact graph-head authority a prepared write observed. An absent head is
+/// first-class: a freshly-created named branch holds the head its source wrote
+/// and has no head of its own until its first graph commit.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GraphHeadExpectation {
     /// `None` means main; `Some("main")` is normalized to `None` by [`new`].
@@ -89,7 +132,7 @@ pub struct GraphHeadExpectation {
     /// Lance-native stable branch identity. This detects delete/recreate ABA;
     /// manifest versions/eTags are deliberately not branch identity.
     pub branch_identifier: lance::dataset::refs::BranchIdentifier,
-    /// Exact commit id stored in the branch's head row, or `None` when absent.
+    /// The id of the branch's exact head commit, or `None` when absent.
     pub head_commit_id: Option<String>,
 }
 
@@ -108,8 +151,12 @@ impl GraphHeadExpectation {
         }
     }
 
-    fn object_id(&self) -> String {
-        graph_head_object_id(self.branch.as_deref())
+    /// The name a changed head carries in a `ReadSetChanged` conflict.
+    fn read_set_member(&self) -> String {
+        format!(
+            "graph_head:{}",
+            self.branch.as_deref().unwrap_or(MAIN_BRANCH_HEAD_KEY)
+        )
     }
 }
 
@@ -142,26 +189,24 @@ pub struct PublishOutcome {
     /// The advanced `__manifest` dataset (its version is the published version).
     pub dataset: Dataset,
     /// The parent the publisher resolved for the recorded commit, if a
-    /// [`LineageIntent`] was supplied. Returned so the caller can update its
-    /// in-memory commit cache without a re-read. `None` when no lineage was
-    /// recorded, or when the commit is the genesis (no parent).
+    /// [`LineageIntent`] was supplied. `None` when no lineage was recorded.
     pub parent_commit_id: Option<String>,
-    /// The new visible per-table state, folded in-memory from the pre-publish
-    /// state ∪ the committed rows (RFC-013 PR2 #1b). Returned so the caller skips
-    /// the O(fragments) post-publish `read_manifest_state` re-scan. Byte-identical
-    /// to that re-scan: built through the same `assemble_manifest_state` reduction.
+    /// The new visible per-table state, reduced in memory from the rows the
+    /// publish wrote by the reduction a read of `dataset` applies, so the
+    /// caller skips that read.
     pub known_state: ManifestState,
-    /// Exact successful-attempt base, when its branch lifetime was checked.
-    pub base_incarnation: Option<ManifestIncarnation>,
-    /// Compact fold returned with `known_state`, absent for the compatibility
-    /// no-op that reads only table state. Never a second durable state. Boxed
-    /// to keep the outcome small across nested async publication callers.
-    pub projection: Option<Box<ProjectionAccumulator>>,
+    /// The head commit's record in `dataset`: the commit this publish recorded
+    /// when a [`LineageIntent`] was supplied, else the head the publish read.
+    pub head: GraphLineageRow,
+    /// The `table` rows of `dataset`'s version.
+    pub tables: Vec<TableRow>,
+    /// The buffer of `dataset`'s version.
+    pub buffer: CommitBuffer,
+    pub schema_contract: Option<crate::SchemaContractRow>,
 }
 
 #[async_trait]
 pub trait ManifestBatchPublisher: Send + Sync {
-    /// Acknowledged rows only when their immutable image matches the capture.
     fn cached_rows(&self, _dataset: &Dataset) -> Option<RecordBatch> {
         None
     }
@@ -208,10 +253,11 @@ struct PublishedRows {
     manifest: Manifest,
     location: ManifestLocation,
     batch: RecordBatch,
+    acknowledged: Option<Dataset>,
 }
 
 impl PublishedRows {
-    fn new(dataset: &Dataset, batch: RecordBatch) -> Option<Self> {
+    async fn new(dataset: &Dataset, batch: RecordBatch) -> Option<Self> {
         let manifest = dataset.manifest();
         let location = dataset.manifest_location();
         let bytes = batch
@@ -229,10 +275,16 @@ impl PublishedRows {
         {
             return None;
         }
+        let acknowledged = crate::instrumentation::retain_control_dataset(
+            dataset,
+            PUBLISHED_ROWS_CACHE_BYTES - bytes,
+        )
+        .await;
         Some(Self {
             manifest: manifest.clone(),
             location: location.clone(),
             batch,
+            acknowledged,
         })
     }
 
@@ -257,50 +309,21 @@ pub(crate) fn manifest_image_matches(
         && manifest.schema.metadata == dataset.schema().metadata
 }
 
-#[derive(Debug)]
-struct PendingVersionRow {
-    object_id: String,
-    object_type: String,
-    location: Option<String>,
-    metadata: Option<String>,
-    table_key: String,
-    identity: Option<TableIdentity>,
-    table_version: Option<u64>,
-    table_branch: Option<String>,
-    row_count: Option<u64>,
-    /// `(source, ir)` texts, present on the `schema_contract` row alone.
-    schema_content: Option<(String, String)>,
-}
-
-/// Everything one CAS attempt needs out of a single `__manifest` scan
-/// (RFC-013 P2): the open dataset, table state for the pre-check + pending-row
-/// build, `graph_commit` lineage rows for parent resolution, and exact
-/// `graph_head` rows for OCC. Folding lineage authority into this struct is what
-/// lets both checks skip their own `read_graph_lineage` scan.
+/// Everything one CAS attempt needs, from one `__manifest` scan: the open
+/// dataset, its `table` rows and its head commit's record.
 struct LoadedPublishState {
     dataset: Dataset,
-    registered_tables: HashMap<TableIdentity, TableRegistration>,
-    /// Registrations keyed by `(identity, manifest_version)` (RFC 0062).
-    existing_versions: HashMap<(TableIdentity, u64), DatasetEntry>,
-    /// Tombstones keyed the same way, see [`PublishScan::tombstones`].
-    existing_tombstones: HashMap<(TableIdentity, u64), u64>,
-    lineage_rows: Vec<GraphLineageRow>,
-    graph_heads: HashMap<String, String>,
-    /// The live `schema_contract` row's head, carried forward by the fold
-    /// unless the batch replaces the row.
-    schema_contract: Option<SchemaContractHead>,
-    /// The scanned rows, the input of the copy-on-write publish.
-    live_rows: Vec<arrow_array::RecordBatch>,
+    rows: ManifestRows,
 }
 
-/// What `fold_inputs` folds a publish batch down to: the alias/path
-/// registrations after the batch, the surviving version entries, and the
-/// `(identity, manifest_version)` pairs of every tombstone after the batch.
-type FoldedPublishInputs = (
-    HashMap<TableIdentity, TableRegistration>,
-    Vec<DatasetEntry>,
-    Vec<(TableIdentity, u64)>,
-);
+type TableRows = BTreeMap<TableIdentity, TableRow>;
+
+/// The rows one CAS attempt read and its overwrite replaces.
+pub(crate) struct HeldRows<'a> {
+    pub(crate) tables: &'a [TableRow],
+    pub(crate) head: &'a GraphLineageRow,
+    pub(crate) buffer: &'a CommitBuffer,
+}
 
 decide_seam! {
     /// The publisher's `load_publish_state` read, inside the CAS retry loop.
@@ -331,32 +354,6 @@ decide_seam! {
 }
 
 impl GraphNamespacePublisher {
-    fn checked_base_incarnation(
-        &self,
-        dataset: &Dataset,
-        precondition: &PublishPrecondition,
-    ) -> Option<ManifestIncarnation> {
-        let branch_identifier = match precondition {
-            PublishPrecondition::ExactGraphHead(expected)
-            | PublishPrecondition::ExactGraphVersion {
-                authority: expected,
-                ..
-            } => expected.branch_identifier.clone(),
-            PublishPrecondition::Any if self.branch.is_none() => {
-                lance::dataset::refs::BranchIdentifier::main()
-            }
-            // Compatibility publishers on named branches carry no checked
-            // lifetime. They keep the conservative full-refresh behavior.
-            PublishPrecondition::Any => return None,
-        };
-        Some(ManifestIncarnation {
-            version: dataset.version().version,
-            e_tag: dataset.manifest_location().e_tag.clone(),
-            timestamp_nanos: Some(dataset.manifest().timestamp_nanos),
-            branch_identifier,
-        })
-    }
-
     #[cfg(any(test, feature = "test-util"))]
     pub fn new(root_uri: &str, branch: Option<&str>) -> Self {
         Self::new_with_session(root_uri, branch, crate::lance_access::control_session())
@@ -378,6 +375,23 @@ impl GraphNamespacePublisher {
     }
 
     async fn dataset(&self) -> Result<Dataset> {
+        if self.branch.is_none() {
+            let held = self
+                .published_rows
+                .lock()
+                .expect("published rows cache lock poisoned")
+                .as_ref()
+                .and_then(|rows| rows.acknowledged.clone());
+            if let Some(held) = held
+                && let Some(current) = crate::instrumentation::current_control_dataset(
+                    &held,
+                    crate::instrumentation::manifest_wrapper(),
+                )
+                .await?
+            {
+                return Ok(current);
+            }
+        }
         open_manifest_dataset_with_session(
             &self.root_uri,
             self.branch.as_deref(),
@@ -393,43 +407,26 @@ impl GraphNamespacePublisher {
         contention(&PUBLISH_LOAD_STATE)?;
         let dataset = self.dataset().await?;
         guard_stamp(&dataset)?;
-        let cached = self.cached_rows(&dataset);
-        let scan = match cached {
-            Some(batch) => decode_publish_batch(&dataset, batch).await?,
-            None => read_publish_scan(&dataset).await?,
+        let rows = match self.cached_rows(&dataset) {
+            Some(batch) => super::state::rows_of_batch(&batch)?,
+            None => read_manifest_rows(&dataset).await?,
         };
-        let existing_versions = scan
-            .version_entries
-            .iter()
-            .map(|entry| ((entry.identity, entry.manifest_version), entry.clone()))
-            .collect();
-        let existing_tombstones = scan.tombstones.into_iter().collect();
-        Ok(LoadedPublishState {
-            dataset,
-            registered_tables: scan.table_registrations,
-            existing_versions,
-            existing_tombstones,
-            lineage_rows: scan.lineage_rows,
-            graph_heads: scan.graph_heads,
-            schema_contract: scan.schema_contract,
-            live_rows: scan.live_rows,
-        })
+        Ok(LoadedPublishState { dataset, rows })
     }
 
-    fn build_pending_rows(
+    /// The `table` rows after `changes`, and whether `changes` wrote any row.
+    /// Registrations and renames apply first, so an update or a drop in the
+    /// same batch resolves through the binding the batch leaves.
+    fn apply_changes(
         changes: &[ManifestChange],
-        known_tables: &HashMap<TableIdentity, TableRegistration>,
-        existing_versions: &HashMap<(TableIdentity, u64), DatasetEntry>,
-        existing_tombstones: &HashMap<(TableIdentity, u64), u64>,
+        tables: &TableRows,
         new_manifest_version: u64,
-    ) -> Result<Vec<PendingVersionRow>> {
-        let mut claimed_identities = std::collections::HashSet::<TableIdentity>::new();
-        let mut binding_changes = HashMap::<TableIdentity, ()>::new();
-        let mut known_tables = known_tables.clone();
-        let mut rows = Vec::with_capacity(changes.len());
+    ) -> Result<(TableRows, bool)> {
+        let mut claimed_identities = HashSet::<TableIdentity>::new();
+        let mut binding_changes = HashSet::<TableIdentity>::new();
+        let mut tables = tables.clone();
+        let mut wrote = false;
 
-        // Registration and rename rows are applied first so an update in the
-        // same batch resolves through the post-change binding.
         for change in changes {
             match change {
                 ManifestChange::RegisterTable(registration) => {
@@ -451,7 +448,8 @@ impl GraphNamespacePublisher {
                             },
                         ));
                     }
-                    if let Some(existing) = known_tables.get(&registration.identity) {
+                    if let Some(existing) = tables.get(&registration.identity) {
+                        let existing = &existing.registration;
                         if existing == registration {
                             continue;
                         }
@@ -464,25 +462,20 @@ impl GraphNamespacePublisher {
                             },
                         ));
                     }
-                    if binding_changes.insert(registration.identity, ()).is_some() {
+                    if !binding_changes.insert(registration.identity) {
                         return Err(OmniError::manifest(format!(
                             "manifest batch changes table binding {} more than once",
                             registration.identity
                         )));
                     }
-                    known_tables.insert(registration.identity, registration.clone());
-                    rows.push(PendingVersionRow {
-                        object_id: table_object_id(registration.identity),
-                        object_type: OBJECT_TYPE_TABLE.to_string(),
-                        location: Some(registration.table_path.clone()),
-                        metadata: None,
-                        table_key: registration.table_key.clone(),
-                        identity: Some(registration.identity),
-                        table_version: None,
-                        table_branch: None,
-                        row_count: None,
-                        schema_content: None,
-                    });
+                    tables.insert(
+                        registration.identity,
+                        TableRow {
+                            registration: registration.clone(),
+                            state: TableState::Registered,
+                        },
+                    );
+                    wrote = true;
                 }
                 ManifestChange::RenameTable(TableRename {
                     identity,
@@ -491,17 +484,17 @@ impl GraphNamespacePublisher {
                     table_path,
                 }) => {
                     identity.validate()?;
-                    if binding_changes.insert(*identity, ()).is_some() {
+                    if !binding_changes.insert(*identity) {
                         return Err(OmniError::manifest(format!(
                             "manifest batch changes table binding {identity} more than once"
                         )));
                     }
-                    let existing = known_tables.get(identity).ok_or_else(|| {
+                    let existing = tables.get_mut(identity).ok_or_else(|| {
                         OmniError::storage_namespace(NamespaceError::TableNotFound {
                             message: format!("table identity {identity} not found"),
                         })
                     })?;
-                    if !Self::is_live_identity(*identity, existing_versions, existing_tombstones) {
+                    if !matches!(existing.state, TableState::Pinned(_)) {
                         return Err(OmniError::storage_namespace(
                             NamespaceError::TableNotFound {
                                 message: format!(
@@ -510,13 +503,17 @@ impl GraphNamespacePublisher {
                             },
                         ));
                     }
-                    if existing.table_key != *expected_table_key
-                        || existing.table_path != *table_path
+                    let registration = &mut existing.registration;
+                    if registration.table_key != *expected_table_key
+                        || registration.table_path != *table_path
                     {
                         return Err(OmniError::manifest_read_set_changed(
                             format!("dataset_binding:{identity}"),
                             Some(format!("{expected_table_key}@{table_path}")),
-                            Some(format!("{}@{}", existing.table_key, existing.table_path)),
+                            Some(format!(
+                                "{}@{}",
+                                registration.table_key, registration.table_path
+                            )),
                         ));
                     }
                     let canonical_path = super::table_path_for_identity(table_key, *identity)?;
@@ -529,24 +526,8 @@ impl GraphNamespacePublisher {
                     if table_key == expected_table_key {
                         continue;
                     }
-                    let renamed = TableRegistration {
-                        identity: *identity,
-                        table_key: table_key.clone(),
-                        table_path: table_path.clone(),
-                    };
-                    known_tables.insert(*identity, renamed);
-                    rows.push(PendingVersionRow {
-                        object_id: table_object_id(*identity),
-                        object_type: OBJECT_TYPE_TABLE.to_string(),
-                        location: Some(table_path.clone()),
-                        metadata: None,
-                        table_key: table_key.clone(),
-                        identity: Some(*identity),
-                        table_version: None,
-                        table_branch: None,
-                        row_count: None,
-                        schema_content: None,
-                    });
+                    registration.table_key = table_key.clone();
+                    wrote = true;
                 }
                 ManifestChange::Update(_)
                 | ManifestChange::Tombstone(_)
@@ -554,84 +535,37 @@ impl GraphNamespacePublisher {
             }
         }
 
-        let mut schema_contract_claimed = false;
         for change in changes {
             match change {
-                ManifestChange::RegisterTable(_) | ManifestChange::RenameTable(_) => {}
-                ManifestChange::SchemaContract(contract) => {
-                    if std::mem::replace(&mut schema_contract_claimed, true) {
-                        return Err(OmniError::manifest(
-                            "the schema contract is replaced twice in one publish request"
-                                .to_string(),
-                        ));
-                    }
-                    rows.push(PendingVersionRow {
-                        object_id: SCHEMA_CONTRACT_OBJECT_ID.to_string(),
-                        object_type: OBJECT_TYPE_SCHEMA_CONTRACT.to_string(),
-                        location: None,
-                        metadata: Some(schema_contract_metadata_json(&contract.head)?),
-                        table_key: String::new(),
-                        identity: None,
-                        table_version: None,
-                        table_branch: None,
-                        row_count: None,
-                        schema_content: Some((contract.source.clone(), contract.ir.clone())),
-                    });
-                }
+                ManifestChange::RegisterTable(_)
+                | ManifestChange::RenameTable(_)
+                | ManifestChange::SchemaContract(_) => {}
                 ManifestChange::Update(update) => {
                     update.identity.validate()?;
                     let request = update.to_create_table_version_request();
-                    let (table_key, table_version, row_count, table_branch, version_metadata) =
+                    let (table_key, table_version, row_count, table_branch, metadata) =
                         parse_namespace_version_request(&request).map_err(OmniError::storage)?;
-                    let registration = known_tables.get(&update.identity).ok_or_else(|| {
-                        OmniError::storage_namespace(NamespaceError::TableNotFound {
-                            message: format!("table identity {} not found", update.identity),
-                        })
-                    })?;
-                    if registration.table_key != table_key {
-                        return Err(OmniError::storage_namespace(
-                            NamespaceError::ConcurrentModification {
-                                message: format!(
-                                    "table identity {} is bound to {}, not {}",
-                                    update.identity, registration.table_key, table_key
-                                ),
-                            },
-                        ));
-                    }
-                    if !claimed_identities.insert(update.identity) {
-                        return Err(OmniError::manifest(format!(
-                            "table identity {} ({}) is claimed twice in one publish request",
-                            update.identity, table_key
-                        )));
-                    }
-                    if existing_tombstones
-                        .keys()
-                        .any(|(candidate, _)| *candidate == update.identity)
-                        && !Self::is_live_identity(
-                            update.identity,
-                            existing_versions,
-                            existing_tombstones,
-                        )
-                    {
+                    let table = Self::claim(
+                        &mut tables,
+                        &mut claimed_identities,
+                        update.identity,
+                        &table_key,
+                    )?;
+                    if matches!(table.state, TableState::Dropped { .. }) {
                         return Err(OmniError::manifest(format!(
                             "table identity {} ({}) is tombstoned; a dropped table is never \
                              re-registered (re-adding a type mints a new incarnation)",
                             update.identity, table_key
                         )));
                     }
-
-                    rows.push(PendingVersionRow {
-                        object_id: version_object_id(update.identity, new_manifest_version),
-                        object_type: OBJECT_TYPE_TABLE_VERSION.to_string(),
-                        location: None,
-                        metadata: Some(version_metadata.to_json_string()?),
-                        table_key,
-                        identity: Some(update.identity),
-                        table_version: Some(table_version),
+                    table.state = TableState::Pinned(TablePin {
+                        table_version,
                         table_branch,
-                        row_count: Some(row_count),
-                        schema_content: None,
+                        row_count,
+                        metadata,
+                        manifest_version: new_manifest_version,
                     });
+                    wrote = true;
                 }
                 ManifestChange::Tombstone(TableTombstone {
                     identity,
@@ -639,345 +573,246 @@ impl GraphNamespacePublisher {
                     tombstone_version,
                 }) => {
                     identity.validate()?;
-                    let registration = known_tables.get(identity).ok_or_else(|| {
-                        OmniError::storage_namespace(NamespaceError::TableNotFound {
-                            message: format!("table identity {identity} not found"),
-                        })
-                    })?;
-                    if registration.table_key != *table_key {
-                        return Err(OmniError::storage_namespace(
-                            NamespaceError::ConcurrentModification {
-                                message: format!(
-                                    "table identity {identity} is bound to {}, not {}",
-                                    registration.table_key, table_key
-                                ),
-                            },
-                        ));
-                    }
-                    if !claimed_identities.insert(*identity) {
-                        return Err(OmniError::manifest(format!(
-                            "table identity {} ({}) is claimed twice in one publish request",
-                            identity, table_key
-                        )));
-                    }
-                    if existing_tombstones
-                        .keys()
-                        .any(|(candidate, _)| *candidate == *identity)
-                        && !Self::is_live_identity(
-                            *identity,
-                            existing_versions,
-                            existing_tombstones,
-                        )
-                    {
+                    let table =
+                        Self::claim(&mut tables, &mut claimed_identities, *identity, table_key)?;
+                    if matches!(table.state, TableState::Dropped { .. }) {
                         return Err(OmniError::manifest(format!(
                             "table identity {identity} ({table_key}) is already tombstoned"
                         )));
                     }
-                    rows.push(PendingVersionRow {
-                        object_id: tombstone_object_id(*identity, new_manifest_version),
-                        object_type: OBJECT_TYPE_TABLE_TOMBSTONE.to_string(),
-                        location: None,
-                        metadata: None,
-                        table_key: table_key.clone(),
-                        identity: Some(*identity),
-                        table_version: Some(*tombstone_version),
-                        table_branch: None,
-                        row_count: None,
-                        schema_content: None,
-                    });
+                    table.state = TableState::Dropped {
+                        dropped_at: new_manifest_version,
+                        sealed_version: *tombstone_version,
+                    };
+                    wrote = true;
                 }
             }
         }
 
-        Ok(rows)
+        Ok((tables, wrote))
     }
 
-    /// Resolve the parent for `intent` against the just-loaded `dataset` and
-    /// build the two lineage rows (`graph_commit` + `graph_head:<branch>`) to
-    /// fold into the publish batch. Runs INSIDE the CAS retry loop, so the
-    /// parent is read from the manifest state this attempt will commit against —
-    /// a retry after a concurrent commit re-reads the advanced head and parents
-    /// correctly (TOCTOU closed). `new_manifest_version` is the version this
-    /// publish produces (the recorded commit pins it).
-    ///
-    /// The parent is the current head of the branch's lineage — the
-    /// `should_replace_head` winner over the visible `graph_commit` rows, the
-    /// same selection the commit-graph cache uses. (The denormalized
-    /// `graph_head:<branch>` row is written for forward-compat but is not the
-    /// parent source here: a branch freshly forked from main inherits main's
-    /// commits but not yet a `graph_head:<its-name>` row, and the head-over-rows
-    /// computation gives the correct fork-point parent in that case.)
-    ///
-    /// `lineage_rows` is the `graph_commit` set this attempt already parsed in
-    /// `load_publish_state`'s single scan (RFC-013 P2) — NOT a fresh
-    /// `read_graph_lineage` scan. The per-attempt re-read is still preserved: the
-    /// retry loop re-runs `load_publish_state`, so each attempt's `lineage_rows`
-    /// reflects the head as it stands for that attempt.
-    fn resolve_lineage_rows(
-        lineage_rows: &[GraphLineageRow],
-        intent: &LineageIntent,
-        new_manifest_version: u64,
-    ) -> Result<(Vec<PendingVersionRow>, Option<String>)> {
-        let parent_commit_id = head_lineage_row(lineage_rows).map(|h| h.graph_commit_id.clone());
+    /// The row of `identity` for the one update or drop a publish may carry
+    /// for it, bound to the alias the change names.
+    fn claim<'a>(
+        tables: &'a mut TableRows,
+        claimed_identities: &mut HashSet<TableIdentity>,
+        identity: TableIdentity,
+        table_key: &str,
+    ) -> Result<&'a mut TableRow> {
+        let table = tables.get_mut(&identity).ok_or_else(|| {
+            OmniError::storage_namespace(NamespaceError::TableNotFound {
+                message: format!("table identity {identity} not found"),
+            })
+        })?;
+        if table.registration.table_key != table_key {
+            return Err(OmniError::storage_namespace(
+                NamespaceError::ConcurrentModification {
+                    message: format!(
+                        "table identity {identity} is bound to {}, not {table_key}",
+                        table.registration.table_key
+                    ),
+                },
+            ));
+        }
+        if !claimed_identities.insert(identity) {
+            return Err(OmniError::manifest(format!(
+                "table identity {identity} ({table_key}) is claimed twice in one publish request"
+            )));
+        }
+        Ok(table)
+    }
 
-        let commit = GraphLineageRow {
-            graph_commit_id: intent.graph_commit_id.clone(),
+    /// The commit `intent` records on top of `parent`, the head this attempt
+    /// read, at the `__manifest` version this attempt writes.
+    fn next_head(
+        intent: &LineageIntent,
+        parent: &GraphLineageRow,
+        buffer: &CommitBuffer,
+        tables: &TableRows,
+        native_branch: Option<String>,
+        new_manifest_version: u64,
+    ) -> Result<GraphLineageRow> {
+        let generation = intent
+            .merged_parent
+            .as_ref()
+            .map_or(parent.generation, |merged| {
+                merged.head.commit.generation.max(parent.generation)
+            })
+            .checked_add(1)
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "generation of graph commit {} overflows",
+                    intent.graph_commit_id
+                ))
+            })?;
+        Ok(GraphLineageRow {
+            graph_commit_id: Self::attempt_commit_id(
+                intent,
+                parent,
+                buffer,
+                tables,
+                native_branch.as_deref(),
+            )?,
+            schema_contract: parent.schema_contract.clone(),
+            schema_content_hash: parent.schema_content_hash.clone(),
             graph_branch: intent.branch.clone(),
+            native_branch,
             graph_manifest_version: new_manifest_version,
-            parent_commit_id: parent_commit_id.clone(),
-            merged_parent_commit_id: intent.merged_parent_commit_id.clone(),
+            generation,
+            parent_commit_id: Some(parent.graph_commit_id.clone()),
+            merged_parent_commit_id: intent
+                .merged_parent
+                .as_ref()
+                .map(|merged| merged.head.commit.graph_commit_id.clone()),
             actor_id: intent.actor_id.clone(),
             created_at: intent.created_at,
+        })
+    }
+
+    /// The block id of this attempt's commit. Slot 0 is the release decision: the
+    /// commit that reaches the byte budget or the slot ceiling opens a new block, and
+    /// the publish after it reads that off the id and archives the buffered block whole.
+    fn attempt_commit_id(
+        intent: &LineageIntent,
+        parent: &GraphLineageRow,
+        buffer: &CommitBuffer,
+        tables: &TableRows,
+        native_branch: Option<&str>,
+    ) -> Result<String> {
+        if intent.graph_commit_id == "hb1" || intent.graph_commit_id.starts_with("hb1.") {
+            return Err(OmniError::manifest_internal(
+                "a publication intent must contain a nonce, not a history block commit id",
+            ));
+        }
+        let Some(nonce) = canonical_ulid(&intent.graph_commit_id) else {
+            return Ok(intent.graph_commit_id.clone());
         };
-        let parts = graph_lineage_row_parts(&commit, intent.branch.as_deref())?;
-        Ok((
-            parts.into_iter().map(lineage_part_to_pending).collect(),
-            parent_commit_id,
-        ))
+        let slot = if buffer.is_full_under(parent, tables.values(), intent.history_release_bytes)? {
+            1
+        } else if buffer.closes_with_under(parent, tables.values(), intent.history_release_bytes) {
+            0
+        } else {
+            buffer.commits().len() + 1
+        };
+        let slot = u16::try_from(slot)
+            .ok()
+            .filter(|slot| *slot < HISTORY_BLOCK_SLOTS)
+            .ok_or_else(|| OmniError::manifest_internal("history block slot overflow"))?;
+        let block = parse_history_block_id(&parent.graph_commit_id)?
+            .filter(|id| parent.native_branch.as_deref() == native_branch && id.slot + 1 == slot)
+            .map_or(nonce, |id| id.block);
+        Ok(HistoryBlockId::new(block, slot, nonce)?.to_string())
     }
 
-    fn pending_rows_to_batch(rows: Vec<PendingVersionRow>) -> Result<arrow_array::RecordBatch> {
-        let mut object_ids = Vec::with_capacity(rows.len());
-        let mut object_types = Vec::with_capacity(rows.len());
-        let mut locations: Vec<Option<String>> = Vec::with_capacity(rows.len());
-        let mut metadata = Vec::with_capacity(rows.len());
-        let mut table_keys = Vec::with_capacity(rows.len());
-        let mut table_identities = Vec::with_capacity(rows.len());
-        let mut table_versions: Vec<Option<u64>> = Vec::with_capacity(rows.len());
-        let mut table_branches = Vec::with_capacity(rows.len());
-        let mut row_counts: Vec<Option<u64>> = Vec::with_capacity(rows.len());
-        let mut schema_sources = Vec::with_capacity(rows.len());
-        let mut schema_irs = Vec::with_capacity(rows.len());
-
-        for row in rows {
-            object_ids.push(row.object_id);
-            object_types.push(row.object_type);
-            locations.push(row.location);
-            metadata.push(row.metadata);
-            table_keys.push(row.table_key);
-            table_identities.push(row.identity);
-            table_versions.push(row.table_version);
-            table_branches.push(row.table_branch);
-            row_counts.push(row.row_count);
-            let (source, ir) = row.schema_content.unzip();
-            schema_sources.push(source);
-            schema_irs.push(ir);
-        }
-
-        manifest_rows_batch(
-            object_ids,
-            object_types,
-            locations,
-            metadata,
-            table_keys,
-            table_identities,
-            table_versions,
-            table_branches,
-            row_counts,
-            schema_sources,
-            schema_irs,
-        )
-    }
-
-    /// Data version of the greatest-clock row per identity: what the caller's
-    /// `expected_table_versions` pin is compared against. A tombstone that wins
-    /// reports its sealed data version, so `actual` stays meaningful.
-    fn latest_visible_per_identity(
-        existing_versions: &HashMap<(TableIdentity, u64), DatasetEntry>,
-        existing_tombstones: &HashMap<(TableIdentity, u64), u64>,
-    ) -> HashMap<TableIdentity, (u64, WinnerRef)> {
-        let mut rows: Vec<(TableIdentity, u64, bool, u64, Option<String>)> = existing_versions
-            .iter()
-            .map(|((identity, clock), entry)| {
-                (
-                    *identity,
-                    *clock,
-                    false,
-                    entry.published_dataset_version,
-                    entry.native_dataset_branch.clone(),
-                )
+    /// What the publish of version `replaced_at` read for each identity whose
+    /// row it writes changed: the row of `read`, or its absence.
+    fn replaced_tables(read: &TableRows, next: &TableRows, replaced_at: u64) -> Vec<ReplacedTable> {
+        next.iter()
+            .filter_map(|(identity, table)| {
+                let before = match read.get(identity) {
+                    None => ReplacedRow::Unregistered(table.registration.clone()),
+                    Some(before) if before != table => ReplacedRow::Table(Box::new(before.clone())),
+                    Some(_) => return None,
+                };
+                Some(ReplacedTable {
+                    replaced_at,
+                    before,
+                })
             })
-            .chain(
-                existing_tombstones
-                    .iter()
-                    .map(|((identity, clock), sealed)| (*identity, *clock, true, *sealed, None)),
-            )
-            .collect();
-        rows.sort_unstable();
-
-        let mut latest = HashMap::<TableIdentity, (u64, u64, WinnerRef)>::new();
-        for (identity, clock, is_tombstone, data_version, native_ref) in rows {
-            match latest.get(&identity) {
-                Some((existing_clock, _, _)) if *existing_clock > clock => {}
-                _ => {
-                    let winner_ref = if is_tombstone {
-                        WinnerRef::Tombstone
-                    } else {
-                        WinnerRef::Registration(native_ref)
-                    };
-                    latest.insert(identity, (clock, data_version, winner_ref));
-                }
-            }
-        }
-        latest
-            .into_iter()
-            .map(|(identity, (_, data_version, native_ref))| (identity, (data_version, native_ref)))
             .collect()
     }
 
-    fn is_live_identity(
-        identity: TableIdentity,
-        existing_versions: &HashMap<(TableIdentity, u64), DatasetEntry>,
-        existing_tombstones: &HashMap<(TableIdentity, u64), u64>,
-    ) -> bool {
-        let latest_registration = existing_versions
-            .keys()
-            .filter_map(|(candidate, clock)| (*candidate == identity).then_some(*clock))
-            .max();
-        let latest_tombstone = existing_tombstones
-            .keys()
-            .filter_map(|(candidate, clock)| (*candidate == identity).then_some(*clock))
-            .max();
-        latest_registration
-            .map(|clock| latest_tombstone.map(|t| t < clock).unwrap_or(true))
-            .unwrap_or(false)
+    /// The records this publish appends to `__history`, oldest first: the full buffer,
+    /// then the merged records after the merge base and the last one a held merge
+    /// commit names, less the commits `read`, the branch `native_branch`, wrote or holds.
+    fn records_to_append<'a>(
+        read: &HeldRows<'a>,
+        native_branch: Option<&str>,
+        intent: &'a LineageIntent,
+    ) -> Result<(Vec<HeldRecord<'a>>, history::ClosedBlocks)> {
+        let mut closed = history::ClosedBlocks::default();
+        let released: Vec<HeldRecord<'a>> =
+            if read
+                .buffer
+                .is_full_under(read.head, read.tables, intent.history_release_bytes)?
+            {
+                let held = read.buffer.commits().iter().chain([read.head]);
+                history::closed_blocks(held, &mut closed)?;
+                let (buffer, current) = (read.buffer, read.tables);
+                let held = |commit| HeldRecord {
+                    commit,
+                    buffer,
+                    current,
+                };
+                buffer.commits().iter().map(held).collect()
+            } else {
+                Vec::new()
+            };
+        let Some(merged) = &intent.merged_parent else {
+            return Ok((released, closed));
+        };
+        history::closed_blocks(merged.commits(), &mut closed)?;
+        let kept_by_target = |commit: &GraphLineageRow| {
+            commit.native_branch.as_deref() == native_branch
+                || commit.graph_commit_id == read.head.graph_commit_id
+                || read.buffer.get(&commit.graph_commit_id).is_some()
+        };
+        let merged_by_held_commits: HashSet<&str> = read
+            .buffer
+            .commits()
+            .iter()
+            .chain([read.head])
+            .filter_map(|held| held.merged_parent_commit_id.as_deref())
+            .collect();
+        let source_run: Vec<HeldRecord<'a>> = merged.held().collect();
+        let archived_through = source_run.iter().rposition(|source| {
+            let id = source.commit.graph_commit_id.as_str();
+            merged_by_held_commits.contains(id) || merged.merge_base.as_deref() == Some(id)
+        });
+        let merged = source_run
+            .into_iter()
+            .skip(archived_through.map_or(0, |at| at + 1))
+            .filter(|merged| !kept_by_target(merged.commit));
+        Ok((released.into_iter().chain(merged).collect(), closed))
     }
 
-    /// Build the inputs for [`assemble_manifest_projection`] from the pre-publish state
-    /// unioned with the pending rows about to be committed — the in-memory basis
-    /// for the post-publish `known_state` fold (RFC-013 PR2 #1b), so the caller
-    /// skips the O(fragments) re-scan. Mirrors `read_manifest_scan`'s row handling
-    /// exactly so the result is byte-identical: current aliases and paths resolve
-    /// through `registrations` = `registered_tables` UNION the pending
-    /// `OBJECT_TYPE_TABLE` rows (including a rename);
-    /// `version_metadata` parses the SAME JSON string a re-scan would read. Pending
-    /// `OBJECT_TYPE_TABLE` rows feed only `table_locations`; lineage rows
-    /// (`graph_commit`/`graph_head`) are not manifest-state entries.
-    fn fold_inputs(
-        existing_versions: HashMap<(TableIdentity, u64), DatasetEntry>,
-        existing_tombstones: HashMap<(TableIdentity, u64), u64>,
-        rows: &[PendingVersionRow],
-        registered_tables: HashMap<TableIdentity, TableRegistration>,
-        new_manifest_version: u64,
-    ) -> Result<FoldedPublishInputs> {
-        let mut registrations = registered_tables;
-        for row in rows {
-            if row.object_type == OBJECT_TYPE_TABLE {
-                let identity = row.identity.ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "post-publish fold: table row missing identity for {}",
-                        row.table_key
-                    ))
-                })?;
-                let location = row.location.clone().ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "post-publish fold: table row missing path for {}",
-                        row.table_key
-                    ))
-                })?;
-                registrations.insert(
-                    identity,
-                    TableRegistration {
-                        identity,
-                        table_key: row.table_key.clone(),
-                        table_path: location,
-                    },
-                );
-            }
-        }
-
-        let mut version_map = existing_versions;
-        let mut tombstones: Vec<(TableIdentity, u64)> = existing_tombstones.into_keys().collect();
-
-        for row in rows {
-            match row.object_type.as_str() {
-                OBJECT_TYPE_TABLE_VERSION => {
-                    let identity = row.identity.ok_or_else(|| {
-                        OmniError::manifest_internal(format!(
-                            "post-publish fold: table_version row missing identity for {}",
-                            row.table_key
-                        ))
-                    })?;
-                    let table_version = row.table_version.ok_or_else(|| {
-                        OmniError::manifest_internal(format!(
-                            "post-publish fold: table_version row missing version for {}",
-                            row.table_key
-                        ))
-                    })?;
-                    let metadata_json = row.metadata.as_deref().ok_or_else(|| {
-                        OmniError::manifest_internal(format!(
-                            "post-publish fold: table_version row missing metadata for {}",
-                            row.table_key
-                        ))
-                    })?;
-                    version_map.insert(
-                        (identity, new_manifest_version),
-                        DatasetEntry {
-                            identity,
-                            type_key: row.table_key.clone(),
-                            dataset_path: String::new(),
-                            published_dataset_version: table_version,
-                            native_dataset_branch: row.table_branch.clone(),
-                            entity_count: row.row_count.ok_or_else(|| {
-                                OmniError::manifest_internal(format!(
-                                    "post-publish fold: table_version row missing row_count for {}",
-                                    row.table_key
-                                ))
-                            })?,
-                            version_metadata: TableVersionMetadata::from_json_str(metadata_json)?,
-                            manifest_version: new_manifest_version,
-                        },
-                    );
-                }
-                OBJECT_TYPE_TABLE_TOMBSTONE => {
-                    let identity = row.identity.ok_or_else(|| {
-                        OmniError::manifest_internal(format!(
-                            "post-publish fold: tombstone row missing identity for {}",
-                            row.table_key
-                        ))
-                    })?;
-                    tombstones.push((identity, new_manifest_version));
-                }
-                _ => {}
-            }
-        }
-
-        // dst: canonically-ordered hash-walk — the post-publish fold's output
-        // order must not depend on HashMap iteration order (this was the one
-        // unsorted walk left in the engine; error- and output-order-sensitive,
-        // the named suspect for concurrent-mode replay flips).
-        let mut ordered_versions: Vec<_> = version_map.into_iter().collect();
-        ordered_versions.sort_by_key(|(key, _)| *key);
-        Ok((
-            registrations,
-            ordered_versions.into_iter().map(|(_, e)| e).collect(),
-            tombstones,
-        ))
+    /// The records [`Self::records_to_append`] chooses, for a test of what choosing them builds.
+    #[cfg(test)]
+    pub(crate) fn chosen_records_to_append<'a>(
+        read: &HeldRows<'a>,
+        native_branch: Option<&str>,
+        intent: &'a LineageIntent,
+    ) -> Result<Vec<HeldRecord<'a>>> {
+        Ok(Self::records_to_append(read, native_branch, intent)?.0)
     }
 
-    /// Check each expectation against the newest visible row per table: the
-    /// version first (`PublishedDatasetVersionMismatch`, `actual = 0` when the
-    /// table is absent), then an `Exact` pin's ref (`ReadSetChanged`).
+    /// Check each expectation against the table's row: the version first
+    /// (`PublishedDatasetVersionMismatch`, `actual = 0` when the table is
+    /// absent), then an `Exact` pin's ref (`ReadSetChanged`).
     fn check_expected_table_versions(
-        latest_per_table: &HashMap<TableIdentity, (u64, WinnerRef)>,
-        registrations: &HashMap<TableIdentity, TableRegistration>,
+        tables: &TableRows,
         expected: &ExpectedTableVersions,
     ) -> Result<()> {
         let mut __dst_ex: Vec<_> = expected.iter().collect();
         __dst_ex.sort_by(|a, b| a.0.cmp(b.0));
         for (identity, expectation) in __dst_ex {
             identity.validate()?;
-            if let Some(registration) = registrations.get(identity) {
-                if registration.table_key != expectation.table_key {
-                    return Err(OmniError::manifest_read_set_changed(
-                        format!("dataset_binding:{identity}"),
-                        Some(expectation.table_key.clone()),
-                        Some(registration.table_key.clone()),
-                    ));
-                }
+            let table = tables.get(identity);
+            if let Some(TableRow { registration, .. }) = table
+                && registration.table_key != expectation.table_key
+            {
+                return Err(OmniError::manifest_read_set_changed(
+                    format!("dataset_binding:{identity}"),
+                    Some(expectation.table_key.clone()),
+                    Some(registration.table_key.clone()),
+                ));
             }
-            let latest = latest_per_table.get(identity);
-            let actual = latest.map(|(version, _)| *version).unwrap_or(0);
+            let (actual, pinned_ref) = match table.map(|table| &table.state) {
+                Some(TableState::Pinned(pin)) => (pin.table_version, Some(&pin.table_branch)),
+                Some(TableState::Dropped { sealed_version, .. }) => (*sealed_version, None),
+                Some(TableState::Registered) | None => (0, None),
+            };
             if actual != expectation.table_version {
                 return Err(OmniError::published_dataset_version_mismatch(
                     expectation.table_key.clone(),
@@ -986,7 +821,7 @@ impl GraphNamespacePublisher {
                 ));
             }
             if let NativeRefPin::Exact(pinned) = &expectation.native_ref
-                && let Some((_, WinnerRef::Registration(winner_ref))) = latest
+                && let Some(winner_ref) = pinned_ref
                 && winner_ref != pinned
             {
                 return Err(OmniError::manifest_read_set_changed(
@@ -1000,12 +835,12 @@ impl GraphNamespacePublisher {
     }
 
     /// Check authority against this attempt's own scan (graph head) and ref
-    /// (native branch id) before pending rows are built, so a CAS loser with an
+    /// (native branch id) before the next rows are built, so a CAS loser with an
     /// exact expectation cannot silently re-parent on its next attempt.
     async fn check_publish_precondition(
         &self,
         dataset: &Dataset,
-        graph_heads: &HashMap<String, String>,
+        head: &GraphLineageRow,
         precondition: &PublishPrecondition,
     ) -> Result<()> {
         let expected = match precondition {
@@ -1075,14 +910,11 @@ impl GraphNamespacePublisher {
             ));
         }
 
-        let object_id = expected.object_id();
-        let branch_key = object_id
-            .strip_prefix("graph_head:")
-            .expect("graph_head_object_id always supplies the prefix");
-        let actual = graph_heads.get(branch_key).cloned();
+        let actual = exact_head(head, dataset.manifest().branch.as_deref())
+            .map(|head| head.graph_commit_id.clone());
         if actual != expected.head_commit_id {
             return Err(OmniError::manifest_read_set_changed(
-                object_id,
+                expected.read_set_member(),
                 expected.head_commit_id.clone(),
                 actual,
             ));
@@ -1090,20 +922,19 @@ impl GraphNamespacePublisher {
         Ok(())
     }
 
-    async fn merge_rows(
-        &self,
-        dataset: Dataset,
-        rows: Vec<PendingVersionRow>,
-        live_rows: Vec<arrow_array::RecordBatch>,
-    ) -> Result<(Dataset, Option<RecordBatch>)> {
+    async fn merge_rows(&self, dataset: Dataset, rows: &ManifestRows) -> Result<Dataset> {
         fail(&PUBLISH_PRE_MERGE)?;
-        let pending = Self::pending_rows_to_batch(rows)?;
-        let new_dataset = commit::overwrite(dataset, pending, live_rows).await?;
+        let (new_dataset, batch) = commit::overwrite(dataset, rows).await?;
         // The commit is durable and the graph is published; a failure here
         // models the acknowledgement being lost after that (RFC 0067). It is
         // an opaque error with no conflict details, so the publish loop's
         // ambiguity arm reads the manifest back rather than reporting failure.
         fail(&PUBLISH_POST_MERGE_PRE_ACK)?;
+        let cached = PublishedRows::new(&new_dataset, batch).await;
+        *self
+            .published_rows
+            .lock()
+            .expect("published rows cache lock poisoned") = cached;
         Ok(new_dataset)
     }
 
@@ -1112,14 +943,15 @@ impl GraphNamespacePublisher {
         &self,
         requests: &[CreateTableVersionRequest],
     ) -> Result<Dataset> {
-        let registrations = self.load_publish_state().await?.registered_tables;
+        let tables = self.load_publish_state().await?.rows.tables;
         let changes = requests
             .iter()
             .map(|request| {
                 let (table_key, table_version, row_count, table_branch, version_metadata) =
                     parse_namespace_version_request(request).map_err(OmniError::storage)?;
-                let identity = registrations
-                    .values()
+                let identity = tables
+                    .iter()
+                    .map(|table| &table.registration)
                     .find(|registration| registration.table_key == table_key)
                     .map(|registration| registration.identity)
                     .ok_or_else(|| {
@@ -1137,27 +969,10 @@ impl GraphNamespacePublisher {
                 }))
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(self.publish(&changes, &HashMap::new(), None).await?.dataset)
-    }
-}
-
-/// Map a `state::GraphLineageRowPart` onto a `PendingVersionRow` so a graph
-/// commit's two lineage rows ride the same publish batch as the table-version
-/// rows (RFC-013 Phase 7). Lineage rows carry no table identity: `table_key` is
-/// the empty string (never matched by a real key) and `location`/`row_count`
-/// are null.
-fn lineage_part_to_pending(part: GraphLineageRowPart) -> PendingVersionRow {
-    PendingVersionRow {
-        object_id: part.object_id,
-        object_type: part.object_type.to_string(),
-        location: None,
-        metadata: Some(part.metadata),
-        table_key: String::new(),
-        identity: None,
-        table_version: part.table_version,
-        table_branch: part.table_branch,
-        row_count: None,
-        schema_content: None,
+        Ok(self
+            .publish(&changes, &ExpectedTableVersions::new(), None)
+            .await?
+            .dataset)
     }
 }
 
@@ -1217,25 +1032,6 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
         lineage: Option<&LineageIntent>,
         precondition: &PublishPrecondition,
     ) -> Result<PublishOutcome> {
-        if changes.is_empty()
-            && expected_table_versions.is_empty()
-            && lineage.is_none()
-            && matches!(precondition, PublishPrecondition::Any)
-        {
-            // Defensive no-op (never reached from `commit_changes_with_lineage`,
-            // which short-circuits the all-empty case): state is unchanged, so a
-            // re-scan here is acceptable.
-            let dataset = self.dataset().await?;
-            let known_state = read_manifest_state(&dataset).await?;
-            return Ok(PublishOutcome {
-                dataset,
-                parent_commit_id: None,
-                known_state,
-                base_incarnation: None,
-                projection: None,
-            });
-        }
-
         for attempt in 0..=PUBLISHER_RETRY_BUDGET {
             // Route a retryable `load_publish_state` error through the SAME retry
             // path as a retryable `merge_rows` conflict below, so typed contention
@@ -1251,113 +1047,162 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
             };
             let LoadedPublishState {
                 dataset,
-                registered_tables: known_tables,
-                existing_versions,
-                existing_tombstones,
-                lineage_rows,
-                graph_heads,
-                schema_contract,
-                live_rows,
+                rows:
+                    ManifestRows {
+                        tables,
+                        head,
+                        buffer,
+                        schema_contract,
+                        ..
+                    },
             } = loaded;
+            let native_branch = dataset.manifest().branch.clone();
 
-            self.check_publish_precondition(&dataset, &graph_heads, precondition)
+            self.check_publish_precondition(&dataset, &head, precondition)
                 .await?;
-            let base_incarnation = self.checked_base_incarnation(&dataset, precondition);
 
-            let latest_per_table =
-                Self::latest_visible_per_identity(&existing_versions, &existing_tombstones);
+            let tables: TableRows = tables
+                .into_iter()
+                .map(|table| (table.registration.identity, table))
+                .collect();
             // Pre-check on every attempt against freshly loaded state so a
             // concurrent commit that broke the caller's expectation is
             // surfaced as `PublishedDatasetVersionMismatch` rather than retried.
-            Self::check_expected_table_versions(
-                &latest_per_table,
-                &known_tables,
-                expected_table_versions,
-            )?;
+            Self::check_expected_table_versions(&tables, expected_table_versions)?;
 
             let new_manifest_version = dataset.version().version + 1;
-            let mut rows = Self::build_pending_rows(
-                changes,
-                &known_tables,
-                &existing_versions,
-                &existing_tombstones,
-                new_manifest_version,
-            )?;
+            let (next_tables, mut wrote) =
+                Self::apply_changes(changes, &tables, new_manifest_version)?;
+            let mut next_contract = schema_contract;
+            let mut seen_contract = false;
+            for change in changes {
+                if let ManifestChange::SchemaContract(contract) = change {
+                    if seen_contract {
+                        return Err(OmniError::manifest(
+                            "schema_contract row cannot be replaced twice in one publish"
+                                .to_string(),
+                        ));
+                    }
+                    seen_contract = true;
+                    next_contract = Some(contract.clone());
+                    wrote = true;
+                }
+            }
 
-            let parent_commit_id = match lineage {
+            let Some(mut next_head) = lineage
+                .map(|intent| {
+                    Self::next_head(
+                        intent,
+                        &head,
+                        &buffer,
+                        &tables,
+                        native_branch.clone(),
+                        new_manifest_version,
+                    )
+                })
+                .transpose()?
+                .or_else(|| wrote.then(|| head.clone()))
+            else {
+                let rows = ManifestRows {
+                    schema_contract_head: next_contract.as_ref().map(|row| row.head.clone()),
+                    tables: tables.into_values().collect(),
+                    head,
+                    buffer,
+                    schema_contract: next_contract,
+                };
+                let known_state =
+                    rows.state(dataset.version().version, native_branch.as_deref())?;
+                return Ok(PublishOutcome {
+                    dataset,
+                    parent_commit_id: None,
+                    known_state,
+                    head: rows.head,
+                    tables: rows.tables,
+                    buffer: rows.buffer,
+                    schema_contract: rows.schema_contract,
+                });
+            };
+            if lineage.is_none() && !cfg!(any(test, feature = "test-util")) {
+                return Err(OmniError::manifest_internal(
+                    "a publish that changes `__manifest` rows records a graph commit, so that \
+                     the `table` rows of every version are the state as of its head commit; \
+                     this publish carries changes and no lineage intent"
+                        .to_string(),
+                ));
+            }
+            let changed = Self::replaced_tables(&tables, &next_tables, new_manifest_version);
+            let tables: Vec<TableRow> = tables.into_values().collect();
+            let next_tables: Vec<TableRow> = next_tables.into_values().collect();
+            if lineage.is_some() {
+                next_head.schema_contract = next_contract.as_ref().map(|row| row.head.clone());
+                let content_unchanged = !seen_contract
+                    && head.schema_content_hash.is_some()
+                    && head.schema_contract == next_head.schema_contract;
+                if !content_unchanged {
+                    next_head.schema_content_hash = next_contract
+                        .as_ref()
+                        .map(history::schema_content_hash)
+                        .transpose()?;
+                }
+                history::check_head_record(&next_head, &next_tables)?;
+                if let Some(contract) = &next_contract
+                    && next_head.schema_content_hash != head.schema_content_hash
+                {
+                    history::archive_schema(&self.root_uri, &self.control_session, contract)
+                        .await?;
+                }
+            }
+            let parent_commit_id = lineage.map(|_| head.graph_commit_id.clone());
+            let mut known_state = manifest_state(
+                &next_tables,
+                &next_head,
+                new_manifest_version,
+                native_branch.as_deref(),
+            )?;
+            known_state.schema_contract = next_contract.as_ref().map(|row| row.head.clone());
+            let appended = match lineage {
                 Some(intent) => {
-                    let (commit_rows, parent) =
-                        Self::resolve_lineage_rows(&lineage_rows, intent, new_manifest_version)?;
-                    rows.extend(commit_rows);
-                    parent
+                    let read = HeldRows {
+                        tables: &tables,
+                        head: &head,
+                        buffer: &buffer,
+                    };
+                    let (records, closed) =
+                        Self::records_to_append(&read, native_branch.as_deref(), intent)?;
+                    match records.is_empty() {
+                        true => None,
+                        false => Some(
+                            history::settle_closed(
+                                &self.root_uri,
+                                &self.control_session,
+                                &records,
+                                &closed,
+                            )
+                            .await?,
+                        ),
+                    }
                 }
                 None => None,
             };
+            let next = ManifestRows {
+                schema_contract_head: next_contract.as_ref().map(|row| row.head.clone()),
+                buffer: buffer.after_publish(
+                    lineage.map(|_| &head),
+                    changed,
+                    &next_head,
+                    appended.as_ref(),
+                    &tables,
+                    lineage.map_or(HistoryReleaseBytes::PRODUCTION, |intent| {
+                        intent.history_release_bytes
+                    }),
+                )?,
+                tables: next_tables,
+                head: next_head,
+                schema_contract: next_contract,
+            };
 
-            if rows.is_empty() {
-                // Expected-version-only publish with no changes and no lineage:
-                // the precondition held, nothing to write. Fold the unchanged state
-                // from the loaded maps — no re-scan (RFC-013 PR2 #1b).
-                let (known_state, projection) = assemble_manifest_projection(
-                    dataset.version().version,
-                    known_tables,
-                    existing_versions.into_values().collect(),
-                    existing_tombstones.into_keys(),
-                    graph_heads,
-                    schema_contract,
-                )?;
-                return Ok(PublishOutcome {
-                    dataset,
-                    parent_commit_id,
-                    known_state,
-                    base_incarnation,
-                    projection: Some(Box::new(projection)),
-                });
-            }
-
-            // Build the post-publish fold inputs from the pre-publish state ∪ the
-            // rows we are about to commit, BEFORE `rows` is moved into merge_rows
-            // (RFC-013 PR2 #1b). Recomputed per attempt from freshly-loaded state.
-            let (fold_registrations, fold_entries, fold_tombstones) = Self::fold_inputs(
-                existing_versions,
-                existing_tombstones,
-                &rows,
-                known_tables,
-                new_manifest_version,
-            )?;
-            let mut fold_graph_heads = graph_heads;
-            if let Some(intent) = lineage {
-                fold_graph_heads.insert(
-                    intent
-                        .branch
-                        .as_deref()
-                        .unwrap_or(MAIN_BRANCH_HEAD_KEY)
-                        .to_string(),
-                    intent.graph_commit_id.clone(),
-                );
-            }
-            let fold_schema_contract = changes
-                .iter()
-                .find_map(|change| match change {
-                    ManifestChange::SchemaContract(contract) => Some(contract.head.clone()),
-                    _ => None,
-                })
-                .or(schema_contract);
-            // Validate the complete post-batch fold before the physical merge.
-            // In particular, alias collisions must fail without advancing
-            // `__manifest`; discovering one after `merge_rows` would be an
-            // acknowledged-but-unreadable manifest commit.
-            let (mut known_state, projection) = assemble_manifest_projection(
-                new_manifest_version,
-                fold_registrations,
-                fold_entries,
-                fold_tombstones,
-                fold_graph_heads,
-                fold_schema_contract,
-            )?;
-
-            match self.merge_rows(dataset.clone(), rows, live_rows).await {
-                Ok((new_dataset, retained)) => {
+            match self.merge_rows(dataset.clone(), &next).await {
+                Ok(new_dataset) => {
                     if new_dataset.version().version != new_manifest_version {
                         return Err(OmniError::manifest_internal(format!(
                             "manifest commit at version {} is durable but its rows carry manifest \
@@ -1366,18 +1211,15 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                             new_manifest_version
                         )));
                     }
-                    *self
-                        .published_rows
-                        .lock()
-                        .expect("published rows cache lock poisoned") =
-                        retained.and_then(|batch| PublishedRows::new(&new_dataset, batch));
                     known_state.version = new_dataset.version().version;
                     return Ok(PublishOutcome {
                         dataset: new_dataset,
                         parent_commit_id,
                         known_state,
-                        base_incarnation,
-                        projection: Some(Box::new(projection)),
+                        head: next.head,
+                        tables: next.tables,
+                        buffer: next.buffer,
+                        schema_contract: next.schema_contract,
                     });
                 }
                 Err(err) => {
@@ -1389,40 +1231,21 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                     // error may instead mean the `__manifest` overwrite landed
                     // durably and only its acknowledgement was lost (a dropped S3
                     // 200), in which case the write is already graph-visible.
-                    // Since the stable lineage commit id is durably written into
-                    // the branch's `graph_head` row, read the manifest back and
-                    // check for it before reporting anything: returning an opaque
-                    // failure for a durable write invites a non-idempotent retry
-                    // to double-apply.
                     let ambiguous = !matches!(&err, OmniError::Manifest(m) if m.details.is_some());
-                    if let (true, Some(intent)) = (ambiguous, lineage) {
+                    if ambiguous && lineage.is_some() {
                         if let Err(readback_err) = fail(&PUBLISH_READ_BACK) {
                             return Err(publish_outcome_in_doubt(
                                 &err,
-                                &intent.graph_commit_id,
+                                &next.head.graph_commit_id,
                                 readback_err,
                             ));
                         }
                         match dataset.checkout_version(new_manifest_version).await {
-                            Ok(reloaded) => match read_publish_scan(&reloaded).await {
-                                Ok(scan) => {
-                                    let branch_key =
-                                        intent.branch.as_deref().unwrap_or(MAIN_BRANCH_HEAD_KEY);
+                            Ok(reloaded) => match read_manifest_rows(&reloaded).await {
+                                Ok(rows) => {
                                     // Read the attempted immutable version on the captured
                                     // native branch, even when another writer has moved HEAD.
-                                    let landed = scan.graph_heads.get(branch_key)
-                                        == Some(&intent.graph_commit_id)
-                                        && scan.lineage_rows.iter().any(|commit| {
-                                            commit.graph_commit_id == intent.graph_commit_id
-                                                && commit.graph_manifest_version
-                                                    == new_manifest_version
-                                                && commit.graph_branch == intent.branch
-                                                && commit.parent_commit_id == parent_commit_id
-                                                && commit.merged_parent_commit_id
-                                                    == intent.merged_parent_commit_id
-                                                && commit.actor_id == intent.actor_id
-                                                && commit.created_at == intent.created_at
-                                        });
+                                    let landed = rows.head == next.head;
                                     if landed {
                                         // Durable; only the ack was lost. Return
                                         // the exact success outcome this attempt
@@ -1432,19 +1255,16 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                                             dataset: reloaded,
                                             parent_commit_id,
                                             known_state,
-                                            base_incarnation,
-                                            projection: Some(Box::new(projection)),
+                                            head: next.head,
+                                            tables: next.tables,
+                                            buffer: next.buffer,
+                                            schema_contract: next.schema_contract,
                                         });
                                     }
-                                    if scan.graph_heads.get(branch_key)
-                                        == Some(&intent.graph_commit_id)
-                                        || scan.lineage_rows.iter().any(|commit| {
-                                            commit.graph_commit_id == intent.graph_commit_id
-                                        })
-                                    {
+                                    if rows.head.graph_commit_id == next.head.graph_commit_id {
                                         return Err(publish_outcome_in_doubt(
                                             &err,
-                                            &intent.graph_commit_id,
+                                            &next.head.graph_commit_id,
                                             "attempted commit identity has inconsistent lineage",
                                         ));
                                     }
@@ -1455,7 +1275,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                                 Err(scan_err) => {
                                     return Err(publish_outcome_in_doubt(
                                         &err,
-                                        &intent.graph_commit_id,
+                                        &next.head.graph_commit_id,
                                         scan_err,
                                     ));
                                 }
@@ -1479,7 +1299,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                                 }
                                 return Err(publish_outcome_in_doubt(
                                     &err,
-                                    &intent.graph_commit_id,
+                                    &next.head.graph_commit_id,
                                     readback_err,
                                 ));
                             }

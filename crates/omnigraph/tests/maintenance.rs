@@ -3222,6 +3222,7 @@ async fn collector_retains_malformed_witnesses_after_retirement_history_is_gone(
     use lance::dataset::refs::BranchIdentifier;
     use lance::dataset::transaction::{Operation, Transaction};
     use omnigraph::db::StagingVerdict;
+    use omnigraph_core::graph_commit_id::HISTORY_BLOCK_SLOTS;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -3241,6 +3242,8 @@ async fn collector_retains_malformed_witnesses_after_retirement_history_is_gone(
     let identity = serde_json::to_string(&identity).unwrap();
     let table_uri = node_table_uri(&db, "Person").await;
     let base = helpers::open_dataset_head_exact(&table_uri, None).await;
+    let slot_at_ceiling =
+        format!("hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.{HISTORY_BLOCK_SLOTS}.01ARZ3NDEKTSV4RRFFQ69G5FAW");
     let mut versions = Vec::new();
     for (label, owner, head) in [
         ("missing-head", identity.as_str(), None),
@@ -3251,6 +3254,16 @@ async fn collector_retains_malformed_witnesses_after_retirement_history_is_gone(
             Some("not-a-graph-head"),
         ),
         ("valid-retired", identity.as_str(), Some("")),
+        (
+            "valid-retired-block",
+            identity.as_str(),
+            Some("hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.3.01ARZ3NDEKTSV4RRFFQ69G5FAW"),
+        ),
+        (
+            "malformed-block-head",
+            identity.as_str(),
+            Some(slot_at_ceiling.as_str()),
+        ),
     ] {
         let mut properties = HashMap::from([(
             "omnigraph.staged_against_branch_incarnation".to_string(),
@@ -3288,7 +3301,7 @@ async fn collector_retains_malformed_witnesses_after_retirement_history_is_gone(
             .iter()
             .find(|staging| staging.version == *version)
             .unwrap();
-        if *label == "valid-retired" {
+        if label.starts_with("valid-retired") {
             assert!(
                 matches!(staging.verdict, StagingVerdict::Dead(_)),
                 "{staging:?}"
@@ -3306,7 +3319,7 @@ async fn collector_retains_malformed_witnesses_after_retirement_history_is_gone(
     for (label, version) in versions {
         assert_eq!(
             remaining.contains(&version),
-            label != "valid-retired",
+            !label.starts_with("valid-retired"),
             "{label}"
         );
     }

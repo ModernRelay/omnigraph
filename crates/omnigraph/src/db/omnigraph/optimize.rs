@@ -328,7 +328,9 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
             .iter()
             .any(|update| update.type_key.starts_with("edge:"));
         if any_committed {
-            let lineage = db.new_lineage_intent_for_branch(None, None).await?;
+            let lineage = db
+                .new_lineage_intent_for_branch(None, None, HistoryReleaseBytes::PRODUCTION)
+                .await?;
             super::table_ops::commit_updates_on_branch_with_expected(
                 db,
                 None,

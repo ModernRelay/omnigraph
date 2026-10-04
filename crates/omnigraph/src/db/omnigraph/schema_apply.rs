@@ -262,7 +262,7 @@ where
             .coordinator
             .read()
             .await
-            .captured_commit(commit_id)
+            .captured_commit(commit_id)?
             .is_some()
     {
         return Err(OmniError::manifest_conflict(
@@ -636,8 +636,6 @@ where
         .await?;
     }
 
-    let graph_commit_id = lineage_intent.graph_commit_id.clone();
-
     let mut published_commit: Option<String> = None;
     let effects = async {
         fail(&SCHEMA_APPLY_POST_LOCK_PRE_EFFECT)?;
@@ -917,7 +915,7 @@ where
                 &precondition,
             )
             .await?;
-        published_commit = Some(graph_commit_id);
+        published_commit = Some(published.commit.graph_commit_id.clone());
 
         db.store_schema_view(
             desired_catalog,

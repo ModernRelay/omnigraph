@@ -56,8 +56,9 @@ manifest version match the captured transaction; otherwise it opens the target
 coordinator from durable state. The publisher independently reads fresh authority
 and enforces the exact graph-head precondition on every attempt. Successful
 publication returns a taken coordinator to the one-entry merge cache; failure
-drops it. Commit IDs and timestamps are minted for the captured branch without
-reloading manifest history. The existing schema and branch gates still serialize
+drops it. The intent nonce and timestamps are minted for the captured branch
+without reloading manifest history; the publish wraps the nonce into the
+addressable commit id `hb1.<block>.<slot>.<nonce>`. The existing schema and branch gates still serialize
 conflicting control operations.
 
 Native branch creation uses an operation-local capture of the bound coordinator
@@ -250,7 +251,9 @@ boundary. See [Schema contract in the manifest](../rfcs/2026-09-30-schema-contra
 
 `prepare_schema_apply_as` binds the canonical root and schema identity domain,
 exact main-branch authority, numeric manifest base, desired contract, actor and
-preallocated graph commit identity before table effects. Preparation supports a
+a preallocated intent nonce before table effects; the published commit id
+`hb1.<block>.<slot>.<nonce>` wraps that nonce, so a lookup by the intent names
+the commit through `commit_id_answers`, never by equality. Preparation supports a
 read-only handle: it captures authority and plans, without issuing native writes.
 `apply_prepared_schema_as` rechecks that authority and the current policy under
 the existing gates. Intent version 2 uses `ExactGraphVersion`: a base at `M` can
@@ -431,7 +434,7 @@ carried stored external reference the policy refuses fails as
 | Any writer fails before publication, after any detached effect | Typed error; no graph movement; the detached staging is unpublished and the collector reclaims it once its recorded authority is gone |
 | Schema apply or the system-column upgrade reports an error after proven publication | `RecoveryRequired` can name the committed outcome; its tables and contract are durable, and refresh/reopen rebuilds only the in-memory view |
 | A foreign linear commit lands above a table's `omnigraph.last_linear_version` | No read or write resolves it; `repair` reports the table as `foreign_drift` and never adopts the commit; the collector deletes neither its manifest nor its files and lists it under `foreign_versions` |
-| A sidecar from a build that predates detached commits is present | A read-write open and the storage upgrade refuse until that build has resolved it |
+| A sidecar from a build that predates detached commits is present | A read-write open refuses until that build has resolved it |
 
 An acknowledgement is returned only after the manifest commit is durable and
 visible.

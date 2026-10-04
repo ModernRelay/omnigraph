@@ -3670,3 +3670,232 @@ async fn change_feed_resumed_oversized_change_is_delivered_solo() {
         other => panic!("expected a caught-up block boundary after the solo change, got {other:?}"),
     }
 }
+
+/// The graph as of one commit: every table pin as `(table key, version, rows)`
+/// and the Person names a query at that commit returns.
+#[derive(Debug, PartialEq)]
+struct StateAtCommit {
+    graph_commit_id: String,
+    pins: Vec<(String, u64, u64)>,
+    people: Vec<String>,
+}
+
+/// What the history operations return for main: its commits, the graph as of
+/// each of them, the diff of its oldest and newest commit, and its change feed
+/// from the beginning.
+#[derive(Debug, PartialEq)]
+struct MainHistory {
+    commits: Vec<omnigraph::db::GraphCommit>,
+    states: Vec<StateAtCommit>,
+    diff: Vec<(String, String, ChangeOp)>,
+    feed: Vec<omnigraph::changes::GraphChangeBlock>,
+}
+
+const ALL_PEOPLE: &str =
+    "query all_people() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
+
+async fn main_history(db: &Session) -> MainHistory {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedStart};
+
+    let commits = db.list_commits(Some("main")).await.unwrap();
+    let mut states = Vec::new();
+    for commit in &commits {
+        let target = ReadTarget::snapshot(omnigraph::db::SnapshotId::new(
+            commit.graph_commit_id.clone(),
+        ));
+        let snapshot = db.snapshot_of(target.clone()).await.unwrap();
+        assert_eq!(
+            snapshot.graph_manifest_version(),
+            commit.graph_manifest_version
+        );
+        let mut pins: Vec<_> = snapshot
+            .datasets()
+            .map(|entry| {
+                (
+                    entry.type_key.clone(),
+                    entry.published_dataset_version,
+                    entry.entity_count,
+                )
+            })
+            .collect();
+        pins.sort();
+        let people = db
+            .query(target, ALL_PEOPLE, "all_people", &params(&[]))
+            .await
+            .unwrap();
+        states.push(StateAtCommit {
+            graph_commit_id: commit.graph_commit_id.clone(),
+            pins,
+            people: first_column_sorted(&people),
+        });
+    }
+    let (newest, oldest) = (commits.first().unwrap(), commits.last().unwrap());
+    let diff = db
+        .diff_commits(
+            &oldest.graph_commit_id,
+            &newest.graph_commit_id,
+            &ChangeFilter::default(),
+        )
+        .await
+        .unwrap();
+    let feed = db
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::Beginning),
+        ))
+        .await
+        .unwrap();
+    assert!(boundary_cursor(&feed).1, "the poll reaches the head");
+    MainHistory {
+        commits,
+        states,
+        diff: change_tuples(&diff),
+        feed: feed.blocks,
+    }
+}
+
+/// A history operation on main returns the same after a merged branch is
+/// deleted and after it is created again. The head a deleted branch wrote
+/// stays resolvable by id; the graph as of it is refused.
+#[tokio::test]
+async fn history_reads_are_the_same_after_a_merged_branch_is_deleted_and_recreated() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = init_and_load(&dir).await;
+    let insert = |name: &'static str| mixed_params(&[("$name", name)], &[("$age", 30)]);
+    mutate_main(&db, MUTATION_QUERIES, "insert_person", &insert("Linear"))
+        .await
+        .unwrap();
+    let fork_point = snapshot_id(&db, "main").await.unwrap();
+
+    db.branch_create("feature").await.unwrap();
+    for name in ["OnFeature", "FeatureHead"] {
+        mutate_branch(
+            &db,
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &insert(name),
+        )
+        .await
+        .unwrap();
+    }
+    let feature_head = snapshot_id(&db, "feature").await.unwrap();
+    mutate_main(&db, MUTATION_QUERIES, "insert_person", &insert("Diverged"))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.branch_merge("feature", "main").await.unwrap().outcome,
+        MergeOutcome::Merged
+    );
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &insert("AfterMerge"),
+    )
+    .await
+    .unwrap();
+
+    let before = main_history(&db).await;
+    assert_eq!(before.commits.len(), before.feed.len() + 1);
+    let feature_commits = db.list_commits(Some("feature")).await.unwrap();
+    assert_eq!(feature_commits[0].graph_commit_id, feature_head.as_str());
+    let feature_head_commit = db.get_commit(feature_head.as_str()).await.unwrap();
+    assert_eq!(feature_head_commit, feature_commits[0]);
+    let feature_diff = db
+        .diff_commits(
+            fork_point.as_str(),
+            feature_head.as_str(),
+            &ChangeFilter::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        change_tuples(&feature_diff),
+        vec![
+            (
+                "node:Person".to_string(),
+                "FeatureHead".to_string(),
+                ChangeOp::Insert
+            ),
+            (
+                "node:Person".to_string(),
+                "OnFeature".to_string(),
+                ChangeOp::Insert
+            ),
+        ]
+    );
+
+    db.branch_create("unmerged").await.unwrap();
+    mutate_branch(
+        &db,
+        "unmerged",
+        MUTATION_QUERIES,
+        "insert_person",
+        &insert("Unmerged"),
+    )
+    .await
+    .unwrap();
+    let unmerged_head = snapshot_id(&db, "unmerged").await.unwrap();
+    let unmerged_head_commit = db.get_commit(unmerged_head.as_str()).await.unwrap();
+
+    db.branch_delete("feature").await.unwrap();
+    db.branch_delete("unmerged").await.unwrap();
+    let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
+    for handle in [&db, &reopened] {
+        assert_eq!(main_history(handle).await, before);
+        assert_eq!(
+            handle.get_commit(feature_head.as_str()).await.unwrap(),
+            feature_head_commit,
+            "the head a deleted branch wrote stays resolvable by id"
+        );
+        assert_eq!(
+            handle.get_commit(unmerged_head.as_str()).await.unwrap(),
+            unmerged_head_commit,
+            "a head no branch merged is settled by the delete of its branch"
+        );
+        let refused = handle
+            .snapshot_of(ReadTarget::snapshot(feature_head.clone()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, omnigraph::error::OmniError::BranchNotFound { .. }),
+            "{refused}"
+        );
+    }
+
+    db.branch_create("feature").await.unwrap();
+    mutate_branch(
+        &db,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &insert("Recreated"),
+    )
+    .await
+    .unwrap();
+    let recreated = db.list_commits(Some("feature")).await.unwrap();
+    assert_eq!(
+        recreated[1..],
+        before.commits[..],
+        "a branch created again holds the commits of its source below its own"
+    );
+    for handle in [&db, &reopened] {
+        assert_eq!(main_history(handle).await, before);
+        assert_eq!(
+            handle.get_commit(feature_head.as_str()).await.unwrap(),
+            feature_head_commit
+        );
+        let refused = handle
+            .snapshot_of(ReadTarget::snapshot(feature_head.clone()))
+            .await
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("has no persisted native-branch incarnation witness"),
+            "{refused}"
+        );
+    }
+}

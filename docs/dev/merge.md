@@ -9,6 +9,12 @@ source branch into a target branch. The merge base, source, and target are
 resolved once; final publication revalidates their exact graph and native-ref
 identities.
 
+Merge first tries to prove the same merge base from the captured recent commits
+and already cached history, within a fixed visit budget. An inconclusive proof
+uses the full lineage reader. A successful proof does not validate unread
+history: missing, malformed, or conflicting settled records outside the proof
+may remain undetected until a history read reaches them.
+
 ## Per-table decision
 
 For every table lifetime present in the accepted catalogs, merge compares:
@@ -160,11 +166,14 @@ merges at four, five for a non-bound target. Every publish rewrites the live
 at 1,048,576 rows per file), so a scan no longer pays per-fragment and
 per-deletion-file requests. Pages within a file are still read separately; the
 local history curve measured 40-41 requests per write from 1 to 1,024 prior
-publications, which is a measurement, not a guarantee. The rows still include history (`graph_commit` and every
-`table_version` registration), so the bytes decoded grow with retained
-history. Read-only scans reduce one Arrow batch at a time; the publish scan
-retains every batch, because the copy-on-write publish rewrites them, so
-publication memory grows with retained history. Each `__manifest` version
+publications, which is a measurement, not a guarantee. The rows hold the
+`table` rows, the head `graph_commit` row and the buffered `settled_commit`
+and `replaced_table` rows, which `HISTORY_RELEASE_BYTES` (or the lower
+`history_release_bytes` a session set) bounds, so the bytes
+decoded per scan no longer grow with retained history; older commits live in
+`__history` and are read only when a history read needs them. Read-only scans
+reduce one Arrow batch at a time; the publish scan retains every batch,
+because the copy-on-write publish rewrites them. Each `__manifest` version
 keeps its own copy of the rows and no path prunes `__manifest` versions yet.
 
 Successful local publication preserves the existing coherent projection after

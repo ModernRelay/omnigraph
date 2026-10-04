@@ -23,7 +23,7 @@ pub(crate) use seams::{admit_seam, arm_seams, finish_seams, refuse_two_store_act
 
 const WORKER_INPUT: &str = "OMNIGRAPH_GQT_WORKER_INPUT";
 const WORKER_REPORT: &str = "OMNIGRAPH_GQT_WORKER_REPORT";
-const LIMIT: usize = 16 * 1024 * 1024;
+const LIMIT: usize = 256 * 1024 * 1024;
 
 tokio::task_local! {
     static OBSERVATIONS: RefCell<Observations>;

@@ -277,6 +277,28 @@ mod tests {
         (rows[0].value.clone(), rows[0].source)
     }
 
+    #[test]
+    fn history_release_bytes_default_is_the_catalog_constant() {
+        assert_eq!(
+            SessionSettings::default().history_release_bytes(),
+            omnigraph_catalog::HISTORY_RELEASE_BYTES
+        );
+        assert_eq!(
+            SettingId::HistoryReleaseBytes.spec().default,
+            omnigraph_catalog::HISTORY_RELEASE_BYTES.to_string()
+        );
+        let omnigraph_compiler::settings::SettingKind::Integer { max, .. } =
+            SettingId::HistoryReleaseBytes.spec().kind
+        else {
+            panic!("history_release_bytes is an integer setting");
+        };
+        assert_eq!(
+            max,
+            Some(omnigraph_catalog::HISTORY_RELEASE_BYTES as i64),
+            "a session may only lower the budget: the row's maximum is the production constant"
+        );
+    }
+
     fn assert_at_baseline(session: &Session) {
         assert_eq!(session.settings(), &seeded_settings());
         assert_eq!(session.sources(), &seeded_sources());

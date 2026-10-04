@@ -153,8 +153,7 @@ different:
   process-local gate ordering. Its contract and table references publish
   together; the removed file-installation protocol supplies no distributed
   lock. Branch creation/deletion and cleanup retain their existing
-  single-writer-process control boundary. Explicit storage conversion
-  requires operator-enforced quiescence.
+  single-writer-process control boundary.
 - Physical index reconciliation is explicit; there is no background scheduler
   whose queue is a second authority.
 

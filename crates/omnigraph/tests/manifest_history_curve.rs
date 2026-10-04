@@ -1,8 +1,9 @@
-//! Instrument: the cost of one fixed-live-row update as `__manifest` history
-//! grows. Every checkpoint repeats `set_age` on the same person, so the live
-//! data never changes size and any growth is history. Each record reports the
-//! Lance requests and bytes per stage and the retained size of `__manifest` on
-//! disk (every version's files), the space term version retention must bound.
+//! Instrument: the cost of one fixed-live-row update as commit history grows.
+//! Every checkpoint repeats `set_age` on the same person, so the live data
+//! never changes size and any growth is history. Each record reports the Lance
+//! requests and bytes per stage, `__manifest` and `__history` each on its own
+//! plane, and the retained size of both on disk (every version's files), the
+//! space term version retention must bound.
 //! Schema-source and serialized-IR bytes vary independently in the contract
 //! curve. These are I/O/storage observations, not heap or RSS bounds. All tests
 //! are `#[ignore]`d instruments, run explicitly.
@@ -57,7 +58,11 @@ async fn publication_curve_read(db: &omnigraph::Session, branch: &str, age: i64)
     assert_eq!(i64::from(ages.value(0)), age);
 }
 
+/// The bytes of every file below `path`, 0 while `path` does not exist.
 fn retained_bytes(path: &Path) -> u64 {
+    if !path.exists() {
+        return 0;
+    }
     std::fs::read_dir(path)
         .unwrap()
         .map(|entry| {
@@ -92,17 +97,21 @@ async fn run_history_curve(depths: &[u64], branches: &[&str], schema: &str, work
             for &depth in depths {
                 let table_tracker = IOTracker::default();
                 let manifest_tracker = IOTracker::default();
+                let history_tracker = IOTracker::default();
                 let mut probes = raw_io_probes(&table_tracker, &manifest_tracker);
+                probes.history_wrapper = Some(Arc::new(history_tracker.clone()));
                 let attempts = AttemptTracker::default();
                 // Native per-store counters below include direct local I/O.
                 // The wrapper separately records failed exact-key probes,
                 // which ordinary IOTracker success counters omit.
                 probes.manifest_wrapper = Some(Arc::new(attempts.clone()));
                 let full_scans = Arc::clone(&probes.manifest_scan_count);
+                let history_reads = Arc::clone(&probes.projection_full_refreshes);
                 let internal_opens = Arc::clone(&probes.internal_open_count);
                 let version_probes = Arc::clone(&probes.probe_count);
                 let table_stores = probes.table_stores.clone();
                 let manifest_stores = probes.manifest_stores.clone();
+                let history_stores = probes.history_stores.clone();
                 with_query_io_probes(
                     probes,
                     Box::pin(async {
@@ -110,6 +119,7 @@ async fn run_history_curve(depths: &[u64], branches: &[&str], schema: &str, work
                         let dir = tempfile::tempdir().unwrap();
                         let uri = dir.path().to_str().unwrap();
                         let manifest_dir = dir.path().join("__manifest");
+                        let history_dir = dir.path().join("__history");
                         let db = init_and_load_with_schema(&dir, schema).await;
                         let schema_source = db.schema_source();
                         assert_eq!(schema_source.as_str(), schema);
@@ -132,6 +142,7 @@ async fn run_history_curve(depths: &[u64], branches: &[&str], schema: &str, work
                         let report = |stage: &str, history_before: Option<u64>, elapsed: Duration, operation: serde_json::Value| {
                             let table = drain_probed_io(&table_tracker, &table_stores);
                             let manifest = drain_probed_io(&manifest_tracker, &manifest_stores);
+                            let history = drain_probed_io(&history_tracker, &history_stores);
                             let attempts = attempts.incremental_attempts();
                             eprintln!(
                                 "PUBLICATION_CURVE {}",
@@ -159,6 +170,7 @@ async fn run_history_curve(depths: &[u64], branches: &[&str], schema: &str, work
                                     "stage": stage,
                                     "elapsed_us_diagnostic": elapsed.as_micros(),
                                     "manifest_scan_invocations": full_scans.swap(0, Ordering::Relaxed),
+                                    "history_lineage_reads": history_reads.swap(0, Ordering::Relaxed),
                                     "manifest_store_read_attempts": attempts.len(),
                                     "manifest_store_not_found": attempts.iter().filter(|attempt| attempt.outcome == AttemptOutcome::NotFound).count(),
                                     "manifest_store_read_errors": attempts.iter().filter(|attempt| attempt.outcome == AttemptOutcome::Error).count(),
@@ -173,8 +185,14 @@ async fn run_history_curve(depths: &[u64], branches: &[&str], schema: &str, work
                                     "manifest_read_bytes": manifest.read_bytes,
                                     "manifest_written_bytes": manifest.written_bytes,
                                     "manifest_retained_bytes": retained_bytes(&manifest_dir),
+                                    "history_read_requests": history.read_iops,
+                                    "history_write_requests": history.write_iops,
+                                    "history_read_bytes": history.read_bytes,
+                                    "history_written_bytes": history.written_bytes,
+                                    "history_retained_bytes": retained_bytes(&history_dir),
                                     "lance_requests": table.read_iops + table.write_iops
-                                        + manifest.read_iops + manifest.write_iops,
+                                        + manifest.read_iops + manifest.write_iops
+                                        + history.read_iops + history.write_iops,
                                 }),
                             );
                         };

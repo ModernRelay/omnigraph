@@ -37,6 +37,7 @@ use omnigraph::db::{
 use omnigraph::loader::LoadMode;
 use omnigraph::seams::FailScenario;
 use omnigraph::seams::catalog;
+use omnigraph_core::graph_commit_id::intent_nonce;
 use serial_test::serial;
 
 const CHILD_ENV: &str = "OMNIGRAPH_RFC0067_CHILD";
@@ -819,7 +820,10 @@ async fn run_cell(
                 .await
                 .unwrap()
                 .iter()
-                .all(|commit| Some(commit.graph_commit_id.as_str()) != intent.graph_commit_id()),
+                .all(|commit| {
+                    intent_nonce(&commit.graph_commit_id).ok().as_deref()
+                        != intent.graph_commit_id()
+                }),
             "{cell}: the interrupted original was published or replayed during recovery"
         );
     }

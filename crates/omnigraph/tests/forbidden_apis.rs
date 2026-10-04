@@ -153,6 +153,7 @@ const ALLOW_LIST_FILES: &[&str] = &[
     "db/upgrade.rs",
     "db/upgrade/tests.rs",
     "omnigraph-catalog/migrations.rs",
+    "omnigraph-catalog/history.rs",
     "omnigraph-catalog/commit.rs",
     "omnigraph-core/lance_clone.rs",
 ];
@@ -411,7 +412,7 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
-        "refresh_for_live_read",
+        "captured_lineage",
     ),
     ("db/graph_coordinator.rs", "GraphCoordinator", "branch_list"),
     (
@@ -472,7 +473,7 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
-        "open_exact_genesis_with_lineage",
+        "open_exact_genesis",
     ),
     ("omnigraph-catalog/lib.rs", "ManifestCoordinator", "open"),
     (
@@ -489,11 +490,6 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
         "open_at_branch_with_session",
-    ),
-    (
-        "omnigraph-catalog/lib.rs",
-        "ManifestCoordinator",
-        "open_with_lineage",
     ),
     (
         "omnigraph-catalog/lib.rs",
@@ -520,20 +516,26 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "ManifestCoordinator",
         "table_registrations_under_control_gates",
     ),
+    ("omnigraph-catalog/lib.rs", "ManifestCoordinator", "refresh"),
     (
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
-        "refresh_with_lineage",
+        "read_head_at",
     ),
     (
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
-        "refresh_for_live_read",
+        "read_held_at",
     ),
     (
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
-        "read_graph_lineage_at",
+        "record_in_live_branches",
+    ),
+    (
+        "omnigraph-catalog/lib.rs",
+        "ManifestCoordinator",
+        "ensure_incarnation_live",
     ),
     (
         "omnigraph-catalog/lib.rs",
@@ -726,9 +728,6 @@ gateway_surfaces! {
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Exact("RFC 0067 detached staged commit gateway")) => [
         "commit_staged_detached",
     ],
-    "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Exact("RFC 0067 promotion replay gateway")) => [
-        "promote_detached",
-    ],
     "table_store.rs" => "TableStore" => GatewayDisposition::ReadOrPure => [
         "validate_initial_empty_table",
         "transaction_identity",
@@ -772,9 +771,6 @@ gateway_surfaces! {
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Exact("RFC 0067 detached staged commit gateway")) => [
         "commit_staged_detached",
-    ],
-    "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Exact("RFC 0067 promotion replay gateway")) => [
-        "promote_detached",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::EphemeralScratch) => [
         "append_or_create_batch", "create_empty_dataset", "write_dataset",
@@ -824,10 +820,6 @@ durable_calls! {
     // deletion is last, so interrupted settlement can safely finish later.
     ("db/omnigraph/prepared_create.rs", ".delete_prefix(", 2, WriteProtocol::Exact("quiesced token-owned empty birth tables and unpublished manifest files; never graph root or foreign refs")),
     ("db/omnigraph/prepared_create.rs", ".delete(", 1, WriteProtocol::Exact("exact prepared init claim, removed only after all verified birth artifacts")),
-    ("db/upgrade/legacy_schema_files.rs", ".delete(", 1, WriteProtocol::Exact("protocol 5: validate every converted branch, remove exact legacy contract files, then activate main")),
-    ("db/upgrade.rs", "CommitBuilder::new(", 3, WriteProtocol::Exact("offline storage upgrade with main-owned intent")),
-    ("db/upgrade.rs", "InsertBuilder::new(", 1, WriteProtocol::Exact("manifest-only conversion under durable upgrade ownership")),
-    ("db/upgrade.rs", ".execute_uncommitted_stream(", 1, WriteProtocol::Exact("manifest-only conversion under durable upgrade ownership")),
     ("omnigraph-core/fts_compat.rs", ".put(", 1, WriteProtocol::Composed("staged index artifact")),
     ("table_store.rs", ".put(", 1, WriteProtocol::Composed("deleted-ids record spilled to `_omnigraph/deleted_ids/<uuid>.json` before the detached delete commit that names it in its transaction properties; marked by the collector as one of the root's files")),
     // The `__manifest` Create write is the manifest's entire birth: entries,
@@ -836,7 +828,9 @@ durable_calls! {
     // (A `table_version_management` config key is deliberately not written:
     // neither the pinned Lance substrate nor this crate reads it.)
     ("omnigraph-catalog/graph.rs", "Dataset::write(", 2, WriteProtocol::Bootstrap),
-    ("omnigraph-catalog/publisher.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
+    ("omnigraph-catalog/history.rs", ".commit(", 4, WriteProtocol::ReadOnlyAccess),
+    ("omnigraph-catalog/history.rs", ".put_if_absent(", 2, WriteProtocol::Composed("create-only puts of immutable `__history` objects: an extent of settled commit records (`write_extent`), issued by the publisher before its `__manifest` CAS and by branch deletion before the ref is retired, and a schema content object named by its hash")),
+    ("omnigraph-catalog/publisher.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("omnigraph-catalog/publisher.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("manifest publisher trait forwarding")),
     ("omnigraph-catalog/commit.rs", "InsertBuilder::new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("omnigraph-catalog/commit.rs", ".execute_uncommitted(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
@@ -879,18 +873,16 @@ durable_calls! {
     ("storage_layer.rs", ".commit_staged(", 1, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
-    ("storage_layer.rs", ".promote_detached(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
-    ("db/omnigraph/promotion.rs", ".promote_detached(", 1, WriteProtocol::Exact("RFC 0067 promotion replay")),
     ("db/omnigraph/promotion.rs", "SnapshotHandle::new(", 1, WriteProtocol::ReadOnlyAccess),
-    ("storage_layer.rs", ".dataset()", 31, WriteProtocol::Composed("sealed TableStorage forwarding")),
-    ("storage_layer.rs", ".into_arc()", 6, WriteProtocol::Composed("sealed TableStorage forwarding")),
-    ("storage_layer.rs", "SnapshotHandle::new(", 4, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".dataset()", 30, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".into_arc()", 5, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", "SnapshotHandle::new(", 3, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("table_store.rs", ".raw_dataset_append(", 1, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "Dataset::write(", 2, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "DeleteBuilder::from_expr(", 1, WriteProtocol::Composed("staged delete primitive")),
     ("table_store.rs", "InsertBuilder::new(", 3, WriteProtocol::Composed("staged insert primitive")),
     ("table_store.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Composed("staged merge primitive")),
-    ("table_store.rs", "CommitBuilder::new(", 4, WriteProtocol::Composed("staged commit primitive")),
+    ("table_store.rs", "CommitBuilder::new(", 3, WriteProtocol::Composed("staged commit primitive")),
     ("table_store.rs", ".create_index_builder(", 5, WriteProtocol::Composed("staged index primitive and RFC 0067 whole-rebuild fold")),
     ("table_store.rs", ".execute_uncommitted(", 10, WriteProtocol::Composed("staged physical primitive")),
     ("db/omnigraph/system_column_upgrade.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached rename-only system-column effect")),
@@ -913,9 +905,6 @@ durable_calls! {
     ("db/omnigraph/schema_apply.rs", ".commit_changes_with_intent_and_expected(", 1, SCHEMA_V9),
     ("db/omnigraph/schema_apply/settlement.rs", ".commit_changes_with_intent_and_expected(", 1, WriteProtocol::Exact("schema settlement: strict numeric neutral lineage publication")),
     ("db/omnigraph/repair.rs", ".commit_updates_with_actor_with_expected(", 1, WriteProtocol::ManifestAdoption),
-    ("db/upgrade/detached_only.rs", ".commit_updates_with_actor_with_expected(", 1, WriteProtocol::Exact("v11 upgrade step: one publication per live branch recording `omnigraph.last_linear_version` on every current row under exact expected table versions, before the fence and the restamp")),
-    ("db/upgrade/detached_only.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
-    ("db/upgrade/detached_only.rs", ".delete(", 1, WriteProtocol::Composed("v11 upgrade step reaps the proven copy of every pin it promoted, through the table's own Lance store, the last reap the engine runs")),
     ("db/graph_coordinator.rs", ".commit_changes_with_intent_and_expected(", 1, WriteProtocol::Exact("publisher gateway")),
     ("db/graph_coordinator.rs", ".commit_changes_with_lineage_and_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("omnigraph-catalog/lib.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
@@ -1008,6 +997,7 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     ".delete_prefix(",
     ".put(",
     ".put_opts(",
+    ".put_if_absent(",
     ".put_multipart(",
     ".put_part(",
     ".complete(",
@@ -3593,9 +3583,7 @@ fn lance_batched_blob_read_call_counts_are_pinned() {
     assert_eq!(
         sites,
         vec![
-            ("read_blob_ranges", "db/upgrade.rs".to_string(), 1),
             ("read_blobs", "table_store.rs".to_string(), 1),
-            ("with_io_buffer_size_bytes", "db/upgrade.rs".to_string(), 1),
             ("with_io_buffer_size_bytes", "table_store.rs".to_string(), 1),
         ],
         "the per-file call counts of read_blobs, read_blob_ranges and \

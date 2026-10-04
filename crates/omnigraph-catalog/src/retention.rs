@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use super::{CapturedManifestProbe, ManifestCoordinator, Snapshot};
 use crate::branch_names::{MERGE_INPUT_PREFIX, encode_head, is_merge_input_tag};
 pub use crate::branch_names::{MergeInputOwner, merge_input_owner};
-use crate::commit_graph::{CommitGraph, GraphCommit};
+use crate::commit_graph::{CommitGraph, GraphCommit, HistoryCache};
 use crate::error::{OmniError, Result};
 use crate::staging::StagingWitness;
 
@@ -28,12 +28,20 @@ pub struct PinnedGraphManifest {
 }
 
 impl PinnedGraphManifest {
-    pub async fn commit_graph(&self, root_uri: &str) -> Result<CommitGraph> {
-        let (rows, _) = super::read_graph_lineage(&self.dataset).await?;
-        Ok(CommitGraph::from_manifest_rows(
+    /// The commit graph of the head this manifest version holds, over the
+    /// settled commits `history` has read.
+    pub async fn commit_graph(
+        &self,
+        root_uri: &str,
+        history: &HistoryCache,
+    ) -> Result<CommitGraph> {
+        let rows = crate::state::read_manifest_rows_projected(&self.dataset).await?;
+        Ok(CommitGraph::from_head(
             root_uri,
-            self.snapshot.graph_branch.as_deref(),
-            rows,
+            self.dataset.session(),
+            rows.head,
+            rows.buffer.commits(),
+            history.clone(),
         ))
     }
 
@@ -239,16 +247,10 @@ impl ManifestCoordinator {
                 Err(error) if error.is_not_found() => continue,
                 Err(error) => return Err(OmniError::storage(error)),
             };
-            let (rows, heads) = super::read_graph_lineage(&dataset).await?;
-            let graph =
-                CommitGraph::from_manifest_rows(root_uri, commit.graph_branch.as_deref(), rows);
-            let head = heads
-                .get(commit.graph_branch.as_deref().unwrap_or("main"))
-                .cloned()
-                .or(graph.head_commit_id().await?);
-            if head.as_deref() != Some(commit.graph_commit_id.as_str())
-                || graph.get_commit(&commit.graph_commit_id).as_ref() != Some(commit)
-            {
+            let head = crate::state::read_manifest_rows_projected(&dataset)
+                .await?
+                .head;
+            if crate::commit_graph::graph_commit_from_manifest_row(head) != *commit {
                 continue;
             }
             return PinnedGraphManifest::from_dataset(root_uri, dataset).await;
@@ -259,7 +261,12 @@ impl ManifestCoordinator {
         )))
     }
 
-    pub async fn retired_commit_graphs(root_uri: &str) -> Result<Vec<(String, CommitGraph)>> {
+    /// The commit graph of every retired branch incarnation by native ref,
+    /// over the settled commits `history` has read.
+    pub async fn retired_commit_graphs(
+        root_uri: &str,
+        history: &HistoryCache,
+    ) -> Result<Vec<(String, CommitGraph)>> {
         let main = super::open_manifest_dataset_native_with_session(
             root_uri,
             None,
@@ -277,11 +284,13 @@ impl ManifestCoordinator {
                 .checkout_version(Ref::Version(Some(native.clone()), None))
                 .await
                 .map_err(OmniError::storage)?;
-            let (rows, _) = super::read_graph_lineage(&dataset).await?;
-            let graph = CommitGraph::from_manifest_rows(
+            let rows = crate::state::read_manifest_rows_projected(&dataset).await?;
+            let graph = CommitGraph::from_head(
                 root_uri,
-                Some(crate::branch_names::logical_branch_name(&native)),
-                rows,
+                dataset.session(),
+                rows.head,
+                rows.buffer.commits(),
+                history.clone(),
             );
             graphs.push((native, graph));
         }
@@ -292,6 +301,7 @@ impl ManifestCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omnigraph_core::graph_commit_id::HISTORY_BLOCK_SLOTS;
 
     #[test]
     fn merge_input_tags_require_canonical_authority() {
@@ -310,7 +320,24 @@ mod tests {
                 .as_deref(),
             Some(head)
         );
+        let block_head = format!("hb1.{head}.15.{nonce}");
+        let block_tag = format!(
+            "{MERGE_INPUT_PREFIX}{digest}_{}_{nonce}",
+            encode_head(Some(&block_head))
+        );
+        assert_eq!(
+            merge_input_owner(&block_tag)
+                .unwrap()
+                .unwrap()
+                .graph_head
+                .as_deref(),
+            Some(block_head.as_str())
+        );
         for bad in [
+            format!(
+                "{MERGE_INPUT_PREFIX}{digest}_{}_{nonce}",
+                encode_head(Some(&format!("hb1.{head}.{HISTORY_BLOCK_SLOTS}.{nonce}")))
+            ),
             valid.replacen(&digest, &digest.to_uppercase(), 1),
             valid.replace(nonce, &nonce.to_lowercase()),
             format!(

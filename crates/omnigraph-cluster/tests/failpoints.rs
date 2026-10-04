@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use omnigraph::db::Omnigraph;
 use omnigraph_cluster::seams::FailScenario;
 use omnigraph_cluster::{DeploymentLookup, apply_deployment};
+use omnigraph_core::graph_commit_id::intent_nonce;
 use serial_test::serial;
 use tempfile::tempdir;
 
@@ -404,7 +405,11 @@ async fn offline_partial_result_allows_corrective_successor_without_replay() {
         GraphDeploymentResult::Schema {
             result: SchemaApplySettlement::Committed { commit, .. },
         } => {
-            assert_eq!(commit.graph_commit_id, original_commit);
+            assert_eq!(
+                intent_nonce(&commit.graph_commit_id).unwrap(),
+                original_commit,
+                "the published ID carries the intent nonce"
+            );
             assert_eq!(commit.actor_id.as_deref(), Some("deployment-original"));
         }
         other => panic!("{other:?}"),
@@ -637,8 +642,8 @@ async fn offline_deployment_process_death_preserves_intent_and_fence() {
                     commits
                         .iter()
                         .filter(|commit| {
-                            Some(commit.graph_commit_id.as_str())
-                                == fence["lineage"]["graph_commit_id"].as_str()
+                            intent_nonce(&commit.graph_commit_id).unwrap()
+                                == fence["lineage"]["graph_commit_id"].as_str().unwrap()
                         })
                         .count(),
                     1,
@@ -674,9 +679,14 @@ async fn offline_deployment_process_death_preserves_intent_and_fence() {
             if !fence.is_null() {
                 let result = serde_json::to_value(&result).unwrap();
                 assert_eq!(
-                    result["graphs"]["knowledge"]["result"]["NotPublished"]["proof"]["Fence"]["commit"]
-                        ["graph_commit_id"],
-                    fence["lineage"]["graph_commit_id"]
+                    intent_nonce(
+                        result["graphs"]["knowledge"]["result"]["NotPublished"]["proof"]["Fence"]
+                            ["commit"]["graph_commit_id"]
+                            .as_str()
+                            .unwrap()
+                    )
+                    .unwrap(),
+                    fence["lineage"]["graph_commit_id"].as_str().unwrap()
                 );
             }
             if let Some(version) = published_fence_version {

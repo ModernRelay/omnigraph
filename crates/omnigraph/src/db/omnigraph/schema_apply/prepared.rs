@@ -109,7 +109,7 @@ impl PreparedSchemaApply {
         }
         if let Some(lineage) = &self.lineage
             && (lineage.branch.is_some()
-                || lineage.merged_parent_commit_id.is_some()
+                || lineage.merged_parent.is_some()
                 || lineage.actor_id != self.actor
                 || !lineage
                     .graph_commit_id
@@ -187,7 +187,10 @@ impl CapturedSchemaApply {
             None
         } else {
             Some(GraphCoordinator::new_lineage_intent_for_branch(
-                None, actor, None,
+                None,
+                actor,
+                None,
+                HistoryReleaseBytes::PRODUCTION,
             )?)
         };
         Ok(PreparedSchemaApply {
