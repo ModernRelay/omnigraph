@@ -14,7 +14,8 @@
   <a href="docs/user/quickstart.md">Quickstart</a> &nbsp;·&nbsp;
   <a href="docs/user/clusters/index.md">Docs</a> &nbsp;·&nbsp;
   <a href="https://github.com/ModernRelay/omnigraph-cookbooks">Cookbooks</a> &nbsp;·&nbsp;
-  <a href="docs/user/cli/reference.md">CLI</a>
+  <a href="docs/user/cli/reference.md">CLI</a> &nbsp;·&nbsp;
+  <a href="https://www.omnigraph.dev/llms.txt">llms.txt</a>
 </p>
 
 <p align="center">
@@ -24,24 +25,12 @@
 
 <hr>
 
-Omnigraph is the operational state and coordination layer for fleets of agents.\
-Run it as a server, declared as code; hundreds of agents operate and enrich the graph on parallel isolated branches, and every change is reviewed and merged safely.
+Omnigraph is the operational state and coordination layer for fleets of agents and teams.
 
 Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace/shared_invite/zt-3wfpglyxj-lHvJGhuySPfqLtN35uJZNw)
 to ask questions, share feedback, and follow development.
 
-## Key capabilities
-
-| Capability | What it gives you |
-|---|---|
-| **Declared as code** | A `cluster.yaml` declares graphs, schemas, stored queries, embedding providers, and policies; `cluster apply` converges it and `omnigraph-server` brings every graph online at `/graphs/{id}/…`. |
-| **Built for fleets of agents** | Hundreds of agents enrich the graph on **parallel isolated branches**; changes are reviewed and merged safely, Git-style, across the whole graph. |
-| **Multimodal retrieval** | Graph traversal + vector ANN + full-text + Reciprocal Rank Fusion in **one** query runtime, for context assembly. |
-| **Security as code** | Cedar policy enforced **server-side on every mutation**, per-graph and server-wide; bearer auth; actor/audit tracking. |
-| **Runs on your infrastructure** | Local storage or any S3-compatible object store (**RustFS / MinIO**, AWS S3 / R2 / GCS, Azure). VPC, on-prem, hybrid; your data never leaves your store. |
-| **Open, versioned storage** | [`Lance`](https://github.com/lance-format/lance) columnar format: branchable, time-travelable, with native blob-as-data (docs, images, video). |
-
-## What you can build
+## 1. Popular use cases
 
 | Use case | What it's for |
 |---|---|
@@ -51,7 +40,60 @@ to ask questions, share feedback, and follow development.
 | **Dev graph** | Issues & dependency model that coding agents read and write |
 | **R&D / ML data layer** | Experiments and trials written into branches, versioned for training & eval |
 
-## Install
+## 2. How it works
+
+Omnigraph is a **graph database** that lives on object storage. You describe your domain with a **typed schema**, which includes the types of entities, their properties, and the relationships between them:
+
+```rust
+node Person {
+  email: String @key
+  name: String
+}
+
+node Organization {
+  slug: String @key
+  name: String
+}
+
+// A relationship between a Person and an Organization.
+edge WorksAt: Person -> Organization
+```
+
+This schema gives people and agents a shared contract, with types enforced by the database rather than left to application code or agent prompts.
+
+Hundreds (or even thousands) of agents can then operate on the shared graph simultaneously on their own isolated branches, and every change can be reviewed and merged safely.
+
+### 2.1 — Key capabilities
+
+| Capability | What it gives you |
+|---|---|
+| **Multimodal data** | Documents, images, audio, video, and structured data in one connected, versioned graph. |
+| **Branching & versioning** | Hundreds of agents enrich the graph on **parallel isolated branches**; changes are reviewed and merged safely, Git-style, across the whole graph. |
+| **Designed for scale** | Built on object storage, with large multimodal datasets and fast retrieval for parallel agent workloads. |
+| **Unified retrieval** | Graph traversal, vector ANN, full-text search, and Reciprocal Rank Fusion in one query runtime. |
+| **Runs on your infra** | Local storage or any S3-compatible object store (**RustFS / MinIO**, AWS S3 / R2 / GCS, Azure). VPC, on-prem, hybrid; your data never leaves your store. |
+| **Open, versioned storage** | Your entire graph on open-format [Lance](https://github.com/lance-format/lance) storage, with branches and history—not locked inside a proprietary database. |
+| **Declarative config** | A `cluster.yaml` declares graphs, schemas, stored queries, embedding providers, and policies; `cluster apply` converges it and `omnigraph-server` brings every graph online at `/graphs/{id}/…`. |
+| **Security as code** | Cedar policy enforced **server-side on every mutation**, per-graph and server-wide; bearer auth; actor/audit tracking. |
+
+### 2.2 — Running Omnigraph
+
+Omnigraph runs as a server, with its configuration defined as code. A **cluster** brings the graphs it serves, their schemas, stored queries, and access policies together in one directory:
+
+```text
+my-omnigraph/
+├── cluster.yaml
+├── people.pg
+├── queries/
+│   └── people.gq
+└── base.policy.yaml
+```
+
+You preview configuration changes with `omnigraph cluster plan`, apply them with `omnigraph cluster apply`, and serve the graphs through `omnigraph-server`.
+
+Follow the [quickstart](docs/user/quickstart.md) to create and query your first graph, or the [cluster guide](docs/user/clusters/index.md) to configure a deployment.
+
+## 3. Getting started
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | bash
@@ -65,7 +107,7 @@ brew tap ModernRelay/tap
 brew install ModernRelay/tap/omnigraph
 ```
 
-## Set it up with an AI agent
+### 3.1 — Set it up with an AI agent
 
 Omnigraph is built to be run by coding agents. Two ways in:
 
@@ -98,188 +140,13 @@ pharma & industry intel),
 [`ModernRelay/omnigraph-cookbooks`](https://github.com/ModernRelay/omnigraph-cookbooks)
 is the fastest way to see Omnigraph shaped to a real domain.
 
-## Deploy
+## 4. Docs
 
-A deployment is a **cluster**: a **multigraph** config directory that declares
-its graphs, schemas, stored queries, and policies as code. You manage it
-**Terraform-style**: `cluster plan` previews the diff, `cluster apply` converges
-it. `omnigraph-server` then boots from the cluster and brings every graph online
-at `/graphs/{id}/…`, each behind its own policy.
-
-**1. Declare the cluster.**
-
-```
-company-brain/
-├── cluster.yaml
-├── people.pg          # schema for the "knowledge" graph
-├── queries/           # stored queries: the .gq files ARE the declaration
-│   └── people.gq
-└── base.policy.yaml   # a Cedar policy bundle
-```
-
-```yaml
-# cluster.yaml
-version: 1
-metadata:
-  name: company-brain
-storage: s3://company/clusters/company-brain   # ledger, catalog, and graph data live here
-graphs:
-  knowledge:
-    schema: people.pg
-    queries: queries/                          # every `query <name>` in queries/*.gq registers
-policies:
-  base:
-    file: base.policy.yaml
-    applies_to: [knowledge]                    # graph-bound; use [cluster] for server-level
-```
-
-**2. Stand up your object store.** On-prem, run RustFS (or MinIO); Omnigraph
-writes [Lance](https://github.com/lance-format/lance) over the standard S3 API.
-In the cloud, use S3 / R2 / GCS through `AWS_*`. Native `az://` roots are also
-available as a qualification preview. Every Azure writer, including
-`cluster apply` and the server, must use the checked-in admission wrapper;
-follow the [Azure deployment guide](docs/user/deployment.md#azure-blob-preview)
-instead of running the bare commands below.
-
-**3. Converge and run.** `apply` creates each graph, applies its schema, and
-publishes queries and policies into the content-addressed catalog. It is
-idempotent; re-running is always safe.
-
-```bash
-omnigraph cluster validate   # parse + typecheck everything
-omnigraph cluster plan       # preview what apply would do
-omnigraph cluster apply      # converge
-
-# Boot the server from the cluster dir; storage resolves through cluster.yaml
-omnigraph-server --cluster company-brain --bind 0.0.0.0:8080
-```
-
-The bare commands above describe local and S3 deployments. See the
-[cluster guide](docs/user/clusters/index.md) for the day-2 loop
-(edit → plan → apply → restart), approval gates for destructive changes, drift
-inspection, and recovery; the [deployment guide](docs/user/deployment.md) for
-containers, AWS/Railway/Azure, auth, and the object-store environment contracts.
-
-## Query and mutate
-
-Set a default server and graph once in `~/.omnigraph/config.yaml`, and the
-everyday commands stay short. Stored queries and mutations run **by name**:
-
-```bash
-omnigraph query  search_docs --params '{"q":"AI safety"}'
-omnigraph mutate add_person  --params '{"name":"Mina"}'
-
-# Branch, review, merge across the whole graph; agents write in isolation
-omnigraph branch create --from main agent/ingest-42
-omnigraph branch merge  agent/ingest-42 --into main
-```
-
-An **alias** is shorter still: bind a server, graph, and stored query to one
-name, then `omnigraph alias triage` runs it. For an ad-hoc target, any command
-still takes `--server <name|url> --graph <id>` (or `--store <uri>` for a local
-graph). See the [CLI reference](docs/user/cli/reference.md).
-
-## Security & governance
-
-- **Engine-wide enforcement:** every write path goes through the same Cedar gate, so the HTTP server, the CLI, and the embedded SDK obey identical rules.
-- **Declared in the cluster:** a policy bundle is bound to graphs (or the whole server) via `policies:` → `applies_to`.
-- **Scoped:** rules apply per graph, per branch, or server-wide.
-- **No plaintext tokens:** bearer tokens are hashed at startup and compared in constant time.
-- **Forge-proof identity:** the actor is resolved server-side from the token; clients can't set it.
-
-See the [policy guide](docs/user/operations/policy.md).
-
-## Clients & SDKs
-
-| Client | Use it for | Where |
-|---|---|---|
-| **TypeScript SDK** | typed access from Node / TS | [`@modernrelay/omnigraph`](https://www.npmjs.com/package/@modernrelay/omnigraph) · [source](https://github.com/ModernRelay/omnigraph-ts) |
-| **MCP server** | bridge Omnigraph to LLM hosts (Claude, Codex, …) | [`@modernrelay/omnigraph-mcp`](https://www.npmjs.com/package/@modernrelay/omnigraph-mcp) |
-| **HTTP / OpenAPI** | any language, the wire contract | the server's OpenAPI spec |
-| **Python SDK** | typed access from Python | *coming soon* |
-
-Both npm packages are versioned in lockstep with `omnigraph-server`.
-
-## Local quick test (no server)
-
-1-min setup to try it: an **embedded, local file-backed graph** (no server, no
-object store). For dev and experiments; production is the deployed cluster above.
-
-```bash
-cat > schema.pg <<'PG'
-node Source {
-  slug: String @key
-  title: String
-}
-
-node Claim {
-  slug: String @key
-  statement: String
-}
-
-edge Supports: Source -> Claim
-PG
-printf '%s\n' \
-  '{"type":"Claim","data":{"slug":"lower-latency","statement":"The migration reduced request latency."}}' \
-  '{"type":"Source","data":{"slug":"load-test","title":"Load test report"}}' \
-  '{"edge":"Supports","from":"load-test","to":"lower-latency"}' > data.jsonl
-
-omnigraph init  --schema schema.pg ./graph.omni
-omnigraph load  --data data.jsonl --mode overwrite --store ./graph.omni
-
-# "Which sources support the lower-latency claim?"
-omnigraph query --store ./graph.omni \
-  --params '{"claim":"lower-latency"}' \
-  -e 'query sources_for_claim($claim: String) {
-    match {
-      $claim_node: Claim { slug: $claim }
-      $source supports $claim_node
-    }
-    return { $source.title as source }
-  }'
-# → Load test report
-```
-
-## Docs
-
-- [Cluster guide](docs/user/clusters/index.md) · [Deployment guide](docs/user/deployment.md) · [CLI reference](docs/user/cli/reference.md)
+- [Quickstart](docs/user/quickstart.md) · [Cluster guide](docs/user/clusters/index.md) · [Deployment guide](docs/user/deployment.md) · [CLI reference](docs/user/cli/reference.md)
 - [Schema](docs/user/schema/index.md) · [Queries](docs/user/queries/index.md) · [Search](docs/user/search/index.md) · [Policy](docs/user/operations/policy.md)
+- For agents: [Documentation index (llms.txt)](https://www.omnigraph.dev/llms.txt) · [Full documentation (llms-full.txt)](https://www.omnigraph.dev/llms-full.txt)
+- Contributing to the engine: [developer guide](docs/dev/index.md)
 
-## Build And Test
+## 5. Contributing
 
-```bash
-cargo build --workspace
-cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst
-```
-
-Notes:
-
-- Rust stable toolchain, edition 2024
-- The GQT corpus (`cargo test -p omnigraph-gqt`) and the DST suite (`cargo test` from `crates/omnigraph-dst`, which supplies its process environment) run separately; a plain `cargo test --workspace` starts the DST binaries without that environment and they refuse. Commands and CI gates: [docs/dev/testing.md](docs/dev/testing.md)
-- CI runs the same excluded command with `--locked` and the failpoint features
-- Full CI and some local test flows require `protobuf-compiler`
-- S3 integration tests expect an S3-compatible endpoint such as RustFS
-
-## Workspace Crates
-
-- `crates/omnigraph-compiler`: shared schema/query parser, typechecker, catalog, and IR lowering (zero Lance dependency)
-- `crates/omnigraph-storage`: shared local/S3/Azure control-object storage implementation and concrete backend handle
-- `crates/omnigraph-azure-admission`: narrow Azure Blob lease wrapper for the single-writer reference deployment
-- `crates/omnigraph` (package `omnigraph-engine`): storage/runtime, branching, merge, change detection, query execution, and embeddings
-- `crates/omnigraph-policy`: Cedar policy compilation and enforcement
-- `crates/omnigraph-api-types`: shared HTTP wire DTOs used by both the server and the CLI
-- `crates/omnigraph-cluster`: cluster config validation, planning, and apply (the control plane)
-- `crates/omnigraph-server`: Axum HTTP server, cluster-first, runs N graphs under `/graphs/{id}/…`
-- `crates/omnigraph-cli`: CLI for graph lifecycle, query/mutate, branch/commit/merge, schema/lint, snapshot/export, cluster control, policy/queries, profiles, and maintenance
-
-## Contributing
-
-Please open an issue before sending large code changes — a maintainer triages
-it, and the `accepted` label is the green light for a PR (see
-[GOVERNANCE.md](GOVERNANCE.md)). Concrete problem statements are the fastest
-way to collaborate on the roadmap.
-
-## Community
-
-Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace/shared_invite/zt-3wfpglyxj-lHvJGhuySPfqLtN35uJZNw)
-to ask questions, share feedback, and follow development.
+Please open an issue before sending large code changes — a maintainer triages it, and the `accepted` label is the green light for a PR (see [GOVERNANCE.md](GOVERNANCE.md)). Build and test setup is in [CONTRIBUTING.md](CONTRIBUTING.md).
