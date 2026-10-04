@@ -808,6 +808,341 @@ async fn rename_only_project_keeps_fragments_field_ids_pk_marker_and_indexes() {
     assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
 }
 
+/// Guard: schema apply's metadata-only evolution. On a stable-row-id V2_2
+/// table holding inline, packed and dedicated Blob-v2 payloads, null and a
+/// valid empty value, a detached `Operation::Project` renames and drops
+/// columns and a detached `Operation::Merge` chained on it adds nullable
+/// String and Blob columns over the unchanged fragments. Neither writes a
+/// data file; surviving fields keep their ids, metadata and indexes with the
+/// same fragment coverage; the index on the dropped column leaves; every
+/// payload reads back; the added columns read null; HEAD never moves. Lance
+/// refuses a Merge that renames a field, which is why the engine chains.
+#[tokio::test]
+async fn metadata_only_schema_evolution_keeps_blob_files_ids_and_index_coverage() {
+    use arrow_array::types::UInt64Type;
+
+    const PROPERTY_ID: &str = "omnigraph.stable_property_id";
+
+    fn data_files(ds: &Dataset) -> Vec<(u64, Vec<String>)> {
+        ds.get_fragments()
+            .iter()
+            .map(|fragment| {
+                (
+                    fragment.id() as u64,
+                    fragment
+                        .metadata()
+                        .files
+                        .iter()
+                        .map(|file| file.path.clone())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    async fn index_coverage(ds: &Dataset) -> HashMap<String, (Vec<i32>, Vec<u32>)> {
+        ds.load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| !lance_index::is_system_index(index))
+            .map(|index| {
+                (
+                    index.name.clone(),
+                    (
+                        index.fields.clone(),
+                        index
+                            .fragment_bitmap
+                            .as_ref()
+                            .map(|bitmap| bitmap.iter().collect())
+                            .unwrap_or_default(),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    async fn commit_detached(ds: &Dataset, operation: Operation) -> lance::Result<Dataset> {
+        let transaction = Transaction::new(ds.version().version, operation, None);
+        CommitBuilder::new(Arc::new(ds.clone()))
+            .with_detached(true)
+            .with_skip_auto_cleanup(true)
+            .execute(transaction)
+            .await
+    }
+
+    async fn ids_and_row_ids(ds: &Dataset) -> (Vec<String>, Vec<u64>) {
+        let mut scanner = ds.scan();
+        scanner.with_row_id();
+        scanner.project(&["id"]).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_string::<i32>()
+            .iter()
+            .map(|id| id.unwrap().to_string())
+            .collect();
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+        (ids, row_ids)
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("evolve.lance");
+    let uri = uri.to_str().unwrap();
+    let payloads: Vec<Option<Vec<u8>>> = vec![
+        Some(vec![b'i'; 80]),
+        Some(vec![b'p'; 96 * 1024]),
+        None,
+        Some(Vec::new()),
+        Some(vec![b'd'; 5 * 1024 * 1024]),
+    ];
+    let mut content = BlobArrayBuilder::new(payloads.len());
+    for payload in &payloads {
+        match payload {
+            Some(payload) => content.push_bytes(payload).unwrap(),
+            None => content.push_null().unwrap(),
+        }
+    }
+    let marked = |field: Field, id: &str| {
+        let mut metadata = field.metadata().clone();
+        metadata.insert(PROPERTY_ID.to_string(), id.to_string());
+        field.with_metadata(metadata)
+    };
+    let mut pk = HashMap::new();
+    pk.insert(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false).with_metadata(pk),
+        marked(Field::new("name", DataType::Utf8, true), "11"),
+        marked(Field::new("note", DataType::Utf8, true), "12"),
+        marked(lance::blob::blob_field("content", true), "13"),
+    ]));
+    let ids = ["r0", "r1", "r2", "r3", "r4"];
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(ids.to_vec())),
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+            Arc::new(StringArray::from(vec!["n0", "n1", "n2", "n3", "n4"])),
+            content.finish().unwrap(),
+        ],
+    )
+    .unwrap();
+    let mut base = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    for column in ["name", "note"] {
+        base.create_index(
+            &[column],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(base.get_fragments().len(), 2, "two fragments");
+    let head = base.version().version;
+    let files = data_files(&base);
+    let coverage = index_coverage(&base).await;
+    let name = base.schema().field("name").unwrap().clone();
+    let content_field = base.schema().field("content").unwrap().clone();
+    let (_, row_ids) = ids_and_row_ids(&base).await;
+
+    // A Merge cannot carry a rename: Lance refuses to move a field id to
+    // another path without rewriting it.
+    let mut renamed_in_merge = base.schema().clone();
+    renamed_in_merge.mut_field_by_id(name.id).unwrap().name = "title".to_string();
+    let error = commit_detached(
+        &base,
+        Operation::Merge {
+            fragments: base.manifest.fragments.as_ref().clone(),
+            schema: renamed_in_merge,
+            preserves_nullability: true,
+        },
+    )
+    .await
+    .expect_err("a Merge that renames a field must be refused");
+    assert!(
+        error.to_string().contains("remaps field id"),
+        "unexpected refusal: {error}"
+    );
+
+    // Step 1: Project renames `name` to `title` and drops `note`.
+    let mut projected = base.schema().clone();
+    projected.mut_field_by_id(name.id).unwrap().name = "title".to_string();
+    projected.fields.retain(|field| field.name != "note");
+    projected.validate().unwrap();
+    let projected = commit_detached(
+        &base,
+        Operation::Project {
+            schema: projected,
+            preserves_nullability: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(lance_table::format::is_detached_version(
+        projected.version().version
+    ));
+    assert_eq!(data_files(&projected), files, "Project writes no data file");
+    let title = projected.schema().field("title").unwrap();
+    assert_eq!(title.id, name.id);
+    assert_eq!(
+        title.metadata, name.metadata,
+        "the renamed field keeps its metadata"
+    );
+    assert!(projected.schema().field("note").is_none());
+    let projected_coverage = index_coverage(&projected).await;
+    assert_eq!(
+        projected_coverage.get("name_idx"),
+        coverage.get("name_idx"),
+        "the renamed column's index keeps its field id and fragment coverage"
+    );
+    assert!(
+        !projected_coverage.contains_key("note_idx"),
+        "the dropped column's index leaves with it"
+    );
+
+    // Step 2: Merge adds nullable `city` and Blob `thumb` over the unchanged
+    // fragments, with ids above every id the data files reference.
+    let max_field_id = projected.manifest.max_field_id();
+    let mut evolved = projected.schema().clone();
+    for added in [
+        marked(Field::new("city", DataType::Utf8, true), "14"),
+        marked(lance::blob::blob_field("thumb", true), "15"),
+    ] {
+        evolved
+            .fields
+            .push(lance::datatypes::Field::try_from(&added).unwrap());
+    }
+    evolved.set_field_id(Some(max_field_id));
+    evolved.validate().unwrap();
+    let evolved = commit_detached(
+        &projected,
+        Operation::Merge {
+            fragments: projected.manifest.fragments.as_ref().clone(),
+            schema: evolved,
+            preserves_nullability: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(data_files(&evolved), files, "Merge writes no data file");
+    for added in ["city", "thumb"] {
+        let field = evolved.schema().field(added).unwrap();
+        assert!(field.id > max_field_id, "{added} takes a fresh field id");
+        assert!(field.metadata.contains_key(PROPERTY_ID));
+    }
+    assert!(evolved.schema().field("thumb").unwrap().is_blob());
+    let kept = evolved.schema().field("content").unwrap();
+    assert_eq!(kept.id, content_field.id);
+    assert_eq!(kept.metadata, content_field.metadata);
+    assert_eq!(
+        evolved
+            .schema()
+            .unenforced_primary_key()
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["id"]
+    );
+    assert_eq!(
+        index_coverage(&evolved).await,
+        projected_coverage,
+        "the Merge keeps every index and its coverage"
+    );
+
+    // Every managed payload, the null and the valid empty value read back by
+    // stable row id; the added Blob column reads null for every row.
+    let (evolved_ids, evolved_row_ids) = ids_and_row_ids(&evolved).await;
+    assert_eq!(evolved_ids, ids);
+    assert_eq!(evolved_row_ids, row_ids, "stable row ids are unchanged");
+    let evolved = Arc::new(evolved);
+    let blobs = evolved
+        .read_blobs("content")
+        .unwrap()
+        .with_row_ids(row_ids.clone())
+        .preserve_order(true)
+        .execute()
+        .await
+        .unwrap();
+    for (blob, expected) in blobs.iter().zip(&payloads) {
+        assert_eq!(blob.data.as_deref(), expected.as_deref());
+    }
+    let thumbs = evolved
+        .read_blobs("thumb")
+        .unwrap()
+        .with_row_ids(row_ids)
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(thumbs.len(), payloads.len());
+    assert!(thumbs.iter().all(|blob| blob.data.is_none()));
+    let mut scanner = evolved.scan();
+    scanner.blob_handling(BlobHandling::AllBinary);
+    scanner
+        .project(&["id", "title", "city", "thumb", "content"])
+        .unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), ids.len());
+    assert_eq!(
+        batch.column_by_name("city").unwrap().null_count(),
+        ids.len()
+    );
+    assert_eq!(
+        batch.column_by_name("thumb").unwrap().null_count(),
+        ids.len()
+    );
+    assert_eq!(
+        batch
+            .column_by_name("title")
+            .unwrap()
+            .as_string::<i32>()
+            .iter()
+            .map(Option::unwrap)
+            .collect::<Vec<_>>(),
+        ["a", "b", "c", "d", "e"]
+    );
+    let contents = batch.column_by_name("content").unwrap().as_binary::<i64>();
+    for (row, expected) in payloads.iter().enumerate() {
+        match expected {
+            Some(expected) => assert_eq!(contents.value(row), expected.as_slice()),
+            None => assert!(contents.is_null(row)),
+        }
+    }
+
+    // The base version still reads its own schema, and nothing moved HEAD.
+    let base_again = DatasetBuilder::from_uri(uri)
+        .with_version(base.version().version)
+        .load()
+        .await
+        .unwrap();
+    assert!(base_again.schema().field("note").is_some());
+    assert!(base_again.schema().field("title").is_none());
+    assert_eq!(
+        Dataset::open(uri).await.unwrap().version().version,
+        head,
+        "detached evolution commits never move HEAD"
+    );
+}
+
 /// Helper: build a small fresh dataset in a tempdir. Pinned at V2_2 to match
 /// production write paths (blob v2 requires V2_2; see `docs/dev/lance.md`).
 async fn fresh_dataset(uri: &str) -> Dataset {
