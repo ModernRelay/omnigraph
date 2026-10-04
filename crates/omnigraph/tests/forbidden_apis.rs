@@ -296,6 +296,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "snapshot_of"),
     ("db/omnigraph.rs", "graph_manifest_version_of"),
     ("db/omnigraph.rs", "internal_schema_version_of"),
+    ("db/omnigraph.rs", "internal_schema_version_at"),
     ("db/omnigraph.rs", "resolved_branch_of"),
     ("db/omnigraph.rs", "sync_branch"),
     ("db/omnigraph.rs", "resolve_snapshot"),
@@ -367,6 +368,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
         "read_schema_contract_for_snapshot",
+    ),
+    (
+        "omnigraph-catalog/lib.rs",
+        "ManifestCoordinator",
+        "internal_schema_stamp_for_snapshot",
     ),
     (
         "db/graph_coordinator.rs",
@@ -3383,6 +3389,78 @@ fn native_branch_controls_use_post_gate_captures_not_handle_refreshes() {
         method_call_count(&delete_helper.block, "invalidate_read_caches"),
         1,
         "captured branch deletion must invalidate derived caches after successful ref removal"
+    );
+}
+
+fn function_blocks(ast: &syn::File, function_name: &str) -> Vec<syn::Block> {
+    struct Finder<'a> {
+        function_name: &'a str,
+        blocks: Vec<syn::Block>,
+    }
+
+    impl<'ast> Visit<'ast> for Finder<'_> {
+        fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+            if node.sig.ident == self.function_name {
+                self.blocks.push((*node.block).clone());
+            }
+            visit::visit_item_fn(self, node);
+        }
+
+        fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+            if node.sig.ident == self.function_name {
+                self.blocks.push(node.block.clone());
+            }
+            visit::visit_impl_item_fn(self, node);
+        }
+    }
+
+    let mut finder = Finder {
+        function_name,
+        blocks: Vec::new(),
+    };
+    finder.visit_file(ast);
+    finder.blocks
+}
+
+/// `omnigraph snapshot` and `GET /snapshot` resolve their target once and read
+/// the stamp from that `Snapshot`; `internal_schema_version_of` would resolve
+/// the target a second time, so the stamp could describe a newer graph version.
+#[test]
+fn snapshot_transports_read_the_stamp_from_the_snapshot_they_return() {
+    let engine_src = engine_src_root();
+    let mut violations = Vec::new();
+    for (crate_name, relative, function_name) in [
+        ("omnigraph-cli", "client.rs", "snapshot"),
+        ("omnigraph-server", "handlers.rs", "server_snapshot"),
+    ] {
+        let file = sibling_crate_src(&engine_src, crate_name).join(relative);
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let ast = parse_rust_source(&contents, relative);
+        let blocks = function_blocks(&ast, function_name);
+        let [block] = blocks.as_slice() else {
+            panic!(
+                "{crate_name}/{relative} must define exactly one `{function_name}`, found {}",
+                blocks.len()
+            );
+        };
+        for (method, expected) in [
+            ("snapshot_of", 1),
+            ("internal_schema_version_at", 1),
+            ("internal_schema_version_of", 0),
+        ] {
+            let found = method_call_count(block, method);
+            if found != expected {
+                violations.push(format!(
+                    "{crate_name}/{relative} `{function_name}`: {found} `{method}` calls, expected {expected}"
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "a snapshot transport must capture one `Snapshot` and read its stamp from it:\n{}",
+        violations.join("\n")
     );
 }
 

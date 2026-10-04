@@ -652,6 +652,35 @@ fn scheduler(store: &Arc<ObjectStore>) -> Arc<ScanScheduler> {
     )
 }
 
+const FOOTER_BYTES: usize = 40;
+const GLOBAL_BUFFER_COUNT_AT: usize = 24;
+const GLOBAL_BUFFER_ENTRY_BYTES: u64 = 16;
+
+/// The Lance file reader allocates one entry per global buffer the footer
+/// counts before reading any; a failed allocation aborts the process, which
+/// `catch_unwind` cannot stop.
+async fn refuse_oversized_global_buffer_count(reader: &ExtentReader) -> Result<()> {
+    let footer = reader
+        .size
+        .checked_sub(FOOTER_BYTES)
+        .ok_or_else(|| invalid("object is shorter than a Lance file footer"))?;
+    let at = footer + GLOBAL_BUFFER_COUNT_AT;
+    let count = reader.get_range(at..at + 4).await.map_err(invalid)?;
+    let count = u32::from_le_bytes(
+        count
+            .as_ref()
+            .try_into()
+            .map_err(|_| invalid("truncated Lance file footer"))?,
+    );
+    if u64::from(count) * GLOBAL_BUFFER_ENTRY_BYTES > reader.size as u64 {
+        return Err(invalid(format!(
+            "global buffer count {count} exceeds what an object of {} bytes can hold",
+            reader.size
+        )));
+    }
+    Ok(())
+}
+
 /// The rows of one extent file in `__history` column order, without the
 /// `tables` column when `lineage_only`.
 async fn decode(
@@ -660,6 +689,7 @@ async fn decode(
     lineage_only: bool,
 ) -> Result<RecordBatch> {
     let expected = file_schema()?;
+    refuse_oversized_global_buffer_count(&reader).await?;
     let read = async {
         let reader = FileReader::try_open(
             scheduler.open_reader(Arc::new(reader)),
@@ -2038,8 +2068,6 @@ pub(crate) mod test_support {
         }
     }
 
-    const FOOTER_BYTES: usize = 40;
-
     #[tokio::test]
     async fn extent_is_a_lance_v2_2_file_that_round_trips_nulls_and_table_states() {
         let mut records = records()[..4].to_vec();
@@ -2119,6 +2147,16 @@ pub(crate) mod test_support {
                     );
                 }
             }
+            let mut bad = bytes.clone();
+            let at = bytes.len() - FOOTER_BYTES + GLOBAL_BUFFER_COUNT_AT;
+            bad[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            let error = decode(&scheduler, held(&bad), lineage_only)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("global buffer count"),
+                "refused before the Lance reader sizes an allocation from it: {error}"
+            );
             assert!(
                 decode(&scheduler, held(&bytes), lineage_only).await.is_ok(),
                 "the untouched object still decodes"
