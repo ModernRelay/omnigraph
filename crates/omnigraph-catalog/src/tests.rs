@@ -9374,6 +9374,175 @@ async fn run_over_the_object_cap_is_archived_as_range_extents_under_the_cap() {
     );
 }
 
+/// Refuses the `fail_at`-th PUT `__history` is sent and passes every other request through.
+#[derive(Debug, Clone)]
+struct HistoryPutFault {
+    fail_at: usize,
+    puts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl lance::io::WrappingObjectStore for HistoryPutFault {
+    fn wrap(
+        &self,
+        _: &str,
+        original: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(HistoryPutFaultStore {
+            original,
+            fault: self.clone(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct HistoryPutFaultStore {
+    original: Arc<dyn object_store::ObjectStore>,
+    fault: HistoryPutFault,
+}
+
+impl std::fmt::Display for HistoryPutFaultStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "history put fault over {}", self.original)
+    }
+}
+
+#[async_trait]
+impl object_store::ObjectStore for HistoryPutFaultStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        let sent = self
+            .fault
+            .puts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if sent == self.fault.fail_at {
+            return Err(object_store::Error::Generic {
+                store: "history put fault",
+                source: Box::new(std::io::Error::other("injected history put refusal")),
+            });
+        }
+        self.original.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.original.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.original.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.original.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.original.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.original.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.original.copy_opts(from, to, options).await
+    }
+}
+
+/// A split run whose creation dies between two of its range extents leaves a
+/// slot-ordered prefix of the tiling; the next settle of the same records keeps
+/// that prefix as equal copies, creates the rest, and the run reads back whole.
+#[tokio::test]
+async fn split_run_interrupted_between_extents_is_completed_by_the_next_settle() {
+    const BLOCK: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const CAP: usize = 64 * 1024;
+    let session = crate::lance_access::control_session();
+    let mut records = history_block_records(BLOCK);
+    for (index, record) in records.iter_mut().enumerate() {
+        record.tables = (0..8).map(|table| bulky_table(index, table)).collect();
+    }
+    let closed = closed_block(&records);
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("file://{}", dir.path().display());
+
+    let fault = HistoryPutFault {
+        fail_at: 2,
+        puts: Arc::default(),
+    };
+    let probes = crate::instrumentation::QueryIoProbes {
+        history_wrapper: Some(Arc::new(fault.clone())),
+        ..Default::default()
+    };
+    let error = crate::instrumentation::with_query_io_probes(
+        probes,
+        super::history::settle_within(&uri, &session, &records, &closed, CAP),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("history put fault"), "{error}");
+    let prefix = stored_ranges(&uri, BLOCK).await;
+    assert_eq!(
+        prefix.len(),
+        1,
+        "the one extent put before the fault is the whole residue: {prefix:?}"
+    );
+    assert_eq!(prefix[0].0, 0, "the residue starts the tiling: {prefix:?}");
+
+    super::history::settle_within(&uri, &session, &records, &closed, CAP)
+        .await
+        .unwrap();
+    let ranges = stored_ranges(&uri, BLOCK).await;
+    assert!(ranges.len() > 1, "{ranges:?}");
+    assert_eq!(
+        ranges[0], prefix[0],
+        "the residue is kept as an equal copy, not rewritten: {ranges:?}"
+    );
+    assert_eq!(ranges[ranges.len() - 1].1, 15, "{ranges:?}");
+    for pair in ranges.windows(2) {
+        assert_eq!(pair[0].1 + 1, pair[1].0, "no gap, no overlap: {ranges:?}");
+    }
+    let ids: Vec<&str> = records
+        .iter()
+        .map(|record| record.commit.graph_commit_id.as_str())
+        .collect();
+    let found = super::history::read_records_of(&uri, &session, &ids)
+        .await
+        .unwrap();
+    assert_eq!(found.len(), records.len());
+    for record in &records {
+        assert_eq!(found.get(&record.commit.graph_commit_id), Some(record));
+    }
+}
+
 const WIDE_TABLES: usize = 128;
 
 /// [`WIDE_TABLES`] pinned tables whose keys carry a 512-byte suffix, in identity order.
