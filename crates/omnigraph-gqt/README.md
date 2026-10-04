@@ -12,6 +12,24 @@ selects an engine.
 The format contract and future extensions live in
 [RFC 0045](../../docs/rfcs/0045-gq-logic-tests.md).
 
+## Slow cases
+
+A case too slow for the complete corpus lives under `cases_slow/`, beside
+`cases/`, with the same subdirectories. The author decides: nothing measures a
+case and moves it. Put a case there when it needs seconds of engine work on
+its own, because the complete corpus runs four cases at once on the CI runner
+and each has ten seconds of wall time. `cargo test` never runs `cases_slow/`;
+the `GQT slow nightly` workflow runs it on main once a night, one case at a
+time, and a case there may declare `timeout_ms` above 10000. Run it locally
+with the binary:
+
+```bash
+cargo run --bin omnigraph-gqt -- cases_slow
+```
+
+A slow case is not a pull request's regression test: the fix regression gate
+counts only cases under `cases/`.
+
 ## Explicit execution
 
 Every case starts with its existing issue header, followed by required runner,
@@ -429,7 +447,7 @@ always miss, `head_failed` then `list`. `delete_prefix` logs only its listing;
 deletes performed inside the adapter are not counted. An
 `exists` the store refused is `head_failed` whether the head or the list
 after it failed. An adapter the engine builds for itself instead of using
-the handle's (the storage upgrade or the graph-index load of a historical
+the handle's (the graph-index load of a historical
 read) is outside the wrapped one; no gqt step reaches one today. An adapter
 object probed then read in one step is a repeat read: `head` and whole-object
 `get` share a key. Repeated loads in that step also count as repeat reads.
@@ -519,7 +537,7 @@ runner section. Ambient fault, entropy and pool overrides also refuse
 admission, including replay, as does a set settings variable
 (`OMNIGRAPH_ENGINE`, `OMNIGRAPH_RRF_PLAN`, `OMNIGRAPH_MERGE_LINEAGE`,
 `OMNIGRAPH_ANN_NPROBES`, `OMNIGRAPH_LOAD_CONCURRENCY`,
-`OMNIGRAPH_TRAVERSAL_WORK_LIMIT`) and the retired
+`OMNIGRAPH_TRAVERSAL_WORK_LIMIT`, `OMNIGRAPH_HISTORY_RELEASE_BYTES`) and the retired
 `OMNIGRAPH_TRAVERSAL_MODE`, which names no setting any more. A case session
 never reads the environment (the runner's own `OMNIGRAPH_GQ_ENGINE` above is
 the one seed), so neither variable decides anything; the refusal keeps a stale

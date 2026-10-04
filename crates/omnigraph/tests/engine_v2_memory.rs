@@ -1,5 +1,6 @@
 //! Pool and concurrency acceptance for engine v2. GQT cannot select a per-query
 //! pool, inspect native spill metrics, or drop an in-flight query future.
+#![recursion_limit = "256"]
 
 mod helpers;
 

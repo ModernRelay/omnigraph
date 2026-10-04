@@ -1,23 +1,13 @@
-//! Read-only evidence for one schema publication at one immutable manifest version.
+//! Read-only evidence from one immutable main manifest version.
 
-use arrow_array::RecordBatch;
-use datafusion::arrow::compute::concat_batches;
-use datafusion::prelude::{col, lit};
-use futures::TryStreamExt;
 use lance::dataset::refs::BranchIdentifier;
+use omnigraph_core::graph_commit_id::{commit_id_answers, is_valid_graph_commit_id};
 
 use crate::commit_graph::{GraphCommit, graph_commit_from_manifest_row};
 use crate::error::{OmniError, Result};
 use crate::instrumentation::{VersionResolution, open_dataset};
-use crate::record::{expand_from_storage, packed_projection};
-use crate::state::{
-    decode_graph_commit_row, decode_graph_head_row, require_null_table_identity,
-    schema_contract_from_batch, string_column, u64_column,
-};
-use crate::{
-    MAIN_BRANCH_HEAD_KEY, OBJECT_TYPE_GRAPH_COMMIT, OBJECT_TYPE_GRAPH_HEAD,
-    OBJECT_TYPE_SCHEMA_CONTRACT, SCHEMA_CONTRACT_OBJECT_ID, SchemaContractRow, manifest_uri,
-};
+use crate::state::{ManifestRows, read_manifest_rows_with_contract};
+use crate::{GraphLineageRow, SchemaContractRow, manifest_uri};
 
 /// Publication evidence read from the commit's own immutable main manifest.
 #[derive(Debug, Clone)]
@@ -27,27 +17,42 @@ pub struct SchemaPublicationEvidence {
     pub branch_identifier: BranchIdentifier,
 }
 
-/// Read only the exact version supplied by the caller, never search a later
-/// head, another branch or retained versions for a matching schema.
-///
-/// A missing/pruned version, absent commit, or a different publication at this
-/// version yields `None`: unknown, never proof that an operation cannot still
-/// publish. The caller verifies predecessor, actor and desired contract against
-/// its prepared intent. Malformed selected evidence and storage failures remain
-/// errors. This performs one pinned open and selects at most four rows (three
-/// expected rows plus one duplicate detector); physical scan I/O can still grow
-/// with the history stored in that version. It adds no retention protection.
-pub async fn read_schema_publication_at(
+/// Verified occupant of an exact numeric manifest version. The head may have
+/// been published earlier when this version contains only a metadata change.
+/// The two requested lineage identities are read even when neither is HEAD:
+/// a buffered occurrence cannot be mistaken for their absence.
+#[derive(Debug, Clone)]
+pub struct SchemaPublicationCandidate {
+    pub head: GraphCommit,
+    pub contract: SchemaContractRow,
+    pub branch_identifier: BranchIdentifier,
+    pub original: Option<GraphCommit>,
+    pub settlement: Option<GraphCommit>,
+}
+
+/// Read one retained version, never search `__history` or substitute latest HEAD.
+/// A missing version is `None`; malformed evidence and I/O remain errors.
+/// A requested ID names a commit by its published ID or by its intent nonce,
+/// among the head and the buffered commits of that version: a commit an exact
+/// version publish wrote is the head of its version. It decodes the whole
+/// `__manifest` version it reads (every table, buffered and replaced row and the
+/// contract), bounded by the release budget, where the removed selective scan
+/// read at most five rows. The caller owns retention and root binding.
+pub async fn read_schema_publication_candidate_at(
     root_uri: &str,
     version: u64,
-    expected_commit_id: &str,
-) -> Result<Option<SchemaPublicationEvidence>> {
+    original_id: Option<&str>,
+    settlement_id: Option<&str>,
+) -> Result<Option<SchemaPublicationCandidate>> {
     if version == 0
-        || !ulid::Ulid::from_string(expected_commit_id)
-            .is_ok_and(|id| id.to_string() == expected_commit_id)
+        || original_id
+            .into_iter()
+            .chain(settlement_id)
+            .any(|id| !is_valid_graph_commit_id(id))
+        || original_id.is_some() && original_id == settlement_id
     {
         return Err(OmniError::manifest(
-            "schema publication lookup requires a positive manifest version and canonical commit ULID",
+            "schema publication lookup requires a positive version and distinct canonical commit IDs",
         ));
     }
     let dataset = match open_dataset(
@@ -68,115 +73,88 @@ pub async fn read_schema_publication_at(
             "main schema publication lookup opened a named native branch",
         ));
     }
-    crate::instrumentation::record_manifest_scan();
-    let head_id = crate::state::graph_head_object_id(None);
-    let mut scanner = dataset.scan();
-    scanner
-        .project(&packed_projection(&dataset, true))
-        .map_err(OmniError::storage)?;
-    scanner.filter_expr(
-        col("object_id")
-            .eq(lit(expected_commit_id))
-            .or(col("object_id").eq(lit(head_id.clone())))
-            .or(col("object_id").eq(lit(SCHEMA_CONTRACT_OBJECT_ID))),
-    );
-    scanner.limit(Some(4), None).map_err(OmniError::storage)?;
-    // Lance 11 cannot decode a packed-record child projected on its own.
-    scanner.materialization_style(lance::dataset::scanner::MaterializationStyle::AllEarly);
-    let mut stream = scanner
-        .try_into_stream()
-        .await
-        .map_err(OmniError::storage)?;
-    let mut batches = Vec::new();
-    let mut count = 0;
-    while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        count += batch.num_rows();
-        if count > 3 {
-            return Err(OmniError::manifest_internal(
-                "schema publication evidence contains duplicate selected rows",
-            ));
-        }
-        batches.push(batch);
+    let (rows, contract) = read_manifest_rows_with_contract(&dataset).await?;
+    if rows.head.graph_branch.is_some() || rows.head.native_branch.is_some() {
+        return Err(OmniError::manifest_internal(
+            "schema publication evidence has no main contract/head binding",
+        ));
     }
-    let Some(first) = batches.first() else {
-        return Ok(None);
-    };
-    let packed = concat_batches(&first.schema(), &batches).map_err(OmniError::arrow_internal)?;
-    let batch = expand_from_storage(&packed)?;
-    let Some(commit) = decode_selected_commit(&batch, expected_commit_id, &head_id)? else {
-        return Ok(None);
-    };
-    if commit.graph_branch.is_some() || commit.graph_manifest_version != version {
-        return Ok(None);
+    let original = requested_commit(&rows, original_id, version)?;
+    let settlement = requested_commit(&rows, settlement_id, version)?;
+    if let (Some(original), Some(settlement)) = (&original, &settlement)
+        && original.graph_commit_id == settlement.graph_commit_id
+    {
+        return Err(OmniError::manifest(
+            "schema publication lookup requires distinct original and settlement commits",
+        ));
     }
-    let contract = schema_contract_from_batch(&dataset, &packed, None)?;
-    Ok(Some(SchemaPublicationEvidence {
-        commit,
-        contract,
+    check_commit_version(&rows.head, version)?;
+    Ok(Some(SchemaPublicationCandidate {
+        head: graph_commit_from_manifest_row(rows.head),
+        contract: contract?,
         branch_identifier: BranchIdentifier::main(),
+        original,
+        settlement,
     }))
 }
 
-fn decode_selected_commit(
-    batch: &RecordBatch,
-    expected_commit_id: &str,
-    head_id: &str,
+fn requested_commit(
+    rows: &ManifestRows,
+    requested: Option<&str>,
+    version: u64,
 ) -> Result<Option<GraphCommit>> {
-    let ids = string_column(batch, "object_id")?;
-    let types = string_column(batch, "object_type")?;
-    let metadata = string_column(batch, "metadata")?;
-    let versions = u64_column(batch, "table_version")?;
-    let branches = string_column(batch, "table_branch")?;
-    let stable_ids = u64_column(batch, "stable_table_id")?;
-    let incarnations = u64_column(batch, "table_incarnation_id")?;
-    let mut commit = None;
-    let mut head = None;
-    let mut contract_seen = false;
-    for row in 0..batch.num_rows() {
-        let expected_type = match ids.value(row) {
-            id if id == expected_commit_id => OBJECT_TYPE_GRAPH_COMMIT,
-            id if id == head_id => OBJECT_TYPE_GRAPH_HEAD,
-            SCHEMA_CONTRACT_OBJECT_ID => OBJECT_TYPE_SCHEMA_CONTRACT,
-            _ => {
-                return Err(OmniError::manifest_internal(
-                    "schema publication scan returned an unselected row",
-                ));
-            }
-        };
-        if types.value(row) != expected_type {
-            return Err(OmniError::manifest_internal(format!(
-                "schema publication row '{}' has object_type '{}', expected '{expected_type}'",
-                ids.value(row),
-                types.value(row),
-            )));
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    let mut found = None;
+    for commit in std::iter::once(&rows.head).chain(rows.buffer.commits()) {
+        if !commit_id_answers(&commit.graph_commit_id, requested)? {
+            continue;
         }
-        require_null_table_identity(stable_ids, incarnations, row, expected_type)?;
-        let duplicate = match expected_type {
-            OBJECT_TYPE_GRAPH_COMMIT => commit
-                .replace(graph_commit_from_manifest_row(decode_graph_commit_row(
-                    ids, metadata, versions, branches, row,
-                )?))
-                .is_some(),
-            OBJECT_TYPE_GRAPH_HEAD => head
-                .replace(decode_graph_head_row(ids, metadata, row)?)
-                .is_some(),
-            _ => std::mem::replace(&mut contract_seen, true),
-        };
-        if duplicate {
+        check_commit_version(commit, version)?;
+        if found.replace(commit).is_some() {
             return Err(OmniError::manifest_internal(
                 "schema publication evidence contains duplicate selected rows",
             ));
         }
     }
-    match (commit, head) {
-        (Some(commit), Some((branch, head)))
-            if branch == MAIN_BRANCH_HEAD_KEY && head == expected_commit_id =>
-        {
-            Ok(Some(commit))
-        }
-        _ => Ok(None),
+    Ok(found.cloned().map(graph_commit_from_manifest_row))
+}
+
+fn check_commit_version(commit: &GraphLineageRow, version: u64) -> Result<()> {
+    if commit.graph_branch.is_some()
+        || commit.graph_manifest_version == 0
+        || commit.graph_manifest_version > version
+    {
+        return Err(OmniError::manifest_internal(
+            "schema publication lineage belongs to another branch or a future version",
+        ));
     }
+    Ok(())
+}
+
+/// Positive evidence for the original schema publication only. A different
+/// occupant remains `None` here; version-2 settlement verifies non-publication
+/// separately against the original retained base and both prepared identities.
+pub async fn read_schema_publication_at(
+    root_uri: &str,
+    version: u64,
+    expected_commit_id: &str,
+) -> Result<Option<SchemaPublicationEvidence>> {
+    let Some(candidate) =
+        read_schema_publication_candidate_at(root_uri, version, Some(expected_commit_id), None)
+            .await?
+    else {
+        return Ok(None);
+    };
+    if !commit_id_answers(&candidate.head.graph_commit_id, expected_commit_id)?
+        || candidate.head.graph_manifest_version != version
+    {
+        return Ok(None);
+    }
+    Ok(Some(SchemaPublicationEvidence {
+        commit: candidate.head,
+        contract: candidate.contract,
+        branch_identifier: candidate.branch_identifier,
+    }))
 }

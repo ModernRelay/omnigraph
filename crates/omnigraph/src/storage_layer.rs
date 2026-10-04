@@ -281,15 +281,6 @@ impl ProvenInsertChunk {
 
 // ─── opaque handles ────────────────────────────────────────────────────────
 
-/// Outcome of replaying a detached transaction at its linear target, in the
-/// storage boundary's own terms (RFC 0067).
-#[derive(Debug)]
-pub enum PromotionOutcome {
-    Landed(SnapshotHandle),
-    Refused,
-    Unsafe(String),
-}
-
 /// Opaque handle to a snapshot of a single sub-table dataset at a
 /// specific version.
 ///
@@ -771,16 +762,6 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: &SnapshotHandle,
     ) -> Result<crate::table_store::StagedTransactionIdentity>;
-
-    /// RFC 0067: replay the transaction recorded in `staged` on `base` so the
-    /// linear history gains its twin at `target`.
-    async fn promote_detached(
-        &self,
-        base: SnapshotHandle,
-        staged: &SnapshotHandle,
-        target: u64,
-        expected_uuid: &str,
-    ) -> Result<PromotionOutcome>;
 
     /// Stage an overwrite (Operation::Overwrite). MR-793 Phase 2.
     async fn stage_overwrite(
@@ -1289,29 +1270,6 @@ impl TableStorage for TableStore {
         snapshot: &SnapshotHandle,
     ) -> Result<crate::table_store::StagedTransactionIdentity> {
         TableStore::transaction_identity(self, snapshot.dataset())
-    }
-
-    async fn promote_detached(
-        &self,
-        base: SnapshotHandle,
-        staged: &SnapshotHandle,
-        target: u64,
-        expected_uuid: &str,
-    ) -> Result<PromotionOutcome> {
-        let base = base.into_arc();
-        Ok(
-            match TableStore::promote_detached(self, base, staged.dataset(), target, expected_uuid)
-                .await?
-            {
-                crate::table_store::PromotionCommit::Landed(dataset) => {
-                    PromotionOutcome::Landed(SnapshotHandle::new(*dataset))
-                }
-                crate::table_store::PromotionCommit::Refused => PromotionOutcome::Refused,
-                crate::table_store::PromotionCommit::Unsafe(reason) => {
-                    PromotionOutcome::Unsafe(reason)
-                }
-            },
-        )
     }
 
     async fn commit_staged_exact(

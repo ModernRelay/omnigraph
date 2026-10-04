@@ -115,7 +115,7 @@ omnigraph load --data delta.jsonl --from main --branch review --mode merge $GRAP
 ```
 
 - `--mode`: `merge` (upsert by logical entity ID; keyed node and keyed edge IDs derive from their `@key` tuple — re-running a merge file duplicates unkeyed edges) · `append` (fails on ID collision) · `overwrite` (destructive, staged). `--from <base>` forks a missing `--branch`; bare `load` needs an existing branch. Works local **and** remote.
-- **Date values**: use a calendar-day string (`YYYY-MM-DD`) for `Date` and an ISO timestamp for `DateTime`, in both `mutate --params` and JSONL. `load` also accepts integer epoch days for `Date`.
+- **Date values**: use a calendar-day string (`YYYY-MM-DD`) for `Date` and an ISO timestamp to the millisecond for `DateTime` (`.123` or `.123000`; `.123456` is refused), in both `mutate --params` and JSONL. `load` also accepts integer epoch days for `Date`.
 
 ### Dispatching
 

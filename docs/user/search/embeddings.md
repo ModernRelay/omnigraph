@@ -73,8 +73,16 @@ When `model` is recorded, a text `nearest` query is rejected unless the active
 provider resolves to exactly that model id. Changing the recorded source or
 model is not an in-place schema migration; rebuild or re-embed the data instead.
 
-`@embed` does not populate the property during a load. Supply vectors in input
-data or prepare seed files with the offline command.
+`@embed` does not populate the property during a load, even with an embedding
+provider configured. Supplied vectors are preserved, omitted nullable vectors
+remain null, and missing required vectors refuse the load. Supply vectors in
+input data or prepare seed files with the offline command.
+
+Successful HTTP and CLI JSON load results include `embedding_generation`:
+`"unsupported"` means the load touched a node type with an `@embed` property;
+`null` means it did not. This describes the load capability, including when
+every vector was supplied. Human CLI output prints the corresponding guidance.
+The same diagnostic applies to the deprecated `ingest` command and endpoint.
 
 ## Offline file pipeline
 

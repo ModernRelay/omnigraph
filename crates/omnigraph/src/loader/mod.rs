@@ -23,6 +23,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::db::Omnigraph;
+use crate::db::manifest::HistoryReleaseBytes;
 use crate::error::{OmniError, Result, missing_graph_type_at_snapshot};
 use crate::exec::staging::{MutationStaging, PendingMode};
 use crate::seams::{catalog, decide_seam, fail};
@@ -246,6 +247,7 @@ impl Session {
             actor_id,
             LoadInputShape::LoaderCompatible,
             self.settings().stage_write_concurrency(),
+            HistoryReleaseBytes(self.settings().history_release_bytes()),
         )
         .await
     }
@@ -289,6 +291,7 @@ impl Session {
             actor_id,
             LoadInputShape::StrictGraphBatch,
             self.settings().stage_write_concurrency(),
+            HistoryReleaseBytes(self.settings().history_release_bytes()),
         )
         .await
     }
@@ -317,6 +320,7 @@ impl Omnigraph {
         actor_id: Option<&str>,
         input_shape: LoadInputShape,
         stage_write_concurrency: usize,
+        history_release_bytes: HistoryReleaseBytes,
     ) -> Result<LoadReceipt> {
         // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
         // `Branch(branch)` to match the HTTP-layer Change convention.
@@ -340,6 +344,7 @@ impl Omnigraph {
             actor_id,
             input_shape,
             stage_write_concurrency,
+            history_release_bytes,
         ))
         .await
     }
@@ -354,6 +359,7 @@ impl Omnigraph {
         actor_id: Option<&str>,
         input_shape: LoadInputShape,
         stage_write_concurrency: usize,
+        history_release_bytes: HistoryReleaseBytes,
     ) -> Result<LoadReceipt> {
         // Schema/catalog authority is captured once via the `WriteTxn` (plus its
         // cheap trailing identity-marker fence); the only second full validation
@@ -399,6 +405,7 @@ impl Omnigraph {
                 actor_id,
                 input_shape,
                 stage_write_concurrency,
+                history_release_bytes,
             )
             .await
             .map_err(|error| {
@@ -458,6 +465,7 @@ impl Omnigraph {
         actor_id: Option<&str>,
         input_shape: LoadInputShape,
         stage_write_concurrency: usize,
+        history_release_bytes: HistoryReleaseBytes,
     ) -> Result<LoadReceipt> {
         load_jsonl_data(
             self,
@@ -467,6 +475,7 @@ impl Omnigraph {
             actor_id,
             input_shape,
             stage_write_concurrency,
+            history_release_bytes,
         )
         .await
     }
@@ -524,6 +533,7 @@ async fn load_jsonl_data(
     actor_id: Option<&str>,
     input_shape: LoadInputShape,
     stage_write_concurrency: usize,
+    history_release_bytes: HistoryReleaseBytes,
 ) -> Result<LoadReceipt> {
     const MAX_PRE_EFFECT_REPREPARES: usize = 32;
 
@@ -542,6 +552,7 @@ async fn load_jsonl_data(
             actor_id,
             input_shape,
             stage_write_concurrency,
+            history_release_bytes,
             attempt == 0,
         )
         .await
@@ -572,6 +583,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     actor_id: Option<&str>,
     input_shape: LoadInputShape,
     stage_write_concurrency: usize,
+    history_release_bytes: HistoryReleaseBytes,
     first_attempt: bool,
 ) -> Result<LoadReceipt> {
     // Capture the manifest/schema authority before interpreting any input. The
@@ -922,7 +934,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
         .stage_all_with_concurrency(db, branch, stage_write_concurrency)
         .await?;
     fail(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
-    let lineage_intent = db.new_lineage_intent_for_branch(branch, actor_id).await?;
+    let lineage_intent = db
+        .new_lineage_intent_for_branch(branch, actor_id, history_release_bytes)
+        .await?;
     // `held_gates` holds the root-shared schema permit → branch →
     // sorted-table gates across manifest publication. This closes
     // same-process interleaving across the effect lifetime. The exact
@@ -2979,7 +2993,9 @@ fn parse_date64_json_value(property: &str, value: &JsonValue) -> Result<Option<i
         return Ok(Some(checked_date64(ms)?));
     }
     if let Some(value) = value.as_str() {
-        return parse_date64_literal(value)
+        return omnigraph_compiler::check_datetime_literal(value)
+            .map_err(OmniError::manifest)
+            .and_then(|()| parse_date64_literal(value))
             .map(Some)
             .map_err(|e| OmniError::manifest(format!("property '{property}': {e}")));
     }
@@ -3684,6 +3700,49 @@ edge WorksAt: Person -> Company
             version_before,
             "a refused load leaves no commit behind"
         );
+    }
+
+    /// The load surface refuses a `DateTime` string with a non-zero digit past the
+    /// millisecond, scalar and list item; Rust because a `.gqt` seed refusal is a harness
+    /// failure. Params and literals: `cases/issue_857_datetime_sub_millisecond_digits_refused.gqt`.
+    #[tokio::test]
+    async fn load_refuses_datetime_string_with_sub_millisecond_digits() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let schema = "node Event { name: String @key at: DateTime? ats: [DateTime]? }";
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, schema).await.unwrap()),
+            SessionSettings::default(),
+        );
+        let version_before = db.version().await;
+
+        for rows in [
+            r#"{"type": "Event", "data": {"name": "a", "at": "2024-01-01T00:00:00.123456Z"}}"#,
+            r#"{"type": "Event", "data": {"name": "a", "ats": ["2024-01-01T00:00:00.123Z", "2024-01-01T00:00:00.123456Z"]}}"#,
+        ] {
+            let err = db
+                .load_jsonl(rows, LoadMode::Overwrite)
+                .await
+                .expect_err("a sub-millisecond digit fails the load, scalar and list item");
+            assert!(
+                err.to_string().contains(
+                    "invalid DateTime literal '2024-01-01T00:00:00.123456Z': a DateTime has millisecond precision; fractional-second digits past the third must be zero"
+                ),
+                "{rows}: {err}"
+            );
+        }
+        assert_eq!(
+            db.version().await,
+            version_before,
+            "a refused load leaves no commit behind"
+        );
+
+        db.load_jsonl(
+            r#"{"type": "Event", "data": {"name": "a", "at": "2024-01-01T00:00:00.123000000Z", "ats": ["2024-01-01T00:00:00.1230Z"]}}"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .expect("zero padding past the millisecond loads");
     }
 
     /// Pins the premise the refusal rests on: arrow's `Utf8 -> Date32` cast

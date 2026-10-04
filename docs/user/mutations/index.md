@@ -116,7 +116,11 @@ boolean, an object) fails the load with `invalid Date value` or `invalid
 DateTime value` naming the property. A `Date` string carries no time of day:
 `"2024-01-01T02:00:00+05:00"` fails the load with `invalid Date literal`, as it
 does in a mutation param, a `date(...)` literal, or a read filter; an instant
-belongs in a `DateTime` property.
+belongs in a `DateTime` property. A `DateTime` holds milliseconds: a string with
+a non-zero digit past the third fractional digit, such as
+`"2024-01-01T00:00:00.123456Z"`, fails the load with `invalid DateTime literal`,
+as it does in a mutation param, a `datetime(...)` literal, or a read filter.
+Trailing zeros, as in `.123000`, are accepted.
 
 Choose the mode explicitly:
 
@@ -136,6 +140,10 @@ omnigraph load --data batch.jsonl --mode merge graph.omni
 
 One load request is one graph commit. Use `--branch <name> --from <base>` to
 create a missing review branch and load onto it in the same workflow.
+
+Loads preserve supplied embeddings and do not generate them. Results report
+`embedding_generation: "unsupported"` when a loaded node type declares
+`@embed`, or `null` otherwise; see [Embeddings](../search/embeddings.md).
 
 ## Limits and conflicts
 

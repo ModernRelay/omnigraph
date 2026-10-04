@@ -13,14 +13,10 @@
 //! participates in change detection.
 
 use std::collections::{HashMap, HashSet};
-use std::pin::Pin;
 
 use arrow_array::{Array, RecordBatch, StringArray, StructArray, UInt64Array};
 use datafusion::prelude::{Expr, col, lit};
-use futures::TryStreamExt;
 use lance::Dataset;
-use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
-use lance_core::datatypes::BlobHandling;
 use lance_table::format::Fragment;
 
 use omnigraph_compiler::{SYSTEM_COLUMNS_META, SystemColumns};
@@ -31,7 +27,7 @@ use crate::db::{
     LogicalBlobValue, RangedExternalBlobs, STABLE_PROPERTY_ID_METADATA_KEY, export_blob_values,
 };
 use crate::error::{OmniError, Result};
-use crate::table_store::TableStore;
+use crate::ordered_cursor::{KeyFilter, KeyOrder, OrderedRowCursor, WalkSubject};
 
 /// Fingerprint of one table's user-visible schema for the schema-compatibility
 /// proof both change surfaces rely on: per field, its Arrow type, nullability,
@@ -314,13 +310,17 @@ impl BatchCursor {
     }
 }
 
-/// An `id`-ordered stream of one dataset snapshot's rows, filled lazily one Lance
-/// batch at a time. Both endpoints of a diff are walked in lockstep so the
-/// merge stays streaming and never buffers a delta-wide row set.
+/// An `id`-ordered stream of one dataset snapshot's rows, walked through the
+/// shared two-phase cursor (keys sorted, rows hydrated in bounded chunks), so
+/// no payload column reaches the sort. Both endpoints of a diff are walked in
+/// lockstep so the merge stays streaming and never buffers a delta-wide row
+/// set.
 pub(crate) struct OrderedRows {
     dataset: Dataset,
-    stream: Option<Pin<Box<DatasetRecordBatchStream>>>,
-    batch: Option<BatchCursor>,
+    rows: OrderedRowCursor,
+    /// The hydrated batch the current row came from, keyed by its
+    /// `(chunk, batch_index)` and prepared once for every row it holds.
+    batch: Option<((u64, usize), BatchCursor)>,
     pending: Option<RawRow>,
     id_col: &'static str,
 }
@@ -354,60 +354,38 @@ impl OrderedRows {
         targets: ScanTargets,
         id_col: &'static str,
     ) -> Result<Self> {
-        if fragments.as_ref().is_some_and(Vec::is_empty) {
-            return Ok(Self {
-                dataset,
-                stream: None,
-                batch: None,
-                pending: None,
-                id_col,
-            });
-        }
-        let after_id = after_id.map(str::to_string);
-        let stream = Box::pin(
-            TableStore::scan_stream_with(
-                &dataset,
-                None,
-                None,
-                Some(vec![ColumnOrdering::asc_nulls_last(id_col.to_string())]),
-                true,
-                move |scanner| {
-                    if let Some(fragments) = fragments {
-                        scanner.with_fragments(fragments);
-                    }
-                    let resume = after_id.map(|after_id| col(id_col).gt(lit(after_id)));
-                    if let Some(filter) = match (resume, extra_filter) {
-                        (Some(resume), Some(extra)) => Some(resume.and(extra)),
-                        (Some(resume), None) => Some(resume),
-                        (None, Some(extra)) => Some(extra),
-                        (None, None) => None,
-                    } {
-                        scanner.filter_expr(filter);
-                    }
-                    // Descriptor-sized batches bounded by rows AND bytes, the
-                    // same shape as every other production ordered-by-id scan.
-                    // strict_batch_size is deliberately absent: Lance's strict
-                    // stream coalesces to a row count the environment can
-                    // override and ignores the byte target while accumulating.
-                    scanner.batch_size(targets.rows);
-                    scanner.batch_size_bytes(targets.bytes);
-                    scanner.blob_handling(BlobHandling::BlobsDescriptions);
-                    // Managed Blob descriptors are file-relative, so `BatchCursor`
-                    // maps the row's fragment (high 32 bits of `_rowaddr`) to the
-                    // owning data file's immutable UUID path — the qualifier that
-                    // tells an unchanged row from a same-length Blob-only update
-                    // (which lands in a new data file) across relocation,
-                    // Overwrite, and branches. `with_row_id` above stays on for
-                    // the payload tie-break's stable-id `take_blobs`.
-                    scanner.with_row_address();
-                    Ok(())
-                },
-            )
-            .await?,
-        );
+        let resume = after_id.map(|after_id| col(id_col).gt(lit(after_id.to_string())));
+        let filter = match (resume, extra_filter) {
+            (Some(resume), Some(extra)) => Some(resume.and(extra)),
+            (Some(resume), None) => Some(resume),
+            (None, Some(extra)) => Some(extra),
+            (None, None) => None,
+        };
+        // Key and chunk targets both come from the page budget, so a
+        // one-change page never prepares an 8,192-row batch. Lance treats
+        // them as targets; the hard page bound remains the serialized-change
+        // accounting in `enumerate`.
+        let rows = OrderedRowCursor::open(
+            Some(dataset.clone()),
+            KeyOrder {
+                fragments,
+                filter: filter.map(KeyFilter::Expr),
+                key_batch_rows: targets.rows,
+                key_batch_bytes: targets.bytes,
+                chunk_rows: targets.rows,
+                chunk_bytes: targets.bytes,
+            },
+            WalkSubject {
+                operation: "change",
+                table: dataset.uri().to_string(),
+                role: "change",
+            },
+            id_col,
+        )
+        .await?;
         Ok(Self {
             dataset,
-            stream: Some(stream),
+            rows,
             batch: None,
             pending: None,
             id_col,
@@ -425,28 +403,22 @@ impl OrderedRows {
     }
 
     async fn fill(&mut self) -> Result<()> {
-        while self.pending.is_none() {
-            if let Some(batch) = self.batch.as_mut() {
-                if let Some(row) = batch.next(&self.dataset)? {
-                    self.pending = Some(row);
-                    return Ok(());
-                }
-                self.batch = None;
-            }
-            let Some(stream) = self.stream.as_mut() else {
-                return Ok(());
-            };
-            match stream.try_next().await {
-                Ok(Some(batch)) => {
-                    self.batch = Some(BatchCursor::try_new(&self.dataset, batch, self.id_col)?)
-                }
-                Ok(None) => {
-                    self.stream = None;
-                    return Ok(());
-                }
-                Err(error) => return Err(TableStore::ordered_scan_error(error)),
-            }
+        if self.pending.is_some() {
+            return Ok(());
         }
+        let Some(row) = self.rows.next().await? else {
+            return Ok(());
+        };
+        let key = (row.chunk, row.batch_index);
+        let cursor = match &mut self.batch {
+            Some((prepared, cursor)) if *prepared == key => cursor,
+            slot => {
+                let cursor = BatchCursor::try_new(&self.dataset, row.batch, self.id_col)?;
+                &mut slot.insert((key, cursor)).1
+            }
+        };
+        cursor.next_row = row.row_index;
+        self.pending = cursor.next(&self.dataset)?;
         Ok(())
     }
 

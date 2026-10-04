@@ -1,8 +1,9 @@
-//! Instrument: the cost of one fixed-live-row update as `__manifest` history
-//! grows. Every checkpoint repeats `set_age` on the same person, so the live
-//! data never changes size and any growth is history. Each record reports the
-//! Lance requests and bytes per stage and the retained size of `__manifest` on
-//! disk (every version's files), the space term version retention must bound.
+//! Instrument: the cost of one fixed-live-row update as commit history grows.
+//! Every checkpoint repeats `set_age` on the same person, so the live data
+//! never changes size and any growth is history. Each record reports the Lance
+//! requests and bytes per stage, `__manifest` and `__history` each on its own
+//! plane, and the retained size of both on disk (every version's files), the
+//! space term version retention must bound.
 //! Schema-source and serialized-IR bytes vary independently in the contract
 //! curve. These are I/O/storage observations, not heap or RSS bounds. All tests
 //! are `#[ignore]`d instruments, run explicitly.
@@ -20,7 +21,7 @@ use omnigraph::instrumentation::with_query_io_probes;
 use omnigraph_compiler::schema_ir_pretty_json;
 use sha2::{Digest, Sha256};
 
-use helpers::cost::{drain_probed_io, raw_io_probes};
+use helpers::cost::{AttemptOutcome, AttemptTracker, drain_probed_io, raw_io_probes};
 use helpers::{MUTATION_QUERIES, TEST_SCHEMA, init_and_load_with_schema, mixed_params};
 
 async fn publication_curve_update(db: &omnigraph::Session, branch: &str, age: i64) {
@@ -57,7 +58,11 @@ async fn publication_curve_read(db: &omnigraph::Session, branch: &str, age: i64)
     assert_eq!(i64::from(ages.value(0)), age);
 }
 
+/// The bytes of every file below `path`, 0 while `path` does not exist.
 fn retained_bytes(path: &Path) -> u64 {
+    if !path.exists() {
+        return 0;
+    }
     std::fs::read_dir(path)
         .unwrap()
         .map(|entry| {
@@ -72,7 +77,19 @@ fn retained_bytes(path: &Path) -> u64 {
         .sum()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurveWork {
+    Writes,
+    SchemaOriginal,
+    SchemaFence,
+    SchemaOccupied,
+}
+
 async fn history_curve(depths: &[u64], branches: &[&str], schema: &str) {
+    run_history_curve(depths, branches, schema, CurveWork::Writes).await;
+}
+
+async fn run_history_curve(depths: &[u64], branches: &[&str], schema: &str, work: CurveWork) {
     let repetitions = if cfg!(debug_assertions) { 1 } else { 3 };
     let measured_writes = if cfg!(debug_assertions) { 1u64 } else { 8u64 };
     for repetition in 1..=repetitions {
@@ -80,12 +97,21 @@ async fn history_curve(depths: &[u64], branches: &[&str], schema: &str) {
             for &depth in depths {
                 let table_tracker = IOTracker::default();
                 let manifest_tracker = IOTracker::default();
-                let probes = raw_io_probes(&table_tracker, &manifest_tracker);
+                let history_tracker = IOTracker::default();
+                let mut probes = raw_io_probes(&table_tracker, &manifest_tracker);
+                probes.history_wrapper = Some(Arc::new(history_tracker.clone()));
+                let attempts = AttemptTracker::default();
+                // Native per-store counters below include direct local I/O.
+                // The wrapper separately records failed exact-key probes,
+                // which ordinary IOTracker success counters omit.
+                probes.manifest_wrapper = Some(Arc::new(attempts.clone()));
                 let full_scans = Arc::clone(&probes.manifest_scan_count);
+                let history_reads = Arc::clone(&probes.projection_full_refreshes);
                 let internal_opens = Arc::clone(&probes.internal_open_count);
                 let version_probes = Arc::clone(&probes.probe_count);
                 let table_stores = probes.table_stores.clone();
                 let manifest_stores = probes.manifest_stores.clone();
+                let history_stores = probes.history_stores.clone();
                 with_query_io_probes(
                     probes,
                     Box::pin(async {
@@ -93,6 +119,7 @@ async fn history_curve(depths: &[u64], branches: &[&str], schema: &str) {
                         let dir = tempfile::tempdir().unwrap();
                         let uri = dir.path().to_str().unwrap();
                         let manifest_dir = dir.path().join("__manifest");
+                        let history_dir = dir.path().join("__history");
                         let db = init_and_load_with_schema(&dir, schema).await;
                         let schema_source = db.schema_source();
                         assert_eq!(schema_source.as_str(), schema);
@@ -112,13 +139,17 @@ async fn history_curve(depths: &[u64], branches: &[&str], schema: &str) {
                             publication_curve_update(&db, branch, 100 + i64::try_from(step).unwrap())
                                 .await;
                         }
-                        let report = |stage: &str, history_before: Option<u64>, elapsed: Duration| {
+                        let report = |stage: &str, history_before: Option<u64>, elapsed: Duration, operation: serde_json::Value| {
                             let table = drain_probed_io(&table_tracker, &table_stores);
                             let manifest = drain_probed_io(&manifest_tracker, &manifest_stores);
+                            let history = drain_probed_io(&history_tracker, &history_stores);
+                            let attempts = attempts.incremental_attempts();
                             eprintln!(
                                 "PUBLICATION_CURVE {}",
                                 serde_json::json!({
                                     "instrument": "manifest_history_curve",
+                                    "workload": format!("{work:?}"),
+                                    "operation": operation,
                                     "io_accounting": "probed-store-internal-v1",
                                     "debug_assertions": cfg!(debug_assertions),
                                     "timing_claim_eligible": false,
@@ -138,22 +169,39 @@ async fn history_curve(depths: &[u64], branches: &[&str], schema: &str) {
                                     "history_before": history_before,
                                     "stage": stage,
                                     "elapsed_us_diagnostic": elapsed.as_micros(),
-                                    "manifest_full_scans": full_scans.swap(0, Ordering::Relaxed),
+                                    "manifest_scan_invocations": full_scans.swap(0, Ordering::Relaxed),
+                                    "history_lineage_reads": history_reads.swap(0, Ordering::Relaxed),
+                                    "manifest_store_read_attempts": attempts.len(),
+                                    "manifest_store_not_found": attempts.iter().filter(|attempt| attempt.outcome == AttemptOutcome::NotFound).count(),
+                                    "manifest_store_read_errors": attempts.iter().filter(|attempt| attempt.outcome == AttemptOutcome::Error).count(),
                                     "internal_opens": internal_opens.swap(0, Ordering::Relaxed),
                                     "version_probes": version_probes.swap(0, Ordering::Relaxed),
                                     "table_read_requests": table.read_iops,
                                     "table_write_requests": table.write_iops,
+                                    "table_read_bytes": table.read_bytes,
+                                    "table_written_bytes": table.written_bytes,
                                     "manifest_read_requests": manifest.read_iops,
                                     "manifest_write_requests": manifest.write_iops,
                                     "manifest_read_bytes": manifest.read_bytes,
                                     "manifest_written_bytes": manifest.written_bytes,
                                     "manifest_retained_bytes": retained_bytes(&manifest_dir),
+                                    "history_read_requests": history.read_iops,
+                                    "history_write_requests": history.write_iops,
+                                    "history_read_bytes": history.read_bytes,
+                                    "history_written_bytes": history.written_bytes,
+                                    "history_retained_bytes": retained_bytes(&history_dir),
                                     "lance_requests": table.read_iops + table.write_iops
-                                        + manifest.read_iops + manifest.write_iops,
+                                        + manifest.read_iops + manifest.write_iops
+                                        + history.read_iops + history.write_iops,
                                 }),
                             );
                         };
-                        report("setup", None, setup_started.elapsed());
+                        report("setup", None, setup_started.elapsed(), serde_json::Value::Null);
+                        if work != CurveWork::Writes {
+                            assert_eq!(branch, "main", "schema apply requires a single live main");
+                            schema_outcome_curve(db, uri, depth, measured_writes, work, &report).await;
+                            return;
+                        }
 
                         for operation in 0..measured_writes {
                             let started = Instant::now();
@@ -163,29 +211,29 @@ async fn history_curve(depths: &[u64], branches: &[&str], schema: &str) {
                                 101 + i64::try_from(depth + operation).unwrap(),
                             )
                             .await;
-                            report("warm_write", Some(depth + operation), started.elapsed());
+                            report("warm_write", Some(depth + operation), started.elapsed(), serde_json::Value::Null);
                         }
 
                         let history = depth + measured_writes;
                         let started = Instant::now();
                         publication_curve_read(&db, branch, 100 + i64::try_from(history).unwrap())
                             .await;
-                        report("read_after_write", Some(history), started.elapsed());
+                        report("read_after_write", Some(history), started.elapsed(), serde_json::Value::Null);
 
                         let started = Instant::now();
                         drop(db);
                         let db = helpers::session(omnigraph::db::Omnigraph::open(uri).await.unwrap());
-                        report("reopen", Some(history), started.elapsed());
+                        report("reopen", Some(history), started.elapsed(), serde_json::Value::Null);
 
                         let started = Instant::now();
                         publication_curve_read(&db, branch, 100 + i64::try_from(history).unwrap())
                             .await;
-                        report("read_after_reopen", Some(history), started.elapsed());
+                        report("read_after_reopen", Some(history), started.elapsed(), serde_json::Value::Null);
 
                         let final_age = 101 + i64::try_from(history).unwrap();
                         let started = Instant::now();
                         publication_curve_update(&db, branch, final_age).await;
-                        report("reopened_write", Some(history), started.elapsed());
+                        report("reopened_write", Some(history), started.elapsed(), serde_json::Value::Null);
 
                         let started = Instant::now();
                         let commits = db.list_commits(Some(branch)).await.unwrap();
@@ -237,7 +285,7 @@ async fn history_curve(depths: &[u64], branches: &[&str], schema: &str) {
                             assert_eq!(helpers::snapshot_id(&db, "main").await.unwrap(), main_head);
                             publication_curve_read(&db, "main", 30).await;
                         }
-                        report("verification", Some(history + 1), started.elapsed());
+                        report("verification", Some(history + 1), started.elapsed(), serde_json::Value::Null);
                     }),
                 )
                 .await;
@@ -312,5 +360,267 @@ async fn manifest_contract_history_curve() {
     }
     for schema in fixtures {
         history_curve(&[1, 16], &["main", "cost-branch"], &schema).await;
+    }
+}
+
+/// Use the same fixed-row/history fixture and counters as ordinary publication.
+/// These stages separate immutable evidence lookup from reopen and publication.
+async fn schema_outcome_curve(
+    db: omnigraph::Session,
+    uri: &str,
+    history: u64,
+    repeats: u64,
+    work: CurveWork,
+    report: &impl Fn(&str, Option<u64>, Duration, serde_json::Value),
+) {
+    use omnigraph::db::{
+        Omnigraph, PreparedSchemaApply, PreparedSchemaSettlement, SchemaApplyReconciliation,
+        SchemaApplySettlement, SchemaNonPublicationProof,
+    };
+    let source = db.schema_source();
+    let mut desired = source.to_string();
+    assert_eq!(
+        desired.pop(),
+        Some('x'),
+        "contract fixture ends in comment padding"
+    );
+    desired.push('y');
+    assert_eq!(source.len(), desired.len());
+    let started = Instant::now();
+    let original = db
+        .prepare_schema_apply_as(&desired, Some("instrument-original"))
+        .await
+        .unwrap();
+    let original_bytes = serde_json::to_vec(&original).unwrap();
+    let original: PreparedSchemaApply = serde_json::from_slice(&original_bytes).unwrap();
+    let fence = db
+        .prepare_schema_settlement_as(&original, Some("instrument-recovery"))
+        .await
+        .unwrap();
+    let fence_bytes = serde_json::to_vec(&fence).unwrap();
+    let fence: PreparedSchemaSettlement = serde_json::from_slice(&fence_bytes).unwrap();
+    let operation = serde_json::json!({
+        "base_manifest_version": original.base_manifest_version(),
+        "candidate_manifest_version": original.base_manifest_version() + 1,
+        "schema_intent_bytes": original_bytes.len(),
+        "settlement_intent_bytes": fence_bytes.len(),
+        "desired_source_bytes": desired.len(),
+        "desired_contract": original.desired_contract(),
+    });
+    report(
+        "schema_prepare_encode",
+        Some(history),
+        started.elapsed(),
+        operation.clone(),
+    );
+    let started = Instant::now();
+    assert_eq!(
+        db.reconcile_schema_apply_as(&original, Some("instrument-original"))
+            .await
+            .unwrap(),
+        SchemaApplyReconciliation::Unknown
+    );
+    report(
+        "candidate_missing_lookup",
+        Some(history),
+        started.elapsed(),
+        operation.clone(),
+    );
+    let started = Instant::now();
+    match work {
+        CurveWork::SchemaOriginal => {
+            let result = db
+                .apply_prepared_schema_as(&original, Some("instrument-original"))
+                .await
+                .unwrap();
+            assert_eq!(
+                result.commit.unwrap().graph_commit_id,
+                original.graph_commit_id().unwrap()
+            );
+            report(
+                "original_publication",
+                Some(history),
+                started.elapsed(),
+                operation.clone(),
+            );
+        }
+        CurveWork::SchemaOccupied => {
+            let mut catalog = omnigraph_catalog::ManifestCoordinator::open(uri)
+                .await
+                .unwrap();
+            let contract = catalog.read_schema_contract().await.unwrap();
+            catalog
+                .commit_changes(&[omnigraph_catalog::ManifestChange::SchemaContract(contract)])
+                .await
+                .unwrap();
+            report(
+                "metadata_publication",
+                Some(history),
+                started.elapsed(),
+                operation.clone(),
+            );
+        }
+        CurveWork::SchemaFence => {}
+        CurveWork::Writes => unreachable!(),
+    }
+    let started = Instant::now();
+    let outcome = db
+        .settle_prepared_schema_as(&original, &fence, Some("instrument-recovery"))
+        .await
+        .unwrap();
+    match (&outcome, work) {
+        (SchemaApplySettlement::Committed { .. }, CurveWork::SchemaOriginal)
+        | (
+            SchemaApplySettlement::NotPublished {
+                proof: SchemaNonPublicationProof::Fence { .. },
+            },
+            CurveWork::SchemaFence,
+        )
+        | (
+            SchemaApplySettlement::NotPublished {
+                proof: SchemaNonPublicationProof::Occupied { .. },
+            },
+            CurveWork::SchemaOccupied,
+        ) => {}
+        other => panic!("wrong instrument outcome: {other:?}"),
+    }
+    let mut operation = operation;
+    operation["outcome"] = serde_json::to_value(&outcome).unwrap();
+    report(
+        if work == CurveWork::SchemaFence {
+            "fence_publication"
+        } else {
+            "settlement_lookup"
+        },
+        Some(history),
+        started.elapsed(),
+        operation.clone(),
+    );
+    let started = Instant::now();
+    drop(db);
+    let db = helpers::session(Omnigraph::open_read_only(uri).await.unwrap());
+    report(
+        "schema_readonly_reopen",
+        Some(history + 1),
+        started.elapsed(),
+        operation.clone(),
+    );
+    for repeat in 0..repeats {
+        let started = Instant::now();
+        assert_eq!(
+            db.settle_prepared_schema_as(&original, &fence, Some("instrument-adopter"))
+                .await
+                .unwrap(),
+            outcome
+        );
+        report(
+            if repeat == 0 {
+                "first_reopened_settlement_lookup"
+            } else {
+                "repeat_settlement_lookup"
+            },
+            Some(history + 1),
+            started.elapsed(),
+            operation.clone(),
+        );
+    }
+    let started = Instant::now();
+    let noop = db
+        .prepare_schema_apply_as(db.schema_source().as_str(), Some("instrument-original"))
+        .await
+        .unwrap();
+    let noop_settlement = db
+        .prepare_schema_settlement_as(&noop, Some("instrument-recovery"))
+        .await
+        .unwrap();
+    assert!(noop.is_noop());
+    assert!(noop_settlement.graph_commit_id().is_none());
+    let mut noop_operation = serde_json::json!({
+        "base_manifest_version": noop.base_manifest_version(),
+        "candidate_manifest_version": null,
+        "schema_intent_bytes": serde_json::to_vec(&noop).unwrap().len(),
+        "settlement_intent_bytes": serde_json::to_vec(&noop_settlement).unwrap().len(),
+        "desired_contract": noop.desired_contract(),
+    });
+    report(
+        "noop_prepare",
+        Some(history + 1),
+        started.elapsed(),
+        noop_operation.clone(),
+    );
+    let started = Instant::now();
+    let noop_outcome = db
+        .settle_prepared_schema_as(&noop, &noop_settlement, Some("instrument-adopter"))
+        .await
+        .unwrap();
+    assert!(matches!(noop_outcome, SchemaApplySettlement::NoOp { .. }));
+    noop_operation["outcome"] = serde_json::to_value(noop_outcome).unwrap();
+    report(
+        "noop_lookup",
+        Some(history + 1),
+        started.elapsed(),
+        noop_operation,
+    );
+    let started = Instant::now();
+    publication_curve_read(&db, "main", 100 + i64::try_from(history).unwrap()).await;
+    assert_eq!(
+        helpers::read_table_branch(&db, "main", "node:Person")
+            .await
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>(),
+        4
+    );
+    assert_eq!(
+        db.schema_source().as_str(),
+        if work == CurveWork::SchemaOriginal {
+            desired.as_str()
+        } else {
+            source.as_str()
+        }
+    );
+    assert_eq!(
+        db.snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .graph_manifest_version(),
+        original.base_manifest_version() + 1
+    );
+    report(
+        "schema_verification",
+        Some(history + 1),
+        started.elapsed(),
+        operation,
+    );
+}
+
+#[tokio::test]
+#[ignore = "instrument: exact schema outcome lookup/fencing costs across independent source/IR sizes and retained history; no RSS or native-settlement bound"]
+async fn manifest_schema_settlement_history_curve() {
+    for work in [
+        CurveWork::SchemaOriginal,
+        CurveWork::SchemaFence,
+        CurveWork::SchemaOccupied,
+    ] {
+        // The independent contract matrix uses the same fixture constructor as
+        // manifest_contract_history_curve; source-only change preserves IR.
+        for enum_values in [4, 512] {
+            for source_bytes in [16 * 1024, 1024 * 1024] {
+                run_history_curve(
+                    &[1, 16],
+                    &["main"],
+                    &contract_curve_schema(source_bytes, enum_values),
+                    work,
+                )
+                .await;
+            }
+        }
+        run_history_curve(
+            &[64, 128],
+            &["main"],
+            &contract_curve_schema(16 * 1024, 4),
+            work,
+        )
+        .await;
     }
 }

@@ -251,7 +251,7 @@ async fn preflight(
     }
     if !crate::db::manifest::is_served_stamp(stamp) {
         report.refuse(format!(
-            "__manifest is stamped at v{stamp}; the system-column upgrade respells a served graph (v{} to v{}), so run `omnigraph upgrade` for the storage conversions first",
+            "__manifest is stamped at v{stamp}; the system-column upgrade respells a served graph (v{} to v{}), and this binary does not serve that storage format",
             crate::db::manifest::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
             crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
         ));
@@ -364,8 +364,6 @@ async fn execute_with_lock(
         existing_heads.insert(entry.type_key.clone(), head);
     }
 
-    let graph_commit_id = lineage_intent.graph_commit_id.clone();
-
     let mut published_commit: Option<String> = None;
     let effects = async {
         fail(&catalog::SCHEMA_APPLY_POST_LOCK_PRE_EFFECT)?;
@@ -430,6 +428,7 @@ async fn execute_with_lock(
         );
         let PublishedSnapshot {
             graph_manifest_version,
+            commit,
             ..
         } = db
             .coordinator
@@ -442,7 +441,7 @@ async fn execute_with_lock(
                 &precondition,
             )
             .await?;
-        published_commit = Some(graph_commit_id);
+        published_commit = Some(commit.graph_commit_id);
 
         db.store_schema_view(desired_catalog, desired_source, &desired_ir)?;
         db.runtime_cache.invalidate_all().await;

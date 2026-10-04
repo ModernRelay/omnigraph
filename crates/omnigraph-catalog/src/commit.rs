@@ -1,6 +1,6 @@
 //! The copy-on-write publish of `__manifest`.
 //!
-//! A publish rewrites the branch's live row set into new files and commits it
+//! A publish writes the branch's whole row set into new files and commits it
 //! as a Lance overwrite with zero retries. Lance then writes
 //! `_versions/{read_version + 1}.manifest` only if it is absent and never
 //! rebases over a concurrent commit, so the version number is the put-if-absent
@@ -9,98 +9,41 @@
 //!
 //! The stored row shape lives in `record`.
 //!
-//! Costs. The live set is normally one fragment (Lance splits a write at
-//! 1,048,576 rows per file). The live set still holds every history row
-//! (`graph_commit` and every `table_version` registration): the bytes written
-//! and decoded per publish, and the publish's memory (the scan keeps every
-//! batch for the rewrite), grow with history. Each version keeps its own full
+//! Costs. The row set is one row per table identity, the head commit's
+//! record and the buffer, which `TAIL_MAX_COMMITS` bounds, in one fragment:
+//! the bytes written and decoded per publish do not depend on the count of
+//! commits behind the head. Each version keeps its own
 //! copy and nothing prunes `__manifest` versions today, so retained bytes grow
-//! with the square of the publication count until version retention exists.
+//! with the publication count until version retention exists.
 //!
 //! Lance's auto-cleanup hook is skipped: `__manifest` versions are the snapshot
-//! and time-travel authority, and a `__manifest` created before the v7 bump
-//! still carries the stored auto-cleanup config.
+//! and time-travel authority.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_array::{BooleanArray, RecordBatch};
-use arrow_schema::Schema;
-use datafusion::arrow::compute::{concat_batches, filter_record_batch};
+use arrow_array::RecordBatch;
 use lance::Dataset;
 use lance::dataset::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use lance_file::version::LanceFileVersion;
 
-use crate::error::{OmniError, Result};
-use crate::migrations::{INTERNAL_MANIFEST_SCHEMA_VERSION, read_stamp, stamp_entry};
-use crate::publisher::{PUBLISHED_ROWS_CACHE_BYTES, map_lance_publish_error};
-use crate::record::{
-    StoredShape, compact_to_storage, flat_manifest_schema, flat_to_storage,
-    manifest_storage_schema, written_shape,
-};
-use crate::state::string_column;
+use crate::error::Result;
+use crate::migrations::guard_row_layout;
+use crate::publisher::map_lance_publish_error;
+use crate::record::{compact_to_storage, manifest_storage_schema};
+use crate::state::ManifestRows;
 
-/// Rewrite the live row set (`live_rows` minus the keys `pending` replaces,
-/// plus `pending`) as new files and commit it at `dataset`'s version + 1. Both
-/// inputs carry the logical `manifest_schema` columns; the stored shape follows
-/// `written_shape`, and a packed write stamps [`INTERNAL_MANIFEST_SCHEMA_VERSION`]
-/// in the same commit.
+/// Write `rows` as the whole row set of `dataset`'s version + 1. The schema
+/// metadata, the stamp with it, carries over from `dataset`, whose stamp must be
+/// the one this binary writes.
 pub(crate) async fn overwrite(
     dataset: Dataset,
-    pending: RecordBatch,
-    live_rows: Vec<RecordBatch>,
-) -> Result<(Dataset, Option<RecordBatch>)> {
-    let replaced: HashSet<&str> = string_column(&pending, "object_id")?
-        .iter()
-        .flatten()
-        .collect();
-    let mut metadata = dataset.schema().metadata.clone();
-    let stamp = read_stamp(&dataset);
-    if let Some(above) = stamp.filter(|stamp| *stamp > INTERNAL_MANIFEST_SCHEMA_VERSION) {
-        return Err(OmniError::manifest_internal(format!(
-            "__manifest is stamped at internal schema v{above}, above the v{INTERNAL_MANIFEST_SCHEMA_VERSION} this binary writes; refusing to publish over it"
-        )));
-    }
-    let shape = written_shape(stamp);
-    let schema = match shape {
-        StoredShape::Packed => {
-            let (key, value) = stamp_entry(INTERNAL_MANIFEST_SCHEMA_VERSION);
-            metadata.insert(key, value);
-            manifest_storage_schema(metadata)?
-        }
-        StoredShape::Flat => Arc::new(Schema::new_with_metadata(
-            flat_manifest_schema().fields().clone(),
-            metadata,
-        )),
-    };
-    let to_storage = |batch: &RecordBatch| match shape {
-        StoredShape::Packed => compact_to_storage(batch, &schema),
-        StoredShape::Flat => flat_to_storage(batch, &schema),
-    };
-    let mut batches = Vec::with_capacity(live_rows.len() + 1);
-    for batch in &live_rows {
-        let keep = BooleanArray::from_iter(
-            string_column(batch, "object_id")?
-                .iter()
-                .map(|id| Some(!id.is_some_and(|id| replaced.contains(id)))),
-        );
-        let kept = filter_record_batch(batch, &keep).map_err(OmniError::arrow_internal)?;
-        if kept.num_rows() > 0 {
-            batches.push(to_storage(&kept)?);
-        }
-    }
-    batches.push(to_storage(&pending)?);
-    let retained_bytes = batches.iter().fold(0usize, |bytes, batch| {
-        bytes.saturating_add(batch.get_array_memory_size())
-    });
-    let retained = if shape == StoredShape::Packed && retained_bytes <= PUBLISHED_ROWS_CACHE_BYTES {
-        let empty = RecordBatch::new_empty(schema.clone());
-        concat_batches(&schema, batches.iter().chain([&empty])).ok()
-    } else {
-        None
-    };
-    let dataset = commit_overwrite(dataset, batches).await?;
-    Ok((dataset, retained))
+    rows: &ManifestRows,
+) -> Result<(Dataset, RecordBatch)> {
+    guard_row_layout(&dataset)?;
+    let schema = manifest_storage_schema(dataset.schema().metadata.clone());
+    let batch = compact_to_storage(&rows.to_batch()?, &schema)?;
+    let committed = commit_overwrite(dataset, vec![batch.clone()]).await?;
+    Ok((committed, batch))
 }
 
 /// Commit `batches` as the whole stored row set at `dataset`'s version + 1 (the module doc: zero

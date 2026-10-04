@@ -704,6 +704,28 @@ jobs:
           fi
           grep -Eq "test current_v10_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v10 \\.\\.\\. ok" "$test_log" \
             || { echo "::error::exact v6 format fence did not pass"; exit 1; }
+          # These real CLI/server/proxy journeys must execute in the ordinary
+          # workspace gate. A removed, filtered or re-ignored owner is not green.
+          for test_name in \
+            remote_server_and_cli_end_to_end_flow \
+            remote_schema_apply_refuses_additive_change_for_cluster_backed_graph \
+            remote_schema_apply_refuses_incompatible_change_for_cluster_backed_graph \
+            remote_schema_apply_refuses_branched_cluster_backed_graph \
+            remote_read_preserves_projection_order_in_json_and_csv \
+            remote_branch_create_list_merge_flow \
+            remote_merge_delivery_loss_never_replays_committed_effect \
+            remote_branch_delete_removes_branch \
+            remote_export_round_trips_full_branch_graph \
+            remote_ingest_creates_review_branch_and_keeps_it_readable \
+            remote_load_round_trips_and_requires_from_for_new_branches \
+            remote_ingest_reuses_existing_branch_and_merges_updates \
+            remote_policy_enforces_branch_first_cli_workflow \
+            graphs_list_against_multi_graph_server \
+            mutate_if_commit_lost_cas_exits_4_issue_365
+          do
+            grep -Fq "test ${test_name} ... ok" "$test_log" \
+              || { echo "::error::required server e2e case did not pass: $test_name"; exit 1; }
+          done
 
 
 
@@ -716,7 +738,6 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_MIN_STACK: 16777216
-      OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS: '1'
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -740,37 +761,12 @@ jobs:
       - name: Check storage compatibility gate configuration
         run: python3 scripts/check-storage-upgrade-ci.py --self-test
 
-      - name: Install genuine v0.9 and v0.10 migration predecessors
-        run: |
-          set -euo pipefail
-          v09_dir="$RUNNER_TEMP/omnigraph-v09"
-          v6_dir="$RUNNER_TEMP/omnigraph-v010"
-          REPO_SLUG=ModernRelay/omnigraph VERSION=v0.9.0 INSTALL_DIR="$v09_dir" \
-            bash scripts/install.sh
-          REPO_SLUG=ModernRelay/omnigraph VERSION=v0.10.0 INSTALL_DIR="$v6_dir" \
-            bash scripts/install.sh
-          test -x "$v09_dir/omnigraph"
-          test -x "$v6_dir/omnigraph"
-          [[ "$("$v09_dir/omnigraph" --version)" == "omnigraph 0.9.0" ]] \
-            || { echo "::error::storage upgrade requires the genuine v0.9.0 CLI"; exit 1; }
-          [[ "$("$v6_dir/omnigraph" --version)" == "omnigraph 0.10.0" ]] \
-            || { echo "::error::storage upgrade requires the genuine v0.10.0 CLI"; exit 1; }
-          echo "OMNIGRAPH_V09_BIN=$v09_dir/omnigraph" >> "$GITHUB_ENV"
-          echo "OMNIGRAPH_V6_BIN=$v6_dir/omnigraph" >> "$GITHUB_ENV"
-
       - name: Run required storage upgrade crossversion tests
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/storage-upgrade-crossversion.log"
           cargo test --workspace --locked --test crossversion_upgrade --features "$FAILPOINT_FEATURES" storage_upgrade -- --test-threads=1 2>&1 | tee "$test_log"
           python3 scripts/check-storage-upgrade-ci.py --check-log crossversion "$test_log"
-
-      - name: Run required storage upgrade engine tests
-        run: |
-          set -euo pipefail
-          test_log="$RUNNER_TEMP/storage-upgrade-engine.log"
-          cargo test --locked -p omnigraph-engine --lib --features failpoints db::upgrade::tests -- --test-threads=1 2>&1 | tee "$test_log"
-          python3 scripts/check-storage-upgrade-ci.py --check-log engine "$test_log"
 
       - name: Run required storage upgrade lance tests
         run: |
@@ -1054,6 +1050,7 @@ jobs:
             --test lance_surface_guards \
             --test s3 \
             --test s3_cluster \
+            --test cli_cluster_e2e \
             --test system_local \
             -- --nocapture --test-threads=1 2>&1 | tee "$test_log"
 
@@ -1076,6 +1073,7 @@ jobs:
             server_opens_s3_graph_directly_and_serves_snapshot_and_read \
             server_boots_cluster_from_bare_storage_uri_and_serves_query \
             s3_cluster_full_lifecycle_import_apply_serve_evolve_delete \
+            cluster_e2e_s3_live_apply_without_restart \
             local_cli_s3_end_to_end_init_load_read_flow
           do
             grep -Eq "test ${test_name} \.\.\. ok" "$test_log" \
@@ -1089,22 +1087,27 @@ jobs:
       # CI pending that harness; run it on demand with a bucket set:
       #   OMNIGRAPH_S3_TEST_BUCKET=… cargo test -p omnigraph-engine --test write_cost_s3
 
-      - name: Run RustFS recovery-sidecar lifecycle
+      - name: Run RustFS detached publication retention
         if: matrix.shard == 'failpoints'
-        # Sidecar put/list/delete through the S3 storage backend on a
-        # real bucket (the failpoint only wedges the publisher; the
-        # sidecar I/O is exercised for real). Name filter `s3_` matches
-        # the bucket-gated tests in the failpoints target only; the
-        # grep guards against the filter going vacuous (cargo passes
-        # with 0 tests matched) if those tests are ever renamed.
+        # Exercise detached write and compaction pins through S3 after a lost
+        # publication acknowledgement, then prove another write succeeds.
+        # Require both owners and reject unconfigured early returns.
         run: |
-          set +e
-          output=$(cargo test --locked -p omnigraph-engine --features failpoints --test failpoints s3_ -- --nocapture 2>&1); status=$?
-          set -e
-          echo "$output"
-          [ "$status" -eq 0 ] || exit "$status"
-          echo "$output" | grep -Eq "test result: ok\. [1-9][0-9]* passed" \
-            || { echo "::error::filter 's3_' matched no tests — vacuous pass"; exit 1; }
+          set -euo pipefail
+          test_log="$RUNNER_TEMP/rustfs-failpoints.log"
+          cargo test --locked -p omnigraph-engine --features failpoints \
+            --test failpoints s3_ -- --nocapture 2>&1 | tee "$test_log"
+          if grep -Eiq 'skipping s3[ _]' "$test_log"; then
+            echo "::error::a configured RustFS failpoint test emitted its unconfigured skip"
+            exit 1
+          fi
+          for test_name in \
+            s3_write_detached_pin_survives_next_write \
+            s3_optimize_detached_pin_survives_next_write
+          do
+            grep -Fq "test ${test_name} ... ok" "$test_log" \
+              || { echo "::error::required RustFS failpoint cell did not pass: $test_name"; exit 1; }
+          done
 
       - name: Dump RustFS diagnostics on failure
         if: failure()
@@ -1284,6 +1287,7 @@ jobs:
           run_cell server_opens_azure_graph_directly_and_serves_snapshot_and_read -p omnigraph-server --test s3
           run_cell server_boots_azure_cluster_from_bare_storage_uri_and_serves_query -p omnigraph-server --test s3
           run_cell local_cli_azure_end_to_end_init_load_read_flow -p omnigraph-cli --test system_local
+          run_cell cluster_e2e_azure_live_apply_without_restart -p omnigraph-cli --test cli_cluster_e2e
 
           if grep -Eiq 'skipping .*azure|skipping .*azurite' "$test_log"; then
             echo "::error::a configured Azure test emitted its unconfigured skip"

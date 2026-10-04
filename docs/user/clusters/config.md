@@ -57,9 +57,9 @@ policies:
 |---|---:|---|
 | `version` | yes | Configuration schema; currently `1` |
 | `metadata.name` | no | Display name |
-| `storage` | no | Cluster root: local by default, or `file://`, `s3://`, `az://` |
+| `storage` | no | Cluster root; direct default is the config directory, remote apply defaults to the selected server |
 | `state.backend` | no | Omit or set to `cluster` |
-| `state.lock` | no | Serialize cluster operations; defaults to `true` |
+| `state.lock` | no | Exclusive writer admission; omit or set to `true`; `false` refuses execution |
 | `providers.embedding` | no | Named embedding provider profiles |
 | `graphs` | no | Graph declarations keyed by graph ID |
 | `policies` | no | Policy bundles keyed by bundle name |
@@ -107,9 +107,10 @@ type-check against the graph's desired schema fail validation.
 
 Provider `kind` may be `openai-compatible`, `openai`, `gemini`, or `mock`.
 Real providers require `api_key: ${ENVIRONMENT_VARIABLE}`; inline secrets are
-rejected. The environment variable is resolved when the server boots, not by
-`cluster validate`, `plan`, or `apply`. Vector dimensions remain part of the
-graph schema.
+rejected. The serving process resolves the environment variable at boot and
+during live deployment preflight for affected graphs. `cluster validate`,
+`plan`, and direct apply do not resolve it. Vector dimensions remain part of
+the graph schema.
 
 See [Embeddings](../search/embeddings.md) for provider behavior.
 
@@ -174,9 +175,11 @@ Only one bundle may bind a given graph or the cluster scope. See
 
 ## Storage
 
-When `storage` is omitted, applied state and graph data live under the config
-directory. An `s3://` or `az://` value puts them under that object-storage root;
-the source bundle still stays in the operator's working tree.
+For direct apply, omitted `storage` puts applied state and graph data under the
+config directory. `cluster apply --server` instead uses the selected server’s
+canonical root when `storage` is omitted; an explicit absolute path or `file://`,
+`s3://` or `az://` URI must match it. Remote apply rejects relative storage paths
+and reads only the source bundle from the caller’s filesystem.
 
 Use the standard storage credential environment for the chosen backend. Azure
 is a qualification preview and requires the admission wrapper for every writer;
@@ -201,19 +204,44 @@ Prefer relative paths; they are what keep a bundle portable and hermetic.
 | Command | Changes graph or cluster state? | Use |
 |---|---:|---|
 | `validate` | no | Parse and type-check the declaration |
-| `plan` | no | Preview creates, updates, and deletes |
-| `apply` | yes | Converge to the declaration |
-| `approve` | yes | Approve one exact destructive plan item |
-| `status` | no | Read recorded state and lock status |
-| `refresh` | state only | Refresh observations for declared graphs |
-| `import` | state only | Adopt existing declared resources |
+| `plan` | no | Preview desired differences; unsupported deployment effects still refuse |
+| `apply` | yes | Bootstrap, add graphs, or update schemas and queries |
+| `status` | no | Read recorded deployment and lock status; server status also observes activation |
+| `observe` | no | Report current observations without changing authority |
 | `force-unlock` | yes | Remove one proven-stale lock by exact ID |
+| `upgrade-ledger` | state only | Convert a stopped legacy ledger without resetting graph data |
 
-`apply` can create graphs, apply supported schema changes, publish query
-and policy resources, and execute approved graph deletion. It does not load
-graph data or start servers. A schema drop removes the data from the branch
-head and reclaims nothing at apply; `omnigraph cleanup` is the step that makes
-it unrecoverable. The plan shows such a step as `drop_property` or `drop_type`,
-with no mode.
+All execution uses ledger v2 and requires `state.lock: true`. With `--server`,
+apply submits to the existing writer and activates without restart. Direct
+apply owns exclusive admission and requires an explicit handoff before serving.
+Existing roots and runtime bindings stay fixed; graph additions receive their
+new bindings with creation. Graph deletion is not a supported deployment effect.
+Apply does not load rows or start servers. Root-addressed status, reconciliation
+and conversion do not use `cluster.yaml`; see [the deployment workflow](index.md).
+
+## Limits
+
+Configuration loading refuses limits before schema effects. Shared files with
+identical bytes count once toward the aggregate source limit.
+
+| Resource | Limit |
+|---|---:|
+| Each `cluster.yaml`, schema, query or policy source | 1 MiB |
+| Distinct source bytes in one captured bundle | 8 MiB |
+| Declared resources (each graph and schema count separately) | 4096 |
+| Query discovery paths plus directory entries, including ignored files | 4096 |
+| Encoded immutable deployment bundle | 16 MiB |
+| Encoded cluster ledger | 16 MiB |
+| Lock metadata read | 64 KiB |
+| Outstanding deployments | 1 |
+| Retained deployment results | 32 records, 4 MiB total, 1 MiB each |
+| Deployment actor / resource address / canonical root | 256 / 512 / 4096 UTF-8 bytes |
+
+Deployment admission checks the actual encoded prepared intents and reserves
+ledger/result space to record completion before accepting schema effects.
+JSON escaping and prepared state can make a deployment exceed its encoded limit
+even when raw source bytes fit. Result history may evict older completed records
+to admit a new deployment; outstanding authority is retained. These bounds do
+not cap graph data, native manifest-history scans or total process memory.
 
 See [Operating a cluster](index.md) for the end-to-end workflow.

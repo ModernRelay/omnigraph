@@ -1597,6 +1597,7 @@ fn load_json_outputs_summary_for_main_branch() {
         );
     }
     assert_eq!(payload["total_entities"], 11);
+    assert_eq!(payload.get("embedding_generation"), Some(&Value::Null));
     assert_eq!(
         payload["nodes"],
         serde_json::json!([

@@ -180,6 +180,7 @@ history of dependency bumps.
 | Detached commits | Every graph-table write is a Lance detached commit (`_versions/d{version}.manifest`), which never moves HEAD and needs no conflict pass, and it is the table's version for its whole life: nothing replays it linearly, no `Restore` is used, a graph table's linear HEAD stays at its `v1` create, and the registration's `omnigraph.last_linear_version` records where the linear history stopped. Every manifest names its transaction file `{read_version}-{uuid}.txn`, which is how the engine matches a pin's `transaction_uuid` and follows a chain of detached commits by `read_version` links without a second request (the collector, `walk_chain`); the pure-insert merge proof follows the same links and also reads each link's transaction file to certify it. A detached commit never triggers Lance auto-cleanup: `auto_cleanup_hook` runs only from `commit_transaction`, and every engine commit passes `skip_auto_cleanup: true`. | `lance_surface_guards.rs` (`rfc_0067_*`), `collector.rs` tests |
 | Catalog publication | Every `__manifest` publish is an `Operation::Overwrite` committed through `CommitBuilder::with_max_retries(0)`. Lance 11 treats that as a strict overwrite: it skips conflict resolution and writes `_versions/{read_version + 1}.manifest` only if absent, so a concurrent commit fails the publish with `CommitConflict` instead of being rebased over; the publisher maps that to `RowLevelCasContention` and retries from a fresh load. A Lance release that rebased overwrites under zero retries would break this version CAS. | `omnigraph-catalog` `stale_overwrite_loses_the_version_cas_without_replacing_the_winner` (the stale publish itself), `publisher_retry_vocabulary_is_the_version_cas` (the error mapping) |
 | Packed catalog record | Since stamp v12 the `__manifest` record fields are one `Struct` column with `lance-encoding:packed = true`, which Lance 2.1+ stores row-major in one column (`PackedStructVariablePerValueEncoder`), so a scan reads one column's pages for the record. Two Lance 11 limits shape the layout: a packed struct child with a null is refused at write (`Per-value compression not yet supported for block type Nullable`, the row format has no per-child null bit), so every child is non-null and the `present` bitmask child carries the logical nulls; and projecting a fixed-width child alone fails to decode (`invalid variable-width layout for UInt64`), so every scan projects `record` whole (no scan filters on a record field). Drop `present` at the bump whose packed struct accepts null values in a child, and the whole-record projection at the bump that decodes a child alone. | `omnigraph-catalog` `packed_record_round_trips_nulls_through_present_bits`, `lance_surface_guards.rs::packed_struct_refuses_null_values_and_lone_child_projection_lance_11` (goes red at either bump) |
+| Ordered walks | Lance 11's `HardCapBatchSizeExec` measures a one-row slice by its whole parent buffer, and `FilteredReadExec`'s byte rechunk (`rechunk_stream_by_size`, no copy) re-slices a batch's tail down to such slices, so sorting complete rows fails on ordinary multi-KiB rows as well as on a row wider than the 37.5 MiB sorter cap. Every `id`-ordered walk (branch merge, change feed, export) sorts only `id`, `_rowid` and `_rowaddr` and hydrates rows in bounded chunks (`ordered_cursor.rs`). Lance 12.0.0 deep-copies the one-row slice before measuring it (lance#9048); the tail collapse remains (lance#9692). | `changes.rs`, `export.rs` and `merge_fast_forward.rs` wide-row tests (`tests/helpers/wide_rows.rs`) |
 | MemWAL | Upstream support exists, but OmniGraph's RFC 0018 and RFC 0026 experiments were removed. No stream profile, token ledger, hidden stream column, or `_mem_wal` path is current. | `lifecycle.rs`, cluster removed-field diagnostics |
 
 The clone adapter is installed during normal dataset opens and initial dataset
@@ -207,15 +208,16 @@ system-column namespace (RFC 0040); schema v10 lets a registration name a
 detached table commit (RFC 0067); schema v11 makes that commit the table's
 version for life and records `omnigraph.last_linear_version` on every
 registration (RFC: Detached-only tables). Schema v12 packs the catalog record;
-schema v13 stores the schema contract row in each branch's `__manifest`.
-Normal open serves v13 only; qualified v6/v7/v8/v9/v10/v11/v12 graphs have
-explicit offline routes to v13, and the
-system-column respelling is a separate step on a served graph. The v7 → v8 handler
-changes only manifest configuration metadata and does not infer fork ownership
-or retire branches. Source v6/v7 graphs with reserved retirement metadata refuse;
-v8 no-op admission validates markers and counts only live logical refs
-while retaining physical ancestors. Older binaries must not expose retired refs
-as live branches.
+schema v13 stores the schema contract row in each branch's `__manifest`;
+schema v14 keeps a buffer of a branch's latest commits there, as
+`settled_commit` and `replaced_table` rows that store what differs from the
+head and the current `table` rows, released on `HISTORY_RELEASE_BYTES` (or
+the lower `history_release_bytes` a session set), and
+older commits in Lance files under `__history`.
+Normal open serves v14 only; a graph at any other stamp is refused and rebuilt
+by export and load, and the
+system-column respelling is a separate step on a served graph. Older binaries
+must not expose retired refs as live branches.
 See [versioning](versioning.md).
 
 Stock `Branches::get` and `list` include every physical ref. OmniGraph's logical

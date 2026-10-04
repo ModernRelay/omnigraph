@@ -10,7 +10,7 @@ use std::path::Path;
 /// catalog blob content, policy bundles from blob paths with their applied
 /// bindings. Always multi-graph routing.
 pub(crate) async fn load_cluster_settings(
-    cluster_dir: &PathBuf,
+    cluster_dir: &Path,
     cli_bind: Option<String>,
     cli_allow_unauthenticated: bool,
     cli_require_all_graphs: bool,
@@ -22,19 +22,41 @@ pub(crate) async fn load_cluster_settings(
     // Any supported scheme-qualified argument (s3://, az://, file://) is a storage root; a
     // bare path is a config directory.
     let cluster_arg = cluster_dir.to_string_lossy();
-    let snapshot = if cluster_arg.contains("://") {
-        omnigraph_cluster::read_serving_snapshot_from_storage(cluster_arg.as_ref()).await
-    } else {
-        omnigraph_cluster::read_serving_snapshot(cluster_dir).await
-    }
-    .map_err(|diagnostics| serving_snapshot_error(cluster_dir, &diagnostics))?;
-    settings_from_snapshot(
+    let admitted = omnigraph_cluster::admit_serving_snapshot(&cluster_arg)
+        .await
+        .map_err(|diagnostics| serving_snapshot_error(cluster_dir, &diagnostics))?;
+    let (snapshot, _, admission) = admitted.into_parts();
+    let mut config = match settings_from_snapshot(
         cluster_dir,
         cli_bind,
         cli_allow_unauthenticated,
         cli_require_all_graphs,
         snapshot,
-    )
+    ) {
+        Ok(config) => config,
+        Err(error) => return Err(release_settings_refusal(error, admission).await),
+    };
+    config.cluster_admission = admission;
+    Ok(config)
+}
+
+/// Only completed read-only settings validation reaches this release. No graph
+/// open, native effect or child owner has started; cancellation still retains
+/// admission because it does not execute this branch.
+async fn release_settings_refusal(
+    error: color_eyre::Report,
+    admission: Option<omnigraph_cluster::ClusterAdmission>,
+) -> color_eyre::Report {
+    if let Some(admission) = admission {
+        if let Err(release) = admission.release_after_settlement().await {
+            return eyre!(
+                "{error}; preflight admission release failed: [{}] {}",
+                release.code,
+                release.message
+            );
+        }
+    }
+    error
 }
 
 fn serving_snapshot_error(
@@ -56,7 +78,7 @@ fn serving_snapshot_error(
     eyre!("the cluster at '{diagnostic_cluster}' is not ready to serve:\n  {details}")
 }
 
-fn settings_from_snapshot(
+pub(crate) fn settings_from_snapshot(
     cluster_dir: &Path,
     cli_bind: Option<String>,
     cli_allow_unauthenticated: bool,
@@ -250,6 +272,7 @@ fn settings_from_snapshot(
         // The binary resolves the flag, then the environment, then the default
         // (`resolve_shutdown_grace`); settings carry the default.
         shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
+        cluster_admission: None,
     })
 }
 
@@ -309,26 +332,32 @@ pub async fn load_server_settings_with_identity_trust(
     }
     let cluster_dir = required_cluster(cli_cluster)?;
     let cluster_arg = cluster_dir.to_string_lossy();
-    let bound = if cluster_arg.contains("://") {
-        omnigraph_cluster::read_root_bound_serving_snapshot_from_storage(&cluster_arg).await
-    } else {
-        omnigraph_cluster::read_root_bound_serving_snapshot(cluster_dir).await
-    }
-    .map_err(|diagnostics| serving_snapshot_error(cluster_dir, &diagnostics))?;
+    let bound = omnigraph_cluster::admit_serving_snapshot(&cluster_arg)
+        .await
+        .map_err(|diagnostics| serving_snapshot_error(cluster_dir, &diagnostics))?;
     let canonical_root = bound.canonical_root().to_string();
-    let trust = data_trust_path
-        .map(|path| data_tokens::DataTokenTrust::read(path, &canonical_root))
-        .transpose()?;
-    let oidc_trust = oidc_trust_path
-        .map(|path| oidc_identity::OidcIdentityTrust::read(path, &canonical_root))
-        .transpose()?;
-    let config = settings_from_snapshot(
-        cluster_dir,
-        cli_bind,
-        cli_allow_unauthenticated,
-        cli_require_all_graphs,
-        bound.into_snapshot(),
-    )?;
+    let (snapshot, _, admission) = bound.into_parts();
+    let validated: Result<_> = (|| {
+        let trust = data_trust_path
+            .map(|path| data_tokens::DataTokenTrust::read(path, &canonical_root))
+            .transpose()?;
+        let oidc_trust = oidc_trust_path
+            .map(|path| oidc_identity::OidcIdentityTrust::read(path, &canonical_root))
+            .transpose()?;
+        let config = settings_from_snapshot(
+            cluster_dir,
+            cli_bind,
+            cli_allow_unauthenticated,
+            cli_require_all_graphs,
+            snapshot,
+        )?;
+        Ok((config, trust, oidc_trust))
+    })();
+    let (mut config, trust, oidc_trust) = match validated {
+        Ok(validated) => validated,
+        Err(error) => return Err(release_settings_refusal(error, admission).await),
+    };
+    config.cluster_admission = admission;
     Ok(ManagedServerConfig {
         config,
         canonical_root,
@@ -406,8 +435,9 @@ pub fn classify_server_runtime_state(
             "server has no bearer tokens and no policy file configured. This is a fully \
              open server — pass `--unauthenticated` (or set OMNIGRAPH_UNAUTHENTICATED=1) \
              if you actually want that, otherwise configure bearer tokens (see \
-             docs/user/operations/server.md) and a graph or cluster policy bundle in \
-             the cluster config, then run `omnigraph cluster apply` and restart."
+             docs/user/operations/server.md). Declare required graph and cluster \
+             policy bundles when bootstrapping; this deployment class keeps existing \
+             policy bindings fixed."
         ),
         (false, false, true) => Ok(ServerRuntimeState::Open),
         (true, false, _) => Ok(ServerRuntimeState::DefaultDeny),
@@ -794,6 +824,7 @@ mod tests {
             require_all_graphs: false,
             witness: crate::BootWitness::default(),
             shutdown_grace: crate::DEFAULT_SHUTDOWN_GRACE,
+            cluster_admission: None,
         };
         let result = serve(config).await;
         let err = result
@@ -851,6 +882,7 @@ mod tests {
             require_all_graphs: false,
             witness: crate::BootWitness::default(),
             shutdown_grace: crate::DEFAULT_SHUTDOWN_GRACE,
+            cluster_admission: None,
         };
         let result = serve(config).await;
         let err =
@@ -1011,7 +1043,8 @@ mod tests {
     /// the base is disjoint and apply accepts it) and the production snapshot
     /// reader then reads it with the storage root spelled as the overlapping
     /// `s3://` prefix. Graph roots derived from that spelling name the same
-    /// bytes, so the served sibling is opened at its local root.
+    /// bytes, so both graph URIs return to their local roots before startup
+    /// admission probes cluster membership; only the served sibling is opened.
     #[tokio::test]
     async fn boot_quarantines_overlapping_external_blob_base_and_strict_boot_refuses() {
         let dir = tempfile::tempdir().unwrap();
@@ -1036,10 +1069,29 @@ graphs:
 "#,
         )
         .unwrap();
-        let import = omnigraph_cluster::import_config_dir(dir.path()).await;
-        assert!(import.ok, "{:?}", import.diagnostics);
-        let apply = omnigraph_cluster::apply_config_dir(dir.path()).await;
-        assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+        let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
+        let apply = omnigraph_cluster::apply_deployment(
+            dir.path(),
+            None,
+            &caller,
+            &Default::default(),
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(apply, omnigraph_cluster::DeploymentLookup::Complete { ref result } if result.converged),
+            "{apply:?}"
+        );
+        let status =
+            omnigraph_cluster::deployment_status(dir.path().to_str().unwrap(), None, &caller)
+                .await
+                .unwrap();
+        if let Some(lock_id) = status.lock_id {
+            omnigraph_cluster::force_unlock_storage_root(dir.path().to_str().unwrap(), &lock_id)
+                .await
+                .unwrap();
+        }
         let before = tree_bytes(dir.path());
 
         let snapshot = omnigraph_cluster::read_serving_snapshot_with_display_root(
@@ -1091,11 +1143,13 @@ graphs:
             Some(StartupFailure::InvalidConfiguration)
         );
         assert_eq!(graphs[0].uri, "s3://assets/cluster/graphs/archive.omni");
-        graphs[0].uri = dir
-            .path()
-            .join("graphs/archive.omni")
-            .to_string_lossy()
-            .to_string();
+        for graph in &mut graphs {
+            graph.uri = dir
+                .path()
+                .join(format!("graphs/{}.omni", graph.graph_id))
+                .to_string_lossy()
+                .to_string();
+        }
         let state = open_multi_graph_state(
             graphs,
             Vec::new(),
@@ -1132,7 +1186,11 @@ graphs:
             }
             _ => panic!("snapshot refusal must remain in the runtime inventory"),
         }
+        let admission = state.cluster_admission.clone().unwrap();
         drop(state);
+        // This fixture has issued no requests; completed local opens have no
+        // surviving native writer. Hand off its exact owner before another boot.
+        admission.release_after_settlement().await.unwrap();
 
         // Settings failures must retain the same complete inventory too.
         // Point the rejected graph at a missing root: these failures must
@@ -1140,6 +1198,9 @@ graphs:
         let snapshot = omnigraph_cluster::read_serving_snapshot(dir.path())
             .await
             .unwrap();
+        let rejected_root = dir.path().join("graphs/knowledge.omni");
+        let saved_root = dir.path().join("saved-knowledge");
+        std::fs::rename(&rejected_root, &saved_root).unwrap();
         for failure in [
             StartupFailure::InvalidStoredQueries,
             StartupFailure::InvalidConfiguration,
@@ -1150,7 +1211,7 @@ graphs:
                 .iter_mut()
                 .find(|graph| graph.graph_id == "knowledge")
                 .unwrap();
-            rejected.root = dir.path().join("never-opened");
+            rejected.root = rejected_root.clone();
             if failure == StartupFailure::InvalidStoredQueries {
                 snapshot.queries.push(omnigraph_cluster::ServingQuery {
                     graph_id: "knowledge".to_string(),
@@ -1191,9 +1252,13 @@ graphs:
                 RegistryLookup::Blocked(graph) => assert_eq!(graph.failure, failure),
                 _ => panic!("settings refusal must remain in the runtime inventory"),
             }
-            assert!(!dir.path().join("never-opened").exists());
+            assert!(!rejected_root.exists());
+            let admission = state.cluster_admission.clone().unwrap();
+            drop(state);
+            admission.release_after_settlement().await.unwrap();
         }
 
+        std::fs::rename(&saved_root, &rejected_root).unwrap();
         assert_eq!(tree_bytes(dir.path()), before);
     }
 }

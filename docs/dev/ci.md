@@ -352,6 +352,10 @@ step runs from the repo root under the workspace Cargo configuration; the
 refusal step clears `RUSTFLAGS` to build the one flagless shape, and the seam
 guard step runs under the same empty `RUSTFLAGS` to share its artifacts. An
 unavailable-runtime refusal test does not replace executing the DST cases.
+`gqt-slow-nightly.yml` (cron 03:30 UTC + manual dispatch) runs the cases under
+`crates/omnigraph-gqt/cases_slow/` through the `omnigraph-gqt` binary, one at
+a time; it is not a required context, and it is its own workflow because the
+GQT runner refuses the pool-quiescing variables `dst-nightly.yml` sets.
 
 ## Local pre-push checks
 

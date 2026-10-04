@@ -14,7 +14,7 @@ pub struct SchemaContractDigest {
 }
 
 impl SchemaContractDigest {
-    fn from_row(row: &SchemaContractRow) -> Self {
+    pub(super) fn from_row(row: &SchemaContractRow) -> Self {
         Self {
             source_hash: source_hash(&row.source),
             schema_ir_hash: row.head.schema_ir_hash.clone(),
@@ -32,16 +32,17 @@ fn source_hash(source: &str) -> String {
 /// is required. Serialization is an internal v0.12 protocol, not an authorization
 /// capability: execution always rechecks the supplied actor and current policy.
 /// The caller owns durable storage, input-size bounds, retention and fencing.
+/// Version 2 can publish only at its numeric base plus one; version 1 refuses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreparedSchemaApply {
     version: u32,
     root: String,
-    authority: GraphHeadExpectation,
-    base_manifest_version: u64,
-    base_contract: SchemaContractDigest,
+    pub(super) authority: GraphHeadExpectation,
+    pub(super) base_manifest_version: u64,
+    pub(super) base_contract: SchemaContractDigest,
     pub(super) desired_source: String,
-    desired_contract: SchemaContractDigest,
+    pub(super) desired_contract: SchemaContractDigest,
     actor: Option<String>,
     pub(super) lineage: Option<LineageIntent>,
 }
@@ -61,16 +62,40 @@ impl PreparedSchemaApply {
         self.base_manifest_version
     }
 
+    pub fn base_head_commit_id(&self) -> Option<&str> {
+        self.authority.head_commit_id.as_deref()
+    }
+
+    pub fn actor(&self) -> Option<&str> {
+        self.actor.as_deref()
+    }
+
+    /// The exact accepted contract against which this intent was prepared.
+    pub fn base_contract(&self) -> &SchemaContractDigest {
+        &self.base_contract
+    }
+
     pub fn desired_contract(&self) -> &SchemaContractDigest {
         &self.desired_contract
     }
 
     pub(super) fn validate_envelope(&self, db: &Omnigraph, actor: Option<&str>) -> Result<()> {
-        if self.version != 1
+        self.validate_structure(db)?;
+        if self.actor.as_deref() != actor {
+            return Err(OmniError::manifest_conflict(
+                "schema publication intent actor does not match its executor",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_structure(&self, db: &Omnigraph) -> Result<()> {
+        if self.version != 2
             || self.root != write_queue_root_identity(&db.root_uri)?
-            || self.actor.as_deref() != actor
             || self.authority.branch.is_some()
+            || self.authority.branch_identifier != lance::dataset::refs::BranchIdentifier::main()
             || self.base_manifest_version == 0
+            || self.base_manifest_version == u64::MAX
             || self.desired_contract.source_hash != source_hash(&self.desired_source)
             || self.desired_contract.schema_identity_domain
                 != self.base_contract.schema_identity_domain
@@ -84,7 +109,7 @@ impl PreparedSchemaApply {
         }
         if let Some(lineage) = &self.lineage
             && (lineage.branch.is_some()
-                || lineage.merged_parent_commit_id.is_some()
+                || lineage.merged_parent.is_some()
                 || lineage.actor_id != self.actor
                 || !lineage
                     .graph_commit_id
@@ -162,11 +187,14 @@ impl CapturedSchemaApply {
             None
         } else {
             Some(GraphCoordinator::new_lineage_intent_for_branch(
-                None, actor, None,
+                None,
+                actor,
+                None,
+                HistoryReleaseBytes::PRODUCTION,
             )?)
         };
         Ok(PreparedSchemaApply {
-            version: 1,
+            version: 2,
             root: write_queue_root_identity(&db.root_uri)?,
             authority: GraphHeadExpectation::new(
                 None,

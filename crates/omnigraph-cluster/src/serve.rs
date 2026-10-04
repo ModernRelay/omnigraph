@@ -58,10 +58,9 @@ pub struct ServingSnapshot {
     pub state_cas: Option<String>,
     /// Every graph the applied revision names, sorted.
     pub applied_graphs: Vec<String>,
-    /// Applied graphs this snapshot does not serve, sorted: pending recovery
-    /// quarantined them, or their applied external Blob policy has a
-    /// server-safe base overlapping the cluster storage root. A sidecar for a
-    /// graph the revision does not name is not in this list.
+    /// Applied graphs refused by legacy recovery-evidence or external Blob
+    /// safety checks, sorted. Evidence for an unregistered graph never adds
+    /// that graph to the applied inventory.
     pub quarantined_graphs: Vec<ServingBlockedGraph>,
 }
 
@@ -91,11 +90,94 @@ impl RootBoundServingSnapshot {
     }
 }
 
+/// Serving input captured while holding the v2 cluster's lifetime admission.
+/// Legacy ledgers must be explicitly converted before ordinary serving.
+#[derive(Debug, Clone)]
+pub struct AdmittedServingSnapshot {
+    snapshot: ServingSnapshot,
+    canonical_root: String,
+    admission: Option<crate::admission::ClusterAdmission>,
+}
+
+impl AdmittedServingSnapshot {
+    pub fn canonical_root(&self) -> &str {
+        &self.canonical_root
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        ServingSnapshot,
+        String,
+        Option<crate::admission::ClusterAdmission>,
+    ) {
+        (self.snapshot, self.canonical_root, self.admission)
+    }
+}
+
+/// Acquire v2 admission before capturing the applied serving input. The caller
+/// must retain the admission through graph opening and the server's lifetime.
+/// A bare path resolves `cluster.yaml`'s storage root; a URI is config-free.
+pub async fn admit_serving_snapshot(
+    cluster: &str,
+) -> Result<AdmittedServingSnapshot, Vec<Diagnostic>> {
+    let store = if cluster.contains("://") {
+        ClusterStore::for_storage_root(cluster).map_err(|diagnostic| vec![diagnostic])?
+    } else {
+        store_for_serving_snapshot(Path::new(cluster))?
+    };
+    let admission = crate::admission::acquire_with_store(
+        &store,
+        crate::admission::ClusterAdmissionPurpose::Serve,
+    )
+    .await
+    .map_err(|diagnostic| vec![diagnostic])?;
+    // Snapshot capture only reads verified control payloads; no graph engine
+    // or write-capable owner exists yet. Completed refusal can release safely.
+    let captured = async {
+        let snapshot = read_snapshot_with_store(&store).await?;
+        let canonical_root = store
+            .canonical_root()
+            .map_err(|diagnostic| vec![diagnostic])?;
+        Ok::<_, Vec<Diagnostic>>((snapshot, canonical_root))
+    }
+    .await;
+    let (snapshot, canonical_root) = match captured {
+        Ok(captured) => captured,
+        Err(mut diagnostics) => {
+            if let Some(owner) = admission {
+                let error = diagnostics.remove(0);
+                diagnostics.insert(0, owner.release_refused_preflight(error).await);
+            }
+            return Err(diagnostics);
+        }
+    };
+    Ok(AdmittedServingSnapshot {
+        snapshot,
+        canonical_root,
+        admission,
+    })
+}
+
+/// Acquire lifetime admission for a server config directory or storage URI.
+/// This resolves the root only; serving input must be captured under the guard.
+pub async fn acquire_serving_admission(
+    cluster: &str,
+) -> Result<Option<crate::admission::ClusterAdmission>, Vec<Diagnostic>> {
+    let store = if cluster.contains("://") {
+        ClusterStore::for_storage_root(cluster).map_err(|diagnostic| vec![diagnostic])?
+    } else {
+        store_for_serving_snapshot(Path::new(cluster))?
+    };
+    crate::admission::acquire_with_store(&store, crate::admission::ClusterAdmissionPurpose::Serve)
+        .await
+        .map_err(|diagnostic| vec![diagnostic])
+}
+
 /// Read the applied revision as a serving snapshot — the read-only loader for
-/// the Phase-5 server boot. Cluster-global readiness failures are still
-/// all-or-nothing, but graph-attributed pending recovery sidecars quarantine
-/// only that graph so healthy graphs can continue serving. This loader never
-/// runs a recovery sweep.
+/// server boot. Cluster-global readiness failures are all-or-nothing;
+/// graph-attributed legacy evidence or unsafe Blob bindings quarantine their
+/// graphs. This loader never runs recovery or converts a legacy ledger.
 /// Takes no lock: the state file is replaced atomically, so this reads a
 /// consistent point-in-time ledger.
 pub async fn read_serving_snapshot(
@@ -188,23 +270,37 @@ async fn read_root_bound_snapshot_with_store(
 /// `init` into a cluster-managed location — graphs there are created by
 /// `cluster apply`, not `init`.
 ///
-/// Cheap by construction: a URI that does not match the `<root>/graphs/<id>.omni`
-/// shape returns `None` without any I/O, so ordinary `init` targets
-/// (`./kb.omni`, `s3://bucket/kb.omni`, `az://container/kb.omni`) never probe
-/// storage. Works for `file://`, `s3://`, and `az://` via the storage adapter.
+/// Local aliases are resolved before testing the layout. Non-cluster-shaped
+/// remote URIs never probe storage. Works for `file://`, `s3://`, and `az://`.
 pub async fn cluster_root_for_graph_uri(graph_uri: &str) -> Result<Option<String>, Diagnostic> {
-    let Some(root) = cluster_root_of_graph_layout(graph_uri) else {
-        return Ok(None);
-    };
-    let store = ClusterStore::for_storage_root(&root)?;
-    let has_state = store.has_state().await.map_err(|error| {
-        Diagnostic::error(
-            "cluster_state_probe_error",
-            omnigraph_storage::redacted_storage_uri(&root),
-            format!("could not inspect cluster state: {error}"),
-        )
+    // Resolve aliases before deciding that a graph is standalone. A symlink to
+    // a managed graph can have any filename. Also inspect the lexical layout
+    // so a managed graph symlink escaping the root is refused by v2 admission.
+    let canonical = crate::admission::canonical_graph_uri(graph_uri)?;
+    let lexical = omnigraph_storage::normalize_root_uri(graph_uri).map_err(|error| {
+        Diagnostic::error("cluster_graph_uri_error", "graph", error.to_string())
     })?;
-    Ok(has_state.then(|| store.display_root().to_string()))
+    let mut roots = BTreeSet::new();
+    for uri in [&canonical, &lexical] {
+        let Some(root) = cluster_root_of_graph_layout(uri) else {
+            continue;
+        };
+        if !roots.insert(root.clone()) {
+            continue;
+        }
+        let store = ClusterStore::for_storage_root(&root)?;
+        let has_state = store.has_state().await.map_err(|error| {
+            Diagnostic::error(
+                "cluster_state_probe_error",
+                omnigraph_storage::redacted_storage_uri(&root),
+                format!("could not inspect cluster state: {error}"),
+            )
+        })?;
+        if has_state {
+            return Ok(Some(store.display_root().to_string()));
+        }
+    }
+    Ok(None)
 }
 
 /// Resolve a graph's **storage URI** (`<root>/graphs/<id>.omni`) from a cluster's
@@ -230,6 +326,13 @@ pub async fn resolve_graph_storage_uri(
     let state = snapshot
         .state
         .ok_or_else(|| missing_state_diagnostic(cluster))?;
+    if state.version != 2 {
+        return Err(Diagnostic::error(
+            "ledger_upgrade_required",
+            CLUSTER_STATE_FILE,
+            "convert the stopped cluster ledger to v2 before using its graphs",
+        ));
+    }
     let address = format!("graph.{graph_id}");
     if !state.applied_revision.resources.contains_key(&address) {
         let applied = applied_graph_ids(&state);
@@ -257,6 +360,13 @@ pub async fn cluster_graph_ids(cluster: &str) -> Result<Vec<String>, Diagnostic>
     let state = snapshot
         .state
         .ok_or_else(|| missing_state_diagnostic(cluster))?;
+    if state.version != 2 {
+        return Err(Diagnostic::error(
+            "ledger_upgrade_required",
+            CLUSTER_STATE_FILE,
+            "convert the stopped cluster ledger to v2 before using its graphs",
+        ));
+    }
     Ok(applied_graph_ids(&state))
 }
 
@@ -304,6 +414,50 @@ fn cluster_root_of_graph_layout(graph_uri: &str) -> Option<String> {
 pub(crate) async fn read_snapshot_with_store(
     backend: &ClusterStore,
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
+    read_snapshot_impl(backend, false, None).await
+}
+
+/// Decode and validate legacy applied facts only for stopped-writer conversion.
+/// This is never authority to serve a v1 ledger or execute a v1 operation.
+pub(crate) async fn read_snapshot_for_ledger_upgrade(
+    backend: &ClusterStore,
+) -> Result<ServingSnapshot, Vec<Diagnostic>> {
+    read_snapshot_impl(backend, true, None).await
+}
+
+/// Use the ordinary serving projector with already validated frozen candidate
+/// resources. No candidate state or payload is written to storage.
+pub(crate) async fn preview_snapshot_with_store(
+    backend: &ClusterStore,
+    candidate: &crate::CapturedDeployment,
+) -> Result<ServingSnapshot, Vec<Diagnostic>> {
+    read_snapshot_impl(backend, false, Some(candidate)).await
+}
+
+async fn serving_payload(
+    backend: &ClusterStore,
+    candidate: Option<&crate::CapturedDeployment>,
+    kind: &ResourceKind,
+    digest: &str,
+    address: &str,
+) -> Result<String, Diagnostic> {
+    if let Some(candidate) = candidate {
+        return candidate.sources.get(digest).cloned().ok_or_else(|| {
+            Diagnostic::error(
+                "deployment_input_invalid",
+                address,
+                "validated candidate payload is missing",
+            )
+        });
+    }
+    backend.read_verified_payload(kind, digest, address).await
+}
+
+async fn read_snapshot_impl(
+    backend: &ClusterStore,
+    legacy_conversion: bool,
+    candidate: Option<&crate::CapturedDeployment>,
+) -> Result<ServingSnapshot, Vec<Diagnostic>> {
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     let mut startup_diagnostics: Vec<Diagnostic> = Vec::new();
     let mut quarantined_graphs: BTreeSet<String> = BTreeSet::new();
@@ -326,7 +480,7 @@ pub(crate) async fn read_snapshot_with_store(
             diagnostics.push(Diagnostic::error(
                 "cluster_recovery_unattributed",
                 path,
-                "recovery sidecar has no graph id; run a state-mutating cluster command to sweep it before serving",
+                "legacy recovery evidence has no graph id; resolve it with the build that wrote it before ledger conversion",
             ));
             continue;
         }
@@ -335,7 +489,7 @@ pub(crate) async fn read_snapshot_with_store(
             "cluster_recovery_pending",
             graph_address(&sidecar.graph_id),
             format!(
-                "graph `{}` is quarantined because interrupted operation `{}` awaits recovery; run any state-mutating cluster command (e.g. `cluster apply`) to sweep",
+                "graph `{}` is quarantined because legacy interrupted operation `{}` awaits recovery; resolve it with the build that wrote the evidence",
                 sidecar.graph_id, sidecar.operation_id
             ),
         ));
@@ -352,7 +506,7 @@ pub(crate) async fn read_snapshot_with_store(
                 diagnostics.push(Diagnostic::error(
                     "cluster_state_missing",
                     CLUSTER_STATE_FILE,
-                    "no cluster state ledger; run `cluster import` and `cluster apply` first",
+                    "no cluster state ledger; run `cluster apply` first",
                 ));
                 None
             }
@@ -362,10 +516,23 @@ pub(crate) async fn read_snapshot_with_store(
             None
         }
     };
-    let Some(state) = state else {
+    let Some(mut state) = state else {
         diagnostics.extend(startup_diagnostics);
         return Err(diagnostics);
     };
+    if state.version != 2 && !legacy_conversion {
+        return Err(vec![Diagnostic::error(
+            "ledger_upgrade_required",
+            CLUSTER_STATE_FILE,
+            "convert the stopped cluster ledger to v2 before serving",
+        )]);
+    }
+    if let Some(candidate) = candidate {
+        // Read-only preflight projects the candidate through the same checks;
+        // revision/CAS still identify the captured achieved base, not approval.
+        state.applied_revision.resources = candidate.resources.clone();
+        state.applied_revision.config_digest = Some(candidate.config_digest.clone());
+    }
     let boot_config_digest = state.applied_revision.config_digest.clone();
     let boot_state_revision = state.state_revision;
     let boot_state_cas = observations.state_cas.clone();
@@ -427,7 +594,7 @@ pub(crate) async fn read_snapshot_with_store(
                 "embedding_provider_digest_mismatch",
                 address.clone(),
                 format!(
-                    "applied embedding provider profile does not match its recorded digest (actual sha256:{actual_digest}); run `cluster refresh` then `cluster apply`, and restart"
+                    "applied embedding provider profile does not match its recorded digest (actual sha256:{actual_digest}); restore the verified provider metadata from a trusted ledger before serving"
                 ),
             ));
             continue;
@@ -503,10 +670,7 @@ pub(crate) async fn read_snapshot_with_store(
                 if quarantined_graphs.contains(graph) {
                     continue;
                 }
-                match backend
-                    .read_verified_payload(&kind, &entry.digest, address)
-                    .await
-                {
+                match serving_payload(backend, candidate, &kind, &entry.digest, address).await {
                     Ok(source) => queries.push(ServingQuery {
                         graph_id: graph.clone(),
                         name: name.clone(),
@@ -538,10 +702,7 @@ pub(crate) async fn read_snapshot_with_store(
                 if applies_to.is_empty() {
                     continue;
                 }
-                match backend
-                    .read_verified_payload(&kind, &entry.digest, address)
-                    .await
-                {
+                match serving_payload(backend, candidate, &kind, &entry.digest, address).await {
                     Ok(source) => policies.push(ServingPolicy {
                         name: name.clone(),
                         source,

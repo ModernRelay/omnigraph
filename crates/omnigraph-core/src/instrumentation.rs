@@ -92,6 +92,9 @@ impl ProbedStores {
 #[derive(Clone, Default)]
 pub struct QueryIoProbes {
     pub manifest_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+    /// Attached to the opens and the creation of `__history`, which carry
+    /// `manifest_wrapper` when this is absent.
+    pub history_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     /// Attached to the per-table data opens a query performs (the cache-miss
     /// path in `DatasetEntry::open`). Lets a cost test assert how many tables
     /// a query actually opened — N on a cold read, 0 on a warm repeat once the
@@ -195,10 +198,12 @@ pub struct QueryIoProbes {
     /// an acknowledged write.
     pub mutation_reprepares: Arc<AtomicU64>,
     /// The Lance `ObjectStore`s behind the opens that carried
-    /// `manifest_wrapper` / `table_wrapper`. A store's own `io_tracker` also
-    /// sees Lance's direct local reader and writer, which on `file://` never
-    /// reach a `WrappingObjectStore`; read it for backend-complete counts.
+    /// `manifest_wrapper` / `history_wrapper` / `table_wrapper`. A store's own
+    /// `io_tracker` also sees Lance's direct local reader and writer, which on
+    /// `file://` never reach a `WrappingObjectStore`; read it for
+    /// backend-complete counts.
     pub manifest_stores: ProbedStores,
+    pub history_stores: ProbedStores,
     pub table_stores: ProbedStores,
     /// Uncapped retries taken after a capped BM25 scan under-filled. Engine
     /// v2's BM25 scans carry no cap, so no engine path records one and the
@@ -791,6 +796,17 @@ pub fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
     current(|p| p.manifest_wrapper.clone()).flatten()
 }
 
+/// The wrapper of `__history`: its own plane when a probe installs one, the
+/// `__manifest` plane otherwise.
+pub fn history_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
+    current(|p| {
+        p.history_wrapper
+            .clone()
+            .or_else(|| p.manifest_wrapper.clone())
+    })
+    .flatten()
+}
+
 pub fn table_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
     current(|p| p.table_wrapper.clone()).flatten()
 }
@@ -804,7 +820,7 @@ pub fn record_probe() {
 /// Internal/system table directory names. An open of one of these is a metadata
 /// open (publisher CAS), NOT a data-table open. Kept in sync with the dir
 /// constants in `omnigraph-catalog/src/layout.rs`.
-const INTERNAL_TABLE_DIRS: [&str; 1] = ["__manifest"];
+const INTERNAL_TABLE_DIRS: [&str; 2] = ["__manifest", "__history"];
 
 /// True when `uri`'s last path segment names an internal/system table.
 fn open_is_internal(uri: &str) -> bool {
@@ -837,13 +853,19 @@ pub fn record_manifest_scan() {
 
 /// Register the store behind a probed open under the plane whose wrapper the
 /// open carried. No-op unless a cost probe is active.
-fn record_probed_store(wrapper: &Arc<dyn WrappingObjectStore>, store: Arc<lance::io::ObjectStore>) {
+pub fn record_probed_store(
+    wrapper: &Arc<dyn WrappingObjectStore>,
+    store: Arc<lance::io::ObjectStore>,
+) {
     let _ = current(|p| {
         let carried = |plane: &Option<Arc<dyn WrappingObjectStore>>| {
             plane.as_ref().is_some_and(|w| Arc::ptr_eq(w, wrapper))
         };
         if carried(&p.manifest_wrapper) {
             p.manifest_stores.register(store.clone());
+        }
+        if carried(&p.history_wrapper) {
+            p.history_stores.register(store.clone());
         }
         if carried(&p.table_wrapper) {
             p.table_stores.register(store);
@@ -1777,6 +1799,8 @@ pub enum VersionResolution {
 
 mod small_manifest_reads;
 pub use small_manifest_reads::manifest_scan_dataset;
+mod control_dataset;
+pub use control_dataset::{current_control_dataset, retain_control_dataset};
 
 /// Open a table pin (RFC 0067): a pin without a staged version opens its
 /// target, a staged pin above `last_linear_version` opens its detached
@@ -1883,26 +1907,7 @@ pub async fn open_dataset(
     session: Option<&Arc<lance::session::Session>>,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Dataset> {
-    record_open(uri);
-    let mut builder = DatasetBuilder::from_uri(uri);
-    if let VersionResolution::At(version) = version {
-        builder = builder.with_version(version);
-    }
-    let session = session
-        .cloned()
-        .unwrap_or_else(crate::lance_access::control_session);
-    builder = builder.with_session(session);
-    let mut store_params = crate::storage::lance_store_params_for_uri(uri)?;
-    if let Some(wrapper) = &wrapper {
-        store_params.object_store_wrapper = Some(wrapper.clone());
-    }
-    let handler =
-        crate::lance_clone::configured_commit_handler(uri, &Some(store_params.clone()), None)
-            .await
-            .map_err(OmniError::storage)?;
-    builder = builder
-        .with_store_params(store_params)
-        .with_commit_handler(handler);
+    let builder = dataset_builder(uri, version, session, &wrapper).await?;
     let dataset = builder.load().await.map_err(|error| match error {
         // Only the two shapes cleanup/drop legitimately leaves behind for a
         // pinned historical read count as reclaimed history:
@@ -1938,6 +1943,59 @@ pub async fn open_dataset(
         record_probed_store(wrapper, store);
     }
     Ok(dataset)
+}
+
+/// [`open_dataset`] at the latest version of a dataset that may not exist:
+/// `None` when Lance finds no dataset at `uri`, every other failure as it is.
+pub async fn open_dataset_if_present(
+    uri: &str,
+    session: Option<&Arc<lance::session::Session>>,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<Option<Dataset>> {
+    let builder = dataset_builder(uri, VersionResolution::Latest, session, &wrapper).await?;
+    let dataset = match builder.load().await {
+        Ok(dataset) => dataset,
+        Err(lance::Error::DatasetNotFound { .. }) => return Ok(None),
+        Err(error) => return Err(OmniError::storage(error)),
+    };
+    if let Some(wrapper) = &wrapper {
+        let store = dataset
+            .object_store(None)
+            .await
+            .map_err(OmniError::storage)?;
+        record_probed_store(wrapper, store);
+    }
+    Ok(Some(dataset))
+}
+
+/// The builder of [`open_dataset`]: the open is recorded, and the session, the
+/// wrapper and the commit handler are attached.
+async fn dataset_builder(
+    uri: &str,
+    version: VersionResolution,
+    session: Option<&Arc<lance::session::Session>>,
+    wrapper: &Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<DatasetBuilder> {
+    record_open(uri);
+    let mut builder = DatasetBuilder::from_uri(uri);
+    if let VersionResolution::At(version) = version {
+        builder = builder.with_version(version);
+    }
+    let session = session
+        .cloned()
+        .unwrap_or_else(crate::lance_access::control_session);
+    builder = builder.with_session(session);
+    let mut store_params = crate::storage::lance_store_params_for_uri(uri)?;
+    if let Some(wrapper) = wrapper {
+        store_params.object_store_wrapper = Some(wrapper.clone());
+    }
+    let handler =
+        crate::lance_clone::configured_commit_handler(uri, &Some(store_params.clone()), None)
+            .await
+            .map_err(OmniError::storage)?;
+    Ok(builder
+        .with_store_params(store_params)
+        .with_commit_handler(handler))
 }
 
 /// Per-method call counts for [`CountingStorageAdapter`].

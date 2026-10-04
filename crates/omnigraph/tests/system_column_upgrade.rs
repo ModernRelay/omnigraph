@@ -329,64 +329,6 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
     );
 }
 
-/// A flat-v11 source needs storage conversion before system-column respelling.
-#[tokio::test]
-async fn system_column_upgrade_respells_a_legacy_graph_after_storage_conversion() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = legacy_graph_with_data(&dir).await;
-    let export_before = db.export_jsonl("main", &[]).await.unwrap();
-    drop(db);
-    helpers::make_legacy_flat_manifest_fixture(dir.path(), 11).await;
-    assert!(Omnigraph::open(uri).await.is_err());
-    assert!(Omnigraph::open_read_only(uri).await.is_err());
-    let upgraded = omnigraph::db::upgrade_storage(uri, omnigraph::db::UpgradeOptions::default())
-        .await
-        .unwrap();
-    assert_eq!(
-        upgraded.outcome,
-        omnigraph::db::UpgradeOutcome::Completed,
-        "{upgraded:?}"
-    );
-
-    let db = helpers::session(Omnigraph::open(uri).await.unwrap());
-    let check = db
-        .upgrade_system_columns(SystemColumnUpgradeOptions { check: true })
-        .await
-        .unwrap();
-    assert_eq!(
-        check.outcome,
-        SystemColumnUpgradeOutcome::CheckPassed,
-        "{check:?}"
-    );
-    assert_eq!((check.stamp_before, check.stamp_after), (13, 13));
-
-    let report = db
-        .upgrade_system_columns(SystemColumnUpgradeOptions::default())
-        .await
-        .unwrap();
-    assert_eq!(
-        report.outcome,
-        SystemColumnUpgradeOutcome::Completed,
-        "{report:?}"
-    );
-    assert_eq!((report.stamp_before, report.stamp_after), (13, 13));
-    assert_eq!(
-        db.internal_schema_version_of(omnigraph::db::ReadTarget::branch("main"))
-            .await
-            .unwrap(),
-        13,
-        "system-column respelling preserves the served storage format"
-    );
-    assert_eq!(db.export_jsonl("main", &[]).await.unwrap(), export_before);
-    assert_eq!(count_rows(&db, "node:Person").await, 2);
-    let result = query_main(&db, COMPANY_QUERY, "company_identity", &ParamMap::new())
-        .await
-        .unwrap();
-    assert_eq!(collect_column_strings(result.batches(), "c.name"), ["Acme"]);
-}
-
 #[tokio::test]
 async fn system_column_upgrade_keeps_history_readable_after_a_user_id_property() {
     let _scenario = FailScenario::setup();

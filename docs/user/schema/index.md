@@ -49,7 +49,7 @@ letter (`worksAt` for `WorksAt`); lookup is otherwise case-insensitive.
 | `U32`, `U64` | Unsigned integers |
 | `F32`, `F64` | Floating-point numbers |
 | `Date` | Calendar date |
-| `DateTime` | Timestamp |
+| `DateTime` | Timestamp with millisecond precision |
 | `Vector(N)` | `N` 32-bit floating-point values |
 | `Blob` | Managed bytes or an external reference; see [Blobs](../blobs.md) |
 | `enum(a, b, ...)` | One of the declared strings |

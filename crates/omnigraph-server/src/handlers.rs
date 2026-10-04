@@ -5,7 +5,8 @@
 use super::*;
 use crate::api::{GraphAvailability, GraphAvailabilityAction};
 use crate::operations::OwnedResult;
-use crate::registry::{GraphEntry, StartupFailure};
+use crate::registry::{GraphEntry, RegistryCapture, StartupFailure};
+use crate::serving::GraphRequest;
 use crate::workload::{AdmissionGuard, IngressLease};
 use futures::StreamExt;
 use omnigraph::Session;
@@ -20,6 +21,7 @@ async fn owned_write<T, F>(
     state: &AppState,
     admission: AdmissionGuard,
     ingress: IngressLease,
+    graph: GraphRequest,
     operation: F,
 ) -> std::result::Result<T, ApiError>
 where
@@ -28,7 +30,9 @@ where
 {
     state
         .operations
-        .submit((admission, ingress), async move { operation.await.into() })?
+        .submit((admission, ingress, graph), async move {
+            operation.await.into()
+        })?
         .result()
         .await
 }
@@ -68,9 +72,10 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
 ///
 /// Unauthenticated, and therefore minimal: it reports whether this replica
 /// is serving or draining, the applied `config_digest` it booted from, the
-/// ledger revision and CAS it read, and registry/ready/blocked counts. Graph
+/// ledger revision and CAS it read, and registry/ready/loading/blocked counts. Graph
 /// ids stay behind authenticated catalog endpoints. Partial availability is
-/// ready but degraded; no available graph or shutdown returns 503. A valid
+/// ready but degraded after loading finishes; loading, no available graph or
+/// shutdown returns 503. A valid
 /// empty registry is ready. `/healthz` reports liveness independently.
 #[utoipa::path(
     get,
@@ -79,7 +84,7 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
     operation_id = "readiness",
     responses(
         (status = 200, description = "Serving", body = ReadinessOutput),
-        (status = 503, description = "No graph available or stopping", body = ReadinessOutput),
+        (status = 503, description = "Graphs loading, no graph available or stopping", body = ReadinessOutput),
     ),
 )]
 pub(crate) async fn server_ready(
@@ -93,12 +98,19 @@ pub(crate) async fn server_ready(
         .iter()
         .filter(|entry| matches!(entry, GraphEntry::Ready(_)))
         .count();
-    let blocked_graph_count = served_graph_count - ready_graph_count;
-    let ready = !draining && (served_graph_count == 0 || ready_graph_count > 0);
+    let loading_graph_count = entries
+        .iter()
+        .filter(|entry| matches!(entry, GraphEntry::Loading(_)))
+        .count();
+    let blocked_graph_count = served_graph_count - ready_graph_count - loading_graph_count;
+    let ready =
+        !draining && loading_graph_count == 0 && (served_graph_count == 0 || ready_graph_count > 0);
     let output = ReadinessOutput {
         ready,
         status: if draining {
             "draining"
+        } else if loading_graph_count > 0 {
+            "loading"
         } else if !ready {
             "blocked"
         } else if blocked_graph_count > 0 {
@@ -112,6 +124,7 @@ pub(crate) async fn server_ready(
         state_cas: state.witness.state_cas.clone(),
         served_graph_count,
         ready_graph_count,
+        loading_graph_count,
         blocked_graph_count,
         shutdown_grace_seconds: state.shutdown_grace.as_secs(),
     };
@@ -180,29 +193,37 @@ pub(crate) async fn server_graphs_list(
         .filter(|entry| may_list(entry.key().graph_id.as_str()))
         .map(|entry| {
             let failure = match &entry {
-                GraphEntry::Ready(_) => None,
+                GraphEntry::Loading(_) | GraphEntry::Ready(_) | GraphEntry::Transitioning(_) => {
+                    None
+                }
                 GraphEntry::Blocked(graph) => Some(graph.failure),
             };
-            let available = !stopping && failure.is_none();
+            let available = !stopping && matches!(entry, GraphEntry::Ready(_));
             GraphInfo {
                 graph_id: entry.key().graph_id.as_str().to_string(),
                 uri: entry.uri().to_string(),
                 state: if stopping {
                     GraphAvailability::Stopping
-                } else if available {
-                    GraphAvailability::Ready
                 } else {
-                    GraphAvailability::Blocked
+                    match &entry {
+                        GraphEntry::Loading(_) => GraphAvailability::Loading,
+                        GraphEntry::Ready(_) => GraphAvailability::Ready,
+                        GraphEntry::Transitioning(_) => GraphAvailability::Transitioning,
+                        GraphEntry::Blocked(_) => GraphAvailability::Blocked,
+                    }
                 },
                 read_available: available,
                 write_available: available,
                 failure,
                 action: if stopping {
                     GraphAvailabilityAction::WaitForRestart
-                } else if available {
-                    GraphAvailabilityAction::None
                 } else {
-                    GraphAvailabilityAction::RestartAfterCorrection
+                    match &entry {
+                        GraphEntry::Loading(_) => GraphAvailabilityAction::WaitForStartup,
+                        GraphEntry::Ready(_) => GraphAvailabilityAction::None,
+                        GraphEntry::Transitioning(_) => GraphAvailabilityAction::WaitForTransition,
+                        GraphEntry::Blocked(_) => GraphAvailabilityAction::RestartAfterCorrection,
+                    }
                 },
             }
         })
@@ -288,6 +309,8 @@ const ALWAYS_FLAT_PATHS: &[&str] = &[
     "/readyz",
     "/graphs",
     "/graphs/discovery",
+    "/cluster/deployments",
+    "/cluster/deployments/{id}",
     "/.well-known/oauth-protected-resource",
 ];
 
@@ -425,8 +448,8 @@ pub(crate) async fn require_bearer_auth(
 }
 
 /// Routing middleware (RFC-011 cluster-only). Resolves the active graph
-/// for the request and injects `Arc<GraphHandle>` as an extension so
-/// handlers can extract it via `Extension<Arc<GraphHandle>>`.
+/// for the request and injects `GraphRequest` as an extension so
+/// handlers can extract it via `Extension<GraphRequest>`.
 ///
 /// Routes are always nested under `/graphs/{graph_id}/...`. The
 /// middleware extracts `{graph_id}` from the URI path and looks it up in
@@ -488,55 +511,69 @@ pub(crate) fn resolve_registered_graph(
     state: &AppState,
     key: &GraphKey,
     actor: Option<&AuthenticatedActor>,
-) -> std::result::Result<Arc<GraphHandle>, ApiError> {
-    match state.routing().registry.get(key) {
-        RegistryLookup::Ready(handle) => Ok(handle),
-        RegistryLookup::Gone => Err(ApiError::not_found("graph not found")),
-        RegistryLookup::Blocked(graph) => {
-            // Invalid policy is not equivalent to the operator choosing no
-            // policy. Only a valid management grant can disclose that failure.
-            let readable = !matches!(
-                graph.failure,
-                StartupFailure::InvalidPolicy | StartupFailure::InvalidConfiguration
-            ) && matches!(
-                authorize(
-                    actor,
-                    graph.policy.as_deref(),
-                    PolicyRequest {
-                        action: PolicyAction::Read,
-                        branch: Some("main".into()),
-                        target_branch: None,
-                    }
-                )?,
-                Authz::Allowed
-            );
-            let listable = readable
-                || matches!(
-                    authorize(
-                        actor,
-                        state.server_policy.as_deref(),
-                        PolicyRequest {
-                            action: PolicyAction::GraphList,
-                            branch: None,
-                            target_branch: None,
-                        }
-                    )?,
-                    Authz::Allowed
-                );
-            if !readable && !listable {
-                return Err(ApiError::not_found("graph not found"));
-            }
-            Err(ApiError {
-                completion_uncertain: false,
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                code: Some(ErrorCode::GraphUnavailable),
-                message:
-                    "graph is unavailable; an operator must correct its startup failure and restart"
-                        .into(),
-                details: None,
-            })
-        }
+) -> std::result::Result<GraphRequest, ApiError> {
+    let (policy, invalid_policy, message) =
+        match state.routing().registry.capture(&state.operations, key)? {
+            RegistryCapture::Loading(graph) => (
+                graph.policy.clone(),
+                false,
+                "graph is loading; wait for its startup attempt to complete",
+            ),
+            RegistryCapture::Ready(handle) => return Ok(handle),
+            RegistryCapture::Gone => return Err(ApiError::not_found("graph not found")),
+            RegistryCapture::Transitioning(view) => (
+                view.policy.clone(),
+                false,
+                "graph admission is closed for a serving transition",
+            ),
+            RegistryCapture::Blocked(graph) => (
+                graph.policy.clone(),
+                matches!(
+                    graph.failure,
+                    StartupFailure::InvalidPolicy | StartupFailure::InvalidConfiguration
+                ),
+                "graph is unavailable; an operator must correct its startup failure and restart",
+            ),
+        };
+    // Invalid policy is not equivalent to the operator choosing no policy.
+    // Both startup failures and transitions preserve authorization before
+    // disclosing a known graph's unavailability.
+    let readable = !invalid_policy
+        && matches!(
+            authorize(
+                actor,
+                policy.as_deref(),
+                PolicyRequest {
+                    action: PolicyAction::Read,
+                    branch: Some("main".into()),
+                    target_branch: None,
+                }
+            )?,
+            Authz::Allowed
+        );
+    let listable = readable
+        || matches!(
+            authorize(
+                actor,
+                state.server_policy.as_deref(),
+                PolicyRequest {
+                    action: PolicyAction::GraphList,
+                    branch: None,
+                    target_branch: None,
+                }
+            )?,
+            Authz::Allowed
+        );
+    if !listable {
+        return Err(ApiError::not_found("graph not found"));
     }
+    Err(ApiError {
+        completion_uncertain: false,
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: Some(ErrorCode::GraphUnavailable),
+        message: message.into(),
+        details: None,
+    })
 }
 
 pub(crate) fn log_policy_decision(
@@ -612,7 +649,7 @@ pub(crate) fn authorize(
         //   return 403. Closes the "configured auth but forgot the
         //   policy file" trap from MR-723.
         // * Either of the above with a **server-scoped** action
-        //   (`graph_list`, future `graph_create`/`graph_delete`).
+        //   (`graph_list`, `config_manage`).
         //
         // Server-scoped actions are always denied here, regardless of
         // mode or actor presence. The management surface leaks server
@@ -623,25 +660,23 @@ pub(crate) fn authorize(
         // runtime state means the docstring contract on
         // `server_graphs_list` ("don't leak the registry until the
         // operator explicitly authorizes it") holds uniformly; the
-        // operator's only path to enabling it is configuring a
-        // cluster-scoped policy bundle, applying the cluster, and
-        // restarting the server.
+        // cluster must be bootstrapped with an explicit cluster-scoped
+        // policy bundle. This deployment class keeps that binding fixed.
         if request.action.resource_kind() == PolicyResourceKind::Server {
             return Ok(Authz::Denied(
-                "server-scoped actions require an explicit cluster policy bundle \
-                 applied with `omnigraph cluster apply` and served after restart — \
-                 the management surface is closed by default in every runtime state, \
-                 including --unauthenticated, so that server topology is never exposed \
-                 without operator opt-in."
+                "server-scoped actions require an applied cluster policy permit; \
+                 declare the cluster policy when bootstrapping. Existing policy bindings \
+                 cannot be changed by this deployment class. The management surface \
+                 is closed by default, including with --unauthenticated."
                     .to_string(),
             ));
         }
         if actor.is_some() && request.action != PolicyAction::Read {
             return Ok(Authz::Denied(
                 "server runs in default-deny mode (bearer tokens configured but no \
-                 applied policy bundle). Only `read` actions are permitted; configure \
-                 a graph or cluster policy bundle in the cluster config, run \
-                 `omnigraph cluster apply`, and restart the server to enable other actions."
+                 applied policy bundle). Only `read` actions are permitted. Other \
+                 actions require an applied graph policy; changing existing policy \
+                 bindings is outside the supported deployment class."
                     .to_string(),
             ));
         }
@@ -709,7 +744,7 @@ pub(crate) fn authorize_request(
 /// published dataset version, entity count) for every backing dataset on the
 /// branch. Defaults to `main` when `branch` is omitted. Read-only.
 pub(crate) async fn server_snapshot(
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     Query(query): Query<SnapshotQuery>,
 ) -> std::result::Result<Json<api::SnapshotOutput>, ApiError> {
@@ -723,6 +758,8 @@ pub(crate) async fn server_snapshot(
             target_branch: None,
         },
     )?;
+    // One resolution: the stamp is read from the snapshot's own manifest
+    // version, so both halves of the response describe one graph version.
     let (snapshot, internal_schema_version) = {
         let db = &handle.engine;
         let snapshot = db
@@ -730,7 +767,7 @@ pub(crate) async fn server_snapshot(
             .await
             .map_err(ApiError::from_omni)?;
         let internal_schema_version = db
-            .internal_schema_version_of(ReadTarget::branch(branch.as_str()))
+            .internal_schema_version_at(&snapshot)
             .await
             .map_err(ApiError::from_omni)?;
         (snapshot, internal_schema_version)
@@ -786,7 +823,7 @@ pub(crate) fn deprecation_headers(successor_link: &'static str) -> [(HeaderName,
 /// signal.
 pub(crate) async fn server_read(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<ReadRequest>,
 ) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<LegacyReadOutput>), ApiError> {
@@ -853,7 +890,7 @@ pub(crate) async fn server_read(
 /// request's target and `params`.
 pub(crate) async fn server_query(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     request: std::result::Result<Json<QueryRequest>, JsonRejection>,
 ) -> std::result::Result<Json<ReadOutput>, ApiError> {
@@ -955,7 +992,7 @@ struct BlobBinaryBody(Vec<u8>);
 /// descriptors redirect without target-store I/O. Authorization and target
 /// resolution share the exact helper used by `/query`.
 pub(crate) async fn server_blob_get(
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     headers: HeaderMap,
     query: std::result::Result<Query<BlobReadQuery>, QueryRejection>,
@@ -1019,7 +1056,7 @@ pub(crate) async fn server_blob_get(
 /// fallback. It never calls `BlobReader::read_range`; Range and If-Range are
 /// deliberately ignored while If-None-Match is still evaluated.
 pub(crate) async fn server_blob_head(
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     headers: HeaderMap,
     query: std::result::Result<Query<BlobReadQuery>, QueryRejection>,
@@ -1141,7 +1178,7 @@ fn redact_blob_api_error(
 /// Read-only.
 pub(crate) async fn server_export(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(observer): Extension<operations::ReadObserver>,
     Extension(input): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -1176,6 +1213,9 @@ pub(crate) async fn server_export(
     let (tx, body_stream) = export_transport::channel(queue_lease);
     tokio::spawn(
         async move {
+            // Declared first so wrapped producer/input resources drop before
+            // the final graph request owner on every exit path.
+            let _producer_graph = handle;
             let _producer_observer = observer;
             let _producer_input = input;
             // The producer half prevents disconnect from recycling queue bytes
@@ -1185,17 +1225,7 @@ pub(crate) async fn server_export(
             let data_tx = tx.clone();
             let export = cut.write_chunks(move |chunk| {
                 let data_tx = data_tx.clone();
-                async move {
-                    data_tx
-                        .send(export_transport::ExportFrame::Data(Bytes::from(chunk)))
-                        .await
-                        .map_err(|_| {
-                            OmniError::Io(std::io::Error::new(
-                                std::io::ErrorKind::BrokenPipe,
-                                "served export response closed",
-                            ))
-                        })
-                }
+                async move { data_tx.send_chunk(chunk).await }
             });
             tokio::pin!(export);
             tokio::select! {
@@ -1205,12 +1235,7 @@ pub(crate) async fn server_export(
                 }
                 (cut, result) = &mut export => {
                     let error = result.err().map(|error| std::io::Error::other(error.to_string()));
-                    let _ = tx
-                        .send(export_transport::ExportFrame::Terminal {
-                            cut: Box::new(cut),
-                            error,
-                        })
-                        .await;
+                    tx.finish(cut, error).await;
                 }
             }
         }
@@ -1303,7 +1328,7 @@ fn reject_graph_commit_expected_head(
 /// one), then the `Change` check, admission, selection, and the engine call.
 pub(crate) async fn run_mutate(
     state: AppState,
-    handle: Arc<GraphHandle>,
+    handle: GraphRequest,
     ingress: IngressLease,
     session: Session,
     actor: Option<&AuthenticatedActor>,
@@ -1373,7 +1398,7 @@ pub(crate) async fn run_mutate(
     let query = query.to_owned();
     let expected_head = expected_head.map(str::to_owned);
     let actor_id = actor_id.map(str::to_owned);
-    owned_write(&state, admission, ingress, async move {
+    owned_write(&state, admission, ingress, handle.clone(), async move {
         let receipt = session
             .mutate_as_with_expected_head_receipt(
                 &branch,
@@ -1415,7 +1440,7 @@ pub(crate) async fn run_mutate(
 /// Intentionally does **not** take [`AppState`] (unlike [`run_mutate`]):
 /// reads use the bounded server observer lane, so there is no `state.workload` consumer.
 pub(crate) async fn run_query(
-    handle: Arc<GraphHandle>,
+    handle: GraphRequest,
     session: Session,
     actor: Option<&AuthenticatedActor>,
     door: Door,
@@ -1584,7 +1609,7 @@ fn engine_error_with_cause(error: OmniError) -> (ApiError, Option<blob_transport
 /// so SDKs and proxies can surface the signal.
 pub(crate) async fn server_change(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     headers: axum::http::HeaderMap,
@@ -1662,7 +1687,7 @@ pub(crate) async fn server_change(
 /// send it to `POST /query`.
 pub(crate) async fn server_mutate(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     headers: axum::http::HeaderMap,
@@ -1720,7 +1745,7 @@ pub(crate) async fn server_mutate(
 /// precondition header; conditional callers must use this route.
 pub(crate) async fn server_mutate_if_graph_commit(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     headers: axum::http::HeaderMap,
@@ -1804,7 +1829,7 @@ pub(crate) fn parse_optional_invoke_body(
 /// actor can't run (the intended double-gate signal).
 pub(crate) async fn server_invoke_query(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     Path(QueryNamePath { name }): Path<QueryNamePath>,
@@ -1847,7 +1872,7 @@ pub(crate) async fn server_invoke_query(
 /// servers return 404 instead of ignoring an unknown conditional header.
 pub(crate) async fn server_invoke_query_if_graph_commit(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     Path(QueryNamePath { name }): Path<QueryNamePath>,
@@ -1869,7 +1894,7 @@ pub(crate) async fn server_invoke_query_if_graph_commit(
 
 async fn invoke_stored_query(
     state: AppState,
-    handle: Arc<GraphHandle>,
+    handle: GraphRequest,
     ingress: IngressLease,
     actor: Option<Extension<AuthenticatedActor>>,
     name: String,
@@ -2011,7 +2036,7 @@ async fn invoke_stored_query(
 /// per query yet, so it can list a query whose `invoke_query` the caller
 /// lacks (a known gap until per-query authorization lands).
 pub(crate) async fn server_list_queries(
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<QueriesCatalogOutput>, ApiError> {
     authorize_request(
@@ -2052,7 +2077,7 @@ pub(crate) async fn server_list_queries(
 /// Useful for clients that want to introspect available types and properties
 /// before constructing GQ queries. Read-only.
 pub(crate) async fn server_schema_get(
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<SchemaOutput>, ApiError> {
     authorize_request(
@@ -2085,7 +2110,7 @@ pub(crate) async fn server_schema_get(
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Schema apply is disabled for cluster-backed serving; use `omnigraph cluster apply` and restart", body = ErrorOutput),
+        (status = 409, description = "Use `omnigraph cluster apply --server <SERVER> --config <CONFIG>` for live schema deployment", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -2093,7 +2118,7 @@ pub(crate) async fn server_schema_get(
 /// Apply a schema migration.
 ///
 /// Cluster-backed servers reject this route with `409 Conflict`; operators
-/// must apply schema changes through `omnigraph cluster apply` and restart.
+/// submit schema changes with `omnigraph cluster apply --server <SERVER> --config <CONFIG>`.
 ///
 /// Diffs `schema_source` against the current schema and applies the resulting
 /// migration steps (add/drop type, add/drop property, etc.). **Destructive**:
@@ -2103,7 +2128,7 @@ pub(crate) async fn server_schema_get(
 /// were made.
 pub(crate) async fn server_schema_apply(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<SchemaApplyRequest>,
@@ -2131,8 +2156,8 @@ pub(crate) async fn server_schema_apply(
     if state.routing().config_path.is_some() {
         return Err(ApiError::conflict(
             "server-side schema apply is disabled for cluster-backed serving; \
-             update the cluster config, run `omnigraph cluster apply`, and restart \
-             the server.",
+             update the cluster config and run \
+             `omnigraph cluster apply --server <SERVER> --config <CONFIG>`.",
         ));
     }
     let est_bytes = request.schema_source.len() as u64;
@@ -2141,7 +2166,7 @@ pub(crate) async fn server_schema_apply(
         .try_admit(&actor_arc, est_bytes)
         .map_err(ApiError::from_workload_reject)?;
     let actor_id = actor_id.map(str::to_owned);
-    owned_write(&state, admission, ingress, async move {
+    owned_write(&state, admission, ingress, handle.clone(), async move {
         let result = {
             let db = &handle.engine;
             let registry = handle.queries.as_deref();
@@ -2227,7 +2252,7 @@ async fn authorize_load_scope(
 /// bulk `load_as`, and the `IngestOutput` mapping.
 async fn run_ingest(
     state: AppState,
-    handle: Arc<GraphHandle>,
+    handle: GraphRequest,
     ingress: IngressLease,
     actor: Option<&AuthenticatedActor>,
     request: IngestRequest,
@@ -2248,7 +2273,7 @@ async fn run_ingest(
         .map_err(ApiError::from_workload_reject)?;
     let session = state.session(&handle, None)?;
     let actor_id = actor_id.map(str::to_owned);
-    owned_write(&state, admission, ingress, async move {
+    owned_write(&state, admission, ingress, handle.clone(), async move {
         let receipt = session
             .load_as_with_receipt(
                 &branch,
@@ -2263,6 +2288,7 @@ async fn run_ingest(
         Ok(ingest_receipt_output(
             handle.uri.as_str(),
             &receipt,
+            &session.catalog(),
             mode,
             actor_id,
         ))
@@ -2303,7 +2329,7 @@ async fn run_ingest(
 /// deprecated alias.
 pub(crate) async fn server_load(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<IngestRequest>,
@@ -2380,7 +2406,7 @@ async fn collect_graph_batch_body(body: Body) -> std::result::Result<Bytes, ApiE
 /// the ordinary graph commit is visible.
 pub(crate) async fn server_load_ndjson(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     Query(query): Query<GraphBatchLoadQuery>,
     request: Request,
@@ -2454,7 +2480,7 @@ pub(crate) async fn server_load_ndjson(
 
     let session = state.session(&handle, None)?;
     let actor_id = actor_id.map(str::to_owned);
-    owned_write(&state, admission, ingress, async move {
+    owned_write(&state, admission, ingress, handle.clone(), async move {
         let receipt = session
             .load_graph_batch_as_with_receipt(
                 &branch,
@@ -2466,7 +2492,10 @@ pub(crate) async fn server_load_ndjson(
             .await
             .map_err(ApiError::from_omni)?;
         Ok(Json(graph_batch_load_receipt_output(
-            &receipt, mode, actor_id,
+            &receipt,
+            &session.catalog(),
+            mode,
+            actor_id,
         )))
     })
     .await
@@ -2501,7 +2530,7 @@ pub(crate) async fn server_load_ndjson(
 /// headers per RFC 9745 / RFC 8288 so SDKs and proxies can surface the signal.
 pub(crate) async fn server_ingest(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<IngestRequest>,
@@ -2537,7 +2566,7 @@ pub(crate) async fn server_ingest(
 /// Returns branch names sorted by name in byte order. Read-only. The GQ statement
 /// `branch list` on `POST /query` runs the same body.
 pub(crate) async fn server_branch_list(
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<BranchListOutput>, ApiError> {
     let branches = branch_list_body(&handle, actor.as_ref().map(|Extension(actor)| actor)).await?;
@@ -2602,7 +2631,7 @@ async fn branch_list_body(
 /// the same body.
 pub(crate) async fn server_branch_create(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<BranchCreateRequest>,
@@ -2629,7 +2658,7 @@ pub(crate) async fn server_branch_create(
 /// `branch_create` check on (`from`, `name`), admission, the engine call.
 async fn branch_create_body(
     state: &AppState,
-    handle: &GraphHandle,
+    handle: &GraphRequest,
     actor: Option<&AuthenticatedActor>,
     ingress: IngressLease,
     from: &str,
@@ -2658,7 +2687,7 @@ async fn branch_create_body(
     let from = from.to_owned();
     let name = name.to_owned();
     let actor_id = actor.map(|actor| actor.actor_id.to_string());
-    owned_write(state, admission, ingress, async move {
+    owned_write(state, admission, ingress, handle.clone(), async move {
         engine
             .branch_create_from_as(ReadTarget::branch(&from), &name, actor_id.as_deref())
             .await
@@ -2707,7 +2736,7 @@ pub(crate) struct BranchPath {
 /// body.
 pub(crate) async fn server_branch_delete(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     Path(BranchPath { branch }): Path<BranchPath>,
@@ -2725,7 +2754,7 @@ pub(crate) async fn server_branch_delete(
 /// statement: the `branch_delete` check on `name`, admission, the engine call.
 async fn branch_delete_body(
     state: &AppState,
-    handle: &GraphHandle,
+    handle: &GraphRequest,
     actor: Option<&AuthenticatedActor>,
     ingress: IngressLease,
     name: &str,
@@ -2750,7 +2779,7 @@ async fn branch_delete_body(
     let engine = Arc::clone(&handle.engine);
     let name = name.to_owned();
     let actor_id = actor.map(|actor| actor.actor_id.to_string());
-    owned_write(state, admission, ingress, async move {
+    owned_write(state, admission, ingress, handle.clone(), async move {
         engine
             .branch_delete_as(&name, actor_id.as_deref())
             .await
@@ -2796,7 +2825,7 @@ async fn branch_delete_body(
 /// (without the deletion composition) and answers the same 409 on conflict.
 pub(crate) async fn server_branch_merge(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     request: std::result::Result<Json<BranchMergeRequest>, JsonRejection>,
@@ -2810,7 +2839,7 @@ pub(crate) async fn server_branch_merge(
     let actor = actor.map(|Extension(actor)| actor);
     state
         .operations
-        .submit((admission, ingress), async move {
+        .submit((admission, ingress, handle.clone()), async move {
             let result = match session
                 .branch_merge_as(
                     &request.source,
@@ -2859,7 +2888,7 @@ pub(crate) async fn server_branch_merge(
 /// call. A conflict surfaces as `ApiError::merge_conflict` (409).
 async fn branch_merge_body(
     state: &AppState,
-    handle: &GraphHandle,
+    handle: &GraphRequest,
     session: &Session,
     actor: Option<&AuthenticatedActor>,
     ingress: IngressLease,
@@ -2871,7 +2900,7 @@ async fn branch_merge_body(
     let source = source.to_owned();
     let target = target.to_owned();
     let actor_id = actor.map(|actor| actor.actor_id.to_string());
-    owned_write(state, admission, ingress, async move {
+    owned_write(state, admission, ingress, handle.clone(), async move {
         session
             .branch_merge_as(&source, &target, actor_id.as_deref())
             .await
@@ -2965,7 +2994,7 @@ async fn delete_merged_source_branch(
 /// a future `cursor`/`limit` pagination will be keyset-based on that same
 /// order. Read-only.
 pub(crate) async fn server_commit_list(
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     Query(query): Query<CommitListQuery>,
 ) -> std::result::Result<Json<CommitListOutput>, ApiError> {
@@ -3022,7 +3051,7 @@ pub(crate) struct CommitPath {
 /// Returns the commit's graph-manifest version, parent commit(s), and creation
 /// metadata. Read-only.
 pub(crate) async fn server_commit_show(
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     Path(CommitPath { commit_id }): Path<CommitPath>,
 ) -> std::result::Result<Json<api::CommitOutput>, ApiError> {
@@ -3304,9 +3333,9 @@ mod blob_error_tests {
         }
     }
 
-    /// A storage failure while the Blob route resolves a snapshot target for
-    /// a policy-gated actor reaches the log with its class through the
-    /// delivery path itself, and the client sees only the redacted 500.
+    /// A storage failure while the Blob route resolves a snapshot target this
+    /// handle does not hold (the read goes to `__history`) for a policy-gated
+    /// actor reaches the log with its class; the client sees the redacted 500.
     #[tokio::test]
     async fn blob_delivery_logs_the_class_of_a_target_resolution_storage_failure() {
         let capture = crate::test_log_capture::Capture::default();
@@ -3320,7 +3349,9 @@ mod blob_error_tests {
         .await
         .unwrap();
         let engine = Omnigraph::open(uri).await.unwrap();
-        let snapshot = engine.resolve_snapshot("main").await.unwrap();
+        let snapshot = omnigraph::db::SnapshotId::new(
+            "hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.0.01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        );
         let policy: PolicyConfig = serde_yaml::from_str(
             "version: 1\n\
              groups:\n  team: [act-alice]\n\
@@ -3344,14 +3375,15 @@ mod blob_error_tests {
             snapshot: Some(snapshot.as_str().to_string()),
         };
 
-        // Unarmed, the same request resolves its target and reaches the cell.
         let unarmed = read_blob_for_delivery(&handle, Some(&actor), query())
             .await
             .unwrap_err();
-        assert_ne!(unarmed.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_ne!(
+            unarmed.status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unarmed, the request reads `__history`, finds no such commit and is refused"
+        );
 
-        // With the fault installed on this task, reopening the graph catalog
-        // at the snapshot's version fails in the object store.
         let probes = omnigraph::instrumentation::QueryIoProbes {
             manifest_wrapper: Some(Arc::new(CatalogReadFault)),
             ..Default::default()
@@ -3375,7 +3407,11 @@ mod blob_error_tests {
         .await
         .unwrap_err()
         .into_response();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "with the fault installed on this task, the read of `__history` fails in the object store"
+        );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -3604,7 +3640,7 @@ pub(crate) fn parse_change_query(
 /// a large commit continues via the opaque `page_token`. `set=` values are
 /// validated and select nothing in this release.
 pub(crate) async fn server_commit_changes(
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     Path(CommitPath { commit_id }): Path<CommitPath>,
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
@@ -3817,7 +3853,7 @@ fn normalize_change_branch(branch: Option<&str>) -> std::result::Result<String, 
 /// terminal cursor together with its blocks. The server holds no consumer
 /// state. `set=` values are validated and select nothing in this release.
 pub(crate) async fn server_changes_feed(
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> std::result::Result<Json<api::ChangeFeedOutput>, ApiError> {
@@ -3895,7 +3931,7 @@ pub(crate) async fn server_changes_feed(
 /// resume cursor's feed scope.
 pub(crate) async fn server_changes_baseline(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(observer): Extension<operations::ReadObserver>,
     Extension(input): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -3925,19 +3961,13 @@ pub(crate) async fn server_changes_baseline(
         .capture_served_change_baseline_cut(&branch, &scope)
         .await
         .map_err(change_route_error)?;
-    let terminal_record = {
-        let mut line = serde_json::to_vec(&api::ChangeBaselineRecord {
-            baseline: api::change_baseline_output(&handshake),
-        })
-        .map_err(|error| ApiError::internal(format!("encode baseline record: {error}")))?;
-        line.push(b'\n');
-        Bytes::from(line)
-    };
-
     let producer_queue_lease = Arc::clone(&queue_lease);
     let (tx, body_stream) = export_transport::channel(queue_lease);
     tokio::spawn(
         async move {
+            // Declared first so wrapped producer/input resources drop before
+            // the final graph request owner on every exit path.
+            let _producer_graph = handle;
             let _producer_observer = observer;
             let _producer_input = input;
             let _producer_queue_lease = producer_queue_lease;
@@ -3945,17 +3975,7 @@ pub(crate) async fn server_changes_baseline(
             let data_tx = tx.clone();
             let export = cut.write_chunks(move |chunk| {
                 let data_tx = data_tx.clone();
-                async move {
-                    data_tx
-                        .send(export_transport::ExportFrame::Data(Bytes::from(chunk)))
-                        .await
-                        .map_err(|_| {
-                            OmniError::Io(std::io::Error::new(
-                                std::io::ErrorKind::BrokenPipe,
-                                "served baseline response closed",
-                            ))
-                        })
-                }
+                async move { data_tx.send_chunk(chunk).await }
             });
             tokio::pin!(export);
             tokio::select! {
@@ -3969,25 +3989,16 @@ pub(crate) async fn server_changes_baseline(
                     // interrupted stream carries no usable cursor.
                     let error = match result {
                         Ok(()) => {
-                            match tx
-                                .send(export_transport::ExportFrame::Data(terminal_record))
-                                .await
-                            {
-                                Ok(()) => None,
-                                Err(_) => Some(std::io::Error::new(
-                                    std::io::ErrorKind::BrokenPipe,
-                                    "served baseline response closed",
-                                )),
-                            }
+                            tx.send_json_line(&api::ChangeBaselineRecord {
+                                baseline: api::change_baseline_output(&handshake),
+                            })
+                            .await
+                            .err()
+                            .map(|error| std::io::Error::other(error.to_string()))
                         }
                         Err(error) => Some(std::io::Error::other(error.to_string())),
                     };
-                    let _ = tx
-                        .send(export_transport::ExportFrame::Terminal {
-                            cut: Box::new(cut),
-                            error,
-                        })
-                        .await;
+                    tx.finish(cut, error).await;
                 }
             }
         }
