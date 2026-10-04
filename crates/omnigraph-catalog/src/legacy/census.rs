@@ -505,8 +505,8 @@ impl Contracts {
             finding(
                 FindingCode::UnsupportedSource,
                 format!(
-                    "version {version} of {} holds no schema_contract row, and neither does its \
-                     head nor the head of main",
+                    "version {version} of {} holds no schema contract, and the source gives none \
+                     for its head nor for the head of main",
                     named(native)
                 ),
             )

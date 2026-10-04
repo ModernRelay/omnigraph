@@ -21,10 +21,11 @@
 //! binary would misread as reclaimed history. Both RFC 0040 system column
 //! vintages (`id`/`src`/`dst` and `__id`/`__src`/`__dst`) live under that
 //! stamp; the vintage is read from the schema IR, never from the stamp.
-//! Normal open never converts: a v13 standalone root is converted by the
-//! offline `omnigraph upgrade`, whose intent, receipts and fence live here; a
-//! graph below v13 is rebuilt by export and load, and normal open refuses a
-//! graph that carries a pending storage-upgrade intent.
+//! Normal open never converts: a v8, v9 or v13 standalone root is converted
+//! by the offline `omnigraph upgrade`, whose intent, receipts and fence live
+//! here; a graph at any other stamp below v14 is rebuilt by export and load,
+//! and normal open refuses a graph that carries a pending storage-upgrade
+//! intent.
 //! Fresh graphs receive their stamp atomically in the manifest Create commit.
 //!
 //! ## Forward-version protection
@@ -114,12 +115,13 @@ use crate::state::{SchemaContractHead, SchemaContractRow};
 ///
 /// v1–v13 graphs are not served by this binary (see `MIN_SUPPORTED`); the
 /// history is kept for provenance and to document what each stamp value meant.
-/// A v13 standalone root reaches v14 through the offline `omnigraph upgrade`.
+/// A v8, v9 or v13 standalone root reaches v14 through the offline
+/// `omnigraph upgrade`.
 pub const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 14;
 
-/// Normal open serves only format 14. A v13 standalone root is converted by
-/// the offline `omnigraph upgrade`; a graph at a lower stamp, and a
-/// cluster-managed v13 graph, is rebuilt by export and load.
+/// Normal open serves only format 14. A v8, v9 or v13 standalone root is
+/// converted by the offline `omnigraph upgrade`; a graph at any other lower
+/// stamp, and a cluster-managed graph, is rebuilt by export and load.
 pub const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = 14;
 
 /// The stamp a fresh graph of the given system column vintage is born with:
@@ -280,8 +282,8 @@ pub fn is_served_stamp(stamp: u32) -> bool {
 /// half-enforce.
 ///
 /// - `stamp > CURRENT`: the graph was written by a newer binary — upgrade omnigraph.
-/// - `stamp == UPGRADE_SOURCE_FORMAT`: a standalone root is converted by the
-///   offline `omnigraph upgrade`; a cluster-managed graph is rebuilt.
+/// - `is_upgrade_source(stamp)` (v8, v9, v13): a standalone root is converted
+///   by the offline `omnigraph upgrade`; a cluster-managed graph is rebuilt.
 /// - any other `stamp < MIN_SUPPORTED`: the graph was made by an older
 ///   omnigraph whose storage format this binary does not read — rebuild via
 ///   export/import.
@@ -294,7 +296,7 @@ pub fn refuse_if_stamp_unsupported(stamp: u32) -> Result<()> {
             stamp, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, INTERNAL_MANIFEST_SCHEMA_VERSION,
         )));
     }
-    if stamp == UPGRADE_SOURCE_FORMAT {
+    if is_upgrade_source(stamp) {
         return Err(OmniError::manifest(format!(
             "__manifest is stamped at internal schema v{stamp}, but this omnigraph reads only v{min} to v{current}. \
              This graph was created by omnigraph {release}. For a standalone root, stop all readers, writers and \
@@ -347,13 +349,59 @@ pub const MAX_BRANCHES: usize = 1024;
 #[doc(hidden)]
 pub const MAX_INTENT_BYTES: usize = 1024 * 1024;
 
-/// The one route this binary runs, as the intent carries it.
+/// The one protocol this binary runs, as the intent carries it; every source
+/// format converts under it.
 #[doc(hidden)]
 pub const UPGRADE_PROTOCOL: u32 = 6;
 
-/// The stamp the upgrade converts from.
+/// A storage format the upgrade converts from: the two stamps of release
+/// 0.11.x, whose schema contract is the three schema objects at the graph
+/// root, and 13, whose contract is the `schema_contract` row of `__manifest`.
 #[doc(hidden)]
-pub const UPGRADE_SOURCE_FORMAT: u32 = 13;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpgradeSource {
+    Stamp8,
+    Stamp9,
+    Stamp13,
+}
+
+impl UpgradeSource {
+    /// Every source, oldest first.
+    pub const ALL: [Self; 3] = [Self::Stamp8, Self::Stamp9, Self::Stamp13];
+
+    /// The stamp the live heads of this source carry.
+    pub const fn stamp(self) -> u32 {
+        match self {
+            Self::Stamp8 => 8,
+            Self::Stamp9 => 9,
+            Self::Stamp13 => 13,
+        }
+    }
+
+    /// The source whose live heads are stamped `stamp`, if the upgrade converts one.
+    pub fn from_stamp(stamp: u32) -> Option<Self> {
+        Self::ALL.into_iter().find(|source| source.stamp() == stamp)
+    }
+
+    /// Whether the contract is a row of `__manifest` (13) or the root objects (8, 9).
+    pub const fn contract_in_row(self) -> bool {
+        matches!(self, Self::Stamp13)
+    }
+}
+
+/// The stamps the upgrade converts from, oldest first.
+#[doc(hidden)]
+pub const UPGRADE_SOURCE_FORMATS: [u32; 3] = [
+    UpgradeSource::Stamp8.stamp(),
+    UpgradeSource::Stamp9.stamp(),
+    UpgradeSource::Stamp13.stamp(),
+];
+
+/// Whether a standalone root stamped `stamp` is converted by the upgrade.
+#[doc(hidden)]
+pub fn is_upgrade_source(stamp: u32) -> bool {
+    UpgradeSource::from_stamp(stamp).is_some()
+}
 
 /// A live ref pinned at the version the upgrade converts; `parent_version`
 /// is 0 for main and the fork version for a named ref. A receipt an earlier
@@ -369,8 +417,20 @@ pub struct SourceBranch {
     pub parent_version: u64,
 }
 
+/// A live ref of the source the upgrade retires once main is fenced, as the
+/// branch delete that created it would have: the `__schema_apply_lock__` ref
+/// a 0.11.x schema apply did not release.
+#[doc(hidden)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SourceLock {
+    pub native: String,
+    pub identity: BranchIdentifier,
+}
+
 /// What the fence binds: the live refs at their source versions, main last,
-/// the schema contract and the plan of the legacy objects.
+/// the refs retired after the fence, the schema contract and the plan of the
+/// legacy objects.
 #[doc(hidden)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -381,12 +441,16 @@ pub struct UpgradeIntent {
     pub target_format: u32,
     pub graph_identity: String,
     pub branches: Vec<SourceBranch>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retire: Vec<SourceLock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_contract: Option<UpgradeSchemaContract>,
     pub legacy: LegacyPlan,
 }
 
-/// The identity and the exact texts of main's schema contract at the fence.
+/// The identity and the exact texts of main's schema contract at the fence,
+/// and the name of its archive under `__history/schemas/`, written before the
+/// fence: a fenced rerun reads the contract from there.
 #[doc(hidden)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -394,19 +458,21 @@ pub struct UpgradeSchemaContract {
     pub identity: SchemaContractHead,
     pub source_sha256: String,
     pub ir_sha256: String,
+    pub content_sha256: String,
 }
 
 impl UpgradeSchemaContract {
-    pub fn from_row(row: &SchemaContractRow) -> Self {
-        Self {
+    pub fn from_row(row: &SchemaContractRow) -> Result<Self> {
+        Ok(Self {
             identity: row.head.clone(),
             source_sha256: format!("{:x}", Sha256::digest(row.source.as_bytes())),
             ir_sha256: format!("{:x}", Sha256::digest(row.ir.as_bytes())),
-        }
+            content_sha256: crate::history::schema_content_hash(row)?,
+        })
     }
 
     pub fn validate_row(&self, row: &SchemaContractRow) -> Result<()> {
-        if *self != Self::from_row(row) {
+        if *self != Self::from_row(row)? {
             return Err(invalid(
                 "upgrade schema contract identity or exact text changed",
             ));
@@ -448,12 +514,9 @@ impl UpgradeIntent {
                 self.legacy.layout.version
             )));
         }
-        let route = (self.protocol, self.source_format, self.target_format)
-            == (
-                UPGRADE_PROTOCOL,
-                UPGRADE_SOURCE_FORMAT,
-                INTERNAL_MANIFEST_SCHEMA_VERSION,
-            );
+        let route = self.protocol == UPGRADE_PROTOCOL
+            && is_upgrade_source(self.source_format)
+            && self.target_format == INTERNAL_MANIFEST_SCHEMA_VERSION;
         let contract_valid = self.schema_contract.as_ref().is_some_and(|contract| {
             contract.identity.schema_identity_domain == self.graph_identity
                 && contract.identity.schema_identity_version != 0
@@ -464,6 +527,7 @@ impl UpgradeIntent {
                     .is_some_and(valid_sha256)
                 && valid_sha256(&contract.source_sha256)
                 && valid_sha256(&contract.ir_sha256)
+                && valid_sha256(&contract.content_sha256)
         });
         let mut names = HashSet::new();
         let branches_valid = !self.branches.is_empty()
@@ -478,9 +542,14 @@ impl UpgradeIntent {
                     && branch.parent_version <= branch.version
                     && names.insert(branch.native.as_deref())
             });
+        let retire_valid = self
+            .retire
+            .iter()
+            .all(|lock| !lock.native.is_empty() && names.insert(Some(lock.native.as_str())));
         if !route
             || !contract_valid
             || !branches_valid
+            || !retire_valid
             || !valid_sha256(&self.legacy.directory_sha256)
             || self.attempt.parse::<ulid::Ulid>().is_err()
             || self.graph_identity.is_empty()
@@ -724,20 +793,51 @@ mod tests {
             legacy.contains("an unreleased v7 development build"),
             "got: {legacy}"
         );
+        assert_eq!(UPGRADE_PROTOCOL, 6);
         assert_eq!(
-            (UPGRADE_SOURCE_FORMAT, UPGRADE_PROTOCOL),
-            (MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION - 1, 6)
+            UPGRADE_SOURCE_FORMATS,
+            [8, 9, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION - 1]
         );
-        for stamp in 1..UPGRADE_SOURCE_FORMAT {
+        for stamp in 1..INTERNAL_MANIFEST_SCHEMA_VERSION {
             let refusal = refuse_if_stamp_unsupported(stamp)
-                .expect_err("a sub-floor stamp has no in-place route")
+                .expect_err("a sub-floor stamp is refused")
                 .to_string();
             assert!(refusal.contains("omnigraph export"), "v{stamp}: {refusal}");
             assert!(
-                !refusal.contains("omnigraph upgrade") && !refusal.contains("in-place"),
+                refusal.contains(release_for_internal_schema_version(stamp)),
                 "v{stamp}: {refusal}"
             );
+            if [8, 9, 13].contains(&stamp) {
+                assert!(is_upgrade_source(stamp), "v{stamp}");
+                assert!(
+                    refusal.contains(
+                        "run `omnigraph upgrade <graph> --check` and then `omnigraph upgrade \
+                         <graph>`"
+                    ),
+                    "v{stamp}: {refusal}"
+                );
+            } else {
+                assert!(!is_upgrade_source(stamp), "v{stamp}");
+                assert!(
+                    !refusal.contains("omnigraph upgrade") && !refusal.contains("in-place"),
+                    "v{stamp}: {refusal}"
+                );
+            }
         }
+        assert!(!is_upgrade_source(0) && !is_upgrade_source(INTERNAL_MANIFEST_SCHEMA_VERSION));
+        let released = refuse_if_stamp_unsupported(9)
+            .expect_err("a v9 stamp must be refused")
+            .to_string();
+        assert!(
+            released.contains(
+                "This graph was created by omnigraph 0.11.x. For a standalone root, stop all \
+                 readers, writers and maintenance"
+            ) && released.contains(
+                "A cluster-managed graph has no in-place route yet: with 0.11.x run `omnigraph \
+                 export <graph> > graph.jsonl`"
+            ),
+            "got: {released}"
+        );
         let future_stamp = INTERNAL_MANIFEST_SCHEMA_VERSION + 1;
         let future = refuse_if_stamp_unsupported(future_stamp)
             .expect_err("the first unsupported future stamp must be refused")

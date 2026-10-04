@@ -2,9 +2,11 @@
 //! from, and the test fixture writer of those stamps. The reader is handed a
 //! dataset checked out at one version and never writes. Everything a source
 //! stamp decides (which versions it admits, its row shapes, its key grammar)
-//! sits behind [`LegacyManifestSource`], so a reader of another source stamp
-//! replaces [`Stamp13Source`] alone. The census, the plan and the conversion
-//! rows derived from what the reader returns are source-independent.
+//! sits behind [`LegacyManifestSource`]. Its two implementors are
+//! [`Stamp13Source`], whose contract is a `__manifest` row, and
+//! [`RootContractSource`] for stamps 8 and 9, whose contract the caller read
+//! from the graph root. The census, the plan and the conversion rows derived
+//! from what the reader returns are source-independent.
 
 mod census;
 mod layout;
@@ -17,7 +19,6 @@ pub use census::{
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use arrow_array::{Array, LargeStringArray, RecordBatch, StringArray, UInt64Array};
@@ -56,14 +57,18 @@ pub const OBJECT_TYPE_TABLE_TOMBSTONE: &str = "table_tombstone";
 /// The head pointer of one branch, keyed `graph_head:<logical branch>`.
 pub const OBJECT_TYPE_GRAPH_HEAD: &str = "graph_head";
 
-/// The stamp this route converts from: a live ref's head carries it.
-const SOURCE_STAMP: u32 = SCHEMA_CONTENT_STAMP;
-/// The stamps a retired ref's head may carry: retirement metadata arrived at 8.
-const RETIRED_HEAD_STAMPS: RangeInclusive<u32> = 8..=SOURCE_STAMP;
-/// The stamps a retained version may carry: the oldest a supported route left behind is 6.
-const VERSION_STAMPS: RangeInclusive<u32> = 6..=SOURCE_STAMP;
+/// The oldest stamp a retired ref's head may carry: retirement metadata arrived at 8.
+const OLDEST_RETIRED_HEAD_STAMP: u32 = 8;
+/// The oldest stamp a retained version may carry: the oldest a supported route left behind is 6.
+const OLDEST_VERSION_STAMP: u32 = 6;
 /// What an unstamped bootstrap version admits as: the stamp an absent key means (`guard_stamp`).
 const ABSENT_STAMP: u32 = 1;
+/// The stamps [`RootContractSource`] reads a live head at: the upgrade sources
+/// below the one whose contract is a row.
+const ROOT_CONTRACT_STAMPS: [u32; 2] = {
+    let [oldest, older, _] = crate::migrations::UPGRADE_SOURCE_FORMATS;
+    [oldest, older]
+};
 
 /// What the upgrade reads a `__manifest` version as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,24 +84,30 @@ pub enum SourceRole {
 }
 
 impl SourceRole {
-    fn admits(self, stamp: Option<u32>, version: u64) -> bool {
+    /// Whether a version stamped `stamp` reads as this role under a source
+    /// whose live heads are stamped `live`: no version of a root is stamped
+    /// above its live heads.
+    fn admits(self, stamp: Option<u32>, version: u64, live: u32) -> bool {
         match (self, stamp) {
-            (Self::LiveHead, Some(stamp)) => stamp == SOURCE_STAMP,
-            (Self::RetiredHead, Some(stamp)) => RETIRED_HEAD_STAMPS.contains(&stamp),
-            (Self::Version, Some(stamp)) => VERSION_STAMPS.contains(&stamp),
+            (Self::LiveHead, Some(stamp)) => stamp == live,
+            (Self::RetiredHead, Some(stamp)) => (OLDEST_RETIRED_HEAD_STAMP..=live).contains(&stamp),
+            (Self::Version, Some(stamp)) => (OLDEST_VERSION_STAMP..=live).contains(&stamp),
             (Self::Version, None) => matches!(version, 1 | 2),
             (Self::LiveHead | Self::RetiredHead, None) => false,
         }
     }
 
-    fn admitted(self) -> &'static str {
+    fn admitted(self, live: u32) -> String {
         match self {
-            Self::LiveHead => "the head of a live branch must be stamped v13",
-            Self::RetiredHead => "the head of a retired branch must be stamped v8 to v13",
-            Self::Version => {
-                "a retained version must be stamped v6 to v13, or be the unstamped version 1 \
-                 or 2 an older init wrote"
-            }
+            Self::LiveHead => format!("the head of a live branch must be stamped v{live}"),
+            Self::RetiredHead => format!(
+                "the head of a retired branch must be stamped v{OLDEST_RETIRED_HEAD_STAMP} to \
+                 v{live}"
+            ),
+            Self::Version => format!(
+                "a retained version must be stamped v{OLDEST_VERSION_STAMP} to v{live}, or be \
+                 the unstamped version 1 or 2 an older init wrote"
+            ),
         }
     }
 }
@@ -118,7 +129,8 @@ pub struct LegacyCommit {
 
 /// Everything one scan of a ref's head holds: every commit and head row,
 /// every registration and tombstone keyed by `(identity, clock)`, the contract
-/// row (`None` below stamp 13) and the count of rows scanned. A stamp-13
+/// (the head's row at stamp 13, the root contract under
+/// [`RootContractSource`], else `None`) and the count of rows scanned. A stamp-13
 /// overwrite rewrites every row and never removes a registration, so a head
 /// holds every pin and drop written on its lineage before it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,8 +146,8 @@ pub struct HeadScan {
 }
 
 /// The table membership, aliases and paths of one version, in identity order,
-/// and its contract (`None` below stamp 13 or when the version holds no
-/// `schema_contract` row).
+/// and its contract: the version's `schema_contract` row at stamp 13, `None`
+/// when it holds none and under `RootContractSource` for every version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionSchema {
     pub tables: Vec<TableRegistration>,
@@ -173,58 +185,11 @@ pub struct Stamp13Source;
 #[async_trait::async_trait]
 impl LegacyManifestSource for Stamp13Source {
     fn admits(&self, dataset: &Dataset, role: SourceRole) -> Result<u32> {
-        let version = dataset.version().version;
-        let metadata = &dataset.schema().metadata;
-        let pending = metadata.get(UPGRADE_PENDING_KEY);
-        if pending.is_some() && role != SourceRole::Version {
-            return Err(OmniError::manifest(format!(
-                "__manifest version {version} carries a pending storage conversion \
-                 ({UPGRADE_PENDING_KEY}); it is not a v13 source"
-            )));
-        }
-        let stamp = match metadata.get(INTERNAL_SCHEMA_VERSION_KEY) {
-            None => None,
-            Some(value) => Some(value.parse::<u32>().map_err(|_| {
-                OmniError::manifest(format!(
-                    "__manifest version {version} carries the internal-schema stamp '{value}', \
-                     which is not a version number"
-                ))
-            })?),
-        };
-        if let Some(intent) = pending {
-            return earlier_route_stamp(dataset, stamp, intent);
-        }
-        if !role.admits(stamp, version) {
-            let found = stamp.map_or_else(|| "unstamped".to_string(), |stamp| format!("v{stamp}"));
-            return Err(OmniError::manifest(format!(
-                "__manifest version {version} is {found}: {}",
-                role.admitted()
-            )));
-        }
-        let stamp = stamp.unwrap_or(ABSENT_STAMP);
-        require_stored_shape(dataset, stamp)?;
-        Ok(stamp)
+        admit(dataset, role, SCHEMA_CONTENT_STAMP)
     }
 
     async fn scan_head(&self, dataset: &Dataset) -> Result<HeadScan> {
-        let stamp = self.admits(dataset, SourceRole::RetiredHead)?;
-        let shape = stored_shape(Some(stamp));
-        let projection = match shape {
-            StoredShape::Packed => crate::record::packed_projection(dataset, true),
-            StoredShape::Flat => flat_projection(),
-        };
-        crate::instrumentation::record_manifest_scan();
-        let mut scanner = dataset.scan();
-        scanner.project(&projection).map_err(OmniError::storage)?;
-        let mut batches = scanner
-            .try_into_stream()
-            .await
-            .map_err(OmniError::storage)?;
-        let mut fold = HeadFold::new(dataset.version().version);
-        while let Some(batch) = batches.try_next().await.map_err(OmniError::storage)? {
-            fold.fold(&logical(shape, batch)?)?;
-        }
-        Ok(fold.finish()?.0)
+        scan_head_as(dataset, SCHEMA_CONTENT_STAMP).await
     }
 
     async fn version_schema(
@@ -232,102 +197,221 @@ impl LegacyManifestSource for Stamp13Source {
         dataset: &Dataset,
         previous: Option<&VersionSchema>,
     ) -> Result<VersionSchema> {
-        let stamp = self.admits(dataset, SourceRole::Version)?;
-        let shape = stored_shape(Some(stamp));
-        let mut projection: Vec<String> = match shape {
-            StoredShape::Packed => vec!["object_id", "object_type", RECORD_COLUMN],
-            StoredShape::Flat => vec![
-                "object_id",
-                "object_type",
-                "location",
-                "metadata",
-                "table_key",
-                "stable_table_id",
-                "table_incarnation_id",
-            ],
+        version_schema_as(dataset, previous, SCHEMA_CONTENT_STAMP).await
+    }
+}
+
+/// The source of the 8 → 14 and 9 → 14 routes: flat rows under the stamp-7
+/// key grammar and no `schema_contract` row in any version. The contract is
+/// the one the caller read from the graph root.
+#[derive(Debug, Clone)]
+pub struct RootContractSource {
+    stamp: u32,
+    contract: SchemaContractRow,
+}
+
+impl RootContractSource {
+    /// The source of a root whose live heads are stamped `stamp` (8 or 9),
+    /// under the contract read from its root.
+    pub fn new(stamp: u32, contract: SchemaContractRow) -> Result<Self> {
+        if !ROOT_CONTRACT_STAMPS.contains(&stamp) {
+            return Err(OmniError::manifest(format!(
+                "a schema contract read from the graph root is the contract of a v8 or v9 \
+                 graph, not of a v{stamp} one"
+            )));
         }
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-        if stamp == SCHEMA_CONTENT_STAMP {
-            projection.push(SCHEMA_CONTENT_COLUMNS[0].to_string());
+        Ok(Self { stamp, contract })
+    }
+}
+
+#[async_trait::async_trait]
+impl LegacyManifestSource for RootContractSource {
+    fn admits(&self, dataset: &Dataset, role: SourceRole) -> Result<u32> {
+        admit(dataset, role, self.stamp)
+    }
+
+    /// Every pin is linear, so each is returned with `last_linear_version`
+    /// set to its own table version: every ref's scan then returns the same
+    /// pin for the same row, inherited or not.
+    async fn scan_head(&self, dataset: &Dataset) -> Result<HeadScan> {
+        let mut scan = scan_head_as(dataset, self.stamp).await?;
+        for pin in scan.pins.values_mut() {
+            pin.metadata = pin
+                .metadata
+                .clone()
+                .with_last_linear_version(Some(pin.table_version));
         }
-        crate::instrumentation::record_manifest_scan();
-        let mut scanner = dataset.scan();
-        scanner.project(&projection).map_err(OmniError::storage)?;
-        scanner.filter_expr(col("object_type").in_list(
-            vec![lit(OBJECT_TYPE_TABLE), lit(OBJECT_TYPE_SCHEMA_CONTRACT)],
-            false,
-        ));
-        scanner.materialization_style(lance::dataset::scanner::MaterializationStyle::AllEarly);
-        let mut batches = scanner
-            .try_into_stream()
-            .await
-            .map_err(OmniError::storage)?;
-        let mut tables = BTreeMap::new();
-        let mut found: Option<(SchemaContractHead, String)> = None;
-        while let Some(batch) = batches.try_next().await.map_err(OmniError::storage)? {
-            let batch = logical(shape, batch)?;
-            let table_columns = TableColumns::of(&batch)?;
-            let object_ids = table_columns.object_ids;
-            let object_types = string_column(&batch, "object_type")?;
-            let metadata = metadata_column(&batch)?;
-            let sources = batch
-                .column_by_name(SCHEMA_CONTENT_COLUMNS[0])
-                .map(|_| large_string_column(&batch, SCHEMA_CONTENT_COLUMNS[0]))
-                .transpose()?;
-            for row in 0..batch.num_rows() {
-                require_contract_type(object_ids, object_types, row)?;
-                match object_types.value(row) {
-                    OBJECT_TYPE_TABLE => insert_registration(
-                        &mut tables,
-                        table_columns.registration(row, dataset.version().version)?,
-                    )?,
-                    OBJECT_TYPE_SCHEMA_CONTRACT => {
-                        let head = decode_schema_contract_head(object_ids, metadata, row)?;
-                        let source = sources
-                            .filter(|sources| !sources.is_null(row))
-                            .ok_or_else(|| {
-                                OmniError::manifest_internal(format!(
-                                    "__manifest version {} has a schema_contract row without its \
-                                     source text",
-                                    dataset.version().version
-                                ))
-                            })?
-                            .value(row)
-                            .to_string();
-                        if found.replace((head, source)).is_some() {
-                            return Err(OmniError::manifest_internal(
-                                "manifest has two schema_contract rows".to_string(),
-                            ));
-                        }
+        scan.contract = Some(self.contract.clone());
+        Ok(scan)
+    }
+
+    async fn version_schema(
+        &self,
+        dataset: &Dataset,
+        previous: Option<&VersionSchema>,
+    ) -> Result<VersionSchema> {
+        version_schema_as(dataset, previous, self.stamp).await
+    }
+}
+
+/// [`LegacyManifestSource::admits`] for a source whose live heads are stamped `live`.
+fn admit(dataset: &Dataset, role: SourceRole, live: u32) -> Result<u32> {
+    let version = dataset.version().version;
+    let metadata = &dataset.schema().metadata;
+    let pending = metadata.get(UPGRADE_PENDING_KEY);
+    if pending.is_some() && role != SourceRole::Version {
+        return Err(OmniError::manifest(format!(
+            "__manifest version {version} carries a pending storage conversion \
+             ({UPGRADE_PENDING_KEY}); it is not a v{live} source"
+        )));
+    }
+    let stamp = match metadata.get(INTERNAL_SCHEMA_VERSION_KEY) {
+        None => None,
+        Some(value) => Some(value.parse::<u32>().map_err(|_| {
+            OmniError::manifest(format!(
+                "__manifest version {version} carries the internal-schema stamp '{value}', \
+                 which is not a version number"
+            ))
+        })?),
+    };
+    if let Some(intent) = pending {
+        return earlier_route_stamp(dataset, stamp, intent, live);
+    }
+    if !role.admits(stamp, version, live) {
+        let found = stamp.map_or_else(|| "unstamped".to_string(), |stamp| format!("v{stamp}"));
+        return Err(OmniError::manifest(format!(
+            "__manifest version {version} is {found}: {}",
+            role.admitted(live)
+        )));
+    }
+    let stamp = stamp.unwrap_or(ABSENT_STAMP);
+    require_stored_shape(dataset, stamp)?;
+    Ok(stamp)
+}
+
+/// [`LegacyManifestSource::scan_head`] for a source whose live heads are stamped `live`.
+async fn scan_head_as(dataset: &Dataset, live: u32) -> Result<HeadScan> {
+    let stamp = admit(dataset, SourceRole::RetiredHead, live)?;
+    let shape = stored_shape(Some(stamp));
+    let projection = match shape {
+        StoredShape::Packed => crate::record::packed_projection(dataset, true),
+        StoredShape::Flat => flat_projection(),
+    };
+    crate::instrumentation::record_manifest_scan();
+    let mut scanner = dataset.scan();
+    scanner.project(&projection).map_err(OmniError::storage)?;
+    let mut batches = scanner
+        .try_into_stream()
+        .await
+        .map_err(OmniError::storage)?;
+    let mut fold = HeadFold::new(dataset.version().version);
+    while let Some(batch) = batches.try_next().await.map_err(OmniError::storage)? {
+        fold.fold(&logical(shape, batch)?)?;
+    }
+    Ok(fold.finish()?.0)
+}
+
+/// [`LegacyManifestSource::version_schema`] for a source whose live heads are stamped `live`.
+async fn version_schema_as(
+    dataset: &Dataset,
+    previous: Option<&VersionSchema>,
+    live: u32,
+) -> Result<VersionSchema> {
+    let stamp = admit(dataset, SourceRole::Version, live)?;
+    let shape = stored_shape(Some(stamp));
+    let mut projection: Vec<String> = match shape {
+        StoredShape::Packed => vec!["object_id", "object_type", RECORD_COLUMN],
+        StoredShape::Flat => vec![
+            "object_id",
+            "object_type",
+            "location",
+            "metadata",
+            "table_key",
+            "stable_table_id",
+            "table_incarnation_id",
+        ],
+    }
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    if stamp == SCHEMA_CONTENT_STAMP {
+        projection.push(SCHEMA_CONTENT_COLUMNS[0].to_string());
+    }
+    crate::instrumentation::record_manifest_scan();
+    let mut scanner = dataset.scan();
+    scanner.project(&projection).map_err(OmniError::storage)?;
+    scanner.filter_expr(col("object_type").in_list(
+        vec![lit(OBJECT_TYPE_TABLE), lit(OBJECT_TYPE_SCHEMA_CONTRACT)],
+        false,
+    ));
+    scanner.materialization_style(lance::dataset::scanner::MaterializationStyle::AllEarly);
+    let mut batches = scanner
+        .try_into_stream()
+        .await
+        .map_err(OmniError::storage)?;
+    let mut tables = BTreeMap::new();
+    let mut found: Option<(SchemaContractHead, String)> = None;
+    while let Some(batch) = batches.try_next().await.map_err(OmniError::storage)? {
+        let batch = logical(shape, batch)?;
+        let table_columns = TableColumns::of(&batch)?;
+        let object_ids = table_columns.object_ids;
+        let object_types = string_column(&batch, "object_type")?;
+        let metadata = metadata_column(&batch)?;
+        let sources = batch
+            .column_by_name(SCHEMA_CONTENT_COLUMNS[0])
+            .map(|_| large_string_column(&batch, SCHEMA_CONTENT_COLUMNS[0]))
+            .transpose()?;
+        for row in 0..batch.num_rows() {
+            require_contract_type(object_ids, object_types, row)?;
+            match object_types.value(row) {
+                OBJECT_TYPE_TABLE => insert_registration(
+                    &mut tables,
+                    table_columns.registration(row, dataset.version().version)?,
+                )?,
+                OBJECT_TYPE_SCHEMA_CONTRACT => {
+                    let head = decode_schema_contract_head(object_ids, metadata, row)?;
+                    let source = sources
+                        .filter(|sources| !sources.is_null(row))
+                        .ok_or_else(|| {
+                            OmniError::manifest_internal(format!(
+                                "__manifest version {} has a schema_contract row without its \
+                                 source text",
+                                dataset.version().version
+                            ))
+                        })?
+                        .value(row)
+                        .to_string();
+                    if found.replace((head, source)).is_some() {
+                        return Err(OmniError::manifest_internal(
+                            "manifest has two schema_contract rows".to_string(),
+                        ));
                     }
-                    other => {
-                        return Err(OmniError::manifest_internal(format!(
-                            "the table and contract scan returned a '{other}' row"
-                        )));
-                    }
+                }
+                other => {
+                    return Err(OmniError::manifest_internal(format!(
+                        "the table and contract scan returned a '{other}' row"
+                    )));
                 }
             }
         }
-        let contract = match found {
-            None => None,
-            Some((head, source)) => {
-                let ir = match previous
-                    .and_then(|previous| previous.contract.as_ref())
-                    .filter(|previous| previous.head == head && previous.source == source)
-                {
-                    Some(previous) => previous.ir.clone(),
-                    None => read_schema_ir(dataset).await?,
-                };
-                Some(SchemaContractRow { source, ir, head })
-            }
-        };
-        Ok(VersionSchema {
-            tables: tables.into_values().collect(),
-            contract,
-        })
     }
+    let contract = match found {
+        None => None,
+        Some((head, source)) => {
+            let ir = match previous
+                .and_then(|previous| previous.contract.as_ref())
+                .filter(|previous| previous.head == head && previous.source == source)
+            {
+                Some(previous) => previous.ir.clone(),
+                None => read_schema_ir(dataset).await?,
+            };
+            Some(SchemaContractRow { source, ir, head })
+        }
+    };
+    Ok(VersionSchema {
+        tables: tables.into_values().collect(),
+        contract,
+    })
 }
 
 /// The current head of a lineage: the commit with the greatest
@@ -620,7 +704,7 @@ async fn manifest_refs(
     Ok(refs)
 }
 
-/// The upgrade routes a stamp-13 root may have completed, as the
+/// The upgrade routes a source root may have completed, as the
 /// `(protocol, source_format, target_format)` their intents carry.
 const EARLIER_ROUTES: [(u32, u32, u32); 7] = [
     (1, 6, 7),
@@ -643,7 +727,12 @@ struct EarlierRoute {
 /// The stamp the rows of a retained main version under an earlier route's
 /// pending key are stored as: the target's for its conversion, the source's
 /// for its fence, which changed the metadata over the rows below it.
-fn earlier_route_stamp(dataset: &Dataset, stamp: Option<u32>, intent: &str) -> Result<u32> {
+fn earlier_route_stamp(
+    dataset: &Dataset,
+    stamp: Option<u32>,
+    intent: &str,
+    live: u32,
+) -> Result<u32> {
     let version = dataset.version().version;
     let refused = |why: String| {
         OmniError::manifest(format!(
@@ -663,6 +752,12 @@ fn earlier_route_stamp(dataset: &Dataset, stamp: Option<u32>, intent: &str) -> R
         return Err(refused(format!(
             "its intent names protocol {protocol} from v{source_format} to v{target_format}, \
              which no released upgrade ran"
+        )));
+    }
+    if target_format > live {
+        return Err(refused(format!(
+            "its intent names protocol {protocol} from v{source_format} to v{target_format}, \
+             which a v{live} root cannot have completed"
         )));
     }
     if stamp != Some(target_format) {
@@ -792,7 +887,7 @@ struct GraphHeadMetadata {
     parent_commit_id: Option<String>,
 }
 
-/// The reduction of a head's rows, shared by [`Stamp13Source::scan_head`] and
+/// The reduction of a head's rows, shared by [`LegacyManifestSource::scan_head`] and
 /// the fixture writer so both decode a row one way.
 struct HeadFold {
     version: u64,
@@ -967,7 +1062,7 @@ impl HeadFold {
                 }
                 other => {
                     return Err(OmniError::manifest_internal(format!(
-                        "manifest row '{}' has object_type '{other}', which no v13 row carries",
+                        "manifest row '{}' has object_type '{other}', which no source row carries",
                         object_ids.value(row)
                     )));
                 }
@@ -1320,27 +1415,47 @@ pub mod write {
         pub commit: Option<LegacyCommitIntent>,
     }
 
-    /// A `__manifest` history a stamp-13 engine would have written. Every
+    /// A `__manifest` history a stamp-13 engine would have written, or one a
+    /// 0.11.x engine would have at stamp 8 or 9 (`create_stamped`). Every
     /// publish overwrites the ref's whole row set, the rows it keeps first and
     /// the rows it writes after, replacing only the ids it writes again
     /// (`graph_head:*`, `schema_contract` and re-emitted `table:*`). A fork is
     /// a Lance ref of `__manifest` at its source's head; a retirement is the
     /// production `retire_branch_recoverably`.
-    pub struct Stamp13History {
+    pub struct LegacyHistory {
         root: String,
         heads: HashMap<Option<String>, Dataset>,
+        source_stamp: u32,
     }
 
-    impl Stamp13History {
+    impl LegacyHistory {
         /// Create the history at `root` with `genesis` as main's version 1.
         pub async fn create(root: &str, genesis: LegacyPublish) -> Result<Self> {
+            Self::create_stamped(root, genesis, SCHEMA_CONTENT_STAMP).await
+        }
+
+        /// [`Self::create`] for a history whose publishes are stamped `stamp`:
+        /// 13, or 8 or 9, which store the flat shape and no `schema_contract`
+        /// row, so a publish's `contract` is not written.
+        pub async fn create_stamped(
+            root: &str,
+            genesis: LegacyPublish,
+            stamp: u32,
+        ) -> Result<Self> {
+            if stamp != SCHEMA_CONTENT_STAMP && !super::ROOT_CONTRACT_STAMPS.contains(&stamp) {
+                return Err(OmniError::manifest_internal(format!(
+                    "the fixture publishes at stamp 8, 9 or {SCHEMA_CONTENT_STAMP}, not {stamp}"
+                )));
+            }
+            let genesis = at_stamp(genesis, stamp);
             let rows = pending_rows(&genesis, &[], &HashMap::new(), None, 1)?;
-            let batch = compact_to_storage(&rows, &stamp_13_schema(HashMap::new())?)?;
+            let batch = to_storage(&rows, &publish_schema(HashMap::new(), stamp)?, stamp)?;
             let dataset =
                 crate::commit::create_for_test(&crate::layout::manifest_uri(root), batch).await?;
             Ok(Self {
                 root: root.to_string(),
                 heads: HashMap::from([(None, dataset)]),
+                source_stamp: stamp,
             })
         }
 
@@ -1355,13 +1470,16 @@ pub mod write {
             })
         }
 
-        /// Write `publish` on `native` as its next version, stamped 13, and
-        /// return that version.
+        /// Write `publish` on `native` as its next version, stamped as the
+        /// history is (13 unless `create_stamped` chose 8 or 9), and return
+        /// that version.
         pub async fn publish(
             &mut self,
             native: Option<&str>,
             publish: LegacyPublish,
         ) -> Result<u64> {
+            let stamp = self.source_stamp;
+            let publish = at_stamp(publish, stamp);
             let dataset = self.head(native)?.clone();
             let version = dataset.version().version + 1;
             let live = logical_rows(&dataset).await?;
@@ -1381,12 +1499,7 @@ pub mod write {
                 .flatten()
                 .map(str::to_string)
                 .collect();
-            let mut metadata = dataset.schema().metadata.clone();
-            metadata.insert(
-                INTERNAL_SCHEMA_VERSION_KEY.to_string(),
-                SCHEMA_CONTENT_STAMP.to_string(),
-            );
-            let schema = stamp_13_schema(metadata)?;
+            let schema = publish_schema(dataset.schema().metadata.clone(), stamp)?;
             let mut batches = Vec::with_capacity(live.len() + 1);
             for batch in &live {
                 let keep = BooleanArray::from_iter(
@@ -1396,10 +1509,10 @@ pub mod write {
                 );
                 let kept = filter_record_batch(batch, &keep).map_err(OmniError::arrow_internal)?;
                 if kept.num_rows() > 0 {
-                    batches.push(compact_to_storage(&kept, &schema)?);
+                    batches.push(to_storage(&kept, &schema, stamp)?);
                 }
             }
-            batches.push(compact_to_storage(&pending, &schema)?);
+            batches.push(to_storage(&pending, &schema, stamp)?);
             self.overwrite_head(native, dataset, batches).await
         }
 
@@ -1544,12 +1657,42 @@ pub mod write {
         }
     }
 
-    fn stamp_13_schema(mut metadata: HashMap<String, String>) -> Result<arrow_schema::SchemaRef> {
-        metadata.insert(
-            INTERNAL_SCHEMA_VERSION_KEY.to_string(),
-            SCHEMA_CONTENT_STAMP.to_string(),
-        );
-        manifest_storage_schema(metadata, true)
+    /// The stored schema of a publish stamped `stamp`, over `metadata`.
+    fn publish_schema(
+        mut metadata: HashMap<String, String>,
+        stamp: u32,
+    ) -> Result<arrow_schema::SchemaRef> {
+        metadata.insert(INTERNAL_SCHEMA_VERSION_KEY.to_string(), stamp.to_string());
+        match stored_shape(Some(stamp)) {
+            StoredShape::Flat => Ok(Arc::new(
+                flat_manifest_schema()
+                    .as_ref()
+                    .clone()
+                    .with_metadata(metadata),
+            )),
+            StoredShape::Packed => manifest_storage_schema(metadata, true),
+        }
+    }
+
+    /// A logical batch in the shape a publish stamped `stamp` stores.
+    fn to_storage(
+        batch: &RecordBatch,
+        schema: &arrow_schema::SchemaRef,
+        stamp: u32,
+    ) -> Result<RecordBatch> {
+        match stored_shape(Some(stamp)) {
+            StoredShape::Flat => flat_to_storage(batch, schema),
+            StoredShape::Packed => compact_to_storage(batch, schema),
+        }
+    }
+
+    /// `publish` as a history stamped `stamp` writes it: below 13 no version
+    /// holds a `schema_contract` row.
+    fn at_stamp(publish: LegacyPublish, stamp: u32) -> LegacyPublish {
+        LegacyPublish {
+            contract: publish.contract.filter(|_| stamp == SCHEMA_CONTENT_STAMP),
+            ..publish
+        }
     }
 
     /// Every row of `dataset` in the logical schema, whatever its stored shape.

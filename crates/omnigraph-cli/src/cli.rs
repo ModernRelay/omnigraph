@@ -317,8 +317,8 @@ pub(crate) enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Convert a standalone graph's storage offline from format v13 to the
-    /// format this binary serves (v14); older formats are rebuilt by export and load
+    /// Convert a standalone graph's storage offline from format v8, v9 or v13 to
+    /// the format this binary serves (v14); other formats are rebuilt by export and load
     Upgrade {
         /// Standalone graph storage URI; alternatively use --store
         uri: Option<String>,

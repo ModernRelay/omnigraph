@@ -555,3 +555,16 @@ this amendment reads no `legacy/` and reports pre-upgrade ids as not found.
   upgrade: Lance data files plus flat locator objects under
   `__history/legacy/`, in place of a Lance dataset with an id index. The
   draft's record stream is not changed by it.
+- 2026-10-04: the legacy area of the amendment also holds the pre-upgrade
+  commits of a stamp-8 or stamp-9 source (release v0.11.0), which the same
+  upgrade now converts ([RFC 0064](0064-explicit-storage-upgrades.md)). The
+  layout, the bounds and the argument of the amendment are unchanged; the
+  directory's source stamp field is 8, 9 or 13. Two statements of the
+  amendment hold for a stamp-13 source only. The schema content row lists
+  each distinct contract a legacy record names: for a stamp-8 or stamp-9
+  source that is one contract, the one at the graph root at the upgrade,
+  named by every record. And the census bound of about 75,000 commits on
+  one lineage is derived from the stamp-13 overwrite publish; a stamp-8 or
+  stamp-9 `__manifest` keeps every row and every version, and its bound in
+  commits has not been derived. The amendment's heading keeps its name so
+  that existing links resolve.

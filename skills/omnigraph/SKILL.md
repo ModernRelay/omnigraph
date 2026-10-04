@@ -17,8 +17,12 @@ Check `omnigraph version` and the command's `--help` before using these
 instructions. This skill targets the [v0.11.0 release](https://github.com/ModernRelay/omnigraph/releases/tag/v0.11.0),
 which reports `internal-schema 9` and serves both v8 and v9 graphs. New graphs
 use v9; opening v8 preserves its physical columns. A v0.10 graph uses v6 and
-requires an explicit upgrade or rebuild. Read [migration guidance](references/migrations.md)
-before replacing a deployed binary.
+requires an explicit upgrade or rebuild. The binary after 0.11 (main after
+2026-10-04) serves storage format 14 only and converts a standalone v8, v9 or
+v13 graph in place with its own `omnigraph upgrade`; see
+[upgrading past v0.11](references/migrations.md#upgrade-v011-to-storage-format-14).
+Read [migration guidance](references/migrations.md) before replacing a
+deployed binary.
 
 ## Upcoming GQ 2.1 traversal support
 
@@ -182,7 +186,9 @@ accept `--cluster <dir|file://|s3://|az://> --graph <id>`:
 - `upgrade <uri> [--check] [--to-format <7|8|9>] [--json]` — offline standalone
   conversion; defaults to v9. `schema upgrade-system-columns <uri> [--check]
   [--json]` is the v8→v9 step. Read [migration preconditions](references/migrations.md)
-  first; cluster-managed roots refuse.
+  first; cluster-managed roots refuse. In the binary after 0.11 the same
+  `upgrade <uri> [--check] [--to-format 14] [--json]` converts a v8, v9 or v13
+  graph to format 14 and accepts no other target.
 - `lint --query <f.gq> [--schema <f.pg>] [<uri>] [--json]` — offline with `--schema`, graph-backed with a URI
 - `optimize [--json]` · `repair [--confirm] [--force] [--json]` · `cleanup [--keep <N>] [--older-than <7d>] --confirm [--json]` (at least one retention option; both may be combined)
 - `rebuild-full-text-indexes [--branch <b>] [--json]` — replace full-text indexes on one branch with default English analysis; custom tokenizer settings are replaced. Stop overlapping writers and retain a whole-store backup for upgrades. `--as` records attribution; direct access does not load server policy. See [maintenance commands](references/commands.md#rebuild-full-text-indexes--explicit-analyzer-upgrade).
@@ -355,6 +361,7 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | Full-text search on indexes built before Lance 11 (v0.9 era), including after `omnigraph upgrade` | `FullTextIndexRebuildRequired` | Stop mixed-version access and run `rebuild-full-text-indexes --branch <b>` on every live branch that needs text search; `upgrade` does not rebuild them |
 | Reopening a v0.10/v6 graph with v0.11 | `__manifest is stamped at internal schema v6, but this omnigraph reads only v8 to v9` | Stop the old fleet and use the explicit standalone upgrade or cluster rebuild procedure |
 | Default `omnigraph upgrade` on a branched graph or one with `_` properties | `the route ends at v9, which requires a graph with only main` (or `reserves property names starting with '_'`) | Delete branches / `@rename_from` first, or pass `--to-format 8` to both check and execution |
+| Opening a v8 or v9 graph with the binary after 0.11 | refused: that binary reads format 14 only and names `omnigraph upgrade` | Stop every process using the graph, back up the whole root, then run that binary's `upgrade --check` and `upgrade` on a standalone graph; a cluster-managed graph is exported with 0.11.x and rebuilt. See [upgrading past v0.11](references/migrations.md#upgrade-v011-to-storage-format-14) |
 | Using `data.id` for identity on a new graph | `unknown input field 'id': move data.id to the top-level 'id' field` | Put identity in top-level JSONL `id`; `data` contains user properties |
 | Re-running a `--mode merge` load with unkeyed edges | duplicate edges | Supply stable top-level edge `id`s, or declare `@key(@src, @dst)` when creating the edge type |
 | Assuming every JSON result cell has a key | absent keys for null values | Query/export JSON omits null cells; change images retain explicit nulls |

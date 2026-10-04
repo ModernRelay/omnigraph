@@ -10301,7 +10301,7 @@ fn legacy_contract(source: &str) -> SchemaContractRow {
 async fn legacy_main(
     root: &str,
 ) -> (
-    super::legacy::write::Stamp13History,
+    super::legacy::write::LegacyHistory,
     [TableRegistration; 3],
     SchemaContractRow,
 ) {
@@ -10311,13 +10311,27 @@ async fn legacy_main(
 /// [`legacy_main`] with the ids of its two commits given.
 async fn legacy_main_with_ids(
     root: &str,
-    [genesis, second]: [&str; 2],
+    ids: [&str; 2],
 ) -> (
-    super::legacy::write::Stamp13History,
+    super::legacy::write::LegacyHistory,
     [TableRegistration; 3],
     SchemaContractRow,
 ) {
-    use super::legacy::write::{LegacyPublish, Stamp13History};
+    legacy_main_stamped(root, ids, 13).await
+}
+
+/// [`legacy_main_with_ids`] published at `stamp`. Below 13 no version holds
+/// the returned contract: it stands for the one at the graph root.
+async fn legacy_main_stamped(
+    root: &str,
+    [genesis, second]: [&str; 2],
+    stamp: u32,
+) -> (
+    super::legacy::write::LegacyHistory,
+    [TableRegistration; 3],
+    SchemaContractRow,
+) {
+    use super::legacy::write::{LegacyHistory, LegacyPublish};
     let person = legacy_table(1, "node:Person");
     let company = legacy_table(2, "node:Company");
     let firm = TableRegistration {
@@ -10325,7 +10339,7 @@ async fn legacy_main_with_ids(
         ..company.clone()
     };
     let contract = legacy_contract("node Person {}");
-    let mut history = Stamp13History::create(
+    let mut history = LegacyHistory::create_stamped(
         root,
         LegacyPublish {
             tables: vec![person.clone(), company.clone()],
@@ -10334,6 +10348,7 @@ async fn legacy_main_with_ids(
             commit: Some(legacy_commit(genesis, 1)),
             ..Default::default()
         },
+        stamp,
     )
     .await
     .unwrap();
@@ -10632,7 +10647,7 @@ async fn legacy_source_admits_a_version_by_its_stamp_and_its_stored_shape() {
     assert_eq!(source.admits(&at_1, SourceRole::Version).unwrap(), 13);
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
-    let mut genesis = super::legacy::write::Stamp13History::create(
+    let mut genesis = super::legacy::write::LegacyHistory::create(
         root,
         super::legacy::write::LegacyPublish {
             tables: vec![person.clone(), company.clone()],
@@ -10687,6 +10702,339 @@ async fn legacy_source_admits_a_version_by_its_stamp_and_its_stored_shape() {
     }
 }
 
+/// A flat head stamped 8 or 9 is a live head only to the `RootContractSource`
+/// of that stamp, whose head scan carries the root contract and every pin
+/// with its own table version as `last_linear_version`.
+#[tokio::test]
+async fn root_contract_source_reads_a_flat_head_under_the_root_contract() {
+    use super::legacy::{
+        HeadScan, LegacyManifestSource, RootContractSource, SourceRole, Stamp13Source,
+        VersionSchema,
+    };
+    use std::collections::BTreeMap;
+    for stamp in [7u32, 10, 13, 14] {
+        let error = RootContractSource::new(stamp, legacy_contract("node Person {}")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("not of a v{stamp} one")),
+            "{error}"
+        );
+    }
+    for stamp in [8u32, 9] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let (history, [person, company, firm], contract) =
+            legacy_main_stamped(root, ["G", "C2"], stamp).await;
+        let main = history.head(None).unwrap().clone();
+        let source = RootContractSource::new(stamp, contract.clone()).unwrap();
+        assert_eq!(source.admits(&main, SourceRole::LiveHead).unwrap(), stamp);
+        let error = Stamp13Source
+            .admits(&main, SourceRole::LiveHead)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(&format!(
+                "version 2 is v{stamp}: the head of a live branch must be stamped v13"
+            )),
+            "{error}"
+        );
+
+        let unfilled = BTreeMap::from([
+            ((person.identity, 1), legacy_read_pin(1, 1)),
+            ((company.identity, 1), legacy_read_pin(1, 1)),
+            ((person.identity, 2), legacy_read_pin(2, 2)),
+        ]);
+        let stored = HeadScan {
+            commits: vec![
+                legacy_read_commit("G", None, 1, None),
+                legacy_read_commit("C2", None, 2, Some("G")),
+            ],
+            heads: HashMap::from([("main".to_string(), "C2".to_string())]),
+            pins: unfilled.clone(),
+            tombstones: BTreeMap::new(),
+            contract: None,
+            rows: 8,
+        };
+        assert_eq!(Stamp13Source.scan_head(&main).await.unwrap(), stored);
+        let scan = source.scan_head(&main).await.unwrap();
+        for pin in scan.pins.values() {
+            assert_eq!(
+                (
+                    pin.metadata.last_linear_version(),
+                    pin.metadata.staged_version()
+                ),
+                (Some(pin.table_version), None)
+            );
+        }
+        let filled = unfilled
+            .into_iter()
+            .map(|(key, pin)| {
+                let metadata = pin
+                    .metadata
+                    .clone()
+                    .with_last_linear_version(Some(pin.table_version));
+                (key, TablePin { metadata, ..pin })
+            })
+            .collect();
+        assert_eq!(
+            scan,
+            HeadScan {
+                pins: filled,
+                contract: Some(contract),
+                ..stored
+            }
+        );
+
+        for (version, tables) in [(1, vec![person.clone(), company]), (2, vec![person, firm])] {
+            assert_eq!(
+                source
+                    .version_schema(&main.checkout_version(version).await.unwrap(), None)
+                    .await
+                    .unwrap(),
+                VersionSchema {
+                    tables,
+                    contract: None,
+                }
+            );
+        }
+    }
+}
+
+/// A root whose live heads are stamped 9 holds no version above 9: a version
+/// stamped 10 or 13 and the fence of a route to 10 are refused, a retired head
+/// at 8 and the routes the released upgrade ran to 7 and 8 are admitted.
+#[tokio::test]
+async fn root_contract_source_admits_no_version_above_its_live_stamp() {
+    use super::legacy::{LegacyManifestSource, RootContractSource, SourceRole, Stamp13Source};
+    let contract = legacy_contract("node Person {}");
+    let source = RootContractSource::new(9, contract.clone()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (at_13, _, _) = legacy_main(dir.path().to_str().unwrap()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (mut history, _, _) =
+        legacy_main_stamped(dir.path().to_str().unwrap(), ["G", "C2"], 9).await;
+    let at_9 = history.head(None).unwrap().clone();
+
+    assert_eq!(history.restamp_for_test(None, Some(10)).await.unwrap(), 3);
+    for (dataset, found) in [
+        (history.head(None).unwrap(), "version 3 is v10"),
+        (at_13.head(None).unwrap(), "version 2 is v13"),
+    ] {
+        let error = source.admits(dataset, SourceRole::Version).unwrap_err();
+        assert!(
+            error.to_string().contains(&format!(
+                "{found}: a retained version must be stamped v6 to v9, or be the unstamped \
+                 version 1 or 2 an older init wrote"
+            )),
+            "{error}"
+        );
+    }
+
+    assert_eq!(history.restamp_for_test(None, Some(8)).await.unwrap(), 4);
+    let at_8 = history.head(None).unwrap().clone();
+    assert_eq!(source.admits(&at_8, SourceRole::RetiredHead).unwrap(), 8);
+    let error = source.admits(&at_8, SourceRole::LiveHead).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("version 4 is v8: the head of a live branch must be stamped v9"),
+        "{error}"
+    );
+    let stamp_8 = RootContractSource::new(8, contract).unwrap();
+    assert_eq!(stamp_8.admits(&at_8, SourceRole::LiveHead).unwrap(), 8);
+    let error = stamp_8.admits(&at_9, SourceRole::RetiredHead).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("version 2 is v9: the head of a retired branch must be stamped v8 to v8"),
+        "{error}"
+    );
+
+    assert_eq!(history.restamp_for_test(None, Some(6)).await.unwrap(), 5);
+    let at_6 = history.head(None).unwrap();
+    assert_eq!(source.admits(at_6, SourceRole::Version).unwrap(), 6);
+    let error = source.admits(at_6, SourceRole::RetiredHead).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("version 5 is v6: the head of a retired branch must be stamped v8 to v9"),
+        "{error}"
+    );
+
+    for (protocol, from, to) in [(1, 6, 7), (2, 7, 8)] {
+        let intent = legacy_route_intent(protocol, from, to);
+        history.fence_for_test(&intent, to).await.unwrap();
+        let fenced = history.head(None).unwrap();
+        assert_eq!(source.admits(fenced, SourceRole::Version).unwrap(), to);
+        let error = source.admits(fenced, SourceRole::LiveHead).unwrap_err();
+        assert!(
+            error.to_string().contains("it is not a v9 source"),
+            "{error}"
+        );
+    }
+    let version = history
+        .fence_for_test(&legacy_route_intent(3, 9, 10), 10)
+        .await
+        .unwrap();
+    let fenced = history.head(None).unwrap();
+    assert_eq!(
+        Stamp13Source.admits(fenced, SourceRole::Version).unwrap(),
+        10
+    );
+    let error = source.admits(fenced, SourceRole::Version).unwrap_err();
+    assert!(
+        error.to_string().contains(&format!(
+            "version {version} carries a pending storage conversion \
+             (omnigraph:storage_upgrade_pending) that is not the fence or the conversion of a \
+             completed earlier upgrade: its intent names protocol 3 from v9 to v10, which a v9 \
+             root cannot have completed"
+        )),
+        "{error}"
+    );
+}
+
+/// The census of a stamp-9 root (main, a branch with a commit of its own, a
+/// fork without one and a retired ref) records every commit under the root
+/// contract, archives that one contract, and names stamp 9 in the directory.
+#[tokio::test]
+async fn legacy_census_of_a_stamp_9_root_records_every_commit_under_the_root_contract() {
+    use super::history::LegacyLayout;
+    use super::legacy::write::LegacyPublish;
+    use super::legacy::{FindingCode, RootContractSource, Stamp13Source};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let [g, c2, f3, r3] = [1, 2, 3, 4].map(legacy_id);
+    let (mut history, [person, _, _], contract) = legacy_main_stamped(root, [&g, &c2], 9).await;
+    let feature = legacy_native("feature");
+    let retired = legacy_native("old");
+    for (native, id, table_version) in [(&feature, &f3, 3), (&retired, &r3, 4)] {
+        assert_eq!(history.fork(None, native).await.unwrap(), 2);
+        let publish = LegacyPublish {
+            pins: vec![legacy_pin(&person, table_version)],
+            commit: Some(legacy_commit(id, 3)),
+            ..Default::default()
+        };
+        assert_eq!(history.publish(Some(native), publish).await.unwrap(), 3);
+    }
+    history.retire(&retired).await.unwrap();
+    let fresh = legacy_native("fresh");
+    assert_eq!(history.fork(Some(&feature), &fresh).await.unwrap(), 3);
+
+    let input = legacy_census_input(&history, &[]).await;
+    let (code, message) = legacy_finding(super::legacy::census(root, &input, &Stamp13Source).await);
+    assert_eq!(code, FindingCode::UnsupportedSource);
+    assert!(
+        message.contains("is v9: the head of a live branch must be stamped v13"),
+        "{message}"
+    );
+
+    let source = RootContractSource::new(9, contract.clone()).unwrap();
+    let census = super::legacy::census(root, &input, &source).await.unwrap();
+    assert_eq!(census.source_stamp, 9);
+    assert_eq!(census.contracts.iter().collect::<Vec<_>>(), vec![&contract]);
+    assert_eq!(
+        (
+            census.counts.live_refs,
+            census.counts.retired_refs,
+            census.counts.legacy_commits,
+            census.counts.schema_contents,
+        ),
+        (3, 1, 4, 1)
+    );
+    let hash = super::history::schema_content_hash(&contract).unwrap();
+    let records: Vec<_> = census
+        .chains
+        .iter()
+        .flat_map(|chain| &chain.records)
+        .chain(census.heads.iter().map(|head| &head.record))
+        .collect();
+    assert_eq!(records.len(), 4 + 3);
+    for record in records {
+        assert_eq!(record.commit.schema_content_hash.as_ref(), Some(&hash));
+        for table in &record.tables {
+            let TableState::Pinned(pin) = &table.state else {
+                panic!("the fixture drops no table: {table:?}");
+            };
+            assert_eq!(
+                pin.metadata.last_linear_version(),
+                Some(pin.table_version),
+                "{table:?}"
+            );
+        }
+    }
+    let head_of = |native: Option<&str>| {
+        &census
+            .heads
+            .iter()
+            .find(|head| head.native.as_deref() == native)
+            .unwrap()
+            .record
+            .commit
+            .graph_commit_id
+    };
+    assert_eq!(
+        [None, Some(feature.as_str()), Some(fresh.as_str())].map(head_of),
+        [&c2, &f3, &f3]
+    );
+
+    let layout = LegacyLayout::CURRENT;
+    let plan = super::legacy::plan(&census, &layout).unwrap();
+    let session = crate::lance_access::control_session();
+    super::legacy::materialize(root, &session, &census, &plan)
+        .await
+        .unwrap();
+    let directory = super::history::legacy_directory(root, &session, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(directory.source_stamp, 9);
+    let mut converted = history.head(None).unwrap().schema().metadata.clone();
+    converted.insert(
+        super::migrations::INTERNAL_SCHEMA_VERSION_KEY.to_string(),
+        "14".to_string(),
+    );
+    let (_, batch) =
+        super::legacy::conversion_batch(root, &session, &census.heads[0].record, converted)
+            .await
+            .unwrap();
+    let rows = super::state::rows_of_batch(&batch).unwrap();
+    assert_eq!(rows.schema_contract.as_ref(), Some(&contract));
+    assert_eq!(rows.tables, census.heads[0].record.tables);
+}
+
+/// `validate` owns protocol 6 from each of the three source formats to 14 and
+/// no other route.
+#[test]
+fn migrations_intent_validates_every_source_format_and_no_other_route() {
+    let route = |protocol, source_format, target_format| {
+        super::migrations::UpgradeIntent {
+            protocol,
+            source_format,
+            target_format,
+            ..migrations_intent(1)
+        }
+        .validate()
+    };
+    for source_format in super::migrations::UPGRADE_SOURCE_FORMATS {
+        route(6, source_format, 14).unwrap();
+    }
+    for (protocol, source_format, target_format) in [
+        (6, 10, 14),
+        (6, 12, 14),
+        (5, 9, 14),
+        (6, 9, 13),
+        (6, 14, 14),
+    ] {
+        let error = route(protocol, source_format, target_format).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported or ambiguous storage upgrade intent"),
+            "({protocol}, {source_format}, {target_format}): {error}"
+        );
+    }
+}
+
 fn legacy_id(number: u128) -> String {
     ulid::Ulid::from(number).to_string()
 }
@@ -10705,7 +11053,7 @@ fn legacy_pinned(table: &TableRegistration, table_version: u64, clock: u64) -> T
 /// The census input of every ref of `history` at its head, less the refs
 /// named in `gone`, as an inventory that cannot see them would pin it.
 async fn legacy_census_input(
-    history: &super::legacy::write::Stamp13History,
+    history: &super::legacy::write::LegacyHistory,
     gone: &[&str],
 ) -> super::legacy::CensusInput {
     use super::legacy::{CensusInput, CensusRef};
@@ -10756,7 +11104,7 @@ async fn legacy_census_input(
 }
 
 async fn legacy_census(
-    history: &super::legacy::write::Stamp13History,
+    history: &super::legacy::write::LegacyHistory,
     gone: &[&str],
 ) -> std::result::Result<super::legacy::LegacyCensus, super::legacy::CensusError> {
     let input = legacy_census_input(history, gone).await;
@@ -11251,13 +11599,13 @@ async fn legacy_census_adopts_orphans_and_refuses_a_first_parent_gap() {
 #[tokio::test]
 async fn legacy_census_verifies_versions_without_a_commit() {
     use super::legacy::FindingCode;
-    use super::legacy::write::{LegacyPublish, Stamp13History};
+    use super::legacy::write::{LegacyHistory, LegacyPublish};
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     let [g, c4, c7] = [1, 2, 3].map(legacy_id);
     let person = legacy_table(1, "node:Person");
     let born = legacy_contract("node Person {}");
-    let mut history = Stamp13History::create(
+    let mut history = LegacyHistory::create(
         root,
         LegacyPublish {
             tables: vec![person.clone()],
@@ -11597,9 +11945,9 @@ async fn legacy_upgraded_main(
     g: &str,
     person: &TableRegistration,
     conversion: super::legacy::write::LegacyPublish,
-) -> super::legacy::write::Stamp13History {
-    use super::legacy::write::{LegacyPublish, Stamp13History};
-    let mut history = Stamp13History::create(
+) -> super::legacy::write::LegacyHistory {
+    use super::legacy::write::{LegacyHistory, LegacyPublish};
+    let mut history = LegacyHistory::create(
         root,
         LegacyPublish {
             tables: vec![person.clone()],
@@ -11763,7 +12111,7 @@ async fn legacy_census_reads_through_the_fence_and_conversion_of_an_earlier_rout
 /// the source stored after it, which the fork holds, not under a later one.
 #[tokio::test]
 async fn legacy_census_records_a_contractless_head_under_the_contract_its_forks_hold() {
-    use super::legacy::write::{LegacyPublish, Stamp13History};
+    use super::legacy::write::{LegacyHistory, LegacyPublish};
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     let [g, c3, c5] = [1, 2, 3].map(legacy_id);
@@ -11771,7 +12119,7 @@ async fn legacy_census_records_a_contractless_head_under_the_contract_its_forks_
     let born = legacy_contract("node Person {}");
     let converted = legacy_contract("node Person { name: String }");
     let changed = legacy_contract("node Person { name: String, age: I32 }");
-    let mut history = Stamp13History::create(
+    let mut history = LegacyHistory::create(
         root,
         LegacyPublish {
             tables: vec![person.clone()],
@@ -11879,7 +12227,7 @@ where
 }
 
 async fn legacy_census_rewriting(
-    history: &super::legacy::write::Stamp13History,
+    history: &super::legacy::write::LegacyHistory,
     rewrite: impl Fn(&mut super::legacy::LegacyCommit) + Send + Sync,
 ) -> (super::legacy::FindingCode, String) {
     let input = legacy_census_input(history, &[]).await;
@@ -12114,7 +12462,7 @@ async fn legacy_census_refuses_an_own_head_its_graph_head_row_does_not_name() {
 #[tokio::test]
 async fn legacy_census_counts_an_empty_version_below_the_genesis_commit() {
     use super::legacy::FindingCode;
-    use super::legacy::write::{LegacyPublish, Stamp13History};
+    use super::legacy::write::{LegacyHistory, LegacyPublish};
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     let [g, c2] = [1, 2].map(legacy_id);
@@ -12123,7 +12471,7 @@ async fn legacy_census_counts_an_empty_version_below_the_genesis_commit() {
         contract: Some(legacy_contract("node Person {}")),
         ..Default::default()
     };
-    let mut history = Stamp13History::create(root, contract_only).await.unwrap();
+    let mut history = LegacyHistory::create(root, contract_only).await.unwrap();
     let genesis = LegacyPublish {
         tables: vec![person.clone()],
         pins: vec![legacy_pin(&person, 1)],
@@ -12167,7 +12515,7 @@ async fn legacy_census_counts_an_empty_version_below_the_genesis_commit() {
 /// A stamp-13 root with its legacy history written, as the upgrade leaves it
 /// before it fences main.
 struct LegacyServed {
-    history: super::legacy::write::Stamp13History,
+    history: super::legacy::write::LegacyHistory,
     census: super::legacy::LegacyCensus,
     contract: SchemaContractRow,
     feature: String,
@@ -12257,7 +12605,7 @@ async fn legacy_served(root: &str) -> LegacyServed {
 #[tokio::test]
 async fn legacy_record_at_resolves_a_version_by_writer_parent_walk_and_fence() {
     use super::history::ExtentCache;
-    use super::legacy::write::{LegacyPublish, Stamp13History};
+    use super::legacy::write::{LegacyHistory, LegacyPublish};
     use super::legacy::{LegacyAt, record_at};
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
@@ -12350,7 +12698,7 @@ async fn legacy_record_at_resolves_a_version_by_writer_parent_walk_and_fence() {
         contract: Some(legacy_contract("node Person {}")),
         ..Default::default()
     };
-    let mut history = Stamp13History::create(root, contract_only).await.unwrap();
+    let mut history = LegacyHistory::create(root, contract_only).await.unwrap();
     let genesis = LegacyPublish {
         tables: vec![person.clone()],
         pins: vec![legacy_pin(&person, 1)],
@@ -12703,7 +13051,8 @@ fn migrations_intent(version: u64) -> super::migrations::UpgradeIntent {
                 parent_version: 0,
             },
         ],
-        schema_contract: Some(UpgradeSchemaContract::from_row(&contract)),
+        retire: Vec::new(),
+        schema_contract: Some(UpgradeSchemaContract::from_row(&contract).unwrap()),
         legacy: super::legacy::LegacyPlan {
             layout: super::history::LegacyLayout::CURRENT,
             commits: 3,

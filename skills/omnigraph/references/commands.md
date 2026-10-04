@@ -125,11 +125,16 @@ omnigraph upgrade "$REPO" --json
 omnigraph schema upgrade-system-columns "$REPO" --check --json
 ```
 
-The default target is v9; `--to-format 8` retains legacy system spellings and
-can preserve live branches. The v9 step requires only `main` and no user
-property starting with `_`. These standalone operations require stopped writers
-and a verified whole-root backup; cluster-managed roots refuse. Read
+In 0.11.0 the default target is v9; `--to-format 8` retains legacy system
+spellings and can preserve live branches. The v9 step requires only `main` and
+no user property starting with `_`. These standalone operations require stopped
+writers and a verified whole-root backup; cluster-managed roots refuse. Read
 [migration preconditions](migrations.md) before executing.
+
+The binary after 0.11 runs the same two commands to convert a v8, v9 or v13
+graph to storage format 14 in place, keeping branches and commit history;
+`--to-format` accepts 14 only there. See
+[upgrading past v0.11](migrations.md#upgrade-v011-to-storage-format-14).
 
 ## Lint
 
