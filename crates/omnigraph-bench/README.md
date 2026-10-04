@@ -19,6 +19,13 @@ The checked-in catalog and command examples are in
 [`../../benchmarks/README.md`](../../benchmarks/README.md). RFC 0039 owns the
 measurement protocol and identity vocabulary.
 
+Synthetic fixtures can optionally execute the versioned
+[`reversible-updates-v1` preparation recipe](../../benchmarks/README.md#preparing-additional-write-history)
+before branching. It adds verified real write history while restoring all
+logical contents, under the existing bounded fixture process and reset
+protocol. The recipe is part of case and stamped fixture identity; absent
+preparation preserves earlier canonical records and point identifiers.
+
 ## Boundaries
 
 - A case describes exactly one benchmark point.

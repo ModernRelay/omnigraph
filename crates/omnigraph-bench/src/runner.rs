@@ -339,6 +339,8 @@ pub struct LogicalFixtureIdentityV1 {
     pub data: Data,
     pub state: State,
     pub logical_content_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<crate::case::FixturePreparation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1835,6 +1837,7 @@ fn stamp_frozen_fixture(
             data: run.case.definition.fixture.data.clone(),
             state: run.case.definition.fixture.state.clone(),
             logical_content_sha256: build.logical_content_sha256.clone(),
+            preparation: run.case.definition.fixture.preparation,
         },
         physical: PhysicalFixtureIdentityV1 {
             digest_algorithm: PHYSICAL_TREE_DIGEST_ALGORITHM.to_string(),

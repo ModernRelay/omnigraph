@@ -28,7 +28,8 @@ use sha2::{Digest, Sha256};
 use crate::ValidatedCase;
 use crate::case::{
     Aging, Arrival, Backend, ColumnShape, CompactionRecency, Contention, DataProvenance,
-    DeletionHistory, Execution, FixtureBuilderKind, NetworkPosition, ReadWriteMix, ResetMode,
+    DeletionHistory, Execution, FixtureBuilderKind, FixturePreparation, MAX_PREPARATION_COMMITS,
+    MAX_PREPARATION_ROWS_PER_COMMIT, NetworkPosition, ReadWriteMix, ResetMode,
     SYNTHETIC_BRANCH_MERGE_BUILDER_VERSION, Scenario, Schedule, TopologySkew,
     branch_merge_change_mix,
 };
@@ -63,6 +64,11 @@ const ESTIMATED_ENTRIES_PER_DATASET: u64 = 64;
 const ESTIMATED_FIXED_ENTRIES: u64 = 1_024;
 const SCRATCH_AMPLIFICATION: u64 = 16;
 const SCRATCH_FIXED_BYTES: u64 = 1024 * 1024 * 1024;
+// Aging retains each successive manifest, whose graph history grows on every
+// publication. Account for that quadratic metadata independently of row payload
+// generation, then reserve three physical copies (active/template/reset).
+const HISTORY_ROW_ALLOWANCE_BYTES: u64 = 4_096;
+const HISTORY_COPY_ALLOWANCE: u64 = 3;
 
 pub type BranchMergeResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -158,6 +164,7 @@ pub struct BranchMergePlan {
     pub delta_rows_per_side: usize,
     pub requested_history_depth: u64,
     pub compaction_recency: CompactionRecency,
+    pub preparation: Option<FixturePreparation>,
     pub table_deltas: Vec<TableDelta>,
     source_update_cohort: String,
     source_delete_cohort: String,
@@ -176,6 +183,14 @@ pub struct FixturePreflight {
     pub expected_history_depth: u64,
     pub estimated_max_entries: u64,
     pub required_scratch_bytes: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub preparation_commits: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub retained_history_allowance_bytes: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl TryFrom<&ValidatedCase> for BranchMergePlan {
@@ -231,7 +246,7 @@ impl TryFrom<&ValidatedCase> for BranchMergePlan {
                 "builder v3 implements uniform topology only",
             ));
         }
-        if case.fixture.state.aging != Aging::BulkLoaded {
+        if case.fixture.state.aging != Aging::BulkLoaded && case.fixture.preparation.is_none() {
             return Err(unsupported(
                 "fixture.state.aging",
                 "the local runner currently implements bulk-loaded fixtures only",
@@ -243,7 +258,9 @@ impl TryFrom<&ValidatedCase> for BranchMergePlan {
                 "the local runner currently implements unindexed fixtures only",
             ));
         }
-        if case.fixture.state.deletion_history != DeletionHistory::None {
+        if case.fixture.state.deletion_history != DeletionHistory::None
+            && case.fixture.preparation.is_none()
+        {
             return Err(unsupported(
                 "fixture.state.deletion_history",
                 "the local runner currently implements no pre-existing deletion history",
@@ -414,6 +431,7 @@ impl TryFrom<&ValidatedCase> for BranchMergePlan {
             delta_rows_per_side,
             requested_history_depth: case.fixture.state.history_depth,
             compaction_recency: case.fixture.state.compaction_recency,
+            preparation: case.fixture.preparation,
             table_deltas,
             source_update_cohort: format!("d{delta_rows_per_side}_src_upd"),
             source_delete_cohort: format!("d{delta_rows_per_side}_src_del"),
@@ -561,6 +579,26 @@ impl BranchMergePlan {
         }
 
         let chunk_rows = load_chunk_rows(self.payload_bytes)?;
+        let preparation_commits = if let Some(preparation) = self.preparation {
+            if !(2..=MAX_PREPARATION_COMMITS).contains(&preparation.additional_commits())
+                || !preparation.additional_commits().is_multiple_of(2)
+                || !(1..=MAX_PREPARATION_ROWS_PER_COMMIT).contains(&preparation.rows_per_commit())
+                || preparation.rows_per_commit() > self.rows_per_table as u64
+                || preparation.rows_per_commit() > chunk_rows as u64
+                || self.compaction_recency != CompactionRecency::NotOptimized
+                || self.tables < 2
+                || !self.tables.is_multiple_of(2)
+            {
+                return Err(unsupported(
+                    "fixture.preparation",
+                    "reversible updates require 2..=10000 even commits, 1..=4096 existing rows within one payload-bounded load batch, balanced node/edge tables, and no maintenance",
+                ));
+            }
+            usize::try_from(preparation.additional_commits())
+                .map_err(|_| invalid_plan("preparation commit count exceeds usize"))?
+        } else {
+            0
+        };
         let chunks_per_table = chunk_count(self.rows_per_table, chunk_rows);
         if self.compaction_recency == CompactionRecency::Optimized && chunks_per_table < 2 {
             return Err(unsupported(
@@ -601,6 +639,7 @@ impl BranchMergePlan {
         let expected_history_depth = 1usize
             .checked_add(base_load_commits)
             .and_then(|value| value.checked_add(optimize_commits))
+            .and_then(|value| value.checked_add(preparation_commits))
             .and_then(|value| value.checked_add(source_divergence_commits))
             .ok_or_else(|| invalid_plan("expected history depth overflowed usize"))?;
         let expected_history_depth = u64::try_from(expected_history_depth)
@@ -617,7 +656,7 @@ impl BranchMergePlan {
             return Err(unsupported(
                 "fixture.state.history_depth",
                 format!(
-                    "builder-v3 recipe requires exactly {expected_history_depth} reachable commits per frozen branch (genesis 1 + base loads {base_load_commits} + optimize {optimize_commits} + divergence {source_divergence_commits}), but the case declares {}",
+                    "builder-v3 recipe requires exactly {expected_history_depth} reachable commits per frozen branch (genesis 1 + base loads {base_load_commits} + optimize {optimize_commits} + preparation {preparation_commits} + divergence {source_divergence_commits}), but the case declares {}",
                     self.requested_history_depth
                 ),
             ));
@@ -631,8 +670,18 @@ impl BranchMergePlan {
                 .and_then(|value| value.checked_add(delta.target.inserts))
                 .ok_or_else(|| invalid_plan("generated divergence-row count overflowed"))
         })?;
+        let preparation_rows = self
+            .preparation
+            .map_or(Some(0), |recipe| {
+                recipe
+                    .additional_commits()
+                    .checked_mul(recipe.rows_per_commit())
+                    .and_then(|rows| usize::try_from(rows).ok())
+            })
+            .ok_or_else(|| invalid_plan("preparation row count overflowed usize"))?;
         let generated_rows = base_rows
             .checked_add(divergent_input_rows)
+            .and_then(|value| value.checked_add(preparation_rows))
             .ok_or_else(|| invalid_plan("generated row count overflowed usize"))?;
         let row_bytes = self
             .payload_bytes
@@ -658,6 +707,7 @@ impl BranchMergePlan {
         let total_publications = 1usize
             .checked_add(base_load_commits)
             .and_then(|value| value.checked_add(optimize_commits))
+            .and_then(|value| value.checked_add(preparation_commits))
             .and_then(|value| value.checked_add(source_divergence_commits))
             .and_then(|value| value.checked_add(target_divergence_commits))
             .ok_or_else(|| invalid_plan("total publication count overflowed usize"))?;
@@ -680,9 +730,30 @@ impl BranchMergePlan {
                 ),
             ));
         }
+        let retained_history_allowance_bytes = if preparation_commits == 0 {
+            0
+        } else {
+            let publications = total_publications as u64;
+            publications
+                .checked_add(1)
+                .and_then(|value| publications.checked_mul(value))
+                .map(|value| value / 2)
+                .and_then(|history| {
+                    publications
+                        .checked_mul(self.tables as u64 + 1)
+                        .and_then(|registrations| history.checked_add(registrations))
+                })
+                .and_then(|rows| rows.checked_mul(HISTORY_ROW_ALLOWANCE_BYTES))
+                .ok_or_else(|| invalid_plan("retained history allowance overflowed u64"))?
+        };
         let required_scratch_bytes = estimated_generated_bytes
             .checked_mul(SCRATCH_AMPLIFICATION)
             .and_then(|bytes| bytes.checked_add(SCRATCH_FIXED_BYTES))
+            .and_then(|bytes| {
+                retained_history_allowance_bytes
+                    .checked_mul(HISTORY_COPY_ALLOWANCE)
+                    .and_then(|history| bytes.checked_add(history))
+            })
             .ok_or_else(|| invalid_plan("required scratch byte estimate overflowed u64"))?;
 
         Ok(FixturePreflight {
@@ -698,6 +769,8 @@ impl BranchMergePlan {
             expected_history_depth,
             estimated_max_entries,
             required_scratch_bytes,
+            preparation_commits: preparation_commits as u64,
+            retained_history_allowance_bytes,
         })
     }
 }
@@ -862,6 +935,8 @@ pub async fn initialize_local_fixture(
         }
         CompactionRecency::NotOptimized => 0,
     };
+
+    prepare_reversible_updates(&db, plan).await?;
 
     db.branch_create_from(ReadTarget::branch(MAIN_BRANCH), SOURCE_BRANCH)
         .await
@@ -1480,6 +1555,71 @@ async fn load_base(db: &Session, plan: &BranchMergePlan) -> BranchMergeResult<us
         }
     }
     Ok(commits)
+}
+
+/// A stable seed and pair ordinal choose one edge table and a wrapping batch
+/// of distinct existing rows. Both writes in a pair address the same rows.
+fn preparation_batch(plan: &BranchMergePlan, seed: u64, pair: u64) -> (usize, usize) {
+    let mut digest = Sha256::new();
+    digest.update(b"omnigraph-bench-reversible-updates-v1\0");
+    digest.update(seed.to_le_bytes());
+    digest.update(pair.to_le_bytes());
+    let bytes = digest.finalize();
+    let table = u64::from_le_bytes(bytes[..8].try_into().unwrap()) % plan.edge_tables() as u64;
+    let start = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) % plan.rows_per_table as u64;
+    (table as usize, start as usize)
+}
+
+async fn prepare_reversible_updates(db: &Session, plan: &BranchMergePlan) -> BranchMergeResult<()> {
+    let Some(recipe) = plan.preparation else {
+        return Ok(());
+    };
+    let before = db.list_commits(Some(MAIN_BRANCH)).await?.len();
+    let payload = "x".repeat(plan.payload_bytes);
+    for pair in 0..recipe.additional_commits() / 2 {
+        let (table, start) = preparation_batch(plan, recipe.seed(), pair);
+        let ty = edge_type_name(table);
+        for restore in [false, true] {
+            let mut chunk = String::new();
+            for offset in 0..recipe.rows_per_commit() as usize {
+                let row = (start + offset) % plan.rows_per_table;
+                let original = i32::try_from(row)
+                    .map_err(|_| invalid_plan("preparation ordinal does not fit I32"))?;
+                // Every base value is nonnegative, so the first write changes
+                // every selected row, even ordinal zero. The second restores it.
+                let value = if restore { original } else { -1 - original };
+                let (from, to) = edge_endpoints(plan, table, row);
+                chunk.push_str(&jsonl_edge_row(
+                    &ty,
+                    &base_edge_id(table, row),
+                    &from,
+                    &to,
+                    plan.base_cohort(table, row).label(),
+                    value,
+                    &payload,
+                ));
+                chunk.push('\n');
+            }
+            db.load(MAIN_BRANCH, &chunk, LoadMode::Merge)
+                .await
+                .map_err(|error| {
+                    fixture_error(format!(
+                        "reversible update pair {pair}, restore={restore}: {error}"
+                    ))
+                })?;
+        }
+    }
+    let after = db.list_commits(Some(MAIN_BRANCH)).await?.len();
+    if after.checked_sub(before).map(|value| value as u64) != Some(recipe.additional_commits()) {
+        return Err(fixture_error(
+            "reversible preparation did not publish exactly its declared additional commits",
+        ));
+    }
+    // Certify restoration before creating either measured branch. Initialization
+    // also performs its existing full verification of all three final branches.
+    verify_branch(db, MAIN_BRANCH, plan, BranchState::Main, None)
+        .await
+        .map(|_| ())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2230,6 +2370,7 @@ mod tests {
             delta_rows_per_side: delta,
             requested_history_depth: 1,
             compaction_recency: CompactionRecency::Optimized,
+            preparation: None,
             table_deltas,
             source_update_cohort: format!("d{delta}_src_upd"),
             source_delete_cohort: format!("d{delta}_src_del"),
@@ -2331,6 +2472,108 @@ mod tests {
         assert_eq!(
             rebuilt.logical_content_sha256, summary.logical_content_sha256,
             "fresh ULIDs, timestamps, and physical Lance bytes must not change logical identity"
+        );
+
+        // Aging is a state treatment: actual graph history changes while every
+        // current row, endpoint, cohort and property remains the same.
+        for commits in [2, 8, 64] {
+            plan.preparation = Some(preparation(commits, 7, 42));
+            plan.requested_history_depth = 6 + commits;
+            let aged_directory = tempfile::tempdir().unwrap();
+            let aged = initialize_local_fixture(aged_directory.path().to_str().unwrap(), &plan)
+                .await
+                .unwrap();
+            assert_eq!(aged.source_history_depth, 6 + commits);
+            assert_eq!(aged.target_history_depth, 6 + commits);
+            assert_eq!(aged.logical_content_sha256, summary.logical_content_sha256);
+            let db = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::open(aged_directory.path().to_str().unwrap())
+                        .await
+                        .unwrap(),
+                ),
+                SessionSettings::default(),
+            );
+            let heads = capture_protected_branch_heads(&db).await.unwrap();
+            db.branch_merge(SOURCE_BRANCH, TARGET_BRANCH).await.unwrap();
+            verify_merged_graph(&db, &plan, &heads).await.unwrap();
+        }
+    }
+
+    fn preparation(commits: u64, rows: u64, seed: u64) -> FixturePreparation {
+        FixturePreparation::ReversibleUpdatesV1 {
+            additional_commits: commits,
+            rows_per_commit: rows,
+            seed,
+            maintenance: crate::case::PreparationMaintenance::None,
+        }
+    }
+
+    #[test]
+    fn aging_preflight_bounds_one_thousand_and_ten_thousand_commits_without_io() {
+        let mut plan = plan(32, 1, 3);
+        plan.compaction_recency = CompactionRecency::NotOptimized;
+        let mut previous_allowance = 0;
+        for commits in [1_000, 10_000] {
+            plan.preparation = Some(preparation(commits, 1, u64::MAX));
+            plan.requested_history_depth = 6 + commits;
+            let preflight = plan.preflight().unwrap();
+            assert_eq!(preflight.preparation_commits, commits);
+            assert_eq!(preflight.expected_history_depth, 6 + commits);
+            assert!(preflight.estimated_max_entries <= MAX_RUNNER_ESTIMATED_ENTRIES);
+            assert!(preflight.retained_history_allowance_bytes > previous_allowance);
+            assert!(
+                preflight.required_scratch_bytes > preflight.retained_history_allowance_bytes * 3
+            );
+            previous_allowance = preflight.retained_history_allowance_bytes;
+        }
+        for (commits, rows) in [(0, 1), (3, 1), (10_002, 1), (2, 0), (2, 33)] {
+            plan.preparation = Some(preparation(commits, rows, 0));
+            assert!(plan.preflight().is_err());
+        }
+        // The commit limit does not waive aggregate payload/storage admission.
+        plan.rows_per_table = 4_096;
+        plan.preparation = Some(preparation(10_000, 4_096, 0));
+        assert!(
+            plan.preflight()
+                .unwrap_err()
+                .to_string()
+                .contains("estimated generated bytes")
+        );
+        // A batch must remain exactly one public commit, never silently split.
+        plan.payload_bytes = 1 << 20;
+        plan.preparation = Some(preparation(2, 32, 0));
+        assert!(
+            plan.preflight()
+                .unwrap_err()
+                .to_string()
+                .contains("one payload-bounded load batch")
+        );
+    }
+
+    #[test]
+    fn reversible_update_schedule_is_seeded_bounded_and_replayable() {
+        let plan = plan(32, 4, 50);
+        let batches = |seed| {
+            (0..5_000)
+                .map(|pair| preparation_batch(&plan, seed, pair))
+                .collect::<Vec<_>>()
+        };
+        let first = batches(42);
+        assert_eq!(first, batches(42));
+        assert_ne!(first, batches(43));
+        assert!(
+            first
+                .iter()
+                .all(|&(table, row)| table < plan.edge_tables() && row < plan.rows_per_table)
+        );
+        assert_eq!(
+            first
+                .iter()
+                .map(|&(table, _)| table)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            4
         );
     }
 
