@@ -24,7 +24,7 @@ pub use catalog::schema_ir::{
     schema_shape_hash_from_ir, system_columns_for_features, validate_schema_ir,
 };
 pub use catalog::schema_plan::{
-    DropMode, SchemaMigrationPlan, SchemaMigrationStep, SchemaTypeKind, plan_schema_migration,
+    SchemaMigrationPlan, SchemaMigrationStep, SchemaTypeKind, plan_schema_migration,
 };
 pub use catalog::schema_shape::{
     EdgeShape, EmbedSourceShape, InterfaceShape, NodeShape, PropertyConstraintShape, PropertyShape,
@@ -61,4 +61,4 @@ pub use query_input::{
     find_read_statement, json_params_to_param_map,
 };
 pub use result::{MutationExecResult, MutationResult, QueryResult, RunResult};
-pub use types::{Direction, PropType, ScalarType, check_date_literal};
+pub use types::{Direction, PropType, ScalarType, check_date_literal, check_datetime_literal};

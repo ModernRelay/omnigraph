@@ -403,7 +403,14 @@ async fn concurrent_branch_ops_morphological_matrix() {
 #[tokio::test]
 async fn cluster_boot_serves_applied_state() {
     let temp = converged_cluster_dir("").await;
-    let settings = cluster_settings(temp.path()).await.unwrap();
+    let mut settings = cluster_settings(temp.path()).await.unwrap();
+    settings
+        .cluster_admission
+        .take()
+        .unwrap()
+        .release_after_settlement()
+        .await
+        .unwrap();
     let omnigraph_server::ServerConfigMode::Multi {
         graphs,
         config_path,
@@ -483,6 +490,7 @@ async fn served_export_process_queue_budget_refuses_then_releases() {
             uri: uri.to_string_lossy().to_string(),
             policy: None,
             embedding: None,
+            startup_failure: None,
             external_blob_policy: omnigraph::ExternalBlobPolicy::Deny,
             queries: stored_query_registry(&[]),
         });
@@ -577,6 +585,7 @@ rules:
             uri: bad_uri.to_string_lossy().to_string(),
             policy: None,
             embedding: None,
+            startup_failure: None,
             external_blob_policy: omnigraph::ExternalBlobPolicy::Deny,
             queries: stored_query_registry(&[]),
         },
@@ -585,6 +594,7 @@ rules:
             uri: good_uri.to_string_lossy().to_string(),
             policy: None,
             embedding: None,
+            startup_failure: None,
             external_blob_policy: omnigraph::ExternalBlobPolicy::Deny,
             queries: stored_query_registry(&[]),
         },
@@ -641,6 +651,7 @@ rules:
         .collect();
     ready.sort();
     assert_eq!(ready, vec!["good"]);
+    assert_eq!(state.routing().registry.len(), 2);
     let app = build_app(state);
 
     let (status, body) = json_response(
@@ -661,7 +672,7 @@ rules:
             .iter()
             .map(|graph| graph["graph_id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec!["good"]
+        vec!["broken", "good"]
     );
 
     let (status, body) = json_response(
@@ -674,7 +685,46 @@ rules:
             .unwrap(),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "graph_unavailable");
+    assert!(!body.to_string().contains("missing.omni"));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/graphs/broken/mutate")
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .header("authorization", "Bearer admin-token")
+                .header("content-type", "application/json")
+                .body(Body::from_stream(futures::stream::poll_fn(
+                    |_| -> std::task::Poll<Option<Result<&'static str, std::io::Error>>> {
+                        panic!("a blocked graph must refuse before consuming mutation input")
+                    },
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!response.headers().contains_key("retry-after"));
+    for (id, expected) in [("good", StatusCode::OK), ("unknown", StatusCode::NOT_FOUND)] {
+        let (status, body) = json_response(
+            &app,
+            Request::get(format!("/graphs/{id}/snapshot"))
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .header("authorization", "Bearer admin-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, expected, "{body}");
+    }
+    let (status, body) =
+        json_response(&app, Request::get("/readyz").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["served_graph_count"], 2);
+    assert_eq!(body["ready_graph_count"], 1);
+    assert_eq!(body["blocked_graph_count"], 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -734,10 +784,7 @@ graphs:
 "#,
     )
     .unwrap();
-    let import = omnigraph_cluster::import_config_dir(temp.path()).await;
-    assert!(import.ok, "{:?}", import.diagnostics);
-    let apply = omnigraph_cluster::apply_config_dir(temp.path()).await;
-    assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+    support::apply_cluster_fixture(temp.path()).await;
 
     let graph_uri = temp
         .path()
@@ -756,7 +803,14 @@ graphs:
         ("OPENAI_API_KEY", None),
         ("GEMINI_API_KEY", None),
     ]);
-    let settings = cluster_settings(temp.path()).await.unwrap();
+    let mut settings = cluster_settings(temp.path()).await.unwrap();
+    settings
+        .cluster_admission
+        .take()
+        .unwrap()
+        .release_after_settlement()
+        .await
+        .unwrap();
     let omnigraph_server::ServerConfigMode::Multi {
         graphs,
         config_path,
@@ -831,10 +885,7 @@ graphs:
 "#,
     )
     .unwrap();
-    let import = omnigraph_cluster::import_config_dir(temp.path()).await;
-    assert!(import.ok, "{:?}", import.diagnostics);
-    let apply = omnigraph_cluster::apply_config_dir(temp.path()).await;
-    assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+    support::apply_cluster_fixture(temp.path()).await;
 
     let _guard = EnvGuard::set(&[
         ("OG_TEST_MISSING_EMBED_KEY", None),
@@ -907,14 +958,18 @@ graphs:
             ),
         )
         .unwrap();
-        let import = omnigraph_cluster::import_config_dir(temp.path()).await;
-        assert!(import.ok, "{:?}", import.diagnostics);
-        let apply = omnigraph_cluster::apply_config_dir(temp.path()).await;
-        assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+        support::apply_cluster_fixture(temp.path()).await;
         temp
     };
 
-    let settings = cluster_settings(temp.path()).await.unwrap();
+    let mut settings = cluster_settings(temp.path()).await.unwrap();
+    settings
+        .cluster_admission
+        .take()
+        .unwrap()
+        .release_after_settlement()
+        .await
+        .unwrap();
     let omnigraph_server::ServerConfigMode::Multi {
         graphs,
         server_policy,
@@ -962,9 +1017,13 @@ async fn cluster_boot_refusals() {
         err.to_string().contains("catalog_payload_digest_mismatch"),
         "{err}"
     );
-    assert!(err.to_string().contains("cluster refresh"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("restore its bytes from a trusted copy"),
+        "{err}"
+    );
 
-    // Missing state refuses with the import/apply remedy.
+    // Missing state refuses before acquiring serving admission.
     let empty = tempfile::tempdir().unwrap();
     let err = cluster_settings(empty.path()).await.unwrap_err();
     assert!(err.to_string().contains("cluster_state_missing"), "{err}");

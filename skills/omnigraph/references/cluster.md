@@ -64,9 +64,10 @@ omnigraph-server --cluster . --bind 127.0.0.1:8080 --unauthenticated  # serve (l
 - **`apply` creates graphs** at `graphs/<id>.omni` — there is no separate
   `omnigraph init` in cluster mode.
 - **Schema changes**: edit the `.pg`, `plan` shows the engine's real migration
-  steps (`add_property`, `drop_property [soft]`, `unsupported: …`), `apply`
-  migrates the live graph. **Soft drops only** — data-loss migrations are not
-  reachable from cluster apply (prior versions retain dropped columns).
+  steps (`add_property`, `drop_property`, `unsupported: …`), `apply`
+  migrates the live graph. **Drops reclaim nothing at apply** — a drop removes
+  the data from the branch head; older commits still read it until
+  `omnigraph cleanup` stops retaining them, and only then is it gone for good.
 - **Applied = serving on the next server restart.** No hot reload.
 - **`storage: s3://bucket/prefix`** (optional) puts the entire cluster — state
   ledger, lock, content-addressed catalog, recovery sidecars, approval
@@ -86,7 +87,16 @@ omnigraph-server --cluster . --bind 127.0.0.1:8080 --unauthenticated  # serve (l
   lists normalized URI bases. `scope: server_safe` can be installed by the
   server; `embedded_only` is never installed by the server or direct-store CLI.
   Cedar chooses who may write; this list chooses which source objects a writer
-  may cause the process to inspect.
+  may cause the process to inspect. A base must lie outside the cluster storage
+  root (`storage`, or the config directory), which holds every graph and the
+  ledger: `cluster validate`, `plan` and `apply` refuse an overlapping base in
+  either scope with `external_blob_base_overlaps_storage_root`, and a server
+  quarantines a graph whose applied `server_safe` base overlaps. Use a sibling
+  prefix, e.g. `s3://company-assets/cluster-external/` beside
+  `storage: s3://company-assets/cluster`. A same-kind base against a storage
+  root spelled with an empty or percent-sign path component is refused with
+  `external_blob_storage_root_uncomparable`; moving the base does not clear it,
+  so re-spell the root or remove those bases.
 - **`--as <actor>` attributes `cluster apply` and `cluster approve`** (sidecars,
   audit, and engine commits where applicable). It defaults from operator config's
   `operator.actor` and is required for `approve`; the other cluster subcommands

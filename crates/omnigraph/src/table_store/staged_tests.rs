@@ -291,7 +291,7 @@ fn pending_scan_budget_caps_are_inclusive_and_one_over_is_typed() {
             ref resource,
             limit: KEYED_WRITE_MAX_BYTES,
             actual,
-        } if resource == "keyed entity bytes for test:people"
+        } if resource == "retained keyed batch bytes per operation"
             && actual == KEYED_WRITE_MAX_BYTES + 1
     ));
 }
@@ -1269,45 +1269,6 @@ async fn keyed_write_rejects_missing_or_non_id_primary_key() {
         .await
         .unwrap_err();
     assert!(wrong_error.to_string().contains("got [\"age\"]"));
-}
-
-#[tokio::test]
-async fn keyed_write_stream_stages_source_dataset_without_wide_collection() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let target_uri = format!("{root}/target.lance");
-    let source_uri = format!("{root}/source.lance");
-    let store = TableStore::new(root, test_session());
-    let target = TableStore::write_dataset(&target_uri, person_pk_batch(&[("alice", Some(30))]))
-        .await
-        .unwrap();
-    let source = TableStore::write_dataset(
-        &source_uri,
-        person_pk_batch(&[("bob", Some(25)), ("carol", Some(40))]),
-    )
-    .await
-    .unwrap();
-
-    let staged = store
-        .stage_keyed_write_stream(
-            target.clone(),
-            "Person",
-            &source,
-            KeyedWriteSemantics::StrictInsert,
-            SYSTEM_COLUMNS_LEGACY,
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        staged_key_filter(&staged).field_ids,
-        vec![target.schema().field("id").unwrap().id]
-    );
-    let committed = store.commit_staged(Arc::new(target), staged).await.unwrap();
-    assert_eq!(
-        collect_ids(&store.scan_batches(&committed).await.unwrap()),
-        vec!["alice", "bob", "carol"]
-    );
-    assert_eq!(source.version().version, 1, "source remains read-only");
 }
 
 #[test]
@@ -2687,4 +2648,22 @@ async fn commit_staged_skips_auto_cleanup_so_pinned_versions_survive() {
         "commit_staged must skip Lance auto-cleanup so a pre-bump graph's pinned \
          v{v1} survives; it was GC'd"
     );
+}
+
+#[test]
+fn compaction_blob_batch_rows_bounds_one_batch() {
+    use crate::table_store::{
+        COMPACTION_BLOB_BATCH_BYTES as BUDGET, COMPACTION_MAX_BATCH_ROWS as MAX_ROWS,
+        compaction_blob_batch_rows,
+    };
+    assert_eq!(compaction_blob_batch_rows(0), MAX_ROWS, "no Blob bytes");
+    assert_eq!(compaction_blob_batch_rows(1), MAX_ROWS, "clamped high");
+    assert_eq!(compaction_blob_batch_rows(BUDGET / 32), 32, "the quotient");
+    assert_eq!(compaction_blob_batch_rows(BUDGET + 1), 1, "clamped low");
+    assert_eq!((BUDGET, MAX_ROWS), (32 << 20, 8192));
+    assert_eq!(compaction_blob_batch_rows(4096), 8192);
+    assert_eq!(compaction_blob_batch_rows(4097), 8190);
+    assert_eq!(compaction_blob_batch_rows(BUDGET), 1);
+    assert_eq!(compaction_blob_batch_rows(BUDGET / 2 + 1), 1);
+    assert_eq!(compaction_blob_batch_rows(BUDGET / 2), 2);
 }

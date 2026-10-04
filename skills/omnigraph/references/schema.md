@@ -112,17 +112,12 @@ If `supported: false`, fix the source before applying. Plan is free; run it as o
 Plan/apply diagnostics may carry stable codes of the form **`OG-XXX-NNN`**. When
 a code is present, match it rather than the free-form message text.
 
-**Destructive drops are gated.** Dropping a property or type is a soft drop by
-default. To preview and execute a hard destructive drop, opt in on both steps:
-
-```bash
-omnigraph schema plan --schema next.pg s3://bucket/repo --allow-data-loss --json
-# inspect the hard-drop plan
-omnigraph schema apply --schema next.pg s3://bucket/repo --allow-data-loss
-```
-
-Without the flag, supported drops preserve prior physical data through soft
-drop semantics. A cluster-only server rejects
+**Drops reclaim nothing at apply.** Dropping a property or type removes it from
+the current schema; older commits still read the dropped data until
+`omnigraph cleanup` stops retaining them, and only then is it gone for good. No
+flag makes a drop destructive at apply: to reclaim the space, run `cleanup`
+with a retention that excludes the commits before the drop. A cluster-only
+server rejects
 `POST /graphs/{id}/schema/apply` with `409`; evolve a served graph through
 `cluster plan` and `cluster apply`.
 
@@ -249,10 +244,8 @@ omnigraph cluster apply --config . --as <you>
 # restart the --cluster server to serve the new shape
 ```
 
-Differences from direct `schema apply` (on a non-cluster store): **soft drops
-only** (`--allow-data-loss` is not reachable from cluster apply — prior versions
-retain dropped columns),
-and out-of-band schema changes on the live graph are *drift* — `cluster
+Differences from direct `schema apply` (on a non-cluster store): out-of-band
+schema changes on the live graph are *drift* — `cluster
 refresh` flags them and the next `apply` converges the graph back to the
 declared schema. Everything else in this file (`@rename_from`, backfills,
 linting, enum discipline) applies unchanged to the `.pg` you edit.

@@ -429,7 +429,11 @@ async fn maintain_indices_for_branch(
             })
             .collect::<crate::db::manifest::ExpectedTableVersions>();
         let lineage = db
-            .new_lineage_intent_for_branch(active_branch.as_deref(), actor)
+            .new_lineage_intent_for_branch(
+                active_branch.as_deref(),
+                actor,
+                HistoryReleaseBytes::PRODUCTION,
+            )
             .await?;
 
         let mut updates = Vec::with_capacity(targets.len());

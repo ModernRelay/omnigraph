@@ -7,19 +7,19 @@ use arrow_array::{Array, RecordBatch, StringArray, StructArray, UInt64Array, new
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::blob::{BlobArrayBuilder, blob_field};
-use lance::dataset::scanner::ColumnOrdering;
 use lance::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::types::{PropType, ScalarType};
 use omnigraph_compiler::{
-    DropMode, SchemaIR, SchemaIdentityDomain, SchemaMigrationPlan, SchemaMigrationStep,
-    SchemaShape, SchemaTypeKind, SystemColumns, build_catalog_from_ir, compile_schema_shape,
+    SchemaIR, SchemaIdentityDomain, SchemaMigrationPlan, SchemaMigrationStep, SchemaShape,
+    SchemaTypeKind, SystemColumns, build_catalog_from_ir, compile_schema_shape,
     initialize_schema_ir, plan_schema_migration,
 };
 
-use crate::db::commit_graph::CommitGraphSnapshot;
-use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot, ResolvedCommitRange};
+use crate::db::graph_coordinator::{
+    CapturedLineage, GraphCoordinator, PublishedSnapshot, ResolvedCommitRange,
+};
 use crate::error::{OmniError, Result, dataset_subject};
 use crate::runtime_cache::RuntimeCache;
 use crate::seams::{decide_seam, fail};
@@ -33,6 +33,7 @@ use crate::table_store::TableStore;
 pub(crate) mod collector;
 mod export;
 pub(crate) mod optimize;
+mod prepared_create;
 pub(crate) mod promotion;
 mod repair;
 pub(crate) mod schema_apply;
@@ -45,12 +46,19 @@ pub use collector::{
 };
 #[doc(hidden)]
 pub use export::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
-pub(crate) use export::{export_blob_values, logical_row_image};
+pub(crate) use export::{
+    LogicalBlobValue, RangedExternalBlobs, export_blob_values, logical_row_image,
+};
 pub use optimize::{CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, SkipReason};
+use prepared_create::initial_schema_ir;
+pub use prepared_create::{GraphCreateReconciliation, PreparedGraphCreate};
 pub use repair::{
     DatasetRepairStats, RepairAction, RepairClassification, RepairOptions, RepairStats,
 };
-pub use schema_apply::SchemaApplyOptions;
+pub use schema_apply::{
+    PreparedSchemaApply, PreparedSchemaSettlement, SchemaApplyReconciliation,
+    SchemaApplySettlement, SchemaContractDigest, SchemaNonPublicationProof,
+};
 pub use system_column_upgrade::{
     SYSTEM_COLUMNS_PREFLIGHT, SystemColumnUpgradeFinding, SystemColumnUpgradeOptions,
     SystemColumnUpgradeOutcome, SystemColumnUpgradeReport,
@@ -60,7 +68,8 @@ pub use table_ops::{FullTextIndexRebuildResult, PendingIndex, RebuiltFullTextInd
 
 use super::commit_graph::GraphCommit;
 use super::manifest::{
-    GenesisManifestAttempt, ManifestChange, SchemaContractRow, TableRegistration, TableTombstone,
+    GenesisManifestAttempt, HistoryReleaseBytes, ManifestChange, SchemaContractRow,
+    TableRegistration, TableTombstone,
 };
 use super::schema_state::{
     SchemaContractIdentity, render_schema_contract, snapshot_contract_identity,
@@ -91,6 +100,10 @@ pub struct SchemaApplyResult {
     pub applied: bool,
     pub graph_manifest_version: u64,
     pub steps: Vec<SchemaMigrationStep>,
+    /// The exact commit published by this invocation; absent for an exact no-op.
+    pub commit: Option<GraphCommit>,
+    /// Accepted source and stable schema identity of this invocation's result.
+    pub contract: SchemaContractDigest,
 }
 
 #[derive(Debug, Clone)]
@@ -116,7 +129,7 @@ pub struct SchemaApplyPreview {
 /// version once and compares the live version's identity under the pre-effect
 /// gates — never once per table. When
 /// present, the per-table resolves source the pinned `base` entry instead of calling
-/// `resolved_branch_target` / `snapshot_for_branch` / `fresh_snapshot_for_branch`
+/// `resolved_branch_target` / `snapshot_for_branch`
 /// (each of which re-runs `ensure_schema_state_valid`). When absent (`None` — every
 /// non-mutate/load caller), every threaded function behaves byte-identically to
 /// before. The carrier never removes a version guard or changes which dataset version
@@ -268,8 +281,6 @@ pub struct Omnigraph {
     /// accepted IR hash is the refresh fence: unlike source bytes, it changes
     /// when a drop/re-add returns to the same names with new identities.
     schema_view: Arc<ArcSwap<HandleSchemaView>>,
-    /// Validated legacy contract used only by an admitted v10 conversion handle.
-    upgrade_schema_contract: Option<SchemaContractRow>,
     /// Root-scoped writer queues shared by every `Omnigraph` handle for this
     /// canonical local root identity (or opaque remote URI) in the process.
     /// Reachable from engine internals
@@ -299,6 +310,10 @@ pub struct Omnigraph {
     /// The mutex serializes captures — the schema serial queue already
     /// serializes merges and branch controls at capture time.
     merge_authority_cache: tokio::sync::Mutex<Option<(String, GraphCoordinator)>>,
+    /// The settled commits this handle has read from `__history`, shared by
+    /// every coordinator it opens. Only an operation that asks for history
+    /// fills it.
+    history: crate::db::commit_graph::HistoryCache,
     /// Optional policy checker for engine-layer enforcement (MR-722).
     /// `None` = no enforcement; mutating methods are unconditionally
     /// allowed (this is the embedded/dev default). `Some` = every
@@ -432,6 +447,7 @@ impl Omnigraph {
             storage_for_uri(uri)?,
             InitOptions::default(),
             true,
+            None,
         )
         .await
     }
@@ -442,7 +458,7 @@ impl Omnigraph {
         storage: Arc<dyn StorageAdapter>,
         options: InitOptions,
     ) -> Result<Self> {
-        Self::init_with_storage_for_vintage(uri, schema_source, storage, options, false).await
+        Self::init_with_storage_for_vintage(uri, schema_source, storage, options, false, None).await
     }
 
     async fn init_with_storage_for_vintage(
@@ -451,6 +467,7 @@ impl Omnigraph {
         storage: Arc<dyn StorageAdapter>,
         options: InitOptions,
         legacy_system_columns: bool,
+        prepared: Option<&PreparedGraphCreate>,
     ) -> Result<Self> {
         let storage = crate::storage::decorate(storage);
         let root = normalize_root_uri(uri)?;
@@ -466,44 +483,35 @@ impl Omnigraph {
         } else {
             omnigraph_compiler::SYSTEM_COLUMNS_V3
         };
-        let schema_shape = read_schema_shape_for_vintage(schema_source, system_columns)?;
-        let domain = SchemaIdentityDomain::from_ulid(crate::dst_ids::new_ulid());
-        let resolution = if legacy_system_columns {
-            let empty_shape = read_schema_shape_from_source("")?;
-            let accepted = omnigraph_compiler::into_legacy_vintage(
-                initialize_schema_ir(domain, &empty_shape)
-                    .map_err(|error| OmniError::manifest(error.to_string()))?
-                    .schema_ir,
-            );
-            omnigraph_compiler::resolve_schema_ir(&accepted, &schema_shape)
-        } else {
-            initialize_schema_ir(domain, &schema_shape)
-        }
-        .map_err(|error| OmniError::manifest(error.to_string()))?;
-        for diagnostic in &resolution.diagnostics {
-            tracing::warn!(
-                target: "omnigraph::schema::identity",
-                kind = ?diagnostic.kind,
-                entity = %diagnostic.entity,
-                hint = %diagnostic.hint,
-                "schema identity hint is inert during graph initialization"
-            );
-        }
-        let schema_ir = resolution.schema_ir;
+        let schema_ir = match prepared {
+            Some(prepared) => prepared.validated_schema_ir()?,
+            None => initial_schema_ir(
+                schema_source,
+                system_columns,
+                SchemaIdentityDomain::from_ulid(crate::dst_ids::new_ulid()),
+                legacy_system_columns,
+            )?,
+        };
         let accepted_schema_ir_hash = omnigraph_compiler::schema_ir_hash(&schema_ir)
             .map_err(|error| OmniError::manifest(error.to_string()))?;
         let schema_identity_domain = schema_ir.schema_identity_domain.as_str().to_string();
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
         fixup_physical_schemas(&mut catalog)?;
         let manifest_contract = render_schema_contract(&schema_ir, schema_source)?;
+        if prepared.is_some() {
+            prepared_create::require_empty_create_target(&root, storage.as_ref()).await?;
+        }
         verify_local_create_if_absent(&root, storage.as_ref()).await?;
-        let init_claim = acquire_init_claim(&root, storage.as_ref()).await?;
+        let init_claim = acquire_init_claim(&root, storage.as_ref(), prepared).await?;
         if let Err(err) = preflight_init_target(&root, storage.as_ref(), options).await {
             best_effort_release_init_claim(&init_claim, storage.as_ref()).await;
             return Err(err);
         }
 
-        let genesis_attempt = match GenesisManifestAttempt::mint(catalog.system_columns) {
+        let genesis_attempt = match prepared
+            .map(|prepared| Ok(prepared.genesis().clone()))
+            .unwrap_or_else(|| GenesisManifestAttempt::mint(catalog.system_columns))
+        {
             Ok(attempt) => attempt,
             Err(err) => {
                 best_effort_release_init_claim(&init_claim, storage.as_ref()).await;
@@ -586,6 +594,7 @@ impl Omnigraph {
             root_uri: root.clone(),
             storage,
             lance_access,
+            history: coordinator.history().clone(),
             coordinator: Arc::new(tokio::sync::RwLock::new(coordinator)),
             // The graph-scoped data session keeps table metadata/index caches
             // warm across reads, writes, and maintenance. Mutable control
@@ -595,7 +604,6 @@ impl Omnigraph {
             runtime_cache: RuntimeCache::default(),
             feed_cut_cache: tokio::sync::RwLock::new(None),
             read_caches,
-            upgrade_schema_contract: None,
             schema_view: Arc::new(ArcSwap::from_pointee(HandleSchemaView {
                 catalog,
                 source: Arc::new(schema_source.to_string()),
@@ -639,7 +647,7 @@ impl Omnigraph {
         let identity = write_queue_root_identity(&root)?;
         let queues = crate::db::write_queue::WriteQueueManager::for_root(&identity);
         let _schema_gate = queues.acquire_schema_shared().await;
-        crate::db::upgrade::legacy_sidecars::refuse_pending_recovery(&root, storage.as_ref()).await
+        crate::db::legacy_sidecars::refuse_pending_recovery(&root, storage.as_ref()).await
     }
 
     /// Whether the selected graph-manifest dataset references files outside
@@ -676,24 +684,6 @@ impl Omnigraph {
         storage: Arc<dyn StorageAdapter>,
         mode: OpenMode,
     ) -> Result<Self> {
-        Self::open_with_contract(uri, storage, mode, None).await
-    }
-
-    pub(super) async fn open_for_storage_upgrade(
-        uri: &str,
-        mode: OpenMode,
-        contract: SchemaContractRow,
-    ) -> Result<Self> {
-        validate_schema_contract_row(&contract)?;
-        Self::open_with_contract(uri, storage_for_uri(uri)?, mode, Some(contract)).await
-    }
-
-    async fn open_with_contract(
-        uri: &str,
-        storage: Arc<dyn StorageAdapter>,
-        mode: OpenMode,
-        upgrade_schema_contract: Option<SchemaContractRow>,
-    ) -> Result<Self> {
         let storage = crate::storage::decorate(storage);
         let root = normalize_root_uri(uri)?;
         let lance_access = crate::lance_access::LanceAccessContext::new();
@@ -707,63 +697,21 @@ impl Omnigraph {
         // Both open modes refuse: there is no in-place migration, and the check is
         // a stamp read with no object-store writes, so it is safe under ReadOnly.
         let control_session = lance_access.control_session();
-        let prepared = if upgrade_schema_contract.is_some() {
-            let stamp = crate::db::manifest::read_supported_internal_schema_version(&root).await?;
-            if stamp != 10 {
-                return Err(OmniError::manifest(
-                    "upgrade-only engine handle requires admitted format 10",
-                ));
-            }
-            None
-        } else {
-            Some(
-                crate::db::manifest::ManifestCoordinator::prepare_open_with_contract(
-                    &root,
-                    &control_session,
-                )
-                .await?,
-            )
-        };
+        let prepared = crate::db::manifest::ManifestCoordinator::prepare_open_with_contract(
+            &root,
+            &control_session,
+        )
+        .await?;
         let schema_contract_guard = write_queue.acquire_schema_exclusive().await;
-        let (coordinator, captured_contract) = if let Some(prepared) = prepared {
-            let (coordinator, contract) =
-                GraphCoordinator::open_with_contract(&root, Arc::clone(&storage), prepared).await?;
-            (coordinator, Some(contract))
-        } else {
-            let mut coordinator =
-                GraphCoordinator::open_with_session(&root, Arc::clone(&storage), &control_session)
-                    .await?;
-            coordinator.refresh().await?;
-            (coordinator, None)
-        };
-        let contract = match &upgrade_schema_contract {
-            Some(contract) if coordinator.snapshot().schema_contract().is_none() => {
-                crate::db::schema_state::refuse_unsupported_schema_versions(&contract.ir)?;
-                contract.clone()
-            }
-            supplied => {
-                let stored = match captured_contract {
-                    Some(contract) => contract,
-                    None => coordinator.read_schema_contract().await?,
-                };
-                crate::db::schema_state::refuse_unsupported_schema_versions(&stored.ir)?;
-                validate_schema_contract_row(&stored)?;
-                if supplied
-                    .as_ref()
-                    .is_some_and(|contract| contract != &stored)
-                {
-                    return Err(OmniError::manifest(
-                        "upgrade contract differs from the source manifest row",
-                    ));
-                }
-                stored
-            }
-        };
+        let (coordinator, contract) =
+            GraphCoordinator::open_with_contract(&root, Arc::clone(&storage), prepared).await?;
+        crate::db::schema_state::refuse_unsupported_schema_versions(&contract.ir)?;
+        validate_schema_contract_row(&contract)?;
         if matches!(mode, OpenMode::ReadWrite) {
             verify_local_create_if_absent(&root, storage.as_ref()).await?;
         }
         if matches!(mode, OpenMode::ReadWrite) {
-            crate::db::upgrade::legacy_sidecars::refuse_legacy_sidecars(
+            crate::db::legacy_sidecars::refuse_legacy_sidecars(
                 &root,
                 storage.as_ref(),
                 "read-write open",
@@ -792,10 +740,10 @@ impl Omnigraph {
             Arc::clone(&catalog),
         );
         let db = Self {
-            upgrade_schema_contract,
             root_uri: root.clone(),
             storage,
             lance_access,
+            history: coordinator.history().clone(),
             coordinator: Arc::new(tokio::sync::RwLock::new(coordinator)),
             // The graph-scoped data session keeps table metadata/index caches
             // warm across reads, writes, and maintenance. Mutable control
@@ -833,6 +781,22 @@ impl Omnigraph {
     /// Returns an `Arc<String>` snapshot of the schema source.
     pub fn schema_source(&self) -> Arc<String> {
         Arc::clone(&self.schema_view.load().source)
+    }
+
+    /// Return the source and identity digest from one coherent handle-local
+    /// accepted schema view, including when the graph has named branches.
+    /// This does not refresh storage; callers comparing current durable
+    /// authority must open or refresh under their writer-exclusion boundary.
+    pub fn schema_contract_digest(&self) -> SchemaContractDigest {
+        use sha2::Digest;
+
+        let view = self.schema_view.load();
+        SchemaContractDigest {
+            source_hash: format!("{:x}", sha2::Sha256::digest(view.source.as_bytes())),
+            schema_ir_hash: view.schema_ir_hash.clone(),
+            schema_identity_domain: view.schema_identity_domain.clone(),
+            schema_identity_version: super::schema_state::SCHEMA_IDENTITY_VERSION,
+        }
     }
 
     /// Publish one coherent handle-local projection after the durable schema
@@ -892,6 +856,14 @@ impl Omnigraph {
     /// The default on every initialized or opened handle is deny. This
     /// consuming builder validates deserialized configuration before replacing
     /// that default, so no writer can observe a partially configured policy.
+    /// A policy with a base that overlaps this handle's own graph root is
+    /// refused at install: ingress would otherwise copy the graph's manifest
+    /// and table bytes into cells readable as ordinary Blob values. This
+    /// install checks no other root. Cluster `validate`, `plan` and `apply`
+    /// compare every base in every scope with the cluster storage root, which
+    /// holds every graph and the ledger. Serve boot compares only the
+    /// server-safe projection of each applied policy with that root, so an
+    /// applied `embedded_only` base is not checked at boot.
     pub fn with_external_blob_policy(
         mut self,
         policy: crate::blob::ExternalBlobPolicy,
@@ -1009,10 +981,7 @@ impl Omnigraph {
         &self,
         snapshot: &Snapshot,
     ) -> Result<Arc<crate::runtime_cache::AcceptedCatalogEntry>> {
-        let identity = match (&self.upgrade_schema_contract, snapshot.schema_contract()) {
-            (Some(contract), None) => SchemaContractIdentity::from(&contract.head),
-            _ => snapshot_contract_identity(snapshot)?,
-        };
+        let identity = snapshot_contract_identity(snapshot)?;
         let previous = self.read_caches.accepted_catalog.current();
         if let Some(entry) = &previous
             && entry.identity == identity
@@ -1021,15 +990,6 @@ impl Omnigraph {
             return Ok(Arc::clone(entry));
         }
         let row = self.read_schema_contract_row_for(snapshot).await?;
-        if self
-            .upgrade_schema_contract
-            .as_ref()
-            .is_some_and(|contract| contract != &row)
-        {
-            return Err(OmniError::manifest(
-                "upgrade contract differs from the source manifest row",
-            ));
-        }
         let catalog = if let Some(entry) = &previous
             && entry.identity == identity
             && entry.row == row
@@ -1063,11 +1023,6 @@ impl Omnigraph {
     /// coordinator only when it holds the same manifest image.
     /// A capture without retained content reads its pinned dataset.
     async fn read_schema_contract_row_for(&self, snapshot: &Snapshot) -> Result<SchemaContractRow> {
-        if snapshot.schema_contract().is_none()
-            && let Some(contract) = &self.upgrade_schema_contract
-        {
-            return Ok(contract.clone());
-        }
         {
             let coord = self.coordinator.read().await;
             if coord.snapshot().same_manifest_image(snapshot) {
@@ -1119,38 +1074,74 @@ impl Omnigraph {
     }
 
     pub async fn plan_schema(&self, desired_schema_source: &str) -> Result<SchemaMigrationPlan> {
-        self.plan_schema_with_options(desired_schema_source, SchemaApplyOptions::default())
-            .await
+        schema_apply::plan_schema(self, desired_schema_source).await
     }
 
-    pub async fn plan_schema_with_options(
+    pub async fn preview_schema_apply(
         &self,
         desired_schema_source: &str,
-        options: SchemaApplyOptions,
-    ) -> Result<SchemaMigrationPlan> {
-        schema_apply::plan_schema(self, desired_schema_source, options).await
-    }
-
-    pub async fn preview_schema_apply_with_options(
-        &self,
-        desired_schema_source: &str,
-        options: SchemaApplyOptions,
     ) -> Result<SchemaApplyPreview> {
-        schema_apply::preview_schema_apply(self, desired_schema_source, options).await
+        schema_apply::preview_schema_apply(self, desired_schema_source).await
     }
 
     pub async fn apply_schema(&self, desired_schema_source: &str) -> Result<SchemaApplyResult> {
-        self.apply_schema_as(desired_schema_source, SchemaApplyOptions::default(), None)
-            .await
+        self.apply_schema_as(desired_schema_source, None).await
     }
 
-    pub async fn apply_schema_with_options(
+    /// Capture a serializable, exact-base schema intent without graph effects.
+    /// The caller must durably retain it before invoking effects if interrupted
+    /// outcomes must be reconciled. This does not reserve or fence the graph.
+    pub async fn prepare_schema_apply_as(
         &self,
         desired_schema_source: &str,
-        options: SchemaApplyOptions,
+        actor: Option<&str>,
+    ) -> Result<PreparedSchemaApply> {
+        schema_apply::prepare_schema_apply(self, desired_schema_source, actor).await
+    }
+
+    /// Execute an engine-issued intent against its exact captured authority.
+    /// A stale intent refuses before effects; it is never silently rebased.
+    pub async fn apply_prepared_schema_as(
+        &self,
+        prepared: &PreparedSchemaApply,
+        actor: Option<&str>,
     ) -> Result<SchemaApplyResult> {
-        self.apply_schema_as(desired_schema_source, options, None)
-            .await
+        schema_apply::apply_prepared_schema(self, prepared, actor).await
+    }
+
+    /// Read exact retained publication evidence, or revalidate a no-op's live
+    /// authority. Missing evidence is unknown and never permits replay. This
+    /// performs no writes and may be used on an `open_read_only` handle.
+    pub async fn reconcile_schema_apply_as(
+        &self,
+        prepared: &PreparedSchemaApply,
+        actor: Option<&str>,
+    ) -> Result<SchemaApplyReconciliation> {
+        schema_apply::reconcile_schema_apply(self, prepared, actor).await
+    }
+
+    /// Issue a serializable neutral settlement intent without graph effects.
+    /// Persist this token before settlement. Current policy authorizes its
+    /// author independently from the actor of the original schema intent.
+    pub async fn prepare_schema_settlement_as(
+        &self,
+        original: &PreparedSchemaApply,
+        actor: Option<&str>,
+    ) -> Result<PreparedSchemaSettlement> {
+        schema_apply::prepare_schema_settlement(self, original, actor).await
+    }
+
+    /// Settle a stopped owner's original schema intent without replaying it.
+    /// May publish the persisted neutral fence at the original candidate only.
+    /// The caller must exclude cleanup/other writers and establish prior native
+    /// and control-I/O quiescence. This grants no general runtime reuse proof.
+    pub async fn settle_prepared_schema_as(
+        &self,
+        original: &PreparedSchemaApply,
+        settlement: &PreparedSchemaSettlement,
+        actor: Option<&str>,
+    ) -> Result<SchemaApplySettlement> {
+        schema_apply::settle_prepared_schema(self, original, settlement, actor).await
     }
 
     /// Apply a schema migration with an explicit actor for engine-layer
@@ -1159,17 +1150,16 @@ impl Omnigraph {
     /// Branch("main"), actor)` before any apply work happens. Denial
     /// returns `OmniError::Policy` and leaves the manifest untouched.
     ///
-    /// The no-actor variants (`apply_schema`, `apply_schema_with_options`)
-    /// pass `None` here. They work fine without a policy; if a policy IS
-    /// installed and actor is None, enforcement intentionally fails to
-    /// prevent silent-bypass-via-forgetting-the-actor footguns.
+    /// The no-actor variant (`apply_schema`) passes `None` here. It works
+    /// without a policy; if a policy IS installed and actor is None,
+    /// enforcement intentionally fails to prevent
+    /// silent-bypass-via-forgetting-the-actor footguns.
     pub async fn apply_schema_as(
         &self,
         desired_schema_source: &str,
-        options: SchemaApplyOptions,
         actor: Option<&str>,
     ) -> Result<SchemaApplyResult> {
-        self.apply_schema_as_with_catalog_check(desired_schema_source, options, actor, |_| Ok(()))
+        self.apply_schema_as_with_catalog_check(desired_schema_source, actor, |_| Ok(()))
             .await
     }
 
@@ -1193,21 +1183,13 @@ impl Omnigraph {
     pub async fn apply_schema_as_with_catalog_check<F>(
         &self,
         desired_schema_source: &str,
-        options: SchemaApplyOptions,
         actor: Option<&str>,
         validate_catalog: F,
     ) -> Result<SchemaApplyResult>
     where
         F: FnOnce(&Catalog) -> Result<()>,
     {
-        schema_apply::apply_schema(
-            self,
-            desired_schema_source,
-            options,
-            actor,
-            validate_catalog,
-        )
-        .await
+        schema_apply::apply_schema(self, desired_schema_source, actor, validate_catalog).await
     }
 
     /// Engine-facing trait surface around `TableStore`.
@@ -1274,11 +1256,13 @@ impl Omnigraph {
             })
     }
 
+    /// The coordinator of `branch`, opened from its `__manifest` and reading
+    /// settled commits through this handle's history cache.
     pub(crate) async fn open_coordinator_for_branch(
         &self,
         branch: Option<&str>,
     ) -> Result<GraphCoordinator> {
-        match branch {
+        let coordinator = match branch {
             Some(branch) => {
                 GraphCoordinator::open_branch_with_session(
                     self.uri(),
@@ -1286,7 +1270,7 @@ impl Omnigraph {
                     Arc::clone(&self.storage),
                     &self.control_session(),
                 )
-                .await
+                .await?
             }
             None => {
                 GraphCoordinator::open_with_session(
@@ -1294,9 +1278,10 @@ impl Omnigraph {
                     Arc::clone(&self.storage),
                     &self.control_session(),
                 )
-                .await
+                .await?
             }
-        }
+        };
+        Ok(coordinator.sharing_history(self.history.clone()))
     }
 
     /// Capture a source after the branch-control gates and schema-state checks.
@@ -1379,7 +1364,7 @@ impl Omnigraph {
         &self,
         source_branch: Option<&str>,
         target_branch: Option<&str>,
-    ) -> Result<(WriteTxn, WriteTxn, CommitGraphSnapshot, CommitGraphSnapshot)> {
+    ) -> Result<(WriteTxn, WriteTxn, CapturedLineage, CapturedLineage)> {
         let source_branch = normalize_branch_name(source_branch.unwrap_or("main"))?;
         let target_branch = normalize_branch_name(target_branch.unwrap_or("main"))?;
         let source_authority = self
@@ -1626,10 +1611,9 @@ impl Omnigraph {
         ))
     }
 
-    /// Merge-specific authority capture that also returns the coordinator's
-    /// already-loaded lineage projection. Keeping the projection attached to
-    /// this exact authority read avoids reopening both manifest branches solely
-    /// to rediscover the merge base.
+    /// Merge-specific authority capture that also returns the lineage of the
+    /// head it captured, so the merge base is searched over the ancestry of
+    /// exactly that head.
     async fn merge_authority_for_known_branch(
         &self,
         branch: Option<&str>,
@@ -1638,7 +1622,7 @@ impl Omnigraph {
         Option<String>,
         Option<String>,
         Snapshot,
-        CommitGraphSnapshot,
+        CapturedLineage,
         crate::db::manifest::CapturedManifestProbe,
     )> {
         {
@@ -1654,7 +1638,7 @@ impl Omnigraph {
                             .await?
                             .map(|head| head.as_str().to_string()),
                         coord.snapshot(),
-                        coord.commit_graph_snapshot(),
+                        coord.captured_lineage().await?,
                         coord.captured_manifest_probe(),
                     ));
                 }
@@ -1678,7 +1662,7 @@ impl Omnigraph {
         Option<String>,
         Option<String>,
         Snapshot,
-        CommitGraphSnapshot,
+        CapturedLineage,
         crate::db::manifest::CapturedManifestProbe,
     )> {
         let cache = self.validated_cached_coordinator(branch).await?;
@@ -1694,7 +1678,7 @@ impl Omnigraph {
                 .await?
                 .map(|head| head.as_str().to_string()),
             coord.snapshot(),
-            coord.commit_graph_snapshot(),
+            coord.captured_lineage().await?,
             coord.captured_manifest_probe(),
         ))
     }
@@ -1861,20 +1845,12 @@ impl Omnigraph {
             .map(|resolved| resolved.snapshot)
     }
 
-    pub(crate) async fn fresh_snapshot_for_branch(&self, branch: Option<&str>) -> Result<Snapshot> {
-        let snapshot = self.fresh_snapshot_for_branch_unchecked(branch).await?;
-        let (catalog, _) = self.accepted_catalog_for_snapshot(&snapshot).await?;
-        validate_bound_catalog_against_snapshot(&catalog, &snapshot)?;
-        Ok(snapshot)
-    }
-
     /// Fresh per-branch manifest snapshot WITHOUT the schema-contract
-    /// re-validation. Identical OCC freshness to [`fresh_snapshot_for_branch`]
-    /// — a fresh manifest re-read from storage, never the warm cache — only the
-    /// redundant `ensure_schema_state_valid` is dropped. Used inside a single
+    /// re-validation: a fresh manifest re-read from storage, never the warm
+    /// cache. Used inside a single
     /// write once a `WriteTxn` has already validated the contract at capture: the
     /// commit-time drift re-read needs the live manifest, not a second contract
-    /// read. Callers with no `WriteTxn` MUST use the checked variant.
+    /// read.
     ///
     /// Reads the manifest directly via `ManifestCoordinator` rather than
     /// `resolve_target`. The OCC re-read uses only the returned `Snapshot`
@@ -1882,11 +1858,7 @@ impl Omnigraph {
     /// produces identically to `GraphCoordinator::open(...).snapshot()` — but
     /// `resolve_target` additionally assembles the lineage projection the OCC
     /// read never consults. Skipping that work is a pure read-cost reduction,
-    /// not a freshness change. The checked
-    /// `fresh_snapshot_for_branch` delegates here, so its no-`txn` callers
-    /// (commit_all's None arm, optimize, repair, fork reclaim) get the same
-    /// identical `Snapshot` via this lighter manifest-only read; they consume
-    /// only the snapshot and never relied on the lineage projection.
+    /// not a freshness change.
     pub(crate) async fn fresh_snapshot_for_branch_unchecked(
         &self,
         branch: Option<&str>,
@@ -1900,6 +1872,7 @@ impl Omnigraph {
         Ok(Snapshot::wrap(manifest.snapshot()))
     }
 
+    #[cfg(test)]
     pub(crate) async fn version(&self) -> u64 {
         self.coordinator.read().await.version()
     }
@@ -1925,8 +1898,16 @@ impl Omnigraph {
     /// The on-disk internal-schema version of `target`'s branch (the storage-format
     /// version this graph is stamped at). Surfaced via `omnigraph snapshot`.
     pub async fn internal_schema_version_of(&self, target: impl Into<ReadTarget>) -> Result<u32> {
-        let branch = self.resolved_branch_of(target).await?;
-        crate::db::manifest::internal_schema_stamp_at(self.uri(), branch.as_deref())
+        let snapshot = self.snapshot_of(target).await?;
+        self.internal_schema_version_at(&snapshot).await
+    }
+
+    /// The internal-schema version stamped on `snapshot`'s own `__manifest`
+    /// version: the same version as the snapshot's tables and heads, read from
+    /// the manifest dataset the snapshot captured.
+    pub async fn internal_schema_version_at(&self, snapshot: &Snapshot) -> Result<u32> {
+        snapshot
+            .internal_schema_stamp(self.uri())
             .await?
             .ok_or_else(|| {
                 // Unreachable through this handle: every open path runs the
@@ -2201,14 +2182,9 @@ impl Omnigraph {
         Ok(Arc::new(rendered))
     }
 
-    /// Resolve a read target to its snapshot, without attaching read caches.
-    /// Same-branch reads reuse the warm coordinator, gated by a cheap version
-    /// probe (invariant 6: strong consistency, never a blind warm read). Reads do
-    /// not need to reopen a separate commit store to pin visibility (the
-    /// manifest version is the authority, invariant 2). The cache id stays
-    /// synthetic. A stale refresh may remain manifest-only when that snapshot
-    /// carries an exact head row; an absent row triggers a coherent lineage
-    /// refresh before exposing the effective inherited head.
+    /// Resolve a read target to its snapshot, without attaching read caches. A
+    /// same-branch read reuses the warm coordinator behind a version probe and
+    /// refreshes a stale one from the branch's `__manifest`.
     async fn resolve_target_inner(&self, target: &ReadTarget) -> Result<ResolvedTarget> {
         if let ReadTarget::Branch(branch) = target {
             let normalized = normalize_branch_name(branch)?;
@@ -2237,11 +2213,7 @@ impl Omnigraph {
                 let held = coord.manifest_incarnation();
                 let mut refreshed = false;
                 if !coord.probe_latest_incarnation().await?.matches(&held) {
-                    // An exact head row keeps this state-only; a fresh/recreated
-                    // branch atomically refreshes its inherited lineage too.
-                    // No fallible second phase can leave replacement rows
-                    // paired with the deleted branch's cached private head.
-                    coord.refresh_for_live_read().await?;
+                    coord.refresh().await?;
                     refreshed = true;
                 }
                 let resolved = warm_resolved_target(&coord, target).await?;
@@ -2506,7 +2478,7 @@ impl Omnigraph {
                             let held = coord.manifest_incarnation();
                             let mut refreshed = false;
                             if !coord.probe_latest_incarnation().await?.matches(&held) {
-                                coord.refresh_for_live_read().await?;
+                                coord.refresh().await?;
                                 refreshed = true;
                             }
                             let refreshed_incarnation = coord.manifest_incarnation();
@@ -2609,6 +2581,12 @@ impl Omnigraph {
     /// return that head's commit id plus the cursor that resumes the feed
     /// immediately after it. A failed export returns `Err` — a usable cursor
     /// never outlives a broken snapshot.
+    ///
+    /// The snapshot uses export's line format, except that a ranged external
+    /// Blob reference, which export refuses, is described as
+    /// `{"uri", "offset", "length"}` as in change images: the consumer starts
+    /// from exactly this state, and refusing would leave the graph with no
+    /// baseline at all.
     pub async fn capture_change_baseline<W: Write>(
         &self,
         branch: &str,
@@ -3194,8 +3172,14 @@ impl Omnigraph {
         &self,
         branch: Option<&str>,
         actor_id: Option<&str>,
+        history_release_bytes: HistoryReleaseBytes,
     ) -> Result<crate::db::manifest::LineageIntent> {
-        GraphCoordinator::new_lineage_intent_for_branch(branch, actor_id, None)
+        GraphCoordinator::new_lineage_intent_for_branch(
+            branch,
+            actor_id,
+            None,
+            history_release_bytes,
+        )
     }
 
     /// Invalidate the cached graph index. Called after edge mutations.
@@ -3489,13 +3473,20 @@ fn init_claim_uri(root: &str) -> String {
 /// primitive Lance relies on for manifest creation. A stale claim is never
 /// stolen automatically: without a distributed lease, a stopped initializer
 /// is indistinguishable from a slow live one.
-async fn acquire_init_claim(root: &str, storage: &dyn StorageAdapter) -> Result<InitClaim> {
+async fn acquire_init_claim(
+    root: &str,
+    storage: &dyn StorageAdapter,
+    prepared: Option<&PreparedGraphCreate>,
+) -> Result<InitClaim> {
     let uri = init_claim_uri(root);
-    let payload = serde_json::json!({
-        "version": INIT_CLAIM_PAYLOAD_VERSION,
-        "attempt_id": crate::dst_ids::new_ulid().to_string(),
-    })
-    .to_string();
+    let payload = match prepared {
+        Some(prepared) => prepared.claim_payload()?,
+        None => serde_json::json!({
+            "version": INIT_CLAIM_PAYLOAD_VERSION,
+            "attempt_id": crate::dst_ids::new_ulid().to_string(),
+        })
+        .to_string(),
+    };
     if !storage.write_text_if_absent(&uri, &payload).await? {
         return Err(OmniError::InitializationClaimed {
             uri: root.to_string(),
@@ -4365,7 +4356,7 @@ edge WorksAt: Person -> Company
                 };
                 assert!(error.contains(expected), "{error}");
             }
-            foreign.refresh_with_lineage().await.unwrap();
+            foreign.refresh().await.unwrap();
             assert_eq!(foreign.version(), before);
         }
     }

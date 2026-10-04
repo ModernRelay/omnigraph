@@ -45,23 +45,23 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
 | `blob get`, `blob stat` | Read or inspect one Blob cell | direct or served |
 | `branch create/list/delete/merge` | Manage graph branches | direct or served |
-| `snapshot` | Show a branch snapshot | direct or served |
+| `snapshot` | Show a branch snapshot: `internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version | direct or served |
 | `commit list/show/changes` | Inspect history or one commit's entity changes | direct or served |
 | `changes poll/baseline` | Consume a branch change feed or establish a new baseline | direct or served |
 | `export` | Stream a branch as JSONL | direct or served |
 | `schema show` | Read the accepted schema | direct or served |
 | `schema apply` | Apply a schema to a standalone graph | direct |
 | `schema plan` | Preview a schema migration | direct |
-| `schema upgrade-system-columns` | Respell a v8 graph's system columns in place (storage format v8 to v9) | direct |
+| `schema upgrade-system-columns` | Respell a graph's system columns in place; needs a graph that normal open accepts and keeps its storage format | direct |
 | `lint` | Validate `.gq` source | local schema or direct graph |
-| `upgrade` | Check or execute a registered offline storage migration | direct standalone |
+| `upgrade` | Report whether graph storage is in the format this binary serves; writes nothing | direct standalone |
 | `optimize` | Compact data and reconcile declared indexes | direct |
 | `rebuild-full-text-indexes` | Replace full-text indexes on one branch | direct |
 | `repair` | Report each table's Lance history against its registration (`no_drift` or `foreign_drift`) | direct |
 | `cleanup` | Delete table versions that no retained graph commit pins, under an explicit retention policy ([Maintenance](../operations/maintenance.md#cleanup)) | direct |
 | `graphs list` | List graph metadata or minimal identity discovery | served |
 | `queries list/validate` | Inspect or validate a cluster query registry | cluster |
-| `cluster validate/plan/apply/...` | Operate declarative cluster state | cluster config or managed context |
+| `cluster validate/plan/apply/...` | Operate declarative state; [deployment/recovery flags](../clusters/index.md) | config, Core server, explicit root, or managed context |
 | `policy validate/test/explain` | Validate or evaluate applied policy | cluster |
 | `embed` | Generate, clean, or refresh seed embeddings | local tooling |
 | `login`, `logout` | Manage a named server credential or a managed API session | local or managed API |
@@ -134,18 +134,18 @@ omnigraph upgrade ./graph.omni --json
 omnigraph schema upgrade-system-columns ./graph.omni --check --json
 ```
 
-`--store` is an alternative to the positional storage URI. Target format defaults
-to 11: qualified v6 inputs run v6 → v7 → v8 → v10 → v11, v7 inputs
-v7 → v8 → v10 → v11, v8 and v9 inputs v10 → v11, v10 inputs the v11 step alone;
-`--to-format 8` or `--to-format 10` stops there with the older format.
-Explicit target 7 remains available, but the current binary refuses normal open
-of v7. `--check` performs read-only preflight and reports output-dependent checks
-in `work.deferred_checks`; execution validates those before the affected handler
-has effects. Execution requires stopped writers, stopped maintenance and a
-verified whole-root backup. A failed check, refusal or
-required recovery exits 1. JSON reports the route, formats, findings, durable
-boundary, recovery action and work categories. Server and cluster addressing
-are refused. See [storage migration](../operations/upgrade.md#explicit-storage-migration).
+`--store` is an alternative to the positional storage URI. `omnigraph upgrade`
+reports the graph's storage format against the one this binary serves (v14)
+and writes nothing, with or without `--check`; this build has no in-place
+storage conversion. A v14 graph reports `already_current` and exits 0. Any
+other format reports the finding `unsupported_source` with the refusal text of
+normal open, a `--to-format` other than 14 reports `unsupported_target`, and a
+graph carrying a pending conversion marker reports `recovery_required`; each
+exits 1. JSON reports the observed and target formats, findings and recovery
+action. Server and cluster addressing are refused. See
+[storage format report](../operations/upgrade.md#storage-format-report).
+`schema upgrade-system-columns` is a separate operation on a served graph; see
+[system-column upgrade](../operations/upgrade.md#system-column-upgrade-legacy-spellings).
 
 ## Load modes
 

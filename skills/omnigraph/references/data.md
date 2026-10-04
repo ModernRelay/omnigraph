@@ -31,7 +31,12 @@ edits.
 > **Per-load bounds.** One keyed load (`append`/`merge`)
 > stages at most **8,192 entities and 32 MiB of Arrow memory per touched type**; a larger
 > batch is refused up front (HTTP 413, typed `resource_limit`) with no durable
-> effect — split it into chunks, each an atomic graph commit. The strict NDJSON
+> effect — split it into chunks, each an atomic graph commit. Two further
+> 32 MiB limits apply to the whole keyed load, summed over every touched type:
+> the staged Arrow memory and the parsed-payload estimate. Separately, the ids
+> an `overwrite` or a delete removes share one 32 MiB limit per operation (each
+> id counts its UTF-8 length plus 24 bytes); an `overwrite` that removes more
+> ids than that is refused and cannot be split. The strict NDJSON
 > input path also limits its request body and decoded Arrow memory to 32 MiB,
 > including `overwrite`; ordinary streamed overwrite can exceed the keyed
 > envelope. Check the selected transport's limits before splitting an import.
@@ -91,8 +96,10 @@ predecessor export into a new graph, relocate its identity as described in
 [migration guidance](migrations.md).
 
 `Date` accepts integer day counts or calendar-date strings; a datetime string is
-refused. `DateTime` accepts integer millisecond counts or datetime strings.
-Whole-number floats (`19723.0`), booleans, objects, and counts outside the
+refused. `DateTime` accepts integer millisecond counts or datetime strings; a
+string with a non-zero digit past the third fractional digit (`.123456`) is
+refused, here and in `mutate --params`, and trailing zeros (`.123000`) are
+accepted. Whole-number floats (`19723.0`), booleans, objects, and counts outside the
 renderable calendar range are refused; `mutate --params` takes date strings
 only. Rows stored with out-of-range counts by an earlier release fail reads and
 exports of that column until corrected.

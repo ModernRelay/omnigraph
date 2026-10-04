@@ -196,6 +196,8 @@ const EXPECTED_PATHS: &[&str] = &[
     "/readyz",
     "/graphs",
     "/graphs/discovery",
+    "/cluster/deployments",
+    "/cluster/deployments/{id}",
     "/graphs/{graph_id}/snapshot",
     "/graphs/{graph_id}/blob",
     "/graphs/{graph_id}/read",
@@ -1625,10 +1627,11 @@ fn error_code_schema_has_expected_variants() {
             "conflict",
             "too_many_requests",
             "service_unavailable",
+            "graph_unavailable",
             "internal",
         ]),
         "ErrorCode must match the closed v0.12 HTTP contract, including its \
-         explicit API admission refusal",
+         explicit API admission and graph availability refusals",
     );
 }
 
@@ -2353,6 +2356,8 @@ async fn multi_mode_openapi_keeps_management_paths_flat() {
         "/healthz",
         "/graphs",
         "/graphs/discovery",
+        "/cluster/deployments",
+        "/cluster/deployments/{id}",
         "/.well-known/oauth-protected-resource",
     ] {
         assert!(
@@ -2389,6 +2394,8 @@ async fn multi_mode_openapi_prefixes_operation_ids_with_cluster() {
                 | "/readyz"
                 | "/graphs"
                 | "/graphs/discovery"
+                | "/cluster/deployments"
+                | "/cluster/deployments/{id}"
                 | "/.well-known/oauth-protected-resource"
         ) {
             continue;
@@ -2458,6 +2465,8 @@ async fn multi_mode_openapi_declares_graph_id_path_parameter() {
         "/healthz",
         "/graphs",
         "/graphs/discovery",
+        "/cluster/deployments",
+        "/cluster/deployments/{id}",
         "/.well-known/oauth-protected-resource",
     ] {
         let item = paths.get(flat).unwrap();
@@ -2591,7 +2600,9 @@ fn openapi_describes_api_contract_admission_and_response_identity() {
                 .filter(|parameter| parameter["name"] == HTTP_API_CONTRACT_HEADER)
                 .collect();
             let oauth = path == "/.well-known/oauth-protected-resource";
-            let protected = path == "/graphs" || path.starts_with("/graphs/");
+            let protected = path == "/graphs"
+                || path.starts_with("/graphs/")
+                || path.starts_with("/cluster/deployments");
             if protected {
                 assert_eq!(contract_parameters.len(), 1, "{method} {path}");
                 let parameter = contract_parameters[0];

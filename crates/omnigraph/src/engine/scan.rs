@@ -541,9 +541,11 @@ pub(super) fn conjoin_fts_queries(
     }
 }
 
-/// The columns one node scan reads and emits. Blob columns are excluded from
-/// the scan when a filter is present (Lance: BlobsDescriptions + filter
-/// trips a projection assertion) and come back as null placeholders.
+/// The columns one node scan reads and emits. Blob properties are never `.gq`
+/// read values: typecheck refuses projecting, filtering, ordering or
+/// aggregating one, so a `.gq` node scan leaves their descriptors unread.
+/// They come back as null placeholders that keep the declared schema; Blob
+/// values are read through `read_blob_at`.
 pub(super) struct ScanColumns<'n> {
     pub(super) has_blobs: bool,
     pub(super) non_blob_cols: Vec<&'n str>,

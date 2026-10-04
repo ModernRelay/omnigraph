@@ -26,8 +26,8 @@ use omnigraph_compiler::settings::SessionSettings;
 use omnigraph_compiler::types::Direction;
 use omnigraph_compiler::types::ScalarType;
 use omnigraph_planner::{
-    AcceptedBoundPlan, DatasetPin, ExpandMode, ExpandPolicy, NodeId, OverfetchRung, PhysicalNode,
-    PhysicalPlan, Prefilter, RankKind, RankScope,
+    AcceptedBoundPlan, BoundPlan, DatasetPin, Evidence, ExpandMode, ExpandPolicy, NodeId,
+    OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, RankKind, RankScope,
 };
 
 use crate::db::{DatasetEntry, Omnigraph, Snapshot};
@@ -415,9 +415,19 @@ pub(crate) async fn execute(
     let traversal_limit = validate_traversal_admission(&bound.plan)?;
     omnigraph_planner::optimizer::validate_rank_fuse_row_tiebreaks(&bound.plan)
         .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
-    let mut executed = ExecutionReport::default();
     let ctx =
         QueryContext::with_traversal_limit(bound.plan.assumptions().memory_limit, traversal_limit)?;
+    ctx.run_owned(execute_with_context(bound, evidence, context, &ctx))
+        .await
+}
+
+async fn execute_with_context(
+    bound: BoundPlan,
+    evidence: Evidence,
+    context: &EngineContext<'_>,
+    ctx: &QueryContext,
+) -> Result<PlanRun> {
+    let mut executed = ExecutionReport::default();
     let policy = bound.plan.assumptions().gate_policy;
     let lowering = Lowering::new(&bound, context);
     let RankedScans { nearest, fusion } = ranked_scans(&bound.plan);
@@ -437,7 +447,7 @@ pub(crate) async fn execute(
         }
         let lowered = lowering.lower_query(&pass)?;
         lowered.record_in_memory_filters();
-        let fused = Box::pin(run_plan(&lowered, &bound.plan, &ctx)).await?;
+        let fused = Box::pin(run_plan(&lowered, &bound.plan, ctx)).await?;
         executed.record(pass_rows(&lowered, &bound.plan, 0)?);
         // Each nearest arm's probe ladder, by its scan, after the fusion's gate.
         let reports = lowered
@@ -481,7 +491,7 @@ pub(crate) async fn execute(
         pass = next;
     }
 
-    let (result_batch, reports, rows) = Box::pin(run_once(&lowering, &ctx, &pass, 0)).await?;
+    let (result_batch, reports, rows) = Box::pin(run_once(&lowering, ctx, &pass, 0)).await?;
     executed.record(rows);
     let nearest_report = |mut reports: ScanReports| {
         nearest
@@ -564,7 +574,7 @@ pub(crate) async fn execute(
                     }
                 };
                 let (retried, retried_reports, rows) =
-                    Box::pin(run_once(&lowering, &ctx, &wider, rung)).await?;
+                    Box::pin(run_once(&lowering, ctx, &wider, rung)).await?;
                 executed.record(rows);
                 let retried_report = nearest_report(retried_reports);
                 if !retried_report.probes.is_empty() {

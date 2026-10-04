@@ -4,8 +4,8 @@
 //! detached commit published as a pin beside its schema contract row. A sidecar
 //! can therefore only come from a
 //! build that predates detached table commits and stopped mid-write. This
-//! binary cannot interpret one, so a read-write open and the storage upgrade
-//! refuse the graph until the build that wrote the sidecar has resolved it.
+//! binary cannot interpret one, so a read-write open refuses the graph until
+//! the build that wrote the sidecar has resolved it.
 //! Reads stay pinned to published manifest versions and never look here.
 
 use crate::error::{OmniError, Result};
@@ -66,8 +66,7 @@ pub(crate) async fn refuse_legacy_sidecars(
 /// cluster admission probe): every JSON object under `__recovery/` blocks,
 /// including malformed ones — absence is the only provable state. Listing is
 /// bounded; exceeding the bound refuses rather than walking an unbounded
-/// directory. A served (stamp 13) root carries no schema staging file; the
-/// upgrade route judges those on a pre-row root.
+/// directory.
 pub(crate) async fn refuse_pending_recovery(
     root_uri: &str,
     storage: &dyn StorageAdapter,

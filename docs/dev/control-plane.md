@@ -10,9 +10,16 @@ There are three distinct views:
 2. **Applied ledger** — the durable state at the configured cluster storage root.
 3. **Serving snapshot** — a validated projection of the applied ledger and content-addressed resources.
 
-The desired bundle is input, not runtime authority. A server reads the applied revision; editing `cluster.yaml` changes nothing until a successful apply and server restart.
+The desired bundle is input, not runtime authority. A server reads the applied revision; editing `cluster.yaml` changes nothing until apply. Server-owned apply activates
+its achieved result in the same process; direct apply requires a subsequent
+server start.
 
-The storage root defaults to the configuration directory and may instead be a local path, `file://`, `s3://`, or `az://` root. Graph roots are derived as `graphs/<graph_id>.omni` beneath it.
+Direct storage resolution defaults to the configuration directory and may instead
+use a local path, `file://`, `s3://`, or `az://` root. Remote capture reads the selected
+server's authenticated canonical root: omitted storage binds to it, while an
+explicit absolute root must match lexically without client storage access. The
+server independently validates canonical identity under its admission. Graph
+roots are derived as `graphs/<graph_id>.omni` beneath that root.
 
 ## Managed CLI sessions
 
@@ -31,42 +38,122 @@ are in the [CLI reference](../user/cli/reference.md#managed-cluster-commands).
 
 | Path | Role |
 |---|---|
-| `__cluster/state.json` | Versioned applied ledger and resource status |
-| `__cluster/resources/` | Content-addressed stored-query and policy payloads |
-| `__cluster/recoveries/` | Control-plane operation sidecars |
-| `__cluster/approvals/` | Digest-bound approval artifacts and consumption record |
-| `__cluster/lock.json` | Exclusive persisted state-operation lock |
+| `__cluster/state.json` | Applied ledger; v2 also owns outstanding deployment authority and bounded results |
+| `__cluster/resources/` | Content-addressed queries, policies and immutable deployment bundles |
+| `__cluster/recoveries/` | Legacy evidence read only during explicit conversion checks |
+| `__cluster/approvals/` | Preserved legacy audit artifacts; no operational approval writer |
+| `__cluster/lock.json` | Persisted control lock; v2 lifetime cluster admission |
 | `graphs/<id>.omni/` | Derived graph roots managed through apply |
 
 All stored control objects use the shared storage adapter. Filesystem replacement and object-store PUT/CAS details stay below that boundary; higher layers deal in versioned reads, conditional writes, and normalized roots.
 
-The cluster sidecars are separate from each graph's ordinary recovery-v9 sidecar. A control-plane operation may need both: the outer cluster record describes desired/applied resource progress, while the engine record owns graph-table publication.
+The engine has no ordinary graph recovery sidecar: schema, table pins and
+lineage publish together in `__manifest`. Ledger v2 stores prepared schema and
+graph-birth authority in one outstanding record. Legacy control evidence is
+preserved for explicit conversion checks, never executed by a fallback sweep.
 
-## Lifecycle operations
+## Deployment ledger
 
-| Operation | Mutation | Responsibility |
-|---|---|---|
-| `validate` | None | Parse the whole bundle, normalize references, type-check schemas and queries, validate policies and bindings, and report all diagnostics. |
-| `plan` | None | Compare desired resource digests with recorded/applied and observed state; compute dependencies and approval requirements. `--observe` takes no lock and labels the output `authority: observed`. |
-| `approve` | Approval artifact | Bind one irreversible planned operation to exact before/after/config digests and an actor. |
-| `apply` | Resources and ledger | Re-plan under the lock, execute eligible changes in dependency order, recover interrupted changes, then CAS the applied ledger. |
-| `status` | None | Read the ledger, lock, recoveries, approvals, and current observations. |
-| `refresh` | Ledger observations | Reconcile recorded observations with live resources without changing the desired bundle. |
-| `observe` | None | `refresh` without the lock, the recovery sweep, or the write: report the statuses and observations `refresh` would record, labeled `authority: observed` with the exact `state_cas` read (RFC 0049). |
-| `import` | Initial ledger | Adopt declared existing resources after validation and observation. |
-| `force-unlock` | Lock only | Remove one exact stale lock ID after an operator proves no owner is alive. |
+`deployment.rs` and `deployment/execution.rs` own the sole v2 protocol. Fresh
+apply bootstraps v2 directly; explicit stopped-writer conversion preserves an
+existing v1 cluster's resources, identities and history. Conversion neither
+resets graphs nor migrates their storage format. Unknown versions and
+`state.lock: false` refuse. There is no offline/online mode field and no legacy
+apply, import, refresh or approval executor.
 
-Apply is idempotent. A no-op apply leaves the state bytes and revision untouched. Failures preserve the last durable ledger and leave enough sidecar evidence for the next status/apply/sweep to classify the interrupted operation.
+Apply creates graphs and changes schemas and stored queries. Existing roots,
+policies, provider/Blob bindings, trust and format stay fixed. New graph bindings
+are validated with creation; deletion and replacement of existing runtime
+bindings refuse. Normal engine open requires v13; server HTTP requires v0.12.
 
-Destructive graph deletion requires a matching unconsumed approval. Any relevant desired or observed digest change invalidates that approval. Approval files are retained with consumption metadata and summarized in the ledger.
+The applied revision and every achieved base retain each graph's exact source/IR
+digests and identity domain/version, captured coherently during conversion and
+advanced by successful schema outcomes. Serving and every new deployment compare
+this identity even after receipt eviction, rejecting a recreated graph with
+identical schema text. Explicit correction supplies the exact observed contract
+through `--schema-correction FILE`; it becomes immutable deployment input and
+requires schema-apply authority even when the source is unchanged.
+
+Config capture reads each source once, preserving exact bytes by digest.
+Immutable bundles and prepared engine intents are bounded before acceptance,
+with ledger/result capacity reserved for completion. Bounded versioned storage
+reads bind bytes and CAS token to the same GET; v2 writes compact JSON matching
+the reservation calculation. Existing digest-named objects are verified before
+reuse. The [configuration reference](../user/clusters/config.md#limits) owns the
+numeric input/result limits; these are encoded control-state bounds, not a
+native-I/O, full manifest-history scan or RSS bound.
+
+The original ID is `<ledger_ULID>:<sequence>:<nonce_ULID>`; the nonce exists
+before exposure and full ID plus input digest identifies resubmission. Acceptance
+CAS consumes the exact next sequence. One outstanding deployment records each
+graph as `NotStarted`, `Started` or `Settled`; the confirmed `Started` CAS
+precedes schema or graph-creation invocation. Recovery never replays it. It records
+`NotStarted` as not attempted, or persists an engine-issued settlement intent
+before reconciling `Started`. Strict numeric publication at the prepared base
+plus one permits a neutral lineage fence or a qualified occupied-version proof
+to establish nonpublication. Missing evidence remains unknown. Such proof
+does not authorize adopting a foreign schema into the applied projection.
+
+A graph-birth token binds canonical root, exact source/IR contract and genesis
+identity. Reconciliation accepts only that birth, not matching text. Under
+explicit prior-owner quiescence, settlement may abandon an exact owned,
+unpublished empty birth and leave a successor free to create a new identity.
+Graph creation records its authenticated initiator in the deployment result;
+engine genesis retains its existing actorless initialization contract. Later
+schema commits record the actor in their engine receipt.
+Foreign, committed or advanced roots are preserved and refused. The durable
+claim remains until cleanup completes; interrupted cleanup is resumable.
+
+Terminal results advance only the achieved resources. Partial convergence is a
+valid base for a corrective successor under the same owner or after a qualified
+ownership handoff. Query-only work creates no
+native commit and permits existing branches; schema apply retains its main-only,
+single-live-branch restriction. Older completed receipts may expire, but consumed
+sequences never execute again; after eviction even acceptance of a requested
+nonce is unknown. Applied result revision is distinct from server activation.
+
+`DeploymentCaller` preserves the storage-owner trust boundary and an optional
+actor label. Authenticated identity callers recheck current cluster
+`ConfigManage`, graph `Read`, and `SchemaApply` for schema effects/recovery.
+Original authority stays immutable; recovery records the current executor while
+preserving the authored engine receipt. The accepted
+[server runtime RFC](../rfcs/2026-09-29-server-runtime-and-online-deployment.md)
+owns the protocol rationale and qualification limits.
 
 ## Concurrency
 
-State-changing operations acquire `__cluster/lock.json` with storage-native create-if-absent semantics. Observe-only reads (`plan --observe`, `observe`) take no lock and write nothing; their output says so (`authority: observed`) and names the `state_cas` they read, and an existing lock is reported rather than refused. A bundle that sets `state.lock: false` gets `authority: unlocked` on every command that would otherwise have held the lock. Final ledger publication is also conditional on the state version observed under the operation. The lock coordinates operator processes; graph-level manifest gates and recovery still own data correctness.
+Read-only `plan`, `observe` and deployment status neither acquire writer
+admission nor change the ledger. Live observations are not execution or takeover
+authority. Ledger publication uses the CAS read under the current owner.
+
+V2 requires locking. `admission.rs` issues an opaque canonical-root/exact-lock-ID
+capability only after acquiring that same lock and rechecking ledger/inventory.
+Server, supported direct CLI graph writers, native controls and cleanup hold
+it for their lifetime; outstanding work admits only exact-ID reconciliation.
+Read-only CLI consumers instead validate canonical membership, captured ledger
+CAS and accepted schema through `graph_read.rs`, without taking writer admission.
+This is an observation, not a reclamation lease or a fence against later changes.
+Dropping a guard or returning from writable work, including success, retains its
+persisted lock. Completed read-only preflight refusals during new deployment,
+conversion, admission construction or read-only server settings validation
+explicitly release the exact lock. Recovery
+of an accepted invocation retains admission even when its current preparation
+refuses. Other explicit release requires qualified terminal graph and control
+I/O; generic server drain does not establish that proof. Operator
+transfer therefore requires stopped prior processes and accepted-I/O quiescence,
+then exact-ID unlock with all admissions and other unlocks excluded until it
+finishes. The backend has no conditional-delete guarantee; this is not a
+distributed fencing lock. Older/raw/embedded writers outside the participating
+doors remain operator-excluded across outstanding work and recovery. No tags or
+additional retention store protect deployment evidence, and the executor never
+runs cleanup.
 
 Do not bypass the cluster API with direct filesystem writes, edit `state.json`, or derive a second mutable inventory. Content digests and live observations are recomputed from the declared and durable authorities.
 
-The current distributed support boundary is still one mutation-capable writer process unless an external fence proves exclusivity. Filesystem and S3 rely on that operator boundary. Azure writers must acquire the external admission lease through `omnigraph-azure-admission`.
+The distributed support boundary remains one mutation-capable writer process.
+V2 admission adds cooperative exclusion on all backends without claiming native
+I/O settlement. Azure writers also acquire the external admission lease through
+`omnigraph-azure-admission`.
 
 ## Serving projection
 
@@ -76,11 +163,31 @@ The current distributed support boundary is still one mutation-capable writer pr
 --cluster <config-directory | file://root | s3://root | az://root>
 ```
 
-A directory lets the server resolve the storage root from `cluster.yaml`; a URI reads the applied deployment artifact directly. There is no single-graph positional boot, `--target`, or runtime graph add/remove API.
+A directory lets the server resolve the storage root from `cluster.yaml`; a URI reads the applied deployment artifact directly. There is no single-graph positional boot, `--target`, or independent graph add/remove API; inventory additions use deployment.
 
-Serving verifies ledger/resource digests, builds each graph's query registry and embedding provider, projects external-Blob policy to the server-safe subset, and binds at most one Cedar bundle per graph plus one cluster-level bundle. A graph-local open or registry failure quarantines that graph while healthy graphs may continue. `--require-all-graphs` makes any quarantine a startup failure; zero healthy graphs always fails.
+Serving captures ledger/resource digests, graph identity, expected contracts and validated policies before binding the listener. The captured registry initially contains loading or preflight-blocked entries, with the same captured policy later installed on the engine. One process-owned startup batch opens at most four graphs concurrently, checks accepted contracts, projects external-Blob policy, and validates stored queries. Each completed graph becomes ready or blocked through the process/registry admission boundary; shutdown prevents late activation and drains entered opens. Default startup admits healthy graphs individually. `--require-all-graphs` installs successful handles atomically only when every graph succeeds; any failure stops startup. A nonempty inventory with zero healthy graphs fails after the batch finishes. No attempt timeout, startup retry, reopen or native-settlement proof is introduced.
 
-Servers do not hot-reload applied graph configuration. Apply the new revision and restart every server that should serve it. Explicit OIDC public-admission snapshots have a separate bounded refresh contract below.
+`POST /cluster/deployments` submits a bounded immutable bundle and original ID
+to the running owner. The bearer actor needs applied cluster `ConfigManage` and
+the graph permissions required by the shared executor. Graph-scoped data tokens
+cannot deploy. One process gate owns execution and activation after caller
+disconnect; no polling worker or second storage-writing CLI is involved.
+
+The controller projects captured input through the existing serving validator,
+resolves required provider secrets and validates new graph bindings before any
+deployment effect. It reserves one batch transition, atomically closes affected graph
+admission and drains request descendants. Existing engine handles remain owned.
+It executes under the server's lifetime admission, loads the achieved bindings,
+and atomically installs exact contracts, query registries and new graph handles.
+Unchanged siblings continue serving. Pre-effect refusals restore predecessor
+views with new epochs. Uncertain effects use existing process containment.
+
+After installation, the ledger records the result revision/config digest and
+server admission incarnation. `GET /cluster/deployments/{id}` reports active
+only for the current achieved revision, matching process and ready affected
+views. Old-ID submission validates immutable input and returns the original
+record before graph closure; it cannot reinstall an old view. Boot digests
+remain boot facts. Explicit OIDC public-admission refresh is separate below.
 
 Protected graph and registry HTTP calls require the v0.12 contract header after
 authentication and before graph resolution. CLI discovery and response validation
@@ -111,12 +218,21 @@ applied-policy ownership are described in
 [Identity credentials and applied policy authorization](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md).
 
 `GET /graphs/discovery` accepts only the verified identity profile and returns
-IDs and display names for the opened and quarantined graph inventory captured
+IDs and display names for the loading, ready and blocked graph inventory captured
 at boot. It neither scans storage nor discloses availability, paths, policy,
 schema, or query definitions. It needs no policy membership. The separate
-`GET /graphs` metadata response and its `graph_list` gate are unchanged;
-version 1 filtering remains an additional restriction. Typed discovery
-responses are additive to the existing public catalog types.
+`GET /graphs` uses the same registry with a `graph_list` gate and returns one
+list containing runtime availability, sanitized failure and action. Version 1
+filtering remains an additional restriction. Neither inventory synthesizes graph
+entries from the boot witness. Discovery still discloses no availability.
+
+HTTP and MCP graph resolution apply credential graph scope before lookup and
+atomically capture a serving view with its graph-epoch lease. A loading, blocked or
+transitioning graph yields 503 only after graph `read` authorization on `main` or
+management `graph_list` authorization; otherwise it remains undisclosed as 404.
+An invalid graph policy or configuration cannot authorize the graph-read fallback.
+Availability booleans describe the runtime, not a policy grant; route
+authorization still applies to ready graphs.
 
 The CLI's versioned keychain cache records the issuance profile and verifies
 its endpoint and identity bindings before replacement. A legacy issuance
@@ -129,9 +245,16 @@ infers routing from an arbitrary bearer token's unverified shape.
 
 A replica reports what it booted from on `GET /readyz` (RFC 0049): the
 applied `config_digest` as `booted_serving_digest`, the ledger revision and
-CAS, and how many applied graphs it serves and does not; it answers 503 from
-the shutdown signal on. Graph IDs stay on the authenticated catalog routes,
-which include quarantined graphs under their respective disclosure contracts.
+CAS, and registry, ready, loading and blocked graph counts. `served_graph_count`
+counts every registry entry; closed transitions contribute to the blocked count.
+Status is `loading`, `serving`, `degraded`, `blocked` or `draining`;
+readiness requires completed startup, a ready graph or valid empty inventory,
+and open admission. Healthy graphs can serve directly while siblings load,
+but an aggregate readiness probe remains 503 until loading finishes.
+Graph IDs stay on the authenticated catalog routes under their respective
+disclosure contracts. Status reads registry snapshots without graph/storage I/O;
+shutdown makes every entry `stopping` and both availability flags false, retaining
+any startup failure category.
 Graceful shutdown is bounded by one deadline (`--shutdown-grace-seconds`,
 default 25), kept by a thread and armed
 by a listener installed before graphs open, after which the process exits 2
@@ -142,19 +265,64 @@ inputs, trusted actor, Session and capacity reservations survive a lost response
 waiter. Merge and optional source deletion share one owner. Registration and
 permanent admission closure have one synchronous ordering boundary; shutdown
 waits for admitted writes and registered read bodies/server producers after HTTP
-connections finish. Panic or explicitly indeterminate owned completion closes
-admission for every graph and signals the same bounded process shutdown, retaining
+connections finish. After bounded body collection, read handlers also run in
+owned tasks; losing the HTTP waiter leaves their engine future, read observer
+and input reservation alive. MCP tool execution retains its own concurrency
+permit after its caller cancels or reaches the response deadline. Completed
+results occupy one observed delivery slot until consumed or dropped. A known
+write retains its reservations in that slot: consuming it releases write
+capacity before the handler responds, while abandoning it destroys the output
+before releasing ownership. A read
+error or panic does not trigger write uncertainty. A write panic or explicitly
+indeterminate owned completion closes admission for every graph and signals the
+same bounded process shutdown, retaining
 unresolved reservations until exit. Proven engine pre-effect refusals remain
 nonfatal. Read/write body and response lanes have independent capacity; bodyless
 reads consume only read observers. Once HTTP connections and the remaining known
 logical owners finish, uncertain completion exits 2 immediately, with the original
 watchdog as the upper bound. This does not establish native-I/O settlement.
 
+Served export and baseline transport divide each existing process reservation
+into three outstanding frame credits and one sequential producer slot. The
+`Bytes` owner holds its payload, frame credit and process lease through the last
+clone or slice. Both routes share this sender; the baseline terminal record is
+encoded into one bounded pending chunk only after snapshot production succeeds.
+Only initial process-capacity admission has a short timeout. An admitted
+producer waits for a frame credit or response closure, including the terminal
+baseline cursor. Slow readers retain their bounded reservation until delivery
+or disconnect; no short per-frame deadline truncates a valid stream.
+[Deployment limits](../user/deployment.md#admission-limits) distinguish this
+transport allowance from engine encoding and native memory.
+
+A same-view transition can close one graph while other graphs keep serving.
+Preparation reserves bounded transition capacity before closing admission.
+Its graph lease follows body collection, owned execution, producers, retained
+results and yielded transport bytes; disconnect or MCP response expiry cannot
+release surviving owners. After those logical owners finish, the transition
+can resume only the exact existing engine, schema, queries and fixed bindings
+under a fresh epoch. Close, resume and shutdown share a synchronous ordering
+boundary. Expiry or an abandoned closed transition leaves that graph unavailable;
+there is no automatic reopen or retry. Only its scheduling record is retired,
+so other ready graphs can transition. The closed registry entry and descendants
+retain the engine and resource charges; no native disposal or lock release is
+implied. Bounded inventory limits retained closed views, and obsolete tickets
+cannot affect a subsequent candidate. Status reports `transitioning` with
+`wait_for_transition`, without a finite `Retry-After` promise.
+
+The embedding entry point is `AppState::prepare_same_view`. It binds the actual
+process runtime; callers cannot substitute a new runtime to bypass stopping.
+It grants no schema/query replacement or deployment authority. The internal
+batch capability used by `deployment.rs` validates exact achieved schema/query
+bindings and new graph additions under the same shutdown/attempt fence. There
+is no public arbitrary-view replacement endpoint.
+
 These registrations account for server lifetimes, not universal storage-I/O
 settlement. A joined future or zero operation counter cannot authorize runtime
-replacement, schema activation, cleanup or replay. Native accepted I/O and
-protected completion memory/local-I/O capacity remain unqualified. Schema and
-stored-query deployment still uses apply followed by restart. The accepted
+replacement, cleanup or replay. Schema activation has a narrower proof: it
+retains the same engine and immutable read-tail owners, finishes interfering
+writers/controls, and never reclaims old inputs. Native accepted-I/O settlement,
+protected completion capacity, generic engine reuse and a process-RSS bound
+remain unqualified. The accepted
 [Owned server operations](../rfcs/2026-09-30-owned-server-operations.md) decision
 owns this boundary and its evidence; the [workload module](../../crates/omnigraph-server/src/workload.rs)
 owns admission limits.
@@ -166,6 +334,11 @@ Ordinary callers use `read_serving_snapshot` or
 `ServingSnapshot` and `ServerConfig` contain their ordinary public fields;
 trust-disabled boot does not add root canonicalization solely for signed
 credentials.
+
+V2 serving acquires lifetime admission before reading its boot snapshot and
+opening graphs. Settings retain that opaque ownership in `ServerConfig`; a
+hand-built configuration cannot use a deployment/reconciliation capability as
+serving authority. Read-only snapshot APIs alone do not grant serving admission.
 
 Managed callers use `read_root_bound_serving_snapshot` or its `_from_storage`
 counterpart to obtain an opaque `RootBoundServingSnapshot`. Its snapshot and
@@ -209,7 +382,7 @@ Every mutation-capable Azure server, apply job, direct writer, and maintenance p
 
 ## Owners
 
-- Configuration, diffing, apply, sweep, and serving projection: `crates/omnigraph-cluster/src/`.
+- Configuration, diffing, deployment, recovery, and serving projection: `crates/omnigraph-cluster/src/`.
 - Shared local/S3/Azure control-object storage: `crates/omnigraph-storage/`.
 - Cluster-only boot and graph quarantine: `crates/omnigraph-server/src/settings.rs`.
 - Operator commands and addressing: `crates/omnigraph-cli/`.

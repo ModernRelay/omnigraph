@@ -56,8 +56,9 @@ manifest version match the captured transaction; otherwise it opens the target
 coordinator from durable state. The publisher independently reads fresh authority
 and enforces the exact graph-head precondition on every attempt. Successful
 publication returns a taken coordinator to the one-entry merge cache; failure
-drops it. Commit IDs and timestamps are minted for the captured branch without
-reloading manifest history. The existing schema and branch gates still serialize
+drops it. The intent nonce and timestamps are minted for the captured branch
+without reloading manifest history; the publish wraps the nonce into the
+addressable commit id `hb1.<block>.<slot>.<nonce>`. The existing schema and branch gates still serialize
 conflicting control operations.
 
 Native branch creation uses an operation-local capture of the bound coordinator
@@ -248,6 +249,49 @@ There are no staged root contract files, schema-apply sentinel or durable
 post-publication install. The system-column upgrade uses the same publication
 boundary. See [Schema contract in the manifest](../rfcs/2026-09-30-schema-contract-in-manifest.md).
 
+`prepare_schema_apply_as` binds the canonical root and schema identity domain,
+exact main-branch authority, numeric manifest base, desired contract, actor and
+a preallocated intent nonce before table effects; the published commit id
+`hb1.<block>.<slot>.<nonce>` wraps that nonce, so a lookup by the intent names
+the commit through `commit_id_answers`, never by equality. Preparation supports a
+read-only handle: it captures authority and plans, without issuing native writes.
+`apply_prepared_schema_as` rechecks that authority and the current policy under
+the existing gates. Intent version 2 uses `ExactGraphVersion`: a base at `M` can
+publish only at `M + 1`, and metadata-only contention that preserves graph HEAD
+still refuses rather than rebasing. Version-1 intents are rejected; this is an
+internal protocol change, not a graph-storage format change. An effectful success
+returns the operation's own `GraphCommit` and contract identity, not a later head
+observation. The prepared
+value is execution input, not an authorization grant or a distributed writer
+fence.
+
+A schema no-op requires the exact source and accepted contract. Changed comments
+or formatting publish a replacement contract and lineage once while preserving
+every table pin. An empty migration plan alone cannot certify the desired
+source. The ordinary apply API uses the same preparation, execution and
+exact-version rule, including refusal on head-preserving metadata contention.
+
+`reconcile_schema_apply_as` only reads retained, exact publication evidence and
+returns `Committed`, `NoOp` or `Unknown`. It checks the single candidate manifest
+version immediately after the prepared base, without walking history. Missing
+evidence, including metadata-only interposition, stays unknown; a no-op requires
+the exact captured base still to be current. Reconciliation neither applies the
+schema nor authorizes replay. Callers still own durable intent recording,
+evidence retention and fencing the previous owner before they can establish
+terminal non-publication.
+
+For a durably accepted invocation, `prepare_schema_settlement_as` issues a
+separate neutral lineage intent bound to that original and its one `M + 1`.
+The caller persists it before `settle_prepared_schema_as` can publish its fence.
+A verified occupied candidate or exact fence receipt proves `NotPublished`;
+missing evidence remains `Unknown`. A stale no-op certificate is `NoOpRefused`.
+Settlement never replays the original schema, authorizes adopting a foreign
+contract into the achieved projection, or proves accepted native I/O has stopped. Prior-owner quiescence, current policy,
+exclusive admission and protected evidence remain caller obligations. These
+engine boundaries do not enable online server activation; the deployment
+protocol remains in the
+[server runtime RFC](../rfcs/2026-09-29-server-runtime-and-online-deployment.md).
+
 Branch merge follows it too. A merge onto main is a pointer switch: main's
 registration takes the source's pin, and the merge stages no fenced insert,
 no keyed update and no payload copy; external blob descriptors stay
@@ -291,8 +335,30 @@ sealed, exact-`id`, filter-bearing MergeInsert adapter:
   existing ID;
 - upsert updates or inserts without changing modes on retry;
 - a bare Lance Append is not a production graph-table write;
-- one table's keyed input is bounded to 8,192 rows and 32 MiB before any
-  effect.
+- one table's keyed input is bounded to 8,192 rows and 32 MiB before its
+  data is staged.
+
+Insert/update mutations and keyed Append/Merge loads also cap the sum of
+retained Arrow batches across tables at 32 MiB
+(`retained keyed batch bytes per operation`). Admission uses
+`get_array_memory_size` accounting; shared buffers may be conservatively counted
+more than once. An update's pending-aware scan charges the same sum under the
+same resource name. The keyed parse spool separately caps its decoded-payload
+estimate across tables at 32 MiB (`keyed parsed entity bytes per operation`).
+External Blob copy admission adds copied payload estimates, which are not yet
+read, to the retained keyed batches under the same resource name before reading
+payloads, then checks materialized batches before staging fragments.
+
+Delete mutations, cascades and Overwrite's removed-ID detection stream matches
+instead of collecting the full scan. One 32 MiB
+`retained removed-id bytes per operation` allowance covers all tables, charging
+each ID's UTF-8 length plus one 24-byte `String` slot before copying it.
+Overwrite's bulk input is not subject to the keyed row/batch limits. These are
+fixed representation limits with no setting, not a
+combined allocator/RSS budget; native scan buffers, conversion copies and
+validation's derived state are outside them. Refusal precedes the current
+operation's fragment staging and publication, though writable open may have
+completed earlier schema work and a load may already have created its branch.
 
 An insertion-only transaction may carry the internal
 `omnigraph.insert_absence = "v1"` certificate after its absence and physical
@@ -353,7 +419,9 @@ Overwrite can preserve an allowed external descriptor through Lance
 `WriteParams`. Keyed writes and row-writing merge paths materialize selected
 external bytes under the operation's 32 MiB budget because Lance's MergeInsert
 surface has no equivalent reference-preservation hook. A pointer-only branch
-adoption does no source I/O. See [blob.md](blob.md).
+adoption does no source I/O. An update never reads the Blobs it assigns; a
+carried stored external reference the policy refuses fails as
+`StoredExternalBlobDenied` before effects. See [blob.md](blob.md).
 
 ## Failure outcomes
 
@@ -366,7 +434,7 @@ adoption does no source I/O. See [blob.md](blob.md).
 | Any writer fails before publication, after any detached effect | Typed error; no graph movement; the detached staging is unpublished and the collector reclaims it once its recorded authority is gone |
 | Schema apply or the system-column upgrade reports an error after proven publication | `RecoveryRequired` can name the committed outcome; its tables and contract are durable, and refresh/reopen rebuilds only the in-memory view |
 | A foreign linear commit lands above a table's `omnigraph.last_linear_version` | No read or write resolves it; `repair` reports the table as `foreign_drift` and never adopts the commit; the collector deletes neither its manifest nor its files and lists it under `foreign_versions` |
-| A sidecar from a build that predates detached commits is present | A read-write open and the storage upgrade refuse until that build has resolved it |
+| A sidecar from a build that predates detached commits is present | A read-write open refuses until that build has resolved it |
 
 An acknowledgement is returned only after the manifest commit is durable and
 visible.

@@ -7,6 +7,7 @@ use omnigraph::db::{GraphCommit, MergeOutcome, ReadTarget, SchemaApplyResult, Sn
 use omnigraph::error::{MergeConflict, MergeConflictKind};
 use omnigraph::loader::{LoadMode, LoadReceipt, LoadResult};
 use omnigraph_compiler::SchemaMigrationStep;
+use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::query::ast::Param;
 use omnigraph_compiler::result::QueryResult;
@@ -119,6 +120,12 @@ pub struct SettingsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = traversal_work_limit_schema)]
     pub traversal_work_limit: Option<i64>,
+    /// `history_release_bytes`: the byte budget of a branch's buffer of
+    /// unreleased commits for this request's mutate or merge publishes, `1024..=262144`; an
+    /// `i64` like `traversal_work_limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(schema_with = history_release_bytes_schema)]
+    pub history_release_bytes: Option<i64>,
 }
 
 impl SettingsRequest {
@@ -143,6 +150,9 @@ impl SettingsRequest {
         }
         if let Some(limit) = self.traversal_work_limit {
             assignments.push((SettingId::TraversalWorkLimit, SettingValue::Integer(limit)));
+        }
+        if let Some(bytes) = self.history_release_bytes {
+            assignments.push((SettingId::HistoryReleaseBytes, SettingValue::Integer(bytes)));
         }
         assignments
     }
@@ -180,6 +190,10 @@ fn ann_nprobes_schema() -> utoipa::openapi::schema::Object {
 
 fn traversal_work_limit_schema() -> utoipa::openapi::schema::Object {
     setting_schema(SettingId::TraversalWorkLimit)
+}
+
+fn history_release_bytes_schema() -> utoipa::openapi::schema::Object {
+    setting_schema(SettingId::HistoryReleaseBytes)
 }
 
 /// Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.
@@ -528,6 +542,38 @@ pub struct ChangeOutput {
     pub outcome: Option<BranchOutcomeOutput>,
 }
 
+/// Load capability for a batch touching a node type with declared `@embed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadEmbeddingGeneration {
+    /// Loads never generate vectors, including with a configured provider.
+    /// Supplied vectors are preserved; omissions follow schema nullability.
+    Unsupported,
+}
+
+impl LoadEmbeddingGeneration {
+    pub fn for_load(catalog: &Catalog, result: &LoadResult) -> Option<Self> {
+        result
+            .nodes_loaded
+            .keys()
+            .any(|name| {
+                catalog
+                    .node_types
+                    .get(name)
+                    .is_some_and(|node| !node.embed_sources.is_empty())
+            })
+            .then_some(Self::Unsupported)
+    }
+
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::Unsupported => {
+                "Loads do not generate embeddings. Supplied vectors are preserved; omitted vectors follow schema nullability. Supply vectors in the input or prepare them with omnigraph embed."
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct IngestOutput {
     pub uri: String,
@@ -543,6 +589,11 @@ pub struct IngestOutput {
     /// Logical edge declarations touched by this load, sorted by name.
     pub edges: Vec<GraphBatchDeclarationOutput>,
     pub total_entities: usize,
+    /// `unsupported` when a loaded node type declares `@embed`, including
+    /// when all vectors were supplied; `null` otherwise.
+    #[serde(deserialize_with = "Option::deserialize")]
+    #[schema(required = true)]
+    pub embedding_generation: Option<LoadEmbeddingGeneration>,
     pub actor_id: Option<String>,
     pub commit: Option<CommitOutput>,
 }
@@ -572,6 +623,11 @@ pub struct GraphBatchLoadOutput {
     /// Logical edge declarations touched by this batch, sorted by name.
     pub edges: Vec<GraphBatchDeclarationOutput>,
     pub total_entities: usize,
+    /// `unsupported` when a loaded node type declares `@embed`, including
+    /// when all vectors were supplied; `null` otherwise.
+    #[serde(deserialize_with = "Option::deserialize")]
+    #[schema(required = true)]
+    pub embedding_generation: Option<LoadEmbeddingGeneration>,
     pub actor_id: Option<String>,
     pub commit: Option<CommitOutput>,
 }
@@ -1221,12 +1277,6 @@ pub struct SchemaApplyRequest {
         example = "node Person {\n    name: String @key\n    age: I32?\n}\n\nedge Knows: Person -> Person"
     )]
     pub schema_source: String,
-    /// When true, promote every `DropMode::Soft` step in the plan to
-    /// `DropMode::Hard`, making the prior property data unreachable
-    /// after the apply. Matches the CLI's `--allow-data-loss` flag.
-    /// Defaults to `false` (drops remain reversible via time travel).
-    #[serde(default)]
-    pub allow_data_loss: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1342,9 +1392,9 @@ pub struct HealthOutput {
 /// no graph id: those stay behind `GET /graphs`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReadinessOutput {
-    /// False once shutdown has begun; the response is then 503.
+    /// False during shutdown or when a nonempty inventory has no ready graph.
     pub ready: bool,
-    /// `serving` or `draining`.
+    /// `loading`, `serving`, `degraded`, `blocked` or `draining`.
     pub status: String,
     /// The `config_digest` of the applied revision this process booted from.
     /// Fixed for the life of the process: the server never reloads.
@@ -1355,11 +1405,14 @@ pub struct ReadinessOutput {
     /// The ledger CAS (`sha256:<hex>`) the process booted from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_cas: Option<String>,
-    /// How many graphs this process serves.
+    /// Number of registered graphs, including blocked entries.
     pub served_graph_count: usize,
-    /// How many graphs the applied revision names that this process does
-    /// not serve, for any reason. `GET /graphs` names them.
-    pub quarantined_graph_count: usize,
+    /// Registered graphs whose startup completed successfully.
+    pub ready_graph_count: usize,
+    /// Registered graphs waiting for their initial startup admission.
+    pub loading_graph_count: usize,
+    /// Unavailable graphs outside startup, including closed transitions.
+    pub blocked_graph_count: usize,
     /// The bound on graceful shutdown, after which the process exits 2.
     pub shutdown_grace_seconds: u64,
 }
@@ -1385,6 +1438,8 @@ pub enum ErrorCode {
     TooManyRequests,
     /// 503: operation admission is closed; reconcile any earlier write.
     ServiceUnavailable,
+    /// 503: a known graph is unavailable. Does not authorize replay.
+    GraphUnavailable,
     Internal,
 }
 
@@ -1982,6 +2037,7 @@ pub fn show_read_output(rows: &[SettingRow]) -> Result<ReadOutput, serde_json::E
 pub fn ingest_output(
     uri: &str,
     result: &LoadResult,
+    catalog: &Catalog,
     mode: LoadMode,
     actor_id: Option<String>,
 ) -> IngestOutput {
@@ -1995,6 +2051,7 @@ pub fn ingest_output(
         nodes,
         edges,
         total_entities,
+        embedding_generation: LoadEmbeddingGeneration::for_load(catalog, result),
         actor_id,
         commit: None,
     }
@@ -2003,16 +2060,18 @@ pub fn ingest_output(
 pub fn ingest_receipt_output(
     uri: &str,
     receipt: &LoadReceipt,
+    catalog: &Catalog,
     mode: LoadMode,
     actor_id: Option<String>,
 ) -> IngestOutput {
-    let mut output = ingest_output(uri, &receipt.result, mode, actor_id);
+    let mut output = ingest_output(uri, &receipt.result, catalog, mode, actor_id);
     output.commit = Some(commit_output(&receipt.commit));
     output
 }
 
 pub fn graph_batch_load_output(
     result: &LoadResult,
+    catalog: &Catalog,
     mode: LoadMode,
     actor_id: Option<String>,
 ) -> GraphBatchLoadOutput {
@@ -2025,6 +2084,7 @@ pub fn graph_batch_load_output(
         nodes,
         edges,
         total_entities,
+        embedding_generation: LoadEmbeddingGeneration::for_load(catalog, result),
         actor_id,
         commit: None,
     }
@@ -2067,10 +2127,11 @@ fn load_declaration_outputs(
 
 pub fn graph_batch_load_receipt_output(
     receipt: &LoadReceipt,
+    catalog: &Catalog,
     mode: LoadMode,
     actor_id: Option<String>,
 ) -> GraphBatchLoadOutput {
-    let mut output = graph_batch_load_output(&receipt.result, mode, actor_id);
+    let mut output = graph_batch_load_output(&receipt.result, catalog, mode, actor_id);
     output.commit = Some(commit_output(&receipt.commit));
     output
 }
@@ -2098,6 +2159,56 @@ pub fn read_target_output(target: &ReadTarget) -> ReadTargetOutput {
 pub struct GraphInfo {
     pub graph_id: String,
     pub uri: String,
+    pub state: GraphAvailability,
+    /// Runtime availability; actor policy still gates every operation.
+    pub read_available: bool,
+    pub write_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<GraphStartupFailure>,
+    pub action: GraphAvailabilityAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphAvailability {
+    Loading,
+    Ready,
+    Transitioning,
+    Blocked,
+    Stopping,
+}
+
+impl std::fmt::Display for GraphAvailability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Loading => "loading",
+            Self::Ready => "ready",
+            Self::Transitioning => "transitioning",
+            Self::Blocked => "blocked",
+            Self::Stopping => "stopping",
+        })
+    }
+}
+
+/// Bounded startup classification, without storage paths or error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphStartupFailure {
+    InvalidConfiguration,
+    InvalidPolicy,
+    InvalidExternalBlobPolicy,
+    OpenFailed,
+    InvalidStoredQueries,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphAvailabilityAction {
+    None,
+    WaitForStartup,
+    WaitForTransition,
+    RestartAfterCorrection,
+    WaitForRestart,
 }
 
 /// Response from `GET /graphs`. Lists every graph registered with the
@@ -2106,11 +2217,6 @@ pub struct GraphInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GraphListResponse {
     pub graphs: Vec<GraphInfo>,
-    /// Graphs the applied revision names that this process does not serve,
-    /// for any reason, sorted (RFC 0049). Empty when every applied graph is
-    /// served.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub quarantined: Vec<String>,
 }
 
 /// A graph's existence, without storage, schema, data, or serving metadata.
@@ -2181,12 +2287,13 @@ mod tests {
             merge_lineage: Some(MergeLineage::Off),
             ann_nprobes: Some(7),
             traversal_work_limit: Some(123),
+            history_release_bytes: Some(2048),
         };
         let expected = format!(
-            "{{\"{}\":\"v2\",\"{}\":\"off\",\"{}\":7,\"{}\":123}}",
-            request_rows[0], request_rows[1], request_rows[2], request_rows[3]
+            "{{\"{}\":\"v2\",\"{}\":\"off\",\"{}\":7,\"{}\":123,\"{}\":2048}}",
+            request_rows[0], request_rows[1], request_rows[2], request_rows[3], request_rows[4]
         );
-        assert_eq!(request_rows.len(), 4);
+        assert_eq!(request_rows.len(), 5);
         assert_eq!(serde_json::to_string(&populated).unwrap(), expected);
         assert_eq!(
             populated

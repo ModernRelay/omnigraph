@@ -352,8 +352,9 @@ pub(super) fn nearest_property_dim_and_model(
     Ok((dim, recorded_model))
 }
 
-/// A value bound through the Rust `ParamMap` API skips the JSON param arm: refuse
-/// a time-bearing `Date` string, and a non-`Date` literal on a `Date` parameter.
+/// A value bound through the Rust `ParamMap` API skips the JSON param arm: refuse a
+/// time-bearing `Date` string, a `DateTime` string finer than a millisecond, and a
+/// literal of another kind on a `Date` or `DateTime` parameter.
 pub(crate) fn check_param_date_literals(
     params: &ParamMap,
     declared: &[omnigraph_compiler::query::ast::Param],
@@ -361,6 +362,8 @@ pub(crate) fn check_param_date_literals(
     fn check(name: &str, lit: &Literal) -> Result<()> {
         match lit {
             Literal::Date(value) => omnigraph_compiler::check_date_literal(value)
+                .map_err(|reason| OmniError::manifest(format!("param '{name}': {reason}"))),
+            Literal::DateTime(value) => omnigraph_compiler::check_datetime_literal(value)
                 .map_err(|reason| OmniError::manifest(format!("param '{name}': {reason}"))),
             Literal::List(items) => items.iter().try_for_each(|item| check(name, item)),
             _ => Ok(()),
@@ -371,16 +374,28 @@ pub(crate) fn check_param_date_literals(
         let Some(lit) = params.get(&param.name) else {
             continue;
         };
-        let is_date = |lit: &Literal| match lit {
-            Literal::Date(_) => true,
+        let scalar = param
+            .type_name
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let is_scalar = |lit: &Literal| match lit {
+            Literal::Date(_) => scalar == "Date",
+            Literal::DateTime(_) => scalar == "DateTime",
             Literal::Null => param.nullable,
             _ => false,
         };
         let well_typed = match param.type_name.as_str() {
-            "Date" => is_date(lit),
+            "Date" | "DateTime" => is_scalar(lit),
             "[Date]" => match lit {
-                Literal::List(items) => items.iter().all(is_date),
-                other => is_date(other),
+                Literal::List(items) => items.iter().all(is_scalar),
+                other => is_scalar(other),
+            },
+            "[DateTime]" => match lit {
+                Literal::List(items) => items
+                    .iter()
+                    .all(|item| matches!(item, Literal::DateTime(_))),
+                Literal::Null => param.nullable,
+                _ => false,
             },
             _ => true,
         };

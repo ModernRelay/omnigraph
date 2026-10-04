@@ -9,7 +9,9 @@ use std::sync::Arc;
 use arrow_array::{Int32Array, RecordBatch, StringArray};
 use arrow_schema::Schema;
 use lance::Dataset;
-use omnigraph::db::{Omnigraph, ReadTarget, StagingVerdict};
+use omnigraph::db::{
+    GraphCreateReconciliation, Omnigraph, PreparedGraphCreate, ReadTarget, StagingVerdict,
+};
 use omnigraph::error::{CompletionEvidence, ManifestErrorKind, OmniError};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
@@ -4443,12 +4445,24 @@ async fn init_manifest_create_lost_ack_recovers_exact_genesis() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
+    let prepared = Omnigraph::prepare_graph_create(&uri, helpers::TEST_SCHEMA)
+        .await
+        .unwrap();
     let _lost_ack = catalog::INIT_MANIFEST_CREATE_POST_NATIVE.fire_always();
 
     let db = helpers::session(
-        Omnigraph::init(&uri, helpers::TEST_SCHEMA)
+        Omnigraph::apply_prepared_graph_create(&prepared)
             .await
             .expect("exact genesis probe must recover a lost Create acknowledgement"),
+    );
+    assert_eq!(
+        Omnigraph::reconcile_prepared_graph_create(&prepared)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Created {
+            graph_manifest_version: 1,
+            contract: prepared.desired_contract().clone(),
+        }
     );
     drop(db);
     for artifact in ["_schema.pg", "_schema.ir.json", "__schema_state.json"] {
@@ -4465,6 +4479,7 @@ async fn init_manifest_create_lost_ack_recovers_exact_genesis() {
     );
     let commits = db.list_commits(None).await.expect("list genesis commit");
     assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].graph_commit_id, prepared.graph_commit_id());
     assert!(commits[0].parent_commit_id.is_none());
     assert!(commits[0].actor_id.is_none());
 
@@ -4485,9 +4500,12 @@ async fn init_table_create_lost_ack_preserves_claim_and_schema() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
+    let prepared = Omnigraph::prepare_graph_create(&uri, helpers::TEST_SCHEMA)
+        .await
+        .unwrap();
     let _lost_ack = catalog::INIT_TABLE_CREATE_POST_NATIVE.fire_always();
 
-    let err = match Omnigraph::init(&uri, helpers::TEST_SCHEMA).await {
+    let err = match Omnigraph::apply_prepared_graph_create(&prepared).await {
         Ok(_) => panic!("a table Create acknowledgement failure must not return success"),
         Err(err) => err,
     };
@@ -4499,7 +4517,19 @@ async fn init_table_create_lost_ack_preserves_claim_and_schema() {
     else {
         panic!("a physical table Create outcome must remain indeterminate");
     };
-    assert_eq!(error_uri, uri);
+    assert_eq!(error_uri, prepared.root());
+    assert_eq!(
+        Omnigraph::reconcile_prepared_graph_create(&prepared)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Unknown,
+        "a partial table creation is never absent or safe to replay"
+    );
+    assert!(
+        Omnigraph::apply_prepared_graph_create(&prepared)
+            .await
+            .is_err()
+    );
     assert!(source.to_string().contains("init.table_create_post_native"));
     assert!(
         dir.path().join("__init_claim.json").exists(),
@@ -4513,6 +4543,174 @@ async fn init_table_create_lost_ack_preserves_claim_and_schema() {
         !dir.path().join("__manifest").exists(),
         "the table-Create test must fail before graph manifest creation"
     );
+    drop(_lost_ack);
+    let claim_path = dir.path().join("__init_claim.json");
+    let claim = std::fs::read(&claim_path).unwrap();
+    std::fs::write(&claim_path, br#"{"version":2,"prepared_digest":"foreign"}"#).unwrap();
+    assert_eq!(
+        Omnigraph::settle_prepared_graph_create_after_quiescence(&prepared)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Unknown,
+        "a foreign init claim is never cleaned up",
+    );
+    assert!(dir.path().join("nodes").exists() || dir.path().join("edges").exists());
+    std::fs::write(&claim_path, claim).unwrap();
+    // Any native manifest is authoritative evidence, including a damaged or
+    // foreign one. The settlement must refuse without deleting birth tables.
+    let versions = dir.path().join("__manifest/_versions");
+    std::fs::create_dir_all(&versions).unwrap();
+    let foreign_manifest = versions.join("1.manifest");
+    std::fs::write(&foreign_manifest, b"foreign publication evidence").unwrap();
+    assert_eq!(
+        Omnigraph::settle_prepared_graph_create_after_quiescence(&prepared)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Unknown,
+    );
+    assert!(foreign_manifest.exists());
+    assert!(claim_path.exists());
+    std::fs::remove_file(foreign_manifest).unwrap();
+    let initial_table = std::fs::read_dir(dir.path().join("nodes"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let native_manifest = std::fs::read_dir(initial_table.join("_versions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "manifest")
+        })
+        .unwrap();
+    let native_bytes = std::fs::read(&native_manifest).unwrap();
+    std::fs::write(&native_manifest, b"malformed native metadata").unwrap();
+    let malformed = Omnigraph::settle_prepared_graph_create_after_quiescence(&prepared).await;
+    assert!(matches!(
+        malformed,
+        Ok(GraphCreateReconciliation::Unknown) | Err(_)
+    ));
+    assert!(native_manifest.exists());
+    assert!(claim_path.exists());
+    std::fs::write(&native_manifest, native_bytes).unwrap();
+    for artifact in [
+        "tree/foreign/_versions/1.manifest",
+        "_refs/tags/retained",
+        "_indices/foreign",
+    ] {
+        let artifact = dir.path().join("__manifest").join(artifact);
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, b"foreign retained state").unwrap();
+        assert_eq!(
+            Omnigraph::settle_prepared_graph_create_after_quiescence(&prepared)
+                .await
+                .unwrap(),
+            GraphCreateReconciliation::Unknown
+        );
+        assert!(artifact.exists());
+        assert!(native_manifest.exists());
+        assert!(claim_path.exists());
+        // Remove only this test's foreign fixture before testing owned cleanup.
+        std::fs::remove_dir_all(dir.path().join("__manifest")).unwrap();
+    }
+    // This test owns the only initializer and awaited its error. Production
+    // callers must establish equivalent native/control-I/O quiescence before
+    // using the explicit settlement door.
+    assert_eq!(
+        Omnigraph::settle_prepared_graph_create_after_quiescence(&prepared)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Absent,
+    );
+    assert!(!dir.path().join("__init_claim.json").exists());
+    let replacement = Omnigraph::prepare_graph_create(&uri, helpers::TEST_SCHEMA)
+        .await
+        .unwrap();
+    assert_ne!(replacement.graph_commit_id(), prepared.graph_commit_id());
+    Omnigraph::apply_prepared_graph_create(&replacement)
+        .await
+        .unwrap();
+
+    // A native writer advancing even an empty birth table revokes cleanup
+    // authority. This deliberately models an excluded raw writer in the fault
+    // owner; production code has no public raw-table writer.
+    let foreign_dir = tempfile::tempdir().unwrap();
+    let foreign_uri = foreign_dir.path().to_str().unwrap();
+    let foreign = Omnigraph::prepare_graph_create(foreign_uri, helpers::TEST_SCHEMA)
+        .await
+        .unwrap();
+    {
+        let _lost_ack = catalog::INIT_TABLE_CREATE_POST_NATIVE.fire_always();
+        assert!(
+            Omnigraph::apply_prepared_graph_create(&foreign)
+                .await
+                .is_err()
+        );
+    }
+    let table = std::fs::read_dir(foreign_dir.path().join("nodes"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut dataset = Dataset::open(table.to_str().unwrap()).await.unwrap();
+    dataset
+        .update_metadata([("foreign", "movement")])
+        .await
+        .unwrap();
+    assert_eq!(dataset.version().version, 2);
+    assert_eq!(
+        Omnigraph::settle_prepared_graph_create_after_quiescence(&foreign)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Unknown
+    );
+    assert!(foreign_dir.path().join("__init_claim.json").exists());
+    assert_eq!(
+        Dataset::open(table.to_str().unwrap())
+            .await
+            .unwrap()
+            .version()
+            .version,
+        2
+    );
+    let interrupted_dir = tempfile::tempdir().unwrap();
+    let interrupted_uri = interrupted_dir.path().to_str().unwrap();
+    let interrupted = Omnigraph::prepare_graph_create(interrupted_uri, helpers::TEST_SCHEMA)
+        .await
+        .unwrap();
+    {
+        let _lost_ack = catalog::INIT_TABLE_CREATE_POST_NATIVE.fire_always();
+        assert!(
+            Omnigraph::apply_prepared_graph_create(&interrupted)
+                .await
+                .is_err()
+        );
+    }
+    let table = std::fs::read_dir(interrupted_dir.path().join("nodes"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    // Model a stopped settlement after deleting a previously verified owned
+    // empty table but before its final claim deletion. The claim is authority.
+    std::fs::remove_dir_all(table).unwrap();
+    assert!(interrupted_dir.path().join("__init_claim.json").exists());
+    assert_eq!(
+        Omnigraph::settle_prepared_graph_create_after_quiescence(&interrupted)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Absent
+    );
+    assert_eq!(
+        Omnigraph::settle_prepared_graph_create_after_quiescence(&interrupted)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Absent
+    );
 }
 
 #[tokio::test]
@@ -4521,10 +4719,13 @@ async fn init_manifest_create_unknown_and_probe_failure_preserves_claim_and_sche
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
+    let prepared = Omnigraph::prepare_graph_create(&uri, helpers::TEST_SCHEMA)
+        .await
+        .unwrap();
     let lost_ack = catalog::INIT_MANIFEST_CREATE_POST_NATIVE.fire_always();
     let probe_failure = catalog::INIT_MANIFEST_CREATE_PROBE.fire_always();
 
-    let err = match Omnigraph::init(&uri, helpers::TEST_SCHEMA).await {
+    let err = match Omnigraph::apply_prepared_graph_create(&prepared).await {
         Ok(_) => panic!("an unavailable exact probe must leave the outcome indeterminate"),
         Err(err) => err,
     };
@@ -4536,7 +4737,7 @@ async fn init_manifest_create_unknown_and_probe_failure_preserves_claim_and_sche
     else {
         panic!("unknown Create plus failed probe must remain typed");
     };
-    assert_eq!(error_uri, uri);
+    assert_eq!(error_uri, prepared.root());
     assert!(
         source
             .to_string()
@@ -4550,6 +4751,16 @@ async fn init_manifest_create_unknown_and_probe_failure_preserves_claim_and_sche
 
     drop(probe_failure);
     drop(lost_ack);
+    assert_eq!(
+        Omnigraph::reconcile_prepared_graph_create(&prepared)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Created {
+            graph_manifest_version: 1,
+            contract: prepared.desired_contract().clone(),
+        },
+        "a later observer authenticates the persisted exact birth without replay"
+    );
     let _db = Omnigraph::open(&uri)
         .await
         .expect("clearing the observation fault must reveal the committed graph");
@@ -4614,11 +4825,15 @@ async fn init_crash_after_manifest_create_leaves_openable_store() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
+    let prepared = Omnigraph::prepare_graph_create(&uri, helpers::TEST_SCHEMA)
+        .await
+        .unwrap();
 
     let crash = catalog::INIT_POST_MANIFEST_CREATE.panic_at();
-    let cloned = uri.clone();
+    let encoded = serde_json::to_vec(&prepared).unwrap();
+    let cloned: PreparedGraphCreate = serde_json::from_slice(&encoded).unwrap();
     let died = tokio::spawn(async move {
-        Omnigraph::init(&cloned, helpers::TEST_SCHEMA)
+        Omnigraph::apply_prepared_graph_create(&cloned)
             .await
             .map(|_| ())
     })
@@ -4629,6 +4844,17 @@ async fn init_crash_after_manifest_create_leaves_openable_store() {
             .is_panic(),
         "the injected failpoint action is a panic"
     );
+
+    assert_eq!(
+        Omnigraph::reconcile_prepared_graph_create(&prepared)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Created {
+            graph_manifest_version: 1,
+            contract: prepared.desired_contract().clone(),
+        }
+    );
+    assert!(dir.path().join("__init_claim.json").exists());
 
     // The Create commit carried the stamp, so the store is fully born: it
     // opens without the ancient-version misdiagnosis and serves a write and

@@ -1,0 +1,50 @@
+# issue: 856
+# red_on: 2026-10-04, main @ 10a3dc53: step 3 (branch merge, $name=b): merge outcome mismatch: expected `fast_forward`, got `merged`
+# notes: main writes a type b0 never touches, so the third merge is three-way.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person { name: String @key }
+node Tag { name: String @key }
+
+--- seed
+
+--- mutate
+branch create b0
+--- expect ok
+
+--- foreach $name a b
+--- mutate branch: b0
+query insert_person($name: String) { insert Person { name: $name } }
+--- params
+{"name": "${name}"}
+--- expect affected: nodes=1 edges=0
+--- mutate
+branch merge b0 into main
+--- expect outcome: fast_forward
+--- endloop
+
+--- query
+query main_people() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name": "a"}
+{"p.name": "b"}
+--- expect shape
+p.name: String
+
+--- mutate
+query insert_on_main() { insert Tag { name: "m" } }
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: b0
+query insert_on_b0() { insert Person { name: "c" } }
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge b0 into main
+--- expect outcome: merged

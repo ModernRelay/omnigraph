@@ -29,7 +29,10 @@ use std::process::Command;
 
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::{BlobCell, BlobContent, EntityKind};
-use support::{HERMETIC_OPERATOR_HOME, cli, fixture, output_failure, output_success};
+use support::{
+    HERMETIC_OPERATOR_HOME, apply_cluster_fixture, cli, fixture, output_failure, output_success,
+    unlock_cluster_fixture,
+};
 use tempfile::tempdir;
 
 /// Resolve the old (0.7.2) binary. `None` ONLY when `OMNIGRAPH_OLD_BIN` is
@@ -818,8 +821,9 @@ fn current_v10_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v10() {
     );
 }
 
-/// The guide's own preflight spelling and the default both report
-/// already_current on a graph this binary created.
+/// The preflight, the default and the explicit current target all report
+/// already_current on a graph this binary created; any other target is
+/// refused, since this binary holds no conversion route.
 #[test]
 fn storage_upgrade_current_binary_reports_already_current_on_a_fresh_graph() {
     let temp = tempdir().unwrap();
@@ -828,35 +832,48 @@ fn storage_upgrade_current_binary_reports_already_current_on_a_fresh_graph() {
     let schema = temp.path().join("fresh-current.pg");
     std::fs::write(&schema, "node Person { name: String @key }\n").unwrap();
     output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&graph));
+    let current = omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION;
+    let current_text = current.to_string();
+    let before = graph_files(&graph);
 
     for args in [
         vec!["upgrade", uri, "--check", "--json"],
         vec!["upgrade", uri, "--json"],
-        vec!["upgrade", uri, "--check", "--to-format", "13", "--json"],
+        vec![
+            "upgrade",
+            uri,
+            "--check",
+            "--to-format",
+            current_text.as_str(),
+            "--json",
+        ],
     ] {
         let report = support::parse_stdout_json(&output_success(cli().args(&args)));
         assert_eq!(report["outcome"], "already_current", "{args:?}");
-        assert_eq!(report["observed_format"], 13, "{args:?}");
+        assert_eq!(report["observed_format"], current, "{args:?}");
+        assert_eq!(report["target_format"], current, "{args:?}");
     }
 
-    for lower in ["7", "8", "10", "11"] {
+    for other in ["7", "8", "10", "11", "13"] {
         let refused = support::parse_stdout_json(&output_failure(cli().args([
             "upgrade",
             uri,
             "--check",
             "--to-format",
-            lower,
+            other,
             "--json",
         ])));
+        assert_eq!(refused["outcome"], "check_failed", "{refused}");
         assert!(
             refused["findings"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|finding| finding["code"] == "target_below_stamp"),
-            "unexpected downgrade refusal for v{lower}: {refused}"
+                .any(|finding| finding["code"] == "unsupported_target"),
+            "unexpected refusal for target v{other}: {refused}"
         );
     }
+    assert_eq!(graph_files(&graph), before, "upgrade must not write");
 }
 
 #[test]
@@ -1065,12 +1082,25 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
     let refusal = output_failure(cli().arg("snapshot").arg(&graph));
     let refusal_stderr = String::from_utf8_lossy(&refusal.stderr);
     assert!(
-        refusal_stderr.contains("0.9.x or 0.10.x"),
-        "the v6 refusal must name the release range that wrote internal schema v6, got: {refusal_stderr}",
+        refusal_stderr.contains("ledger_upgrade_required"),
+        "the CLI must refuse the legacy cluster ledger before opening its graph, got: {refusal_stderr}",
+    );
+
+    // The CLI's cluster gate precedes engine storage admission. Exercise the
+    // engine directly, read-only, to retain the genuine-v6 format fence too.
+    let storage_refusal = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Omnigraph::open_read_only(uri))
+        .err()
+        .expect("the engine must refuse the genuine v6 graph")
+        .to_string();
+    assert!(
+        storage_refusal.contains("0.9.x or 0.10.x"),
+        "the v6 refusal must name the release range that wrote internal schema v6, got: {storage_refusal}",
     );
     assert!(
-        refusal_stderr.contains("export"),
-        "the v6 refusal must direct the operator to export/import rebuild, got: {refusal_stderr}",
+        storage_refusal.contains("export"),
+        "the v6 refusal must direct the operator to export/import rebuild, got: {storage_refusal}",
     );
 
     output_success(
@@ -1086,13 +1116,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
     for name in ["graph.pg", "queries.gq", "cluster.yaml"] {
         fs::copy(cluster.join(name), rebuilt_cluster.join(name)).unwrap();
     }
-    for operation in ["import", "plan", "apply"] {
-        output_success(
-            cli()
-                .args(["cluster", operation, "--config"])
-                .arg(&rebuilt_cluster),
-        );
-    }
+    apply_cluster_fixture(&rebuilt_cluster);
     let rebuilt = rebuilt_cluster.join("graphs/knowledge.omni");
     let rebuilt_uri = rebuilt.to_str().unwrap();
     for (i, branch) in ["main", "review"].into_iter().enumerate() {
@@ -1106,6 +1130,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
             load.args(["--from", "main"]);
         }
         output_success(load.arg(&rebuilt));
+        unlock_cluster_fixture(&rebuilt_cluster);
     }
 
     assert_rebuilt_v10_graph(&rebuilt);
@@ -1239,6 +1264,9 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
             .any(|row| row["d.slug"] == "ml-intro" && row["d.title"] == "organism branch")
     );
     drop(server);
+    // The local server process is killed and reaped; release its retained
+    // admission by exact ID before this fixture starts the replacement.
+    unlock_cluster_fixture(&rebuilt_cluster);
     let reopened = spawn_server_with_cluster(&rebuilt_cluster);
     let remote = [
         "--server",
@@ -1295,57 +1323,6 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
     eprintln!("v0.9 refusal and export/import rebuild completed");
 }
 
-fn migration_bin(variable: &str, version: &str) -> Option<PathBuf> {
-    let fixtures =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/storage-upgrade-binaries");
-    let local = fixtures.join(match variable {
-        "OMNIGRAPH_V09_BIN" => "v0.9.0/omnigraph",
-        "OMNIGRAPH_V6_BIN" => "v0.10.0/omnigraph",
-        _ => panic!("unknown migration predecessor {variable}"),
-    });
-    let selected = std::env::var_os(variable)
-        .map(PathBuf::from)
-        .or_else(|| fixtures.exists().then_some(local));
-    let Some(path) = selected else {
-        assert!(
-            std::env::var_os("OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS").is_none(),
-            "required storage migration predecessor {variable} is unset"
-        );
-        eprintln!("skipping explicit storage upgrade: {variable} is unset");
-        return None;
-    };
-    assert!(
-        path.is_file(),
-        "{variable} is not a binary: {}",
-        path.display()
-    );
-    eprintln!(
-        "storage migration predecessor {version}: {}",
-        path.display()
-    );
-    let output = run_old(&path, &["version"]);
-    assert_ok("migration predecessor version", &output);
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).lines().next(),
-        Some(version)
-    );
-    Some(path)
-}
-
-#[test]
-fn genuine_v09_explicit_storage_upgrade_preserves_history() {
-    if let Some(old) = migration_bin("OMNIGRAPH_V09_BIN", "omnigraph 0.9.0") {
-        explicit_storage_upgrade_journey(&old, false);
-    }
-}
-
-#[test]
-fn genuine_v010_explicit_storage_upgrade_preserves_history() {
-    if let Some(old) = migration_bin("OMNIGRAPH_V6_BIN", "omnigraph 0.10.0") {
-        explicit_storage_upgrade_journey(&old, true);
-    }
-}
-
 fn graph_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
     let mut files = std::collections::BTreeMap::new();
     let mut pending = vec![root.to_path_buf()];
@@ -1364,597 +1341,6 @@ fn graph_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
         }
     }
     files
-}
-
-fn explicit_storage_upgrade_journey(old: &Path, has_property_lifetime_metadata: bool) {
-    let temp = tempdir().unwrap();
-    let graph = temp.path().join("standalone.omni");
-    let uri = graph.to_str().unwrap();
-    let schema = temp.path().join("migration.pg");
-    let data = temp.path().join("migration.jsonl");
-    let queries = temp.path().join("migration.gq");
-    std::fs::write(&schema, format!(
-        "{}\nedge Cites: Doc -> Doc {{ note: String }}\nnode BinaryAsset {{ name: String @key payload: Blob }}\n",
-        std::fs::read_to_string(fixture("search.pg")).unwrap()
-    )).unwrap();
-    std::fs::write(&data, format!("{}\n{}\n{}\n",
-        std::fs::read_to_string(fixture("search.jsonl")).unwrap().trim_end(),
-        r#"{"edge":"Cites","from":"ml-intro","to":"dl-basics","data":{"id":"citation-1","note":"preserved edge"}}"#,
-        r#"{"type":"BinaryAsset","data":{"name":"blob-sentinel","payload":"base64:AAECA/8="}}"#,
-    )).unwrap();
-    std::fs::write(
-        &queries,
-        r#"
-query docs() {
-    match { $d: Doc }
-    return { $d.slug, $d.title, $d.body, $d.embedding }
-    order { $d.slug }
-}
-query edges() {
-    match { $a: Doc $a $c:cites $b }
-    return { $a.slug, $b.slug, $c.note }
-}
-query retitle($title: String) { update Doc set { title: $title } where slug = "ml-intro" }
-query remove() { delete Doc where slug = "rl-intro" }
-query revise() { update Doc set { body: "written after storage upgrade" } where slug = "dl-basics" }
-query terms() {
-    match { $d: Doc search($d.title, "organism") }
-    return { $d.slug }
-    order { $d.slug }
-}
-query vectors($q: Vector(4)) {
-    match { $d: Doc }
-    return { $d.slug }
-    order { nearest($d.embedding, $q) }
-    limit 1
-}
-"#,
-    )
-    .unwrap();
-    let query_path = queries.to_str().unwrap();
-    assert_ok(
-        "migration init",
-        &run_old(old, &["init", "--schema", schema.to_str().unwrap(), uri]),
-    );
-    assert_ok(
-        "migration load",
-        &run_old(
-            old,
-            &[
-                "load",
-                "--mode",
-                "overwrite",
-                "--data",
-                data.to_str().unwrap(),
-                uri,
-            ],
-        ),
-    );
-    for (branch, title) in [
-        ("main", r#"{"title":"organism main"}"#),
-        ("review", r#"{"title":"organism review"}"#),
-    ] {
-        if branch == "review" {
-            assert_ok(
-                "migration branch",
-                &run_old(old, &["branch", "create", "review", "--uri", uri]),
-            );
-        }
-        assert_ok(
-            "migration update",
-            &run_old(
-                old,
-                &[
-                    "mutate", "retitle", "--query", query_path, "--store", uri, "--branch", branch,
-                    "--params", title,
-                ],
-            ),
-        );
-    }
-    assert_ok(
-        "migration deletion",
-        &run_old(
-            old,
-            &[
-                "mutate", "remove", "--query", query_path, "--store", uri, "--branch", "review",
-            ],
-        ),
-    );
-
-    let old_query = |selector: &str, value: &str, name: &str| {
-        let output = run_old(
-            old,
-            &[
-                "query", name, "--query", query_path, "--store", uri, selector, value, "--json",
-            ],
-        );
-        assert_ok("source snapshot query", &output);
-        let mut rows = support::parse_stdout_json(&output)["rows"].clone();
-        normalize_f32_and_nulls(&mut rows);
-        rows
-    };
-    let histories: Vec<_> = ["main", "review"]
-        .into_iter()
-        .map(|branch| {
-            let output = run_old(old, &["commit", "list", uri, "--branch", branch, "--json"]);
-            assert_ok("migration source commits", &output);
-            let mut commits = support::parse_stdout_json(&output)["commits"].clone();
-            for commit in commits.as_array_mut().unwrap() {
-                let fields = commit.as_object_mut().unwrap();
-                for (old, current) in [
-                    ("manifest_branch", "graph_branch"),
-                    ("manifest_version", "graph_manifest_version"),
-                ] {
-                    if let Some(value) = fields.remove(old) {
-                        assert!(fields.insert(current.to_string(), value).is_none());
-                    }
-                }
-            }
-            commits
-        })
-        .collect();
-    let mut historical_rows = std::collections::BTreeMap::new();
-    for history in &histories {
-        for commit in history.as_array().unwrap() {
-            let id = commit["graph_commit_id"].as_str().unwrap();
-            historical_rows.entry(id.to_owned()).or_insert_with(|| {
-                [
-                    old_query("--snapshot", id, "docs"),
-                    old_query("--snapshot", id, "edges"),
-                ]
-            });
-        }
-    }
-    let exports: Vec<_> = ["main", "review"]
-        .into_iter()
-        .map(|branch| {
-            let output = run_old(old, &["export", uri, "--branch", branch]);
-            assert_ok("migration source export", &output);
-            canonical_export_rows(&output.stdout)
-        })
-        .collect();
-    let before = graph_files(&graph);
-    output_failure(cli().args(["snapshot", uri]));
-    let check = support::parse_stdout_json(&output_success(cli().args([
-        "upgrade",
-        uri,
-        "--check",
-        "--to-format",
-        "8",
-        "--json",
-    ])));
-    assert_eq!(check["outcome"], "check_passed");
-    assert_eq!(check["observed_format"], 6);
-    assert_eq!(check["target_format"], 8);
-    assert_eq!(check["target_defaulted"], false);
-    assert_eq!(check["route"].as_array().unwrap().len(), 2);
-    assert_eq!(
-        check["work"]["historical_blob_identity_limits"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|field| field.as_str().unwrap().ends_with(":payload")),
-        !has_property_lifetime_metadata,
-        "preflight must report the legacy Blob property-lifetime limitation"
-    );
-    assert!(
-        !check["work"]["deferred_checks"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(
-        graph_files(&graph),
-        before,
-        "--check and refused open must leave every source byte unchanged"
-    );
-    let upgraded = support::parse_stdout_json(&output_success(cli().args([
-        "upgrade",
-        uri,
-        "--to-format",
-        "8",
-        "--json",
-    ])));
-    assert_eq!(upgraded["outcome"], "completed");
-    assert_eq!(upgraded["target_format"], 8);
-    assert_eq!(upgraded["target_defaulted"], false);
-    assert_eq!(upgraded["completed_handlers"].as_array().unwrap().len(), 2);
-    assert_eq!(upgraded["work"]["payload_bytes_copied"], 0);
-    assert_eq!(upgraded["work"]["payload_bytes_rewritten"], 0);
-    let mut after = graph_files(&graph);
-    let schema_identity = Path::new("_schema.ir.json");
-    assert!(before.contains_key(schema_identity));
-    assert_eq!(
-        after.get(schema_identity),
-        before.get(schema_identity),
-        "storage upgrade must preserve accepted schema identities exactly"
-    );
-    let payloads = |files: &std::collections::BTreeMap<PathBuf, Vec<u8>>| {
-        files
-            .iter()
-            .filter(|(path, _)| path.starts_with("nodes") || path.starts_with("edges"))
-            .map(|(path, bytes)| (path.clone(), bytes.clone()))
-            .collect::<std::collections::BTreeMap<_, _>>()
-    };
-    assert!(!payloads(&before).is_empty());
-    assert_eq!(
-        payloads(&after),
-        payloads(&before),
-        "storage migration must preserve every table object without adding table objects"
-    );
-    let immutable_payloads = |files: &std::collections::BTreeMap<PathBuf, Vec<u8>>| {
-        payloads(files)
-            .into_iter()
-            .filter(|(path, _)| {
-                !path.components().any(|part| {
-                    ["_versions", "_transactions", "_refs"]
-                        .iter()
-                        .any(|name| part.as_os_str() == std::ffi::OsStr::new(name))
-                })
-            })
-            .collect::<std::collections::BTreeMap<_, _>>()
-    };
-    let original_payloads = immutable_payloads(&before);
-    for kind in ["nodes", "edges"] {
-        assert!(original_payloads.keys().any(|path| path.starts_with(kind)));
-    }
-    for check_mode in [true, false] {
-        let mut command = cli();
-        command.args(["upgrade", uri, "--to-format", "8", "--json"]);
-        if check_mode {
-            command.arg("--check");
-        }
-        let report = support::parse_stdout_json(&output_success(&mut command));
-        assert_eq!(report["outcome"], "already_current");
-        assert_eq!(graph_files(&graph), after, "rerun must be effect-free");
-        let mut default_route = cli();
-        default_route.args(["upgrade", uri, "--json"]);
-        if check_mode {
-            default_route.arg("--check");
-        }
-        let completed = support::parse_stdout_json(&output_success(&mut default_route));
-        assert_eq!(completed["target_format"], 13);
-        assert_eq!(completed["target_defaulted"], true);
-        if check_mode {
-            assert_eq!(
-                completed["outcome"], "check_passed",
-                "the default route reaches v13 through the live branches: {completed}"
-            );
-            assert_eq!(
-                graph_files(&graph),
-                after,
-                "the v13 check must be effect-free"
-            );
-        } else {
-            assert_eq!(
-                completed["outcome"], "completed",
-                "the default route takes a branched graph to v13: {completed}"
-            );
-            assert_eq!(completed["completed_handlers"].as_array().unwrap().len(), 3);
-            after = graph_files(&graph);
-            assert_eq!(
-                immutable_payloads(&after),
-                original_payloads,
-                "the complete v6-to-v13 route must preserve every immutable table object"
-            );
-            assert_eq!(completed["work"]["payload_bytes_copied"], 0);
-            assert_eq!(completed["work"]["payload_bytes_rewritten"], 0);
-        }
-        let mut downgrade = cli();
-        downgrade.args(["upgrade", uri, "--to-format", "7", "--json"]);
-        if check_mode {
-            downgrade.arg("--check");
-        }
-        let refused = support::parse_stdout_json(&output_failure(&mut downgrade));
-        assert_ne!(refused["outcome"], "completed");
-        assert_eq!(
-            graph_files(&graph),
-            after,
-            "downgrade refusal must be effect-free"
-        );
-    }
-    for name in ["_schema.pg", "_schema.ir.json", "__schema_state.json"] {
-        assert!(!graph.join(name).exists(), "converted graph retains {name}");
-    }
-    tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let db = Omnigraph::open_read_only(uri).await.unwrap();
-        for branch in ["main", "review"] {
-            db.sync_branch(branch).await.unwrap();
-            assert_eq!(
-                db.schema_source().as_bytes(),
-                before[Path::new("_schema.pg")]
-            );
-            let expected_ir: serde_json::Value =
-                serde_json::from_slice(&before[Path::new("_schema.ir.json")]).unwrap();
-            assert_eq!(
-                serde_json::to_value(db.catalog().bound_schema_ir().unwrap()).unwrap(),
-                expected_ir
-            );
-        }
-    });
-    let refused = support::parse_stdout_json(&output_failure(cli().args([
-        "upgrade",
-        uri,
-        "--check",
-        "--to-format",
-        "8",
-        "--json",
-    ])));
-    assert_eq!(refused["outcome"], "check_failed");
-    assert!(
-        refused["findings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|finding| finding["code"] == "target_below_stamp"),
-        "v8 is below the served floor once the graph is at v13: {refused}"
-    );
-    assert_eq!(
-        graph_files(&graph),
-        after,
-        "the refused downgrade is effect-free"
-    );
-    assert!(
-        !run_old(old, &["snapshot", uri]).status.success(),
-        "predecessor writer must refuse upgraded graph"
-    );
-
-    let current_query = |selector: &str, value: &str, name: &str| {
-        let params = if name == "vectors" {
-            r#"{"q":[0.1,0.2,0.3,0.4]}"#
-        } else {
-            "{}"
-        };
-        let output = output_success(cli().args([
-            "query", name, "--query", query_path, "--store", uri, selector, value, "--params",
-            params, "--json",
-        ]));
-        let mut rows = support::parse_stdout_json(&output)["rows"].clone();
-        normalize_f32_and_nulls(&mut rows);
-        rows
-    };
-    let check_history = |after_maintenance: bool| {
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let db = Omnigraph::open(uri).await.unwrap();
-            for history in &histories {
-                for commit in history.as_array().unwrap() {
-                    let branch = commit["graph_branch"].as_str().unwrap_or("main");
-                    db.sync_branch(branch).await.unwrap();
-                    let version = commit["graph_manifest_version"].as_u64().unwrap();
-                    let numeric = db
-                        .snapshot_at_graph_manifest_version(version)
-                        .await
-                        .unwrap();
-                    let by_id = db
-                        .snapshot_of(ReadTarget::snapshot(omnigraph::db::SnapshotId::new(
-                            commit["graph_commit_id"].as_str().unwrap(),
-                        )))
-                        .await
-                        .unwrap();
-                    assert_eq!(numeric.graph_manifest_version(), version);
-                    assert_eq!(numeric.datasets().count(), by_id.datasets().count());
-                    for entry in numeric.datasets() {
-                        assert!(
-                            entry.same_registration(by_id.dataset(&entry.type_key).unwrap()),
-                            "numeric snapshot and commit selector disagree at {branch}/{version}"
-                        );
-                        if entry.type_key == "node:BinaryAsset" && entry.entity_count != 0 {
-                            let table_uri = format!("{uri}/{}", entry.dataset_path);
-                            let table = lance::Dataset::open(&table_uri).await.unwrap();
-                            let table = if let Some(native) = &entry.native_dataset_branch {
-                                table.checkout_branch(native).await.unwrap()
-                            } else {
-                                table
-                            };
-                            let table = std::sync::Arc::new(
-                                table
-                                    .checkout_version(entry.published_dataset_version)
-                                    .await
-                                    .unwrap(),
-                            );
-                            assert_eq!(table.count_rows(None).await.unwrap(), 1);
-                            assert_eq!(
-                                table
-                                    .schema()
-                                    .field("payload")
-                                    .unwrap()
-                                    .metadata
-                                    .contains_key("omnigraph.stable_property_id"),
-                                has_property_lifetime_metadata
-                            );
-                            let blobs = table.take_blobs_by_indices(&[0], "payload").await.unwrap();
-                            let blob = blobs[0].as_ref().unwrap();
-                            assert_eq!(
-                                blob.read().await.unwrap().as_ref(),
-                                [0, 1, 2, 3, 255],
-                                "retained Blob bytes at {branch}/{version}"
-                            );
-                        }
-                    }
-                }
-            }
-        });
-        for (id, expected) in &historical_rows {
-            assert_eq!(
-                current_query("--snapshot", id, "docs"),
-                expected[0],
-                "retained docs at {id}"
-            );
-            assert_eq!(
-                current_query("--snapshot", id, "edges"),
-                expected[1],
-                "retained edges at {id}"
-            );
-            if !expected[0].as_array().unwrap().is_empty() {
-                let deliverable = tokio::runtime::Runtime::new().unwrap().block_on(async {
-                    let db = Omnigraph::open(uri).await.unwrap();
-                    match db
-                        .read_blob_at(
-                            ReadTarget::snapshot(omnigraph::db::SnapshotId::new(id)),
-                            BlobCell {
-                                entity: EntityKind::Node,
-                                type_name: "BinaryAsset".into(),
-                                id: "blob-sentinel".into(),
-                                property: "payload".into(),
-                            },
-                        )
-                        .await
-                    {
-                        Ok(_) => true,
-                        Err(error) => {
-                            assert!(
-                                after_maintenance && !has_property_lifetime_metadata,
-                                "historical Blob {id}: {error:?}"
-                            );
-                            assert!(
-                                error
-                                    .to_string()
-                                    .contains("no persisted property-lifetime witness"),
-                                "{error:?}"
-                            );
-                            false
-                        }
-                    }
-                });
-                if !deliverable {
-                    let refused = output_failure(cli().args([
-                        "blob",
-                        "get",
-                        "node",
-                        "BinaryAsset",
-                        "blob-sentinel",
-                        "payload",
-                        "--store",
-                        uri,
-                        "--snapshot",
-                        id,
-                    ]));
-                    assert!(
-                        String::from_utf8_lossy(&refused.stderr).contains("invalid Blob selector")
-                    );
-                    continue;
-                }
-                let blob = output_success(cli().args([
-                    "blob",
-                    "get",
-                    "node",
-                    "BinaryAsset",
-                    "blob-sentinel",
-                    "payload",
-                    "--store",
-                    uri,
-                    "--snapshot",
-                    id,
-                ]));
-                assert_eq!(blob.stdout, [0, 1, 2, 3, 255], "retained blob at {id}");
-            }
-        }
-    };
-    for (index, branch) in ["main", "review"].into_iter().enumerate() {
-        let exported = output_success(cli().args(["export", uri, "--branch", branch]));
-        assert_eq!(canonical_export_rows(&exported.stdout), exports[index]);
-        let history = support::parse_stdout_json(&output_success(
-            cli().args(["commit", "list", uri, "--branch", branch, "--json"]),
-        ));
-        for commit in histories[index].as_array().unwrap() {
-            assert!(
-                history["commits"].as_array().unwrap().contains(commit),
-                "retained commit identity and ancestry changed: {commit}"
-            );
-        }
-        let blob = output_success(cli().args([
-            "blob",
-            "get",
-            "node",
-            "BinaryAsset",
-            "blob-sentinel",
-            "payload",
-            "--store",
-            uri,
-            "--branch",
-            branch,
-        ]));
-        assert_eq!(blob.stdout, [0, 1, 2, 3, 255]);
-        assert_eq!(
-            current_query("--branch", branch, "vectors"),
-            serde_json::json!([{"d.slug":"ml-intro"}])
-        );
-    }
-    check_history(false);
-    let stamps = || {
-        ["main", "review"].map(|branch| {
-            support::parse_stdout_json(&output_success(
-                cli().args(["snapshot", uri, "--branch", branch, "--json"]),
-            ))["internal_schema_version"]
-                .clone()
-        })
-    };
-    assert_eq!(
-        stamps(),
-        [13, 13],
-        "the upgrade converts every live branch to v13"
-    );
-    for (branch, after_rebuild) in [("main", [13, 13]), ("review", [13, 13])] {
-        output_success(cli().args([
-            "rebuild-full-text-indexes",
-            uri,
-            "--branch",
-            branch,
-            "--json",
-        ]));
-        assert_eq!(
-            stamps(),
-            after_rebuild,
-            "the rebuild preserves stamp 13 on {branch} and every other live branch"
-        );
-        assert_eq!(
-            current_query("--branch", branch, "terms"),
-            serde_json::json!([{"d.slug":"ml-intro"}])
-        );
-    }
-    output_success(cli().args([
-        "mutate", "revise", "--query", query_path, "--store", uri, "--branch", "review",
-    ]));
-    output_success(cli().args([
-        "branch", "merge", "review", "--into", "main", "--store", uri, "--json",
-    ]));
-    let merged = current_query("--branch", "main", "docs");
-    assert!(merged.as_array().unwrap().iter().any(
-        |row| row["d.slug"] == "dl-basics" && row["d.body"] == "written after storage upgrade"
-    ));
-    assert!(
-        !merged
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|row| row["d.slug"] == "rl-intro")
-    );
-    output_success(cli().args([
-        "cleanup",
-        uri,
-        "--older-than",
-        "7d",
-        "--confirm",
-        "--yes",
-        "--json",
-    ]));
-    check_history(true);
-    assert_eq!(current_query("--branch", "main", "docs"), merged);
-    std::fs::remove_dir_all(&graph).unwrap();
-    let restored = &graph;
-    for (path, bytes) in &before {
-        let destination = restored.join(path);
-        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
-        std::fs::write(destination, bytes).unwrap();
-    }
-    for (index, branch) in ["main", "review"].into_iter().enumerate() {
-        let output = run_old(
-            old,
-            &["export", restored.to_str().unwrap(), "--branch", branch],
-        );
-        assert_ok("whole-root backup restore", &output);
-        assert_eq!(canonical_export_rows(&output.stdout), exports[index]);
-    }
 }
 
 #[test]
@@ -1997,63 +1383,6 @@ fn storage_upgrade_refuses_cluster_path_aliases() {
                 graph_files(&cluster),
                 before,
                 "{alias} must refuse before effects"
-            );
-        }
-    }
-}
-
-#[test]
-fn genuine_v09_storage_upgrade_refuses_ambiguous_branch_names() {
-    let Some(old) = migration_bin("OMNIGRAPH_V09_BIN", "omnigraph 0.9.0") else {
-        return;
-    };
-    for sibling in [false, true] {
-        let temp = tempdir().unwrap();
-        let graph = temp.path().join("legacy.omni");
-        let uri = graph.to_str().unwrap();
-        let schema = temp.path().join("schema.pg");
-        std::fs::write(&schema, "node A { name: String @key }").unwrap();
-        assert_ok(
-            "legacy branch init",
-            &run_old(&old, &["init", "--schema", schema.to_str().unwrap(), uri]),
-        );
-        if sibling {
-            assert_ok(
-                "legacy sibling",
-                &run_old(&old, &["branch", "create", "feature", "--uri", uri]),
-            );
-        }
-        let name = "feature.01ARZ3NDEKTSV4RRFFQ69G5FAV";
-        assert_ok(
-            "legacy suffixed branch",
-            &run_old(&old, &["branch", "create", name, "--uri", uri]),
-        );
-        let before = graph_files(&graph);
-        for (check, target) in [
-            (true, None),
-            (false, None),
-            (true, Some("8")),
-            (false, Some("8")),
-        ] {
-            let mut command = cli();
-            command.args(["upgrade", uri, "--json"]);
-            if check {
-                command.arg("--check");
-            }
-            if let Some(format) = target {
-                command.args(["--to-format", format]);
-            }
-            let report = support::parse_stdout_json(&output_failure(&mut command));
-            assert_eq!(report["outcome"], "check_failed", "{report}");
-            let findings = report["findings"].to_string();
-            assert!(
-                findings.contains("branch identity"),
-                "the v7 -> v8 step refuses the ambiguous lifetime before any effect, on the explicit and the default route: {report}"
-            );
-            assert_eq!(graph_files(&graph), before);
-            assert_ok(
-                "legacy source still opens",
-                &run_old(&old, &["snapshot", uri, "--branch", name]),
             );
         }
     }

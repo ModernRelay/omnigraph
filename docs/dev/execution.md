@@ -402,7 +402,33 @@ inside Lance or Arrow.
 
 `ExpandExec` runs traversal work on `spawn_blocking` with cooperative
 cancellation checks. Dropping its consumer signals that work to stop;
-reservations held by the worker remain alive until it exits. Custom operators
+reservations held by the worker remain alive until it exits. A query-owned
+registration precedes each graph producer and blocking job. The registration
+outlives its captured future, resources and abandoned result, including on
+panic or cancellation. `QueryContext::run_owned` drops the completed execution
+future, closes new root registrations and joins these children before returning
+success, an error or the original panic payload. This includes a panic when
+dropping the completed execution future; successive search passes share the
+same scope. Dropping an embedded caller closes registration while surviving
+children retain their leases. HTTP/MCP read execution stays owned after caller
+disconnect or response timeout, allowing this join to finish.
+After closure a root registration (`QueryWorkScope::register`, which
+`WorkMemory::blocking` takes) is refused; a live child adds workers only through
+its own lease (`QueryWorkLease::child`, `WorkMemory::blocking_owned`).
+This covers OmniGraph's graph workers, not opaque DataFusion tasks or native
+Lance/storage I/O, and cannot authorize engine reuse.
+
+The wait in `run_owned` has no deadline. It ends when every registered worker
+has dropped its lease: a running blocking poll drops it when the poll returns,
+and a cancelled worker stops at its next cooperative `memory.check()`.
+`GraphIndex::build`, the whole-input `lexsort_to_indices` call in the sort
+operator and the hash-join build loop run without a check, so a cancelled
+worker inside one of them finishes that stretch first. An aborted blocking job
+that is still queued holds its lease until the blocking pool dequeues it. The
+`/query` and `/read` routes have no route timeout. No benchmark or timing test
+measures the latency this wait adds to a query that errors or stops early.
+
+Custom operators
 publish output-row and elapsed-compute metrics, with `output_batches` for
 every `ExpandExec` and scan metrics for ANN
 probe/search outcomes. `engine::execute_query` keeps the nearest prefilter
@@ -722,9 +748,21 @@ All load modes share the mutation publisher and recovery protocol:
 | `Append` | Strict insert by exact physical `id`; an existing ID is a typed conflict. The public mode name does not mean a bare Lance Append transaction. |
 | `Merge` | Upsert by exact physical `id`; the last input occurrence wins. |
 
-Mutation and keyed Load reject a table's accumulated input above 8,192 rows or
-32 MiB before recovery is armed. Larger imports must be split into separately
-atomic graph commits; Overwrite remains the initial bulk-replacement path.
+Mutation insert/update and keyed Load retain the per-table limits of 8,192 rows
+and 32 MiB, plus one 32 MiB sum of retained Arrow batches across touched tables.
+The sum uses `get_array_memory_size`, preserving conservative shared-buffer
+counting. Keyed parsing separately caps its decoded-payload estimate across
+types at 32 MiB before retaining each row. External Blob copy admission includes
+the retained keyed batches plus copied payload estimates before payload reads;
+materialized batches are checked again before fragment staging.
+
+Mutation delete, cascading delete and Overwrite replacement removal scan IDs
+incrementally under one 32 MiB allowance per operation, charging UTF-8 bytes
+plus one `String` slot before copying an ID. These checks precede this
+operation's data fragments and publication. They do not bound JSON containers,
+simultaneous conversion copies, predicate/validation state or native scan
+buffers. Overwrite's bulk input retains its existing separate checks and is not
+subject to the keyed row limit. See [writes.md](writes.md#keyed-writes).
 
 `load_graph_batch_as` is the strict graph-level NDJSON boundary. Each nonblank
 line is one logical node or edge envelope; duplicate members, physical fields,

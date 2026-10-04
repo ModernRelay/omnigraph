@@ -22,25 +22,25 @@ For object storage, replace `./company-brain` with the cluster root, for example
 `s3://company-data/omnigraph/company-brain`.
 
 The default bind address is `127.0.0.1:8080`. `--require-all-graphs` makes any
-graph startup failure fatal. Without it, an unhealthy graph is quarantined and
-healthy graphs continue to serve.
+graph startup failure fatal. Otherwise failed graphs remain in the authorized
+inventory as blocked while healthy graphs serve; see [readiness](../deployment.md).
 
-An applied empty cluster serves an empty authorized inventory; no default graph
-is created. `/readyz` reports its applied digest, ledger revision/CAS and zero
-served/quarantined counts. Missing or unapplied state, or a nonempty cluster whose
-graphs all fail, refuses startup. Authentication, policy and data-token root
-checks still apply.
+An applied empty cluster creates no default graph and serves an empty inventory.
+`/readyz` reports its applied digest, ledger revision/CAS and zero graph counts.
+Missing or unapplied state, or a nonempty cluster whose graphs all fail, refuses
+startup. Authentication, policy and data-token root checks still apply.
 
-Applied changes become active after restart. Add or remove graphs with
-`cluster.yaml` and `cluster apply`; there are no runtime graph-create/delete
-routes. An unapplied resource edit does not activate it, although changing or
-breaking the directory's config can change where boot looks for applied state.
+Use `cluster apply --server URL --config DIR` for schema/query changes and graph
+additions without restart. Direct apply requires stopped serving and a subsequent start. Graph deletion and changes to existing runtime
+bindings are outside this deployment class; see [cluster deployments](../clusters/index.md).
+An unapplied resource edit does not activate it, although changing or breaking
+the directory's config can change where boot looks for applied state.
 
 ## HTTP contract
 
 Upgrade the v0.12 CLI, server and HTTP integrations together. Every protected
-request requires exactly one `Omnigraph-Http-Api: 0.12`: graph/registry calls,
-including `/graphs/discovery`, JSON, streams and Blob GET/HEAD. Missing,
+request requires exactly one `Omnigraph-Http-Api: 0.12`: graph, registry and
+cluster-deployment calls, including `/graphs/discovery`, JSON, streams and Blob GET/HEAD. Missing,
 duplicate, combined or unsupported values return `400 api_contract_mismatch`
 after authentication but before graph lookup, body decoding or execution. This
 HTTP identifier is separate from package/storage versions and grants no permission.
@@ -54,7 +54,7 @@ with `--graph`, `default_graph` or `alias.graph`. Migrate graph-qualified server
 URLs to that root plus graph selection; the CLI never guesses a root from a path.
 
 Public `/healthz`, `/readyz` and `/openapi.json` need no header and identify the
-contract in their responses. Before every graph/registry request, the CLI sends
+contract in their responses. Before every graph, registry or deployment request, the CLI sends
 `HEAD /healthz` to that base with a five-second bound, no bearer, body consumption
 or cache. Failure prevents data dispatch. Each request adds one discovery round
 trip; its existing deadline stays separate. Neither request follows redirects
@@ -116,7 +116,7 @@ two explicit profiles:
   `config_manage`, or `admin`.
 
 Every valid identity credential can call `GET /graphs/discovery` for applied
-graph IDs and names (currently identical), including quarantined graphs. It
+graph IDs and names (currently identical), including blocked graphs. It
 requires no policy membership and returns no locations, availability, schema,
 queries or data. Static/restricted credentials cannot use it. `GET /graphs`
 requires `graph_list` permission and, for restricted credentials, a signed
@@ -129,9 +129,9 @@ clock up to 30 seconds ahead, so at most 86,430 seconds can remain on admission.
 Expiry has no grace period. Logout or a permission change at the issuer does
 not revoke an issued token; already accepted operations can finish after
 expiry. Stored-query calls need `invoke_query` plus `read` or `change` for the
-body. An applied policy change takes effect on the next request after server
-activation, using the same identity credential. Schema changes still use
-`cluster apply` and its [current-policy authorization](policy.md#actions);
+body. Existing policy bindings remain fixed across deployments; editing a
+policy source file does not change permissions. Schema changes use
+`cluster apply --server` and its [current-policy authorization](policy.md#actions);
 the identity credential supplies no permission or ownership bypass.
 
 Static credentials can coexist for operator recovery. An exact configured
@@ -187,9 +187,10 @@ The initial MCP tools are `graphs` (IDs and names), `queries` (permitted stored
 read names for one graph), and `query` (a named stored read with parameters and
 an optional branch). Mutation definitions are excluded and cannot be invoked
 through a read tool. These tools use the same actor and Cedar checks as HTTP
-graph requests. A 30-second deadline, 16 concurrent tool calls, 64 KiB request
-body and 1 MiB complete tool result bound this interface. Client cancellation
-cancels the waiting tool call; it does not create a background operation.
+graph requests. Limits are 30 seconds to wait, 16 concurrent executions,
+64 KiB requests and 1 MiB results. Cancelled or expired callers stop waiting;
+execution retains its input and slot until it finishes, with no later result
+lookup. See [admission and shutdown](../deployment.md).
 
 `omnigraph_server::init_tracing()` limits `rmcp` and `rmcp::*` logging to warnings
 and errors even with `RUST_LOG=trace`: verbose SDK logs contain query arguments
@@ -211,6 +212,8 @@ keep their existing routes and do not expose MCP.
 | `GET /openapi.json` | Runtime copy of the OpenAPI document |
 | `GET /graphs` | Graph metadata catalog; requires `graph_list` policy |
 | `GET /graphs/discovery` | Graph IDs and display names only; requires an identity credential |
+| `POST /cluster/deployments` | Submit an exact-ID schema/query deployment or graph addition to the serving owner |
+| `GET /cluster/deployments`, `GET /cluster/deployments/{id}` | Authorized deployment status and current-process activation observation |
 | `GET /.well-known/oauth-protected-resource` | Public OIDC resource metadata; only when OIDC trust is configured |
 | `/mcp` | Stored reads and discovery over MCP; only when OIDC trust is configured |
 | `/graphs/{id}/query`, `/mutate` | Run inline GQ source |
@@ -219,7 +222,7 @@ keep their existing routes and do not expose MCP.
 | `/graphs/{id}/load`, `/load/ndjson` | Bounded batch loading |
 | `/graphs/{id}/blob` | GET/HEAD one Blob cell |
 | `/graphs/{id}/branches` | Branch management and merge |
-| `/graphs/{id}/snapshot`, `/commits` | Snapshot, history, and per-commit changes |
+| `/graphs/{id}/snapshot`, `/commits` | Snapshot (`internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version), history, and per-commit changes |
 | `/graphs/{id}/changes` | Poll a branch feed or establish a baseline |
 | `/graphs/{id}/schema` | Show the accepted schema |
 | `/graphs/{id}/export` | Stream a branch snapshot as JSONL |
@@ -236,7 +239,8 @@ clients should use `/query`, `/mutate`, and `/load`.
 
 `POST /graphs/{id}/schema/apply` remains in the wire surface for compatibility,
 but a cluster-only server rejects it with `409`. Change a managed graph's
-schema through `cluster apply`.
+schema through `cluster apply --server URL --config DIR`; see
+[cluster deployments](../clusters/index.md#deploy-without-restarting).
 
 ## Run an inline query
 
@@ -322,7 +326,8 @@ modes.
 
 `GET`/`HEAD /graphs/{id}/blob` select a cell by `entity`, `type`, `id` and
 `property`. They support managed ranges/ETag conditions and report external
-references without fetching them. See [Blob values](../blobs.md) for details.
+references without fetching them. See [Blob values](../blobs.md) for details
+and [Blob limits](../blobs.md#limits).
 
 ## Changes and baselines
 
@@ -336,14 +341,10 @@ pagination, checkpointing and recovery.
 ## Errors and retries
 
 Application errors preserve structured details. Admission limits use `429` with
-`Retry-After`; size limits use `413`, and closed admission or pending schema
-completion can use `503`. Admitted writes continue after disconnect. Only the
+`Retry-After`; size limits use `413`, and blocked graphs or closed admission use
+`503`. Admitted writes continue after disconnect. Only the
 CLI's qualified whole-command admission refusal permits exit 75 and caller retry;
 generic 409/503 and lost responses do not. See [failure outcomes](troubleshooting.md#failed-data-write-commands).
 
-## Deployment notes
-
-Terminate TLS at a trusted reverse proxy or platform edge. Keep storage
-credentials and bearer tokens in a secret manager, not cluster source files.
-For S3 and Azure credential requirements, container examples, and Azure's
-single-writer admission requirement, see [Deployment](../deployment.md).
+For TLS, secrets, storage credentials, container examples and Azure admission,
+see [Deployment](../deployment.md).

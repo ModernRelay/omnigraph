@@ -1240,7 +1240,7 @@ async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
     let ndjson = "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n{\"type\":\"Person\",\"data\":{\"name\":\"Grace\"}}\n";
     std::fs::write(&batch, ndjson).unwrap();
     let commit = json!({"graph_commit_id":"head-load","graph_branch":"review","graph_manifest_version":7,"parent_commit_id":"before","merged_parent_commit_id":null,"actor_id":"principal:alice","created_at":12345});
-    let reply = json!({"branch":"review","base_branch":"main","branch_created":true,"mode":"append","nodes":[{"name":"Person","entities_loaded":2}],"edges":[],"total_entities":2,"actor_id":"principal:alice","commit":commit});
+    let reply = json!({"branch":"review","base_branch":"main","branch_created":true,"mode":"append","nodes":[{"name":"Person","entities_loaded":2}],"edges":[],"total_entities":2,"embedding_generation":null,"actor_id":"principal:alice","commit":commit});
     // This is a real response past the ordinary managed 30-second deadline.
     // The request-construction owner separately pins load's 300-second ceiling.
     let server = IntentApiFixture::graph_with_response_delay(

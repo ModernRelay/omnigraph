@@ -2,6 +2,7 @@
 // RNG); without the flag the lib compiles EMPTY, so this file must vanish
 // with it or the build fails on unresolved imports.
 #![cfg(tokio_unstable)]
+#![recursion_limit = "256"]
 
 //! DST scenario suite — an omnigraph graph living entirely in memory.
 //!
@@ -1129,47 +1130,8 @@ fn dst_v11_fault_injection_atomicity_and_replay() {
     }
 }
 
-/// Legacy upgrade is the remaining consumer of schema-file text. Serve an
-/// actual older source value during execution, require refusal before a fence,
-/// replay every counter/result, then upgrade successfully after weather stops.
-#[test]
-#[serial]
-fn dst_legacy_upgrade_staleness_bite_and_replay() {
-    use omnigraph_dst::harness::{FaultPlan, run_legacy_upgrade_read_weather};
-
-    let plan = FaultPlan {
-        seed: 27_800,
-        stale_read_pct: 100,
-        max_lag_ticks: 1,
-        ..Default::default()
-    };
-    let a = run_legacy_upgrade_read_weather(
-        "shared-memory://dst-upgrade-stale-a",
-        278,
-        plan.clone(),
-        4,
-        true,
-    );
-    let b =
-        run_legacy_upgrade_read_weather("shared-memory://dst-upgrade-stale-b", 278, plan, 4, true);
-    assert_eq!(a, b, "legacy upgrade stale reads must replay identically");
-    assert!(
-        a.stale_reads_served > 0,
-        "stale source bytes must reach preflight"
-    );
-    assert_eq!(a.checks_failed, 4);
-    assert_eq!(a.checks_passed, 0);
-    assert!(!a.detections.is_empty());
-    assert!(a.missing_ir_refused);
-    assert!(
-        !a.final_rows.is_empty(),
-        "clean upgrade must preserve readable data"
-    );
-}
-
 /// Historical instrument for adapter-read schedules, excluded from the suite.
-/// Current serving no longer reads schema files; the legacy upgrade pin above
-/// owns schema-file staleness coverage.
+/// Current serving no longer reads schema files.
 #[test]
 #[serial]
 #[ignore = "instrument: bounded-staleness seed search — run explicitly"]
@@ -1518,110 +1480,6 @@ fn dst_fault_storm_on_one_live_handle_keeps_writing() {
         "the same handle must publish model-changing data after a delivered fault: {a:?}"
     );
     assert!(a.verified > 0);
-}
-
-/// Read-time bit rot and truncation reach real legacy upgrade validation.
-/// Moderate weather must admit clean checks alongside attributed refusals;
-/// full object, data and lineage oracles remain independent of the decorator.
-#[test]
-#[serial]
-fn dst_legacy_upgrade_read_corruption_bite_and_replay() {
-    use omnigraph_dst::harness::{FaultPlan, run_legacy_upgrade_read_weather};
-
-    let plan = FaultPlan {
-        seed: 8300,
-        corrupt_read_pct: 8,
-        truncate_read_pct: 5,
-        ..Default::default()
-    };
-    let a = run_legacy_upgrade_read_weather(
-        "shared-memory://dst-upgrade-corrupt-a",
-        83,
-        plan.clone(),
-        30,
-        false,
-    );
-    let b = run_legacy_upgrade_read_weather(
-        "shared-memory://dst-upgrade-corrupt-b",
-        83,
-        plan,
-        30,
-        false,
-    );
-    assert_eq!(a, b, "legacy upgrade corruption must replay identically");
-    assert!(
-        a.reads_corrupted + a.reads_truncated > 0,
-        "weather must deliver damage"
-    );
-    assert!(
-        a.checks_failed > 0,
-        "damage must flip at least one admission result"
-    );
-    assert!(
-        a.checks_passed > 0,
-        "moderate weather must also allow clean admission"
-    );
-    assert!(!a.detections.is_empty());
-    assert!(a.missing_ir_refused);
-    assert!(!a.final_rows.is_empty());
-}
-
-/// Fresh fixtures keep latent errors from hiding other verbs; each must deliver
-/// and cause typed refusal. Truncation and latent cells require execution to
-/// refuse before a fence; bit-rot checks permit harmless changed text.
-#[test]
-#[serial]
-fn dst_legacy_upgrade_corruption_detections_attributed() {
-    use omnigraph_dst::harness::{FaultPlan, run_legacy_upgrade_read_weather};
-
-    for verb in ["bitrot", "truncate", "latent"] {
-        let plan = FaultPlan {
-            seed: 8900,
-            corrupt_read_pct: if verb == "bitrot" { 100 } else { 0 },
-            truncate_read_pct: if verb == "truncate" { 100 } else { 0 },
-            latent_read_pct: if verb == "latent" { 100 } else { 0 },
-            ..Default::default()
-        };
-        let execute = verb != "bitrot";
-        let a = run_legacy_upgrade_read_weather(
-            &format!("shared-memory://dst-upgrade-{verb}-a"),
-            89,
-            plan.clone(),
-            4,
-            execute,
-        );
-        let b = run_legacy_upgrade_read_weather(
-            &format!("shared-memory://dst-upgrade-{verb}-b"),
-            89,
-            plan,
-            4,
-            execute,
-        );
-        assert_eq!(
-            a, b,
-            "{verb} legacy upgrade refusals must replay identically"
-        );
-        let delivered = match verb {
-            "bitrot" => a.reads_corrupted,
-            "truncate" => a.reads_truncated,
-            "latent" => a.latent_errors,
-            _ => unreachable!(),
-        };
-        assert!(delivered > 0, "{verb} must deliver");
-        assert!(
-            a.checks_failed > 0,
-            "{verb} must alter an engine admission result"
-        );
-        assert!(
-            !a.detections.is_empty(),
-            "{verb} must have attributed refusals"
-        );
-        assert!(a.missing_ir_refused);
-        assert!(
-            !a.final_rows.is_empty(),
-            "clean retry must finish conversion"
-        );
-    }
 }
 
 /// Additive schema applies interleave the seeded workload and publish their

@@ -1,7 +1,7 @@
 # issue: none
 # red_on: 2026-09-08, PR 662 @ 2850d86f: `branch merge hotfix into feature` failed with `merge target ref … already exists … refusing to claim unowned physical state`.
 # notes: After feature adopts main, merging hotfix must reclaim feature's former fork.
-# notes: hotfix forks from main, so this is a three-way merge with an unchanged target.
+# notes: hotfix forks from main and feature still holds main's state, so the merge fast-forwards.
 # notes: bob proves the reclaimed fork starts from main's lineage.
 
 --- runner
@@ -70,7 +70,7 @@ query hotfix_write() {
 --- mutate
 branch merge hotfix into feature
 
---- expect outcome: merged
+--- expect outcome: fast_forward
 
 --- query branch: feature
 query feature_reads_hotfix() {

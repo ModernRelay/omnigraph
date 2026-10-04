@@ -18,7 +18,7 @@ use datafusion::prelude::{col, lit};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::BlobFile;
-use lance::datatypes::BlobHandling;
+use lance::datatypes::{BlobHandling, Field};
 use lance_core::datatypes::BlobKind;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -81,6 +81,46 @@ pub struct ExternalBlobRef {
     pub uri: String,
     pub offset: u64,
     pub length: Option<u64>,
+}
+
+impl ExternalBlobRef {
+    /// The URI when the descriptor names its whole object. A ranged descriptor
+    /// is refused: a whole-object surface would widen it to bytes outside the
+    /// cell.
+    pub fn whole_object_uri(&self) -> std::result::Result<&str, RangedExternalBlob> {
+        if self.offset != 0 || self.length.is_some() {
+            Err(RangedExternalBlob {
+                offset: self.offset,
+                length: self.length,
+            })
+        } else {
+            Ok(&self.uri)
+        }
+    }
+}
+
+/// A persisted external descriptor naming a byte range. A whole-object surface
+/// (redirect, URI export, Lance's minimal logical Blob input) cannot carry it;
+/// widening it to the whole object would return bytes outside the cell.
+/// Display never includes the URI, which may carry credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangedExternalBlob {
+    pub offset: u64,
+    pub length: Option<u64>,
+}
+
+impl fmt::Display for RangedExternalBlob {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "ranged external Blob descriptor (offset {}, ",
+            self.offset
+        )?;
+        match self.length {
+            Some(length) => write!(formatter, "length {length})"),
+            None => formatter.write_str("no recorded length)"),
+        }
+    }
 }
 
 /// Snapshot-pinned, bounded reader for one managed Blob value.
@@ -256,6 +296,80 @@ impl ExternalBlobBase {
     fn lexical_normalized(&self) -> Result<NormalizedExternalUri> {
         NormalizedExternalUri::parse(&self.uri, UriRole::Base)
     }
+
+    /// Refuse a base that contains, or lies inside, an OmniGraph storage root.
+    ///
+    /// Blob ingress reads with the process's storage principal, so a base over
+    /// a graph or cluster root would let any authorized writer copy manifest,
+    /// table, or cluster-ledger bytes into a managed cell that Cedar then
+    /// serves as graph data. Both the operator spelling and the canonical
+    /// filesystem form are compared against every form of the root; the error
+    /// names the base only, never the root. A base whose scheme cannot name
+    /// the root's storage kind is disjoint without the root being rendered.
+    pub fn ensure_disjoint_from_storage_root(
+        &self,
+        storage_root: &str,
+    ) -> std::result::Result<(), StorageRootConflict> {
+        let bases = [
+            self.lexical_normalized()
+                .map_err(StorageRootConflict::InvalidPolicy)?,
+            self.normalized()
+                .map_err(StorageRootConflict::InvalidPolicy)?,
+        ];
+        let roots = NormalizedExternalUri::storage_root_forms(storage_root, &bases[0].scheme)
+            .map_err(
+                |UncomparableStorageRoot| StorageRootConflict::UncomparableRoot {
+                    base: self.uri.clone(),
+                },
+            )?;
+        let overlaps = bases
+            .iter()
+            .any(|base| roots.iter().any(|root| base.overlaps_base(root)));
+        if overlaps {
+            return Err(StorageRootConflict::Overlap {
+                base: self.uri.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Why a policy is refused by a storage-root disjointness check.
+#[derive(Debug)]
+pub enum StorageRootConflict {
+    /// The base contains, or lies inside, the storage root.
+    Overlap { base: String },
+    /// The base's scheme can name the root's storage kind, and the root has
+    /// no form to compare with it. Moving the base cannot clear this.
+    UncomparableRoot { base: String },
+    /// The base or its policy failed its own validation before any comparison.
+    InvalidPolicy(OmniError),
+}
+
+impl std::fmt::Display for StorageRootConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Overlap { base } => write!(
+                formatter,
+                "external Blob base '{base}' overlaps an OmniGraph storage root; bases must name storage outside every graph and cluster root"
+            ),
+            Self::UncomparableRoot { base } => write!(
+                formatter,
+                "the storage root cannot be compared with external Blob base '{base}': the root is spelled with a path component or scheme that has no base URI form, so disjointness cannot be proven"
+            ),
+            Self::InvalidPolicy(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl StorageRootConflict {
+    /// The policy error an engine handle returns for this conflict.
+    pub fn into_error(self) -> OmniError {
+        match self {
+            Self::InvalidPolicy(error) => error,
+            refused => policy_error(refused.to_string()),
+        }
+    }
 }
 
 /// Graph-level trust policy for new external Blob references.
@@ -342,6 +456,22 @@ impl ExternalBlobPolicy {
             Self::Deny => &[],
             Self::Allow { bases } => bases,
         }
+    }
+
+    /// Refuse a policy with any base overlapping `storage_root`, the root of a
+    /// graph or of the cluster that stores it. Bases are validated again first
+    /// so a deserialized policy regains its canonical filesystem forms.
+    pub fn ensure_disjoint_from_storage_root(
+        &self,
+        storage_root: &str,
+    ) -> std::result::Result<(), StorageRootConflict> {
+        let validated = self
+            .validated()
+            .map_err(StorageRootConflict::InvalidPolicy)?;
+        for base in validated.bases() {
+            base.ensure_disjoint_from_storage_root(storage_root)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn authorize(&self, uri: &str) -> Result<NormalizedExternalBlobUri> {
@@ -525,6 +655,55 @@ impl NormalizedExternalUri {
         })
     }
 
+    /// Base-shaped forms of a storage root that a base in `base_scheme` can
+    /// overlap: none when that scheme cannot name the root's storage kind, the
+    /// one spelling of an S3 root, the lexical and canonical forms of a local root.
+    fn storage_root_forms(
+        root: &str,
+        base_scheme: &str,
+    ) -> std::result::Result<Vec<Self>, UncomparableStorageRoot> {
+        // In-memory and DST shared-memory roots hold nothing a `file` or `s3`
+        // base can name; the storage layer refuses the first and admits the
+        // second only in DST builds, so both prefixes are recognized here.
+        if root.starts_with("memory://") || root.starts_with("shared-memory://") {
+            return Ok(Vec::new());
+        }
+        let kind =
+            omnigraph_storage::storage_kind_for_uri(root).map_err(|_| UncomparableStorageRoot)?;
+        let root_scheme = match kind {
+            omnigraph_storage::StorageKind::S3 => "s3",
+            omnigraph_storage::StorageKind::Local => "file",
+            omnigraph_storage::StorageKind::Azure => return Ok(Vec::new()),
+        };
+        if base_scheme != root_scheme {
+            return Ok(Vec::new());
+        }
+        let form = |uri: &str| Self::parse(uri, UriRole::Base).map_err(|_| UncomparableStorageRoot);
+        let directory_form = |path: &std::path::Path| {
+            let uri = url::Url::from_directory_path(path).map_err(|_| UncomparableStorageRoot)?;
+            form(uri.as_str())
+        };
+        let path = match kind {
+            omnigraph_storage::StorageKind::S3 => {
+                return Ok(vec![form(&format!("{}/", root.trim_end_matches('/')))?]);
+            }
+            _ if root.starts_with("file://") => url::Url::parse(root)
+                .ok()
+                .and_then(|parsed| parsed.to_file_path().ok())
+                .ok_or(UncomparableStorageRoot)?,
+            _ => std::path::PathBuf::from(root),
+        };
+        let absolute =
+            omnigraph_storage::absolutize_lexically(path).map_err(|_| UncomparableStorageRoot)?;
+        let canonical = canonical_existing_prefix(&absolute).ok_or(UncomparableStorageRoot)?;
+        let mut forms = vec![directory_form(&absolute)?];
+        let canonical = directory_form(&canonical)?;
+        if canonical != forms[0] {
+            forms.push(canonical);
+        }
+        Ok(forms)
+    }
+
     fn canonical_file_base(self) -> Result<Self> {
         let uri = self.uri();
         let path = file_path_from_normalized_uri(&uri)?;
@@ -636,6 +815,40 @@ fn reject_raw_dot_path_components(raw: &str) -> Result<()> {
     Ok(())
 }
 
+/// A storage root with no base-shaped form to compare a same-kind base with.
+#[derive(Debug)]
+struct UncomparableStorageRoot;
+
+/// The deepest existing ancestor of `absolute` resolved through symlinks, the
+/// missing suffix appended unchanged. `None` when an ancestor fails to resolve
+/// for any reason other than being absent.
+fn canonical_existing_prefix(absolute: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut ancestor = absolute;
+    let mut suffix = Vec::new();
+    loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(mut canonical) => {
+                for component in suffix.iter().rev() {
+                    canonical.push(component);
+                }
+                return Some(canonical);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(_) => return None,
+        }
+        let mut components = ancestor.components();
+        match components.next_back()? {
+            std::path::Component::Normal(name) => suffix.push(name.to_os_string()),
+            _ => return None,
+        }
+        ancestor = components.as_path();
+    }
+}
+
 fn file_path_from_normalized_uri(uri: &str) -> Result<std::path::PathBuf> {
     url::Url::parse(uri)
         .ok()
@@ -705,6 +918,21 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+/// The first Blob field of `schema` below the top level, if any. Such a field
+/// has no top-level descriptor column, so a descriptor scan cannot see it.
+pub(crate) fn nested_blob_field(schema: &lance::datatypes::Schema) -> Option<&Field> {
+    fn below(field: &Field) -> Option<&Field> {
+        field.children.iter().find_map(|child| {
+            if child.is_blob() {
+                Some(child)
+            } else {
+                below(child)
+            }
+        })
+    }
+    schema.fields.iter().find_map(below)
 }
 
 /// Logical state decoded from one persisted Blob-v2 descriptor.
@@ -910,6 +1138,14 @@ impl<'a> BlobDescriptorDecoder<'a> {
                         "external row {row} blob_uri is not an absolute URI: {error}"
                     ))
                 })?;
+                // Lance's external reader substitutes the object size for size 0
+                // but keeps the position, so offset > 0 with size 0 would read
+                // past the object's end.
+                if size == 0 && position != 0 {
+                    return Err(malformed_descriptor(format!(
+                        "external row {row} has offset {position} with size 0; a whole-object reference has offset 0"
+                    )));
+                }
                 Ok(BlobDescriptor::External {
                     uri: blob_uri.to_owned(),
                     offset: position,
@@ -1714,6 +1950,314 @@ mod tests {
         );
     }
 
+    fn assert_overlaps_storage_root(result: std::result::Result<(), StorageRootConflict>) {
+        let conflict = result.expect_err("expected an overlap refusal");
+        assert!(
+            matches!(conflict, StorageRootConflict::Overlap { .. }),
+            "expected an overlap refusal, got {conflict:?}"
+        );
+        match conflict.into_error() {
+            OmniError::ExternalBlobPolicy { uri, reason } => {
+                assert_eq!(uri, "<redacted>");
+                assert!(
+                    reason.contains("overlaps an OmniGraph storage root"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected a policy error, got {other:?}"),
+        }
+    }
+
+    fn assert_uncomparable_storage_root(result: std::result::Result<(), StorageRootConflict>) {
+        let conflict = result.expect_err("expected an uncomparable-root refusal");
+        assert!(
+            matches!(conflict, StorageRootConflict::UncomparableRoot { .. }),
+            "expected an uncomparable-root refusal, got {conflict:?}"
+        );
+        let message = conflict.to_string();
+        assert!(
+            message.contains("storage root cannot be compared") && !message.contains("overlaps"),
+            "{message}"
+        );
+    }
+
+    /// Every URI scheme [`NormalizedExternalUri::parse`] admits for a base;
+    /// `storage_root_forms` must yield comparable forms for a root in each.
+    const EXTERNAL_BASE_SCHEMES: [&str; 2] = ["s3", "file"];
+
+    #[test]
+    fn storage_root_forms_cover_every_base_scheme() {
+        let directory = tempfile::tempdir().unwrap();
+        let file_root = url::Url::from_directory_path(directory.path()).unwrap();
+        for scheme in EXTERNAL_BASE_SCHEMES {
+            let root = match scheme {
+                "s3" => "s3://bucket/cluster".to_string(),
+                "file" => file_root.to_string(),
+                other => panic!("no storage root sample for base scheme '{other}'"),
+            };
+            assert!(
+                !NormalizedExternalUri::storage_root_forms(&root, scheme)
+                    .unwrap()
+                    .is_empty(),
+                "a '{scheme}' storage root must yield comparable forms"
+            );
+            for other in EXTERNAL_BASE_SCHEMES
+                .iter()
+                .filter(|other| **other != scheme)
+            {
+                assert!(
+                    NormalizedExternalUri::storage_root_forms(&root, other)
+                        .unwrap()
+                        .is_empty(),
+                    "a '{other}' base cannot name a '{scheme}' storage root"
+                );
+            }
+        }
+        for root in ["s3://b", "s3://b/", "s3://b/c"] {
+            assert_eq!(
+                NormalizedExternalUri::storage_root_forms(root, "s3")
+                    .unwrap()
+                    .len(),
+                1,
+                "{root}"
+            );
+        }
+        for scheme in EXTERNAL_BASE_SCHEMES {
+            for root in [
+                "az://container/c",
+                "memory://graph",
+                "shared-memory://universe/g",
+            ] {
+                assert!(
+                    NormalizedExternalUri::storage_root_forms(root, scheme)
+                        .unwrap()
+                        .is_empty(),
+                    "{root}"
+                );
+            }
+            for root in ["gs://bucket/graph", "og://graph", "S3://bucket/graph"] {
+                assert!(
+                    matches!(
+                        NormalizedExternalUri::storage_root_forms(root, scheme),
+                        Err(UncomparableStorageRoot)
+                    ),
+                    "{root}: a scheme the storage layer does not recognize must fail closed"
+                );
+            }
+        }
+    }
+
+    /// An absolute local path may contain `://`: `/tmp/og://graph` names the
+    /// directory `graph` inside a directory literally called `og:`. It is a
+    /// local root, compared like any other, not a URI with scheme `/tmp/og`.
+    #[test]
+    fn external_blob_base_must_be_disjoint_from_local_root_spelled_with_scheme_separator() {
+        let directory = tempfile::tempdir().unwrap();
+        let colon_dir = directory.path().join("og:");
+        let graph = colon_dir.join("graph");
+        let external = directory.path().join("external");
+        std::fs::create_dir_all(&graph).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let root = format!("{}/og://graph", directory.path().display());
+        assert!(root.contains("://"));
+        assert!(
+            !NormalizedExternalUri::storage_root_forms(&root, "file")
+                .unwrap()
+                .is_empty()
+        );
+        let base = |path: &std::path::Path| {
+            ExternalBlobBase::new(
+                url::Url::from_directory_path(path).unwrap().as_str(),
+                ExternalBlobExecutionScope::EmbeddedOnly,
+            )
+            .unwrap()
+        };
+        for overlapping in [directory.path(), colon_dir.as_path(), graph.as_path()] {
+            assert_overlaps_storage_root(
+                base(overlapping).ensure_disjoint_from_storage_root(&root),
+            );
+        }
+        base(&external)
+            .ensure_disjoint_from_storage_root(&root)
+            .unwrap();
+    }
+
+    #[test]
+    fn external_blob_base_must_be_disjoint_from_s3_storage_roots() {
+        let base =
+            |uri: &str| ExternalBlobBase::new(uri, ExternalBlobExecutionScope::ServerSafe).unwrap();
+        for (uri, root) in [
+            ("s3://b/", "s3://b/c"),
+            ("s3://b/c/", "s3://b"),
+            ("s3://b/anything/", "s3://b/"),
+            ("s3://b/c/graphs/x.omni/", "s3://b/c"),
+            ("s3://b/c/__cluster/", "s3://b/c/"),
+            ("s3://B/c/graphs/", "s3://b/c"),
+        ] {
+            assert_overlaps_storage_root(base(uri).ensure_disjoint_from_storage_root(root));
+        }
+        for (uri, root) in [
+            ("s3://b/c-external/", "s3://b/c"),
+            ("s3://other/c/", "s3://b/c"),
+            ("s3://b/c/", "az://b/c"),
+        ] {
+            base(uri).ensure_disjoint_from_storage_root(root).unwrap();
+        }
+        let policy = ExternalBlobPolicy::allow(vec![
+            base("s3://b/c-external/"),
+            base("s3://b/c/graphs/x.omni/"),
+        ])
+        .unwrap();
+        assert_overlaps_storage_root(policy.ensure_disjoint_from_storage_root("s3://b/c"));
+        ExternalBlobPolicy::Deny
+            .ensure_disjoint_from_storage_root("s3://b/c")
+            .unwrap();
+    }
+
+    #[test]
+    fn external_blob_base_must_be_disjoint_from_local_storage_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("cluster");
+        let external = directory.path().join("cluster-external");
+        std::fs::create_dir_all(root.join("graphs").join("x.omni")).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let base = |path: &std::path::Path| {
+            ExternalBlobBase::new(
+                url::Url::from_directory_path(path).unwrap().as_str(),
+                ExternalBlobExecutionScope::EmbeddedOnly,
+            )
+            .unwrap()
+        };
+        let plain_root = root.to_str().unwrap();
+        let file_root = url::Url::from_directory_path(&root).unwrap().to_string();
+        let dotted_root = format!("{}/graphs/../", root.display());
+        for storage_root in [plain_root, file_root.as_str(), dotted_root.as_str()] {
+            for overlapping in [
+                directory.path().to_path_buf(),
+                root.clone(),
+                root.join("graphs").join("x.omni"),
+            ] {
+                assert_overlaps_storage_root(
+                    base(&overlapping).ensure_disjoint_from_storage_root(storage_root),
+                );
+            }
+            base(&external)
+                .ensure_disjoint_from_storage_root(storage_root)
+                .unwrap();
+        }
+        // A root that does not exist yet still compares through its existing
+        // ancestors.
+        let future_root = directory.path().join("future").join("graph.omni");
+        assert_overlaps_storage_root(
+            base(directory.path()).ensure_disjoint_from_storage_root(future_root.to_str().unwrap()),
+        );
+        base(&external)
+            .ensure_disjoint_from_storage_root(future_root.to_str().unwrap())
+            .unwrap();
+    }
+
+    fn embedded_base(path: &std::path::Path) -> ExternalBlobBase {
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(path).unwrap().as_str(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap()
+    }
+
+    fn server_base(uri: &str) -> ExternalBlobBase {
+        ExternalBlobBase::new(uri, ExternalBlobExecutionScope::ServerSafe).unwrap()
+    }
+
+    /// The storage adapter folds `..` lexically, so `<dir>/link/../cluster`
+    /// is written at `<dir>/cluster` whatever `link` points to.
+    #[cfg(unix)]
+    #[test]
+    fn local_root_spelled_through_symlink_and_parent_is_compared_where_storage_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let cluster = directory.path().join("cluster");
+        let link_target = directory.path().join("volume").join("sub");
+        let physical_sibling = directory.path().join("volume").join("cluster");
+        for path in [&cluster, &link_target, &physical_sibling] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::os::unix::fs::symlink(&link_target, directory.path().join("link")).unwrap();
+        let root = format!("{}/link/../cluster", directory.path().display());
+
+        assert_overlaps_storage_root(
+            embedded_base(&cluster).ensure_disjoint_from_storage_root(&root),
+        );
+        embedded_base(&physical_sibling)
+            .ensure_disjoint_from_storage_root(&root)
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_root_behind_a_symlink_loop_is_uncomparable() {
+        let directory = tempfile::tempdir().unwrap();
+        let external = directory.path().join("external");
+        std::fs::create_dir_all(&external).unwrap();
+        let looped = directory.path().join("loop");
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        let root = looped.join("cluster");
+
+        assert_uncomparable_storage_root(
+            embedded_base(&external).ensure_disjoint_from_storage_root(root.to_str().unwrap()),
+        );
+    }
+
+    #[test]
+    fn base_whose_scheme_cannot_name_the_root_storage_kind_is_disjoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let percent_root = directory.path().join("a%b").join("cluster");
+        server_base("s3://bucket/assets/")
+            .ensure_disjoint_from_storage_root(percent_root.to_str().unwrap())
+            .unwrap();
+        embedded_base(directory.path())
+            .ensure_disjoint_from_storage_root("s3://b/a//c")
+            .unwrap();
+    }
+
+    /// A base may not hold a percent sign or an empty component, so no `file`
+    /// base lies under `<dir>/a%b` and the refused bases are an ancestor of
+    /// the local root and bases beside the S3 root.
+    #[test]
+    fn same_kind_root_without_a_comparable_form_is_uncomparable() {
+        let directory = tempfile::tempdir().unwrap();
+        let percent_root = directory.path().join("a%b").join("cluster");
+        assert_uncomparable_storage_root(
+            embedded_base(directory.path())
+                .ensure_disjoint_from_storage_root(percent_root.to_str().unwrap()),
+        );
+        for base in ["s3://b/a/", "s3://b/elsewhere/", "s3://other/a/"] {
+            assert_uncomparable_storage_root(
+                server_base(base).ensure_disjoint_from_storage_root("s3://b/a//c"),
+            );
+        }
+        let policy = ExternalBlobPolicy::allow(vec![server_base("s3://b/elsewhere/")]).unwrap();
+        assert_uncomparable_storage_root(policy.ensure_disjoint_from_storage_root("s3://b/a//c"));
+    }
+
+    #[test]
+    fn invalid_policy_is_not_reported_as_a_storage_root_conflict() {
+        let unvalidated = ExternalBlobPolicy::Allow { bases: Vec::new() };
+        assert!(matches!(
+            unvalidated.ensure_disjoint_from_storage_root("s3://b/c"),
+            Err(StorageRootConflict::InvalidPolicy(
+                OmniError::ExternalBlobPolicy { .. }
+            ))
+        ));
+        let unparsable = ExternalBlobBase {
+            uri: "s3://b/c//d/".to_string(),
+            scope: ExternalBlobExecutionScope::ServerSafe,
+            canonical_uri: None,
+        };
+        assert!(matches!(
+            unparsable.ensure_disjoint_from_storage_root("s3://b/c"),
+            Err(StorageRootConflict::InvalidPolicy(_))
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn external_blob_file_policy_rejects_symlink_escape() {
@@ -1932,6 +2476,52 @@ mod tests {
         let decoder = BlobDescriptorDecoder::try_new(&overflow).unwrap();
         assert_blob_integrity(decoder.classify(0).unwrap_err(), "overflows");
         assert_blob_integrity(decoder.classify(1).unwrap_err(), "outside");
+
+        let offset_without_length =
+            descriptor(Some(3), Some(4), Some(0), Some(0), Some("s3://b/o"));
+        let decoder = BlobDescriptorDecoder::try_new(&offset_without_length).unwrap();
+        assert_blob_integrity(
+            decoder.classify(0).unwrap_err(),
+            "external row 0 has offset 4 with size 0",
+        );
+    }
+
+    #[test]
+    fn whole_object_uri_refuses_a_ranged_descriptor_without_naming_it() {
+        let whole = ExternalBlobRef {
+            uri: "s3://bucket/object".to_string(),
+            offset: 0,
+            length: None,
+        };
+        assert_eq!(whole.whole_object_uri().unwrap(), "s3://bucket/object");
+        for (offset, length, display) in [
+            (
+                4,
+                Some(8),
+                "ranged external Blob descriptor (offset 4, length 8)",
+            ),
+            (
+                4,
+                None,
+                "ranged external Blob descriptor (offset 4, no recorded length)",
+            ),
+            (
+                0,
+                Some(8),
+                "ranged external Blob descriptor (offset 0, length 8)",
+            ),
+        ] {
+            let ranged = ExternalBlobRef {
+                uri: "s3://user:secret@bucket/object?signature=private".to_string(),
+                offset,
+                length,
+            };
+            let refused = ranged.whole_object_uri().unwrap_err();
+            assert_eq!(refused, RangedExternalBlob { offset, length });
+            let message = refused.to_string();
+            assert_eq!(message, display);
+            assert!(!message.contains("secret") && !message.contains("bucket"));
+        }
     }
 
     #[test]

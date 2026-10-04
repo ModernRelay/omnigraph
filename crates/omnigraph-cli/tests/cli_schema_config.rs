@@ -302,6 +302,33 @@ fn schema_apply_human_reports_noop() {
     assert!(stdout.contains("applied: no"));
     assert!(stdout.contains("graph_manifest_version:"));
     assert!(stdout.contains("no schema changes"));
+
+    let source_only = temp.path().join("commented.pg");
+    fs::write(
+        &source_only,
+        format!(
+            "// Updated schema documentation.\n{}",
+            fs::read_to_string(&schema_path).unwrap()
+        ),
+    )
+    .unwrap();
+    let stdout = stdout_string(&output_success(
+        cli()
+            .args(["schema", "apply", "--schema"])
+            .arg(&source_only)
+            .arg(&graph),
+    ));
+    assert!(stdout.contains("applied: yes"), "{stdout}");
+    assert!(stdout.contains("schema source updated"), "{stdout}");
+    assert!(!stdout.contains("no schema changes"), "{stdout}");
+
+    let plan = stdout_string(&output_success(
+        cli()
+            .args(["schema", "plan", "--schema"])
+            .arg(&source_only)
+            .arg(&graph),
+    ));
+    assert!(plan.contains("no table migration steps"), "{plan}");
 }
 
 #[test]
@@ -488,7 +515,7 @@ fn schema_apply_rejects_when_non_main_branch_exists() {
 }
 
 #[test]
-fn schema_apply_allow_data_loss_flag_promotes_drops_to_hard() {
+fn schema_apply_drop_step_has_no_mode_and_the_removed_flag_is_refused() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     let schema_path = temp.path().join("drop-age.pg");
@@ -500,45 +527,24 @@ fn schema_apply_allow_data_loss_flag_promotes_drops_to_hard() {
         .replace("    age: I32?\n", "");
     fs::write(&schema_path, next_schema).unwrap();
 
-    let output = output_success(
-        cli()
-            .arg("schema")
-            .arg("apply")
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--allow-data-loss")
-            .arg("--json")
-            .arg(&graph),
-    );
-    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(payload["applied"], true);
-
-    let drop_step = payload["steps"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| s["kind"] == "drop_property")
-        .expect("plan should include a drop_property step");
-    assert_eq!(
-        drop_step["mode"], "hard",
-        "--allow-data-loss should promote Soft → Hard; full step: {drop_step}",
-    );
-}
-
-#[test]
-fn schema_apply_without_allow_data_loss_keeps_soft_drops() {
-    // Symmetric to the above: same schema change without the flag →
-    // drops stay Soft. Pins default semantics against accidental Hard
-    // promotion if a future refactor changes the option threading.
-    let temp = tempdir().unwrap();
-    let graph = graph_path(temp.path());
-    let schema_path = temp.path().join("drop-age-soft.pg");
-    init_graph(&graph);
-
-    let next_schema = fs::read_to_string(fixture("test.pg"))
-        .unwrap()
-        .replace("    age: I32?\n", "");
-    fs::write(&schema_path, next_schema).unwrap();
+    // A drop reclaims nothing at apply, so no flag opts into one: a script
+    // still passing `--allow-data-loss` fails before touching the graph.
+    for command in ["plan", "apply"] {
+        let refused = output_failure(
+            cli()
+                .arg("schema")
+                .arg(command)
+                .arg("--schema")
+                .arg(&schema_path)
+                .arg("--allow-data-loss")
+                .arg(&graph),
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains("unexpected argument '--allow-data-loss'"),
+            "schema {command}: {stderr}"
+        );
+    }
 
     let output = output_success(
         cli()
@@ -551,7 +557,6 @@ fn schema_apply_without_allow_data_loss_keeps_soft_drops() {
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["applied"], true);
-
     let drop_step = payload["steps"]
         .as_array()
         .unwrap()
@@ -559,19 +564,23 @@ fn schema_apply_without_allow_data_loss_keeps_soft_drops() {
         .find(|s| s["kind"] == "drop_property")
         .expect("plan should include a drop_property step");
     assert_eq!(
-        drop_step["mode"], "soft",
-        "no flag should leave drops Soft; full step: {drop_step}",
+        drop_step,
+        &serde_json::json!({
+            "kind": "drop_property",
+            "type_kind": "node",
+            "type_name": "Person",
+            "property_name": "age",
+        })
     );
 }
 
 #[test]
 fn schema_plan_parity_cli_and_sdk() {
-    // Same .pg through `Omnigraph::plan_schema_with_options` (SDK) and
+    // Same .pg through `Omnigraph::plan_schema` (SDK) and
     // `omnigraph schema plan --json` (CLI). Asserts the steps array is
     // byte-identical after JSON round-trip. HTTP doesn't expose a
     // separate /schema/plan route — that side of parity is covered by
-    // the HTTP soft/hard drop tests, which exercise apply with
-    // identical fixtures.
+    // the HTTP drop tests, which exercise apply with identical fixtures.
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     init_graph(&graph);
@@ -648,24 +657,34 @@ fn explicit_graph_discovery_preserves_jwt_shaped_static_catalog_and_skips_contex
         "header.{}.signature",
         URL_SAFE_NO_PAD.encode(claims.to_string())
     );
-    for discovery in [false, true] {
+    for (discovery, json_output) in [(false, false), (false, true), (true, true)] {
         let reply = if discovery {
             serde_json::json!({"graphs":[{"graph_id":"alpha","display_name":"alpha"}]})
         } else {
-            serde_json::json!({"graphs":[{"graph_id":"alpha","uri":"file:///private/alpha"}]})
+            serde_json::json!({"graphs":[{"graph_id":"alpha","uri":"file:///private/alpha","state":"ready","read_available":true,"write_available":true,"action":"none"},{"graph_id":"beta","uri":"file:///private/beta","state":"blocked","read_available":false,"write_available":false,"failure":"open_failed","action":"restart_after_correction"}]})
         };
         let server = IntentApiFixture::graph(vec![IntentReply::json(200, reply.clone())]);
         let mut command = cli();
         command
             .current_dir(directory.path())
             .env("OMNIGRAPH_BEARER_TOKEN", &token)
-            .args(["graphs", "list", "--server", &server.origin, "--json"]);
+            .args(["graphs", "list", "--server", &server.origin]);
+        if json_output {
+            command.arg("--json");
+        }
         if discovery {
             command.arg("--discovery");
         }
         let output = output_success(&mut command);
-        let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(actual, reply);
+        if json_output {
+            let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(actual, reply);
+        } else {
+            assert_eq!(
+                stdout_string(&output),
+                "alpha\tready\tfile:///private/alpha\nbeta\tblocked\tfile:///private/beta\n"
+            );
+        }
         assert_eq!(
             server.workflow_requests()[0].path,
             if discovery {

@@ -149,7 +149,15 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
     match flag {
         // Served addressing always needs a server. `graphs list` uses the bare
         // registry scope.
-        ScopeFlag::Server => matches!(capability, Any | Served),
+        ScopeFlag::Server => {
+            matches!(capability, Any | Served)
+                || matches!(
+                    cmd,
+                    Command::Cluster {
+                        command: ClusterCommand::Apply { .. } | ClusterCommand::Status { .. }
+                    }
+                )
+        }
         ScopeFlag::Cluster => cluster_ok,
         // The one graph selector across scopes: a served graph (`any`), or a
         // cluster graph on verbs that take
@@ -176,7 +184,7 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         // (rejected downstream with its own message). On `direct`, full-text
         // rebuild attributes its graph publication; other maintenance verbs
         // record no actor. `control` refines per command:
-        // `cluster apply`/`approve` attribute an actor — the other read-only
+        // `cluster apply`/`upgrade-ledger` attribute an actor — the other read-only
         // control verbs (status/plan/validate, policy, queries) never read it.
         ScopeFlag::As => match capability {
             // `--as` names an actor for a direct/`--store` WRITE; a served write
@@ -193,7 +201,7 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
             Control => matches!(
                 cmd,
                 Command::Cluster {
-                    command: ClusterCommand::Apply { .. } | ClusterCommand::Approve { .. },
+                    command: ClusterCommand::Apply { .. } | ClusterCommand::UpgradeLedger { .. },
                     ..
                 }
             ),
@@ -356,13 +364,15 @@ pub(crate) fn accepts_cluster_addressing(cmd: &Command) -> bool {
             // picks a graph's bundle/registry within it.
             | Command::Policy { .. }
             | Command::Queries { .. }
+            | Command::Cluster { command: ClusterCommand::Apply { .. } | ClusterCommand::Status { .. }
+                | ClusterCommand::ForceUnlock { .. } | ClusterCommand::UpgradeLedger { .. } }
     )
 }
 
 /// Commands that consume the global `--graph` selector, which is exactly the
 /// set that consumes global `--cluster` addressing.
 fn accepts_graph_selector(cmd: &Command) -> bool {
-    accepts_cluster_addressing(cmd)
+    accepts_cluster_addressing(cmd) && !matches!(cmd, Command::Cluster { .. })
 }
 
 /// Reject a scope-addressing flag (`--server`/`--cluster`/`--graph`) on a verb
@@ -512,19 +522,35 @@ mod tests {
                 [false, false, false, false, false, false],
             ),
             // Read-only control verbs never read the actor; `cluster
-            // apply`/`approve` do. The `cluster` family addresses its config
-            // with --config and never resolves a profile scope.
+            // apply`/`upgrade-ledger` do. The cluster family accepts
+            // root addressing for durable deployment/recovery, without graph
+            // selection or profile scope.
             (
                 parse(&["omnigraph", "queries", "list"]),
                 [false, true, true, false, false, true],
             ),
             (
                 parse(&["omnigraph", "cluster", "status", "--config", "."]),
-                [false, false, false, false, false, false],
+                [true, true, false, false, false, false],
             ),
             (
                 parse(&["omnigraph", "cluster", "apply", "--config", "."]),
-                [false, false, false, false, true, false],
+                [true, true, false, false, true, false],
+            ),
+            (
+                parse(&["omnigraph", "cluster", "force-unlock", "lock-id"]),
+                [false, true, false, false, false, false],
+            ),
+            (
+                parse(&[
+                    "omnigraph",
+                    "cluster",
+                    "upgrade-ledger",
+                    "--cluster",
+                    "file:///cluster",
+                    "--writers-stopped",
+                ]),
+                [false, true, false, false, true, false],
             ),
             (
                 parse(&["omnigraph", "version"]),
@@ -541,6 +567,39 @@ mod tests {
                     command_label(cmd),
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn live_cluster_scope_conflicts_refuse_before_discovery() {
+        let cases: &[(&[&str], &str)] = &[
+            (&["--as", "spoofed"], "--as cannot be used with --server"),
+            (
+                &["--cluster", "file:///unused"],
+                "--server and --cluster are mutually exclusive",
+            ),
+            (
+                &["--writers-stopped", "--deployment-id", "unused"],
+                "--writers-stopped cannot be used with --server",
+            ),
+            (&["--no-wait"], "does not accept managed run arguments"),
+            (&["--graph", "knowledge"], "--graph selects a graph"),
+        ];
+        for (extra, expected) in cases {
+            let mut args = vec![
+                "omnigraph",
+                "cluster",
+                "apply",
+                "--server",
+                "http://127.0.0.1:1",
+            ];
+            args.extend_from_slice(extra);
+            let cli = Cli::try_parse_from(args).unwrap();
+            let error = crate::cluster_remote::dispatch(&cli)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
         }
     }
 

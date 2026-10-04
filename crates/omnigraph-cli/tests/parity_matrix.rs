@@ -16,6 +16,12 @@
 
 use tempfile::TempDir;
 
+#[path = "support/http_bench.rs"]
+mod http_bench;
+#[path = "support/http_perf_layout.rs"]
+mod http_perf_layout;
+#[path = "support/http_soak.rs"]
+mod http_soak;
 mod support;
 use support::*;
 
@@ -649,6 +655,121 @@ fn parity_load() {
 }
 
 #[test]
+fn parity_load_embedding_diagnostics() {
+    let temp = tempfile::tempdir().unwrap();
+    let local = temp.path().join("local.omni");
+    let schema = temp.path().join("embeddings.pg");
+    std::fs::write(
+        &schema,
+        format!(
+            "{}\nnode Doc {{ slug: String @key body: String embedding: Vector(2)? @embed(body) }}\n",
+            std::fs::read_to_string(fixture("test.pg")).unwrap(),
+        ),
+    )
+    .unwrap();
+    let cluster_dir = parity_configs_with_schema(temp.path(), &local, &schema);
+    let server = spawn_server_with_cluster_env(
+        &cluster_dir,
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-parity":"parity-tok"}"#,
+        )],
+    );
+    let p = Parity {
+        _temp: temp,
+        local,
+        server,
+        blob_external_uri: None,
+    };
+    let data = p.local.parent().unwrap().join("embeddings.jsonl");
+    std::fs::write(&data, concat!(
+        r#"{"type":"Doc","data":{"slug":"omitted","body":"missing vector"}}"#,
+        "\n",
+        r#"{"type":"Doc","data":{"slug":"supplied","body":"keep vector","embedding":[0.25,0.75]}}"#,
+    )).unwrap();
+    for verb in ["load", "ingest"] {
+        for structured in [true, false] {
+            let mut args = vec![
+                verb,
+                "--branch",
+                "main",
+                "--mode",
+                "merge",
+                "--data",
+                data.to_str().unwrap(),
+            ];
+            if structured {
+                args.push("--json");
+            }
+            let (local, remote) = p.run(&args);
+            for (arm, output) in [("local", &local), ("remote", &remote)] {
+                assert!(output.status.success(), "{verb} {arm}: {output:?}");
+                if structured {
+                    assert_eq!(
+                        parse_stdout_json(output)["embedding_generation"],
+                        "unsupported",
+                        "{verb} {arm}"
+                    );
+                } else {
+                    let human = String::from_utf8_lossy(&output.stdout);
+                    assert!(
+                        human.contains("Loads do not generate embeddings."),
+                        "{verb} {arm}: {human}"
+                    );
+                    assert!(human.contains("omnigraph embed"), "{verb} {arm}: {human}");
+                }
+            }
+            if verb == "load" && structured {
+                assert_write_parity("load embedding diagnostics", &local, &remote);
+            }
+        }
+    }
+    let (local, remote) = p.run(&[
+        "query",
+        "-e",
+        "query docs() { match { $d: Doc } return { $d.slug, $d.embedding } order { $d.slug asc } }",
+        "--json",
+    ]);
+    // Each arm has independently published commits; compare their contents,
+    // not the intentionally different graph-commit identities.
+    for output in [&local, &remote] {
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            parse_stdout_json(output)["rows"],
+            serde_json::json!([
+                {"d.slug": "omitted"},
+                {"d.slug": "supplied", "d.embedding": [0.25, 0.75]},
+            ])
+        );
+    }
+
+    std::fs::write(
+        &data,
+        r#"{"type":"Person","data":{"name":"Plain","age":1}}"#,
+    )
+    .unwrap();
+    for verb in ["load", "ingest"] {
+        let (local, remote) = p.run(&[
+            verb,
+            "--branch",
+            "main",
+            "--mode",
+            "merge",
+            "--data",
+            data.to_str().unwrap(),
+            "--json",
+        ]);
+        for output in [&local, &remote] {
+            assert!(output.status.success(), "{verb}: {output:?}");
+            assert_eq!(
+                parse_stdout_json(output).get("embedding_generation"),
+                Some(&serde_json::Value::Null)
+            );
+        }
+    }
+}
+
+#[test]
 fn parity_export() {
     let p = parity();
     let (l, r) = p.run(&["export"]);
@@ -680,6 +801,176 @@ fn parity_export() {
         local_lines, remote_lines,
         "export: JSONL streams diverge (left=local, right=remote)"
     );
+
+    #[cfg(unix)]
+    assert_slow_export_and_baseline_complete(&p);
+}
+
+/// Exercise the actual Hyper/socket ownership boundary. A Tower body consumer
+/// cannot reproduce a transport retaining yielded chunks behind a full socket.
+#[cfg(unix)]
+fn assert_slow_export_and_baseline_complete(p: &Parity) {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    let data = p._temp.path().join("slow-export.jsonl");
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&data).unwrap());
+    for row in 0..4096 {
+        serde_json::to_writer(
+            &mut file,
+            &serde_json::json!({
+                "type": "Person",
+                "data": {"name": format!("slow-{row:04}-{}", "x".repeat(2048)), "age": 12}
+            }),
+        )
+        .unwrap();
+        file.write_all(b"\n").unwrap();
+    }
+    file.flush().unwrap();
+    let (local, remote) = p.run(&[
+        "load",
+        "--mode",
+        "merge",
+        "--data",
+        data.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_write_parity("slow export fixture", &local, &remote);
+    let expected = output_success(cli().args(["export", "--store", p.local.to_str().unwrap()]));
+    assert!(
+        expected.stdout.len() > 8 * 1024 * 1024,
+        "fixture must exceed socket buffers"
+    );
+
+    let address = p.server.base_url.strip_prefix("http://").unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .unwrap();
+    for route in ["export", "changes/baseline"] {
+        let mut socket = runtime.block_on(async {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            // Negotiate TCP with the small receive buffer. Shrinking it after
+            // connect can throttle Linux loopback even after reads resume.
+            socket.set_recv_buffer_size(16 * 1024).unwrap();
+            socket
+                .connect(address.parse().unwrap())
+                .await
+                .unwrap()
+                .into_std()
+                .unwrap()
+        });
+        socket.set_nonblocking(false).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        let request = r#"{"branch":"main"}"#;
+        write!(socket,
+            "POST /graphs/parity/{route} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer parity-tok\r\n{}: {}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{request}",
+            omnigraph_api_types::HTTP_API_CONTRACT_HEADER,
+            omnigraph_api_types::HTTP_API_CONTRACT,
+            request.len(),
+        ).unwrap();
+        let mut first = [0; 4096];
+        let count = socket.read(&mut first).unwrap();
+        assert!(count > 0);
+        let mut wire = first[..count].to_vec();
+        // A headers-only first read does not prove export production started.
+        // Consume a little body data before holding the receive window closed.
+        let first_body_deadline = Instant::now() + Duration::from_secs(15);
+        while !wire
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .is_some_and(|offset| wire.len() > offset + 4 + 64)
+        {
+            let remaining = first_body_deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "{route}: no response body arrived");
+            socket.set_read_timeout(Some(remaining)).unwrap();
+            let count = socket.read(&mut first).unwrap();
+            assert!(count > 0, "{route}: response closed before body data");
+            wire.extend_from_slice(&first[..count]);
+            assert!(wire.len() < 64 * 1024, "{route}: invalid response headers");
+        }
+        // This is a protocol-deadline regression, not a throughput threshold:
+        // socket backpressure must outlive the 250 ms admission timeout.
+        std::thread::sleep(Duration::from_secs(2));
+        let drain_started = Instant::now();
+        let deadline = drain_started + Duration::from_secs(30);
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "{route}: response did not complete");
+            socket.set_read_timeout(Some(remaining)).unwrap();
+            let count = socket.read(&mut buffer).unwrap_or_else(|error| {
+                panic!(
+                    "{route}: response read failed after {:?} and {} bytes: {error}\nserver stderr:\n{}",
+                    drain_started.elapsed(),
+                    wire.len(),
+                    p.server.stderr()
+                )
+            });
+            if count == 0 {
+                break;
+            }
+            wire.extend_from_slice(&buffer[..count]);
+            assert!(
+                wire.len() <= 64 * 1024 * 1024,
+                "{route}: unexpected response growth"
+            );
+        }
+        let header_end = wire
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let headers = std::str::from_utf8(&wire[..header_end]).unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200"), "{route}: {headers}");
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("transfer-encoding: chunked")
+        );
+        let mut remaining = &wire[header_end..];
+        let mut body = Vec::new();
+        loop {
+            let end = remaining
+                .windows(2)
+                .position(|part| part == b"\r\n")
+                .unwrap_or_else(|| {
+                    panic!("{route}: truncated response without chunked terminator")
+                });
+            let count =
+                usize::from_str_radix(std::str::from_utf8(&remaining[..end]).unwrap(), 16).unwrap();
+            remaining = &remaining[end + 2..];
+            if count == 0 {
+                assert_eq!(remaining, b"\r\n", "{route}: invalid terminal chunk");
+                break;
+            }
+            assert!(remaining.len() >= count + 2, "{route}: incomplete chunk");
+            body.extend_from_slice(&remaining[..count]);
+            assert_eq!(&remaining[count..count + 2], b"\r\n");
+            remaining = &remaining[count + 2..];
+        }
+        if route == "changes/baseline" {
+            assert!(
+                body.starts_with(&expected.stdout),
+                "baseline snapshot changed"
+            );
+            let terminal: serde_json::Value =
+                serde_json::from_slice(&body[expected.stdout.len()..]).unwrap();
+            assert!(terminal["baseline"]["resume_cursor"].as_str().is_some());
+            assert!(
+                terminal["baseline"]["snapshot_commit_id"]
+                    .as_str()
+                    .is_some()
+            );
+        } else {
+            assert_eq!(body, expected.stdout, "slow export lost or changed rows");
+        }
+    }
 }
 
 #[test]

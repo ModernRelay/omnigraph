@@ -2,6 +2,7 @@
 mod catalog_tests;
 pub mod commit_graph;
 pub(crate) mod graph_coordinator;
+pub(crate) mod legacy_sidecars;
 pub mod manifest;
 pub(crate) mod omnigraph;
 mod schema_state;
@@ -17,24 +18,25 @@ pub use manifest::{DatasetEntry, DatasetUpdate};
 pub use omnigraph::{
     CleanupPolicyOptions, CollectorCost, CollectorPathSnapshot, CollectorReport,
     CollectorRowSummary, DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats,
-    EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult, InitOptions, MergeOutcome,
-    MergeResult, Omnigraph, OpenMode, PendingIndex, RebuiltFullTextIndex, RepairAction,
+    EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult, GraphCreateReconciliation,
+    InitOptions, MergeOutcome, MergeResult, Omnigraph, OpenMode, PendingIndex, PreparedGraphCreate,
+    PreparedSchemaApply, PreparedSchemaSettlement, RebuiltFullTextIndex, RepairAction,
     RepairClassification, RepairOptions, RepairStats, RetainedManifestVersions,
-    SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyOptions, SchemaApplyResult, SkipReason, StagingVerdict,
+    SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyReconciliation, SchemaApplyResult, SchemaApplySettlement,
+    SchemaContractDigest, SchemaNonPublicationProof, SkipReason, StagingVerdict,
     SystemColumnUpgradeFinding, SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome,
     SystemColumnUpgradeReport, TableCollectionPlan, UnpublishedManifest,
 };
+pub(crate) use omnigraph::{
+    LogicalBlobValue, RangedExternalBlobs, export_blob_values, logical_row_image,
+};
 pub(crate) use omnigraph::{WriteAuthorityToken, WriteTxn};
-pub(crate) use omnigraph::{export_blob_values, logical_row_image};
 pub(crate) use omnigraph_core::metadata::now_micros;
 pub(crate) use schema_state::SchemaContractIdentity;
 pub use snapshot::{Snapshot, SnapshotDataset, SnapshotScanner};
-#[cfg(feature = "dst")]
-#[doc(hidden)]
-pub use upgrade::dst_prepare_legacy_upgrade_fixture;
 pub use upgrade::{
     UpgradeFinding, UpgradeMode, UpgradeOptions, UpgradeOutcome, UpgradeRecovery, UpgradeReport,
-    UpgradeWork, upgrade_storage, upgrade_storage_as,
+    upgrade_storage, upgrade_storage_as,
 };
 
 use crate::error::{OmniError, Result};

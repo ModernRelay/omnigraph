@@ -29,11 +29,10 @@ or `change`. Ad-hoc query and mutation source uses `read` or `change`
 respectively. Control-plane admin or apply permission does not confer graph
 permission.
 
-When a changed policy is applied and activated by a server restart, it governs
-the next request using the same credential. Editing a source file alone has
-no effect. Schema changes retain the [cluster configuration
-workflow](../operations/policy.md#actions); identity credentials do not bypass
-its ownership or permission checks.
+Existing graph policy bindings stay fixed in the current deployment class;
+editing a source file alone has no effect. Schema changes use the
+[cluster configuration workflow](../clusters/index.md#deploy-without-restarting);
+identity credentials do not bypass its ownership or permission checks.
 
 Normal issuance takes neither `--graph` nor `--actions`; choose a graph on the
 operation that needs it. `--ttl` accepts seconds or an `s`, `m`, `h`, or `d`
@@ -189,11 +188,23 @@ permissions; a load does not merge its target branch.
 
 One managed load accepts at most **32 MiB (33,554,432 bytes)** of input. The
 CLI checks this before sending the request. Incremental `append` and `merge`
-also retain the engine's **8,192 rows and 32 MiB per keyed table** bounds;
-strict loads check projected in-memory size too. The NDJSON byte bound does
-not prove that a batch fits those [engine limits](../mutations/index.md#limits-and-conflicts).
-Split prepared inputs into suitable batches, preserving endpoint dependencies
-and recording each batch's returned commit.
+also retain the engine's **8,192 rows and 32 MiB per keyed table** bounds, plus
+**32 MiB across retained keyed batches** and a separate parsed-payload estimate
+across types. Strict loads check projected in-memory size too. The NDJSON byte
+bound does not prove that a batch fits those
+[engine limits](../mutations/index.md#limits-and-conflicts).
+Split prepared `append` and `merge` inputs into suitable batches, preserving
+endpoint dependencies and recording each batch's returned commit. Blob values carry
+their own [limits](../blobs.md#limits).
+
+`overwrite` also refuses when the IDs it removes exceed **32 MiB per
+operation**, summed over all touched types. Each removed ID is charged its UTF-8
+length plus 24 bytes, so the allowance holds 671,088 IDs of 26 bytes, the
+length of a generated ID. Entities loaded without a `@key` and without an
+explicit `id` get a new generated ID on every load, so overwriting them removes
+every committed ID of that type. A delete and the edges it cascades to draw on
+the same allowance. No setting changes it. An overwrite cannot be split; a
+delete can be split into several commits.
 
 The request has a **300-second deadline**, including receipt download, with
 at most **10 seconds to connect** and **8 MiB of response data**. The CLI

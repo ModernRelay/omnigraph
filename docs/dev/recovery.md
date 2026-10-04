@@ -1,7 +1,7 @@
 # Graph recovery
 
 **Audience:** engine and storage contributors
-**Authority:** current graph publication and explicit storage-upgrade recovery
+**Authority:** current graph publication recovery
 
 A graph write becomes visible at its branch's `__manifest` publication. The
 published table references and accepted schema contract are complete together;
@@ -9,16 +9,16 @@ normal open never installs a contract from root files. No writer arms a
 recovery sidecar, classifier, roll-forward, rollback, `Restore` compensation or
 recovery audit ([RFC 0067](../rfcs/0067-detached-table-commits.md)). Table pins
 are not promoted onto linear history
-([Detached-only tables](../rfcs/2026-09-21-detached-only-tables.md)). Explicit
-offline storage conversion retains its separate intent and activation protocol.
+([Detached-only tables](../rfcs/2026-09-21-detached-only-tables.md)). This
+build has no storage conversion and refuses a graph that carries a pending one.
 
 ## What a crash can leave
 
 | Interrupted | What is on storage | Who finishes it |
 |---|---|---|
-| Before the manifest commit | Unreferenced detached Lance versions and possibly an unregistered original empty added-type dataset | The caller retries from a fresh capture. The collector reclaims detached versions only when their recorded publication authority is gone. Added-type retry preserves the existing path and qualifies its original Create as described in [writes.md](writes.md) |
+| Before the manifest commit | Unreferenced detached Lance versions and possibly an unregistered original empty added-type dataset | A replay-safe caller retries from a fresh capture. A durably accepted prepared schema invocation instead retains its original identity and uses settlement below. The collector reclaims detached versions only when their recorded publication authority is gone. Added-type retry preserves the existing path and qualifies its original Create as described in [writes.md](writes.md) |
 | After the manifest commit | Complete table pins and the accepted contract row in the branch's `__manifest` | No durable installation remains. Reads open the published pins and contract; refresh rebuilds disposable memory |
-| During explicit storage conversion | Main's pending intent, branch receipts and possibly partially deleted legacy contract files | Rerun the same upgrade-capable executable and target while the root remains offline; activation is last |
+| During a storage conversion run by another executable | `UPGRADE_PENDING_KEY` on main's `__manifest` | The executable that started the conversion, while the root remains offline; this build refuses the graph |
 
 ## Pins
 
@@ -51,38 +51,49 @@ complete even if a later error interrupts adoption of the in-memory view.
 Lost acknowledgement remains a distinct outcome checked against the exact
 attempted publication, not evidence that the write lost.
 
+A durably recorded version-2 prepared schema intent fixes numeric manifest base
+`M` and can publish only at `M + 1`, including under head-preserving metadata
+contention. Its ordinary read-only reconciliation reports exact publication or
+`Unknown`; unknown is not permission to reissue it. After prior-owner and
+accepted-I/O quiescence, an authorized recovery owner persists the engine's
+neutral settlement intent before invocation. `settle_prepared_schema_as` can
+prove nonpublication from a verified occupant of `M + 1` or its own exact fence
+receipt. It adds no schema/data changes, never adopts foreign schema, and never
+rebases either contender. Missing evidence stays unresolved, while a stale
+no-op certificate can be refused without a fence. Version-1 prepared intents
+are rejected. See [writes.md](writes.md#mutation-and-load) for the two engine
+APIs and [control-plane.md](control-plane.md#deployment-ledger) for their
+durable cluster owner; neither result alone proves native-I/O settlement.
+
+A prepared-create or prepared-schema token is settled by the build that wrote
+it. Format 14 added lineage fields: a prepared-create token from an older build
+decodes with `generation` 0 and no native branch and is refused by its stamp
+before anything is published, and a format-14 token read by an older build
+fails on the unknown fields before any stamp check. An operation interrupted
+across a binary swap is prepared again, never settled by the other build.
+
 Historical queries keep the accepted live contract and rebind its aliases by
 stable identity to the selected historical table image. Retained contract rows
 do not introduce historical schema-language semantics. See
 [Schema contract in the manifest](../rfcs/2026-09-30-schema-contract-in-manifest.md).
 
-## Explicit storage conversion
+## Pending storage conversion
 
-`schema-contract-v11-v12-to-v13` validates the actual source layout of every
-live branch and reads the legacy contract only through the upgrade reader.
-Before effects it refuses legacy staging, a residual schema-apply sentinel
-and unresolved recovery sidecars. Protocol 5's intent pins the semantic
-contract identity and SHA-256 digests of the exact source and IR text.
-Each strict branch overwrite includes the contract row, target stamp and
-receipt without creating a graph commit. Foreign movement or contract drift
-fails closed.
-
-All branches and receipts must validate before deleting `_schema.pg`,
-`_schema.ir.json` and `__schema_state.json`. Main retains its pending marker
-through cleanup. Once every branch has converted, retry takes the contract
-from main's validated row and tolerates any subset of those files being absent.
-Only after cleanup does main activate. Ordinary opens remain refused while the
-intent is pending; never remove it by hand. A current-v13 no-op uses the row
-and ignores orphan legacy schema files and staging. The former sentinel name
-is available to user branches in v13. The separate recovery-sidecar admission
-rule below still applies.
+A storage conversion sets `UPGRADE_PENDING_KEY`
+(`omnigraph:storage_upgrade_pending`) on main's `__manifest` while it runs.
+This build never writes the key and holds no conversion. Ordinary open refuses
+a graph that carries it with `recovery_guidance`, and `omnigraph upgrade`
+reports `recovery_required`. Stop all writers and maintenance, keep the graph
+and its backup, and finish the conversion with the executable that started
+it; never remove the key by hand. The separate recovery-sidecar admission rule
+below still applies.
 
 ## Sidecars from older builds
 
 No build at or after RFC 0067 step 5 writes or reads a recovery sidecar. A
 file under `__recovery/` can only come from an earlier build that stopped
-mid-write. This build cannot interpret it, so a read-write open and the
-storage upgrade refuse the graph, naming the operation ids, until the build
+mid-write. This build cannot interpret it, so a read-write open
+refuses the graph, naming the operation ids, until the build
 that wrote the sidecar has opened the graph read-write and finished its own
 recovery. A read-only open never looks at `__recovery/`: reads are pinned to
 published manifest versions, which a sidecar-era writer never moved before
@@ -125,6 +136,17 @@ attempt-local genesis before deciding the outcome:
   the committed graph;
 - an unavailable or mismatched proof returns `InitializationIndeterminate`
   and preserves initialization artifacts and the claim.
+
+Cluster deployment persists an engine-issued `PreparedGraphCreate` before
+invocation. Its claim binds the exact root, genesis and source/IR contract.
+Read-only reconciliation recognizes that birth or returns `Absent`/`Unknown`;
+matching schema text is insufficient. After explicit prior-owner quiescence,
+`settle_prepared_graph_create_after_quiescence` may remove only that token's
+unpublished empty creation artifacts. It preserves any manifest publication,
+foreign claim, advanced table, branch/ref/index state or malformed evidence.
+Cleanup keeps the claim until last and is repeatable after interruption; a
+successor uses a fresh token and identity. See the [deployment ledger](control-plane.md#deployment-ledger)
+for its admission and durable-result owner.
 
 Do not retry initialization or remove an indeterminate claim until every
 initializer for that root is quiescent and the root has been inspected. The
@@ -171,8 +193,8 @@ The v8 storage fence keeps older binaries from exposing retired branches.
 - `crates/omnigraph/tests/schema_apply.rs` and `system_column_upgrade.rs` own
   atomic contract publication, pre-publication refusal and complete published
   outcomes, including later errors.
-- `crates/omnigraph/src/db/upgrade/tests.rs` owns intent and receipt recovery,
-  contract-byte drift refusal and every legacy-file deletion boundary.
+- `crates/omnigraph/src/db/upgrade/tests.rs` owns the `recovery_required`
+  report for a graph carrying a pending conversion marker.
 - `crates/omnigraph/tests/recovery.rs` owns manifest-only contract admission,
   ignored orphan schema artifacts, read-only opens without writes, and legacy
   sidecars refusing read-write but not read-only open.

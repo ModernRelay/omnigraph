@@ -59,16 +59,77 @@ use omnigraph_compiler::SystemColumns;
 use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::table_store::{
-    ExternalBlobPreflight, StagedTransactionIdentity, StagedWrite, TableState, TableStore,
+    ExternalBlobPreflight, ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, StagedTransactionIdentity,
+    StagedWrite, TableState, TableStore,
 };
 
 /// One fenced merge chunk is bounded in both rows and materialized Arrow
 /// bytes. The byte ceiling bounds the staging adapter; the row ceiling
 /// prevents pathological tiny-row filter expressions and keeps evidence
 /// repeatable. Callers must also bound parsing/materialization before this
-/// final Arrow-sized check.
+/// final Arrow-sized check. The byte ceiling is also the size of three separate
+/// operation-wide allowances: retained keyed batches across tables, the keyed
+/// parse estimate, and the removed-ID collection.
 pub(crate) const KEYED_WRITE_MAX_ROWS: usize = 8192;
 pub(crate) const KEYED_WRITE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The operation-wide sibling of the per-table keyed ceiling. This uses the
+/// existing Arrow accounting (including its conservative shared-buffer count),
+/// not a second allocator or a claim about native execution/RSS.
+pub(crate) fn retained_keyed_bytes(current: u64, additional: u64) -> Result<u64> {
+    let actual = current
+        .checked_add(additional)
+        .ok_or_else(|| OmniError::manifest_internal("retained keyed batch byte count overflow"))?;
+    if actual > KEYED_WRITE_MAX_BYTES {
+        return Err(OmniError::resource_limit(
+            "retained keyed batch bytes per operation",
+            KEYED_WRITE_MAX_BYTES,
+            actual,
+        ));
+    }
+    Ok(actual)
+}
+
+pub(crate) fn retain_keyed_batch(current: u64, batch: &RecordBatch) -> Result<u64> {
+    let bytes = u64::try_from(batch.get_array_memory_size())
+        .map_err(|_| OmniError::manifest_internal("retained keyed batch bytes exceed u64"))?;
+    retained_keyed_bytes(current, bytes)
+}
+
+/// One allowance per mutation (all tables and cascades) or load (all replacement
+/// removals): each removed id is charged its UTF-8 bytes plus one String slot before
+/// the copy. Native scan batches, predicate copies and validation state are outside it.
+#[derive(Default)]
+pub(crate) struct DeletedIdBudget {
+    bytes: u64,
+}
+
+impl DeletedIdBudget {
+    pub(crate) fn retain(&mut self, id: &str) -> Result<()> {
+        let bytes = id
+            .len()
+            .checked_add(std::mem::size_of::<String>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .and_then(|bytes| self.bytes.checked_add(bytes))
+            .ok_or_else(|| {
+                OmniError::manifest_internal("retained removed-id byte count overflow")
+            })?;
+        if bytes > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                "retained removed-id bytes per operation",
+                KEYED_WRITE_MAX_BYTES,
+                bytes,
+            ));
+        }
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+
+/// Scheduler I/O buffer of every batched managed Blob read; Lance's default is
+/// 32 MiB times the store's I/O parallelism. It caps read-ahead, not what a
+/// caller holds: 64 contiguous 1 MiB validation windows may arrive as one buffer.
+pub(crate) const BLOB_REBUILD_IO_BUFFER_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Resource budget for a pending-aware keyed scan that will feed one mutation
 /// table transaction.
@@ -219,15 +280,6 @@ impl ProvenInsertChunk {
 }
 
 // ─── opaque handles ────────────────────────────────────────────────────────
-
-/// Outcome of replaying a detached transaction at its linear target, in the
-/// storage boundary's own terms (RFC 0067).
-#[derive(Debug)]
-pub enum PromotionOutcome {
-    Landed(SnapshotHandle),
-    Refused,
-    Unsafe(String),
-}
 
 /// Opaque handle to a snapshot of a single sub-table dataset at a
 /// specific version.
@@ -457,19 +509,16 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         with_row_id: bool,
     ) -> Result<Vec<RecordBatch>>;
 
-    /// `scan` under a typed DataFusion filter, the form the mutation path
-    /// builds from a GQ `where`; no SQL text is rendered.
+    /// Stream under the typed filter built from a GQ `where`; no SQL text is
+    /// rendered. Scanner sizing is a soft hint; consumers admit retained data.
     async fn scan_filtered(
         &self,
         snapshot: &SnapshotHandle,
         projection: Option<&[&str]>,
         filter: Expr,
-    ) -> Result<Vec<RecordBatch>>;
+    ) -> Result<DatasetRecordBatchStream>;
 
     async fn scan_batches(&self, snapshot: &SnapshotHandle) -> Result<Vec<RecordBatch>>;
-
-    async fn scan_batches_for_rewrite(&self, snapshot: &SnapshotHandle)
-    -> Result<Vec<RecordBatch>>;
 
     async fn count_rows(&self, snapshot: &SnapshotHandle, filter: Option<String>) -> Result<usize>;
 
@@ -499,11 +548,9 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>>;
 
-    /// Full-schema blob-aware sibling of `scan_with_pending` for mutation
-    /// updates. The committed predicate scan retains row ids without projecting
-    /// blobs; only matched rows are then taken and rebuilt as Lance's logical
-    /// blob input arrays before unioning the in-memory pending view. This keeps
-    /// the eventual merge source schema independent of scalar-index state.
+    /// Blob-aware sibling of `scan_with_pending` for mutation updates; see
+    /// `TableStore::scan_with_pending_materialized_blobs`. `omit_blob_columns`
+    /// names the Blobs the caller replaces, which are never read or returned.
     async fn scan_with_pending_materialized_blobs(
         &self,
         snapshot: &SnapshotHandle,
@@ -511,6 +558,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         pending_schema: Option<SchemaRef>,
         filter: Option<Expr>,
         key_column: Option<&str>,
+        omit_blob_columns: &[&str],
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>>;
 
@@ -621,16 +669,6 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         prior_stages: &[StagedHandle],
     ) -> Result<StagedHandle>;
 
-    /// Append `source`'s rows into `snapshot`'s table, streaming so the whole
-    /// row set is never materialized in memory (see `TableStore::stage_append_stream`).
-    #[cfg(test)]
-    async fn stage_append_stream(
-        &self,
-        snapshot: &SnapshotHandle,
-        source: &SnapshotHandle,
-        prior_stages: &[StagedHandle],
-    ) -> Result<StagedHandle>;
-
     /// Stage one RFC-023 fenced keyed write from an in-memory batch.
     ///
     /// This production adapter accepts only the graph `id` key and checks that
@@ -657,23 +695,6 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: SnapshotHandle,
         chunk: ProvenInsertChunk,
-        system_columns: SystemColumns,
-    ) -> Result<StagedHandle>;
-
-    /// Test-only streaming-source sibling of [`Self::stage_keyed_write`].
-    ///
-    /// `source` must be a trusted graph dataset with the same exact-id PK
-    /// contract. It is scanned twice: once in bounded id-only batches for
-    /// validation / strict preflight, then through the existing blob-aware
-    /// rewrite stream. Neither ordinary nor blob rows are collected into one
-    /// delta-wide batch.
-    #[cfg(test)]
-    async fn stage_keyed_write_stream(
-        &self,
-        snapshot: SnapshotHandle,
-        table_key: &str,
-        source: &SnapshotHandle,
-        semantics: KeyedWriteSemantics,
         system_columns: SystemColumns,
     ) -> Result<StagedHandle>;
 
@@ -741,16 +762,6 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: &SnapshotHandle,
     ) -> Result<crate::table_store::StagedTransactionIdentity>;
-
-    /// RFC 0067: replay the transaction recorded in `staged` on `base` so the
-    /// linear history gains its twin at `target`.
-    async fn promote_detached(
-        &self,
-        base: SnapshotHandle,
-        staged: &SnapshotHandle,
-        target: u64,
-        expected_uuid: &str,
-    ) -> Result<PromotionOutcome>;
 
     /// Stage an overwrite (Operation::Overwrite). MR-793 Phase 2.
     async fn stage_overwrite(
@@ -930,9 +941,8 @@ impl TableStorage for TableStore {
         snapshot: &SnapshotHandle,
         projection: Option<&[&str]>,
         filter: Expr,
-    ) -> Result<Vec<RecordBatch>> {
-        TableStore::scan_with(
-            self,
+    ) -> Result<DatasetRecordBatchStream> {
+        TableStore::scan_stream_with(
             snapshot.dataset(),
             projection,
             None,
@@ -940,6 +950,8 @@ impl TableStorage for TableStore {
             false,
             |scanner| {
                 scanner.filter_expr(filter);
+                scanner.batch_size(ID_SCAN_BATCH_ROWS);
+                scanner.batch_size_bytes(ID_SCAN_BATCH_BYTES);
                 Ok(())
             },
         )
@@ -948,13 +960,6 @@ impl TableStorage for TableStore {
 
     async fn scan_batches(&self, snapshot: &SnapshotHandle) -> Result<Vec<RecordBatch>> {
         TableStore::scan_batches(self, snapshot.dataset()).await
-    }
-
-    async fn scan_batches_for_rewrite(
-        &self,
-        snapshot: &SnapshotHandle,
-    ) -> Result<Vec<RecordBatch>> {
-        TableStore::scan_batches_for_rewrite(self, snapshot.dataset()).await
     }
 
     async fn count_rows(&self, snapshot: &SnapshotHandle, filter: Option<String>) -> Result<usize> {
@@ -1013,6 +1018,7 @@ impl TableStorage for TableStore {
         pending_schema: Option<SchemaRef>,
         filter: Option<Expr>,
         key_column: Option<&str>,
+        omit_blob_columns: &[&str],
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>> {
         TableStore::scan_with_pending_materialized_blobs(
@@ -1022,6 +1028,7 @@ impl TableStorage for TableStore {
             pending_schema,
             filter,
             key_column,
+            omit_blob_columns,
             budget,
         )
         .await
@@ -1162,19 +1169,6 @@ impl TableStorage for TableStore {
             .map(StagedHandle::new)
     }
 
-    #[cfg(test)]
-    async fn stage_append_stream(
-        &self,
-        snapshot: &SnapshotHandle,
-        source: &SnapshotHandle,
-        prior_stages: &[StagedHandle],
-    ) -> Result<StagedHandle> {
-        let staged_writes = staged_handles_as_writes(prior_stages);
-        TableStore::stage_append_stream(self, snapshot.dataset(), source.dataset(), &staged_writes)
-            .await
-            .map(StagedHandle::new)
-    }
-
     async fn stage_keyed_write(
         &self,
         snapshot: SnapshotHandle,
@@ -1199,28 +1193,6 @@ impl TableStorage for TableStore {
         TableStore::stage_proven_strict_insert(self, ds, chunk, system_columns)
             .await
             .map(StagedHandle::new)
-    }
-
-    #[cfg(test)]
-    async fn stage_keyed_write_stream(
-        &self,
-        snapshot: SnapshotHandle,
-        table_key: &str,
-        source: &SnapshotHandle,
-        semantics: KeyedWriteSemantics,
-        system_columns: SystemColumns,
-    ) -> Result<StagedHandle> {
-        let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
-        TableStore::stage_keyed_write_stream(
-            self,
-            ds,
-            table_key,
-            source.dataset(),
-            semantics,
-            system_columns,
-        )
-        .await
-        .map(StagedHandle::new)
     }
 
     async fn scan_stream_for_rewrite_bounded(
@@ -1298,29 +1270,6 @@ impl TableStorage for TableStore {
         snapshot: &SnapshotHandle,
     ) -> Result<crate::table_store::StagedTransactionIdentity> {
         TableStore::transaction_identity(self, snapshot.dataset())
-    }
-
-    async fn promote_detached(
-        &self,
-        base: SnapshotHandle,
-        staged: &SnapshotHandle,
-        target: u64,
-        expected_uuid: &str,
-    ) -> Result<PromotionOutcome> {
-        let base = base.into_arc();
-        Ok(
-            match TableStore::promote_detached(self, base, staged.dataset(), target, expected_uuid)
-                .await?
-            {
-                crate::table_store::PromotionCommit::Landed(dataset) => {
-                    PromotionOutcome::Landed(SnapshotHandle::new(*dataset))
-                }
-                crate::table_store::PromotionCommit::Refused => PromotionOutcome::Refused,
-                crate::table_store::PromotionCommit::Unsafe(reason) => {
-                    PromotionOutcome::Unsafe(reason)
-                }
-            },
-        )
     }
 
     async fn commit_staged_exact(
