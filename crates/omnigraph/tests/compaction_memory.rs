@@ -11,9 +11,12 @@
 //! named allowances on fragments twice as wide as the derived batch. Every
 //! value is 1 MiB, a packed placement. A second instrument measures schema
 //! apply's peak over Blob tables of two sizes: its column changes are
-//! metadata-only, so the peak must not grow with the table's Blob bytes.
-//! Both are ignored by default: the allocator counts the whole process, so a
-//! measurement needs the test binary to itself (`--exact`).
+//! metadata-only, so the peak must not grow with the table's Blob bytes. A
+//! third measures the `optimize` that erases a dropped Blob property: the
+//! rewrite reads only the remaining columns, so it peaks within the same
+//! bound as an ordinary compaction although every row also stored a dropped
+//! 1 MiB value. All are ignored by default: the allocator counts the whole
+//! process, so a measurement needs the test binary to itself (`--exact`).
 
 mod helpers;
 
@@ -303,5 +306,86 @@ async fn schema_apply_peak_allocation_is_flat_in_blob_bytes() {
     assert!(
         large <= small + 4 * MIB,
         "schema apply's peak grew with the table's Blob bytes: {small} -> {large}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "instrument: erasing a dropped Blob property compacts within the batch budget"]
+async fn dropped_blob_erasure_peak_allocation_is_within_the_compaction_bound() {
+    let graph = tempfile::tempdir().unwrap();
+    let uri = graph.path().to_str().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(
+            uri,
+            "node Doc {\n    slug: String @key\n    content: Blob?\n    secret: Blob?\n}\n",
+        )
+        .await
+        .unwrap(),
+    );
+    // Eight loads of 16 MiB, compacted into one fragment of 64 rows, each row
+    // holding a kept and a soon-dropped 1 MiB value.
+    for load in 0..8 {
+        let lines = (load * 8..(load + 1) * 8)
+            .map(|row| {
+                let encode = |bytes: Vec<u8>| {
+                    format!(
+                        "base64:{}",
+                        base64::engine::general_purpose::STANDARD.encode(bytes)
+                    )
+                };
+                serde_json::json!({
+                    "type": "Doc",
+                    "data": {
+                        "slug": format!("d{row:03}"),
+                        "content": encode(payload(row)),
+                        "secret": encode(payload(row + 1)),
+                    },
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>();
+        let mode = if load == 0 {
+            LoadMode::Overwrite
+        } else {
+            LoadMode::Merge
+        };
+        db.load_jsonl(&lines.join("\n"), mode).await.unwrap();
+    }
+    db.optimize().await.unwrap();
+    let doc = |stats: Vec<omnigraph::db::DatasetOptimizeStats>| {
+        stats
+            .into_iter()
+            .find(|stat| stat.type_key == "node:Doc")
+            .unwrap()
+    };
+    assert!(
+        !doc(db.optimize().await.unwrap()).committed,
+        "test precondition: nothing left to compact before the drop"
+    );
+    let fragment_rows = helpers::open_pinned_dataset_for_test(&db, "main", "node:Doc")
+        .await
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.metadata().physical_rows.unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(fragment_rows, vec![WIDE_FRAGMENT_ROWS], "test precondition");
+    db.apply_schema("node Doc {\n    slug: String @key\n    content: Blob?\n}\n")
+        .await
+        .unwrap();
+
+    let (stats, peak) = peak_above_baseline(db.optimize()).await;
+    let doc = doc(stats.unwrap());
+    assert!(doc.committed);
+    assert_eq!(doc.fragments_removed, 1, "the measured optimize erases");
+    let bound = BUDGET + IN_FLIGHT_VALUE_ALLOWANCE + NON_PAYLOAD_ALLOWANCE;
+    eprintln!(
+        "engine optimize erasing a dropped Blob, {WIDE_FRAGMENT_ROWS} rows of 1 MiB kept \
+         + 1 MiB dropped: peak {:.1} MiB (bound {:.1} MiB)",
+        peak as f64 / MIB as f64,
+        bound as f64 / MIB as f64
+    );
+    assert!(
+        peak <= bound,
+        "the erasing optimize allocated {peak} bytes at its peak, above the {bound}-byte bound"
     );
 }

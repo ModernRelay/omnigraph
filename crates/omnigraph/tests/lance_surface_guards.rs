@@ -1143,6 +1143,328 @@ async fn metadata_only_schema_evolution_keeps_blob_files_ids_and_index_coverage(
     );
 }
 
+/// Guard: what `optimize`'s erasure of dropped properties relies on
+/// (`TableStore::plan_table_compaction`). On a stable-row-id V2_2 table holding
+/// inline, packed and dedicated Blob-v2 payloads, every field id a data file
+/// lists is a schema field id (a Blob-v2 column is listed by its own id, not
+/// by its descriptor children's), so no fragment of an undropped table reads
+/// as holding a dropped column. A detached `Operation::Project` dropping a
+/// String and a Blob column keeps the data file and its `fields` list, which
+/// still names exactly the two dropped ids; Lance's default planner selects
+/// nothing for a lone fragment without deletions, dropped columns or not, and
+/// compacts by re-encoding. A
+/// `CompactionTask` naming that one fragment, executed and committed as a
+/// detached single-group `Rewrite`, writes data files whose `fields` are the
+/// current schema's ids only, writes no Blob sidecar for the dropped column
+/// while carrying the kept one, keeps every row, value and stable row id, and
+/// carries the surviving scalar index over to the new fragment.
+#[tokio::test]
+async fn compacting_a_chosen_fragment_drops_the_bytes_of_dropped_columns() {
+    use arrow_array::types::UInt64Type;
+    use std::collections::BTreeSet;
+
+    use lance::dataset::optimize::{CompactionMode, CompactionTask, TaskData, plan_compaction};
+    use lance::dataset::transaction::RewriteGroup;
+
+    fn file_field_ids(ds: &Dataset) -> Vec<(String, Vec<i32>)> {
+        ds.get_fragments()
+            .iter()
+            .flat_map(|fragment| fragment.metadata().files.clone())
+            .map(|file| (file.path.clone(), file.fields.to_vec()))
+            .collect()
+    }
+
+    async fn sidecar_parents(ds: &Dataset) -> BTreeSet<String> {
+        let store = ds.object_store(None).await.unwrap();
+        store
+            .read_dir_all(&ds.data_dir(), None)
+            .try_filter(|object| {
+                futures::future::ready(object.location.extension() == Some("blob"))
+            })
+            .map_ok(|object| {
+                let parts = object.location.parts().collect::<Vec<_>>();
+                format!("{}.lance", parts[parts.len() - 2].as_ref())
+            })
+            .try_collect::<BTreeSet<_>>()
+            .await
+            .unwrap()
+    }
+
+    async fn rows(ds: &Dataset) -> Vec<(String, String, Option<Vec<u8>>, u64)> {
+        let mut scanner = ds.scan();
+        scanner.with_row_id();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        scanner.project(&["id", "name", "content"]).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let ids = batch.column_by_name("id").unwrap().as_string::<i32>();
+        let names = batch.column_by_name("name").unwrap().as_string::<i32>();
+        let contents = batch.column_by_name("content").unwrap().as_binary::<i64>();
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>();
+        (0..batch.num_rows())
+            .map(|row| {
+                (
+                    ids.value(row).to_string(),
+                    names.value(row).to_string(),
+                    contents.is_valid(row).then(|| contents.value(row).to_vec()),
+                    row_ids.value(row),
+                )
+            })
+            .collect()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("erase.lance");
+    let uri = uri.to_str().unwrap();
+    let blob_column = |name: &str, payloads: &[Option<Vec<u8>>]| {
+        let mut builder = BlobArrayBuilder::new(payloads.len());
+        for payload in payloads {
+            match payload {
+                Some(payload) => builder.push_bytes(payload).unwrap(),
+                None => builder.push_null().unwrap(),
+            }
+        }
+        (
+            lance::blob::blob_field(name, true),
+            builder.finish().unwrap(),
+        )
+    };
+    let ids = ["r0", "r1", "r2", "r3", "r4"];
+    let kept: Vec<Option<Vec<u8>>> = vec![
+        Some(vec![b'k'; 80]),
+        Some(vec![b'K'; 96 * 1024]),
+        None,
+        Some(Vec::new()),
+        Some(vec![b'D'; 5 * 1024 * 1024]),
+    ];
+    let dropped: Vec<Option<Vec<u8>>> = vec![
+        Some(vec![b'x'; 80]),
+        Some(vec![b'y'; 96 * 1024]),
+        Some(vec![b'z'; 5 * 1024 * 1024]),
+        None,
+        Some(Vec::new()),
+    ];
+    let (content_field, content) = blob_column("content", &kept);
+    let (secret_field, secret) = blob_column("secret", &dropped);
+    let mut pk = HashMap::new();
+    pk.insert(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false).with_metadata(pk),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("note", DataType::Utf8, true),
+        content_field,
+        secret_field,
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(ids.to_vec())),
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+            Arc::new(StringArray::from(vec!["n0", "n1", "n2", "n3", "n4"])),
+            content,
+            secret,
+        ],
+    )
+    .unwrap();
+    let mut base = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    base.create_index(
+        &["name"],
+        IndexType::Scalar,
+        None,
+        &ScalarIndexParams::default(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(base.get_fragments().len(), 1, "one fragment");
+
+    // No false positive: every id a data file names is a schema field id.
+    let schema_ids = base
+        .schema()
+        .field_ids()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    for (path, fields) in file_field_ids(&base) {
+        assert!(
+            fields.iter().all(|id| schema_ids.contains(id)),
+            "{path} names ids {fields:?} outside the schema's {schema_ids:?}"
+        );
+    }
+    let note_id = base.schema().field("note").unwrap().id;
+    let secret_id = base.schema().field("secret").unwrap().id;
+    let files_before = file_field_ids(&base);
+    let sidecars_before = sidecar_parents(&base).await;
+    assert!(
+        !sidecars_before.is_empty(),
+        "the 5 MiB payloads must create dedicated Blob sidecars"
+    );
+    let expected = rows(&base).await;
+
+    // Drop `note` and `secret` with a detached Project: the data file stays,
+    // and its `fields` still names both dropped columns.
+    let mut projected = base.schema().clone();
+    projected
+        .fields
+        .retain(|field| field.name != "note" && field.name != "secret");
+    projected.validate().unwrap();
+    let projected = CommitBuilder::new(Arc::new(base.clone()))
+        .with_detached(true)
+        .with_skip_auto_cleanup(true)
+        .execute(Transaction::new(
+            base.version().version,
+            Operation::Project {
+                schema: projected,
+                preserves_nullability: true,
+            },
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        file_field_ids(&projected),
+        files_before,
+        "a drop keeps the data file and its field ids"
+    );
+    let live = projected
+        .schema()
+        .field_ids()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let held = file_field_ids(&projected)
+        .into_iter()
+        .flat_map(|(_, fields)| fields)
+        .filter(|id| !live.contains(id))
+        .collect::<BTreeSet<_>>();
+    // A Blob-v2 column is named by its own id; its descriptor children are
+    // not listed.
+    assert_eq!(
+        held,
+        BTreeSet::from([note_id, secret_id]),
+        "the file still names exactly the dropped `note` and `secret`"
+    );
+
+    // Lance's planner does not select a fragment for its dropped columns, and
+    // compacts by re-encoding, never by copying pages.
+    let options = CompactionOptions::default();
+    assert_eq!(options.compaction_mode(), CompactionMode::Reencode);
+    assert_eq!(
+        plan_compaction(&projected, &options)
+            .await
+            .unwrap()
+            .num_tasks(),
+        0,
+        "the default planner leaves a lone fragment without deletions alone"
+    );
+
+    // A task naming the fragment rewrites it from the current schema.
+    let task = CompactionTask {
+        task: TaskData {
+            fragments: vec![projected.get_fragments()[0].metadata().clone()],
+        },
+        read_version: projected.version().version,
+        options,
+    };
+    let result = task.execute(&projected).await.unwrap();
+    assert!(result.row_addrs.is_none(), "stable row ids are rechunked");
+    let next_id = projected.manifest.max_fragment_id().map_or(0, |id| id + 1);
+    let mut new_fragments = result.new_fragments.clone();
+    for (fragment, id) in new_fragments.iter_mut().zip(next_id..) {
+        fragment.id = id;
+    }
+    let compacted = CommitBuilder::new(Arc::new(projected.clone()))
+        .with_detached(true)
+        .with_skip_auto_cleanup(true)
+        .execute(Transaction::new(
+            projected.version().version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: result.original_fragments.clone(),
+                    new_fragments,
+                }],
+                rewritten_indices: Vec::new(),
+                frag_reuse_index: None,
+            },
+            None,
+        ))
+        .await
+        .unwrap();
+    let files_after = file_field_ids(&compacted);
+    assert!(
+        files_after
+            .iter()
+            .all(|(path, _)| files_before.iter().all(|(old, _)| old != path)),
+        "the rewrite replaces the data file"
+    );
+    for (path, fields) in &files_after {
+        assert!(
+            fields.iter().all(|id| live.contains(id)),
+            "{path} still names a dropped field id: {fields:?}"
+        );
+    }
+    let sidecars_after = sidecar_parents(&compacted).await;
+    let new_sidecars = sidecars_after
+        .difference(&sidecars_before)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert!(
+        !new_sidecars.is_empty()
+            && new_sidecars
+                .iter()
+                .all(|parent| files_after.iter().any(|(path, _)| path == parent)),
+        "the kept 5 MiB value moves to a sidecar of the new file: {new_sidecars:?}"
+    );
+    let compacted_dir = std::path::Path::new(uri).join("data");
+    let sidecar_bytes = new_sidecars
+        .iter()
+        .map(|parent| {
+            std::fs::read_dir(compacted_dir.join(parent.trim_end_matches(".lance")))
+                .unwrap()
+                .map(|entry| entry.unwrap().metadata().unwrap().len())
+                .sum::<u64>()
+        })
+        .sum::<u64>();
+    assert!(
+        sidecar_bytes < 6 * 1024 * 1024,
+        "only the kept 5 MiB value is carried, not the dropped one: {sidecar_bytes} bytes"
+    );
+    assert_eq!(rows(&compacted).await, expected, "rows survive the rewrite");
+    let name_index = compacted
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .find(|index| index.name == "name_idx")
+        .cloned()
+        .expect("the scalar index survives");
+    assert_eq!(
+        name_index
+            .fragment_bitmap
+            .as_ref()
+            .map(|bitmap| bitmap.iter().collect::<Vec<_>>()),
+        Some(
+            compacted
+                .get_fragments()
+                .iter()
+                .map(|fragment| fragment.id() as u32)
+                .collect()
+        ),
+        "the index covers the rewritten fragment"
+    );
+}
+
 /// Helper: build a small fresh dataset in a tempdir. Pinned at V2_2 to match
 /// production write paths (blob v2 requires V2_2; see `docs/dev/lance.md`).
 async fn fresh_dataset(uri: &str) -> Dataset {

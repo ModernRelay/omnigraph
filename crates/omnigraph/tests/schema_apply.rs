@@ -2867,7 +2867,10 @@ node Anchor { name: String @key }
 // lived) stays pinned by the older `__manifest` versions, so
 // `snapshot_at_graph_manifest_version(pre_drop)` still reads it. It becomes
 // unreachable once `omnigraph cleanup --keep 1` stops retaining those versions
-// and the collector reclaims its files.
+// and the collector reclaims its manifest. The dropped values stay in the
+// current data files until optimize rewrites them;
+// `maintenance.rs::optimize_then_cleanup_erases_dropped_property_values` owns
+// that erasure.
 
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
@@ -2883,7 +2886,7 @@ async fn apply_schema_property_drop_is_reclaimed_by_cleanup_not_apply() {
         .unwrap()
         .graph_manifest_version();
 
-    // Drop the `age` column. Apply rewrites the table without it.
+    // Drop the `age` column, a metadata-only change of the table.
     let desired = TEST_SCHEMA.replace("    age: I32?\n", "");
     let result = db.apply_schema(&desired).await.unwrap();
     assert!(result.applied);

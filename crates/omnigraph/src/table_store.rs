@@ -23,7 +23,9 @@ use datafusion::prelude::Expr;
 use futures::{StreamExt, TryStreamExt, future::BoxFuture};
 use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
-use lance::dataset::optimize::{CompactionMetrics, CompactionOptions, plan_compaction};
+use lance::dataset::optimize::{
+    CompactionMetrics, CompactionOptions, CompactionPlan, TaskData, plan_compaction,
+};
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
 use lance::dataset::transaction::{
     Operation, RewriteGroup, Transaction, TransactionBuilder, UpdateMode,
@@ -688,6 +690,22 @@ pub struct StagedIndexFold {
 pub struct StagedCompaction {
     pub staged: StagedWrite,
     pub metrics: CompactionMetrics,
+}
+
+/// Whether `fragment` still physically stores a column the current schema no
+/// longer has: a field id that one of its data or overlay files lists and
+/// `live` (the schema's field ids) lacks. A metadata-only drop keeps the
+/// dropped id in every file that also holds a surviving column; a file
+/// holding no surviving column leaves the fragment with the drop. Lance's
+/// overlay tombstone is negative and names no column, and a Blob-v2 column is
+/// listed by its own id, never by its descriptor children's, so a table
+/// without a dropped column never matches. Manifest metadata only.
+fn fragment_holds_dropped_column(fragment: &Fragment, live: &HashSet<i32>) -> bool {
+    fragment
+        .files
+        .iter()
+        .chain(fragment.overlays.iter().map(|overlay| &overlay.data_file))
+        .any(|file| file.fields.iter().any(|id| *id >= 0 && !live.contains(id)))
 }
 
 /// The metadata-only commits of one table's schema evolution, planned once by
@@ -3860,22 +3878,70 @@ impl TableStore {
         Ok((dataset, committed_identity))
     }
 
-    /// RFC 0067: plan and execute Lance compaction against a pinned base and
-    /// stage the result as one `Rewrite` transaction. The new fragments take
-    /// ids above the base's high-water mark, so the commit needs no
-    /// `ReserveFragments` (whose replay would not conflict with its twin). A
-    /// stable-row-id rewrite carries every index's coverage over to the new
-    /// fragments when Lance applies it. `None` when the plan has no task.
-    /// Every task of a Blob table is sized before any executes, so a sizing
-    /// refusal leaves no rewritten file behind.
+    /// Plan a graph table's compaction: Lance's plan for `options`, plus one
+    /// task of its own for every other fragment that still physically holds
+    /// a dropped column ([`fragment_holds_dropped_column`]).
+    ///
+    /// This is how a dropped property's values are erased. Schema apply drops
+    /// a property with a metadata-only `Operation::Project`, which keeps every
+    /// data file that also holds a surviving column, the dropped values
+    /// included, and Lance's planner selects fragments by size, deletions and
+    /// overlays, never by dropped columns. Planning those fragments here makes
+    /// every `optimize` rewrite them: the rewrite scans the current schema
+    /// only, so the new data files and Blob sidecars hold no dropped value,
+    /// and a later `cleanup` that no longer retains the versions before the
+    /// rewrite deletes the old files. A single-fragment task is the shape
+    /// Lance itself plans for a fragment that compacts alone (deletion
+    /// materialization), and its `Rewrite` group replaces the fragment in
+    /// place. A fragment a Lance task already rewrites, or one
+    /// `options.excluded_fragment_ids` names, gets no task of its own; the
+    /// added tasks are outside Lance's per-run source budgets. The selection
+    /// reads only the manifest, so a table holding no dropped column costs
+    /// nothing beyond Lance's own planning.
+    pub(crate) async fn plan_table_compaction(
+        ds: &Dataset,
+        options: &CompactionOptions,
+    ) -> Result<CompactionPlan> {
+        let mut plan = plan_compaction(ds, options)
+            .await
+            .map_err(OmniError::storage)?;
+        let live = ds.schema().field_ids().into_iter().collect::<HashSet<_>>();
+        let mut skip = plan
+            .tasks
+            .iter()
+            .flat_map(|task| task.fragments.iter().map(|fragment| fragment.id))
+            .chain(
+                options
+                    .excluded_fragment_ids
+                    .iter()
+                    .map(|id| u64::from(*id)),
+            )
+            .collect::<HashSet<_>>();
+        for fragment in ds.manifest.fragments.iter() {
+            if fragment_holds_dropped_column(fragment, &live) && skip.insert(fragment.id) {
+                plan.tasks.push(TaskData {
+                    fragments: vec![fragment.clone()],
+                });
+            }
+        }
+        Ok(plan)
+    }
+
+    /// RFC 0067: plan ([`Self::plan_table_compaction`]) and execute Lance
+    /// compaction against a pinned base and stage the result as one `Rewrite`
+    /// transaction. The new fragments take ids above the base's high-water
+    /// mark, so the commit needs no `ReserveFragments` (whose replay would
+    /// not conflict with its twin). A stable-row-id rewrite carries every
+    /// index's coverage over to the new fragments when Lance applies it.
+    /// `None` when the plan has no task. Every task of a Blob table is sized
+    /// before any executes, so a sizing refusal leaves no rewritten file
+    /// behind.
     pub async fn stage_compaction(
         &self,
         ds: &Dataset,
         options: &CompactionOptions,
     ) -> Result<Option<StagedCompaction>> {
-        let plan = plan_compaction(ds, options)
-            .await
-            .map_err(OmniError::storage)?;
+        let plan = Self::plan_table_compaction(ds, options).await?;
         if plan.num_tasks() == 0 {
             return Ok(None);
         }
