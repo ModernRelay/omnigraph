@@ -153,6 +153,9 @@ dependencies do.
 6. Implementation PRs link the accepted RFC and update `implementation` plus
    any durable evidence or support boundary in the canonical file.
 7. A later incompatible decision gets a new RFC and supersedes the old one.
+8. An accepted RFC that replaces only part of an earlier RFC keeps that RFC's
+   status. Its PR adds a `> **RFC NNNN disposition:**` note under the earlier
+   RFC's title: what changed, `Historical:` sections, `Current:` remainder.
 
 For Lance-dependent work, follow [the Lance reading protocol](../dev/lance.md)
 and record the exact upstream version and surfaces reviewed. For test planning,
