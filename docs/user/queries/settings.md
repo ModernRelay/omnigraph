@@ -101,16 +101,17 @@ Internal traversal pins used by the GQT harness can force indexed execution. A
 forced CSR pin is refused for statements with selections; there is no public
 `set traversal` setting.
 
-`history_release_bytes` is measured as `CommitBuffer::buffered_bytes` measures
-a branch's `__manifest`: the buffered `settled_commit` and `replaced_table`
-rows as stored plus the head whole. The commit that reaches the budget records
-the decision in its commit id's slot, so sessions publishing to one branch
-under different budgets agree on where a block closes, and the publish after
-it releases the block whatever its own budget. A load carries the setting only
-from the CLI or an embedded `Session`: the HTTP load routes take no settings.
-The bound on a head's commit
-fields stays 256 KiB, the production budget. A lower budget means more and
-smaller `__history` files and more requests per release, never different rows.
+`history_release_bytes` is measured against the branch's buffered commit and
+table-change rows as stored, plus the head whole; the row layout is in
+[storage versioning](../../dev/versioning.md#current-storage-contract). The
+commit that reaches the budget records the decision in its commit id's slot,
+so sessions publishing to one branch under different budgets agree on where a
+block closes, and the publish after it releases the block whatever its own
+budget. A load carries the setting only from the CLI or an embedded
+`Session`: the HTTP load routes take no settings. The bound on a head's
+commit fields stays 256 KiB, the production budget. A lower budget means more
+and smaller `__history` files and more requests per release, never different
+rows.
 
 A name outside the table, a value of the wrong type, and a value outside the
 declared values or range are each refused with the table's row. A `process`
