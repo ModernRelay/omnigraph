@@ -35,7 +35,6 @@ tokio = { workspace = true }
 ulid = { workspace = true }
 
 [dev-dependencies]
-omnigraph-core = { path = "../omnigraph-core", version = "0.11.0" }
 serial_test = "3"
 tempfile = { workspace = true }
 tokio = { workspace = true }
