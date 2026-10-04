@@ -428,7 +428,10 @@ Prefer ISO strings on both paths:
 Integer epoch days remain useful for generated Arrow-oriented input, but are
 not required for hand-authored JSONL. A `Date` string must name a calendar day;
 a string containing a time of day is refused, even at midnight. Use `DateTime`
-for an instant. Loads refuse floats, booleans, and objects for either date
+for an instant. A `DateTime` holds milliseconds: a string with a non-zero digit
+past the third fractional digit (`"2026-04-29T10:00:00.123456Z"`) is refused on
+both paths and in `datetime(...)` literals; trailing zeros (`.123000`) are
+accepted. Loads refuse floats, booleans, and objects for either date
 type, and refuse counts outside the JSON writer's supported calendar range.
 
 ## Branch Statements
