@@ -154,6 +154,13 @@ nodes, edges, or properties with `@rename_from`, adding index declarations,
 widening an enum with new values, updating descriptions or instructions, and
 dropping node, edge, or property declarations.
 
+None of these changes rewrites existing rows. Adding a nullable property,
+renaming a property, or dropping a property changes only the table's metadata:
+existing rows read the new property as null, no stored value or Blob is read,
+and existing indexes keep covering the rows they covered. The time and memory
+the apply takes do not grow with the number of rows or the size of their
+values.
+
 Applying changed schema text, including comments or formatting, records the new
 source in one graph commit even when no table changes are needed. Applying the
 same accepted source again leaves the graph unchanged.
@@ -167,8 +174,13 @@ A drop removes the declaration from the current schema and reclaims no storage
 at apply. Older commits still read the dropped data until `omnigraph cleanup`
 stops retaining them; after that, the dropped data cannot be recovered. Review
 the plan carefully, and treat the cleanup that follows as the step that cannot
-be undone. To reclaim the space, run cleanup with a retention that excludes
-the commits before the drop. See [cleanup](../operations/maintenance.md#cleanup).
+be undone. A dropped type's data is reclaimed by cleanup with a retention that
+excludes the commits before the drop. A dropped property's values stay in the
+table's current data files, beside the properties that remain, so cleanup
+alone does not free them: they are removed when `omnigraph optimize` rewrites
+the fragments that hold them, and optimize rewrites only small fragments and
+fragments with many deleted rows. See [optimize](../operations/maintenance.md#optimize)
+and [cleanup](../operations/maintenance.md#cleanup).
 
 Cluster-managed graphs change schema through `omnigraph cluster apply`. Direct
 schema apply and the server schema-apply endpoint refuse cluster-managed graphs.
