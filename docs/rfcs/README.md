@@ -240,3 +240,4 @@ then dated RFCs by date.
 | [2026-09-30](2026-09-30-owned-server-operations.md) | Owned server operations | maintainer | accepted | complete |
 | [2026-09-30](2026-09-30-schema-contract-in-manifest.md) | Schema contract in the manifest | maintainer | draft | in-progress |
 | [2026-10-01](2026-10-01-engine-settlement-and-resource-bounds.md) | Engine settlement and resource bounds | maintainer | accepted | partial |
+| [2026-10-02](2026-10-02-studio.md) | Studio: a local graph UI served by the CLI | public | draft | not-started |

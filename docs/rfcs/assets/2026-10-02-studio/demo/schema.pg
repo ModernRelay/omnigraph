@@ -1,0 +1,122 @@
+// Lumen Labs: a fictional warehouse-robotics software company.
+// Demo data for Omnigraph Studio. Every name, person and company here is invented.
+// Nodes have no key property: seed.ts gives each a readable @id (e.g. ada-brandt) at load time.
+
+// A label shared across sections. Declared before the first section, so it sits at the root of the
+// studio's tree rather than in a folder.
+node Tag {
+    name: String @unique
+    color: enum(gray, blue, green, amber, red, purple)
+}
+
+// 1 — Organization
+
+// The company and its partners.
+node Company {
+    name: String @index
+    // Headquarters city.
+    hq: String?
+    founded: Date?
+    website: String?
+}
+
+// A team inside a company.
+node Team {
+    name: String
+    focus: enum(platform, perception, planning, product, growth, support)
+}
+
+// An employee.
+node Person {
+    name: String @index
+    title: String?
+    email: String?
+    location: String?
+    joined: Date?
+}
+
+// 2 — Product
+
+// A product line.
+node Product {
+    name: String
+    description: String
+    status: enum(concept, beta, ga, sunset)
+    launched: Date?
+}
+
+// A capability of a product, from proposal to shipped.
+node Feature {
+    name: String @index
+    description: String
+    status: enum(proposed, building, shipped, cut)
+    priority: enum(p0, p1, p2, p3)
+}
+
+// A versioned release of a product.
+node Release {
+    version: String
+    released_at: DateTime
+    notes: String?
+}
+
+// 3 — Engineering
+
+// A source repository.
+node Repository {
+    name: String
+    url: String
+    language: enum(rust, typescript, python, go)
+    stars: I32
+}
+
+// A bug or task filed against a repository.
+node Issue {
+    title: String @index
+    state: enum(open, closed)
+    severity: enum(low, medium, high, critical)
+    opened_at: DateTime
+    closed_at: DateTime?
+}
+
+// A change proposed to a repository.
+node PullRequest {
+    title: String
+    state: enum(open, merged, closed)
+    additions: I32
+    deletions: I32
+    merged_at: DateTime?
+}
+
+// 4 — Customers
+
+// A customer or prospect.
+node Account {
+    name: String @index
+    industry: enum(retail, logistics, manufacturing, grocery, healthcare, apparel)
+    stage: enum(prospect, pilot, customer, churned)
+    // Annual recurring revenue, USD.
+    arr: F64?
+    website: String?
+}
+
+edge PartOf: Team -> Company
+edge MemberOf: Person -> Team
+edge Owns: Team -> Product
+edge HasFeature: Product -> Feature
+edge ShippedIn: Feature -> Release
+edge ReleaseOf: Release -> Product
+edge Builds: Repository -> Product
+edge FiledIn: Issue -> Repository
+edge AssignedTo: Issue -> Person
+edge ReportedBy: Issue -> Account
+edge Resolves: PullRequest -> Issue
+edge AuthoredBy: PullRequest -> Person
+edge Uses: Account -> Product
+edge Requests: Account -> Feature {
+    // How strongly the account asked for it.
+    weight: enum(nice_to_have, important, blocking)
+}
+edge AccountOwner: Account -> Person
+edge IssueTagged: Issue -> Tag
+edge FeatureTagged: Feature -> Tag

@@ -1,0 +1,1923 @@
+{"type":"Tag","id":"safety","data":{"name":"safety","color":"red"}}
+{"type":"Tag","id":"performance","data":{"name":"performance","color":"amber"}}
+{"type":"Tag","id":"ux","data":{"name":"ux","color":"purple"}}
+{"type":"Tag","id":"reliability","data":{"name":"reliability","color":"blue"}}
+{"type":"Tag","id":"integrations","data":{"name":"integrations","color":"green"}}
+{"type":"Tag","id":"tech-debt","data":{"name":"tech-debt","color":"gray"}}
+{"type":"Tag","id":"customer-request","data":{"name":"customer-request","color":"blue"}}
+{"type":"Company","id":"lumen-labs","data":{"name":"Lumen Labs","hq":"Pittsburgh","founded":"2019-03-14","website":"https://lumenlabs.example"}}
+{"type":"Team","id":"platform","data":{"name":"Fleet Platform","focus":"platform"}}
+{"edge":"PartOf","from":"platform","to":"lumen-labs"}
+{"type":"Team","id":"perception","data":{"name":"Perception","focus":"perception"}}
+{"edge":"PartOf","from":"perception","to":"lumen-labs"}
+{"type":"Team","id":"planning","data":{"name":"Motion Planning","focus":"planning"}}
+{"edge":"PartOf","from":"planning","to":"lumen-labs"}
+{"type":"Team","id":"console","data":{"name":"Console & SDK","focus":"product"}}
+{"edge":"PartOf","from":"console","to":"lumen-labs"}
+{"type":"Team","id":"growth","data":{"name":"Growth","focus":"growth"}}
+{"edge":"PartOf","from":"growth","to":"lumen-labs"}
+{"type":"Team","id":"success","data":{"name":"Customer Success","focus":"support"}}
+{"edge":"PartOf","from":"success","to":"lumen-labs"}
+{"type":"Person","id":"ada-brandt","data":{"name":"Ada Brandt","title":"SRE","email":"ada.brandt@lumenlabs.example","location":"Berlin","joined":"2022-07-13"}}
+{"edge":"MemberOf","from":"ada-brandt","to":"platform"}
+{"type":"Person","id":"lena-lindqvist","data":{"name":"Lena Lindqvist","title":"Research Engineer","email":"lena.lindqvist@lumenlabs.example","location":"Austin","joined":"2023-11-05"}}
+{"edge":"MemberOf","from":"lena-lindqvist","to":"perception"}
+{"type":"Person","id":"hana-delacroix","data":{"name":"Hana Delacroix","title":"Software Engineer","email":"hana.delacroix@lumenlabs.example","location":"Austin","joined":"2020-06-27"}}
+{"edge":"MemberOf","from":"hana-delacroix","to":"planning"}
+{"type":"Person","id":"kofi-haas","data":{"name":"Kofi Haas","title":"Product Designer","email":"kofi.haas@lumenlabs.example","location":"Lisbon","joined":"2025-05-29"}}
+{"edge":"MemberOf","from":"kofi-haas","to":"console"}
+{"type":"Person","id":"gus-varga","data":{"name":"Gus Varga","title":"Account Executive","email":"gus.varga@lumenlabs.example","location":"Pittsburgh","joined":"2020-03-21"}}
+{"edge":"MemberOf","from":"gus-varga","to":"growth"}
+{"type":"Person","id":"ines-nakamura","data":{"name":"Ines Nakamura","title":"Support Engineer","email":"ines.nakamura@lumenlabs.example","location":"Pittsburgh","joined":"2024-12-30"}}
+{"edge":"MemberOf","from":"ines-nakamura","to":"success"}
+{"type":"Person","id":"priya-petrov","data":{"name":"Priya Petrov","title":"SRE","email":"priya.petrov@lumenlabs.example","location":"Remote","joined":"2023-03-07"}}
+{"edge":"MemberOf","from":"priya-petrov","to":"platform"}
+{"type":"Person","id":"amara-ueda","data":{"name":"Amara Ueda","title":"Research Engineer","email":"amara.ueda@lumenlabs.example","location":"Lisbon","joined":"2021-06-30"}}
+{"edge":"MemberOf","from":"amara-ueda","to":"perception"}
+{"type":"Person","id":"lena-abara","data":{"name":"Lena Abara","title":"Robotics Engineer","email":"lena.abara@lumenlabs.example","location":"Berlin","joined":"2021-07-27"}}
+{"edge":"MemberOf","from":"lena-abara","to":"planning"}
+{"type":"Person","id":"bodhi-rahman","data":{"name":"Bodhi Rahman","title":"Software Engineer","email":"bodhi.rahman@lumenlabs.example","location":"Lisbon","joined":"2021-06-28"}}
+{"edge":"MemberOf","from":"bodhi-rahman","to":"console"}
+{"type":"Person","id":"dev-delacroix","data":{"name":"Dev Delacroix","title":"Marketing Lead","email":"dev.delacroix@lumenlabs.example","location":"Lisbon","joined":"2020-06-12"}}
+{"edge":"MemberOf","from":"dev-delacroix","to":"growth"}
+{"type":"Person","id":"rosa-ibarra","data":{"name":"Rosa Ibarra","title":"Customer Success Manager","email":"rosa.ibarra@lumenlabs.example","location":"Berlin","joined":"2025-01-19"}}
+{"edge":"MemberOf","from":"rosa-ibarra","to":"success"}
+{"type":"Person","id":"priya-ueda","data":{"name":"Priya Ueda","title":"Software Engineer","email":"priya.ueda@lumenlabs.example","location":"Remote","joined":"2019-12-26"}}
+{"edge":"MemberOf","from":"priya-ueda","to":"platform"}
+{"type":"Person","id":"oren-quist","data":{"name":"Oren Quist","title":"Software Engineer","email":"oren.quist@lumenlabs.example","location":"Remote","joined":"2024-07-11"}}
+{"edge":"MemberOf","from":"oren-quist","to":"perception"}
+{"type":"Person","id":"quinn-zeller","data":{"name":"Quinn Zeller","title":"Software Engineer","email":"quinn.zeller@lumenlabs.example","location":"Austin","joined":"2024-05-27"}}
+{"edge":"MemberOf","from":"quinn-zeller","to":"planning"}
+{"type":"Person","id":"ada-moreau","data":{"name":"Ada Moreau","title":"Frontend Engineer","email":"ada.moreau@lumenlabs.example","location":"Berlin","joined":"2022-09-16"}}
+{"edge":"MemberOf","from":"ada-moreau","to":"console"}
+{"type":"Person","id":"viktor-zeller","data":{"name":"Viktor Zeller","title":"Solutions Engineer","email":"viktor.zeller@lumenlabs.example","location":"Berlin","joined":"2021-12-15"}}
+{"edge":"MemberOf","from":"viktor-zeller","to":"growth"}
+{"type":"Person","id":"rosa-silva","data":{"name":"Rosa Silva","title":"Support Engineer","email":"rosa.silva@lumenlabs.example","location":"Lisbon","joined":"2020-09-26"}}
+{"edge":"MemberOf","from":"rosa-silva","to":"success"}
+{"type":"Person","id":"ada-abara","data":{"name":"Ada Abara","title":"SRE","email":"ada.abara@lumenlabs.example","location":"Remote","joined":"2023-03-22"}}
+{"edge":"MemberOf","from":"ada-abara","to":"platform"}
+{"type":"Person","id":"ada-petrov","data":{"name":"Ada Petrov","title":"ML Engineer","email":"ada.petrov@lumenlabs.example","location":"Berlin","joined":"2025-07-07"}}
+{"edge":"MemberOf","from":"ada-petrov","to":"perception"}
+{"type":"Person","id":"hana-zeller","data":{"name":"Hana Zeller","title":"Software Engineer","email":"hana.zeller@lumenlabs.example","location":"Berlin","joined":"2023-03-07"}}
+{"edge":"MemberOf","from":"hana-zeller","to":"planning"}
+{"type":"Person","id":"yara-delacroix","data":{"name":"Yara Delacroix","title":"Software Engineer","email":"yara.delacroix@lumenlabs.example","location":"Austin","joined":"2022-10-26"}}
+{"edge":"MemberOf","from":"yara-delacroix","to":"console"}
+{"type":"Person","id":"elif-jansen","data":{"name":"Elif Jansen","title":"Account Executive","email":"elif.jansen@lumenlabs.example","location":"Berlin","joined":"2024-09-03"}}
+{"edge":"MemberOf","from":"elif-jansen","to":"growth"}
+{"type":"Person","id":"uma-quist","data":{"name":"Uma Quist","title":"Support Engineer","email":"uma.quist@lumenlabs.example","location":"Austin","joined":"2023-11-20"}}
+{"edge":"MemberOf","from":"uma-quist","to":"success"}
+{"type":"Person","id":"bodhi-moreau","data":{"name":"Bodhi Moreau","title":"Staff Engineer","email":"bodhi.moreau@lumenlabs.example","location":"Austin","joined":"2024-04-04"}}
+{"edge":"MemberOf","from":"bodhi-moreau","to":"platform"}
+{"type":"Person","id":"yara-eklund","data":{"name":"Yara Eklund","title":"ML Engineer","email":"yara.eklund@lumenlabs.example","location":"Toronto","joined":"2022-07-23"}}
+{"edge":"MemberOf","from":"yara-eklund","to":"perception"}
+{"type":"Person","id":"farah-gallo","data":{"name":"Farah Gallo","title":"Robotics Engineer","email":"farah.gallo@lumenlabs.example","location":"Toronto","joined":"2020-04-28"}}
+{"edge":"MemberOf","from":"farah-gallo","to":"planning"}
+{"type":"Person","id":"ada-eklund","data":{"name":"Ada Eklund","title":"Frontend Engineer","email":"ada.eklund@lumenlabs.example","location":"Pittsburgh","joined":"2024-10-07"}}
+{"edge":"MemberOf","from":"ada-eklund","to":"console"}
+{"type":"Person","id":"cleo-brandt","data":{"name":"Cleo Brandt","title":"Account Executive","email":"cleo.brandt@lumenlabs.example","location":"Toronto","joined":"2022-05-23"}}
+{"edge":"MemberOf","from":"cleo-brandt","to":"growth"}
+{"type":"Person","id":"uma-jansen","data":{"name":"Uma Jansen","title":"Customer Success Manager","email":"uma.jansen@lumenlabs.example","location":"Berlin","joined":"2023-09-22"}}
+{"edge":"MemberOf","from":"uma-jansen","to":"success"}
+{"type":"Person","id":"wren-nakamura","data":{"name":"Wren Nakamura","title":"SRE","email":"wren.nakamura@lumenlabs.example","location":"Toronto","joined":"2022-10-16"}}
+{"edge":"MemberOf","from":"wren-nakamura","to":"platform"}
+{"type":"Person","id":"viktor-castell","data":{"name":"Viktor Castell","title":"Research Engineer","email":"viktor.castell@lumenlabs.example","location":"Berlin","joined":"2024-06-16"}}
+{"edge":"MemberOf","from":"viktor-castell","to":"perception"}
+{"type":"Person","id":"viktor-kowal","data":{"name":"Viktor Kowal","title":"Robotics Engineer","email":"viktor.kowal@lumenlabs.example","location":"Remote","joined":"2020-10-30"}}
+{"edge":"MemberOf","from":"viktor-kowal","to":"planning"}
+{"type":"Person","id":"kofi-lindqvist","data":{"name":"Kofi Lindqvist","title":"Software Engineer","email":"kofi.lindqvist@lumenlabs.example","location":"Toronto","joined":"2025-05-21"}}
+{"edge":"MemberOf","from":"kofi-lindqvist","to":"console"}
+{"type":"Person","id":"priya-kowal","data":{"name":"Priya Kowal","title":"Solutions Engineer","email":"priya.kowal@lumenlabs.example","location":"Austin","joined":"2021-02-03"}}
+{"edge":"MemberOf","from":"priya-kowal","to":"growth"}
+{"type":"Person","id":"zane-okafor","data":{"name":"Zane Okafor","title":"Support Engineer","email":"zane.okafor@lumenlabs.example","location":"Remote","joined":"2022-05-15"}}
+{"edge":"MemberOf","from":"zane-okafor","to":"success"}
+{"type":"Person","id":"mateo-rahman","data":{"name":"Mateo Rahman","title":"SRE","email":"mateo.rahman@lumenlabs.example","location":"Austin","joined":"2023-05-22"}}
+{"edge":"MemberOf","from":"mateo-rahman","to":"platform"}
+{"type":"Person","id":"elif-rahman","data":{"name":"Elif Rahman","title":"ML Engineer","email":"elif.rahman@lumenlabs.example","location":"Austin","joined":"2024-08-21"}}
+{"edge":"MemberOf","from":"elif-rahman","to":"perception"}
+{"type":"Person","id":"chiara-rahman","data":{"name":"Chiara Rahman","title":"Software Engineer","email":"chiara.rahman@lumenlabs.example","location":"Remote","joined":"2021-03-31"}}
+{"edge":"MemberOf","from":"chiara-rahman","to":"planning"}
+{"type":"Person","id":"hana-brandt","data":{"name":"Hana Brandt","title":"Software Engineer","email":"hana.brandt@lumenlabs.example","location":"Remote","joined":"2024-03-09"}}
+{"edge":"MemberOf","from":"hana-brandt","to":"console"}
+{"type":"Person","id":"yara-zeller","data":{"name":"Yara Zeller","title":"Account Executive","email":"yara.zeller@lumenlabs.example","location":"Remote","joined":"2021-01-10"}}
+{"edge":"MemberOf","from":"yara-zeller","to":"growth"}
+{"type":"Person","id":"priya-jansen","data":{"name":"Priya Jansen","title":"Support Engineer","email":"priya.jansen@lumenlabs.example","location":"Berlin","joined":"2023-03-06"}}
+{"edge":"MemberOf","from":"priya-jansen","to":"success"}
+{"type":"Person","id":"uma-petrov","data":{"name":"Uma Petrov","title":"Software Engineer","email":"uma.petrov@lumenlabs.example","location":"Lisbon","joined":"2024-06-27"}}
+{"edge":"MemberOf","from":"uma-petrov","to":"platform"}
+{"type":"Person","id":"nia-delacroix","data":{"name":"Nia Delacroix","title":"Software Engineer","email":"nia.delacroix@lumenlabs.example","location":"Toronto","joined":"2022-10-09"}}
+{"edge":"MemberOf","from":"nia-delacroix","to":"perception"}
+{"type":"Person","id":"priya-weiss","data":{"name":"Priya Weiss","title":"Software Engineer","email":"priya.weiss@lumenlabs.example","location":"Pittsburgh","joined":"2019-11-21"}}
+{"edge":"MemberOf","from":"priya-weiss","to":"planning"}
+{"type":"Person","id":"kofi-weiss","data":{"name":"Kofi Weiss","title":"Software Engineer","email":"kofi.weiss@lumenlabs.example","location":"Austin","joined":"2024-12-19"}}
+{"edge":"MemberOf","from":"kofi-weiss","to":"console"}
+{"type":"Person","id":"hana-moreau","data":{"name":"Hana Moreau","title":"Marketing Lead","email":"hana.moreau@lumenlabs.example","location":"Berlin","joined":"2024-04-05"}}
+{"edge":"MemberOf","from":"hana-moreau","to":"growth"}
+{"type":"Person","id":"jonah-weiss","data":{"name":"Jonah Weiss","title":"Support Engineer","email":"jonah.weiss@lumenlabs.example","location":"Remote","joined":"2019-04-07"}}
+{"edge":"MemberOf","from":"jonah-weiss","to":"success"}
+{"type":"Product","id":"fleet","data":{"name":"Lumen Fleet","description":"Coordinates mixed robot fleets across a warehouse floor.","status":"ga","launched":"2021-05-03"}}
+{"edge":"Owns","from":"platform","to":"fleet"}
+{"type":"Product","id":"vision","data":{"name":"Lumen Vision","description":"Shelf and pallet recognition from on-robot cameras.","status":"ga","launched":"2022-02-15"}}
+{"edge":"Owns","from":"perception","to":"vision"}
+{"type":"Product","id":"planner","data":{"name":"Lumen Planner","description":"Multi-robot path planning with live congestion maps.","status":"beta","launched":"2024-09-30"}}
+{"edge":"Owns","from":"planning","to":"planner"}
+{"type":"Product","id":"console","data":{"name":"Lumen Console","description":"Web console and SDKs for operators and integrators.","status":"ga","launched":"2021-05-03"}}
+{"edge":"Owns","from":"console","to":"console"}
+{"type":"Product","id":"edge","data":{"name":"Lumen Edge","description":"On-premise runtime for sites without reliable uplink.","status":"concept"}}
+{"edge":"Owns","from":"platform","to":"edge"}
+{"type":"Feature","id":"battery-aware-routing","data":{"name":"Battery-aware routing","description":"Battery-aware routing for Lumen Fleet.","status":"building","priority":"p2"}}
+{"edge":"HasFeature","from":"fleet","to":"battery-aware-routing"}
+{"edge":"FeatureTagged","from":"battery-aware-routing","to":"safety"}
+{"edge":"FeatureTagged","from":"battery-aware-routing","to":"performance"}
+{"type":"Feature","id":"battery-aware-routing-v2","data":{"name":"Battery-aware routing v2","description":"Battery-aware routing, second iteration for Lumen Planner.","status":"shipped","priority":"p0"}}
+{"edge":"HasFeature","from":"planner","to":"battery-aware-routing-v2"}
+{"edge":"FeatureTagged","from":"battery-aware-routing-v2","to":"ux"}
+{"edge":"FeatureTagged","from":"battery-aware-routing-v2","to":"reliability"}
+{"type":"Feature","id":"aisle-reservations","data":{"name":"Aisle reservations","description":"Aisle reservations for Lumen Vision.","status":"building","priority":"p1"}}
+{"edge":"HasFeature","from":"vision","to":"aisle-reservations"}
+{"edge":"FeatureTagged","from":"aisle-reservations","to":"safety"}
+{"edge":"FeatureTagged","from":"aisle-reservations","to":"integrations"}
+{"type":"Feature","id":"remote-e-stop","data":{"name":"Remote e-stop","description":"Remote e-stop for Lumen Planner.","status":"shipped","priority":"p2"}}
+{"edge":"HasFeature","from":"planner","to":"remote-e-stop"}
+{"edge":"FeatureTagged","from":"remote-e-stop","to":"safety"}
+{"edge":"FeatureTagged","from":"remote-e-stop","to":"performance"}
+{"type":"Feature","id":"remote-e-stop-v2","data":{"name":"Remote e-stop v2","description":"Remote e-stop, second iteration for Lumen Edge.","status":"proposed","priority":"p0"}}
+{"edge":"HasFeature","from":"edge","to":"remote-e-stop-v2"}
+{"edge":"FeatureTagged","from":"remote-e-stop-v2","to":"safety"}
+{"edge":"FeatureTagged","from":"remote-e-stop-v2","to":"tech-debt"}
+{"type":"Feature","id":"heatmap-replay","data":{"name":"Heatmap replay","description":"Heatmap replay for Lumen Console.","status":"shipped","priority":"p2"}}
+{"edge":"HasFeature","from":"console","to":"heatmap-replay"}
+{"edge":"FeatureTagged","from":"heatmap-replay","to":"safety"}
+{"edge":"FeatureTagged","from":"heatmap-replay","to":"ux"}
+{"edge":"FeatureTagged","from":"heatmap-replay","to":"customer-request"}
+{"type":"Feature","id":"pallet-pose-estimation","data":{"name":"Pallet pose estimation","description":"Pallet pose estimation for Lumen Edge.","status":"proposed","priority":"p3"}}
+{"edge":"HasFeature","from":"edge","to":"pallet-pose-estimation"}
+{"edge":"FeatureTagged","from":"pallet-pose-estimation","to":"integrations"}
+{"edge":"FeatureTagged","from":"pallet-pose-estimation","to":"customer-request"}
+{"type":"Feature","id":"pallet-pose-estimation-v2","data":{"name":"Pallet pose estimation v2","description":"Pallet pose estimation, second iteration for Lumen Vision.","status":"shipped","priority":"p2"}}
+{"edge":"HasFeature","from":"vision","to":"pallet-pose-estimation-v2"}
+{"edge":"FeatureTagged","from":"pallet-pose-estimation-v2","to":"performance"}
+{"edge":"FeatureTagged","from":"pallet-pose-estimation-v2","to":"integrations"}
+{"type":"Feature","id":"low-light-mode","data":{"name":"Low-light mode","description":"Low-light mode for Lumen Fleet.","status":"proposed","priority":"p1"}}
+{"edge":"HasFeature","from":"fleet","to":"low-light-mode"}
+{"type":"Feature","id":"shift-handoff-report","data":{"name":"Shift handoff report","description":"Shift handoff report for Lumen Vision.","status":"shipped","priority":"p2"}}
+{"edge":"HasFeature","from":"vision","to":"shift-handoff-report"}
+{"type":"Feature","id":"shift-handoff-report-v2","data":{"name":"Shift handoff report v2","description":"Shift handoff report, second iteration for Lumen Console.","status":"shipped","priority":"p2"}}
+{"edge":"HasFeature","from":"console","to":"shift-handoff-report-v2"}
+{"type":"Feature","id":"dock-scheduling","data":{"name":"Dock scheduling","description":"Dock scheduling for Lumen Planner.","status":"shipped","priority":"p0"}}
+{"edge":"HasFeature","from":"planner","to":"dock-scheduling"}
+{"edge":"FeatureTagged","from":"dock-scheduling","to":"integrations"}
+{"type":"Feature","id":"role-based-access","data":{"name":"Role-based access","description":"Role-based access for Lumen Console.","status":"shipped","priority":"p2"}}
+{"edge":"HasFeature","from":"console","to":"role-based-access"}
+{"edge":"FeatureTagged","from":"role-based-access","to":"reliability"}
+{"type":"Feature","id":"role-based-access-v2","data":{"name":"Role-based access v2","description":"Role-based access, second iteration for Lumen Fleet.","status":"shipped","priority":"p1"}}
+{"edge":"HasFeature","from":"fleet","to":"role-based-access-v2"}
+{"edge":"FeatureTagged","from":"role-based-access-v2","to":"integrations"}
+{"edge":"FeatureTagged","from":"role-based-access-v2","to":"customer-request"}
+{"type":"Feature","id":"audit-log-export","data":{"name":"Audit log export","description":"Audit log export for Lumen Edge.","status":"proposed","priority":"p2"}}
+{"edge":"HasFeature","from":"edge","to":"audit-log-export"}
+{"edge":"FeatureTagged","from":"audit-log-export","to":"ux"}
+{"type":"Feature","id":"webhook-triggers","data":{"name":"Webhook triggers","description":"Webhook triggers for Lumen Fleet.","status":"cut","priority":"p1"}}
+{"edge":"HasFeature","from":"fleet","to":"webhook-triggers"}
+{"edge":"FeatureTagged","from":"webhook-triggers","to":"reliability"}
+{"edge":"FeatureTagged","from":"webhook-triggers","to":"tech-debt"}
+{"type":"Feature","id":"webhook-triggers-v2","data":{"name":"Webhook triggers v2","description":"Webhook triggers, second iteration for Lumen Planner.","status":"shipped","priority":"p2"}}
+{"edge":"HasFeature","from":"planner","to":"webhook-triggers-v2"}
+{"type":"Feature","id":"zone-speed-limits","data":{"name":"Zone speed limits","description":"Zone speed limits for Lumen Vision.","status":"shipped","priority":"p2"}}
+{"edge":"HasFeature","from":"vision","to":"zone-speed-limits"}
+{"type":"Feature","id":"multi-site-view","data":{"name":"Multi-site view","description":"Multi-site view for Lumen Planner.","status":"proposed","priority":"p1"}}
+{"edge":"HasFeature","from":"planner","to":"multi-site-view"}
+{"edge":"FeatureTagged","from":"multi-site-view","to":"reliability"}
+{"type":"Feature","id":"multi-site-view-v2","data":{"name":"Multi-site view v2","description":"Multi-site view, second iteration for Lumen Edge.","status":"proposed","priority":"p1"}}
+{"edge":"HasFeature","from":"edge","to":"multi-site-view-v2"}
+{"edge":"FeatureTagged","from":"multi-site-view-v2","to":"integrations"}
+{"type":"Feature","id":"offline-map-sync","data":{"name":"Offline map sync","description":"Offline map sync for Lumen Console.","status":"proposed","priority":"p0"}}
+{"edge":"HasFeature","from":"console","to":"offline-map-sync"}
+{"edge":"FeatureTagged","from":"offline-map-sync","to":"ux"}
+{"edge":"FeatureTagged","from":"offline-map-sync","to":"integrations"}
+{"type":"Feature","id":"pick-rate-forecast","data":{"name":"Pick-rate forecast","description":"Pick-rate forecast for Lumen Edge.","status":"building","priority":"p2"}}
+{"edge":"HasFeature","from":"edge","to":"pick-rate-forecast"}
+{"type":"Feature","id":"pick-rate-forecast-v2","data":{"name":"Pick-rate forecast v2","description":"Pick-rate forecast, second iteration for Lumen Vision.","status":"shipped","priority":"p1"}}
+{"edge":"HasFeature","from":"vision","to":"pick-rate-forecast-v2"}
+{"edge":"FeatureTagged","from":"pick-rate-forecast-v2","to":"ux"}
+{"edge":"FeatureTagged","from":"pick-rate-forecast-v2","to":"customer-request"}
+{"type":"Feature","id":"elevator-integration","data":{"name":"Elevator integration","description":"Elevator integration for Lumen Fleet.","status":"building","priority":"p0"}}
+{"edge":"HasFeature","from":"fleet","to":"elevator-integration"}
+{"edge":"FeatureTagged","from":"elevator-integration","to":"customer-request"}
+{"type":"Feature","id":"human-in-the-loop-assist","data":{"name":"Human-in-the-loop assist","description":"Human-in-the-loop assist for Lumen Vision.","status":"building","priority":"p1"}}
+{"edge":"HasFeature","from":"vision","to":"human-in-the-loop-assist"}
+{"edge":"FeatureTagged","from":"human-in-the-loop-assist","to":"ux"}
+{"edge":"FeatureTagged","from":"human-in-the-loop-assist","to":"tech-debt"}
+{"edge":"FeatureTagged","from":"human-in-the-loop-assist","to":"customer-request"}
+{"type":"Feature","id":"human-in-the-loop-assist-v2","data":{"name":"Human-in-the-loop assist v2","description":"Human-in-the-loop assist, second iteration for Lumen Console.","status":"shipped","priority":"p1"}}
+{"edge":"HasFeature","from":"console","to":"human-in-the-loop-assist-v2"}
+{"edge":"FeatureTagged","from":"human-in-the-loop-assist-v2","to":"performance"}
+{"type":"Feature","id":"fleet-simulation","data":{"name":"Fleet simulation","description":"Fleet simulation for Lumen Planner.","status":"cut","priority":"p3"}}
+{"edge":"HasFeature","from":"planner","to":"fleet-simulation"}
+{"type":"Feature","id":"firmware-rollback","data":{"name":"Firmware rollback","description":"Firmware rollback for Lumen Console.","status":"building","priority":"p1"}}
+{"edge":"HasFeature","from":"console","to":"firmware-rollback"}
+{"edge":"FeatureTagged","from":"firmware-rollback","to":"reliability"}
+{"type":"Feature","id":"firmware-rollback-v2","data":{"name":"Firmware rollback v2","description":"Firmware rollback, second iteration for Lumen Fleet.","status":"shipped","priority":"p2"}}
+{"edge":"HasFeature","from":"fleet","to":"firmware-rollback-v2"}
+{"edge":"FeatureTagged","from":"firmware-rollback-v2","to":"ux"}
+{"edge":"FeatureTagged","from":"firmware-rollback-v2","to":"tech-debt"}
+{"edge":"FeatureTagged","from":"firmware-rollback-v2","to":"customer-request"}
+{"type":"Feature","id":"custom-dashboards","data":{"name":"Custom dashboards","description":"Custom dashboards for Lumen Edge.","status":"proposed","priority":"p1"}}
+{"edge":"HasFeature","from":"edge","to":"custom-dashboards"}
+{"type":"Release","id":"fleet-1.0.0","data":{"version":"1.0.0","released_at":"2022-10-28T10:33:51Z","notes":"Security improvements and 23 fixes."}}
+{"edge":"ReleaseOf","from":"fleet-1.0.0","to":"fleet"}
+{"type":"Release","id":"fleet-1.1.0","data":{"version":"1.1.0","released_at":"2022-04-22T17:58:00Z"}}
+{"edge":"ReleaseOf","from":"fleet-1.1.0","to":"fleet"}
+{"type":"Release","id":"fleet-1.2.0","data":{"version":"1.2.0","released_at":"2023-09-20T11:23:50Z","notes":"Performance improvements and 9 fixes."}}
+{"edge":"ReleaseOf","from":"fleet-1.2.0","to":"fleet"}
+{"type":"Release","id":"fleet-2.0.0","data":{"version":"2.0.0","released_at":"2024-06-12T22:37:41Z"}}
+{"edge":"ReleaseOf","from":"fleet-2.0.0","to":"fleet"}
+{"type":"Release","id":"fleet-2.1.0","data":{"version":"2.1.0","released_at":"2025-08-30T23:23:07Z","notes":"Security improvements and 19 fixes."}}
+{"edge":"ReleaseOf","from":"fleet-2.1.0","to":"fleet"}
+{"type":"Release","id":"vision-1.0.0","data":{"version":"1.0.0","released_at":"2022-07-29T00:05:34Z"}}
+{"edge":"ReleaseOf","from":"vision-1.0.0","to":"vision"}
+{"type":"Release","id":"vision-1.1.0","data":{"version":"1.1.0","released_at":"2022-07-24T17:28:26Z"}}
+{"edge":"ReleaseOf","from":"vision-1.1.0","to":"vision"}
+{"type":"Release","id":"vision-1.2.0","data":{"version":"1.2.0","released_at":"2023-01-28T17:59:02Z"}}
+{"edge":"ReleaseOf","from":"vision-1.2.0","to":"vision"}
+{"type":"Release","id":"vision-2.0.0","data":{"version":"2.0.0","released_at":"2024-10-29T22:06:39Z","notes":"Performance improvements and 19 fixes."}}
+{"edge":"ReleaseOf","from":"vision-2.0.0","to":"vision"}
+{"type":"Release","id":"vision-2.1.0","data":{"version":"2.1.0","released_at":"2025-09-14T13:03:48Z","notes":"Performance improvements and 23 fixes."}}
+{"edge":"ReleaseOf","from":"vision-2.1.0","to":"vision"}
+{"type":"Release","id":"planner-0.8.0","data":{"version":"0.8.0","released_at":"2022-11-23T19:31:07Z","notes":"Usability improvements and 8 fixes."}}
+{"edge":"ReleaseOf","from":"planner-0.8.0","to":"planner"}
+{"type":"Release","id":"planner-0.9.0","data":{"version":"0.9.0","released_at":"2024-07-07T03:22:17Z","notes":"Usability improvements and 11 fixes."}}
+{"edge":"ReleaseOf","from":"planner-0.9.0","to":"planner"}
+{"type":"Release","id":"console-1.0.0","data":{"version":"1.0.0","released_at":"2022-08-12T17:24:40Z","notes":"Security improvements and 5 fixes."}}
+{"edge":"ReleaseOf","from":"console-1.0.0","to":"console"}
+{"type":"Release","id":"console-1.1.0","data":{"version":"1.1.0","released_at":"2022-03-05T18:33:10Z"}}
+{"edge":"ReleaseOf","from":"console-1.1.0","to":"console"}
+{"type":"Release","id":"console-1.2.0","data":{"version":"1.2.0","released_at":"2023-01-24T20:58:54Z"}}
+{"edge":"ReleaseOf","from":"console-1.2.0","to":"console"}
+{"type":"Release","id":"console-2.0.0","data":{"version":"2.0.0","released_at":"2024-04-14T19:41:05Z","notes":"Performance improvements and 20 fixes."}}
+{"edge":"ReleaseOf","from":"console-2.0.0","to":"console"}
+{"type":"Release","id":"console-2.1.0","data":{"version":"2.1.0","released_at":"2025-03-14T21:36:56Z","notes":"Performance improvements and 16 fixes."}}
+{"edge":"ReleaseOf","from":"console-2.1.0","to":"console"}
+{"edge":"ShippedIn","from":"battery-aware-routing-v2","to":"planner-0.8.0"}
+{"edge":"ShippedIn","from":"remote-e-stop","to":"planner-0.9.0"}
+{"edge":"ShippedIn","from":"heatmap-replay","to":"console-1.0.0"}
+{"edge":"ShippedIn","from":"pallet-pose-estimation-v2","to":"vision-2.0.0"}
+{"edge":"ShippedIn","from":"shift-handoff-report","to":"vision-1.2.0"}
+{"edge":"ShippedIn","from":"shift-handoff-report-v2","to":"console-1.0.0"}
+{"edge":"ShippedIn","from":"dock-scheduling","to":"planner-0.9.0"}
+{"edge":"ShippedIn","from":"role-based-access","to":"console-2.1.0"}
+{"edge":"ShippedIn","from":"role-based-access-v2","to":"fleet-2.0.0"}
+{"edge":"ShippedIn","from":"webhook-triggers-v2","to":"planner-0.8.0"}
+{"edge":"ShippedIn","from":"zone-speed-limits","to":"vision-1.0.0"}
+{"edge":"ShippedIn","from":"pick-rate-forecast-v2","to":"vision-1.2.0"}
+{"edge":"ShippedIn","from":"human-in-the-loop-assist-v2","to":"console-1.1.0"}
+{"edge":"ShippedIn","from":"firmware-rollback-v2","to":"fleet-1.1.0"}
+{"type":"Repository","id":"fleet-server","data":{"name":"fleet-server","url":"https://git.lumenlabs.example/lumen/fleet-server","language":"rust","stars":1046}}
+{"edge":"Builds","from":"fleet-server","to":"fleet"}
+{"type":"Repository","id":"fleet-proto","data":{"name":"fleet-proto","url":"https://git.lumenlabs.example/lumen/fleet-proto","language":"rust","stars":409}}
+{"edge":"Builds","from":"fleet-proto","to":"fleet"}
+{"type":"Repository","id":"vision-models","data":{"name":"vision-models","url":"https://git.lumenlabs.example/lumen/vision-models","language":"python","stars":253}}
+{"edge":"Builds","from":"vision-models","to":"vision"}
+{"type":"Repository","id":"planner-core","data":{"name":"planner-core","url":"https://git.lumenlabs.example/lumen/planner-core","language":"rust","stars":1150}}
+{"edge":"Builds","from":"planner-core","to":"planner"}
+{"type":"Repository","id":"planner-sim","data":{"name":"planner-sim","url":"https://git.lumenlabs.example/lumen/planner-sim","language":"python","stars":1654}}
+{"edge":"Builds","from":"planner-sim","to":"planner"}
+{"type":"Repository","id":"web-console","data":{"name":"web-console","url":"https://git.lumenlabs.example/lumen/web-console","language":"typescript","stars":2274}}
+{"edge":"Builds","from":"web-console","to":"console"}
+{"type":"Repository","id":"sdk-python","data":{"name":"sdk-python","url":"https://git.lumenlabs.example/lumen/sdk-python","language":"python","stars":1571}}
+{"edge":"Builds","from":"sdk-python","to":"console"}
+{"type":"Repository","id":"sdk-ts","data":{"name":"sdk-ts","url":"https://git.lumenlabs.example/lumen/sdk-ts","language":"typescript","stars":1586}}
+{"edge":"Builds","from":"sdk-ts","to":"console"}
+{"type":"Repository","id":"edge-agent","data":{"name":"edge-agent","url":"https://git.lumenlabs.example/lumen/edge-agent","language":"go","stars":1129}}
+{"edge":"Builds","from":"edge-agent","to":"edge"}
+{"type":"Account","id":"brightwater-distribution","data":{"name":"Brightwater Distribution","industry":"logistics","stage":"pilot","arr":39000,"website":"https://brightwaterdistribution.example"}}
+{"edge":"AccountOwner","from":"brightwater-distribution","to":"hana-moreau"}
+{"edge":"Uses","from":"brightwater-distribution","to":"fleet"}
+{"edge":"Uses","from":"brightwater-distribution","to":"vision"}
+{"edge":"Uses","from":"brightwater-distribution","to":"planner"}
+{"edge":"Requests","from":"brightwater-distribution","to":"low-light-mode","data":{"weight":"important"}}
+{"edge":"Requests","from":"brightwater-distribution","to":"custom-dashboards","data":{"weight":"blocking"}}
+{"type":"Account","id":"westbrook-parts","data":{"name":"Westbrook Parts","industry":"manufacturing","stage":"customer","arr":432000,"website":"https://westbrookparts.example"}}
+{"edge":"AccountOwner","from":"westbrook-parts","to":"rosa-silva"}
+{"edge":"Uses","from":"westbrook-parts","to":"fleet"}
+{"edge":"Uses","from":"westbrook-parts","to":"planner"}
+{"edge":"Uses","from":"westbrook-parts","to":"console"}
+{"edge":"Requests","from":"westbrook-parts","to":"zone-speed-limits","data":{"weight":"important"}}
+{"edge":"Requests","from":"westbrook-parts","to":"multi-site-view","data":{"weight":"important"}}
+{"type":"Account","id":"pinecrest-markets","data":{"name":"Pinecrest Markets","industry":"retail","stage":"prospect"}}
+{"edge":"AccountOwner","from":"pinecrest-markets","to":"jonah-weiss"}
+{"edge":"Uses","from":"pinecrest-markets","to":"vision"}
+{"edge":"Uses","from":"pinecrest-markets","to":"console"}
+{"edge":"Requests","from":"pinecrest-markets","to":"battery-aware-routing","data":{"weight":"important"}}
+{"edge":"Requests","from":"pinecrest-markets","to":"dock-scheduling","data":{"weight":"blocking"}}
+{"edge":"Requests","from":"pinecrest-markets","to":"role-based-access","data":{"weight":"blocking"}}
+{"edge":"Requests","from":"pinecrest-markets","to":"firmware-rollback","data":{"weight":"important"}}
+{"type":"Account","id":"pinecrest-pharmacy","data":{"name":"Pinecrest Pharmacy","industry":"healthcare","stage":"customer","arr":701000,"website":"https://pinecrestpharmacy.example"}}
+{"edge":"AccountOwner","from":"pinecrest-pharmacy","to":"ines-nakamura"}
+{"edge":"Uses","from":"pinecrest-pharmacy","to":"vision"}
+{"edge":"Uses","from":"pinecrest-pharmacy","to":"planner"}
+{"edge":"Uses","from":"pinecrest-pharmacy","to":"console"}
+{"edge":"Requests","from":"pinecrest-pharmacy","to":"battery-aware-routing-v2","data":{"weight":"important"}}
+{"edge":"Requests","from":"pinecrest-pharmacy","to":"pallet-pose-estimation-v2","data":{"weight":"important"}}
+{"type":"Account","id":"pinecrest-freight","data":{"name":"Pinecrest Freight","industry":"logistics","stage":"churned","arr":744000,"website":"https://pinecrestfreight.example"}}
+{"edge":"AccountOwner","from":"pinecrest-freight","to":"uma-jansen"}
+{"edge":"Uses","from":"pinecrest-freight","to":"vision"}
+{"edge":"Uses","from":"pinecrest-freight","to":"planner"}
+{"edge":"Uses","from":"pinecrest-freight","to":"console"}
+{"edge":"Requests","from":"pinecrest-freight","to":"role-based-access-v2","data":{"weight":"nice_to_have"}}
+{"type":"Account","id":"granite-grocers","data":{"name":"Granite Grocers","industry":"grocery","stage":"prospect","website":"https://granitegrocers.example"}}
+{"edge":"AccountOwner","from":"granite-grocers","to":"dev-delacroix"}
+{"edge":"Uses","from":"granite-grocers","to":"vision"}
+{"edge":"Requests","from":"granite-grocers","to":"dock-scheduling","data":{"weight":"important"}}
+{"edge":"Requests","from":"granite-grocers","to":"webhook-triggers-v2","data":{"weight":"important"}}
+{"edge":"Requests","from":"granite-grocers","to":"pick-rate-forecast","data":{"weight":"important"}}
+{"type":"Account","id":"brightwater-foods","data":{"name":"Brightwater Foods","industry":"grocery","stage":"churned","arr":791000}}
+{"edge":"AccountOwner","from":"brightwater-foods","to":"viktor-zeller"}
+{"edge":"Uses","from":"brightwater-foods","to":"planner"}
+{"edge":"Requests","from":"brightwater-foods","to":"custom-dashboards","data":{"weight":"important"}}
+{"type":"Account","id":"northgate-foods","data":{"name":"Northgate Foods","industry":"grocery","stage":"pilot","arr":38000,"website":"https://northgatefoods.example"}}
+{"edge":"AccountOwner","from":"northgate-foods","to":"cleo-brandt"}
+{"edge":"Uses","from":"northgate-foods","to":"vision"}
+{"edge":"Uses","from":"northgate-foods","to":"planner"}
+{"edge":"Requests","from":"northgate-foods","to":"firmware-rollback","data":{"weight":"nice_to_have"}}
+{"type":"Account","id":"northgate-logistics","data":{"name":"Northgate Logistics","industry":"logistics","stage":"churned","arr":308000,"website":"https://northgatelogistics.example"}}
+{"edge":"AccountOwner","from":"northgate-logistics","to":"yara-zeller"}
+{"edge":"Uses","from":"northgate-logistics","to":"planner"}
+{"edge":"Uses","from":"northgate-logistics","to":"console"}
+{"edge":"Requests","from":"northgate-logistics","to":"remote-e-stop-v2","data":{"weight":"important"}}
+{"type":"Account","id":"granite-markets","data":{"name":"Granite Markets","industry":"retail","stage":"churned","arr":698000,"website":"https://granitemarkets.example"}}
+{"edge":"AccountOwner","from":"granite-markets","to":"gus-varga"}
+{"edge":"Uses","from":"granite-markets","to":"planner"}
+{"type":"Account","id":"westbrook-distribution","data":{"name":"Westbrook Distribution","industry":"logistics","stage":"customer","arr":615000}}
+{"edge":"AccountOwner","from":"westbrook-distribution","to":"ines-nakamura"}
+{"edge":"Uses","from":"westbrook-distribution","to":"vision"}
+{"edge":"Uses","from":"westbrook-distribution","to":"planner"}
+{"edge":"Requests","from":"westbrook-distribution","to":"remote-e-stop","data":{"weight":"nice_to_have"}}
+{"edge":"Requests","from":"westbrook-distribution","to":"dock-scheduling","data":{"weight":"important"}}
+{"edge":"Requests","from":"westbrook-distribution","to":"pick-rate-forecast","data":{"weight":"important"}}
+{"type":"Account","id":"tidewater-apparel","data":{"name":"Tidewater Apparel","industry":"apparel","stage":"churned","arr":225000,"website":"https://tidewaterapparel.example"}}
+{"edge":"AccountOwner","from":"tidewater-apparel","to":"uma-quist"}
+{"edge":"Uses","from":"tidewater-apparel","to":"fleet"}
+{"edge":"Requests","from":"tidewater-apparel","to":"battery-aware-routing","data":{"weight":"important"}}
+{"type":"Account","id":"westbrook-grocers","data":{"name":"Westbrook Grocers","industry":"grocery","stage":"customer","arr":459000,"website":"https://westbrookgrocers.example"}}
+{"edge":"AccountOwner","from":"westbrook-grocers","to":"dev-delacroix"}
+{"edge":"Uses","from":"westbrook-grocers","to":"fleet"}
+{"edge":"Uses","from":"westbrook-grocers","to":"vision"}
+{"edge":"Uses","from":"westbrook-grocers","to":"planner"}
+{"edge":"Requests","from":"westbrook-grocers","to":"remote-e-stop-v2","data":{"weight":"blocking"}}
+{"edge":"Requests","from":"westbrook-grocers","to":"pallet-pose-estimation-v2","data":{"weight":"nice_to_have"}}
+{"edge":"Requests","from":"westbrook-grocers","to":"pick-rate-forecast","data":{"weight":"important"}}
+{"type":"Account","id":"halcyon-foods","data":{"name":"Halcyon Foods","industry":"grocery","stage":"customer","arr":564000,"website":"https://halcyonfoods.example"}}
+{"edge":"AccountOwner","from":"halcyon-foods","to":"rosa-ibarra"}
+{"edge":"Uses","from":"halcyon-foods","to":"fleet"}
+{"edge":"Uses","from":"halcyon-foods","to":"vision"}
+{"edge":"Uses","from":"halcyon-foods","to":"console"}
+{"edge":"Requests","from":"halcyon-foods","to":"role-based-access","data":{"weight":"important"}}
+{"edge":"Requests","from":"halcyon-foods","to":"fleet-simulation","data":{"weight":"important"}}
+{"type":"Account","id":"northgate-apparel","data":{"name":"Northgate Apparel","industry":"apparel","stage":"customer","arr":659000,"website":"https://northgateapparel.example"}}
+{"edge":"AccountOwner","from":"northgate-apparel","to":"priya-kowal"}
+{"edge":"Uses","from":"northgate-apparel","to":"fleet"}
+{"edge":"Requests","from":"northgate-apparel","to":"role-based-access","data":{"weight":"important"}}
+{"edge":"Requests","from":"northgate-apparel","to":"human-in-the-loop-assist","data":{"weight":"blocking"}}
+{"type":"Account","id":"northgate-freight","data":{"name":"Northgate Freight","industry":"logistics","stage":"customer","arr":365000,"website":"https://northgatefreight.example"}}
+{"edge":"AccountOwner","from":"northgate-freight","to":"yara-zeller"}
+{"edge":"Uses","from":"northgate-freight","to":"vision"}
+{"edge":"Uses","from":"northgate-freight","to":"console"}
+{"type":"Account","id":"bluefin-markets","data":{"name":"Bluefin Markets","industry":"retail","stage":"churned","arr":526000,"website":"https://bluefinmarkets.example"}}
+{"edge":"AccountOwner","from":"bluefin-markets","to":"jonah-weiss"}
+{"edge":"Uses","from":"bluefin-markets","to":"fleet"}
+{"edge":"Uses","from":"bluefin-markets","to":"vision"}
+{"edge":"Requests","from":"bluefin-markets","to":"aisle-reservations","data":{"weight":"important"}}
+{"edge":"Requests","from":"bluefin-markets","to":"remote-e-stop","data":{"weight":"important"}}
+{"edge":"Requests","from":"bluefin-markets","to":"pick-rate-forecast-v2","data":{"weight":"important"}}
+{"edge":"Requests","from":"bluefin-markets","to":"fleet-simulation","data":{"weight":"important"}}
+{"type":"Account","id":"tidewater-outfitters","data":{"name":"Tidewater Outfitters","industry":"apparel","stage":"customer","arr":801000,"website":"https://tidewateroutfitters.example"}}
+{"edge":"AccountOwner","from":"tidewater-outfitters","to":"zane-okafor"}
+{"edge":"Uses","from":"tidewater-outfitters","to":"vision"}
+{"edge":"Uses","from":"tidewater-outfitters","to":"console"}
+{"edge":"Requests","from":"tidewater-outfitters","to":"battery-aware-routing-v2","data":{"weight":"blocking"}}
+{"edge":"Requests","from":"tidewater-outfitters","to":"human-in-the-loop-assist-v2","data":{"weight":"nice_to_have"}}
+{"type":"Account","id":"meridian-outfitters","data":{"name":"Meridian Outfitters","industry":"apparel","stage":"prospect"}}
+{"edge":"AccountOwner","from":"meridian-outfitters","to":"ines-nakamura"}
+{"edge":"Uses","from":"meridian-outfitters","to":"fleet"}
+{"edge":"Uses","from":"meridian-outfitters","to":"vision"}
+{"edge":"Uses","from":"meridian-outfitters","to":"console"}
+{"edge":"Requests","from":"meridian-outfitters","to":"low-light-mode","data":{"weight":"important"}}
+{"edge":"Requests","from":"meridian-outfitters","to":"human-in-the-loop-assist","data":{"weight":"nice_to_have"}}
+{"edge":"Requests","from":"meridian-outfitters","to":"custom-dashboards","data":{"weight":"nice_to_have"}}
+{"type":"Account","id":"westbrook-apparel","data":{"name":"Westbrook Apparel","industry":"apparel","stage":"pilot","arr":37000,"website":"https://westbrookapparel.example"}}
+{"edge":"AccountOwner","from":"westbrook-apparel","to":"priya-kowal"}
+{"edge":"Uses","from":"westbrook-apparel","to":"planner"}
+{"edge":"Uses","from":"westbrook-apparel","to":"console"}
+{"edge":"Requests","from":"westbrook-apparel","to":"remote-e-stop","data":{"weight":"blocking"}}
+{"edge":"Requests","from":"westbrook-apparel","to":"multi-site-view-v2","data":{"weight":"blocking"}}
+{"type":"Account","id":"juniper-grocers","data":{"name":"Juniper Grocers","industry":"grocery","stage":"customer","arr":662000,"website":"https://junipergrocers.example"}}
+{"edge":"AccountOwner","from":"juniper-grocers","to":"uma-quist"}
+{"edge":"Uses","from":"juniper-grocers","to":"vision"}
+{"type":"Account","id":"westbrook-freight","data":{"name":"Westbrook Freight","industry":"logistics","stage":"customer","arr":193000,"website":"https://westbrookfreight.example"}}
+{"edge":"AccountOwner","from":"westbrook-freight","to":"rosa-silva"}
+{"edge":"Uses","from":"westbrook-freight","to":"fleet"}
+{"edge":"Uses","from":"westbrook-freight","to":"vision"}
+{"edge":"Requests","from":"westbrook-freight","to":"shift-handoff-report-v2","data":{"weight":"important"}}
+{"type":"Account","id":"ironwood-distribution","data":{"name":"Ironwood Distribution","industry":"logistics","stage":"pilot","arr":25000,"website":"https://ironwooddistribution.example"}}
+{"edge":"AccountOwner","from":"ironwood-distribution","to":"elif-jansen"}
+{"edge":"Uses","from":"ironwood-distribution","to":"vision"}
+{"edge":"Uses","from":"ironwood-distribution","to":"console"}
+{"edge":"Requests","from":"ironwood-distribution","to":"remote-e-stop-v2","data":{"weight":"important"}}
+{"edge":"Requests","from":"ironwood-distribution","to":"multi-site-view","data":{"weight":"blocking"}}
+{"edge":"Requests","from":"ironwood-distribution","to":"pick-rate-forecast-v2","data":{"weight":"important"}}
+{"edge":"Requests","from":"ironwood-distribution","to":"fleet-simulation","data":{"weight":"nice_to_have"}}
+{"edge":"Requests","from":"ironwood-distribution","to":"custom-dashboards","data":{"weight":"important"}}
+{"type":"Account","id":"halcyon-markets","data":{"name":"Halcyon Markets","industry":"retail","stage":"customer","arr":489000,"website":"https://halcyonmarkets.example"}}
+{"edge":"AccountOwner","from":"halcyon-markets","to":"rosa-ibarra"}
+{"edge":"Uses","from":"halcyon-markets","to":"fleet"}
+{"edge":"Uses","from":"halcyon-markets","to":"planner"}
+{"edge":"Requests","from":"halcyon-markets","to":"battery-aware-routing-v2","data":{"weight":"important"}}
+{"edge":"Requests","from":"halcyon-markets","to":"pallet-pose-estimation","data":{"weight":"nice_to_have"}}
+{"edge":"Requests","from":"halcyon-markets","to":"webhook-triggers","data":{"weight":"nice_to_have"}}
+{"edge":"Requests","from":"halcyon-markets","to":"custom-dashboards","data":{"weight":"important"}}
+{"type":"Account","id":"redcliff-parts","data":{"name":"Redcliff Parts","industry":"manufacturing","stage":"prospect"}}
+{"edge":"AccountOwner","from":"redcliff-parts","to":"hana-moreau"}
+{"edge":"Uses","from":"redcliff-parts","to":"fleet"}
+{"edge":"Uses","from":"redcliff-parts","to":"planner"}
+{"edge":"Uses","from":"redcliff-parts","to":"console"}
+{"edge":"Requests","from":"redcliff-parts","to":"shift-handoff-report-v2","data":{"weight":"nice_to_have"}}
+{"edge":"Requests","from":"redcliff-parts","to":"human-in-the-loop-assist","data":{"weight":"blocking"}}
+{"type":"Account","id":"silverleaf-fulfillment","data":{"name":"Silverleaf Fulfillment","industry":"retail","stage":"churned","arr":187000}}
+{"edge":"AccountOwner","from":"silverleaf-fulfillment","to":"priya-jansen"}
+{"edge":"Uses","from":"silverleaf-fulfillment","to":"vision"}
+{"edge":"Uses","from":"silverleaf-fulfillment","to":"planner"}
+{"edge":"Requests","from":"silverleaf-fulfillment","to":"remote-e-stop-v2","data":{"weight":"important"}}
+{"edge":"Requests","from":"silverleaf-fulfillment","to":"pallet-pose-estimation-v2","data":{"weight":"nice_to_have"}}
+{"edge":"Requests","from":"silverleaf-fulfillment","to":"fleet-simulation","data":{"weight":"nice_to_have"}}
+{"edge":"Requests","from":"silverleaf-fulfillment","to":"firmware-rollback","data":{"weight":"nice_to_have"}}
+{"type":"Account","id":"brightwater-markets","data":{"name":"Brightwater Markets","industry":"retail","stage":"customer","arr":825000,"website":"https://brightwatermarkets.example"}}
+{"edge":"AccountOwner","from":"brightwater-markets","to":"gus-varga"}
+{"edge":"Uses","from":"brightwater-markets","to":"vision"}
+{"edge":"Requests","from":"brightwater-markets","to":"webhook-triggers","data":{"weight":"blocking"}}
+{"edge":"Requests","from":"brightwater-markets","to":"pick-rate-forecast-v2","data":{"weight":"important"}}
+{"edge":"Requests","from":"brightwater-markets","to":"elevator-integration","data":{"weight":"important"}}
+{"type":"Account","id":"copperline-outfitters","data":{"name":"Copperline Outfitters","industry":"apparel","stage":"customer","arr":499000,"website":"https://copperlineoutfitters.example"}}
+{"edge":"AccountOwner","from":"copperline-outfitters","to":"priya-jansen"}
+{"edge":"Uses","from":"copperline-outfitters","to":"vision"}
+{"edge":"Uses","from":"copperline-outfitters","to":"console"}
+{"edge":"Requests","from":"copperline-outfitters","to":"low-light-mode","data":{"weight":"blocking"}}
+{"edge":"Requests","from":"copperline-outfitters","to":"offline-map-sync","data":{"weight":"nice_to_have"}}
+{"type":"Account","id":"northgate-parts","data":{"name":"Northgate Parts","industry":"manufacturing","stage":"churned","arr":772000,"website":"https://northgateparts.example"}}
+{"edge":"AccountOwner","from":"northgate-parts","to":"jonah-weiss"}
+{"edge":"Uses","from":"northgate-parts","to":"fleet"}
+{"edge":"Uses","from":"northgate-parts","to":"vision"}
+{"edge":"Uses","from":"northgate-parts","to":"planner"}
+{"edge":"Requests","from":"northgate-parts","to":"aisle-reservations","data":{"weight":"nice_to_have"}}
+{"edge":"Requests","from":"northgate-parts","to":"audit-log-export","data":{"weight":"nice_to_have"}}
+{"type":"Account","id":"granite-freight","data":{"name":"Granite Freight","industry":"logistics","stage":"churned","arr":83000,"website":"https://granitefreight.example"}}
+{"edge":"AccountOwner","from":"granite-freight","to":"dev-delacroix"}
+{"edge":"Uses","from":"granite-freight","to":"vision"}
+{"edge":"Uses","from":"granite-freight","to":"planner"}
+{"edge":"Uses","from":"granite-freight","to":"console"}
+{"edge":"Requests","from":"granite-freight","to":"multi-site-view-v2","data":{"weight":"important"}}
+{"type":"Account","id":"pinecrest-grocers","data":{"name":"Pinecrest Grocers","industry":"grocery","stage":"prospect","website":"https://pinecrestgrocers.example"}}
+{"edge":"AccountOwner","from":"pinecrest-grocers","to":"viktor-zeller"}
+{"edge":"Uses","from":"pinecrest-grocers","to":"planner"}
+{"type":"Account","id":"granite-foods","data":{"name":"Granite Foods","industry":"grocery","stage":"customer","arr":898000,"website":"https://granitefoods.example"}}
+{"edge":"AccountOwner","from":"granite-foods","to":"uma-quist"}
+{"edge":"Uses","from":"granite-foods","to":"planner"}
+{"edge":"Uses","from":"granite-foods","to":"console"}
+{"edge":"Requests","from":"granite-foods","to":"battery-aware-routing","data":{"weight":"nice_to_have"}}
+{"edge":"Requests","from":"granite-foods","to":"fleet-simulation","data":{"weight":"blocking"}}
+{"type":"Account","id":"ironwood-apparel","data":{"name":"Ironwood Apparel","industry":"apparel","stage":"pilot","arr":30000,"website":"https://ironwoodapparel.example"}}
+{"edge":"AccountOwner","from":"ironwood-apparel","to":"uma-quist"}
+{"edge":"Uses","from":"ironwood-apparel","to":"fleet"}
+{"edge":"Uses","from":"ironwood-apparel","to":"vision"}
+{"edge":"Requests","from":"ironwood-apparel","to":"aisle-reservations","data":{"weight":"important"}}
+{"edge":"Requests","from":"ironwood-apparel","to":"fleet-simulation","data":{"weight":"nice_to_have"}}
+{"type":"Account","id":"juniper-pharmacy","data":{"name":"Juniper Pharmacy","industry":"healthcare","stage":"customer","arr":82000,"website":"https://juniperpharmacy.example"}}
+{"edge":"AccountOwner","from":"juniper-pharmacy","to":"viktor-zeller"}
+{"type":"Account","id":"bluefin-freight","data":{"name":"Bluefin Freight","industry":"logistics","stage":"customer","arr":161000,"website":"https://bluefinfreight.example"}}
+{"edge":"AccountOwner","from":"bluefin-freight","to":"ines-nakamura"}
+{"edge":"Uses","from":"bluefin-freight","to":"fleet"}
+{"edge":"Uses","from":"bluefin-freight","to":"console"}
+{"edge":"Requests","from":"bluefin-freight","to":"dock-scheduling","data":{"weight":"important"}}
+{"type":"Account","id":"oakridge-pharmacy","data":{"name":"Oakridge Pharmacy","industry":"healthcare","stage":"customer","arr":746000,"website":"https://oakridgepharmacy.example"}}
+{"edge":"AccountOwner","from":"oakridge-pharmacy","to":"rosa-ibarra"}
+{"edge":"Uses","from":"oakridge-pharmacy","to":"fleet"}
+{"edge":"Uses","from":"oakridge-pharmacy","to":"vision"}
+{"edge":"Uses","from":"oakridge-pharmacy","to":"planner"}
+{"edge":"Requests","from":"oakridge-pharmacy","to":"battery-aware-routing-v2","data":{"weight":"blocking"}}
+{"edge":"Requests","from":"oakridge-pharmacy","to":"shift-handoff-report","data":{"weight":"important"}}
+{"type":"Account","id":"juniper-parts","data":{"name":"Juniper Parts","industry":"manufacturing","stage":"prospect","website":"https://juniperparts.example"}}
+{"edge":"AccountOwner","from":"juniper-parts","to":"priya-jansen"}
+{"edge":"Uses","from":"juniper-parts","to":"fleet"}
+{"edge":"Uses","from":"juniper-parts","to":"vision"}
+{"edge":"Requests","from":"juniper-parts","to":"webhook-triggers","data":{"weight":"blocking"}}
+{"edge":"Requests","from":"juniper-parts","to":"pick-rate-forecast","data":{"weight":"important"}}
+{"type":"Account","id":"oakridge-freight","data":{"name":"Oakridge Freight","industry":"logistics","stage":"churned","arr":776000,"website":"https://oakridgefreight.example"}}
+{"edge":"AccountOwner","from":"oakridge-freight","to":"viktor-zeller"}
+{"edge":"Uses","from":"oakridge-freight","to":"fleet"}
+{"edge":"Requests","from":"oakridge-freight","to":"remote-e-stop-v2","data":{"weight":"important"}}
+{"edge":"Requests","from":"oakridge-freight","to":"low-light-mode","data":{"weight":"important"}}
+{"edge":"Requests","from":"oakridge-freight","to":"shift-handoff-report","data":{"weight":"important"}}
+{"edge":"Requests","from":"oakridge-freight","to":"shift-handoff-report-v2","data":{"weight":"nice_to_have"}}
+{"edge":"Requests","from":"oakridge-freight","to":"fleet-simulation","data":{"weight":"important"}}
+{"type":"Account","id":"brightwater-outfitters","data":{"name":"Brightwater Outfitters","industry":"apparel","stage":"prospect","website":"https://brightwateroutfitters.example"}}
+{"edge":"AccountOwner","from":"brightwater-outfitters","to":"gus-varga"}
+{"edge":"Uses","from":"brightwater-outfitters","to":"fleet"}
+{"edge":"Uses","from":"brightwater-outfitters","to":"planner"}
+{"edge":"Requests","from":"brightwater-outfitters","to":"human-in-the-loop-assist","data":{"weight":"nice_to_have"}}
+{"type":"Account","id":"granite-distribution","data":{"name":"Granite Distribution","industry":"logistics","stage":"pilot","arr":10000}}
+{"edge":"AccountOwner","from":"granite-distribution","to":"priya-jansen"}
+{"edge":"Uses","from":"granite-distribution","to":"fleet"}
+{"edge":"Requests","from":"granite-distribution","to":"pick-rate-forecast-v2","data":{"weight":"nice_to_have"}}
+{"type":"Account","id":"juniper-freight","data":{"name":"Juniper Freight","industry":"logistics","stage":"customer","arr":393000,"website":"https://juniperfreight.example"}}
+{"edge":"AccountOwner","from":"juniper-freight","to":"viktor-zeller"}
+{"edge":"Uses","from":"juniper-freight","to":"fleet"}
+{"edge":"Uses","from":"juniper-freight","to":"planner"}
+{"edge":"Requests","from":"juniper-freight","to":"aisle-reservations","data":{"weight":"nice_to_have"}}
+{"edge":"Requests","from":"juniper-freight","to":"shift-handoff-report-v2","data":{"weight":"important"}}
+{"edge":"Requests","from":"juniper-freight","to":"zone-speed-limits","data":{"weight":"nice_to_have"}}
+{"type":"Account","id":"halcyon-supply","data":{"name":"Halcyon Supply","industry":"manufacturing","stage":"customer","arr":350000,"website":"https://halcyonsupply.example"}}
+{"edge":"AccountOwner","from":"halcyon-supply","to":"zane-okafor"}
+{"edge":"Requests","from":"halcyon-supply","to":"battery-aware-routing-v2","data":{"weight":"important"}}
+{"edge":"Requests","from":"halcyon-supply","to":"remote-e-stop-v2","data":{"weight":"important"}}
+{"edge":"Requests","from":"halcyon-supply","to":"pallet-pose-estimation-v2","data":{"weight":"blocking"}}
+{"edge":"Requests","from":"halcyon-supply","to":"zone-speed-limits","data":{"weight":"important"}}
+{"edge":"Requests","from":"halcyon-supply","to":"pick-rate-forecast","data":{"weight":"nice_to_have"}}
+{"type":"Account","id":"northgate-distribution","data":{"name":"Northgate Distribution","industry":"logistics","stage":"churned","arr":672000,"website":"https://northgatedistribution.example"}}
+{"edge":"AccountOwner","from":"northgate-distribution","to":"dev-delacroix"}
+{"edge":"Uses","from":"northgate-distribution","to":"console"}
+{"edge":"Requests","from":"northgate-distribution","to":"pallet-pose-estimation","data":{"weight":"important"}}
+{"edge":"Requests","from":"northgate-distribution","to":"pallet-pose-estimation-v2","data":{"weight":"nice_to_have"}}
+{"type":"Account","id":"pinecrest-foods","data":{"name":"Pinecrest Foods","industry":"grocery","stage":"customer","arr":678000,"website":"https://pinecrestfoods.example"}}
+{"edge":"AccountOwner","from":"pinecrest-foods","to":"dev-delacroix"}
+{"edge":"Uses","from":"pinecrest-foods","to":"fleet"}
+{"edge":"Requests","from":"pinecrest-foods","to":"aisle-reservations","data":{"weight":"important"}}
+{"edge":"Requests","from":"pinecrest-foods","to":"remote-e-stop-v2","data":{"weight":"blocking"}}
+{"edge":"Requests","from":"pinecrest-foods","to":"shift-handoff-report-v2","data":{"weight":"nice_to_have"}}
+{"type":"Account","id":"juniper-logistics","data":{"name":"Juniper Logistics","industry":"logistics","stage":"customer","arr":163000,"website":"https://juniperlogistics.example"}}
+{"edge":"AccountOwner","from":"juniper-logistics","to":"uma-jansen"}
+{"edge":"Uses","from":"juniper-logistics","to":"vision"}
+{"edge":"Uses","from":"juniper-logistics","to":"planner"}
+{"edge":"Requests","from":"juniper-logistics","to":"audit-log-export","data":{"weight":"important"}}
+{"edge":"Requests","from":"juniper-logistics","to":"pick-rate-forecast-v2","data":{"weight":"important"}}
+{"edge":"Requests","from":"juniper-logistics","to":"fleet-simulation","data":{"weight":"nice_to_have"}}
+{"edge":"Requests","from":"juniper-logistics","to":"firmware-rollback","data":{"weight":"nice_to_have"}}
+{"type":"Account","id":"ironwood-pharmacy","data":{"name":"Ironwood Pharmacy","industry":"healthcare","stage":"customer","arr":504000,"website":"https://ironwoodpharmacy.example"}}
+{"edge":"AccountOwner","from":"ironwood-pharmacy","to":"elif-jansen"}
+{"edge":"Uses","from":"ironwood-pharmacy","to":"fleet"}
+{"edge":"Requests","from":"ironwood-pharmacy","to":"role-based-access","data":{"weight":"important"}}
+{"edge":"Requests","from":"ironwood-pharmacy","to":"multi-site-view","data":{"weight":"important"}}
+{"type":"Account","id":"copperline-supply","data":{"name":"Copperline Supply","industry":"manufacturing","stage":"customer","arr":393000,"website":"https://copperlinesupply.example"}}
+{"edge":"AccountOwner","from":"copperline-supply","to":"rosa-silva"}
+{"edge":"Uses","from":"copperline-supply","to":"fleet"}
+{"edge":"Uses","from":"copperline-supply","to":"vision"}
+{"edge":"Uses","from":"copperline-supply","to":"console"}
+{"type":"Account","id":"bluefin-parts","data":{"name":"Bluefin Parts","industry":"manufacturing","stage":"customer","arr":658000}}
+{"edge":"AccountOwner","from":"bluefin-parts","to":"yara-zeller"}
+{"edge":"Uses","from":"bluefin-parts","to":"fleet"}
+{"edge":"Requests","from":"bluefin-parts","to":"heatmap-replay","data":{"weight":"important"}}
+{"edge":"Requests","from":"bluefin-parts","to":"pallet-pose-estimation","data":{"weight":"blocking"}}
+{"edge":"Requests","from":"bluefin-parts","to":"webhook-triggers-v2","data":{"weight":"important"}}
+{"type":"Account","id":"granite-logistics","data":{"name":"Granite Logistics","industry":"logistics","stage":"prospect","website":"https://granitelogistics.example"}}
+{"edge":"AccountOwner","from":"granite-logistics","to":"rosa-silva"}
+{"edge":"Uses","from":"granite-logistics","to":"planner"}
+{"edge":"Uses","from":"granite-logistics","to":"console"}
+{"edge":"Requests","from":"granite-logistics","to":"remote-e-stop-v2","data":{"weight":"blocking"}}
+{"edge":"Requests","from":"granite-logistics","to":"multi-site-view","data":{"weight":"blocking"}}
+{"edge":"Requests","from":"granite-logistics","to":"pick-rate-forecast","data":{"weight":"important"}}
+{"type":"Account","id":"northgate-pharmacy","data":{"name":"Northgate Pharmacy","industry":"healthcare","stage":"prospect","website":"https://northgatepharmacy.example"}}
+{"edge":"AccountOwner","from":"northgate-pharmacy","to":"uma-jansen"}
+{"edge":"Uses","from":"northgate-pharmacy","to":"planner"}
+{"edge":"Requests","from":"northgate-pharmacy","to":"zone-speed-limits","data":{"weight":"blocking"}}
+{"type":"Account","id":"meridian-apparel","data":{"name":"Meridian Apparel","industry":"apparel","stage":"churned","arr":288000}}
+{"edge":"AccountOwner","from":"meridian-apparel","to":"priya-kowal"}
+{"edge":"Uses","from":"meridian-apparel","to":"fleet"}
+{"edge":"Uses","from":"meridian-apparel","to":"vision"}
+{"type":"Account","id":"redcliff-distribution","data":{"name":"Redcliff Distribution","industry":"logistics","stage":"churned","arr":851000,"website":"https://redcliffdistribution.example"}}
+{"edge":"AccountOwner","from":"redcliff-distribution","to":"rosa-silva"}
+{"edge":"Uses","from":"redcliff-distribution","to":"fleet"}
+{"edge":"Uses","from":"redcliff-distribution","to":"vision"}
+{"edge":"Requests","from":"redcliff-distribution","to":"dock-scheduling","data":{"weight":"important"}}
+{"type":"Account","id":"oakridge-markets","data":{"name":"Oakridge Markets","industry":"retail","stage":"customer","arr":425000,"website":"https://oakridgemarkets.example"}}
+{"edge":"AccountOwner","from":"oakridge-markets","to":"hana-moreau"}
+{"edge":"Uses","from":"oakridge-markets","to":"vision"}
+{"edge":"Uses","from":"oakridge-markets","to":"planner"}
+{"edge":"Requests","from":"oakridge-markets","to":"remote-e-stop","data":{"weight":"nice_to_have"}}
+{"edge":"Requests","from":"oakridge-markets","to":"custom-dashboards","data":{"weight":"important"}}
+{"type":"Account","id":"juniper-foods","data":{"name":"Juniper Foods","industry":"grocery","stage":"churned","arr":379000,"website":"https://juniperfoods.example"}}
+{"edge":"AccountOwner","from":"juniper-foods","to":"zane-okafor"}
+{"edge":"Uses","from":"juniper-foods","to":"vision"}
+{"edge":"Requests","from":"juniper-foods","to":"remote-e-stop","data":{"weight":"nice_to_have"}}
+{"edge":"Requests","from":"juniper-foods","to":"role-based-access","data":{"weight":"blocking"}}
+{"edge":"Requests","from":"juniper-foods","to":"role-based-access-v2","data":{"weight":"important"}}
+{"type":"Account","id":"ironwood-grocers","data":{"name":"Ironwood Grocers","industry":"grocery","stage":"customer","arr":128000}}
+{"edge":"AccountOwner","from":"ironwood-grocers","to":"dev-delacroix"}
+{"edge":"Uses","from":"ironwood-grocers","to":"console"}
+{"edge":"Requests","from":"ironwood-grocers","to":"remote-e-stop","data":{"weight":"important"}}
+{"edge":"Requests","from":"ironwood-grocers","to":"webhook-triggers-v2","data":{"weight":"important"}}
+{"edge":"Requests","from":"ironwood-grocers","to":"pick-rate-forecast","data":{"weight":"important"}}
+{"edge":"Requests","from":"ironwood-grocers","to":"custom-dashboards","data":{"weight":"important"}}
+{"type":"Account","id":"halcyon-distribution","data":{"name":"Halcyon Distribution","industry":"logistics","stage":"churned","arr":808000,"website":"https://halcyondistribution.example"}}
+{"edge":"AccountOwner","from":"halcyon-distribution","to":"gus-varga"}
+{"edge":"Uses","from":"halcyon-distribution","to":"fleet"}
+{"edge":"Uses","from":"halcyon-distribution","to":"planner"}
+{"edge":"Requests","from":"halcyon-distribution","to":"human-in-the-loop-assist-v2","data":{"weight":"important"}}
+{"edge":"Requests","from":"halcyon-distribution","to":"firmware-rollback","data":{"weight":"important"}}
+{"type":"Account","id":"brightwater-grocers","data":{"name":"Brightwater Grocers","industry":"grocery","stage":"customer","arr":51000,"website":"https://brightwatergrocers.example"}}
+{"edge":"AccountOwner","from":"brightwater-grocers","to":"jonah-weiss"}
+{"edge":"Uses","from":"brightwater-grocers","to":"vision"}
+{"edge":"Requests","from":"brightwater-grocers","to":"dock-scheduling","data":{"weight":"nice_to_have"}}
+{"edge":"Requests","from":"brightwater-grocers","to":"role-based-access-v2","data":{"weight":"nice_to_have"}}
+{"edge":"Requests","from":"brightwater-grocers","to":"pick-rate-forecast-v2","data":{"weight":"important"}}
+{"edge":"Requests","from":"brightwater-grocers","to":"human-in-the-loop-assist-v2","data":{"weight":"blocking"}}
+{"type":"Account","id":"redcliff-logistics","data":{"name":"Redcliff Logistics","industry":"logistics","stage":"customer","arr":355000,"website":"https://redclifflogistics.example"}}
+{"edge":"AccountOwner","from":"redcliff-logistics","to":"uma-jansen"}
+{"edge":"Uses","from":"redcliff-logistics","to":"planner"}
+{"edge":"Uses","from":"redcliff-logistics","to":"console"}
+{"edge":"Requests","from":"redcliff-logistics","to":"pallet-pose-estimation-v2","data":{"weight":"nice_to_have"}}
+{"type":"Account","id":"ironwood-markets","data":{"name":"Ironwood Markets","industry":"retail","stage":"churned","arr":294000,"website":"https://ironwoodmarkets.example"}}
+{"edge":"AccountOwner","from":"ironwood-markets","to":"viktor-zeller"}
+{"edge":"Uses","from":"ironwood-markets","to":"planner"}
+{"edge":"Requests","from":"ironwood-markets","to":"custom-dashboards","data":{"weight":"important"}}
+{"type":"Account","id":"summit-grocers","data":{"name":"Summit Grocers","industry":"grocery","stage":"churned","arr":588000,"website":"https://summitgrocers.example"}}
+{"edge":"AccountOwner","from":"summit-grocers","to":"elif-jansen"}
+{"edge":"Uses","from":"summit-grocers","to":"vision"}
+{"edge":"Requests","from":"summit-grocers","to":"shift-handoff-report","data":{"weight":"nice_to_have"}}
+{"edge":"Requests","from":"summit-grocers","to":"elevator-integration","data":{"weight":"blocking"}}
+{"type":"Issue","id":"sdk-python-101","data":{"title":"Pick verifier reports stale battery levels","state":"closed","severity":"high","opened_at":"2025-04-21T14:21:02Z","closed_at":"2025-05-29T14:21:02Z"}}
+{"edge":"FiledIn","from":"sdk-python-101","to":"sdk-python"}
+{"edge":"IssueTagged","from":"sdk-python-101","to":"ux"}
+{"edge":"IssueTagged","from":"sdk-python-101","to":"reliability"}
+{"edge":"AssignedTo","from":"sdk-python-101","to":"lena-abara"}
+{"type":"Issue","id":"vision-models-102","data":{"title":"Pone manager times out after reconnect","state":"closed","severity":"medium","opened_at":"2024-02-13T02:50:13Z","closed_at":"2024-04-05T02:50:13Z"}}
+{"edge":"FiledIn","from":"vision-models-102","to":"vision-models"}
+{"type":"Issue","id":"fleet-server-103","data":{"title":"Sleet dashboard crashes on empty map","state":"closed","severity":"high","opened_at":"2023-12-04T18:25:59Z","closed_at":"2023-12-19T18:25:59Z"}}
+{"edge":"FiledIn","from":"fleet-server-103","to":"fleet-server"}
+{"edge":"IssueTagged","from":"fleet-server-103","to":"tech-debt"}
+{"type":"Issue","id":"web-console-104","data":{"title":"Pidar driver drops frames under load","state":"closed","severity":"medium","opened_at":"2025-04-02T22:25:44Z","closed_at":"2025-04-06T22:25:44Z"}}
+{"edge":"FiledIn","from":"web-console-104","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-104","to":"performance"}
+{"edge":"IssueTagged","from":"web-console-104","to":"integrations"}
+{"edge":"IssueTagged","from":"web-console-104","to":"customer-request"}
+{"edge":"AssignedTo","from":"web-console-104","to":"mateo-rahman"}
+{"type":"Issue","id":"fleet-proto-105","data":{"title":"MDK auth shows wrong timezone","state":"closed","severity":"high","opened_at":"2023-12-25T12:46:16Z","closed_at":"2024-01-13T12:46:16Z"}}
+{"edge":"FiledIn","from":"fleet-proto-105","to":"fleet-proto"}
+{"edge":"AssignedTo","from":"fleet-proto-105","to":"ada-moreau"}
+{"type":"Issue","id":"fleet-server-106","data":{"title":"Cap editor stalls at aisle intersections","state":"open","severity":"critical","opened_at":"2023-05-05T00:31:54Z"}}
+{"edge":"FiledIn","from":"fleet-server-106","to":"fleet-server"}
+{"edge":"IssueTagged","from":"fleet-server-106","to":"safety"}
+{"edge":"IssueTagged","from":"fleet-server-106","to":"ux"}
+{"edge":"IssueTagged","from":"fleet-server-106","to":"tech-debt"}
+{"edge":"AssignedTo","from":"fleet-server-106","to":"chiara-rahman"}
+{"type":"Issue","id":"fleet-server-107","data":{"title":"Pone manager times out after reconnect","state":"closed","severity":"low","opened_at":"2025-06-01T16:38:09Z","closed_at":"2025-07-31T16:38:09Z"}}
+{"edge":"FiledIn","from":"fleet-server-107","to":"fleet-server"}
+{"edge":"AssignedTo","from":"fleet-server-107","to":"kofi-weiss"}
+{"type":"Issue","id":"vision-models-108","data":{"title":"Lath planner reports stale battery levels","state":"closed","severity":"medium","opened_at":"2025-02-26T19:48:41Z","closed_at":"2025-03-19T19:48:41Z"}}
+{"edge":"FiledIn","from":"vision-models-108","to":"vision-models"}
+{"type":"Issue","id":"edge-agent-109","data":{"title":"Cone manager ignores no-go zones","state":"closed","severity":"high","opened_at":"2024-10-24T16:40:52Z","closed_at":"2024-12-08T16:40:52Z"}}
+{"edge":"FiledIn","from":"edge-agent-109","to":"edge-agent"}
+{"edge":"IssueTagged","from":"edge-agent-109","to":"reliability"}
+{"type":"Issue","id":"sdk-python-110","data":{"title":"Bick verifier reports stale battery levels","state":"open","severity":"low","opened_at":"2024-02-09T02:10:40Z"}}
+{"edge":"FiledIn","from":"sdk-python-110","to":"sdk-python"}
+{"edge":"IssueTagged","from":"sdk-python-110","to":"ux"}
+{"edge":"ReportedBy","from":"sdk-python-110","to":"halcyon-distribution"}
+{"type":"Issue","id":"edge-agent-111","data":{"title":"Safety monitor reports stale battery levels","state":"closed","severity":"low","opened_at":"2023-06-02T00:15:09Z","closed_at":"2023-07-14T00:15:09Z"}}
+{"edge":"FiledIn","from":"edge-agent-111","to":"edge-agent"}
+{"edge":"IssueTagged","from":"edge-agent-111","to":"ux"}
+{"edge":"AssignedTo","from":"edge-agent-111","to":"yara-eklund"}
+{"type":"Issue","id":"fleet-proto-112","data":{"title":"Mleet dashboard shows wrong timezone","state":"open","severity":"low","opened_at":"2024-03-13T17:56:20Z"}}
+{"edge":"FiledIn","from":"fleet-proto-112","to":"fleet-proto"}
+{"edge":"IssueTagged","from":"fleet-proto-112","to":"safety"}
+{"edge":"IssueTagged","from":"fleet-proto-112","to":"tech-debt"}
+{"edge":"AssignedTo","from":"fleet-proto-112","to":"wren-nakamura"}
+{"type":"Issue","id":"planner-sim-113","data":{"title":"Safety monitor times out after reconnect","state":"closed","severity":"critical","opened_at":"2023-06-05T12:12:14Z","closed_at":"2023-07-06T12:12:14Z"}}
+{"edge":"FiledIn","from":"planner-sim-113","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-113","to":"reliability"}
+{"type":"Issue","id":"sdk-ts-114","data":{"title":"Pafety monitor shows wrong timezone","state":"closed","severity":"low","opened_at":"2025-03-04T07:04:41Z","closed_at":"2025-03-25T07:04:41Z"}}
+{"edge":"FiledIn","from":"sdk-ts-114","to":"sdk-ts"}
+{"edge":"AssignedTo","from":"sdk-ts-114","to":"hana-zeller"}
+{"type":"Issue","id":"vision-models-115","data":{"title":"Lone manager leaks memory overnight","state":"open","severity":"critical","opened_at":"2024-06-24T06:48:13Z"}}
+{"edge":"FiledIn","from":"vision-models-115","to":"vision-models"}
+{"edge":"AssignedTo","from":"vision-models-115","to":"ada-petrov"}
+{"type":"Issue","id":"web-console-116","data":{"title":"Cath planner times out after reconnect","state":"open","severity":"medium","opened_at":"2025-08-23T07:32:40Z"}}
+{"edge":"FiledIn","from":"web-console-116","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-116","to":"integrations"}
+{"edge":"AssignedTo","from":"web-console-116","to":"chiara-rahman"}
+{"edge":"ReportedBy","from":"web-console-116","to":"northgate-parts"}
+{"type":"Issue","id":"fleet-proto-117","data":{"title":"Fath planner leaks memory overnight","state":"open","severity":"critical","opened_at":"2023-04-24T20:38:57Z"}}
+{"edge":"FiledIn","from":"fleet-proto-117","to":"fleet-proto"}
+{"edge":"IssueTagged","from":"fleet-proto-117","to":"customer-request"}
+{"edge":"AssignedTo","from":"fleet-proto-117","to":"bodhi-moreau"}
+{"edge":"ReportedBy","from":"fleet-proto-117","to":"northgate-distribution"}
+{"type":"Issue","id":"edge-agent-118","data":{"title":"Carcode reader reports stale battery levels","state":"closed","severity":"medium","opened_at":"2025-01-17T23:44:58Z","closed_at":"2025-02-19T23:44:58Z"}}
+{"edge":"FiledIn","from":"edge-agent-118","to":"edge-agent"}
+{"edge":"AssignedTo","from":"edge-agent-118","to":"priya-weiss"}
+{"type":"Issue","id":"fleet-server-119","data":{"title":"Sidar driver reports stale battery levels","state":"closed","severity":"high","opened_at":"2025-04-15T00:27:29Z","closed_at":"2025-05-26T00:27:29Z"}}
+{"edge":"FiledIn","from":"fleet-server-119","to":"fleet-server"}
+{"edge":"AssignedTo","from":"fleet-server-119","to":"ada-brandt"}
+{"type":"Issue","id":"planner-sim-120","data":{"title":"PTA updater drops frames under load","state":"open","severity":"medium","opened_at":"2025-03-18T10:03:52Z"}}
+{"edge":"FiledIn","from":"planner-sim-120","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-120","to":"performance"}
+{"edge":"AssignedTo","from":"planner-sim-120","to":"kofi-haas"}
+{"edge":"ReportedBy","from":"planner-sim-120","to":"granite-freight"}
+{"type":"Issue","id":"edge-agent-121","data":{"title":"Lharging scheduler leaks memory overnight","state":"open","severity":"low","opened_at":"2025-02-23T13:50:00Z"}}
+{"edge":"FiledIn","from":"edge-agent-121","to":"edge-agent"}
+{"edge":"IssueTagged","from":"edge-agent-121","to":"reliability"}
+{"edge":"IssueTagged","from":"edge-agent-121","to":"customer-request"}
+{"edge":"AssignedTo","from":"edge-agent-121","to":"lena-lindqvist"}
+{"edge":"ReportedBy","from":"edge-agent-121","to":"brightwater-distribution"}
+{"type":"Issue","id":"sdk-python-122","data":{"title":"STA updater crashes on empty map","state":"closed","severity":"low","opened_at":"2023-12-24T17:06:06Z","closed_at":"2024-01-19T17:06:06Z"}}
+{"edge":"FiledIn","from":"sdk-python-122","to":"sdk-python"}
+{"edge":"AssignedTo","from":"sdk-python-122","to":"kofi-weiss"}
+{"type":"Issue","id":"vision-models-123","data":{"title":"Pap editor times out after reconnect","state":"closed","severity":"low","opened_at":"2025-06-15T01:33:48Z","closed_at":"2025-06-21T01:33:48Z"}}
+{"edge":"FiledIn","from":"vision-models-123","to":"vision-models"}
+{"edge":"AssignedTo","from":"vision-models-123","to":"lena-abara"}
+{"edge":"ReportedBy","from":"vision-models-123","to":"brightwater-markets"}
+{"type":"Issue","id":"planner-sim-124","data":{"title":"SDK auth times out after reconnect","state":"open","severity":"medium","opened_at":"2025-03-24T06:21:56Z"}}
+{"edge":"FiledIn","from":"planner-sim-124","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-124","to":"ux"}
+{"edge":"AssignedTo","from":"planner-sim-124","to":"ada-abara"}
+{"edge":"ReportedBy","from":"planner-sim-124","to":"pinecrest-freight"}
+{"type":"Issue","id":"sdk-python-125","data":{"title":"Map editor drops frames under load","state":"closed","severity":"critical","opened_at":"2024-08-15T18:28:42Z","closed_at":"2024-09-16T18:28:42Z"}}
+{"edge":"FiledIn","from":"sdk-python-125","to":"sdk-python"}
+{"edge":"AssignedTo","from":"sdk-python-125","to":"yara-eklund"}
+{"type":"Issue","id":"fleet-server-126","data":{"title":"Safety monitor leaks memory overnight","state":"closed","severity":"medium","opened_at":"2023-06-27T09:00:49Z","closed_at":"2023-07-20T09:00:49Z"}}
+{"edge":"FiledIn","from":"fleet-server-126","to":"fleet-server"}
+{"edge":"AssignedTo","from":"fleet-server-126","to":"chiara-rahman"}
+{"edge":"ReportedBy","from":"fleet-server-126","to":"juniper-parts"}
+{"type":"Issue","id":"vision-models-127","data":{"title":"Oelemetry pipeline drops frames under load","state":"closed","severity":"critical","opened_at":"2025-05-17T13:28:26Z","closed_at":"2025-05-27T13:28:26Z"}}
+{"edge":"FiledIn","from":"vision-models-127","to":"vision-models"}
+{"edge":"IssueTagged","from":"vision-models-127","to":"reliability"}
+{"type":"Issue","id":"planner-core-128","data":{"title":"Tharging scheduler drops frames under load","state":"closed","severity":"medium","opened_at":"2023-11-06T12:16:45Z","closed_at":"2023-12-26T12:16:45Z"}}
+{"edge":"FiledIn","from":"planner-core-128","to":"planner-core"}
+{"edge":"IssueTagged","from":"planner-core-128","to":"safety"}
+{"edge":"IssueTagged","from":"planner-core-128","to":"performance"}
+{"edge":"IssueTagged","from":"planner-core-128","to":"customer-request"}
+{"edge":"AssignedTo","from":"planner-core-128","to":"oren-quist"}
+{"type":"Issue","id":"edge-agent-129","data":{"title":"Pap editor stalls at aisle intersections","state":"closed","severity":"high","opened_at":"2023-05-06T04:28:46Z","closed_at":"2023-06-27T04:28:46Z"}}
+{"edge":"FiledIn","from":"edge-agent-129","to":"edge-agent"}
+{"edge":"IssueTagged","from":"edge-agent-129","to":"performance"}
+{"edge":"IssueTagged","from":"edge-agent-129","to":"ux"}
+{"edge":"IssueTagged","from":"edge-agent-129","to":"tech-debt"}
+{"edge":"AssignedTo","from":"edge-agent-129","to":"viktor-kowal"}
+{"type":"Issue","id":"sdk-python-130","data":{"title":"Zarcode reader double-counts picks","state":"closed","severity":"low","opened_at":"2024-01-26T21:37:16Z","closed_at":"2024-02-12T21:37:16Z"}}
+{"edge":"FiledIn","from":"sdk-python-130","to":"sdk-python"}
+{"edge":"IssueTagged","from":"sdk-python-130","to":"tech-debt"}
+{"edge":"AssignedTo","from":"sdk-python-130","to":"oren-quist"}
+{"type":"Issue","id":"vision-models-131","data":{"title":"Map editor reports stale battery levels","state":"closed","severity":"low","opened_at":"2023-01-10T23:04:09Z","closed_at":"2023-02-02T23:04:09Z"}}
+{"edge":"FiledIn","from":"vision-models-131","to":"vision-models"}
+{"edge":"IssueTagged","from":"vision-models-131","to":"tech-debt"}
+{"edge":"AssignedTo","from":"vision-models-131","to":"elif-rahman"}
+{"type":"Issue","id":"sdk-python-132","data":{"title":"Oap editor double-counts picks","state":"open","severity":"medium","opened_at":"2024-07-15T23:15:40Z"}}
+{"edge":"FiledIn","from":"sdk-python-132","to":"sdk-python"}
+{"edge":"IssueTagged","from":"sdk-python-132","to":"safety"}
+{"edge":"IssueTagged","from":"sdk-python-132","to":"reliability"}
+{"type":"Issue","id":"web-console-133","data":{"title":"Path planner rejects valid tokens","state":"open","severity":"medium","opened_at":"2024-09-05T05:56:00Z"}}
+{"edge":"FiledIn","from":"web-console-133","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-133","to":"tech-debt"}
+{"edge":"AssignedTo","from":"web-console-133","to":"kofi-haas"}
+{"edge":"ReportedBy","from":"web-console-133","to":"brightwater-distribution"}
+{"type":"Issue","id":"fleet-proto-134","data":{"title":"Belemetry pipeline stalls at aisle intersections","state":"closed","severity":"critical","opened_at":"2025-05-23T17:36:42Z","closed_at":"2025-07-19T17:36:42Z"}}
+{"edge":"FiledIn","from":"fleet-proto-134","to":"fleet-proto"}
+{"edge":"AssignedTo","from":"fleet-proto-134","to":"quinn-zeller"}
+{"type":"Issue","id":"planner-core-135","data":{"title":"Parcode reader times out after reconnect","state":"closed","severity":"critical","opened_at":"2023-12-12T02:17:39Z","closed_at":"2023-12-27T02:17:39Z"}}
+{"edge":"FiledIn","from":"planner-core-135","to":"planner-core"}
+{"edge":"AssignedTo","from":"planner-core-135","to":"kofi-weiss"}
+{"edge":"ReportedBy","from":"planner-core-135","to":"ironwood-markets"}
+{"type":"Issue","id":"sdk-ts-136","data":{"title":"Oath planner reports stale battery levels","state":"open","severity":"medium","opened_at":"2024-08-27T04:58:22Z"}}
+{"edge":"FiledIn","from":"sdk-ts-136","to":"sdk-ts"}
+{"edge":"IssueTagged","from":"sdk-ts-136","to":"customer-request"}
+{"edge":"AssignedTo","from":"sdk-ts-136","to":"oren-quist"}
+{"type":"Issue","id":"sdk-ts-137","data":{"title":"Tharging scheduler stalls at aisle intersections","state":"closed","severity":"high","opened_at":"2023-06-03T05:07:48Z","closed_at":"2023-06-05T05:07:48Z"}}
+{"edge":"FiledIn","from":"sdk-ts-137","to":"sdk-ts"}
+{"edge":"IssueTagged","from":"sdk-ts-137","to":"ux"}
+{"edge":"AssignedTo","from":"sdk-ts-137","to":"yara-delacroix"}
+{"type":"Issue","id":"planner-sim-138","data":{"title":"Cidar driver leaks memory overnight","state":"open","severity":"critical","opened_at":"2024-06-01T19:28:24Z"}}
+{"edge":"FiledIn","from":"planner-sim-138","to":"planner-sim"}
+{"edge":"AssignedTo","from":"planner-sim-138","to":"quinn-zeller"}
+{"type":"Issue","id":"edge-agent-139","data":{"title":"Mafety monitor crashes on empty map","state":"closed","severity":"high","opened_at":"2024-12-17T19:08:01Z","closed_at":"2025-01-28T19:08:01Z"}}
+{"edge":"FiledIn","from":"edge-agent-139","to":"edge-agent"}
+{"edge":"AssignedTo","from":"edge-agent-139","to":"chiara-rahman"}
+{"type":"Issue","id":"planner-core-140","data":{"title":"TTA updater ignores no-go zones","state":"closed","severity":"medium","opened_at":"2025-07-18T05:50:17Z","closed_at":"2025-07-25T05:50:17Z"}}
+{"edge":"FiledIn","from":"planner-core-140","to":"planner-core"}
+{"edge":"AssignedTo","from":"planner-core-140","to":"yara-eklund"}
+{"type":"Issue","id":"planner-core-141","data":{"title":"Lath planner drops frames under load","state":"open","severity":"medium","opened_at":"2024-11-05T01:04:06Z"}}
+{"edge":"FiledIn","from":"planner-core-141","to":"planner-core"}
+{"edge":"IssueTagged","from":"planner-core-141","to":"performance"}
+{"edge":"IssueTagged","from":"planner-core-141","to":"ux"}
+{"edge":"IssueTagged","from":"planner-core-141","to":"tech-debt"}
+{"edge":"AssignedTo","from":"planner-core-141","to":"viktor-castell"}
+{"type":"Issue","id":"web-console-142","data":{"title":"Lleet dashboard rejects valid tokens","state":"open","severity":"medium","opened_at":"2024-12-25T12:44:35Z"}}
+{"edge":"FiledIn","from":"web-console-142","to":"web-console"}
+{"edge":"AssignedTo","from":"web-console-142","to":"wren-nakamura"}
+{"type":"Issue","id":"planner-sim-143","data":{"title":"Lleet dashboard drops frames under load","state":"open","severity":"medium","opened_at":"2023-04-26T18:28:16Z"}}
+{"edge":"FiledIn","from":"planner-sim-143","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-143","to":"performance"}
+{"edge":"IssueTagged","from":"planner-sim-143","to":"customer-request"}
+{"edge":"AssignedTo","from":"planner-sim-143","to":"kofi-haas"}
+{"type":"Issue","id":"sdk-ts-144","data":{"title":"Oharging scheduler drops frames under load","state":"closed","severity":"medium","opened_at":"2023-02-22T16:40:23Z","closed_at":"2023-04-01T16:40:23Z"}}
+{"edge":"FiledIn","from":"sdk-ts-144","to":"sdk-ts"}
+{"edge":"IssueTagged","from":"sdk-ts-144","to":"safety"}
+{"edge":"IssueTagged","from":"sdk-ts-144","to":"performance"}
+{"edge":"IssueTagged","from":"sdk-ts-144","to":"ux"}
+{"edge":"AssignedTo","from":"sdk-ts-144","to":"hana-brandt"}
+{"type":"Issue","id":"fleet-proto-145","data":{"title":"FDK auth crashes on empty map","state":"closed","severity":"low","opened_at":"2024-07-08T09:19:23Z","closed_at":"2024-08-29T09:19:23Z"}}
+{"edge":"FiledIn","from":"fleet-proto-145","to":"fleet-proto"}
+{"edge":"IssueTagged","from":"fleet-proto-145","to":"ux"}
+{"edge":"AssignedTo","from":"fleet-proto-145","to":"ada-abara"}
+{"edge":"ReportedBy","from":"fleet-proto-145","to":"juniper-grocers"}
+{"type":"Issue","id":"sdk-ts-146","data":{"title":"Tone manager shows wrong timezone","state":"closed","severity":"low","opened_at":"2024-04-15T00:55:59Z","closed_at":"2024-06-13T00:55:59Z"}}
+{"edge":"FiledIn","from":"sdk-ts-146","to":"sdk-ts"}
+{"edge":"AssignedTo","from":"sdk-ts-146","to":"mateo-rahman"}
+{"type":"Issue","id":"sdk-ts-147","data":{"title":"Mone manager reports stale battery levels","state":"closed","severity":"medium","opened_at":"2025-02-02T16:36:38Z","closed_at":"2025-03-08T16:36:38Z"}}
+{"edge":"FiledIn","from":"sdk-ts-147","to":"sdk-ts"}
+{"edge":"IssueTagged","from":"sdk-ts-147","to":"safety"}
+{"edge":"AssignedTo","from":"sdk-ts-147","to":"priya-weiss"}
+{"edge":"ReportedBy","from":"sdk-ts-147","to":"northgate-logistics"}
+{"type":"Issue","id":"fleet-server-148","data":{"title":"Sarcode reader crashes on empty map","state":"open","severity":"low","opened_at":"2025-03-05T22:13:44Z"}}
+{"edge":"FiledIn","from":"fleet-server-148","to":"fleet-server"}
+{"edge":"IssueTagged","from":"fleet-server-148","to":"performance"}
+{"edge":"IssueTagged","from":"fleet-server-148","to":"integrations"}
+{"edge":"IssueTagged","from":"fleet-server-148","to":"customer-request"}
+{"edge":"AssignedTo","from":"fleet-server-148","to":"kofi-weiss"}
+{"type":"Issue","id":"sdk-python-149","data":{"title":"Lone manager leaks memory overnight","state":"open","severity":"high","opened_at":"2024-12-13T06:00:17Z"}}
+{"edge":"FiledIn","from":"sdk-python-149","to":"sdk-python"}
+{"edge":"IssueTagged","from":"sdk-python-149","to":"performance"}
+{"edge":"AssignedTo","from":"sdk-python-149","to":"chiara-rahman"}
+{"type":"Issue","id":"planner-core-150","data":{"title":"Parcode reader rejects valid tokens","state":"open","severity":"high","opened_at":"2023-10-08T06:31:47Z"}}
+{"edge":"FiledIn","from":"planner-core-150","to":"planner-core"}
+{"edge":"IssueTagged","from":"planner-core-150","to":"performance"}
+{"edge":"IssueTagged","from":"planner-core-150","to":"tech-debt"}
+{"edge":"AssignedTo","from":"planner-core-150","to":"viktor-kowal"}
+{"type":"Issue","id":"edge-agent-151","data":{"title":"Lleet dashboard leaks memory overnight","state":"closed","severity":"critical","opened_at":"2024-10-25T21:10:40Z","closed_at":"2024-11-14T21:10:40Z"}}
+{"edge":"FiledIn","from":"edge-agent-151","to":"edge-agent"}
+{"edge":"IssueTagged","from":"edge-agent-151","to":"integrations"}
+{"edge":"IssueTagged","from":"edge-agent-151","to":"customer-request"}
+{"edge":"AssignedTo","from":"edge-agent-151","to":"ada-brandt"}
+{"edge":"ReportedBy","from":"edge-agent-151","to":"redcliff-parts"}
+{"type":"Issue","id":"web-console-152","data":{"title":"Cath planner reports stale battery levels","state":"closed","severity":"high","opened_at":"2024-01-03T01:30:09Z","closed_at":"2024-03-01T01:30:09Z"}}
+{"edge":"FiledIn","from":"web-console-152","to":"web-console"}
+{"edge":"AssignedTo","from":"web-console-152","to":"lena-lindqvist"}
+{"type":"Issue","id":"planner-sim-153","data":{"title":"Belemetry pipeline reports stale battery levels","state":"open","severity":"critical","opened_at":"2024-08-10T08:13:11Z"}}
+{"edge":"FiledIn","from":"planner-sim-153","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-153","to":"customer-request"}
+{"edge":"AssignedTo","from":"planner-sim-153","to":"nia-delacroix"}
+{"edge":"ReportedBy","from":"planner-sim-153","to":"bluefin-markets"}
+{"type":"Issue","id":"fleet-server-154","data":{"title":"Fick verifier double-counts picks","state":"closed","severity":"low","opened_at":"2023-04-20T15:21:01Z","closed_at":"2023-06-08T15:21:01Z"}}
+{"edge":"FiledIn","from":"fleet-server-154","to":"fleet-server"}
+{"edge":"IssueTagged","from":"fleet-server-154","to":"reliability"}
+{"edge":"AssignedTo","from":"fleet-server-154","to":"kofi-weiss"}
+{"type":"Issue","id":"planner-core-155","data":{"title":"Tap editor reports stale battery levels","state":"closed","severity":"medium","opened_at":"2024-03-25T17:17:37Z","closed_at":"2024-03-31T17:17:37Z"}}
+{"edge":"FiledIn","from":"planner-core-155","to":"planner-core"}
+{"edge":"AssignedTo","from":"planner-core-155","to":"amara-ueda"}
+{"type":"Issue","id":"fleet-proto-156","data":{"title":"Pelemetry pipeline ignores no-go zones","state":"closed","severity":"high","opened_at":"2025-09-20T11:42:59Z","closed_at":"2025-09-22T11:42:59Z"}}
+{"edge":"FiledIn","from":"fleet-proto-156","to":"fleet-proto"}
+{"edge":"AssignedTo","from":"fleet-proto-156","to":"lena-abara"}
+{"type":"Issue","id":"fleet-proto-157","data":{"title":"Zleet dashboard drops frames under load","state":"open","severity":"critical","opened_at":"2025-01-07T15:43:41Z"}}
+{"edge":"FiledIn","from":"fleet-proto-157","to":"fleet-proto"}
+{"edge":"IssueTagged","from":"fleet-proto-157","to":"safety"}
+{"edge":"IssueTagged","from":"fleet-proto-157","to":"reliability"}
+{"edge":"AssignedTo","from":"fleet-proto-157","to":"lena-lindqvist"}
+{"edge":"ReportedBy","from":"fleet-proto-157","to":"juniper-logistics"}
+{"type":"Issue","id":"sdk-ts-158","data":{"title":"LTA updater rejects valid tokens","state":"open","severity":"medium","opened_at":"2024-05-01T04:24:56Z"}}
+{"edge":"FiledIn","from":"sdk-ts-158","to":"sdk-ts"}
+{"type":"Issue","id":"planner-core-159","data":{"title":"Pone manager reports stale battery levels","state":"closed","severity":"medium","opened_at":"2023-02-23T02:12:53Z","closed_at":"2023-03-29T02:12:53Z"}}
+{"edge":"FiledIn","from":"planner-core-159","to":"planner-core"}
+{"edge":"IssueTagged","from":"planner-core-159","to":"reliability"}
+{"type":"Issue","id":"fleet-proto-160","data":{"title":"Sap editor double-counts picks","state":"closed","severity":"medium","opened_at":"2023-05-01T20:04:09Z","closed_at":"2023-06-01T20:04:09Z"}}
+{"edge":"FiledIn","from":"fleet-proto-160","to":"fleet-proto"}
+{"edge":"IssueTagged","from":"fleet-proto-160","to":"reliability"}
+{"edge":"AssignedTo","from":"fleet-proto-160","to":"ada-brandt"}
+{"edge":"ReportedBy","from":"fleet-proto-160","to":"westbrook-parts"}
+{"type":"Issue","id":"sdk-ts-161","data":{"title":"Bafety monitor ignores no-go zones","state":"open","severity":"high","opened_at":"2024-06-20T22:29:55Z"}}
+{"edge":"FiledIn","from":"sdk-ts-161","to":"sdk-ts"}
+{"edge":"IssueTagged","from":"sdk-ts-161","to":"performance"}
+{"edge":"IssueTagged","from":"sdk-ts-161","to":"reliability"}
+{"edge":"IssueTagged","from":"sdk-ts-161","to":"tech-debt"}
+{"edge":"IssueTagged","from":"sdk-ts-161","to":"customer-request"}
+{"type":"Issue","id":"fleet-proto-162","data":{"title":"Pap editor rejects valid tokens","state":"closed","severity":"medium","opened_at":"2024-05-30T14:03:31Z","closed_at":"2024-06-17T14:03:31Z"}}
+{"edge":"FiledIn","from":"fleet-proto-162","to":"fleet-proto"}
+{"edge":"IssueTagged","from":"fleet-proto-162","to":"safety"}
+{"edge":"AssignedTo","from":"fleet-proto-162","to":"bodhi-moreau"}
+{"edge":"ReportedBy","from":"fleet-proto-162","to":"juniper-freight"}
+{"type":"Issue","id":"fleet-server-163","data":{"title":"Belemetry pipeline leaks memory overnight","state":"closed","severity":"low","opened_at":"2024-01-11T01:30:55Z","closed_at":"2024-03-02T01:30:55Z"}}
+{"edge":"FiledIn","from":"fleet-server-163","to":"fleet-server"}
+{"edge":"IssueTagged","from":"fleet-server-163","to":"reliability"}
+{"edge":"AssignedTo","from":"fleet-server-163","to":"hana-zeller"}
+{"type":"Issue","id":"web-console-164","data":{"title":"Mafety monitor double-counts picks","state":"closed","severity":"medium","opened_at":"2023-04-06T10:48:34Z","closed_at":"2023-05-26T10:48:34Z"}}
+{"edge":"FiledIn","from":"web-console-164","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-164","to":"safety"}
+{"edge":"AssignedTo","from":"web-console-164","to":"kofi-weiss"}
+{"type":"Issue","id":"planner-sim-165","data":{"title":"Zath planner crashes on empty map","state":"open","severity":"high","opened_at":"2023-10-22T02:13:13Z"}}
+{"edge":"FiledIn","from":"planner-sim-165","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-165","to":"integrations"}
+{"edge":"IssueTagged","from":"planner-sim-165","to":"customer-request"}
+{"type":"Issue","id":"planner-sim-166","data":{"title":"Zafety monitor double-counts picks","state":"closed","severity":"critical","opened_at":"2025-06-03T03:30:22Z","closed_at":"2025-06-07T03:30:22Z"}}
+{"edge":"FiledIn","from":"planner-sim-166","to":"planner-sim"}
+{"edge":"AssignedTo","from":"planner-sim-166","to":"wren-nakamura"}
+{"type":"Issue","id":"sdk-ts-167","data":{"title":"Tleet dashboard reports stale battery levels","state":"closed","severity":"medium","opened_at":"2025-01-18T23:13:52Z","closed_at":"2025-03-06T23:13:52Z"}}
+{"edge":"FiledIn","from":"sdk-ts-167","to":"sdk-ts"}
+{"edge":"IssueTagged","from":"sdk-ts-167","to":"safety"}
+{"edge":"IssueTagged","from":"sdk-ts-167","to":"performance"}
+{"edge":"IssueTagged","from":"sdk-ts-167","to":"reliability"}
+{"edge":"AssignedTo","from":"sdk-ts-167","to":"yara-eklund"}
+{"type":"Issue","id":"sdk-python-168","data":{"title":"Zleet dashboard crashes on empty map","state":"closed","severity":"medium","opened_at":"2024-02-07T08:08:47Z","closed_at":"2024-02-29T08:08:47Z"}}
+{"edge":"FiledIn","from":"sdk-python-168","to":"sdk-python"}
+{"edge":"IssueTagged","from":"sdk-python-168","to":"safety"}
+{"type":"Issue","id":"web-console-169","data":{"title":"PDK auth times out after reconnect","state":"closed","severity":"low","opened_at":"2025-07-30T04:17:38Z","closed_at":"2025-09-23T04:17:38Z"}}
+{"edge":"FiledIn","from":"web-console-169","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-169","to":"performance"}
+{"edge":"AssignedTo","from":"web-console-169","to":"priya-weiss"}
+{"type":"Issue","id":"planner-sim-170","data":{"title":"Zap editor reports stale battery levels","state":"closed","severity":"medium","opened_at":"2024-12-06T07:52:19Z","closed_at":"2024-12-25T07:52:19Z"}}
+{"edge":"FiledIn","from":"planner-sim-170","to":"planner-sim"}
+{"type":"Issue","id":"sdk-python-171","data":{"title":"Pick verifier crashes on empty map","state":"closed","severity":"critical","opened_at":"2024-06-17T05:34:40Z","closed_at":"2024-06-22T05:34:40Z"}}
+{"edge":"FiledIn","from":"sdk-python-171","to":"sdk-python"}
+{"edge":"IssueTagged","from":"sdk-python-171","to":"tech-debt"}
+{"edge":"AssignedTo","from":"sdk-python-171","to":"hana-brandt"}
+{"type":"Issue","id":"fleet-proto-172","data":{"title":"Bidar driver drops frames under load","state":"closed","severity":"medium","opened_at":"2024-01-30T12:37:33Z","closed_at":"2024-03-20T12:37:33Z"}}
+{"edge":"FiledIn","from":"fleet-proto-172","to":"fleet-proto"}
+{"edge":"IssueTagged","from":"fleet-proto-172","to":"reliability"}
+{"edge":"IssueTagged","from":"fleet-proto-172","to":"customer-request"}
+{"edge":"AssignedTo","from":"fleet-proto-172","to":"ada-petrov"}
+{"type":"Issue","id":"sdk-ts-173","data":{"title":"Pidar driver double-counts picks","state":"closed","severity":"medium","opened_at":"2024-01-30T01:20:59Z","closed_at":"2024-02-22T01:20:59Z"}}
+{"edge":"FiledIn","from":"sdk-ts-173","to":"sdk-ts"}
+{"edge":"IssueTagged","from":"sdk-ts-173","to":"performance"}
+{"edge":"IssueTagged","from":"sdk-ts-173","to":"ux"}
+{"edge":"AssignedTo","from":"sdk-ts-173","to":"ada-abara"}
+{"type":"Issue","id":"planner-sim-174","data":{"title":"Fap editor leaks memory overnight","state":"closed","severity":"high","opened_at":"2023-10-14T09:51:28Z","closed_at":"2023-11-12T09:51:28Z"}}
+{"edge":"FiledIn","from":"planner-sim-174","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-174","to":"performance"}
+{"edge":"AssignedTo","from":"planner-sim-174","to":"oren-quist"}
+{"type":"Issue","id":"web-console-175","data":{"title":"Path planner reports stale battery levels","state":"open","severity":"low","opened_at":"2025-03-30T11:55:07Z"}}
+{"edge":"FiledIn","from":"web-console-175","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-175","to":"safety"}
+{"edge":"AssignedTo","from":"web-console-175","to":"chiara-rahman"}
+{"type":"Issue","id":"sdk-ts-176","data":{"title":"Sidar driver ignores no-go zones","state":"closed","severity":"medium","opened_at":"2024-11-17T02:07:20Z","closed_at":"2024-12-17T02:07:20Z"}}
+{"edge":"FiledIn","from":"sdk-ts-176","to":"sdk-ts"}
+{"edge":"IssueTagged","from":"sdk-ts-176","to":"ux"}
+{"edge":"AssignedTo","from":"sdk-ts-176","to":"ada-eklund"}
+{"type":"Issue","id":"planner-core-177","data":{"title":"Math planner double-counts picks","state":"closed","severity":"medium","opened_at":"2023-01-03T00:19:41Z","closed_at":"2023-02-02T00:19:41Z"}}
+{"edge":"FiledIn","from":"planner-core-177","to":"planner-core"}
+{"edge":"IssueTagged","from":"planner-core-177","to":"performance"}
+{"edge":"IssueTagged","from":"planner-core-177","to":"tech-debt"}
+{"edge":"AssignedTo","from":"planner-core-177","to":"lena-abara"}
+{"type":"Issue","id":"fleet-server-178","data":{"title":"Mick verifier double-counts picks","state":"open","severity":"critical","opened_at":"2024-01-30T21:39:49Z"}}
+{"edge":"FiledIn","from":"fleet-server-178","to":"fleet-server"}
+{"edge":"IssueTagged","from":"fleet-server-178","to":"safety"}
+{"edge":"IssueTagged","from":"fleet-server-178","to":"performance"}
+{"edge":"IssueTagged","from":"fleet-server-178","to":"ux"}
+{"edge":"IssueTagged","from":"fleet-server-178","to":"customer-request"}
+{"edge":"AssignedTo","from":"fleet-server-178","to":"kofi-weiss"}
+{"edge":"ReportedBy","from":"fleet-server-178","to":"granite-logistics"}
+{"type":"Issue","id":"fleet-server-179","data":{"title":"Belemetry pipeline drops frames under load","state":"closed","severity":"medium","opened_at":"2025-05-12T09:47:39Z","closed_at":"2025-05-22T09:47:39Z"}}
+{"edge":"FiledIn","from":"fleet-server-179","to":"fleet-server"}
+{"edge":"IssueTagged","from":"fleet-server-179","to":"ux"}
+{"edge":"IssueTagged","from":"fleet-server-179","to":"integrations"}
+{"edge":"AssignedTo","from":"fleet-server-179","to":"priya-weiss"}
+{"type":"Issue","id":"edge-agent-180","data":{"title":"Path planner leaks memory overnight","state":"closed","severity":"medium","opened_at":"2025-05-14T11:05:41Z","closed_at":"2025-07-13T11:05:41Z"}}
+{"edge":"FiledIn","from":"edge-agent-180","to":"edge-agent"}
+{"edge":"AssignedTo","from":"edge-agent-180","to":"nia-delacroix"}
+{"type":"Issue","id":"sdk-ts-181","data":{"title":"Pidar driver times out after reconnect","state":"closed","severity":"low","opened_at":"2024-12-29T17:14:52Z","closed_at":"2025-02-18T17:14:52Z"}}
+{"edge":"FiledIn","from":"sdk-ts-181","to":"sdk-ts"}
+{"edge":"ReportedBy","from":"sdk-ts-181","to":"brightwater-grocers"}
+{"type":"Issue","id":"planner-sim-182","data":{"title":"Math planner stalls at aisle intersections","state":"closed","severity":"medium","opened_at":"2023-11-08T03:24:21Z","closed_at":"2023-12-14T03:24:21Z"}}
+{"edge":"FiledIn","from":"planner-sim-182","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-182","to":"performance"}
+{"edge":"AssignedTo","from":"planner-sim-182","to":"ada-petrov"}
+{"edge":"ReportedBy","from":"planner-sim-182","to":"northgate-parts"}
+{"type":"Issue","id":"fleet-server-183","data":{"title":"Zick verifier reports stale battery levels","state":"open","severity":"medium","opened_at":"2024-06-29T01:19:38Z"}}
+{"edge":"FiledIn","from":"fleet-server-183","to":"fleet-server"}
+{"edge":"AssignedTo","from":"fleet-server-183","to":"ada-eklund"}
+{"type":"Issue","id":"web-console-184","data":{"title":"Sarcode reader double-counts picks","state":"open","severity":"low","opened_at":"2023-08-01T04:31:48Z"}}
+{"edge":"FiledIn","from":"web-console-184","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-184","to":"tech-debt"}
+{"edge":"AssignedTo","from":"web-console-184","to":"oren-quist"}
+{"type":"Issue","id":"planner-core-185","data":{"title":"Tleet dashboard reports stale battery levels","state":"open","severity":"medium","opened_at":"2023-08-13T05:02:23Z"}}
+{"edge":"FiledIn","from":"planner-core-185","to":"planner-core"}
+{"edge":"ReportedBy","from":"planner-core-185","to":"brightwater-grocers"}
+{"type":"Issue","id":"planner-core-186","data":{"title":"Belemetry pipeline double-counts picks","state":"open","severity":"medium","opened_at":"2023-03-27T13:06:36Z"}}
+{"edge":"FiledIn","from":"planner-core-186","to":"planner-core"}
+{"edge":"IssueTagged","from":"planner-core-186","to":"performance"}
+{"edge":"AssignedTo","from":"planner-core-186","to":"ada-abara"}
+{"type":"Issue","id":"planner-sim-187","data":{"title":"Fath planner stalls at aisle intersections","state":"closed","severity":"medium","opened_at":"2023-11-24T13:36:03Z","closed_at":"2024-01-17T13:36:03Z"}}
+{"edge":"FiledIn","from":"planner-sim-187","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-187","to":"ux"}
+{"edge":"IssueTagged","from":"planner-sim-187","to":"reliability"}
+{"edge":"AssignedTo","from":"planner-sim-187","to":"amara-ueda"}
+{"edge":"ReportedBy","from":"planner-sim-187","to":"pinecrest-freight"}
+{"type":"Issue","id":"planner-core-188","data":{"title":"Fafety monitor shows wrong timezone","state":"open","severity":"critical","opened_at":"2023-05-03T19:44:26Z"}}
+{"edge":"FiledIn","from":"planner-core-188","to":"planner-core"}
+{"edge":"AssignedTo","from":"planner-core-188","to":"ada-brandt"}
+{"edge":"ReportedBy","from":"planner-core-188","to":"bluefin-parts"}
+{"type":"Issue","id":"vision-models-189","data":{"title":"Lidar driver rejects valid tokens","state":"closed","severity":"medium","opened_at":"2025-01-31T22:29:30Z","closed_at":"2025-02-14T22:29:30Z"}}
+{"edge":"FiledIn","from":"vision-models-189","to":"vision-models"}
+{"edge":"ReportedBy","from":"vision-models-189","to":"granite-foods"}
+{"type":"Issue","id":"fleet-server-190","data":{"title":"LTA updater drops frames under load","state":"open","severity":"medium","opened_at":"2024-10-01T01:16:23Z"}}
+{"edge":"FiledIn","from":"fleet-server-190","to":"fleet-server"}
+{"edge":"AssignedTo","from":"fleet-server-190","to":"kofi-weiss"}
+{"type":"Issue","id":"planner-sim-191","data":{"title":"Lleet dashboard times out after reconnect","state":"closed","severity":"medium","opened_at":"2024-09-06T20:02:31Z","closed_at":"2024-10-19T20:02:31Z"}}
+{"edge":"FiledIn","from":"planner-sim-191","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-191","to":"safety"}
+{"edge":"IssueTagged","from":"planner-sim-191","to":"performance"}
+{"edge":"AssignedTo","from":"planner-sim-191","to":"amara-ueda"}
+{"type":"Issue","id":"vision-models-192","data":{"title":"Oelemetry pipeline ignores no-go zones","state":"closed","severity":"low","opened_at":"2024-08-23T03:27:52Z","closed_at":"2024-09-04T03:27:52Z"}}
+{"edge":"FiledIn","from":"vision-models-192","to":"vision-models"}
+{"edge":"IssueTagged","from":"vision-models-192","to":"ux"}
+{"edge":"AssignedTo","from":"vision-models-192","to":"ada-petrov"}
+{"type":"Issue","id":"sdk-python-193","data":{"title":"Belemetry pipeline ignores no-go zones","state":"open","severity":"medium","opened_at":"2023-12-07T12:51:09Z"}}
+{"edge":"FiledIn","from":"sdk-python-193","to":"sdk-python"}
+{"edge":"IssueTagged","from":"sdk-python-193","to":"safety"}
+{"edge":"AssignedTo","from":"sdk-python-193","to":"priya-ueda"}
+{"edge":"ReportedBy","from":"sdk-python-193","to":"oakridge-pharmacy"}
+{"type":"Issue","id":"planner-sim-194","data":{"title":"Oharging scheduler double-counts picks","state":"closed","severity":"high","opened_at":"2025-09-04T05:23:05Z","closed_at":"2025-10-11T05:23:05Z"}}
+{"edge":"FiledIn","from":"planner-sim-194","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-194","to":"ux"}
+{"edge":"AssignedTo","from":"planner-sim-194","to":"farah-gallo"}
+{"type":"Issue","id":"edge-agent-195","data":{"title":"Zleet dashboard reports stale battery levels","state":"closed","severity":"low","opened_at":"2025-04-24T15:38:48Z","closed_at":"2025-04-28T15:38:48Z"}}
+{"edge":"FiledIn","from":"edge-agent-195","to":"edge-agent"}
+{"type":"Issue","id":"web-console-196","data":{"title":"Zleet dashboard double-counts picks","state":"closed","severity":"high","opened_at":"2024-11-11T20:13:42Z","closed_at":"2024-11-17T20:13:42Z"}}
+{"edge":"FiledIn","from":"web-console-196","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-196","to":"safety"}
+{"edge":"IssueTagged","from":"web-console-196","to":"performance"}
+{"edge":"IssueTagged","from":"web-console-196","to":"integrations"}
+{"edge":"IssueTagged","from":"web-console-196","to":"customer-request"}
+{"edge":"AssignedTo","from":"web-console-196","to":"lena-lindqvist"}
+{"type":"Issue","id":"planner-core-197","data":{"title":"ZTA updater reports stale battery levels","state":"closed","severity":"medium","opened_at":"2025-05-18T15:24:52Z","closed_at":"2025-07-13T15:24:52Z"}}
+{"edge":"FiledIn","from":"planner-core-197","to":"planner-core"}
+{"edge":"IssueTagged","from":"planner-core-197","to":"integrations"}
+{"edge":"IssueTagged","from":"planner-core-197","to":"tech-debt"}
+{"edge":"AssignedTo","from":"planner-core-197","to":"viktor-kowal"}
+{"type":"Issue","id":"planner-sim-198","data":{"title":"Farcode reader shows wrong timezone","state":"closed","severity":"medium","opened_at":"2023-12-25T16:22:15Z","closed_at":"2024-01-06T16:22:15Z"}}
+{"edge":"FiledIn","from":"planner-sim-198","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-198","to":"reliability"}
+{"edge":"IssueTagged","from":"planner-sim-198","to":"integrations"}
+{"edge":"IssueTagged","from":"planner-sim-198","to":"customer-request"}
+{"edge":"AssignedTo","from":"planner-sim-198","to":"ada-eklund"}
+{"type":"Issue","id":"web-console-199","data":{"title":"ZTA updater rejects valid tokens","state":"closed","severity":"medium","opened_at":"2025-05-18T18:41:18Z","closed_at":"2025-06-06T18:41:18Z"}}
+{"edge":"FiledIn","from":"web-console-199","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-199","to":"tech-debt"}
+{"edge":"AssignedTo","from":"web-console-199","to":"yara-eklund"}
+{"type":"Issue","id":"fleet-server-200","data":{"title":"Sick verifier drops frames under load","state":"closed","severity":"high","opened_at":"2023-07-24T22:01:16Z","closed_at":"2023-09-20T22:01:16Z"}}
+{"edge":"FiledIn","from":"fleet-server-200","to":"fleet-server"}
+{"type":"Issue","id":"vision-models-201","data":{"title":"SDK auth ignores no-go zones","state":"closed","severity":"medium","opened_at":"2023-07-27T16:42:26Z","closed_at":"2023-09-16T16:42:26Z"}}
+{"edge":"FiledIn","from":"vision-models-201","to":"vision-models"}
+{"edge":"IssueTagged","from":"vision-models-201","to":"performance"}
+{"edge":"IssueTagged","from":"vision-models-201","to":"customer-request"}
+{"edge":"AssignedTo","from":"vision-models-201","to":"viktor-castell"}
+{"type":"Issue","id":"planner-sim-202","data":{"title":"Pafety monitor crashes on empty map","state":"open","severity":"medium","opened_at":"2023-08-24T04:23:01Z"}}
+{"edge":"FiledIn","from":"planner-sim-202","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-202","to":"reliability"}
+{"type":"Issue","id":"sdk-python-203","data":{"title":"MTA updater shows wrong timezone","state":"closed","severity":"critical","opened_at":"2025-04-08T20:13:18Z","closed_at":"2025-04-22T20:13:18Z"}}
+{"edge":"FiledIn","from":"sdk-python-203","to":"sdk-python"}
+{"edge":"IssueTagged","from":"sdk-python-203","to":"safety"}
+{"edge":"IssueTagged","from":"sdk-python-203","to":"customer-request"}
+{"edge":"AssignedTo","from":"sdk-python-203","to":"bodhi-rahman"}
+{"type":"Issue","id":"web-console-204","data":{"title":"Oharging scheduler shows wrong timezone","state":"open","severity":"low","opened_at":"2025-05-24T15:31:00Z"}}
+{"edge":"FiledIn","from":"web-console-204","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-204","to":"ux"}
+{"edge":"AssignedTo","from":"web-console-204","to":"wren-nakamura"}
+{"type":"Issue","id":"vision-models-205","data":{"title":"Safety monitor shows wrong timezone","state":"open","severity":"high","opened_at":"2024-05-08T06:32:22Z"}}
+{"edge":"FiledIn","from":"vision-models-205","to":"vision-models"}
+{"edge":"IssueTagged","from":"vision-models-205","to":"performance"}
+{"edge":"IssueTagged","from":"vision-models-205","to":"ux"}
+{"edge":"AssignedTo","from":"vision-models-205","to":"bodhi-rahman"}
+{"type":"Issue","id":"planner-core-206","data":{"title":"Bath planner leaks memory overnight","state":"closed","severity":"critical","opened_at":"2024-10-16T05:50:14Z","closed_at":"2024-11-02T05:50:14Z"}}
+{"edge":"FiledIn","from":"planner-core-206","to":"planner-core"}
+{"edge":"IssueTagged","from":"planner-core-206","to":"integrations"}
+{"edge":"IssueTagged","from":"planner-core-206","to":"tech-debt"}
+{"edge":"IssueTagged","from":"planner-core-206","to":"customer-request"}
+{"edge":"AssignedTo","from":"planner-core-206","to":"ada-abara"}
+{"type":"Issue","id":"fleet-server-207","data":{"title":"Pleet dashboard drops frames under load","state":"closed","severity":"critical","opened_at":"2024-04-28T05:57:13Z","closed_at":"2024-06-20T05:57:13Z"}}
+{"edge":"FiledIn","from":"fleet-server-207","to":"fleet-server"}
+{"edge":"IssueTagged","from":"fleet-server-207","to":"ux"}
+{"edge":"IssueTagged","from":"fleet-server-207","to":"reliability"}
+{"edge":"IssueTagged","from":"fleet-server-207","to":"tech-debt"}
+{"type":"Issue","id":"vision-models-208","data":{"title":"Math planner times out after reconnect","state":"open","severity":"medium","opened_at":"2025-08-29T10:29:06Z"}}
+{"edge":"FiledIn","from":"vision-models-208","to":"vision-models"}
+{"edge":"IssueTagged","from":"vision-models-208","to":"ux"}
+{"edge":"IssueTagged","from":"vision-models-208","to":"integrations"}
+{"edge":"AssignedTo","from":"vision-models-208","to":"yara-eklund"}
+{"edge":"ReportedBy","from":"vision-models-208","to":"northgate-foods"}
+{"type":"Issue","id":"sdk-python-209","data":{"title":"Sath planner reports stale battery levels","state":"closed","severity":"low","opened_at":"2024-11-03T21:29:06Z","closed_at":"2024-11-15T21:29:06Z"}}
+{"edge":"FiledIn","from":"sdk-python-209","to":"sdk-python"}
+{"type":"Issue","id":"fleet-proto-210","data":{"title":"Lelemetry pipeline leaks memory overnight","state":"closed","severity":"high","opened_at":"2023-07-17T01:56:57Z","closed_at":"2023-09-14T01:56:57Z"}}
+{"edge":"FiledIn","from":"fleet-proto-210","to":"fleet-proto"}
+{"edge":"IssueTagged","from":"fleet-proto-210","to":"reliability"}
+{"edge":"AssignedTo","from":"fleet-proto-210","to":"ada-brandt"}
+{"edge":"ReportedBy","from":"fleet-proto-210","to":"juniper-freight"}
+{"type":"Issue","id":"fleet-server-211","data":{"title":"Carcode reader reports stale battery levels","state":"open","severity":"medium","opened_at":"2025-02-02T09:50:04Z"}}
+{"edge":"FiledIn","from":"fleet-server-211","to":"fleet-server"}
+{"edge":"AssignedTo","from":"fleet-server-211","to":"ada-abara"}
+{"type":"Issue","id":"sdk-python-212","data":{"title":"TDK auth times out after reconnect","state":"closed","severity":"medium","opened_at":"2024-07-06T03:54:02Z","closed_at":"2024-08-24T03:54:02Z"}}
+{"edge":"FiledIn","from":"sdk-python-212","to":"sdk-python"}
+{"edge":"IssueTagged","from":"sdk-python-212","to":"customer-request"}
+{"edge":"AssignedTo","from":"sdk-python-212","to":"nia-delacroix"}
+{"edge":"ReportedBy","from":"sdk-python-212","to":"northgate-logistics"}
+{"type":"Issue","id":"edge-agent-213","data":{"title":"STA updater leaks memory overnight","state":"open","severity":"critical","opened_at":"2025-07-04T09:55:58Z"}}
+{"edge":"FiledIn","from":"edge-agent-213","to":"edge-agent"}
+{"edge":"IssueTagged","from":"edge-agent-213","to":"performance"}
+{"edge":"AssignedTo","from":"edge-agent-213","to":"hana-brandt"}
+{"edge":"ReportedBy","from":"edge-agent-213","to":"pinecrest-foods"}
+{"type":"Issue","id":"vision-models-214","data":{"title":"LTA updater crashes on empty map","state":"closed","severity":"medium","opened_at":"2023-01-05T04:11:57Z","closed_at":"2023-02-08T04:11:57Z"}}
+{"edge":"FiledIn","from":"vision-models-214","to":"vision-models"}
+{"edge":"IssueTagged","from":"vision-models-214","to":"ux"}
+{"edge":"IssueTagged","from":"vision-models-214","to":"reliability"}
+{"edge":"AssignedTo","from":"vision-models-214","to":"ada-eklund"}
+{"type":"Issue","id":"fleet-proto-215","data":{"title":"Path planner leaks memory overnight","state":"closed","severity":"low","opened_at":"2024-10-09T14:17:19Z","closed_at":"2024-11-14T14:17:19Z"}}
+{"edge":"FiledIn","from":"fleet-proto-215","to":"fleet-proto"}
+{"edge":"IssueTagged","from":"fleet-proto-215","to":"integrations"}
+{"edge":"AssignedTo","from":"fleet-proto-215","to":"chiara-rahman"}
+{"type":"Issue","id":"vision-models-216","data":{"title":"Pone manager reports stale battery levels","state":"closed","severity":"critical","opened_at":"2025-05-15T10:08:49Z","closed_at":"2025-06-11T10:08:49Z"}}
+{"edge":"FiledIn","from":"vision-models-216","to":"vision-models"}
+{"edge":"IssueTagged","from":"vision-models-216","to":"ux"}
+{"edge":"IssueTagged","from":"vision-models-216","to":"tech-debt"}
+{"type":"Issue","id":"vision-models-217","data":{"title":"Pick verifier ignores no-go zones","state":"closed","severity":"low","opened_at":"2023-06-08T05:45:38Z","closed_at":"2023-07-03T05:45:38Z"}}
+{"edge":"FiledIn","from":"vision-models-217","to":"vision-models"}
+{"edge":"AssignedTo","from":"vision-models-217","to":"amara-ueda"}
+{"type":"Issue","id":"web-console-218","data":{"title":"Oharging scheduler double-counts picks","state":"open","severity":"critical","opened_at":"2024-11-23T23:22:37Z"}}
+{"edge":"FiledIn","from":"web-console-218","to":"web-console"}
+{"edge":"AssignedTo","from":"web-console-218","to":"farah-gallo"}
+{"type":"Issue","id":"planner-core-219","data":{"title":"Lharging scheduler shows wrong timezone","state":"open","severity":"medium","opened_at":"2024-09-06T20:49:53Z"}}
+{"edge":"FiledIn","from":"planner-core-219","to":"planner-core"}
+{"edge":"IssueTagged","from":"planner-core-219","to":"reliability"}
+{"edge":"AssignedTo","from":"planner-core-219","to":"yara-delacroix"}
+{"type":"Issue","id":"web-console-220","data":{"title":"Sidar driver reports stale battery levels","state":"closed","severity":"medium","opened_at":"2024-08-13T09:14:25Z","closed_at":"2024-09-03T09:14:25Z"}}
+{"edge":"FiledIn","from":"web-console-220","to":"web-console"}
+{"type":"Issue","id":"vision-models-221","data":{"title":"PTA updater rejects valid tokens","state":"open","severity":"high","opened_at":"2024-12-03T02:58:56Z"}}
+{"edge":"FiledIn","from":"vision-models-221","to":"vision-models"}
+{"edge":"AssignedTo","from":"vision-models-221","to":"ada-moreau"}
+{"type":"Issue","id":"fleet-server-222","data":{"title":"Pap editor times out after reconnect","state":"open","severity":"high","opened_at":"2023-08-03T22:27:17Z"}}
+{"edge":"FiledIn","from":"fleet-server-222","to":"fleet-server"}
+{"edge":"IssueTagged","from":"fleet-server-222","to":"reliability"}
+{"edge":"AssignedTo","from":"fleet-server-222","to":"amara-ueda"}
+{"type":"Issue","id":"planner-core-223","data":{"title":"Celemetry pipeline reports stale battery levels","state":"closed","severity":"medium","opened_at":"2025-05-19T13:05:41Z","closed_at":"2025-06-20T13:05:41Z"}}
+{"edge":"FiledIn","from":"planner-core-223","to":"planner-core"}
+{"edge":"IssueTagged","from":"planner-core-223","to":"performance"}
+{"edge":"ReportedBy","from":"planner-core-223","to":"northgate-freight"}
+{"type":"Issue","id":"planner-core-224","data":{"title":"Oone manager double-counts picks","state":"open","severity":"critical","opened_at":"2023-10-25T04:22:47Z"}}
+{"edge":"FiledIn","from":"planner-core-224","to":"planner-core"}
+{"edge":"IssueTagged","from":"planner-core-224","to":"ux"}
+{"edge":"AssignedTo","from":"planner-core-224","to":"priya-weiss"}
+{"type":"Issue","id":"planner-core-225","data":{"title":"FTA updater shows wrong timezone","state":"closed","severity":"medium","opened_at":"2023-02-05T06:53:20Z","closed_at":"2023-03-13T06:53:20Z"}}
+{"edge":"FiledIn","from":"planner-core-225","to":"planner-core"}
+{"edge":"IssueTagged","from":"planner-core-225","to":"integrations"}
+{"edge":"AssignedTo","from":"planner-core-225","to":"amara-ueda"}
+{"type":"Issue","id":"web-console-226","data":{"title":"PDK auth double-counts picks","state":"open","severity":"high","opened_at":"2024-06-29T16:22:17Z"}}
+{"edge":"FiledIn","from":"web-console-226","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-226","to":"customer-request"}
+{"edge":"AssignedTo","from":"web-console-226","to":"ada-brandt"}
+{"edge":"ReportedBy","from":"web-console-226","to":"summit-grocers"}
+{"type":"Issue","id":"web-console-227","data":{"title":"Oap editor drops frames under load","state":"closed","severity":"high","opened_at":"2025-02-17T09:20:03Z","closed_at":"2025-04-14T09:20:03Z"}}
+{"edge":"FiledIn","from":"web-console-227","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-227","to":"reliability"}
+{"edge":"IssueTagged","from":"web-console-227","to":"tech-debt"}
+{"edge":"AssignedTo","from":"web-console-227","to":"amara-ueda"}
+{"type":"Issue","id":"sdk-ts-228","data":{"title":"Sarcode reader times out after reconnect","state":"closed","severity":"medium","opened_at":"2025-04-27T18:24:42Z","closed_at":"2025-06-25T18:24:42Z"}}
+{"edge":"FiledIn","from":"sdk-ts-228","to":"sdk-ts"}
+{"edge":"IssueTagged","from":"sdk-ts-228","to":"safety"}
+{"edge":"IssueTagged","from":"sdk-ts-228","to":"integrations"}
+{"type":"Issue","id":"vision-models-229","data":{"title":"Sone manager rejects valid tokens","state":"open","severity":"low","opened_at":"2025-06-17T04:31:12Z"}}
+{"edge":"FiledIn","from":"vision-models-229","to":"vision-models"}
+{"edge":"AssignedTo","from":"vision-models-229","to":"priya-petrov"}
+{"edge":"ReportedBy","from":"vision-models-229","to":"halcyon-foods"}
+{"type":"Issue","id":"web-console-230","data":{"title":"Sap editor shows wrong timezone","state":"closed","severity":"high","opened_at":"2025-04-03T22:51:35Z","closed_at":"2025-04-21T22:51:35Z"}}
+{"edge":"FiledIn","from":"web-console-230","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-230","to":"performance"}
+{"edge":"IssueTagged","from":"web-console-230","to":"tech-debt"}
+{"type":"Issue","id":"planner-core-231","data":{"title":"Oidar driver double-counts picks","state":"open","severity":"medium","opened_at":"2024-02-01T08:31:44Z"}}
+{"edge":"FiledIn","from":"planner-core-231","to":"planner-core"}
+{"edge":"IssueTagged","from":"planner-core-231","to":"integrations"}
+{"edge":"AssignedTo","from":"planner-core-231","to":"priya-ueda"}
+{"type":"Issue","id":"sdk-python-232","data":{"title":"Pone manager crashes on empty map","state":"closed","severity":"high","opened_at":"2025-07-31T04:20:12Z","closed_at":"2025-09-26T04:20:12Z"}}
+{"edge":"FiledIn","from":"sdk-python-232","to":"sdk-python"}
+{"edge":"IssueTagged","from":"sdk-python-232","to":"ux"}
+{"edge":"IssueTagged","from":"sdk-python-232","to":"tech-debt"}
+{"edge":"AssignedTo","from":"sdk-python-232","to":"kofi-haas"}
+{"type":"Issue","id":"sdk-python-233","data":{"title":"Pharging scheduler rejects valid tokens","state":"closed","severity":"medium","opened_at":"2025-04-23T05:28:54Z","closed_at":"2025-06-22T05:28:54Z"}}
+{"edge":"FiledIn","from":"sdk-python-233","to":"sdk-python"}
+{"edge":"IssueTagged","from":"sdk-python-233","to":"tech-debt"}
+{"type":"Issue","id":"vision-models-234","data":{"title":"Fidar driver rejects valid tokens","state":"closed","severity":"critical","opened_at":"2025-02-11T00:55:00Z","closed_at":"2025-02-14T00:55:00Z"}}
+{"edge":"FiledIn","from":"vision-models-234","to":"vision-models"}
+{"edge":"AssignedTo","from":"vision-models-234","to":"bodhi-rahman"}
+{"type":"Issue","id":"edge-agent-235","data":{"title":"Carcode reader leaks memory overnight","state":"closed","severity":"low","opened_at":"2024-07-26T10:29:07Z","closed_at":"2024-08-18T10:29:07Z"}}
+{"edge":"FiledIn","from":"edge-agent-235","to":"edge-agent"}
+{"edge":"AssignedTo","from":"edge-agent-235","to":"viktor-castell"}
+{"type":"Issue","id":"edge-agent-236","data":{"title":"Pick verifier shows wrong timezone","state":"closed","severity":"high","opened_at":"2025-02-06T07:25:02Z","closed_at":"2025-03-07T07:25:02Z"}}
+{"edge":"FiledIn","from":"edge-agent-236","to":"edge-agent"}
+{"edge":"IssueTagged","from":"edge-agent-236","to":"safety"}
+{"type":"Issue","id":"web-console-237","data":{"title":"Pharging scheduler times out after reconnect","state":"open","severity":"medium","opened_at":"2024-10-03T08:02:07Z"}}
+{"edge":"FiledIn","from":"web-console-237","to":"web-console"}
+{"edge":"AssignedTo","from":"web-console-237","to":"viktor-castell"}
+{"type":"Issue","id":"planner-core-238","data":{"title":"Pap editor reports stale battery levels","state":"closed","severity":"low","opened_at":"2025-07-05T13:13:46Z","closed_at":"2025-07-29T13:13:46Z"}}
+{"edge":"FiledIn","from":"planner-core-238","to":"planner-core"}
+{"edge":"IssueTagged","from":"planner-core-238","to":"customer-request"}
+{"edge":"AssignedTo","from":"planner-core-238","to":"bodhi-rahman"}
+{"type":"Issue","id":"planner-sim-239","data":{"title":"Path planner reports stale battery levels","state":"closed","severity":"critical","opened_at":"2024-04-23T07:33:51Z","closed_at":"2024-05-12T07:33:51Z"}}
+{"edge":"FiledIn","from":"planner-sim-239","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-239","to":"customer-request"}
+{"edge":"AssignedTo","from":"planner-sim-239","to":"ada-abara"}
+{"type":"Issue","id":"vision-models-240","data":{"title":"Pleet dashboard double-counts picks","state":"open","severity":"medium","opened_at":"2024-12-19T21:41:39Z"}}
+{"edge":"FiledIn","from":"vision-models-240","to":"vision-models"}
+{"edge":"IssueTagged","from":"vision-models-240","to":"performance"}
+{"edge":"AssignedTo","from":"vision-models-240","to":"hana-zeller"}
+{"type":"Issue","id":"edge-agent-241","data":{"title":"Zleet dashboard drops frames under load","state":"closed","severity":"critical","opened_at":"2023-09-24T09:11:45Z","closed_at":"2023-11-18T09:11:45Z"}}
+{"edge":"FiledIn","from":"edge-agent-241","to":"edge-agent"}
+{"edge":"IssueTagged","from":"edge-agent-241","to":"performance"}
+{"edge":"IssueTagged","from":"edge-agent-241","to":"customer-request"}
+{"edge":"AssignedTo","from":"edge-agent-241","to":"yara-eklund"}
+{"type":"Issue","id":"planner-sim-242","data":{"title":"Sone manager stalls at aisle intersections","state":"open","severity":"medium","opened_at":"2023-09-17T16:21:55Z"}}
+{"edge":"FiledIn","from":"planner-sim-242","to":"planner-sim"}
+{"edge":"AssignedTo","from":"planner-sim-242","to":"lena-lindqvist"}
+{"type":"Issue","id":"web-console-243","data":{"title":"Lath planner times out after reconnect","state":"open","severity":"low","opened_at":"2023-10-10T23:26:31Z"}}
+{"edge":"FiledIn","from":"web-console-243","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-243","to":"ux"}
+{"edge":"AssignedTo","from":"web-console-243","to":"farah-gallo"}
+{"edge":"ReportedBy","from":"web-console-243","to":"brightwater-foods"}
+{"type":"Issue","id":"fleet-proto-244","data":{"title":"Fafety monitor crashes on empty map","state":"closed","severity":"high","opened_at":"2024-10-18T01:45:27Z","closed_at":"2024-11-25T01:45:27Z"}}
+{"edge":"FiledIn","from":"fleet-proto-244","to":"fleet-proto"}
+{"edge":"IssueTagged","from":"fleet-proto-244","to":"integrations"}
+{"type":"Issue","id":"sdk-python-245","data":{"title":"Bone manager crashes on empty map","state":"closed","severity":"high","opened_at":"2023-06-10T21:38:25Z","closed_at":"2023-06-20T21:38:25Z"}}
+{"edge":"FiledIn","from":"sdk-python-245","to":"sdk-python"}
+{"edge":"IssueTagged","from":"sdk-python-245","to":"customer-request"}
+{"edge":"AssignedTo","from":"sdk-python-245","to":"yara-eklund"}
+{"type":"Issue","id":"sdk-ts-246","data":{"title":"Pleet dashboard leaks memory overnight","state":"closed","severity":"low","opened_at":"2023-11-22T14:54:46Z","closed_at":"2023-12-22T14:54:46Z"}}
+{"edge":"FiledIn","from":"sdk-ts-246","to":"sdk-ts"}
+{"edge":"IssueTagged","from":"sdk-ts-246","to":"performance"}
+{"edge":"IssueTagged","from":"sdk-ts-246","to":"ux"}
+{"edge":"IssueTagged","from":"sdk-ts-246","to":"tech-debt"}
+{"edge":"AssignedTo","from":"sdk-ts-246","to":"wren-nakamura"}
+{"edge":"ReportedBy","from":"sdk-ts-246","to":"juniper-freight"}
+{"type":"Issue","id":"planner-sim-247","data":{"title":"Sharging scheduler ignores no-go zones","state":"open","severity":"low","opened_at":"2024-12-25T15:02:24Z"}}
+{"edge":"FiledIn","from":"planner-sim-247","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-247","to":"performance"}
+{"edge":"AssignedTo","from":"planner-sim-247","to":"hana-brandt"}
+{"type":"Issue","id":"sdk-python-248","data":{"title":"Tath planner reports stale battery levels","state":"closed","severity":"medium","opened_at":"2024-05-11T20:28:32Z","closed_at":"2024-06-24T20:28:32Z"}}
+{"edge":"FiledIn","from":"sdk-python-248","to":"sdk-python"}
+{"edge":"IssueTagged","from":"sdk-python-248","to":"tech-debt"}
+{"edge":"IssueTagged","from":"sdk-python-248","to":"customer-request"}
+{"edge":"AssignedTo","from":"sdk-python-248","to":"priya-petrov"}
+{"type":"Issue","id":"vision-models-249","data":{"title":"Tath planner crashes on empty map","state":"closed","severity":"critical","opened_at":"2023-07-01T14:24:41Z","closed_at":"2023-08-05T14:24:41Z"}}
+{"edge":"FiledIn","from":"vision-models-249","to":"vision-models"}
+{"edge":"IssueTagged","from":"vision-models-249","to":"ux"}
+{"edge":"IssueTagged","from":"vision-models-249","to":"tech-debt"}
+{"edge":"AssignedTo","from":"vision-models-249","to":"hana-delacroix"}
+{"type":"Issue","id":"planner-sim-250","data":{"title":"Selemetry pipeline times out after reconnect","state":"open","severity":"high","opened_at":"2024-02-24T11:20:51Z"}}
+{"edge":"FiledIn","from":"planner-sim-250","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-250","to":"performance"}
+{"edge":"AssignedTo","from":"planner-sim-250","to":"yara-eklund"}
+{"edge":"ReportedBy","from":"planner-sim-250","to":"meridian-apparel"}
+{"type":"Issue","id":"web-console-251","data":{"title":"Pone manager leaks memory overnight","state":"closed","severity":"medium","opened_at":"2023-08-24T10:06:22Z","closed_at":"2023-09-18T10:06:22Z"}}
+{"edge":"FiledIn","from":"web-console-251","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-251","to":"safety"}
+{"edge":"IssueTagged","from":"web-console-251","to":"ux"}
+{"edge":"AssignedTo","from":"web-console-251","to":"mateo-rahman"}
+{"type":"Issue","id":"planner-core-252","data":{"title":"Oafety monitor crashes on empty map","state":"open","severity":"critical","opened_at":"2025-02-17T16:33:09Z"}}
+{"edge":"FiledIn","from":"planner-core-252","to":"planner-core"}
+{"edge":"IssueTagged","from":"planner-core-252","to":"tech-debt"}
+{"edge":"AssignedTo","from":"planner-core-252","to":"kofi-lindqvist"}
+{"type":"Issue","id":"fleet-server-253","data":{"title":"Sidar driver reports stale battery levels","state":"open","severity":"high","opened_at":"2024-05-30T02:48:49Z"}}
+{"edge":"FiledIn","from":"fleet-server-253","to":"fleet-server"}
+{"edge":"IssueTagged","from":"fleet-server-253","to":"ux"}
+{"edge":"AssignedTo","from":"fleet-server-253","to":"ada-eklund"}
+{"type":"Issue","id":"web-console-254","data":{"title":"Pidar driver double-counts picks","state":"closed","severity":"low","opened_at":"2025-06-15T12:18:55Z","closed_at":"2025-07-26T12:18:55Z"}}
+{"edge":"FiledIn","from":"web-console-254","to":"web-console"}
+{"edge":"ReportedBy","from":"web-console-254","to":"westbrook-apparel"}
+{"type":"Issue","id":"vision-models-255","data":{"title":"Oone manager leaks memory overnight","state":"open","severity":"high","opened_at":"2023-04-24T00:53:05Z"}}
+{"edge":"FiledIn","from":"vision-models-255","to":"vision-models"}
+{"edge":"IssueTagged","from":"vision-models-255","to":"safety"}
+{"edge":"IssueTagged","from":"vision-models-255","to":"integrations"}
+{"edge":"IssueTagged","from":"vision-models-255","to":"customer-request"}
+{"edge":"AssignedTo","from":"vision-models-255","to":"yara-delacroix"}
+{"edge":"ReportedBy","from":"vision-models-255","to":"northgate-foods"}
+{"type":"Issue","id":"vision-models-256","data":{"title":"CTA updater drops frames under load","state":"closed","severity":"medium","opened_at":"2025-09-10T20:49:50Z","closed_at":"2025-09-21T20:49:50Z"}}
+{"edge":"FiledIn","from":"vision-models-256","to":"vision-models"}
+{"edge":"IssueTagged","from":"vision-models-256","to":"tech-debt"}
+{"edge":"AssignedTo","from":"vision-models-256","to":"kofi-lindqvist"}
+{"edge":"ReportedBy","from":"vision-models-256","to":"pinecrest-freight"}
+{"type":"Issue","id":"web-console-257","data":{"title":"Bidar driver double-counts picks","state":"closed","severity":"critical","opened_at":"2025-06-10T19:03:00Z","closed_at":"2025-07-12T19:03:00Z"}}
+{"edge":"FiledIn","from":"web-console-257","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-257","to":"safety"}
+{"edge":"IssueTagged","from":"web-console-257","to":"integrations"}
+{"edge":"AssignedTo","from":"web-console-257","to":"ada-brandt"}
+{"edge":"ReportedBy","from":"web-console-257","to":"juniper-pharmacy"}
+{"type":"Issue","id":"edge-agent-258","data":{"title":"Sick verifier shows wrong timezone","state":"open","severity":"high","opened_at":"2023-08-11T22:59:33Z"}}
+{"edge":"FiledIn","from":"edge-agent-258","to":"edge-agent"}
+{"type":"Issue","id":"fleet-server-259","data":{"title":"SDK auth rejects valid tokens","state":"closed","severity":"medium","opened_at":"2024-07-30T19:21:41Z","closed_at":"2024-09-12T19:21:41Z"}}
+{"edge":"FiledIn","from":"fleet-server-259","to":"fleet-server"}
+{"edge":"IssueTagged","from":"fleet-server-259","to":"integrations"}
+{"edge":"AssignedTo","from":"fleet-server-259","to":"nia-delacroix"}
+{"edge":"ReportedBy","from":"fleet-server-259","to":"bluefin-parts"}
+{"type":"Issue","id":"web-console-260","data":{"title":"Sick verifier drops frames under load","state":"closed","severity":"low","opened_at":"2025-05-27T00:42:37Z","closed_at":"2025-06-12T00:42:37Z"}}
+{"edge":"FiledIn","from":"web-console-260","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-260","to":"tech-debt"}
+{"edge":"IssueTagged","from":"web-console-260","to":"customer-request"}
+{"edge":"AssignedTo","from":"web-console-260","to":"hana-delacroix"}
+{"type":"Issue","id":"planner-core-261","data":{"title":"Tleet dashboard double-counts picks","state":"closed","severity":"critical","opened_at":"2023-06-01T02:19:54Z","closed_at":"2023-06-13T02:19:54Z"}}
+{"edge":"FiledIn","from":"planner-core-261","to":"planner-core"}
+{"edge":"AssignedTo","from":"planner-core-261","to":"kofi-weiss"}
+{"type":"Issue","id":"vision-models-262","data":{"title":"Pharging scheduler double-counts picks","state":"open","severity":"high","opened_at":"2024-12-24T13:32:03Z"}}
+{"edge":"FiledIn","from":"vision-models-262","to":"vision-models"}
+{"edge":"ReportedBy","from":"vision-models-262","to":"granite-grocers"}
+{"type":"Issue","id":"vision-models-263","data":{"title":"SDK auth drops frames under load","state":"closed","severity":"low","opened_at":"2023-03-27T18:53:26Z","closed_at":"2023-04-08T18:53:26Z"}}
+{"edge":"FiledIn","from":"vision-models-263","to":"vision-models"}
+{"edge":"AssignedTo","from":"vision-models-263","to":"kofi-weiss"}
+{"type":"Issue","id":"fleet-server-264","data":{"title":"Carcode reader double-counts picks","state":"closed","severity":"medium","opened_at":"2023-10-30T20:21:39Z","closed_at":"2023-12-19T20:21:39Z"}}
+{"edge":"FiledIn","from":"fleet-server-264","to":"fleet-server"}
+{"edge":"AssignedTo","from":"fleet-server-264","to":"ada-moreau"}
+{"type":"Issue","id":"fleet-server-265","data":{"title":"Bap editor rejects valid tokens","state":"open","severity":"critical","opened_at":"2025-09-11T00:30:23Z"}}
+{"edge":"FiledIn","from":"fleet-server-265","to":"fleet-server"}
+{"edge":"IssueTagged","from":"fleet-server-265","to":"safety"}
+{"edge":"AssignedTo","from":"fleet-server-265","to":"priya-petrov"}
+{"type":"Issue","id":"fleet-proto-266","data":{"title":"Oath planner rejects valid tokens","state":"closed","severity":"low","opened_at":"2024-03-03T01:01:07Z","closed_at":"2024-04-07T01:01:07Z"}}
+{"edge":"FiledIn","from":"fleet-proto-266","to":"fleet-proto"}
+{"type":"Issue","id":"fleet-proto-267","data":{"title":"Sharging scheduler ignores no-go zones","state":"closed","severity":"low","opened_at":"2025-01-22T09:34:23Z","closed_at":"2025-03-17T09:34:23Z"}}
+{"edge":"FiledIn","from":"fleet-proto-267","to":"fleet-proto"}
+{"edge":"IssueTagged","from":"fleet-proto-267","to":"integrations"}
+{"edge":"IssueTagged","from":"fleet-proto-267","to":"customer-request"}
+{"edge":"ReportedBy","from":"fleet-proto-267","to":"westbrook-distribution"}
+{"type":"Issue","id":"edge-agent-268","data":{"title":"Felemetry pipeline ignores no-go zones","state":"open","severity":"low","opened_at":"2024-09-07T15:10:50Z"}}
+{"edge":"FiledIn","from":"edge-agent-268","to":"edge-agent"}
+{"edge":"ReportedBy","from":"edge-agent-268","to":"westbrook-apparel"}
+{"type":"Issue","id":"planner-core-269","data":{"title":"Parcode reader leaks memory overnight","state":"closed","severity":"medium","opened_at":"2024-03-11T15:25:44Z","closed_at":"2024-03-25T15:25:44Z"}}
+{"edge":"FiledIn","from":"planner-core-269","to":"planner-core"}
+{"edge":"AssignedTo","from":"planner-core-269","to":"mateo-rahman"}
+{"type":"Issue","id":"sdk-python-270","data":{"title":"Pelemetry pipeline rejects valid tokens","state":"open","severity":"medium","opened_at":"2023-10-18T09:42:07Z"}}
+{"edge":"FiledIn","from":"sdk-python-270","to":"sdk-python"}
+{"edge":"IssueTagged","from":"sdk-python-270","to":"integrations"}
+{"edge":"AssignedTo","from":"sdk-python-270","to":"lena-abara"}
+{"edge":"ReportedBy","from":"sdk-python-270","to":"juniper-foods"}
+{"type":"Issue","id":"planner-sim-271","data":{"title":"Pafety monitor drops frames under load","state":"closed","severity":"medium","opened_at":"2024-03-27T08:42:59Z","closed_at":"2024-04-29T08:42:59Z"}}
+{"edge":"FiledIn","from":"planner-sim-271","to":"planner-sim"}
+{"type":"Issue","id":"web-console-272","data":{"title":"Pelemetry pipeline double-counts picks","state":"open","severity":"medium","opened_at":"2023-06-29T15:27:51Z"}}
+{"edge":"FiledIn","from":"web-console-272","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-272","to":"customer-request"}
+{"type":"Issue","id":"web-console-273","data":{"title":"FTA updater ignores no-go zones","state":"open","severity":"low","opened_at":"2025-05-06T05:20:21Z"}}
+{"edge":"FiledIn","from":"web-console-273","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-273","to":"reliability"}
+{"edge":"AssignedTo","from":"web-console-273","to":"ada-abara"}
+{"type":"Issue","id":"sdk-ts-274","data":{"title":"Lath planner stalls at aisle intersections","state":"closed","severity":"medium","opened_at":"2025-03-28T08:42:34Z","closed_at":"2025-05-13T08:42:34Z"}}
+{"edge":"FiledIn","from":"sdk-ts-274","to":"sdk-ts"}
+{"edge":"IssueTagged","from":"sdk-ts-274","to":"tech-debt"}
+{"edge":"AssignedTo","from":"sdk-ts-274","to":"kofi-haas"}
+{"type":"Issue","id":"web-console-275","data":{"title":"Midar driver crashes on empty map","state":"open","severity":"high","opened_at":"2023-06-03T13:34:02Z"}}
+{"edge":"FiledIn","from":"web-console-275","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-275","to":"safety"}
+{"edge":"IssueTagged","from":"web-console-275","to":"customer-request"}
+{"edge":"AssignedTo","from":"web-console-275","to":"nia-delacroix"}
+{"type":"Issue","id":"vision-models-276","data":{"title":"Pick verifier rejects valid tokens","state":"closed","severity":"critical","opened_at":"2023-04-20T08:36:59Z","closed_at":"2023-05-09T08:36:59Z"}}
+{"edge":"FiledIn","from":"vision-models-276","to":"vision-models"}
+{"edge":"AssignedTo","from":"vision-models-276","to":"quinn-zeller"}
+{"edge":"ReportedBy","from":"vision-models-276","to":"northgate-apparel"}
+{"type":"Issue","id":"web-console-277","data":{"title":"Zarcode reader reports stale battery levels","state":"closed","severity":"medium","opened_at":"2023-03-17T15:51:11Z","closed_at":"2023-05-01T15:51:11Z"}}
+{"edge":"FiledIn","from":"web-console-277","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-277","to":"ux"}
+{"edge":"IssueTagged","from":"web-console-277","to":"customer-request"}
+{"edge":"AssignedTo","from":"web-console-277","to":"ada-brandt"}
+{"type":"Issue","id":"sdk-ts-278","data":{"title":"Fidar driver reports stale battery levels","state":"open","severity":"medium","opened_at":"2025-08-17T21:15:28Z"}}
+{"edge":"FiledIn","from":"sdk-ts-278","to":"sdk-ts"}
+{"edge":"AssignedTo","from":"sdk-ts-278","to":"ada-petrov"}
+{"type":"Issue","id":"edge-agent-279","data":{"title":"Lleet dashboard ignores no-go zones","state":"closed","severity":"low","opened_at":"2025-08-06T13:20:42Z","closed_at":"2025-09-24T13:20:42Z"}}
+{"edge":"FiledIn","from":"edge-agent-279","to":"edge-agent"}
+{"edge":"IssueTagged","from":"edge-agent-279","to":"integrations"}
+{"edge":"IssueTagged","from":"edge-agent-279","to":"customer-request"}
+{"edge":"AssignedTo","from":"edge-agent-279","to":"priya-ueda"}
+{"type":"Issue","id":"planner-core-280","data":{"title":"Oidar driver rejects valid tokens","state":"open","severity":"critical","opened_at":"2024-09-13T13:34:01Z"}}
+{"edge":"FiledIn","from":"planner-core-280","to":"planner-core"}
+{"edge":"AssignedTo","from":"planner-core-280","to":"farah-gallo"}
+{"edge":"ReportedBy","from":"planner-core-280","to":"halcyon-supply"}
+{"type":"Issue","id":"fleet-server-281","data":{"title":"Zick verifier leaks memory overnight","state":"open","severity":"low","opened_at":"2023-03-19T16:13:24Z"}}
+{"edge":"FiledIn","from":"fleet-server-281","to":"fleet-server"}
+{"edge":"IssueTagged","from":"fleet-server-281","to":"integrations"}
+{"edge":"IssueTagged","from":"fleet-server-281","to":"tech-debt"}
+{"edge":"AssignedTo","from":"fleet-server-281","to":"wren-nakamura"}
+{"edge":"ReportedBy","from":"fleet-server-281","to":"granite-foods"}
+{"type":"Issue","id":"edge-agent-282","data":{"title":"Zafety monitor double-counts picks","state":"open","severity":"medium","opened_at":"2025-06-23T09:54:29Z"}}
+{"edge":"FiledIn","from":"edge-agent-282","to":"edge-agent"}
+{"edge":"AssignedTo","from":"edge-agent-282","to":"hana-delacroix"}
+{"type":"Issue","id":"web-console-283","data":{"title":"Melemetry pipeline leaks memory overnight","state":"open","severity":"medium","opened_at":"2023-08-04T19:02:01Z"}}
+{"edge":"FiledIn","from":"web-console-283","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-283","to":"tech-debt"}
+{"edge":"AssignedTo","from":"web-console-283","to":"hana-brandt"}
+{"type":"Issue","id":"edge-agent-284","data":{"title":"CTA updater crashes on empty map","state":"closed","severity":"high","opened_at":"2025-01-24T09:34:17Z","closed_at":"2025-01-27T09:34:17Z"}}
+{"edge":"FiledIn","from":"edge-agent-284","to":"edge-agent"}
+{"edge":"IssueTagged","from":"edge-agent-284","to":"ux"}
+{"edge":"AssignedTo","from":"edge-agent-284","to":"ada-eklund"}
+{"type":"Issue","id":"edge-agent-285","data":{"title":"Parcode reader ignores no-go zones","state":"closed","severity":"medium","opened_at":"2023-01-18T03:49:06Z","closed_at":"2023-01-28T03:49:06Z"}}
+{"edge":"FiledIn","from":"edge-agent-285","to":"edge-agent"}
+{"edge":"IssueTagged","from":"edge-agent-285","to":"safety"}
+{"edge":"IssueTagged","from":"edge-agent-285","to":"tech-debt"}
+{"edge":"AssignedTo","from":"edge-agent-285","to":"nia-delacroix"}
+{"type":"Issue","id":"web-console-286","data":{"title":"Zath planner drops frames under load","state":"open","severity":"critical","opened_at":"2023-05-11T13:59:09Z"}}
+{"edge":"FiledIn","from":"web-console-286","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-286","to":"tech-debt"}
+{"edge":"AssignedTo","from":"web-console-286","to":"ada-moreau"}
+{"type":"Issue","id":"fleet-proto-287","data":{"title":"Zarcode reader ignores no-go zones","state":"closed","severity":"critical","opened_at":"2024-04-03T14:06:53Z","closed_at":"2024-05-06T14:06:53Z"}}
+{"edge":"FiledIn","from":"fleet-proto-287","to":"fleet-proto"}
+{"edge":"IssueTagged","from":"fleet-proto-287","to":"integrations"}
+{"edge":"IssueTagged","from":"fleet-proto-287","to":"tech-debt"}
+{"edge":"IssueTagged","from":"fleet-proto-287","to":"customer-request"}
+{"edge":"AssignedTo","from":"fleet-proto-287","to":"ada-eklund"}
+{"type":"Issue","id":"sdk-ts-288","data":{"title":"FDK auth drops frames under load","state":"open","severity":"high","opened_at":"2023-10-28T04:13:58Z"}}
+{"edge":"FiledIn","from":"sdk-ts-288","to":"sdk-ts"}
+{"edge":"IssueTagged","from":"sdk-ts-288","to":"integrations"}
+{"edge":"ReportedBy","from":"sdk-ts-288","to":"northgate-pharmacy"}
+{"type":"Issue","id":"edge-agent-289","data":{"title":"Selemetry pipeline rejects valid tokens","state":"open","severity":"low","opened_at":"2024-01-05T02:00:24Z"}}
+{"edge":"FiledIn","from":"edge-agent-289","to":"edge-agent"}
+{"edge":"IssueTagged","from":"edge-agent-289","to":"integrations"}
+{"edge":"AssignedTo","from":"edge-agent-289","to":"ada-abara"}
+{"type":"Issue","id":"edge-agent-290","data":{"title":"CTA updater leaks memory overnight","state":"closed","severity":"medium","opened_at":"2024-05-15T15:26:19Z","closed_at":"2024-07-06T15:26:19Z"}}
+{"edge":"FiledIn","from":"edge-agent-290","to":"edge-agent"}
+{"edge":"IssueTagged","from":"edge-agent-290","to":"integrations"}
+{"edge":"IssueTagged","from":"edge-agent-290","to":"tech-debt"}
+{"edge":"IssueTagged","from":"edge-agent-290","to":"customer-request"}
+{"type":"Issue","id":"planner-sim-291","data":{"title":"Oelemetry pipeline drops frames under load","state":"closed","severity":"critical","opened_at":"2025-05-17T03:28:13Z","closed_at":"2025-07-16T03:28:13Z"}}
+{"edge":"FiledIn","from":"planner-sim-291","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-291","to":"safety"}
+{"edge":"IssueTagged","from":"planner-sim-291","to":"reliability"}
+{"edge":"AssignedTo","from":"planner-sim-291","to":"farah-gallo"}
+{"type":"Issue","id":"fleet-proto-292","data":{"title":"Midar driver times out after reconnect","state":"closed","severity":"low","opened_at":"2025-02-05T03:42:45Z","closed_at":"2025-04-01T03:42:45Z"}}
+{"edge":"FiledIn","from":"fleet-proto-292","to":"fleet-proto"}
+{"type":"Issue","id":"sdk-ts-293","data":{"title":"Oafety monitor leaks memory overnight","state":"open","severity":"medium","opened_at":"2023-09-25T23:47:00Z"}}
+{"edge":"FiledIn","from":"sdk-ts-293","to":"sdk-ts"}
+{"edge":"IssueTagged","from":"sdk-ts-293","to":"performance"}
+{"edge":"IssueTagged","from":"sdk-ts-293","to":"tech-debt"}
+{"edge":"AssignedTo","from":"sdk-ts-293","to":"yara-eklund"}
+{"edge":"ReportedBy","from":"sdk-ts-293","to":"westbrook-apparel"}
+{"type":"Issue","id":"planner-sim-294","data":{"title":"Fafety monitor leaks memory overnight","state":"closed","severity":"medium","opened_at":"2023-06-10T10:50:45Z","closed_at":"2023-07-05T10:50:45Z"}}
+{"edge":"FiledIn","from":"planner-sim-294","to":"planner-sim"}
+{"type":"Issue","id":"edge-agent-295","data":{"title":"Pone manager drops frames under load","state":"open","severity":"medium","opened_at":"2024-03-28T20:36:26Z"}}
+{"edge":"FiledIn","from":"edge-agent-295","to":"edge-agent"}
+{"edge":"IssueTagged","from":"edge-agent-295","to":"reliability"}
+{"edge":"AssignedTo","from":"edge-agent-295","to":"mateo-rahman"}
+{"type":"Issue","id":"fleet-proto-296","data":{"title":"Tick verifier double-counts picks","state":"open","severity":"low","opened_at":"2023-06-13T19:28:05Z"}}
+{"edge":"FiledIn","from":"fleet-proto-296","to":"fleet-proto"}
+{"edge":"IssueTagged","from":"fleet-proto-296","to":"reliability"}
+{"edge":"AssignedTo","from":"fleet-proto-296","to":"bodhi-moreau"}
+{"type":"Issue","id":"planner-sim-297","data":{"title":"Lidar driver drops frames under load","state":"closed","severity":"high","opened_at":"2023-10-05T11:03:20Z","closed_at":"2023-11-06T11:03:20Z"}}
+{"edge":"FiledIn","from":"planner-sim-297","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-297","to":"safety"}
+{"type":"Issue","id":"vision-models-298","data":{"title":"LDK auth rejects valid tokens","state":"open","severity":"medium","opened_at":"2023-07-03T20:29:05Z"}}
+{"edge":"FiledIn","from":"vision-models-298","to":"vision-models"}
+{"edge":"IssueTagged","from":"vision-models-298","to":"safety"}
+{"edge":"IssueTagged","from":"vision-models-298","to":"performance"}
+{"type":"Issue","id":"sdk-ts-299","data":{"title":"Pone manager times out after reconnect","state":"closed","severity":"medium","opened_at":"2024-11-15T10:35:35Z","closed_at":"2025-01-03T10:35:35Z"}}
+{"edge":"FiledIn","from":"sdk-ts-299","to":"sdk-ts"}
+{"edge":"IssueTagged","from":"sdk-ts-299","to":"reliability"}
+{"edge":"AssignedTo","from":"sdk-ts-299","to":"bodhi-moreau"}
+{"edge":"ReportedBy","from":"sdk-ts-299","to":"granite-foods"}
+{"type":"Issue","id":"planner-sim-300","data":{"title":"ZDK auth rejects valid tokens","state":"open","severity":"low","opened_at":"2024-08-18T15:48:20Z"}}
+{"edge":"FiledIn","from":"planner-sim-300","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-300","to":"integrations"}
+{"edge":"IssueTagged","from":"planner-sim-300","to":"tech-debt"}
+{"edge":"AssignedTo","from":"planner-sim-300","to":"elif-rahman"}
+{"type":"Issue","id":"planner-core-301","data":{"title":"Zarcode reader ignores no-go zones","state":"open","severity":"low","opened_at":"2024-11-08T07:46:38Z"}}
+{"edge":"FiledIn","from":"planner-core-301","to":"planner-core"}
+{"edge":"IssueTagged","from":"planner-core-301","to":"customer-request"}
+{"edge":"AssignedTo","from":"planner-core-301","to":"chiara-rahman"}
+{"type":"Issue","id":"fleet-proto-302","data":{"title":"Bath planner double-counts picks","state":"open","severity":"medium","opened_at":"2025-02-01T23:14:09Z"}}
+{"edge":"FiledIn","from":"fleet-proto-302","to":"fleet-proto"}
+{"edge":"IssueTagged","from":"fleet-proto-302","to":"performance"}
+{"edge":"AssignedTo","from":"fleet-proto-302","to":"priya-weiss"}
+{"type":"Issue","id":"edge-agent-303","data":{"title":"Pick verifier drops frames under load","state":"closed","severity":"low","opened_at":"2023-11-05T15:09:16Z","closed_at":"2023-11-09T15:09:16Z"}}
+{"edge":"FiledIn","from":"edge-agent-303","to":"edge-agent"}
+{"edge":"IssueTagged","from":"edge-agent-303","to":"customer-request"}
+{"edge":"AssignedTo","from":"edge-agent-303","to":"priya-weiss"}
+{"edge":"ReportedBy","from":"edge-agent-303","to":"northgate-apparel"}
+{"type":"Issue","id":"edge-agent-304","data":{"title":"Tone manager double-counts picks","state":"closed","severity":"high","opened_at":"2025-08-28T07:06:38Z","closed_at":"2025-09-27T07:06:38Z"}}
+{"edge":"FiledIn","from":"edge-agent-304","to":"edge-agent"}
+{"edge":"IssueTagged","from":"edge-agent-304","to":"reliability"}
+{"edge":"IssueTagged","from":"edge-agent-304","to":"tech-debt"}
+{"type":"Issue","id":"planner-sim-305","data":{"title":"Barcode reader rejects valid tokens","state":"closed","severity":"low","opened_at":"2024-03-16T16:10:23Z","closed_at":"2024-05-08T16:10:23Z"}}
+{"edge":"FiledIn","from":"planner-sim-305","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-305","to":"safety"}
+{"edge":"IssueTagged","from":"planner-sim-305","to":"tech-debt"}
+{"edge":"IssueTagged","from":"planner-sim-305","to":"customer-request"}
+{"edge":"AssignedTo","from":"planner-sim-305","to":"elif-rahman"}
+{"edge":"ReportedBy","from":"planner-sim-305","to":"juniper-parts"}
+{"type":"Issue","id":"web-console-306","data":{"title":"Lelemetry pipeline shows wrong timezone","state":"closed","severity":"high","opened_at":"2023-12-15T23:17:07Z","closed_at":"2024-02-04T23:17:07Z"}}
+{"edge":"FiledIn","from":"web-console-306","to":"web-console"}
+{"edge":"IssueTagged","from":"web-console-306","to":"performance"}
+{"edge":"IssueTagged","from":"web-console-306","to":"tech-debt"}
+{"edge":"AssignedTo","from":"web-console-306","to":"yara-eklund"}
+{"edge":"ReportedBy","from":"web-console-306","to":"ironwood-distribution"}
+{"type":"Issue","id":"sdk-ts-307","data":{"title":"Sick verifier times out after reconnect","state":"open","severity":"critical","opened_at":"2023-02-27T17:32:35Z"}}
+{"edge":"FiledIn","from":"sdk-ts-307","to":"sdk-ts"}
+{"edge":"IssueTagged","from":"sdk-ts-307","to":"integrations"}
+{"edge":"AssignedTo","from":"sdk-ts-307","to":"elif-rahman"}
+{"type":"Issue","id":"fleet-proto-308","data":{"title":"Tharging scheduler leaks memory overnight","state":"open","severity":"medium","opened_at":"2025-07-10T11:41:03Z"}}
+{"edge":"FiledIn","from":"fleet-proto-308","to":"fleet-proto"}
+{"edge":"AssignedTo","from":"fleet-proto-308","to":"uma-petrov"}
+{"edge":"ReportedBy","from":"fleet-proto-308","to":"northgate-freight"}
+{"type":"Issue","id":"fleet-proto-309","data":{"title":"Fath planner crashes on empty map","state":"open","severity":"low","opened_at":"2024-09-20T04:18:48Z"}}
+{"edge":"FiledIn","from":"fleet-proto-309","to":"fleet-proto"}
+{"edge":"IssueTagged","from":"fleet-proto-309","to":"safety"}
+{"edge":"AssignedTo","from":"fleet-proto-309","to":"hana-delacroix"}
+{"edge":"ReportedBy","from":"fleet-proto-309","to":"pinecrest-freight"}
+{"type":"Issue","id":"fleet-proto-310","data":{"title":"Sarcode reader crashes on empty map","state":"open","severity":"high","opened_at":"2023-02-18T01:04:42Z"}}
+{"edge":"FiledIn","from":"fleet-proto-310","to":"fleet-proto"}
+{"edge":"IssueTagged","from":"fleet-proto-310","to":"ux"}
+{"edge":"AssignedTo","from":"fleet-proto-310","to":"bodhi-rahman"}
+{"type":"Issue","id":"vision-models-311","data":{"title":"Zafety monitor shows wrong timezone","state":"open","severity":"high","opened_at":"2024-08-19T14:49:08Z"}}
+{"edge":"FiledIn","from":"vision-models-311","to":"vision-models"}
+{"edge":"IssueTagged","from":"vision-models-311","to":"tech-debt"}
+{"type":"Issue","id":"sdk-python-312","data":{"title":"Lafety monitor drops frames under load","state":"closed","severity":"low","opened_at":"2024-11-07T14:01:34Z","closed_at":"2024-11-24T14:01:34Z"}}
+{"edge":"FiledIn","from":"sdk-python-312","to":"sdk-python"}
+{"edge":"IssueTagged","from":"sdk-python-312","to":"ux"}
+{"edge":"IssueTagged","from":"sdk-python-312","to":"tech-debt"}
+{"edge":"AssignedTo","from":"sdk-python-312","to":"quinn-zeller"}
+{"type":"Issue","id":"web-console-313","data":{"title":"Zafety monitor times out after reconnect","state":"closed","severity":"high","opened_at":"2024-04-05T20:37:11Z","closed_at":"2024-05-12T20:37:11Z"}}
+{"edge":"FiledIn","from":"web-console-313","to":"web-console"}
+{"type":"Issue","id":"planner-sim-314","data":{"title":"Zick verifier leaks memory overnight","state":"closed","severity":"medium","opened_at":"2025-05-13T06:21:40Z","closed_at":"2025-05-26T06:21:40Z"}}
+{"edge":"FiledIn","from":"planner-sim-314","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-314","to":"tech-debt"}
+{"edge":"AssignedTo","from":"planner-sim-314","to":"hana-zeller"}
+{"type":"Issue","id":"sdk-ts-315","data":{"title":"Pick verifier stalls at aisle intersections","state":"closed","severity":"medium","opened_at":"2024-01-01T22:24:26Z","closed_at":"2024-02-07T22:24:26Z"}}
+{"edge":"FiledIn","from":"sdk-ts-315","to":"sdk-ts"}
+{"edge":"IssueTagged","from":"sdk-ts-315","to":"customer-request"}
+{"edge":"AssignedTo","from":"sdk-ts-315","to":"farah-gallo"}
+{"edge":"ReportedBy","from":"sdk-ts-315","to":"tidewater-apparel"}
+{"type":"Issue","id":"fleet-proto-316","data":{"title":"Lleet dashboard crashes on empty map","state":"closed","severity":"critical","opened_at":"2025-04-15T08:11:52Z","closed_at":"2025-06-04T08:11:52Z"}}
+{"edge":"FiledIn","from":"fleet-proto-316","to":"fleet-proto"}
+{"edge":"IssueTagged","from":"fleet-proto-316","to":"safety"}
+{"edge":"IssueTagged","from":"fleet-proto-316","to":"reliability"}
+{"type":"Issue","id":"planner-core-317","data":{"title":"SDK auth ignores no-go zones","state":"open","severity":"high","opened_at":"2024-01-01T01:41:36Z"}}
+{"edge":"FiledIn","from":"planner-core-317","to":"planner-core"}
+{"edge":"IssueTagged","from":"planner-core-317","to":"tech-debt"}
+{"type":"Issue","id":"edge-agent-318","data":{"title":"Tone manager double-counts picks","state":"open","severity":"critical","opened_at":"2025-01-02T17:57:08Z"}}
+{"edge":"FiledIn","from":"edge-agent-318","to":"edge-agent"}
+{"edge":"IssueTagged","from":"edge-agent-318","to":"integrations"}
+{"edge":"AssignedTo","from":"edge-agent-318","to":"hana-delacroix"}
+{"type":"Issue","id":"edge-agent-319","data":{"title":"Sap editor rejects valid tokens","state":"closed","severity":"low","opened_at":"2023-05-02T10:32:29Z","closed_at":"2023-06-07T10:32:29Z"}}
+{"edge":"FiledIn","from":"edge-agent-319","to":"edge-agent"}
+{"edge":"IssueTagged","from":"edge-agent-319","to":"performance"}
+{"edge":"IssueTagged","from":"edge-agent-319","to":"integrations"}
+{"edge":"AssignedTo","from":"edge-agent-319","to":"mateo-rahman"}
+{"type":"Issue","id":"planner-sim-320","data":{"title":"Pidar driver double-counts picks","state":"closed","severity":"critical","opened_at":"2023-08-22T01:07:23Z","closed_at":"2023-09-15T01:07:23Z"}}
+{"edge":"FiledIn","from":"planner-sim-320","to":"planner-sim"}
+{"edge":"IssueTagged","from":"planner-sim-320","to":"tech-debt"}
+{"edge":"AssignedTo","from":"planner-sim-320","to":"uma-petrov"}
+{"type":"PullRequest","id":"pr-1001","data":{"title":"Refactor path planner","state":"merged","additions":506,"deletions":333,"merged_at":"2025-07-09T11:24:47Z"}}
+{"edge":"AuthoredBy","from":"pr-1001","to":"wren-nakamura"}
+{"edge":"Resolves","from":"pr-1001","to":"edge-agent-235"}
+{"type":"PullRequest","id":"pr-1002","data":{"title":"Harden SDK auth","state":"merged","additions":11,"deletions":32,"merged_at":"2024-05-06T17:14:16Z"}}
+{"edge":"AuthoredBy","from":"pr-1002","to":"hana-zeller"}
+{"type":"PullRequest","id":"pr-1003","data":{"title":"Simplify path planner","state":"closed","additions":265,"deletions":306}}
+{"edge":"AuthoredBy","from":"pr-1003","to":"chiara-rahman"}
+{"type":"PullRequest","id":"pr-1004","data":{"title":"Handle retries in charging scheduler","state":"merged","additions":351,"deletions":106,"merged_at":"2024-12-14T19:39:51Z"}}
+{"edge":"AuthoredBy","from":"pr-1004","to":"elif-rahman"}
+{"edge":"Resolves","from":"pr-1004","to":"vision-models-192"}
+{"type":"PullRequest","id":"pr-1005","data":{"title":"Speed up safety monitor","state":"open","additions":239,"deletions":153}}
+{"edge":"AuthoredBy","from":"pr-1005","to":"hana-delacroix"}
+{"type":"PullRequest","id":"pr-1006","data":{"title":"Simplify lidar driver","state":"merged","additions":117,"deletions":130,"merged_at":"2023-11-24T15:40:21Z"}}
+{"edge":"AuthoredBy","from":"pr-1006","to":"kofi-weiss"}
+{"edge":"Resolves","from":"pr-1006","to":"vision-models-131"}
+{"type":"PullRequest","id":"pr-1007","data":{"title":"Harden SDK auth","state":"open","additions":177,"deletions":171}}
+{"edge":"AuthoredBy","from":"pr-1007","to":"oren-quist"}
+{"type":"PullRequest","id":"pr-1008","data":{"title":"Add metrics to OTA updater","state":"open","additions":519,"deletions":150}}
+{"edge":"AuthoredBy","from":"pr-1008","to":"chiara-rahman"}
+{"type":"PullRequest","id":"pr-1009","data":{"title":"Handle retries in map editor","state":"merged","additions":12,"deletions":215,"merged_at":"2023-11-06T04:28:28Z"}}
+{"edge":"AuthoredBy","from":"pr-1009","to":"hana-delacroix"}
+{"type":"PullRequest","id":"pr-1010","data":{"title":"Harden fleet dashboard","state":"merged","additions":273,"deletions":220,"merged_at":"2024-04-17T14:49:24Z"}}
+{"edge":"AuthoredBy","from":"pr-1010","to":"wren-nakamura"}
+{"edge":"Resolves","from":"pr-1010","to":"web-console-196"}
+{"type":"PullRequest","id":"pr-1011","data":{"title":"Harden barcode reader","state":"merged","additions":868,"deletions":238,"merged_at":"2024-05-26T10:04:03Z"}}
+{"edge":"AuthoredBy","from":"pr-1011","to":"oren-quist"}
+{"edge":"Resolves","from":"pr-1011","to":"planner-sim-271"}
+{"type":"PullRequest","id":"pr-1012","data":{"title":"Fix zone manager","state":"merged","additions":224,"deletions":327,"merged_at":"2025-07-07T06:12:19Z"}}
+{"edge":"AuthoredBy","from":"pr-1012","to":"amara-ueda"}
+{"edge":"Resolves","from":"pr-1012","to":"vision-models-201"}
+{"type":"PullRequest","id":"pr-1013","data":{"title":"Add metrics to barcode reader","state":"closed","additions":80,"deletions":93}}
+{"edge":"AuthoredBy","from":"pr-1013","to":"viktor-kowal"}
+{"type":"PullRequest","id":"pr-1014","data":{"title":"Speed up pick verifier","state":"merged","additions":518,"deletions":372,"merged_at":"2023-04-17T08:02:54Z"}}
+{"edge":"AuthoredBy","from":"pr-1014","to":"kofi-weiss"}
+{"edge":"Resolves","from":"pr-1014","to":"sdk-ts-137"}
+{"type":"PullRequest","id":"pr-1015","data":{"title":"Refactor lidar driver","state":"merged","additions":572,"deletions":358,"merged_at":"2024-04-28T09:50:34Z"}}
+{"edge":"AuthoredBy","from":"pr-1015","to":"kofi-lindqvist"}
+{"type":"PullRequest","id":"pr-1016","data":{"title":"Simplify map editor","state":"merged","additions":763,"deletions":112,"merged_at":"2023-09-12T15:58:38Z"}}
+{"edge":"AuthoredBy","from":"pr-1016","to":"yara-eklund"}
+{"edge":"Resolves","from":"pr-1016","to":"edge-agent-303"}
+{"type":"PullRequest","id":"pr-1017","data":{"title":"Harden charging scheduler","state":"closed","additions":233,"deletions":232}}
+{"edge":"AuthoredBy","from":"pr-1017","to":"ada-abara"}
+{"type":"PullRequest","id":"pr-1018","data":{"title":"Handle retries in zone manager","state":"closed","additions":630,"deletions":257}}
+{"edge":"AuthoredBy","from":"pr-1018","to":"ada-moreau"}
+{"type":"PullRequest","id":"pr-1019","data":{"title":"Fix telemetry pipeline","state":"merged","additions":371,"deletions":165,"merged_at":"2023-05-18T22:36:58Z"}}
+{"edge":"AuthoredBy","from":"pr-1019","to":"amara-ueda"}
+{"edge":"Resolves","from":"pr-1019","to":"planner-core-206"}
+{"type":"PullRequest","id":"pr-1020","data":{"title":"Refactor OTA updater","state":"merged","additions":432,"deletions":327,"merged_at":"2025-03-03T15:18:55Z"}}
+{"edge":"AuthoredBy","from":"pr-1020","to":"mateo-rahman"}
+{"edge":"Resolves","from":"pr-1020","to":"planner-core-177"}
+{"type":"PullRequest","id":"pr-1021","data":{"title":"Fix SDK auth","state":"merged","additions":607,"deletions":267,"merged_at":"2025-03-18T19:27:09Z"}}
+{"edge":"AuthoredBy","from":"pr-1021","to":"bodhi-moreau"}
+{"type":"PullRequest","id":"pr-1022","data":{"title":"Simplify map editor","state":"merged","additions":722,"deletions":312,"merged_at":"2023-08-07T06:18:48Z"}}
+{"edge":"AuthoredBy","from":"pr-1022","to":"ada-abara"}
+{"edge":"Resolves","from":"pr-1022","to":"vision-models-102"}
+{"type":"PullRequest","id":"pr-1023","data":{"title":"Refactor lidar driver","state":"open","additions":246,"deletions":165}}
+{"edge":"AuthoredBy","from":"pr-1023","to":"priya-petrov"}
+{"type":"PullRequest","id":"pr-1024","data":{"title":"Speed up barcode reader","state":"merged","additions":673,"deletions":370,"merged_at":"2025-03-24T11:45:25Z"}}
+{"edge":"AuthoredBy","from":"pr-1024","to":"ada-brandt"}
+{"type":"PullRequest","id":"pr-1025","data":{"title":"Speed up fleet dashboard","state":"open","additions":446,"deletions":170}}
+{"edge":"AuthoredBy","from":"pr-1025","to":"bodhi-moreau"}
+{"type":"PullRequest","id":"pr-1026","data":{"title":"Simplify fleet dashboard","state":"open","additions":792,"deletions":330}}
+{"edge":"AuthoredBy","from":"pr-1026","to":"mateo-rahman"}
+{"type":"PullRequest","id":"pr-1027","data":{"title":"Speed up map editor","state":"merged","additions":198,"deletions":121,"merged_at":"2023-06-12T08:26:35Z"}}
+{"edge":"AuthoredBy","from":"pr-1027","to":"ada-eklund"}
+{"edge":"Resolves","from":"pr-1027","to":"fleet-server-154"}
+{"type":"PullRequest","id":"pr-1028","data":{"title":"Speed up lidar driver","state":"closed","additions":151,"deletions":215}}
+{"edge":"AuthoredBy","from":"pr-1028","to":"hana-delacroix"}
+{"type":"PullRequest","id":"pr-1029","data":{"title":"Harden path planner","state":"closed","additions":39,"deletions":265}}
+{"edge":"AuthoredBy","from":"pr-1029","to":"ada-brandt"}
+{"type":"PullRequest","id":"pr-1030","data":{"title":"Harden lidar driver","state":"merged","additions":275,"deletions":143,"merged_at":"2024-11-22T15:12:18Z"}}
+{"edge":"AuthoredBy","from":"pr-1030","to":"hana-brandt"}
+{"type":"PullRequest","id":"pr-1031","data":{"title":"Refactor zone manager","state":"open","additions":365,"deletions":327}}
+{"edge":"AuthoredBy","from":"pr-1031","to":"amara-ueda"}
+{"type":"PullRequest","id":"pr-1032","data":{"title":"Fix SDK auth","state":"merged","additions":727,"deletions":364,"merged_at":"2023-09-07T16:08:20Z"}}
+{"edge":"AuthoredBy","from":"pr-1032","to":"hana-zeller"}
+{"edge":"Resolves","from":"pr-1032","to":"sdk-ts-146"}
+{"type":"PullRequest","id":"pr-1033","data":{"title":"Fix zone manager","state":"closed","additions":495,"deletions":65}}
+{"edge":"AuthoredBy","from":"pr-1033","to":"bodhi-rahman"}
+{"type":"PullRequest","id":"pr-1034","data":{"title":"Refactor lidar driver","state":"merged","additions":155,"deletions":51,"merged_at":"2024-07-15T07:42:07Z"}}
+{"edge":"AuthoredBy","from":"pr-1034","to":"farah-gallo"}
+{"type":"PullRequest","id":"pr-1035","data":{"title":"Harden pick verifier","state":"merged","additions":815,"deletions":108,"merged_at":"2023-07-03T05:04:10Z"}}
+{"edge":"AuthoredBy","from":"pr-1035","to":"kofi-weiss"}
+{"edge":"Resolves","from":"pr-1035","to":"planner-sim-187"}
+{"type":"PullRequest","id":"pr-1036","data":{"title":"Handle retries in OTA updater","state":"merged","additions":230,"deletions":2,"merged_at":"2023-07-31T08:58:19Z"}}
+{"edge":"AuthoredBy","from":"pr-1036","to":"bodhi-moreau"}
+{"type":"PullRequest","id":"pr-1037","data":{"title":"Handle retries in OTA updater","state":"merged","additions":772,"deletions":361,"merged_at":"2023-05-16T18:22:00Z"}}
+{"edge":"AuthoredBy","from":"pr-1037","to":"priya-petrov"}
+{"edge":"Resolves","from":"pr-1037","to":"fleet-proto-156"}
+{"type":"PullRequest","id":"pr-1038","data":{"title":"Speed up telemetry pipeline","state":"merged","additions":38,"deletions":274,"merged_at":"2024-05-11T22:07:31Z"}}
+{"edge":"AuthoredBy","from":"pr-1038","to":"amara-ueda"}
+{"edge":"Resolves","from":"pr-1038","to":"vision-models-234"}
+{"type":"PullRequest","id":"pr-1039","data":{"title":"Refactor safety monitor","state":"merged","additions":330,"deletions":33,"merged_at":"2023-02-11T06:12:13Z"}}
+{"edge":"AuthoredBy","from":"pr-1039","to":"ada-eklund"}
+{"edge":"Resolves","from":"pr-1039","to":"web-console-164"}
+{"type":"PullRequest","id":"pr-1040","data":{"title":"Harden charging scheduler","state":"merged","additions":868,"deletions":99,"merged_at":"2025-07-09T11:43:57Z"}}
+{"edge":"AuthoredBy","from":"pr-1040","to":"bodhi-moreau"}
+{"edge":"Resolves","from":"pr-1040","to":"planner-sim-191"}
+{"type":"PullRequest","id":"pr-1041","data":{"title":"Handle retries in SDK auth","state":"closed","additions":109,"deletions":253}}
+{"edge":"AuthoredBy","from":"pr-1041","to":"oren-quist"}
+{"type":"PullRequest","id":"pr-1042","data":{"title":"Handle retries in path planner","state":"merged","additions":868,"deletions":392,"merged_at":"2024-11-21T12:15:23Z"}}
+{"edge":"AuthoredBy","from":"pr-1042","to":"nia-delacroix"}
+{"edge":"Resolves","from":"pr-1042","to":"fleet-proto-145"}
+{"type":"PullRequest","id":"pr-1043","data":{"title":"Fix pick verifier","state":"merged","additions":331,"deletions":362,"merged_at":"2023-04-11T12:15:00Z"}}
+{"edge":"AuthoredBy","from":"pr-1043","to":"oren-quist"}
+{"type":"PullRequest","id":"pr-1044","data":{"title":"Speed up barcode reader","state":"merged","additions":504,"deletions":369,"merged_at":"2023-12-28T20:17:33Z"}}
+{"edge":"AuthoredBy","from":"pr-1044","to":"lena-lindqvist"}
+{"edge":"Resolves","from":"pr-1044","to":"fleet-proto-210"}
+{"type":"PullRequest","id":"pr-1045","data":{"title":"Speed up charging scheduler","state":"closed","additions":530,"deletions":10}}
+{"edge":"AuthoredBy","from":"pr-1045","to":"hana-delacroix"}
+{"type":"PullRequest","id":"pr-1046","data":{"title":"Refactor fleet dashboard","state":"open","additions":408,"deletions":324}}
+{"edge":"AuthoredBy","from":"pr-1046","to":"elif-rahman"}
+{"type":"PullRequest","id":"pr-1047","data":{"title":"Handle retries in charging scheduler","state":"closed","additions":190,"deletions":322}}
+{"edge":"AuthoredBy","from":"pr-1047","to":"viktor-kowal"}
+{"type":"PullRequest","id":"pr-1048","data":{"title":"Simplify zone manager","state":"merged","additions":379,"deletions":151,"merged_at":"2025-07-23T10:26:32Z"}}
+{"edge":"AuthoredBy","from":"pr-1048","to":"elif-rahman"}
+{"edge":"Resolves","from":"pr-1048","to":"planner-sim-187"}
+{"type":"PullRequest","id":"pr-1049","data":{"title":"Harden safety monitor","state":"merged","additions":573,"deletions":278,"merged_at":"2023-10-08T09:10:02Z"}}
+{"edge":"AuthoredBy","from":"pr-1049","to":"ada-petrov"}
+{"edge":"Resolves","from":"pr-1049","to":"edge-agent-235"}
+{"type":"PullRequest","id":"pr-1050","data":{"title":"Fix barcode reader","state":"merged","additions":829,"deletions":21,"merged_at":"2025-02-18T19:02:07Z"}}
+{"edge":"AuthoredBy","from":"pr-1050","to":"chiara-rahman"}
+{"edge":"Resolves","from":"pr-1050","to":"fleet-proto-287"}
+{"type":"PullRequest","id":"pr-1051","data":{"title":"Harden barcode reader","state":"merged","additions":472,"deletions":337,"merged_at":"2024-02-07T21:55:11Z"}}
+{"edge":"AuthoredBy","from":"pr-1051","to":"viktor-kowal"}
+{"edge":"Resolves","from":"pr-1051","to":"vision-models-276"}
+{"type":"PullRequest","id":"pr-1052","data":{"title":"Fix fleet dashboard","state":"merged","additions":600,"deletions":297,"merged_at":"2024-08-29T13:05:03Z"}}
+{"edge":"AuthoredBy","from":"pr-1052","to":"priya-weiss"}
+{"edge":"Resolves","from":"pr-1052","to":"vision-models-256"}
+{"type":"PullRequest","id":"pr-1053","data":{"title":"Speed up zone manager","state":"merged","additions":117,"deletions":353,"merged_at":"2024-12-21T13:03:02Z"}}
+{"edge":"AuthoredBy","from":"pr-1053","to":"bodhi-moreau"}
+{"edge":"Resolves","from":"pr-1053","to":"sdk-python-122"}
+{"type":"PullRequest","id":"pr-1054","data":{"title":"Harden charging scheduler","state":"merged","additions":353,"deletions":167,"merged_at":"2024-06-28T04:03:35Z"}}
+{"edge":"AuthoredBy","from":"pr-1054","to":"yara-delacroix"}
+{"edge":"Resolves","from":"pr-1054","to":"sdk-ts-137"}
+{"type":"PullRequest","id":"pr-1055","data":{"title":"Refactor fleet dashboard","state":"closed","additions":81,"deletions":287}}
+{"edge":"AuthoredBy","from":"pr-1055","to":"ada-brandt"}
+{"type":"PullRequest","id":"pr-1056","data":{"title":"Fix safety monitor","state":"closed","additions":487,"deletions":264}}
+{"edge":"AuthoredBy","from":"pr-1056","to":"viktor-kowal"}
+{"type":"PullRequest","id":"pr-1057","data":{"title":"Simplify OTA updater","state":"open","additions":452,"deletions":326}}
+{"edge":"AuthoredBy","from":"pr-1057","to":"elif-rahman"}
+{"type":"PullRequest","id":"pr-1058","data":{"title":"Simplify SDK auth","state":"merged","additions":207,"deletions":216,"merged_at":"2024-11-08T12:17:28Z"}}
+{"edge":"AuthoredBy","from":"pr-1058","to":"oren-quist"}
+{"edge":"Resolves","from":"pr-1058","to":"fleet-server-179"}
+{"type":"PullRequest","id":"pr-1059","data":{"title":"Simplify SDK auth","state":"merged","additions":433,"deletions":63,"merged_at":"2024-01-03T18:25:57Z"}}
+{"edge":"AuthoredBy","from":"pr-1059","to":"priya-ueda"}
+{"edge":"Resolves","from":"pr-1059","to":"edge-agent-139"}
+{"type":"PullRequest","id":"pr-1060","data":{"title":"Simplify OTA updater","state":"merged","additions":458,"deletions":111,"merged_at":"2024-03-22T12:34:11Z"}}
+{"edge":"AuthoredBy","from":"pr-1060","to":"lena-lindqvist"}
+{"edge":"Resolves","from":"pr-1060","to":"sdk-python-171"}
+{"type":"PullRequest","id":"pr-1061","data":{"title":"Add metrics to barcode reader","state":"merged","additions":771,"deletions":93,"merged_at":"2023-12-10T22:17:17Z"}}
+{"edge":"AuthoredBy","from":"pr-1061","to":"hana-brandt"}
+{"type":"PullRequest","id":"pr-1062","data":{"title":"Speed up fleet dashboard","state":"merged","additions":486,"deletions":288,"merged_at":"2025-09-28T15:29:12Z"}}
+{"edge":"AuthoredBy","from":"pr-1062","to":"viktor-castell"}
+{"edge":"Resolves","from":"pr-1062","to":"vision-models-189"}
+{"type":"PullRequest","id":"pr-1063","data":{"title":"Handle retries in map editor","state":"open","additions":176,"deletions":26}}
+{"edge":"AuthoredBy","from":"pr-1063","to":"farah-gallo"}
+{"type":"PullRequest","id":"pr-1064","data":{"title":"Add metrics to fleet dashboard","state":"closed","additions":748,"deletions":340}}
+{"edge":"AuthoredBy","from":"pr-1064","to":"nia-delacroix"}
+{"type":"PullRequest","id":"pr-1065","data":{"title":"Harden safety monitor","state":"merged","additions":37,"deletions":63,"merged_at":"2023-11-14T22:42:44Z"}}
+{"edge":"AuthoredBy","from":"pr-1065","to":"hana-brandt"}
+{"edge":"Resolves","from":"pr-1065","to":"web-console-196"}
+{"type":"PullRequest","id":"pr-1066","data":{"title":"Refactor pick verifier","state":"merged","additions":307,"deletions":371,"merged_at":"2025-02-07T18:29:58Z"}}
+{"edge":"AuthoredBy","from":"pr-1066","to":"yara-delacroix"}
+{"edge":"Resolves","from":"pr-1066","to":"planner-sim-239"}
+{"type":"PullRequest","id":"pr-1067","data":{"title":"Harden charging scheduler","state":"open","additions":327,"deletions":294}}
+{"edge":"AuthoredBy","from":"pr-1067","to":"quinn-zeller"}
+{"type":"PullRequest","id":"pr-1068","data":{"title":"Simplify OTA updater","state":"merged","additions":208,"deletions":358,"merged_at":"2025-02-23T10:04:55Z"}}
+{"edge":"AuthoredBy","from":"pr-1068","to":"mateo-rahman"}
+{"edge":"Resolves","from":"pr-1068","to":"web-console-313"}
+{"type":"PullRequest","id":"pr-1069","data":{"title":"Handle retries in charging scheduler","state":"merged","additions":634,"deletions":83,"merged_at":"2024-09-23T04:32:14Z"}}
+{"edge":"AuthoredBy","from":"pr-1069","to":"lena-abara"}
+{"type":"PullRequest","id":"pr-1070","data":{"title":"Fix lidar driver","state":"merged","additions":254,"deletions":223,"merged_at":"2023-09-23T19:13:10Z"}}
+{"edge":"AuthoredBy","from":"pr-1070","to":"priya-weiss"}
+{"edge":"Resolves","from":"pr-1070","to":"planner-core-261"}
+{"type":"PullRequest","id":"pr-1071","data":{"title":"Harden OTA updater","state":"merged","additions":542,"deletions":130,"merged_at":"2023-03-14T01:43:21Z"}}
+{"edge":"AuthoredBy","from":"pr-1071","to":"ada-moreau"}
+{"type":"PullRequest","id":"pr-1072","data":{"title":"Fix charging scheduler","state":"merged","additions":576,"deletions":244,"merged_at":"2024-04-19T05:39:19Z"}}
+{"edge":"AuthoredBy","from":"pr-1072","to":"kofi-haas"}
+{"type":"PullRequest","id":"pr-1073","data":{"title":"Handle retries in charging scheduler","state":"closed","additions":262,"deletions":54}}
+{"edge":"AuthoredBy","from":"pr-1073","to":"lena-abara"}
+{"type":"PullRequest","id":"pr-1074","data":{"title":"Fix lidar driver","state":"closed","additions":801,"deletions":351}}
+{"edge":"AuthoredBy","from":"pr-1074","to":"viktor-kowal"}
+{"type":"PullRequest","id":"pr-1075","data":{"title":"Simplify pick verifier","state":"merged","additions":631,"deletions":315,"merged_at":"2023-05-11T10:36:57Z"}}
+{"edge":"AuthoredBy","from":"pr-1075","to":"priya-petrov"}
+{"type":"PullRequest","id":"pr-1076","data":{"title":"Simplify fleet dashboard","state":"merged","additions":829,"deletions":106,"merged_at":"2024-02-16T03:52:40Z"}}
+{"edge":"AuthoredBy","from":"pr-1076","to":"hana-zeller"}
+{"edge":"Resolves","from":"pr-1076","to":"planner-sim-191"}
+{"type":"PullRequest","id":"pr-1077","data":{"title":"Harden fleet dashboard","state":"closed","additions":755,"deletions":338}}
+{"edge":"AuthoredBy","from":"pr-1077","to":"lena-lindqvist"}
+{"type":"PullRequest","id":"pr-1078","data":{"title":"Fix OTA updater","state":"merged","additions":76,"deletions":37,"merged_at":"2024-03-04T13:13:18Z"}}
+{"edge":"AuthoredBy","from":"pr-1078","to":"priya-weiss"}
+{"type":"PullRequest","id":"pr-1079","data":{"title":"Speed up path planner","state":"merged","additions":767,"deletions":309,"merged_at":"2023-05-30T01:10:45Z"}}
+{"edge":"AuthoredBy","from":"pr-1079","to":"uma-petrov"}
+{"type":"PullRequest","id":"pr-1080","data":{"title":"Speed up map editor","state":"merged","additions":621,"deletions":206,"merged_at":"2025-06-29T23:38:42Z"}}
+{"edge":"AuthoredBy","from":"pr-1080","to":"ada-petrov"}
+{"edge":"Resolves","from":"pr-1080","to":"fleet-server-163"}
+{"type":"PullRequest","id":"pr-1081","data":{"title":"Fix map editor","state":"merged","additions":266,"deletions":122,"merged_at":"2023-11-05T23:10:08Z"}}
+{"edge":"AuthoredBy","from":"pr-1081","to":"yara-eklund"}
+{"edge":"Resolves","from":"pr-1081","to":"fleet-proto-244"}
+{"type":"PullRequest","id":"pr-1082","data":{"title":"Harden lidar driver","state":"merged","additions":434,"deletions":119,"merged_at":"2023-04-10T00:23:43Z"}}
+{"edge":"AuthoredBy","from":"pr-1082","to":"lena-lindqvist"}
+{"type":"PullRequest","id":"pr-1083","data":{"title":"Simplify pick verifier","state":"merged","additions":285,"deletions":243,"merged_at":"2024-08-25T09:38:58Z"}}
+{"edge":"AuthoredBy","from":"pr-1083","to":"hana-delacroix"}
+{"type":"PullRequest","id":"pr-1084","data":{"title":"Harden path planner","state":"merged","additions":204,"deletions":193,"merged_at":"2024-09-07T23:13:41Z"}}
+{"edge":"AuthoredBy","from":"pr-1084","to":"chiara-rahman"}
+{"edge":"Resolves","from":"pr-1084","to":"vision-models-189"}
+{"type":"PullRequest","id":"pr-1085","data":{"title":"Refactor telemetry pipeline","state":"merged","additions":613,"deletions":276,"merged_at":"2024-03-23T11:19:47Z"}}
+{"edge":"AuthoredBy","from":"pr-1085","to":"farah-gallo"}
+{"edge":"Resolves","from":"pr-1085","to":"sdk-python-245"}
+{"type":"PullRequest","id":"pr-1086","data":{"title":"Add metrics to zone manager","state":"open","additions":233,"deletions":26}}
+{"edge":"AuthoredBy","from":"pr-1086","to":"lena-abara"}
+{"type":"PullRequest","id":"pr-1087","data":{"title":"Add metrics to zone manager","state":"merged","additions":738,"deletions":252,"merged_at":"2024-12-24T08:05:51Z"}}
+{"edge":"AuthoredBy","from":"pr-1087","to":"ada-eklund"}
+{"edge":"Resolves","from":"pr-1087","to":"sdk-python-168"}
+{"type":"PullRequest","id":"pr-1088","data":{"title":"Fix fleet dashboard","state":"open","additions":670,"deletions":201}}
+{"edge":"AuthoredBy","from":"pr-1088","to":"priya-ueda"}
+{"type":"PullRequest","id":"pr-1089","data":{"title":"Speed up telemetry pipeline","state":"closed","additions":428,"deletions":397}}
+{"edge":"AuthoredBy","from":"pr-1089","to":"wren-nakamura"}
+{"type":"PullRequest","id":"pr-1090","data":{"title":"Fix zone manager","state":"closed","additions":539,"deletions":196}}
+{"edge":"AuthoredBy","from":"pr-1090","to":"amara-ueda"}
+{"type":"PullRequest","id":"pr-1091","data":{"title":"Add metrics to map editor","state":"closed","additions":627,"deletions":337}}
+{"edge":"AuthoredBy","from":"pr-1091","to":"farah-gallo"}
+{"type":"PullRequest","id":"pr-1092","data":{"title":"Simplify OTA updater","state":"merged","additions":730,"deletions":147,"merged_at":"2024-07-28T16:16:33Z"}}
+{"edge":"AuthoredBy","from":"pr-1092","to":"kofi-haas"}
+{"edge":"Resolves","from":"pr-1092","to":"sdk-python-101"}
+{"type":"PullRequest","id":"pr-1093","data":{"title":"Speed up path planner","state":"merged","additions":243,"deletions":150,"merged_at":"2023-12-18T10:55:41Z"}}
+{"edge":"AuthoredBy","from":"pr-1093","to":"kofi-haas"}
+{"edge":"Resolves","from":"pr-1093","to":"sdk-ts-173"}
+{"type":"PullRequest","id":"pr-1094","data":{"title":"Add metrics to telemetry pipeline","state":"closed","additions":493,"deletions":246}}
+{"edge":"AuthoredBy","from":"pr-1094","to":"priya-ueda"}
+{"type":"PullRequest","id":"pr-1095","data":{"title":"Simplify path planner","state":"merged","additions":25,"deletions":294,"merged_at":"2023-07-01T15:01:18Z"}}
+{"edge":"AuthoredBy","from":"pr-1095","to":"oren-quist"}
+{"edge":"Resolves","from":"pr-1095","to":"fleet-server-119"}
+{"type":"PullRequest","id":"pr-1096","data":{"title":"Handle retries in telemetry pipeline","state":"closed","additions":564,"deletions":39}}
+{"edge":"AuthoredBy","from":"pr-1096","to":"amara-ueda"}
+{"type":"PullRequest","id":"pr-1097","data":{"title":"Add metrics to charging scheduler","state":"open","additions":750,"deletions":197}}
+{"edge":"AuthoredBy","from":"pr-1097","to":"lena-abara"}
+{"type":"PullRequest","id":"pr-1098","data":{"title":"Fix SDK auth","state":"closed","additions":561,"deletions":9}}
+{"edge":"AuthoredBy","from":"pr-1098","to":"hana-delacroix"}
+{"type":"PullRequest","id":"pr-1099","data":{"title":"Refactor zone manager","state":"merged","additions":510,"deletions":64,"merged_at":"2023-10-05T04:34:23Z"}}
+{"edge":"AuthoredBy","from":"pr-1099","to":"farah-gallo"}
+{"edge":"Resolves","from":"pr-1099","to":"web-console-230"}
+{"type":"PullRequest","id":"pr-1100","data":{"title":"Handle retries in charging scheduler","state":"merged","additions":507,"deletions":305,"merged_at":"2025-01-07T00:46:19Z"}}
+{"edge":"AuthoredBy","from":"pr-1100","to":"amara-ueda"}
+{"type":"PullRequest","id":"pr-1101","data":{"title":"Fix zone manager","state":"open","additions":464,"deletions":354}}
+{"edge":"AuthoredBy","from":"pr-1101","to":"oren-quist"}
+{"type":"PullRequest","id":"pr-1102","data":{"title":"Speed up OTA updater","state":"merged","additions":370,"deletions":188,"merged_at":"2025-05-07T18:30:52Z"}}
+{"edge":"AuthoredBy","from":"pr-1102","to":"ada-abara"}
+{"edge":"Resolves","from":"pr-1102","to":"fleet-server-154"}
+{"type":"PullRequest","id":"pr-1103","data":{"title":"Refactor map editor","state":"open","additions":279,"deletions":129}}
+{"edge":"AuthoredBy","from":"pr-1103","to":"ada-petrov"}
+{"type":"PullRequest","id":"pr-1104","data":{"title":"Fix path planner","state":"closed","additions":381,"deletions":71}}
+{"edge":"AuthoredBy","from":"pr-1104","to":"lena-abara"}
+{"type":"PullRequest","id":"pr-1105","data":{"title":"Add metrics to OTA updater","state":"open","additions":138,"deletions":182}}
+{"edge":"AuthoredBy","from":"pr-1105","to":"kofi-haas"}
+{"type":"PullRequest","id":"pr-1106","data":{"title":"Add metrics to zone manager","state":"merged","additions":18,"deletions":345,"merged_at":"2024-11-07T07:35:24Z"}}
+{"edge":"AuthoredBy","from":"pr-1106","to":"quinn-zeller"}
+{"edge":"Resolves","from":"pr-1106","to":"edge-agent-290"}
+{"type":"PullRequest","id":"pr-1107","data":{"title":"Fix safety monitor","state":"closed","additions":414,"deletions":13}}
+{"edge":"AuthoredBy","from":"pr-1107","to":"wren-nakamura"}
+{"type":"PullRequest","id":"pr-1108","data":{"title":"Simplify barcode reader","state":"merged","additions":328,"deletions":249,"merged_at":"2024-11-02T15:22:22Z"}}
+{"edge":"AuthoredBy","from":"pr-1108","to":"mateo-rahman"}
+{"type":"PullRequest","id":"pr-1109","data":{"title":"Simplify zone manager","state":"open","additions":274,"deletions":59}}
+{"edge":"AuthoredBy","from":"pr-1109","to":"chiara-rahman"}
+{"type":"PullRequest","id":"pr-1110","data":{"title":"Handle retries in fleet dashboard","state":"open","additions":806,"deletions":115}}
+{"edge":"AuthoredBy","from":"pr-1110","to":"yara-delacroix"}
+{"type":"PullRequest","id":"pr-1111","data":{"title":"Speed up barcode reader","state":"closed","additions":549,"deletions":206}}
+{"edge":"AuthoredBy","from":"pr-1111","to":"viktor-castell"}
+{"type":"PullRequest","id":"pr-1112","data":{"title":"Speed up charging scheduler","state":"merged","additions":888,"deletions":183,"merged_at":"2025-01-15T03:37:00Z"}}
+{"edge":"AuthoredBy","from":"pr-1112","to":"amara-ueda"}
+{"edge":"Resolves","from":"pr-1112","to":"sdk-python-233"}
+{"type":"PullRequest","id":"pr-1113","data":{"title":"Speed up lidar driver","state":"merged","additions":461,"deletions":149,"merged_at":"2023-03-20T02:52:41Z"}}
+{"edge":"AuthoredBy","from":"pr-1113","to":"mateo-rahman"}
+{"type":"PullRequest","id":"pr-1114","data":{"title":"Harden OTA updater","state":"merged","additions":591,"deletions":298,"merged_at":"2024-10-09T02:46:58Z"}}
+{"edge":"AuthoredBy","from":"pr-1114","to":"kofi-haas"}
+{"edge":"Resolves","from":"pr-1114","to":"sdk-ts-299"}
+{"type":"PullRequest","id":"pr-1115","data":{"title":"Fix barcode reader","state":"merged","additions":558,"deletions":244,"merged_at":"2023-08-17T10:00:32Z"}}
+{"edge":"AuthoredBy","from":"pr-1115","to":"wren-nakamura"}
+{"type":"PullRequest","id":"pr-1116","data":{"title":"Add metrics to path planner","state":"closed","additions":21,"deletions":38}}
+{"edge":"AuthoredBy","from":"pr-1116","to":"priya-weiss"}
+{"type":"PullRequest","id":"pr-1117","data":{"title":"Harden charging scheduler","state":"closed","additions":832,"deletions":372}}
+{"edge":"AuthoredBy","from":"pr-1117","to":"wren-nakamura"}
+{"type":"PullRequest","id":"pr-1118","data":{"title":"Simplify OTA updater","state":"closed","additions":741,"deletions":155}}
+{"edge":"AuthoredBy","from":"pr-1118","to":"kofi-weiss"}
+{"type":"PullRequest","id":"pr-1119","data":{"title":"Handle retries in telemetry pipeline","state":"merged","additions":187,"deletions":254,"merged_at":"2023-05-31T17:40:23Z"}}
+{"edge":"AuthoredBy","from":"pr-1119","to":"ada-moreau"}
+{"edge":"Resolves","from":"pr-1119","to":"web-console-306"}
+{"type":"PullRequest","id":"pr-1120","data":{"title":"Handle retries in OTA updater","state":"closed","additions":535,"deletions":133}}
+{"edge":"AuthoredBy","from":"pr-1120","to":"lena-lindqvist"}
+{"type":"PullRequest","id":"pr-1121","data":{"title":"Simplify lidar driver","state":"merged","additions":699,"deletions":248,"merged_at":"2024-11-01T02:49:13Z"}}
+{"edge":"AuthoredBy","from":"pr-1121","to":"lena-abara"}
+{"edge":"Resolves","from":"pr-1121","to":"edge-agent-118"}
+{"type":"PullRequest","id":"pr-1122","data":{"title":"Harden charging scheduler","state":"closed","additions":627,"deletions":164}}
+{"edge":"AuthoredBy","from":"pr-1122","to":"bodhi-moreau"}
+{"type":"PullRequest","id":"pr-1123","data":{"title":"Handle retries in map editor","state":"merged","additions":611,"deletions":268,"merged_at":"2024-07-15T07:07:30Z"}}
+{"edge":"AuthoredBy","from":"pr-1123","to":"nia-delacroix"}
+{"edge":"Resolves","from":"pr-1123","to":"web-console-220"}
+{"type":"PullRequest","id":"pr-1124","data":{"title":"Fix zone manager","state":"merged","additions":2,"deletions":344,"merged_at":"2025-01-05T21:46:34Z"}}
+{"edge":"AuthoredBy","from":"pr-1124","to":"priya-petrov"}
+{"edge":"Resolves","from":"pr-1124","to":"web-console-254"}
+{"type":"PullRequest","id":"pr-1125","data":{"title":"Fix OTA updater","state":"merged","additions":104,"deletions":22,"merged_at":"2024-12-11T22:47:29Z"}}
+{"edge":"AuthoredBy","from":"pr-1125","to":"uma-petrov"}
+{"edge":"Resolves","from":"pr-1125","to":"vision-models-201"}
+{"type":"PullRequest","id":"pr-1126","data":{"title":"Harden barcode reader","state":"closed","additions":798,"deletions":246}}
+{"edge":"AuthoredBy","from":"pr-1126","to":"oren-quist"}
+{"type":"PullRequest","id":"pr-1127","data":{"title":"Add metrics to lidar driver","state":"merged","additions":340,"deletions":320,"merged_at":"2025-04-14T18:00:28Z"}}
+{"edge":"AuthoredBy","from":"pr-1127","to":"mateo-rahman"}
+{"edge":"Resolves","from":"pr-1127","to":"vision-models-108"}
+{"type":"PullRequest","id":"pr-1128","data":{"title":"Speed up SDK auth","state":"merged","additions":816,"deletions":228,"merged_at":"2024-08-14T10:28:29Z"}}
+{"edge":"AuthoredBy","from":"pr-1128","to":"priya-ueda"}
+{"edge":"Resolves","from":"pr-1128","to":"edge-agent-241"}
+{"type":"PullRequest","id":"pr-1129","data":{"title":"Speed up pick verifier","state":"open","additions":889,"deletions":146}}
+{"edge":"AuthoredBy","from":"pr-1129","to":"mateo-rahman"}
+{"type":"PullRequest","id":"pr-1130","data":{"title":"Fix zone manager","state":"merged","additions":92,"deletions":242,"merged_at":"2024-11-01T10:27:06Z"}}
+{"edge":"AuthoredBy","from":"pr-1130","to":"elif-rahman"}
+{"edge":"Resolves","from":"pr-1130","to":"edge-agent-129"}
+{"type":"PullRequest","id":"pr-1131","data":{"title":"Refactor fleet dashboard","state":"merged","additions":352,"deletions":87,"merged_at":"2023-11-16T04:54:12Z"}}
+{"edge":"AuthoredBy","from":"pr-1131","to":"kofi-haas"}
+{"edge":"Resolves","from":"pr-1131","to":"vision-models-276"}
+{"type":"PullRequest","id":"pr-1132","data":{"title":"Simplify OTA updater","state":"merged","additions":816,"deletions":322,"merged_at":"2023-02-01T15:05:24Z"}}
+{"edge":"AuthoredBy","from":"pr-1132","to":"uma-petrov"}
+{"edge":"Resolves","from":"pr-1132","to":"web-console-164"}
+{"type":"PullRequest","id":"pr-1133","data":{"title":"Handle retries in zone manager","state":"merged","additions":813,"deletions":249,"merged_at":"2024-07-23T23:22:59Z"}}
+{"edge":"AuthoredBy","from":"pr-1133","to":"priya-weiss"}
+{"edge":"Resolves","from":"pr-1133","to":"edge-agent-195"}
+{"type":"PullRequest","id":"pr-1134","data":{"title":"Harden charging scheduler","state":"merged","additions":285,"deletions":207,"merged_at":"2023-04-27T22:39:30Z"}}
+{"edge":"AuthoredBy","from":"pr-1134","to":"viktor-castell"}
+{"edge":"Resolves","from":"pr-1134","to":"web-console-251"}
+{"type":"PullRequest","id":"pr-1135","data":{"title":"Handle retries in path planner","state":"merged","additions":48,"deletions":189,"merged_at":"2025-01-22T10:54:51Z"}}
+{"edge":"AuthoredBy","from":"pr-1135","to":"farah-gallo"}
+{"edge":"Resolves","from":"pr-1135","to":"web-console-164"}
+{"type":"PullRequest","id":"pr-1136","data":{"title":"Fix charging scheduler","state":"closed","additions":17,"deletions":143}}
+{"edge":"AuthoredBy","from":"pr-1136","to":"viktor-kowal"}
+{"type":"PullRequest","id":"pr-1137","data":{"title":"Add metrics to map editor","state":"closed","additions":207,"deletions":179}}
+{"edge":"AuthoredBy","from":"pr-1137","to":"elif-rahman"}
+{"type":"PullRequest","id":"pr-1138","data":{"title":"Harden SDK auth","state":"merged","additions":152,"deletions":386,"merged_at":"2023-03-03T00:10:09Z"}}
+{"edge":"AuthoredBy","from":"pr-1138","to":"priya-ueda"}
+{"edge":"Resolves","from":"pr-1138","to":"sdk-python-312"}
+{"type":"PullRequest","id":"pr-1139","data":{"title":"Speed up map editor","state":"open","additions":443,"deletions":183}}
+{"edge":"AuthoredBy","from":"pr-1139","to":"bodhi-rahman"}
+{"type":"PullRequest","id":"pr-1140","data":{"title":"Harden SDK auth","state":"open","additions":455,"deletions":208}}
+{"edge":"AuthoredBy","from":"pr-1140","to":"quinn-zeller"}
+{"type":"PullRequest","id":"pr-1141","data":{"title":"Simplify zone manager","state":"merged","additions":427,"deletions":320,"merged_at":"2023-11-23T00:14:26Z"}}
+{"edge":"AuthoredBy","from":"pr-1141","to":"chiara-rahman"}
+{"edge":"Resolves","from":"pr-1141","to":"sdk-python-245"}
+{"type":"PullRequest","id":"pr-1142","data":{"title":"Simplify zone manager","state":"merged","additions":455,"deletions":28,"merged_at":"2025-08-11T05:55:05Z"}}
+{"edge":"AuthoredBy","from":"pr-1142","to":"viktor-castell"}
+{"edge":"Resolves","from":"pr-1142","to":"web-console-152"}
+{"type":"PullRequest","id":"pr-1143","data":{"title":"Fix zone manager","state":"open","additions":568,"deletions":94}}
+{"edge":"AuthoredBy","from":"pr-1143","to":"priya-ueda"}
+{"type":"PullRequest","id":"pr-1144","data":{"title":"Add metrics to safety monitor","state":"closed","additions":623,"deletions":21}}
+{"edge":"AuthoredBy","from":"pr-1144","to":"yara-delacroix"}
+{"type":"PullRequest","id":"pr-1145","data":{"title":"Handle retries in fleet dashboard","state":"open","additions":692,"deletions":45}}
+{"edge":"AuthoredBy","from":"pr-1145","to":"priya-petrov"}
+{"type":"PullRequest","id":"pr-1146","data":{"title":"Harden path planner","state":"open","additions":405,"deletions":220}}
+{"edge":"AuthoredBy","from":"pr-1146","to":"yara-eklund"}
+{"type":"PullRequest","id":"pr-1147","data":{"title":"Handle retries in SDK auth","state":"closed","additions":602,"deletions":216}}
+{"edge":"AuthoredBy","from":"pr-1147","to":"ada-moreau"}
+{"type":"PullRequest","id":"pr-1148","data":{"title":"Simplify map editor","state":"merged","additions":2,"deletions":113,"merged_at":"2023-04-18T18:15:37Z"}}
+{"edge":"AuthoredBy","from":"pr-1148","to":"bodhi-moreau"}
+{"edge":"Resolves","from":"pr-1148","to":"planner-core-197"}
+{"type":"PullRequest","id":"pr-1149","data":{"title":"Add metrics to charging scheduler","state":"merged","additions":835,"deletions":253,"merged_at":"2023-09-01T05:28:12Z"}}
+{"edge":"AuthoredBy","from":"pr-1149","to":"ada-abara"}
+{"edge":"Resolves","from":"pr-1149","to":"vision-models-217"}
+{"type":"PullRequest","id":"pr-1150","data":{"title":"Fix path planner","state":"closed","additions":337,"deletions":271}}
+{"edge":"AuthoredBy","from":"pr-1150","to":"yara-delacroix"}
