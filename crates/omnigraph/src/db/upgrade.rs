@@ -2,7 +2,6 @@
 //! this binary serves. This binary holds no conversion route, so the command
 //! reads main's `__manifest` stamp and never writes.
 
-use std::collections::BTreeSet;
 
 use serde::Serialize;
 
@@ -52,18 +51,6 @@ pub struct UpgradeRecovery {
     pub action: String,
 }
 
-#[derive(Debug, Default, Serialize)]
-pub struct UpgradeWork {
-    pub metadata_rows: u64,
-    pub retained_snapshots: u64,
-    pub payload_bytes_copied: u64,
-    pub payload_bytes_rewritten: u64,
-    pub validation_bytes: Option<u64>,
-    pub deferred_checks: BTreeSet<String>,
-    pub external_blob_exclusions: BTreeSet<String>,
-    pub historical_blob_identity_limits: BTreeSet<String>,
-}
-
 #[derive(Debug, Serialize)]
 pub struct UpgradeReport {
     pub mode: UpgradeMode,
@@ -78,7 +65,6 @@ pub struct UpgradeReport {
     pub findings: Vec<UpgradeFinding>,
     pub last_durable_completed_boundary: Option<String>,
     pub recovery: Option<UpgradeRecovery>,
-    pub work: UpgradeWork,
 }
 
 impl UpgradeReport {
@@ -132,7 +118,6 @@ pub async fn upgrade_storage_as(
         findings: Vec::new(),
         last_durable_completed_boundary: None,
         recovery: None,
-        work: UpgradeWork::default(),
     };
     if let Err(error) = inspect(&root, &mut report).await {
         report.finding("preflight_failed", error.to_string());

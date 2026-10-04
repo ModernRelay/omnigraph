@@ -36,7 +36,7 @@ pub(crate) use schema_state::SchemaContractIdentity;
 pub use snapshot::{Snapshot, SnapshotDataset, SnapshotScanner};
 pub use upgrade::{
     UpgradeFinding, UpgradeMode, UpgradeOptions, UpgradeOutcome, UpgradeRecovery, UpgradeReport,
-    UpgradeWork, upgrade_storage, upgrade_storage_as,
+    upgrade_storage, upgrade_storage_as,
 };
 
 use crate::error::{OmniError, Result};
