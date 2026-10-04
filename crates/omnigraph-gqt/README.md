@@ -12,6 +12,24 @@ selects an engine.
 The format contract and future extensions live in
 [RFC 0045](../../docs/rfcs/0045-gq-logic-tests.md).
 
+## Slow cases
+
+A case too slow for the complete corpus lives under `cases_slow/`, beside
+`cases/`, with the same subdirectories. The author decides: nothing measures a
+case and moves it. Put a case there when it needs seconds of engine work on
+its own, because the complete corpus runs four cases at once on the CI runner
+and each has ten seconds of wall time. `cargo test` never runs `cases_slow/`;
+the `GQT slow nightly` workflow runs it on main once a night, one case at a
+time, and a case there may declare `timeout_ms` above 10000. Run it locally
+with the binary:
+
+```bash
+cargo run --bin omnigraph-gqt -- cases_slow
+```
+
+A slow case is not a pull request's regression test: the fix regression gate
+counts only cases under `cases/`.
+
 ## Explicit execution
 
 Every case starts with its existing issue header, followed by required runner,
