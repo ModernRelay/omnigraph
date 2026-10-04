@@ -47,12 +47,22 @@ table ref, version and pin: the target's registration takes the source's
 `staged_version` in the same dataset, with no fenced insert, keyed update or
 payload copy, and external blob descriptors stay external. Numeric table
 versions are not compared across refs: the publication's manifest version
-orders the registration within the graph branch (RFC 0062).
+orders the registration within the graph branch (RFC 0062). Main is the
+exception twice: after an empty source delta it keeps its own registration
+(see Publication and recovery), and for a source table on a pre-v11 fork it
+applies the delta at a new version of its own lineage.
 
 The source's registration metadata stays with an adopted pointer. A later
 target write stages detached on that same dataset from the adopted pin; no
 table fork is created. Pointer adoption still computes any required
-validation delta and runs the shared constraint evaluator.
+validation delta and runs the shared constraint evaluator, except for a
+`FastForward` whose candidates are all proven pure inserts into node types
+with no `@unique`, `@range`, `@check` or enum property
+(`proven_fast_forward_needs_no_validation`). For that delta the evaluator reads
+nothing from the target; it would only check that no two new rows share a key,
+which the source's certified exact-`id` inserts already rule out. The skip
+follows the outcome, so it also bypasses the 32 MiB validation budget: such a
+`FastForward` can publish a delta larger than a `Merged` merge accepts.
 
 ## Proven insertion route
 
@@ -161,7 +171,10 @@ chunks publish sequentially inside the one recovery envelope, and all routes
 defer index construction to reconciliation.
 
 Cost tests cap common fast-forward manifest opens/scans at three and diverged
-merges at four, five for a non-bound target. Every publish rewrites the live
+merges at four, five for a non-bound target. A `FastForward` whose target head
+is not the merge base, such as a second merge from the same source, opens the
+base like a diverged merge and compares the two states in memory. Every
+publish rewrites the live
 `__manifest` rows into new files, normally one fragment (Lance splits a write
 at 1,048,576 rows per file), so a scan no longer pays per-fragment and
 per-deletion-file requests. Pages within a file are still read separately; the
@@ -280,8 +293,16 @@ the CAS the merge is complete; nothing follows the publication.
 The engine returns `MergeResult { outcome, commit }`. `MergeOutcome` is one of:
 
 - `AlreadyUpToDate` — source adds no target-visible change;
-- `FastForward` — the target adopts source state without a divergent
-  three-way result;
+- `FastForward` — the target's state equals the merge base's: equal
+  `schema_contract` and `same_manifest_state` for every table
+  (`same_graph_state`). A target head that is the base needs no comparison
+  (`head_is_base`). Every publishing merge, a fast forward included, writes its
+  own commit, so after a fast forward the target head is no longer the base of
+  the next merge from the same source, and the state comparison decides it.
+  The comparison is by registration, so it can answer `Merged` when an earlier
+  fast forward left main on its own registration for a table: after an empty
+  source delta (see Publication and recovery), or for a source table on a
+  pre-v11 fork, whose delta main applies at a new version of its own lineage;
 - `Merged` — a productive three-way merge publishes a new graph commit.
 
 Both publishing outcomes carry their own `GraphCommit`; `AlreadyUpToDate`
