@@ -90,7 +90,7 @@ async fn warm_stamp_read_costs_one_version_probe() {
         commit_many(&db, 5).await;
 
         let (stamp, io) = measure(db.internal_schema_version_of(ReadTarget::branch("main"))).await;
-        assert_eq!(stamp.unwrap(), 13);
+        assert_eq!(stamp.unwrap(), 14);
         assert_eq!(io.version_probes, 1, "{io:?}");
         assert_eq!(io.manifest_reads, 0, "{io:?}");
         assert_eq!(io.internal_open_count, 0, "{io:?}");
@@ -102,7 +102,7 @@ async fn warm_stamp_read_costs_one_version_probe() {
         })
         .await;
         let (version, stamp) = pair.unwrap();
-        assert_eq!(stamp, 13);
+        assert_eq!(stamp, 14);
         assert_eq!(
             version,
             db.snapshot_of(ReadTarget::branch("main"))

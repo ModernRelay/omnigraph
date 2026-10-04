@@ -74,6 +74,10 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 `--as` for actor attribution. Direct maintenance does not load server policy;
 see the [rebuild procedure](../operations/maintenance.md#rebuild-full-text-indexes).
 
+`snapshot` reports `internal_schema_version`, `graph_manifest_version`, and the
+datasets from one captured graph version, so the storage format it prints is
+the format of the tables listed beside it.
+
 ## Query inputs and output
 
 For ad-hoc source, pass `--query <FILE>` or `-e/--query-string <GQ>`; with

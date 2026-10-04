@@ -230,6 +230,9 @@ keep their existing routes and do not expose MCP.
 `/query` also serves `branch list`, `show`, and [explain](../queries/explain.md).
 `/mutate` serves `branch create`, `branch delete`, and `branch merge`.
 See [Branching](../branching/index.md).
+`/snapshot` returns `internal_schema_version`, `graph_manifest_version`, and
+the datasets from one captured graph version, so the storage format describes
+the tables listed beside it.
 Each of `/query`, `/mutate`, `/mutate/if-graph-commit` and `/branches/merge`
 takes an optional `settings` field, and the two GET change routes a `set=`
 parameter; see [Session settings](../queries/index.md#session-settings).
