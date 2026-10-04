@@ -1,0 +1,126 @@
+# issue: none
+# notes: Under set history_release_bytes = 2048; main diverges, then a merge of src into main fails at publish.pre_merge
+# notes: after putting src's three commits under __history; src's own release then puts its block beside those copies and
+# notes: is accepted, the merge re-runs and lands, and after a restart branch delete src accepts the copies it finds.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":0}}
+{"type":"Person","data":{"name":"bob","age":0}}
+
+--- mutate
+set history_release_bytes = 2048;
+
+--- expect ok
+
+--- mutate
+branch create src
+
+--- expect ok
+
+--- mutate
+query diverge_main() {
+    update Person set { age: 9 } where name = "bob"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- loop $i 1 4
+--- mutate branch: src
+query bump_alice($n: I32) {
+    update Person set { age: $n } where name = "alice"
+}
+--- params
+{"n": ${i}}
+--- expect affected: nodes=1 edges=0
+--- endloop
+
+--- seam
+at: publish.pre_merge
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+branch merge src into main
+
+--- expect error: injected failpoint triggered: publish.pre_merge
+
+--- query branch: main
+query rows_after_interrupted_merge() { match { $p: Person } return { $p.name, $p.age } }
+
+--- expect unordered
+{"p.name":"alice","p.age":0}
+{"p.name":"bob","p.age":9}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- concurrent
+w1 on src: query source_releases_its_block() { insert Person { name: "carol", age: 1 } }
+r1 on src: query all() { match { $p: Person } return { $p.name } }
+order: w1 park put __history/blocks/, r1 start, r1, w1 put __history/blocks/, w1
+--- expect
+w1: ok
+r1: ok
+
+--- mutate
+branch merge src into main
+
+--- expect outcome: merged
+
+--- query branch: main
+query rows_after_merge() { match { $p: Person } return { $p.name, $p.age } }
+
+--- expect unordered
+{"p.name":"alice","p.age":3}
+{"p.name":"bob","p.age":9}
+{"p.name":"carol","p.age":1}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- restart
+
+--- query branch: main
+query rows_after_reopen() { match { $p: Person } return { $p.name, $p.age } }
+
+--- expect unordered
+{"p.name":"alice","p.age":3}
+{"p.name":"bob","p.age":9}
+{"p.name":"carol","p.age":1}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- mutate
+branch delete src
+
+--- expect ok
+
+--- query branch: main
+query rows_after_delete() { match { $p: Person } return { $p.name, $p.age } }
+
+--- expect unordered
+{"p.name":"alice","p.age":3}
+{"p.name":"bob","p.age":9}
+{"p.name":"carol","p.age":1}
+
+--- expect shape
+p.name: String
+p.age: I32
