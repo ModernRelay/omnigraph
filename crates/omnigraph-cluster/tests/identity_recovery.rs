@@ -16,7 +16,10 @@ use omnigraph_cluster::{
     force_unlock_storage_root, plan_config_dir_authorized, reconcile_deployment,
     upgrade_deployment_ledger,
 };
-use omnigraph_core::graph_commit_id::intent_nonce;
+
+fn intent_nonce(commit_id: &str) -> Option<&str> {
+    commit_id.rsplit('.').next()
+}
 
 const SCHEMA: &str = "node Person { name: String @key }";
 
