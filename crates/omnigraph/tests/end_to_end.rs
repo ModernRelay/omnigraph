@@ -5,7 +5,6 @@ use base64::Engine as _;
 use futures::TryStreamExt;
 
 use omnigraph::db::{Omnigraph, ReadTarget};
-#[cfg(feature = "failpoints")]
 use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
