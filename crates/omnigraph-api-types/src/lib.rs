@@ -283,8 +283,8 @@ pub struct SnapshotOutput {
     pub graph_branch: String,
     pub graph_manifest_version: u64,
     /// The on-disk internal-schema (storage-format) version this graph's branch
-    /// is stamped at. Branches of one graph can differ (v11 beside v12) while a
-    /// v11 graph converts branch by branch on publish.
+    /// is stamped at. This binary serves only its own storage-format version; a
+    /// graph at any other version is refused until it is upgraded offline or rebuilt.
     pub internal_schema_version: u32,
     pub datasets: Vec<SnapshotDatasetOutput>,
 }
@@ -1377,10 +1377,9 @@ pub struct CommitListQuery {
 pub struct HealthOutput {
     pub status: String,
     pub version: String,
-    /// The internal-schema (storage-format) version this binary writes, the
-    /// top of the range it serves (v11 and v12 today; a v11 branch converts on
-    /// its next publish); a graph outside that range is refused until an
-    /// explicit upgrade.
+    /// The internal-schema (storage-format) version this binary writes and
+    /// the only one it serves; a graph at any other version is refused until
+    /// it is upgraded offline or rebuilt.
     pub internal_schema_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_version: Option<String>,

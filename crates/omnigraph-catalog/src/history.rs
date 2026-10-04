@@ -21,6 +21,14 @@
 //! magic `OGSC0001`, three little-endian `u64` lengths, then the
 //! `SchemaContractHead` JSON, the source text and the IR text. A commit
 //! record names it in `schema_content_hash`.
+//!
+//! The commits a root held before the offline storage upgrade to stamp 14
+//! live under `legacy/`, written once by that upgrade and never again: the
+//! records of one writer's consecutive own commits in `legacy/data/<n>.lance`,
+//! extents like any other, and under `legacy/locator/` the flat objects that
+//! find them, id shards (`OGLI0001`, commit id to file and row), writer
+//! shards (`OGLW0001`, one entry per writer with own commits) and the
+//! directory (`OGLD0001`) that lists every file and shard with its digest.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
@@ -56,6 +64,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWrite;
 use ulid::Ulid;
 
+use crate::TableIdentity;
 use crate::error::{OmniError, Result};
 use crate::layout::history_uri;
 use crate::record::{
@@ -63,8 +72,10 @@ use crate::record::{
     expand_record, packed_children, packed_record,
 };
 use crate::row::{CommitColumns, CommitColumnsBuilder, TableColumns, TableColumnsBuilder};
+use crate::seams::{decide_seam, fail};
 use crate::state::{
-    GraphLineageRow, SchemaContractHead, SchemaContractRow, TableRow, commit_bytes, table_bytes,
+    GraphLineageRow, SchemaContractHead, SchemaContractRow, TableRow, TableState, commit_bytes,
+    table_bytes,
 };
 
 const COMMIT_ID_COLUMN: &str = "graph_commit_id";
@@ -95,6 +106,32 @@ const KEY_BYTES: usize = 512;
 /// Lineage columns in file order; `tables` precedes them in the file.
 const LINEAGE_COLUMNS: [&str; 2] = [COMMIT_ID_COLUMN, RECORD_COLUMN];
 const FILE_COLUMNS: [&str; 3] = [TABLES_COLUMN, COMMIT_ID_COLUMN, RECORD_COLUMN];
+const LEGACY_DIR: &str = "legacy";
+const LEGACY_DATA_DIR: &str = "data";
+const LEGACY_LOCATOR_DIR: &str = "locator";
+const LEGACY_IDS_DIR: &str = "ids";
+const LEGACY_WRITERS_DIR: &str = "writers";
+const LEGACY_DIRECTORY_FILE: &str = "directory";
+const LOCATOR_EXTENSION: &str = "oglx";
+const ID_SHARD_MAGIC: &[u8; 8] = b"OGLI0001";
+const WRITER_SHARD_MAGIC: &[u8; 8] = b"OGLW0001";
+const DIRECTORY_MAGIC: &[u8; 8] = b"OGLD0001";
+/// The one locator layout this build writes and reads.
+const LEGACY_LAYOUT_VERSION: u32 = 1;
+/// Record bytes of one legacy data file, so that eight files fit the cache.
+const LEGACY_FILE_RECORD_BYTES: usize = CACHE_BYTES / 8;
+/// Legacy file names are eight decimal digits.
+const LEGACY_MAX_FILES: usize = 100_000_000;
+const LEGACY_FILE_DIGITS: usize = 8;
+const SHARD_HEADER_BYTES: usize = 12;
+const ID_ENTRY_BYTES: usize = 16 + 4 + 4;
+/// Id entries of one shard, the most that keep the shard within one lineage read.
+const LEGACY_SHARD_ENTRIES: usize = (TAIL_BYTES - SHARD_HEADER_BYTES) / ID_ENTRY_BYTES;
+const DIRECTORY_HEADER_BYTES: usize = 8 + 4 + 4 + 16 + 8 + 4 * 4;
+const DIRECTORY_FILE_BYTES: usize = 8 + 8 + 4 + 32;
+const DIRECTORY_ID_SHARD_BYTES: usize = 16 + 16 + 4 + 32;
+const DIRECTORY_WRITER_SHARD_BYTES: usize = 32 + 32 + 4 + 32;
+const SHA256_BYTES: usize = 32;
 
 /// One settled graph commit and the `table` rows of its `__manifest` version.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,15 +315,42 @@ enum ExtentKey {
         end: u16,
     },
     Singleton(String),
+    /// The records of one writer's consecutive own commits from before the
+    /// storage upgrade, under the file number the legacy directory lists.
+    LegacyData(u32),
 }
 
 fn singleton_digest(id: &str) -> String {
     format!("{:x}", Sha256::digest(id.as_bytes()))
 }
 
+fn legacy_locator_path(base: &Path) -> Path {
+    base.clone().join(LEGACY_DIR).join(LEGACY_LOCATOR_DIR)
+}
+
+fn legacy_directory_path(base: &Path) -> Path {
+    legacy_locator_path(base).join(format!("{LEGACY_DIRECTORY_FILE}.{LOCATOR_EXTENSION}"))
+}
+
+fn legacy_shard_path(base: &Path, dir: &str, shard: u32) -> Path {
+    legacy_locator_path(base).join(dir).join(format!(
+        "{shard:0width$}.{LOCATOR_EXTENSION}",
+        width = LEGACY_FILE_DIGITS
+    ))
+}
+
 impl ExtentKey {
     fn path(&self, base: &Path) -> Path {
         match self {
+            Self::LegacyData(file) => {
+                base.clone()
+                    .join(LEGACY_DIR)
+                    .join(LEGACY_DATA_DIR)
+                    .join(format!(
+                        "{file:0width$}.{EXTENSION}",
+                        width = LEGACY_FILE_DIGITS
+                    ))
+            }
             Self::Full { block } => base
                 .clone()
                 .join("blocks")
@@ -354,6 +418,20 @@ impl ExtentKey {
                 }
                 Self::Singleton(id.to_string())
             }
+            [LEGACY_DIR, LEGACY_DATA_DIR, file] => {
+                let number = file
+                    .strip_suffix(".lance")
+                    .ok_or_else(|| invalid("unexpected legacy data object"))?;
+                if number.len() != LEGACY_FILE_DIGITS || !number.bytes().all(|c| c.is_ascii_digit())
+                {
+                    return Err(invalid("legacy data file name is not eight digits"));
+                }
+                Self::LegacyData(
+                    number
+                        .parse()
+                        .map_err(|_| invalid("invalid legacy data file number"))?,
+                )
+            }
             _ => return Err(invalid("unexpected object key")),
         };
         if key.path(base) != *path {
@@ -366,7 +444,7 @@ impl ExtentKey {
     fn covers(&self, slots: &BTreeSet<u16>) -> bool {
         match self {
             Self::Block { start, end, .. } => slots.range(*start..=*end).next().is_some(),
-            Self::Full { .. } | Self::Singleton(_) => true,
+            Self::Full { .. } | Self::Singleton(_) | Self::LegacyData(_) => true,
         }
     }
 
@@ -388,7 +466,7 @@ impl ExtentKey {
                 Some((block, first.slot, None))
             }
             Self::Block { block, start, end } => Some((block, *start, Some(*end))),
-            Self::Singleton(_) => None,
+            Self::Singleton(_) | Self::LegacyData(_) => None,
         };
         if let Some((block, start, end)) = address {
             if end.is_some_and(|end| ids.len() != usize::from(end - start + 1)) {
@@ -411,6 +489,33 @@ impl ExtentKey {
                     || parse_history_block_id(ids.value(0))?.is_some()
                 {
                     return Err(invalid("singleton does not match its commit ID"));
+                }
+            }
+            Self::LegacyData(_) => {
+                if ids.len() > usize::from(HISTORY_BLOCK_SLOTS) {
+                    return Err(invalid("legacy data file holds more rows than a block"));
+                }
+                let commits = commits_of(batch)?;
+                let mut seen = HashSet::new();
+                for (row, commit) in commits.iter().enumerate() {
+                    if parse_history_block_id(&commit.graph_commit_id)?.is_some() {
+                        return Err(invalid("block ID in legacy data file"));
+                    }
+                    if !seen.insert(commit.graph_commit_id.as_str()) {
+                        return Err(invalid("legacy data file repeats a commit ID"));
+                    }
+                    let Some(previous) = row.checked_sub(1).map(|row| &commits[row]) else {
+                        continue;
+                    };
+                    if commit.native_branch != previous.native_branch {
+                        return Err(invalid("legacy data file holds two writers"));
+                    }
+                    if commit.parent_commit_id.as_deref() != Some(previous.graph_commit_id.as_str())
+                    {
+                        return Err(invalid(
+                            "legacy data file rows are not a first-parent chain",
+                        ));
+                    }
                 }
             }
         }
@@ -923,6 +1028,7 @@ async fn list_extents(
         |(block, _)| base.clone().join("blocks").join(block.to_string()),
     );
     let schemas = base.clone().join(SCHEMAS_DIR);
+    let locator = legacy_locator_path(base);
     let mut stream = store.inner.list(Some(&prefix));
     let mut keys = Vec::new();
     let mut narrowest: BTreeMap<u16, Vec<(u16, ExtentKey)>> = BTreeMap::new();
@@ -932,7 +1038,9 @@ async fn list_extents(
         .await
         .map_err(|error| OmniError::storage(error.into()))?
     {
-        if meta.location.prefix_match(&schemas).is_some() {
+        if meta.location.prefix_match(&schemas).is_some()
+            || meta.location.prefix_match(&locator).is_some()
+        {
             continue;
         }
         let Some(key) = ExtentKey::from_path(base, &meta.location)? else {
@@ -1298,7 +1406,8 @@ pub fn schema_content_hash(contract: &SchemaContractRow) -> Result<String> {
 
 /// Archive the content of `contract` under its digest and return the digest.
 /// An object already under that name must hold the same bytes.
-pub(crate) async fn archive_schema(
+#[doc(hidden)]
+pub async fn archive_schema(
     root_uri: &str,
     session: &Arc<lance::session::Session>,
     contract: &SchemaContractRow,
@@ -1307,18 +1416,25 @@ pub(crate) async fn archive_schema(
     let digest = format!("{:x}", Sha256::digest(&bytes));
     let (store, base) = store(root_uri, session).await?;
     let path = schema_path(&base, &digest);
-    if let Err(error) = store.put_if_absent(&path, bytes.clone().into()).await {
-        let existing = match request(&store, &path, None).await.map_err(storage_error)? {
+    if !put_immutable(&store, &path, bytes.into()).await? {
+        return Err(unreadable_schema(format!(
+            "archived schema content '{digest}' differs from the content it is named for"
+        )));
+    }
+    Ok(digest)
+}
+
+/// Create the object at `path` holding `bytes`, or accept one that exists and
+/// holds the same bytes; `false` when the existing object holds other bytes.
+async fn put_immutable(store: &ObjectStore, path: &Path, bytes: Bytes) -> Result<bool> {
+    if let Err(error) = store.put_if_absent(path, bytes.clone().into()).await {
+        let existing = match request(store, path, None).await.map_err(storage_error)? {
             Some(result) => body(result, |size| 0..size).await?,
             None => return Err(OmniError::storage(error.into())),
         };
-        if existing.bytes != bytes {
-            return Err(unreadable_schema(format!(
-                "archived schema content '{digest}' differs from the content it is named for"
-            )));
-        }
+        return Ok(existing.bytes == bytes);
     }
-    Ok(digest)
+    Ok(true)
 }
 
 /// The schema content archived under `digest`, for a commit whose accepted
@@ -1364,6 +1480,1006 @@ pub async fn read_schema(
         )));
     }
     Ok(contract)
+}
+
+fn legacy_error(message: impl std::fmt::Display) -> OmniError {
+    OmniError::manifest_internal(format!("`__history` legacy locator: {message}"))
+}
+
+fn malformed_locator(object: &str) -> OmniError {
+    legacy_error(format!("the {object} object is malformed"))
+}
+
+fn sha256(bytes: &[u8]) -> [u8; SHA256_BYTES] {
+    Sha256::digest(bytes).into()
+}
+
+fn ulid_bytes(id: Ulid) -> [u8; 16] {
+    id.0.to_be_bytes()
+}
+
+fn canonical_ulid(id: &str) -> Result<Ulid> {
+    Ulid::from_string(id)
+        .ok()
+        .filter(|parsed| parsed.to_string() == id)
+        .ok_or_else(|| legacy_error(format!("commit ID '{id}' is not a canonical ULID")))
+}
+
+fn fits_u32(count: usize, what: &str) -> Result<u32> {
+    u32::try_from(count).map_err(|_| legacy_error(format!("{what} count {count} overflows u32")))
+}
+
+/// The bytes of one locator object as they are decoded, front to back.
+struct LocatorBytes<'a> {
+    rest: &'a [u8],
+    object: &'static str,
+}
+
+impl<'a> LocatorBytes<'a> {
+    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+        let (taken, rest) = self
+            .rest
+            .split_at_checked(len)
+            .ok_or_else(|| malformed_locator(self.object))?;
+        self.rest = rest;
+        Ok(taken)
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| malformed_locator(self.object))
+    }
+
+    fn u16(&mut self) -> Result<u16> {
+        self.array().map(u16::from_le_bytes)
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        self.array().map(u32::from_le_bytes)
+    }
+
+    fn u64(&mut self) -> Result<u64> {
+        self.array().map(u64::from_le_bytes)
+    }
+
+    fn ulid(&mut self) -> Result<Ulid> {
+        self.array().map(|bytes| Ulid(u128::from_be_bytes(bytes)))
+    }
+
+    fn text(&mut self) -> Result<String> {
+        let len = usize::from(self.u16()?);
+        std::str::from_utf8(self.take(len)?)
+            .map(str::to_string)
+            .map_err(|_| malformed_locator(self.object))
+    }
+
+    fn done(&self) -> Result<()> {
+        match self.rest.is_empty() {
+            true => Ok(()),
+            false => Err(malformed_locator(self.object)),
+        }
+    }
+}
+
+fn push_text(bytes: &mut Vec<u8>, text: &str) -> Result<()> {
+    let len = u16::try_from(text.len()).map_err(|_| {
+        legacy_error(format!(
+            "name of {} bytes is over the u16 bound",
+            text.len()
+        ))
+    })?;
+    bytes.extend_from_slice(&len.to_le_bytes());
+    bytes.extend_from_slice(text.as_bytes());
+    Ok(())
+}
+
+/// Where a legacy commit's record lies: its data file and the row in it.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyIdEntry {
+    pub id: Ulid,
+    pub file: u32,
+    pub row: u32,
+}
+
+/// One `legacy/locator/ids/<n>.oglx` object: `OGLI0001`, a `u32` count, then
+/// entries sorted by id, each the binary ULID, the file and the row.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyIdShard {
+    pub entries: Vec<LegacyIdEntry>,
+}
+
+impl LegacyIdShard {
+    fn check(&self) -> Result<()> {
+        if self.entries.is_empty() || self.entries.len() > LEGACY_SHARD_ENTRIES {
+            return Err(legacy_error(format!(
+                "an id shard holds {} entries, outside 1..={LEGACY_SHARD_ENTRIES}",
+                self.entries.len()
+            )));
+        }
+        if self.entries.windows(2).any(|pair| pair[0].id >= pair[1].id) {
+            return Err(legacy_error("id shard entries are not strictly ascending"));
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.check()?;
+        let mut bytes =
+            Vec::with_capacity(SHARD_HEADER_BYTES + self.entries.len() * ID_ENTRY_BYTES);
+        bytes.extend_from_slice(ID_SHARD_MAGIC);
+        bytes.extend_from_slice(&fits_u32(self.entries.len(), "id entry")?.to_le_bytes());
+        for entry in &self.entries {
+            bytes.extend_from_slice(&ulid_bytes(entry.id));
+            bytes.extend_from_slice(&entry.file.to_le_bytes());
+            bytes.extend_from_slice(&entry.row.to_le_bytes());
+        }
+        Ok(bytes)
+    }
+
+    /// The shard an object holds; the object must be its exact encoding.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut cursor = LocatorBytes {
+            rest: bytes,
+            object: "id shard",
+        };
+        if cursor.take(ID_SHARD_MAGIC.len())? != ID_SHARD_MAGIC {
+            return Err(malformed_locator("id shard"));
+        }
+        let count = cursor.u32()? as usize;
+        if count > LEGACY_SHARD_ENTRIES {
+            return Err(malformed_locator("id shard"));
+        }
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            entries.push(LegacyIdEntry {
+                id: cursor.ulid()?,
+                file: cursor.u32()?,
+                row: cursor.u32()?,
+            });
+        }
+        cursor.done()?;
+        let shard = Self { entries };
+        if shard.encode()? != bytes {
+            return Err(malformed_locator("id shard"));
+        }
+        Ok(shard)
+    }
+
+    /// The file and row of `id`, when the shard lists it.
+    pub fn find(&self, id: Ulid) -> Option<(u32, u32)> {
+        self.entries
+            .binary_search_by_key(&id, |entry| entry.id)
+            .ok()
+            .map(|index| (self.entries[index].file, self.entries[index].row))
+    }
+}
+
+/// What kind of ref wrote a run of legacy commits; the order is the stored byte.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LegacyWriterKind {
+    Main,
+    Live,
+    Retired,
+    Orphaned,
+}
+
+impl LegacyWriterKind {
+    fn from_byte(byte: u8) -> Option<Self> {
+        [Self::Main, Self::Live, Self::Retired, Self::Orphaned]
+            .into_iter()
+            .find(|kind| *kind as u8 == byte)
+    }
+}
+
+/// One writer with own legacy commits: its native name (`None` on main), the
+/// native name it forked from (`None` for main), the version it forked at, its
+/// pinned head version, its head commit and the data files holding its chain.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyWriter {
+    pub kind: LegacyWriterKind,
+    pub native: Option<String>,
+    pub parent: Option<String>,
+    pub parent_version: u64,
+    pub head_version: u64,
+    pub head: Ulid,
+    pub first_file: u32,
+    pub files: u32,
+}
+
+impl LegacyWriter {
+    /// The SHA-256 of the native name, the sort key of writer shards.
+    pub fn digest(&self) -> [u8; SHA256_BYTES] {
+        sha256(self.native.as_deref().unwrap_or_default().as_bytes())
+    }
+
+    fn check(&self) -> Result<()> {
+        let main = self.kind == LegacyWriterKind::Main;
+        if main != self.native.is_none() {
+            return Err(legacy_error(
+                "a writer is main exactly when it has no native name",
+            ));
+        }
+        if main && (self.parent.is_some() || self.parent_version != 0) {
+            return Err(legacy_error("main has no parent"));
+        }
+        if self.native.as_deref() == Some("") || self.parent.as_deref() == Some("") {
+            return Err(legacy_error("a native name is never empty"));
+        }
+        if self.files == 0 {
+            return Err(legacy_error("a writer lists no data file"));
+        }
+        Ok(())
+    }
+
+    fn encode_into(&self, bytes: &mut Vec<u8>) -> Result<()> {
+        self.check()?;
+        bytes.extend_from_slice(&self.digest());
+        bytes.push(self.kind as u8);
+        push_text(bytes, self.native.as_deref().unwrap_or_default())?;
+        push_text(bytes, self.parent.as_deref().unwrap_or_default())?;
+        bytes.extend_from_slice(&self.parent_version.to_le_bytes());
+        bytes.extend_from_slice(&self.head_version.to_le_bytes());
+        bytes.extend_from_slice(&ulid_bytes(self.head));
+        bytes.extend_from_slice(&self.first_file.to_le_bytes());
+        bytes.extend_from_slice(&self.files.to_le_bytes());
+        Ok(())
+    }
+
+    fn decode_from(cursor: &mut LocatorBytes<'_>) -> Result<Self> {
+        let _digest: [u8; SHA256_BYTES] = cursor.array()?;
+        let kind = LegacyWriterKind::from_byte(cursor.array::<1>()?[0])
+            .ok_or_else(|| malformed_locator("writer shard"))?;
+        let native = Some(cursor.text()?).filter(|name| !name.is_empty());
+        let parent = Some(cursor.text()?).filter(|name| !name.is_empty());
+        Ok(Self {
+            kind,
+            native,
+            parent,
+            parent_version: cursor.u64()?,
+            head_version: cursor.u64()?,
+            head: cursor.ulid()?,
+            first_file: cursor.u32()?,
+            files: cursor.u32()?,
+        })
+    }
+}
+
+/// One `legacy/locator/writers/<n>.oglx` object: `OGLW0001`, a `u32` count,
+/// then entries sorted by `(digest, kind)`.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyWriterShard {
+    pub entries: Vec<LegacyWriter>,
+}
+
+impl LegacyWriterShard {
+    fn check(&self) -> Result<()> {
+        if self.entries.is_empty() {
+            return Err(legacy_error("a writer shard holds no entry"));
+        }
+        let key = |writer: &LegacyWriter| (writer.digest(), writer.kind);
+        if self
+            .entries
+            .windows(2)
+            .any(|pair| key(&pair[0]) >= key(&pair[1]))
+        {
+            return Err(legacy_error(
+                "writer shard entries are not strictly ascending by digest and kind",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.check()?;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(WRITER_SHARD_MAGIC);
+        bytes.extend_from_slice(&fits_u32(self.entries.len(), "writer entry")?.to_le_bytes());
+        for writer in &self.entries {
+            writer.encode_into(&mut bytes)?;
+        }
+        if bytes.len() > TAIL_BYTES {
+            return Err(legacy_error(format!(
+                "a writer shard of {} bytes is over the {TAIL_BYTES}-byte bound",
+                bytes.len()
+            )));
+        }
+        Ok(bytes)
+    }
+
+    /// The shard an object holds; the object must be its exact encoding.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > TAIL_BYTES {
+            return Err(malformed_locator("writer shard"));
+        }
+        let mut cursor = LocatorBytes {
+            rest: bytes,
+            object: "writer shard",
+        };
+        if cursor.take(WRITER_SHARD_MAGIC.len())? != WRITER_SHARD_MAGIC {
+            return Err(malformed_locator("writer shard"));
+        }
+        let count = cursor.u32()? as usize;
+        if count > bytes.len() {
+            return Err(malformed_locator("writer shard"));
+        }
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            entries.push(LegacyWriter::decode_from(&mut cursor)?);
+        }
+        cursor.done()?;
+        let shard = Self { entries };
+        if shard.encode()? != bytes {
+            return Err(malformed_locator("writer shard"));
+        }
+        Ok(shard)
+    }
+
+    /// The writers whose native name is `native`, in kind order.
+    pub fn find<'a>(
+        &'a self,
+        native: Option<&str>,
+    ) -> impl Iterator<Item = &'a LegacyWriter> + use<'a> {
+        let digest = sha256(native.unwrap_or_default().as_bytes());
+        let first = self
+            .entries
+            .partition_point(|writer| writer.digest() < digest);
+        self.entries[first..]
+            .iter()
+            .take_while(move |writer| writer.digest() == digest)
+    }
+}
+
+/// One legacy data file as the directory lists it.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyFile {
+    pub first_version: u64,
+    pub last_version: u64,
+    pub rows: u32,
+    /// [`legacy_records_sha256`] of the file's records.
+    pub records_sha256: [u8; SHA256_BYTES],
+}
+
+/// One id shard as the directory lists it: its first and last id, its entry
+/// count and the SHA-256 of its bytes.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyIdShardRef {
+    pub first: Ulid,
+    pub last: Ulid,
+    pub entries: u32,
+    pub sha256: [u8; SHA256_BYTES],
+}
+
+/// One writer shard as the directory lists it: its first and last writer
+/// digest, its entry count and the SHA-256 of its bytes.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyWriterShardRef {
+    pub first: [u8; SHA256_BYTES],
+    pub last: [u8; SHA256_BYTES],
+    pub entries: u32,
+    pub sha256: [u8; SHA256_BYTES],
+}
+
+/// The `legacy/locator/directory.oglx` object: `OGLD0001`, the layout version,
+/// the source stamp, the attempt, the commit count, the four table lengths,
+/// the file table, the id-shard table, the writer-shard table, the sorted
+/// absent merged parents, then the SHA-256 of everything before it.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyDirectory {
+    pub layout: u32,
+    pub source_stamp: u32,
+    pub attempt: Ulid,
+    pub commits: u64,
+    pub files: Vec<LegacyFile>,
+    pub id_shards: Vec<LegacyIdShardRef>,
+    pub writer_shards: Vec<LegacyWriterShardRef>,
+    pub absent_parents: Vec<Ulid>,
+}
+
+impl LegacyDirectory {
+    fn check(&self) -> Result<()> {
+        if self.layout != LEGACY_LAYOUT_VERSION {
+            return Err(legacy_error(format!(
+                "layout version {} is not known to this build, which reads layout \
+                 {LEGACY_LAYOUT_VERSION}",
+                self.layout
+            )));
+        }
+        if self.files.len() > LEGACY_MAX_FILES {
+            return Err(legacy_error("more data files than eight digits name"));
+        }
+        let mut rows = 0u64;
+        for file in &self.files {
+            if file.rows == 0 || file.rows > u32::from(HISTORY_BLOCK_SLOTS) {
+                return Err(legacy_error("a data file row count is outside a block"));
+            }
+            if file.first_version > file.last_version {
+                return Err(legacy_error("a data file version range is reversed"));
+            }
+            rows = rows.saturating_add(u64::from(file.rows));
+        }
+        let listed = self.id_shards.iter().fold(0u64, |sum, shard| {
+            sum.saturating_add(u64::from(shard.entries))
+        });
+        if rows != self.commits || listed != self.commits {
+            return Err(legacy_error(
+                "the commit count, the file rows and the id entries disagree",
+            ));
+        }
+        let ids_ascend = self.id_shards.iter().all(|shard| {
+            shard.entries > 0
+                && shard.first <= shard.last
+                && (shard.entries > 1 || shard.first == shard.last)
+        }) && self
+            .id_shards
+            .windows(2)
+            .all(|pair| pair[0].last < pair[1].first);
+        if !ids_ascend {
+            return Err(legacy_error(
+                "id shard ranges are not ascending and disjoint",
+            ));
+        }
+        let writers_ascend = self
+            .writer_shards
+            .iter()
+            .all(|shard| shard.entries > 0 && shard.first <= shard.last)
+            && self
+                .writer_shards
+                .windows(2)
+                .all(|pair| pair[0].last <= pair[1].first);
+        if !writers_ascend {
+            return Err(legacy_error("writer shard ranges are not ascending"));
+        }
+        if self
+            .absent_parents
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(legacy_error("absent parents are not strictly ascending"));
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.check()?;
+        let size = DIRECTORY_HEADER_BYTES
+            + self.files.len() * DIRECTORY_FILE_BYTES
+            + self.id_shards.len() * DIRECTORY_ID_SHARD_BYTES
+            + self.writer_shards.len() * DIRECTORY_WRITER_SHARD_BYTES
+            + self.absent_parents.len() * 16
+            + SHA256_BYTES;
+        if size > TAIL_BYTES {
+            return Err(OmniError::resource_limit(
+                "bytes of the `__history` legacy directory",
+                TAIL_BYTES as u64,
+                size as u64,
+            ));
+        }
+        let mut bytes = Vec::with_capacity(size);
+        bytes.extend_from_slice(DIRECTORY_MAGIC);
+        bytes.extend_from_slice(&self.layout.to_le_bytes());
+        bytes.extend_from_slice(&self.source_stamp.to_le_bytes());
+        bytes.extend_from_slice(&ulid_bytes(self.attempt));
+        bytes.extend_from_slice(&self.commits.to_le_bytes());
+        bytes.extend_from_slice(&fits_u32(self.files.len(), "data file")?.to_le_bytes());
+        bytes.extend_from_slice(&fits_u32(self.id_shards.len(), "id shard")?.to_le_bytes());
+        bytes.extend_from_slice(&fits_u32(self.writer_shards.len(), "writer shard")?.to_le_bytes());
+        bytes.extend_from_slice(
+            &fits_u32(self.absent_parents.len(), "absent parent")?.to_le_bytes(),
+        );
+        for file in &self.files {
+            bytes.extend_from_slice(&file.first_version.to_le_bytes());
+            bytes.extend_from_slice(&file.last_version.to_le_bytes());
+            bytes.extend_from_slice(&file.rows.to_le_bytes());
+            bytes.extend_from_slice(&file.records_sha256);
+        }
+        for shard in &self.id_shards {
+            bytes.extend_from_slice(&ulid_bytes(shard.first));
+            bytes.extend_from_slice(&ulid_bytes(shard.last));
+            bytes.extend_from_slice(&shard.entries.to_le_bytes());
+            bytes.extend_from_slice(&shard.sha256);
+        }
+        for shard in &self.writer_shards {
+            bytes.extend_from_slice(&shard.first);
+            bytes.extend_from_slice(&shard.last);
+            bytes.extend_from_slice(&shard.entries.to_le_bytes());
+            bytes.extend_from_slice(&shard.sha256);
+        }
+        for parent in &self.absent_parents {
+            bytes.extend_from_slice(&ulid_bytes(*parent));
+        }
+        let trailer = sha256(&bytes);
+        bytes.extend_from_slice(&trailer);
+        assert_eq!(
+            bytes.len(),
+            size,
+            "directory size is computed from its tables"
+        );
+        Ok(bytes)
+    }
+
+    /// The directory an object holds; the object must be its exact encoding.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let malformed = || malformed_locator("directory");
+        if bytes.len() > TAIL_BYTES || bytes.len() < DIRECTORY_HEADER_BYTES + SHA256_BYTES {
+            return Err(malformed());
+        }
+        let (body, trailer) = bytes.split_at(bytes.len() - SHA256_BYTES);
+        if !body.starts_with(DIRECTORY_MAGIC) || sha256(body) != trailer {
+            return Err(malformed());
+        }
+        let mut cursor = LocatorBytes {
+            rest: &body[DIRECTORY_MAGIC.len()..],
+            object: "directory",
+        };
+        let layout = cursor.u32()?;
+        if layout != LEGACY_LAYOUT_VERSION {
+            return Err(legacy_error(format!(
+                "layout version {layout} is not known to this build, which reads layout \
+                 {LEGACY_LAYOUT_VERSION}"
+            )));
+        }
+        let source_stamp = cursor.u32()?;
+        let attempt = cursor.ulid()?;
+        let commits = cursor.u64()?;
+        let counts = [cursor.u32()?, cursor.u32()?, cursor.u32()?, cursor.u32()?];
+        if counts.iter().any(|count| *count as usize > bytes.len()) {
+            return Err(malformed());
+        }
+        let [files, id_shards, writer_shards, absent] = counts.map(|count| count as usize);
+        let mut directory = Self {
+            layout,
+            source_stamp,
+            attempt,
+            commits,
+            files: Vec::with_capacity(files),
+            id_shards: Vec::with_capacity(id_shards),
+            writer_shards: Vec::with_capacity(writer_shards),
+            absent_parents: Vec::with_capacity(absent),
+        };
+        for _ in 0..files {
+            directory.files.push(LegacyFile {
+                first_version: cursor.u64()?,
+                last_version: cursor.u64()?,
+                rows: cursor.u32()?,
+                records_sha256: cursor.array()?,
+            });
+        }
+        for _ in 0..id_shards {
+            directory.id_shards.push(LegacyIdShardRef {
+                first: cursor.ulid()?,
+                last: cursor.ulid()?,
+                entries: cursor.u32()?,
+                sha256: cursor.array()?,
+            });
+        }
+        for _ in 0..writer_shards {
+            directory.writer_shards.push(LegacyWriterShardRef {
+                first: cursor.array()?,
+                last: cursor.array()?,
+                entries: cursor.u32()?,
+                sha256: cursor.array()?,
+            });
+        }
+        for _ in 0..absent {
+            directory.absent_parents.push(cursor.ulid()?);
+        }
+        cursor.done()?;
+        if directory.encode()? != bytes {
+            return Err(malformed());
+        }
+        Ok(directory)
+    }
+
+    /// The id shard that can list `id`, by the shard table.
+    pub fn id_shard_of(&self, id: Ulid) -> Option<u32> {
+        let index = self.id_shards.partition_point(|shard| shard.last < id);
+        let shard = self.id_shards.get(index)?;
+        (shard.first <= id).then_some(index as u32)
+    }
+
+    /// Whether the upgrade found `id` named as a merged parent and held by no
+    /// ref, so no reader will find its commit.
+    pub fn lists_absent(&self, id: &str) -> bool {
+        canonical_ulid(id).is_ok_and(|id| self.absent_parents.binary_search(&id).is_ok())
+    }
+
+    /// The writer shards that can hold `native`, by the shard table.
+    pub fn writer_shards_of(&self, native: Option<&str>) -> Range<u32> {
+        let digest = sha256(native.unwrap_or_default().as_bytes());
+        let first = self
+            .writer_shards
+            .partition_point(|shard| shard.last < digest);
+        let end = self
+            .writer_shards
+            .partition_point(|shard| shard.first <= digest);
+        first as u32..end.max(first) as u32
+    }
+}
+
+#[derive(serde::Serialize)]
+enum DigestedState<'a> {
+    Registered,
+    Pinned {
+        table_version: u64,
+        table_branch: Option<&'a str>,
+        row_count: u64,
+        metadata: String,
+        manifest_version: u64,
+    },
+    Dropped {
+        dropped_at: u64,
+        sealed_version: u64,
+    },
+}
+
+#[derive(serde::Serialize)]
+struct DigestedTable<'a> {
+    identity: TableIdentity,
+    table_key: &'a str,
+    table_path: &'a str,
+    state: DigestedState<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct DigestedRecord<'a> {
+    commit: &'a GraphLineageRow,
+    tables: Vec<DigestedTable<'a>>,
+}
+
+/// The SHA-256 the directory lists for a data file: over the JSON of the
+/// file's canonical records in field order, never over Lance bytes.
+#[doc(hidden)]
+pub fn legacy_records_sha256(records: &[HistoryRecord]) -> Result<[u8; SHA256_BYTES]> {
+    let canonical = records
+        .iter()
+        .map(canonical_record)
+        .collect::<Result<Vec<_>>>()?;
+    let mut digested = Vec::with_capacity(canonical.len());
+    for record in &canonical {
+        let mut tables = Vec::with_capacity(record.tables.len());
+        for table in &record.tables {
+            let state = match &table.state {
+                TableState::Registered => DigestedState::Registered,
+                TableState::Pinned(pin) => DigestedState::Pinned {
+                    table_version: pin.table_version,
+                    table_branch: pin.table_branch.as_deref(),
+                    row_count: pin.row_count,
+                    metadata: pin.metadata.to_json_string()?,
+                    manifest_version: pin.manifest_version,
+                },
+                TableState::Dropped {
+                    dropped_at,
+                    sealed_version,
+                } => DigestedState::Dropped {
+                    dropped_at: *dropped_at,
+                    sealed_version: *sealed_version,
+                },
+            };
+            tables.push(DigestedTable {
+                identity: table.registration.identity,
+                table_key: &table.registration.table_key,
+                table_path: &table.registration.table_path,
+                state,
+            });
+        }
+        digested.push(DigestedRecord {
+            commit: &record.commit,
+            tables,
+        });
+    }
+    let json = serde_json::to_vec(&digested).map_err(legacy_error)?;
+    Ok(sha256(&json))
+}
+
+/// The bounds the legacy data files and id shards are cut under; the plan is
+/// a pure function of the census and of this, so a resume under the layout
+/// the intent carries rebuilds the same objects.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyLayout {
+    pub version: u32,
+    pub release_bytes: u64,
+    pub file_record_bytes: u64,
+    pub block_slots: u32,
+    pub shard_entries: u32,
+}
+
+impl LegacyLayout {
+    pub const CURRENT: Self = Self {
+        version: LEGACY_LAYOUT_VERSION,
+        release_bytes: crate::HISTORY_RELEASE_BYTES as u64,
+        file_record_bytes: LEGACY_FILE_RECORD_BYTES as u64,
+        block_slots: HISTORY_BLOCK_SLOTS as u32,
+        shard_entries: LEGACY_SHARD_ENTRIES as u32,
+    };
+
+    fn check(&self) -> Result<()> {
+        let current = Self::CURRENT;
+        if self.version != current.version {
+            return Err(legacy_error(format!(
+                "layout version {} is not known to this build, which writes layout {}",
+                self.version, current.version
+            )));
+        }
+        let within = self.release_bytes <= current.release_bytes
+            && self.file_record_bytes <= current.file_record_bytes
+            && (1..=current.block_slots).contains(&self.block_slots)
+            && (1..=current.shard_entries).contains(&self.shard_entries)
+            && self.release_bytes > 0
+            && self.file_record_bytes > 0;
+        if !within {
+            return Err(legacy_error(format!(
+                "layout {self:?} exceeds the bounds of layout {current:?}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The own commits of one writer, oldest first, with what the writer shard
+/// records about it. The head is the last record.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyChain {
+    pub kind: LegacyWriterKind,
+    pub native: Option<String>,
+    pub parent: Option<String>,
+    pub parent_version: u64,
+    pub head_version: u64,
+    pub records: Vec<HistoryRecord>,
+}
+
+/// Every object of `legacy/`, planned in memory: the data files in chain
+/// order, the id shards, the writer shards and the directory that lists them.
+/// Only [`LegacyObjects::plan`] builds one, so the set is always consistent.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyObjects {
+    files: Vec<Vec<HistoryRecord>>,
+    id_shards: Vec<LegacyIdShard>,
+    writer_shards: Vec<LegacyWriterShard>,
+    directory: LegacyDirectory,
+}
+
+impl LegacyObjects {
+    /// Cut `chains` into data files under `layout`, never across a writer and
+    /// never across a break of the first-parent link, then shard the ids and
+    /// the writers and list everything in the directory.
+    pub fn plan(
+        layout: &LegacyLayout,
+        source_stamp: u32,
+        attempt: Ulid,
+        chains: &[LegacyChain],
+        absent_parents: &BTreeSet<Ulid>,
+    ) -> Result<Self> {
+        layout.check()?;
+        let release = usize::try_from(layout.release_bytes).map_err(legacy_error)?;
+        let file_bytes = usize::try_from(layout.file_record_bytes).map_err(legacy_error)?;
+        let slots = layout.block_slots as usize;
+        let mut files: Vec<Vec<HistoryRecord>> = Vec::new();
+        let mut ids = Vec::new();
+        let mut writers = Vec::new();
+        for chain in chains {
+            let first_file = files.len();
+            let mut file: Vec<HistoryRecord> = Vec::new();
+            let (mut held_fields, mut held_bytes) = (0usize, 0usize);
+            let mut head = None;
+            for record in &chain.records {
+                let record = canonical_record(record)?;
+                let commit = &record.commit;
+                if commit.native_branch != chain.native {
+                    return Err(legacy_error(format!(
+                        "commit '{}' names native branch {:?}, its writer {:?}",
+                        commit.graph_commit_id, commit.native_branch, chain.native
+                    )));
+                }
+                let id = canonical_ulid(&commit.graph_commit_id)?;
+                let fields = commit_bytes(commit);
+                let bytes = record_bytes(commit, &record.tables);
+                if fields > release || bytes > MAX_RECORD_BYTES {
+                    return Err(legacy_error(format!(
+                        "commit '{}' records {fields} bytes of commit fields and {bytes} bytes \
+                         in all, over the bounds {release} and {MAX_RECORD_BYTES}",
+                        commit.graph_commit_id
+                    )));
+                }
+                let cut = file.last().is_some_and(|previous| {
+                    held_fields + fields > release
+                        || held_bytes + bytes > file_bytes
+                        || file.len() >= slots
+                        || commit.parent_commit_id.as_deref()
+                            != Some(previous.commit.graph_commit_id.as_str())
+                });
+                if cut {
+                    files.push(std::mem::take(&mut file));
+                    (held_fields, held_bytes) = (0, 0);
+                }
+                ids.push(LegacyIdEntry {
+                    id,
+                    file: fits_u32(files.len(), "data file")?,
+                    row: fits_u32(file.len(), "data file row")?,
+                });
+                held_fields += fields;
+                held_bytes += bytes;
+                head = Some(id);
+                file.push(record);
+            }
+            let Some(head) = head else {
+                return Err(legacy_error(format!(
+                    "writer {:?} has no own commit",
+                    chain.native
+                )));
+            };
+            files.push(file);
+            writers.push(LegacyWriter {
+                kind: chain.kind,
+                native: chain.native.clone(),
+                parent: chain.parent.clone(),
+                parent_version: chain.parent_version,
+                head_version: chain.head_version,
+                head,
+                first_file: fits_u32(first_file, "data file")?,
+                files: fits_u32(files.len() - first_file, "data file")?,
+            });
+        }
+        if files.len() > LEGACY_MAX_FILES {
+            return Err(legacy_error("more data files than eight digits name"));
+        }
+
+        ids.sort_by_key(|entry| entry.id);
+        if let Some(pair) = ids.windows(2).find(|pair| pair[0].id == pair[1].id) {
+            return Err(legacy_error(format!(
+                "commit '{}' is written by two chains",
+                pair[0].id
+            )));
+        }
+        let id_shards: Vec<LegacyIdShard> = ids
+            .chunks(layout.shard_entries as usize)
+            .map(|entries| LegacyIdShard {
+                entries: entries.to_vec(),
+            })
+            .collect();
+
+        writers.sort_by_key(|writer| (writer.digest(), writer.kind));
+        let mut writer_shards: Vec<LegacyWriterShard> = Vec::new();
+        let mut held = 0usize;
+        for writer in writers {
+            let mut entry = Vec::new();
+            writer.encode_into(&mut entry)?;
+            match writer_shards.last_mut() {
+                Some(shard) if held + entry.len() <= TAIL_BYTES => shard.entries.push(writer),
+                _ => {
+                    held = SHARD_HEADER_BYTES;
+                    writer_shards.push(LegacyWriterShard {
+                        entries: vec![writer],
+                    });
+                }
+            }
+            held += entry.len();
+        }
+
+        let mut directory = LegacyDirectory {
+            layout: layout.version,
+            source_stamp,
+            attempt,
+            commits: ids.len() as u64,
+            files: Vec::with_capacity(files.len()),
+            id_shards: Vec::with_capacity(id_shards.len()),
+            writer_shards: Vec::with_capacity(writer_shards.len()),
+            absent_parents: absent_parents.iter().copied().collect(),
+        };
+        for records in &files {
+            let (first, last) = (&records[0].commit, &records[records.len() - 1].commit);
+            directory.files.push(LegacyFile {
+                first_version: first.graph_manifest_version,
+                last_version: last.graph_manifest_version,
+                rows: fits_u32(records.len(), "data file row")?,
+                records_sha256: legacy_records_sha256(records)?,
+            });
+        }
+        for shard in &id_shards {
+            directory.id_shards.push(LegacyIdShardRef {
+                first: shard.entries[0].id,
+                last: shard.entries[shard.entries.len() - 1].id,
+                entries: fits_u32(shard.entries.len(), "id entry")?,
+                sha256: sha256(&shard.encode()?),
+            });
+        }
+        for shard in &writer_shards {
+            directory.writer_shards.push(LegacyWriterShardRef {
+                first: shard.entries[0].digest(),
+                last: shard.entries[shard.entries.len() - 1].digest(),
+                entries: fits_u32(shard.entries.len(), "writer entry")?,
+                sha256: sha256(&shard.encode()?),
+            });
+        }
+        directory.encode()?;
+        Ok(Self {
+            files,
+            id_shards,
+            writer_shards,
+            directory,
+        })
+    }
+
+    pub fn files(&self) -> &[Vec<HistoryRecord>] {
+        &self.files
+    }
+
+    pub fn id_shards(&self) -> &[LegacyIdShard] {
+        &self.id_shards
+    }
+
+    pub fn writer_shards(&self) -> &[LegacyWriterShard] {
+        &self.writer_shards
+    }
+
+    pub fn directory(&self) -> &LegacyDirectory {
+        &self.directory
+    }
+}
+
+decide_seam! {
+    /// After each data file, id shard and writer shard of `legacy/` is
+    /// created and before the next object: the directory does not exist yet,
+    /// so a retry runs the census again and creates the rest.
+    pub static UPGRADE_BETWEEN_LEGACY_FILES = ("upgrade.between_legacy_files", Unreachable, [Fail]);
+}
+
+/// Create every object of `objects` under `legacy/`: the data files first,
+/// then the id shards, the writer shards and the directory last, so a
+/// directory that exists lists objects that exist. An object that exists
+/// must hold the same bytes, so a resumed write is a no-op.
+#[doc(hidden)]
+pub async fn write_legacy(
+    root_uri: &str,
+    session: &Arc<lance::session::Session>,
+    objects: &LegacyObjects,
+) -> Result<()> {
+    let (store, base) = store(root_uri, session).await?;
+    for (file, records) in objects.files.iter().enumerate() {
+        let key = ExtentKey::LegacyData(fits_u32(file, "data file")?);
+        if !write_extent(&store, &base, &key, records.clone(), MAX_OBJECT_BYTES).await? {
+            return Err(over_limit(&records[0].commit, MAX_OBJECT_BYTES));
+        }
+        fail(&UPGRADE_BETWEEN_LEGACY_FILES)?;
+    }
+    let differs = |path: &Path| {
+        legacy_error(format!(
+            "the object at {path} exists and holds other bytes; the upgrade that wrote it \
+             planned a different legacy set"
+        ))
+    };
+    for (shard, object) in objects.id_shards.iter().enumerate() {
+        let path = legacy_shard_path(&base, LEGACY_IDS_DIR, fits_u32(shard, "id shard")?);
+        if !put_immutable(&store, &path, object.encode()?.into()).await? {
+            return Err(differs(&path));
+        }
+        fail(&UPGRADE_BETWEEN_LEGACY_FILES)?;
+    }
+    for (shard, object) in objects.writer_shards.iter().enumerate() {
+        let path = legacy_shard_path(&base, LEGACY_WRITERS_DIR, fits_u32(shard, "writer shard")?);
+        if !put_immutable(&store, &path, object.encode()?.into()).await? {
+            return Err(differs(&path));
+        }
+        fail(&UPGRADE_BETWEEN_LEGACY_FILES)?;
+    }
+    let path = legacy_directory_path(&base);
+    if !put_immutable(&store, &path, objects.directory.encode()?.into()).await? {
+        return Err(differs(&path));
+    }
+    Ok(())
 }
 
 /// The rows of one immutable object: its commits, or its complete records.
@@ -1428,23 +2544,95 @@ impl Rows {
             )),
         })
     }
+
+    /// The rows at the positions `rows` of the object, each of which it must hold.
+    fn at_rows(self, rows: &BTreeSet<u32>) -> Result<Self> {
+        let len = self.len();
+        if rows.iter().any(|row| *row as usize >= len) {
+            return Err(invalid(
+                "the legacy locator names a row beyond the rows of the data file",
+            ));
+        }
+        if rows.len() == len {
+            return Ok(self);
+        }
+        let requested = rows.iter().map(|row| *row as usize);
+        Ok(match &self {
+            Self::Lineage(commits) => Self::Lineage(Arc::new(
+                requested.map(|row| commits[row].clone()).collect(),
+            )),
+            Self::Full(records) => Self::Full(Arc::new(
+                requested.map(|row| records[row].clone()).collect(),
+            )),
+        })
+    }
+}
+
+/// What one held object decodes to: the rows of an extent, or an id shard or
+/// a writer shard of the legacy locator.
+#[derive(Clone)]
+enum Held {
+    Rows(Rows),
+    IdShard(Arc<LegacyIdShard>),
+    WriterShard(Arc<LegacyWriterShard>),
 }
 
 #[derive(Default)]
 struct CachedObjects {
-    /// Per object path: its rows, their size, and when they were last used.
-    held: HashMap<String, (Rows, usize, u64)>,
+    /// Per object path: what it holds, its size, and when it was last used.
+    held: HashMap<String, (Held, usize, u64)>,
     bytes: usize,
     clock: u64,
 }
 
+impl CachedObjects {
+    /// Keep `held` under `path`, least recently used objects leaving until the
+    /// bound holds again.
+    fn hold(&mut self, path: &Path, held: Held, bytes: usize) {
+        self.clock += 1;
+        let clock = self.clock;
+        if let Some((_, replaced, _)) = self.held.insert(path.to_string(), (held, bytes, clock)) {
+            self.bytes -= replaced;
+        }
+        self.bytes += bytes;
+        while self.bytes > CACHE_BYTES {
+            let Some(oldest) = self
+                .held
+                .iter()
+                .min_by_key(|(_, (_, _, used))| *used)
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            if let Some((_, evicted, _)) = self.held.remove(&oldest) {
+                self.bytes -= evicted;
+            }
+        }
+    }
+}
+
+/// What one handle knows of `legacy/locator/directory.oglx`: nothing yet, that
+/// the root has none, or the directory itself.
+#[derive(Clone, Default)]
+enum LegacyProbe {
+    #[default]
+    Unprobed,
+    Absent,
+    Present(Arc<LegacyDirectory>),
+}
+
 /// The immutable `__history` objects one handle has read, by object path. An
 /// object is created once, never replaced and never deleted, so its rows are
-/// served again with no request. An absent object and a LIST are never kept:
-/// absence can end. Bounded at 16 MiB, least recently used first out.
+/// served again with no request. An absent object and a LIST are never kept,
+/// since absence can end, with one exception: whether
+/// `legacy/locator/directory.oglx` exists is kept, because the offline storage
+/// upgrade creates it before the root can be opened and never again, and a
+/// root restore calls [`Self::clear`]. Bounded at 16 MiB, least recently used
+/// first out.
 #[derive(Clone, Default)]
 pub struct ExtentCache {
     objects: Arc<Mutex<CachedObjects>>,
+    legacy: Arc<Mutex<LegacyProbe>>,
 }
 
 impl ExtentCache {
@@ -1453,7 +2641,10 @@ impl ExtentCache {
         let mut objects = self.objects.lock().unwrap_or_else(PoisonError::into_inner);
         objects.clock += 1;
         let clock = objects.clock;
-        let (rows, _, used) = objects.held.get_mut(path.as_ref())?;
+        let (held, _, used) = objects.held.get_mut(path.as_ref())?;
+        let Held::Rows(rows) = held else {
+            return None;
+        };
         if !lineage_only && matches!(rows, Rows::Lineage(_)) {
             return None;
         }
@@ -1469,40 +2660,83 @@ impl ExtentCache {
         }
         let mut objects = self.objects.lock().unwrap_or_else(PoisonError::into_inner);
         if matches!(rows, Rows::Lineage(_))
-            && matches!(objects.held.get(path.as_ref()), Some((Rows::Full(_), ..)))
+            && matches!(
+                objects.held.get(path.as_ref()),
+                Some((Held::Rows(Rows::Full(_)), ..))
+            )
         {
             return;
         }
+        objects.hold(path, Held::Rows(rows.clone()), bytes);
+    }
+
+    /// The held id shard at `path`.
+    fn id_shard(&self, path: &Path) -> Option<Arc<LegacyIdShard>> {
+        let mut objects = self.objects.lock().unwrap_or_else(PoisonError::into_inner);
         objects.clock += 1;
         let clock = objects.clock;
-        if let Some((_, replaced, _)) = objects
-            .held
-            .insert(path.to_string(), (rows.clone(), bytes, clock))
-        {
-            objects.bytes -= replaced;
-        }
-        objects.bytes += bytes;
-        while objects.bytes > CACHE_BYTES {
-            let Some(oldest) = objects
-                .held
-                .iter()
-                .min_by_key(|(_, (_, _, used))| *used)
-                .map(|(path, _)| path.clone())
-            else {
-                break;
-            };
-            if let Some((_, evicted, _)) = objects.held.remove(&oldest) {
-                objects.bytes -= evicted;
-            }
+        let (held, _, used) = objects.held.get_mut(path.as_ref())?;
+        let Held::IdShard(shard) = held else {
+            return None;
+        };
+        *used = clock;
+        Some(Arc::clone(shard))
+    }
+
+    /// Keep the id shard at `path`, whose object is `bytes` long.
+    fn insert_id_shard(&self, path: &Path, shard: &Arc<LegacyIdShard>, bytes: usize) {
+        let mut objects = self.objects.lock().unwrap_or_else(PoisonError::into_inner);
+        objects.hold(path, Held::IdShard(Arc::clone(shard)), bytes);
+    }
+
+    /// The held writer shard at `path`.
+    fn writer_shard(&self, path: &Path) -> Option<Arc<LegacyWriterShard>> {
+        let mut objects = self.objects.lock().unwrap_or_else(PoisonError::into_inner);
+        objects.clock += 1;
+        let clock = objects.clock;
+        let (held, _, used) = objects.held.get_mut(path.as_ref())?;
+        let Held::WriterShard(shard) = held else {
+            return None;
+        };
+        *used = clock;
+        Some(Arc::clone(shard))
+    }
+
+    /// Keep the writer shard at `path`, whose object is `bytes` long.
+    fn insert_writer_shard(&self, path: &Path, shard: &Arc<LegacyWriterShard>, bytes: usize) {
+        let mut objects = self.objects.lock().unwrap_or_else(PoisonError::into_inner);
+        objects.hold(path, Held::WriterShard(Arc::clone(shard)), bytes);
+    }
+
+    fn probe(&self) -> LegacyProbe {
+        self.legacy
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set_probe(&self, probe: LegacyProbe) {
+        *self.legacy.lock().unwrap_or_else(PoisonError::into_inner) = probe;
+    }
+
+    /// The legacy directory this handle has already read, with no request.
+    pub(crate) fn known_legacy_directory(&self) -> Option<Arc<LegacyDirectory>> {
+        match self.probe() {
+            LegacyProbe::Present(directory) => Some(directory),
+            LegacyProbe::Unprobed | LegacyProbe::Absent => None,
         }
     }
 
-    /// Forget every held object: the root was replaced, so a path may now name
-    /// a different object. Shared by every clone of this cache.
+    /// Forget every held object and whether the root has a legacy directory:
+    /// the root was replaced, so a path may now name a different object.
+    /// Shared by every clone of this cache.
     pub(crate) fn clear(&self) {
-        let mut objects = self.objects.lock().unwrap_or_else(PoisonError::into_inner);
-        objects.held.clear();
-        objects.bytes = 0;
+        {
+            let mut objects = self.objects.lock().unwrap_or_else(PoisonError::into_inner);
+            objects.held.clear();
+            objects.bytes = 0;
+        }
+        self.set_probe(LegacyProbe::Unprobed);
     }
 
     #[cfg(test)]
@@ -1515,6 +2749,24 @@ impl ExtentCache {
     }
 }
 
+/// Which rows of an object a read hands back and charges: all of them, those
+/// at block slots, or those at the row positions the legacy locator names.
+#[derive(Clone, Copy)]
+enum Narrow<'a> {
+    All,
+    Slots(&'a BTreeSet<u16>),
+    Rows(&'a BTreeSet<u32>),
+}
+
+/// What a read without a handle's cache keeps for its own duration: the
+/// directory probe and the id and writer shards it decoded.
+#[derive(Default)]
+struct LegacyMemo {
+    probe: LegacyProbe,
+    id_shards: HashMap<u32, Arc<LegacyIdShard>>,
+    writer_shards: HashMap<u32, Arc<LegacyWriterShard>>,
+}
+
 /// One read of addressed or listed extents: the store, the allowance left,
 /// and the cache of the handle that reads.
 struct Selection<'a> {
@@ -1524,21 +2776,187 @@ struct Selection<'a> {
     lineage_only: bool,
     budget: Option<usize>,
     cache: Option<&'a ExtentCache>,
+    memo: LegacyMemo,
 }
 
 impl Selection<'_> {
-    /// The rows of `key`, from the cache or one GET, narrowed to `kept_slots` when
-    /// given; `None` when it is absent. Only the rows returned are charged as owned.
-    async fn read(
-        &mut self,
-        key: &ExtentKey,
-        kept_slots: Option<&BTreeSet<u16>>,
-    ) -> Result<Option<Rows>> {
+    fn charge(&mut self, bytes: usize, exhausted: &str) -> Result<()> {
         if let Some(left) = &mut self.budget {
-            *left = left
-                .checked_sub(KEY_BYTES)
-                .ok_or_else(|| invalid("selective lineage address budget exhausted"))?;
+            *left = left.checked_sub(bytes).ok_or_else(|| invalid(exhausted))?;
         }
+        Ok(())
+    }
+
+    fn probe(&self) -> LegacyProbe {
+        match self.cache {
+            Some(cache) => cache.probe(),
+            None => self.memo.probe.clone(),
+        }
+    }
+
+    fn set_probe(&mut self, probe: LegacyProbe) {
+        match self.cache {
+            Some(cache) => cache.set_probe(probe),
+            None => self.memo.probe = probe,
+        }
+    }
+
+    /// The bytes of one locator object, whole; `None` when it is absent. The
+    /// address and every byte fetched are charged.
+    async fn locator_object(&mut self, path: &Path) -> Result<Option<Bytes>> {
+        self.charge(KEY_BYTES, "selective lineage address budget exhausted")?;
+        let Some(result) = request(&self.store, path, None)
+            .await
+            .map_err(storage_error)?
+        else {
+            return Ok(None);
+        };
+        let fetched = body(result, |size| 0..size).await?;
+        self.charge(
+            fetched.bytes.len(),
+            "selective lineage byte budget exhausted by the legacy locator",
+        )?;
+        Ok(Some(fetched.bytes))
+    }
+
+    /// The legacy directory, read once per handle, or per read without a
+    /// handle; `None` when the root has none.
+    async fn directory(&mut self) -> Result<Option<Arc<LegacyDirectory>>> {
+        let probe = match self.probe() {
+            LegacyProbe::Unprobed => {
+                match self
+                    .locator_object(&legacy_directory_path(&self.base))
+                    .await?
+                {
+                    Some(bytes) => LegacyProbe::Present(Arc::new(LegacyDirectory::decode(&bytes)?)),
+                    None => LegacyProbe::Absent,
+                }
+            }
+            known => known,
+        };
+        self.set_probe(probe.clone());
+        Ok(match probe {
+            LegacyProbe::Present(directory) => Some(directory),
+            LegacyProbe::Unprobed | LegacyProbe::Absent => None,
+        })
+    }
+
+    /// Id shard `shard` of `directory`, held or read and checked against the
+    /// digest the directory lists.
+    async fn id_shard(
+        &mut self,
+        directory: &LegacyDirectory,
+        shard: u32,
+    ) -> Result<Arc<LegacyIdShard>> {
+        let path = legacy_shard_path(&self.base, LEGACY_IDS_DIR, shard);
+        let held = match self.cache {
+            Some(cache) => cache.id_shard(&path),
+            None => self.memo.id_shards.get(&shard).cloned(),
+        };
+        if let Some(held) = held {
+            return Ok(held);
+        }
+        let listed = directory
+            .id_shards
+            .get(shard as usize)
+            .ok_or_else(|| legacy_error(format!("the directory lists no id shard {shard}")))?;
+        let bytes = self.locator_object(&path).await?.ok_or_else(|| {
+            legacy_error(format!(
+                "the directory lists id shard {shard} and the object is absent"
+            ))
+        })?;
+        if sha256(&bytes) != listed.sha256 {
+            return Err(legacy_error(format!(
+                "id shard {shard} does not hash to the digest the directory lists"
+            )));
+        }
+        let decoded = Arc::new(LegacyIdShard::decode(&bytes)?);
+        match self.cache {
+            Some(cache) => cache.insert_id_shard(&path, &decoded, bytes.len()),
+            None => {
+                self.memo.id_shards.insert(shard, Arc::clone(&decoded));
+            }
+        }
+        Ok(decoded)
+    }
+
+    /// Writer shard `shard` of `directory`, held or read and checked against
+    /// the digest the directory lists.
+    async fn writer_shard(
+        &mut self,
+        directory: &LegacyDirectory,
+        shard: u32,
+    ) -> Result<Arc<LegacyWriterShard>> {
+        let path = legacy_shard_path(&self.base, LEGACY_WRITERS_DIR, shard);
+        let held = match self.cache {
+            Some(cache) => cache.writer_shard(&path),
+            None => self.memo.writer_shards.get(&shard).cloned(),
+        };
+        if let Some(held) = held {
+            return Ok(held);
+        }
+        let listed = directory
+            .writer_shards
+            .get(shard as usize)
+            .ok_or_else(|| legacy_error(format!("the directory lists no writer shard {shard}")))?;
+        let bytes = self.locator_object(&path).await?.ok_or_else(|| {
+            legacy_error(format!(
+                "the directory lists writer shard {shard} and the object is absent"
+            ))
+        })?;
+        if sha256(&bytes) != listed.sha256 {
+            return Err(legacy_error(format!(
+                "writer shard {shard} does not hash to the digest the directory lists"
+            )));
+        }
+        let decoded = Arc::new(LegacyWriterShard::decode(&bytes)?);
+        match self.cache {
+            Some(cache) => cache.insert_writer_shard(&path, &decoded, bytes.len()),
+            None => {
+                self.memo.writer_shards.insert(shard, Arc::clone(&decoded));
+            }
+        }
+        Ok(decoded)
+    }
+
+    /// The data file and row the locator names for `id`; `None` when it lists
+    /// no such commit, which every id that is not a canonical ULID is.
+    async fn locate(
+        &mut self,
+        directory: &LegacyDirectory,
+        id: &str,
+    ) -> Result<Option<(u32, u32)>> {
+        let Ok(id) = canonical_ulid(id) else {
+            return Ok(None);
+        };
+        let Some(shard) = directory.id_shard_of(id) else {
+            return Ok(None);
+        };
+        Ok(self.id_shard(directory, shard).await?.find(id))
+    }
+
+    /// The singleton object of `id`, which must hold that commit; `None` when
+    /// it is absent.
+    async fn singleton(&mut self, id: &str) -> Result<Option<Rows>> {
+        let key = ExtentKey::Singleton(singleton_digest(id));
+        let Some(rows) = self.read(&key, Narrow::All).await? else {
+            return Ok(None);
+        };
+        if rows
+            .commit(0)
+            .is_none_or(|commit| commit.graph_commit_id != id)
+        {
+            return Err(invalid(
+                "singleton returned a different requested commit ID",
+            ));
+        }
+        Ok(Some(rows))
+    }
+
+    /// The rows of `key`, from the cache or one GET, narrowed as `narrow` says;
+    /// `None` when it is absent. Only the rows returned are charged as owned.
+    async fn read(&mut self, key: &ExtentKey, narrow: Narrow<'_>) -> Result<Option<Rows>> {
+        self.charge(KEY_BYTES, "selective lineage address budget exhausted")?;
         let path = key.path(&self.base);
         let cached = self
             .cache
@@ -1568,32 +2986,28 @@ impl Selection<'_> {
                 rows
             }
         };
-        let rows = match kept_slots {
-            Some(slots) => rows.at_slots(slots)?,
-            None => rows,
+        let rows = match narrow {
+            Narrow::All => rows,
+            Narrow::Slots(slots) => rows.at_slots(slots)?,
+            Narrow::Rows(positions) => rows.at_rows(positions)?,
         };
-        if let Some(left) = &mut self.budget {
-            *left = left
-                .checked_sub(rows.len().saturating_mul(ROW_CHARGE))
-                .ok_or_else(|| invalid("selective lineage byte budget exhausted"))?;
-        }
+        self.charge(
+            rows.len().saturating_mul(ROW_CHARGE),
+            "selective lineage byte budget exhausted",
+        )?;
         Ok(Some(rows))
     }
 
-    async fn listed(
-        &mut self,
-        key: &ExtentKey,
-        kept_slots: Option<&BTreeSet<u16>>,
-    ) -> Result<Rows> {
-        self.read(key, kept_slots)
+    async fn listed(&mut self, key: &ExtentKey, narrow: Narrow<'_>) -> Result<Rows> {
+        self.read(key, narrow)
             .await?
             .ok_or_else(|| invalid("listed immutable extent disappeared"))
     }
 }
 
-/// The rows of every extent that can hold one of `ids`, or of every extent. An
-/// `hb1` id names its block's one object, fetched first; when it is absent or
-/// lacks the id, the block LIST gives each slot `COPIES_READ` narrowest extents.
+/// The rows of every extent that can hold one of `ids`, or of every extent: an
+/// `hb1` id by its block's one object, else the block LIST; any other id by its
+/// singleton until one is absent, then by the legacy locator ([`LegacyProbe`]).
 async fn read_selected(
     root_uri: &str,
     session: &Arc<lance::session::Session>,
@@ -1610,11 +3024,12 @@ async fn read_selected(
         lineage_only,
         budget,
         cache,
+        memo: LegacyMemo::default(),
     };
     let mut found = Vec::new();
     let Some(ids) = ids else {
         for key in list_extents(&selection.store, &selection.base, None).await? {
-            found.push(selection.listed(&key, None).await?);
+            found.push(selection.listed(&key, Narrow::All).await?);
         }
         return Ok(found);
     };
@@ -1641,7 +3056,7 @@ async fn read_selected(
             false => rows.at_slots(&slots),
         };
         let full = ExtentKey::Full { block };
-        let direct = selection.read(&full, None).await?;
+        let direct = selection.read(&full, Narrow::All).await?;
         if let Some(rows) = &direct {
             let opener = rows.commit(0).map(|first| first.graph_commit_id.as_str());
             let opener = opener.map(parse_history_block_id).transpose()?.flatten();
@@ -1659,29 +3074,316 @@ async fn read_selected(
         let covering = Some((block, &slots));
         let covering = list_extents(&selection.store, &selection.base, covering).await?;
         let copies_overlap = covering.len() > 1;
-        let kept_slots = (!lineage_only || copies_overlap).then_some(&slots);
+        let kept = match !lineage_only || copies_overlap {
+            true => Narrow::Slots(&slots),
+            false => Narrow::All,
+        };
         for key in covering {
             if key != full || direct.is_none() {
-                found.push(selection.listed(&key, kept_slots).await?);
+                found.push(selection.listed(&key, kept).await?);
             }
         }
         found.extend(direct.map(requested).transpose()?);
     }
-    for id in singletons {
-        let key = ExtentKey::Singleton(singleton_digest(id));
-        if let Some(rows) = selection.read(&key, None).await? {
-            if rows
-                .commit(0)
-                .is_none_or(|commit| commit.graph_commit_id != id)
-            {
-                return Err(invalid(
-                    "singleton returned a different requested commit ID",
-                ));
+    let mut singletons = singletons.into_iter();
+    let mut missed = None;
+    if matches!(selection.probe(), LegacyProbe::Unprobed) {
+        for id in singletons.by_ref() {
+            match selection.singleton(id).await? {
+                Some(rows) => found.push(rows),
+                None => {
+                    missed = Some(id);
+                    break;
+                }
             }
-            found.push(rows);
         }
     }
+    let rest: Vec<&str> = singletons.collect();
+    if missed.is_none() && rest.is_empty() {
+        return Ok(found);
+    }
+    let Some(directory) = selection.directory().await? else {
+        for id in rest {
+            found.extend(selection.singleton(id).await?);
+        }
+        return Ok(found);
+    };
+    let mut located: BTreeMap<u32, BTreeMap<u32, &str>> = BTreeMap::new();
+    let mut unlisted = Vec::new();
+    for id in missed.into_iter().chain(rest) {
+        match selection.locate(&directory, id).await? {
+            Some((file, row)) => {
+                if located.entry(file).or_default().insert(row, id).is_some() {
+                    return Err(legacy_error(format!(
+                        "the locator places two requested commits at row {row} of data file {file}"
+                    )));
+                }
+            }
+            None if missed == Some(id) => {}
+            None => unlisted.push(id),
+        }
+    }
+    for (file, rows) in located {
+        let positions: BTreeSet<u32> = rows.keys().copied().collect();
+        let read = selection
+            .read(&ExtentKey::LegacyData(file), Narrow::Rows(&positions))
+            .await?
+            .ok_or_else(|| {
+                legacy_error(format!(
+                    "the directory lists data file {file} and the object is absent"
+                ))
+            })?;
+        for (row, id) in rows {
+            if !read.commits().any(|commit| commit.graph_commit_id == id) {
+                return Err(legacy_error(format!(
+                    "the locator places commit '{id}' at row {row} of data file {file}, which \
+                     holds another commit"
+                )));
+            }
+        }
+        found.push(read);
+    }
+    for id in unlisted {
+        found.extend(selection.singleton(id).await?);
+    }
     Ok(found)
+}
+
+/// The legacy directory of the root, through `cache` when given, so a handle
+/// reads it once; `None` when the root has none, which a handle also keeps.
+#[doc(hidden)]
+pub async fn legacy_directory(
+    root_uri: &str,
+    session: &Arc<lance::session::Session>,
+    cache: Option<&ExtentCache>,
+) -> Result<Option<Arc<LegacyDirectory>>> {
+    let (store, base) = store(root_uri, session).await?;
+    let mut selection = Selection {
+        scheduler: scheduler(&store),
+        store,
+        base,
+        lineage_only: true,
+        budget: None,
+        cache,
+        memo: LegacyMemo::default(),
+    };
+    selection.directory().await
+}
+
+/// The keys under `__history`, relative to it and sorted, of every object that
+/// is not a schema content archive named by its digest, `limit` of them at
+/// most. The offline storage upgrade fences a root only when this is empty.
+#[doc(hidden)]
+pub async fn foreign_history_objects(
+    root_uri: &str,
+    session: &Arc<lance::session::Session>,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let (store, base) = store(root_uri, session).await?;
+    let schemas = base.clone().join(SCHEMAS_DIR);
+    let prefix = format!("{base}/");
+    let mut stream = store.inner.list(Some(&base));
+    let mut foreign = BTreeSet::new();
+    while let Some(meta) = stream
+        .try_next()
+        .await
+        .map_err(|error| OmniError::storage(error.into()))?
+    {
+        let archive = meta
+            .location
+            .prefix_match(&schemas)
+            .is_some_and(|mut parts| {
+                let name = parts.next();
+                parts.next().is_none()
+                    && name.is_some_and(|name| {
+                        name.as_ref()
+                            .strip_suffix(SCHEMA_EXTENSION)
+                            .and_then(|stem| stem.strip_suffix('.'))
+                            .is_some_and(valid_schema_digest)
+                    })
+            });
+        if !archive {
+            foreign.insert(meta.location.as_ref().replacen(&prefix, "", 1));
+            if foreign.len() > limit {
+                foreign.pop_last();
+            }
+        }
+    }
+    Ok(foreign.into_iter().collect())
+}
+
+/// Read every object of `legacy/` again, through no cache, and check it
+/// against the directory: the data files are exactly the listed ones and hash
+/// to their record digests, every id entry names the row holding its commit,
+/// and every writer's head is the last record of its files. Returns the
+/// directory, `None` when the root has none.
+#[doc(hidden)]
+pub async fn verify_legacy(
+    root_uri: &str,
+    session: &Arc<lance::session::Session>,
+) -> Result<Option<Arc<LegacyDirectory>>> {
+    let Some(mut reader) = LegacyReader::open(root_uri, session, None).await? else {
+        return Ok(None);
+    };
+    let directory = Arc::clone(&reader.directory);
+    let found: BTreeSet<u32> = list_extents(&reader.selection.store, &reader.selection.base, None)
+        .await?
+        .into_iter()
+        .filter_map(|key| match key {
+            ExtentKey::LegacyData(file) => Some(file),
+            _ => None,
+        })
+        .collect();
+    let listed: BTreeSet<u32> = (0..fits_u32(directory.files.len(), "data file")?).collect();
+    if found != listed {
+        return Err(legacy_error(format!(
+            "legacy/data holds files {found:?}, the directory lists {} files numbered from 0",
+            listed.len()
+        )));
+    }
+    let mut files: Vec<Vec<String>> = Vec::with_capacity(directory.files.len());
+    let mut rows = 0u64;
+    for (file, listed) in (0u32..).zip(&directory.files) {
+        let records = reader.file(file).await?;
+        if legacy_records_sha256(&records)? != listed.records_sha256 {
+            return Err(legacy_error(format!(
+                "the records of data file {file} do not hash to the digest the directory lists"
+            )));
+        }
+        rows += records.len() as u64;
+        files.push(
+            records
+                .iter()
+                .map(|record| record.commit.graph_commit_id.clone())
+                .collect(),
+        );
+    }
+    let held = |file: u32, row: usize| {
+        files
+            .get(file as usize)
+            .and_then(|ids| ids.get(row))
+            .map(String::as_str)
+    };
+    let mut entries = 0u64;
+    for shard in 0..fits_u32(directory.id_shards.len(), "id shard")? {
+        for entry in &reader.selection.id_shard(&directory, shard).await?.entries {
+            if held(entry.file, entry.row as usize) != Some(entry.id.to_string().as_str()) {
+                return Err(legacy_error(format!(
+                    "id shard {shard} names row {} of data file {} for commit '{}', which that \
+                     row does not hold",
+                    entry.row, entry.file, entry.id
+                )));
+            }
+            entries += 1;
+        }
+    }
+    if entries != directory.commits || rows != directory.commits {
+        return Err(legacy_error(format!(
+            "the directory lists {} commits, the id shards {entries} and the data files {rows}",
+            directory.commits
+        )));
+    }
+    for shard in 0..fits_u32(directory.writer_shards.len(), "writer shard")? {
+        for writer in &reader
+            .selection
+            .writer_shard(&directory, shard)
+            .await?
+            .entries
+        {
+            let last = (writer.first_file + writer.files).saturating_sub(1);
+            let head = files
+                .get(last as usize)
+                .and_then(|ids| ids.last())
+                .map(String::as_str);
+            if head != Some(writer.head.to_string().as_str()) {
+                return Err(legacy_error(format!(
+                    "writer shard {shard} names '{}' as the head of a writer whose last data \
+                     file {last} ends with another commit",
+                    writer.head
+                )));
+            }
+        }
+    }
+    Ok(Some(directory))
+}
+
+/// One reader of the legacy locator of a root that has one, through the cache
+/// of a handle when given: the writers it lists and the records of a data file.
+pub(crate) struct LegacyReader<'a> {
+    selection: Selection<'a>,
+    directory: Arc<LegacyDirectory>,
+}
+
+impl<'a> LegacyReader<'a> {
+    /// The reader of the root's legacy history; `None` when the root has none.
+    pub(crate) async fn open(
+        root_uri: &str,
+        session: &Arc<lance::session::Session>,
+        cache: Option<&'a ExtentCache>,
+    ) -> Result<Option<Self>> {
+        let (store, base) = store(root_uri, session).await?;
+        let mut selection = Selection {
+            scheduler: scheduler(&store),
+            store,
+            base,
+            lineage_only: false,
+            budget: None,
+            cache,
+            memo: LegacyMemo::default(),
+        };
+        Ok(selection.directory().await?.map(|directory| Self {
+            selection,
+            directory,
+        }))
+    }
+
+    pub(crate) fn directory(&self) -> &Arc<LegacyDirectory> {
+        &self.directory
+    }
+
+    /// The writers listed under the native name `native` (`None` for main), in
+    /// kind order: at most one ref of `__manifest`, then an orphaned writer.
+    pub(crate) async fn writers(&mut self, native: Option<&str>) -> Result<Vec<LegacyWriter>> {
+        let directory = Arc::clone(&self.directory);
+        let mut writers = Vec::new();
+        for shard in directory.writer_shards_of(native) {
+            let shard = self.selection.writer_shard(&directory, shard).await?;
+            writers.extend(
+                shard
+                    .find(native)
+                    .filter(|writer| writer.native.as_deref() == native)
+                    .cloned(),
+            );
+        }
+        Ok(writers)
+    }
+
+    /// The complete records of data file `file`, in the row count the
+    /// directory lists for it.
+    pub(crate) async fn file(&mut self, file: u32) -> Result<Arc<Vec<HistoryRecord>>> {
+        let listed = self
+            .directory
+            .files
+            .get(file as usize)
+            .ok_or_else(|| legacy_error(format!("the directory lists no data file {file}")))?
+            .rows;
+        let rows = self
+            .selection
+            .read(&ExtentKey::LegacyData(file), Narrow::All)
+            .await?
+            .ok_or_else(|| {
+                legacy_error(format!(
+                    "the directory lists data file {file} and the object is absent"
+                ))
+            })?;
+        match rows {
+            Rows::Full(records) if records.len() == listed as usize => Ok(records),
+            rows => Err(legacy_error(format!(
+                "data file {file} holds {} complete records, the directory lists {listed}",
+                rows.len()
+            ))),
+        }
+    }
 }
 
 fn insert_copy<T: PartialEq>(known: &mut HashMap<String, T>, id: String, copy: T) -> Result<()> {
@@ -2408,6 +4110,1138 @@ pub(crate) mod test_support {
                 .to_string()
                 .contains("bound of the commit fields of one history record"),
             "{error}"
+        );
+    }
+
+    /// `count` own commits of `native` with ULIDs from `first`, a first-parent
+    /// chain at consecutive versions from `version`, each with every table state.
+    fn legacy_records(
+        native: Option<&str>,
+        first: u128,
+        count: usize,
+        version: u64,
+    ) -> Vec<HistoryRecord> {
+        let ids: Vec<String> = (0..count)
+            .map(|index| Ulid::from(first + index as u128).to_string())
+            .collect();
+        ids.iter()
+            .enumerate()
+            .map(|(index, id)| HistoryRecord {
+                commit: GraphLineageRow {
+                    graph_commit_id: id.clone(),
+                    schema_contract: None,
+                    schema_content_hash: None,
+                    graph_branch: native.map(|native| native.replace(".fork", "")),
+                    native_branch: native.map(str::to_string),
+                    graph_manifest_version: version + index as u64,
+                    generation: index as u64,
+                    parent_commit_id: index.checked_sub(1).map(|parent| ids[parent].clone()),
+                    merged_parent_commit_id: None,
+                    actor_id: None,
+                    created_at: index as i64,
+                },
+                tables: crate::tests::history_table_states(),
+            })
+            .collect()
+    }
+
+    fn legacy_chain(
+        kind: LegacyWriterKind,
+        native: Option<&str>,
+        parent: Option<&str>,
+        records: Vec<HistoryRecord>,
+    ) -> LegacyChain {
+        LegacyChain {
+            kind,
+            native: native.map(str::to_string),
+            parent: parent.map(str::to_string),
+            parent_version: u64::from(parent.is_some()) * 3,
+            head_version: records.last().unwrap().commit.graph_manifest_version + 1,
+            records,
+        }
+    }
+
+    /// Main with five commits, a live fork with three, one absent merged parent.
+    fn legacy_objects(attempt: u128) -> LegacyObjects {
+        LegacyObjects::plan(
+            &LegacyLayout::CURRENT,
+            13,
+            Ulid::from(attempt),
+            &[
+                legacy_chain(
+                    LegacyWriterKind::Main,
+                    None,
+                    None,
+                    legacy_records(None, 1_000, 5, 1),
+                ),
+                legacy_chain(
+                    LegacyWriterKind::Live,
+                    Some("feature.fork"),
+                    None,
+                    legacy_records(Some("feature.fork"), 2_000, 3, 4),
+                ),
+            ],
+            &BTreeSet::from([Ulid::from(7u128), Ulid::from(5u128)]),
+        )
+        .unwrap()
+    }
+
+    fn message(error: OmniError) -> String {
+        error.to_string()
+    }
+
+    #[test]
+    fn legacy_data_keys_name_eight_digit_files_and_nothing_else() {
+        let base = Path::from("root/__history");
+        let key = ExtentKey::LegacyData(7);
+        let path = key.path(&base);
+        assert_eq!(path.as_ref(), "root/__history/legacy/data/00000007.lance");
+        assert_eq!(ExtentKey::from_path(&base, &path).unwrap(), Some(key));
+        assert!(ExtentKey::LegacyData(0).covers(&BTreeSet::new()));
+        let parse =
+            |relative: &str| ExtentKey::from_path(&base, &Path::from(format!("{base}/{relative}")));
+        assert_eq!(
+            parse("legacy/data/00000000.lance").unwrap(),
+            Some(ExtentKey::LegacyData(0))
+        );
+        assert_eq!(
+            parse(&format!(
+                "legacy/data/00000003.lance.tmp.{}",
+                "0a".repeat(16)
+            ))
+            .unwrap(),
+            None,
+            "a conditional-create temporary of a data file is skipped"
+        );
+        for refused in [
+            "legacy/data/1.lance",
+            "legacy/data/000000001.lance",
+            "legacy/data/0000000a.lance",
+            "legacy/data/00000001.parquet",
+            "legacy/x.lance",
+            "legacy/locator/directory.oglx",
+        ] {
+            let error = message(parse(refused).unwrap_err());
+            assert!(
+                error.contains("invalid history extent"),
+                "{refused}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_data_files_are_validated_as_one_writer_chain() {
+        let validate = |records: &[HistoryRecord]| {
+            ExtentKey::LegacyData(0).validate(&records_to_batch(records).unwrap())
+        };
+        let good = legacy_records(Some("feature.fork"), 10, 4, 2);
+        validate(&good).unwrap();
+
+        let mut block_id = good.clone();
+        block_id[0].commit.graph_commit_id = records()[0].commit.graph_commit_id.clone();
+        block_id[1].commit.parent_commit_id = Some(block_id[0].commit.graph_commit_id.clone());
+        assert!(message(validate(&block_id).unwrap_err()).contains("block ID"));
+
+        let mut repeated = good.clone();
+        repeated[3].commit.graph_commit_id = repeated[1].commit.graph_commit_id.clone();
+        assert!(message(validate(&repeated).unwrap_err()).contains("repeats a commit ID"));
+
+        let mut unlinked = good.clone();
+        unlinked[2].commit.parent_commit_id = Some(unlinked[0].commit.graph_commit_id.clone());
+        assert!(message(validate(&unlinked).unwrap_err()).contains("first-parent chain"));
+
+        let mut two_writers = good.clone();
+        two_writers[3].commit.native_branch = Some("other.fork".to_string());
+        assert!(message(validate(&two_writers).unwrap_err()).contains("two writers"));
+    }
+
+    #[test]
+    fn legacy_records_digest_is_over_the_canonical_records() {
+        let records = legacy_records(None, 30, 2, 1);
+        let digest = legacy_records_sha256(&records).unwrap();
+        let mut reversed = records.clone();
+        reversed[0].tables.reverse();
+        assert_eq!(legacy_records_sha256(&reversed).unwrap(), digest);
+        let mut other_pin = records.clone();
+        let TableState::Pinned(pin) = &mut other_pin[1].tables[0].state else {
+            panic!("the first table state is pinned");
+        };
+        pin.row_count += 1;
+        assert_ne!(legacy_records_sha256(&other_pin).unwrap(), digest);
+        let mut other_commit = records;
+        other_commit[0].commit.created_at += 1;
+        assert_ne!(legacy_records_sha256(&other_commit).unwrap(), digest);
+    }
+
+    #[test]
+    fn legacy_locator_codecs_round_trip_and_refuse_other_bytes() {
+        let objects = legacy_objects(99);
+        let id_shard = &objects.id_shards()[0];
+        let writer_shard = &objects.writer_shards()[0];
+        let directory = objects.directory();
+        assert_eq!(objects.files().len(), 2);
+        assert_eq!(id_shard.entries.len(), 8);
+        assert_eq!(writer_shard.entries.len(), 2);
+        assert_eq!(
+            directory.absent_parents,
+            [Ulid::from(5u128), Ulid::from(7u128)]
+        );
+
+        let id_bytes = id_shard.encode().unwrap();
+        assert_eq!(id_bytes.len(), SHARD_HEADER_BYTES + 8 * ID_ENTRY_BYTES);
+        assert_eq!(&LegacyIdShard::decode(&id_bytes).unwrap(), id_shard);
+        let writer_bytes = writer_shard.encode().unwrap();
+        assert_eq!(
+            &LegacyWriterShard::decode(&writer_bytes).unwrap(),
+            writer_shard
+        );
+        let directory_bytes = directory.encode().unwrap();
+        assert_eq!(
+            directory_bytes.len(),
+            DIRECTORY_HEADER_BYTES
+                + 2 * DIRECTORY_FILE_BYTES
+                + DIRECTORY_ID_SHARD_BYTES
+                + DIRECTORY_WRITER_SHARD_BYTES
+                + 2 * 16
+                + SHA256_BYTES
+        );
+        assert_eq!(
+            &LegacyDirectory::decode(&directory_bytes).unwrap(),
+            directory
+        );
+
+        type Refuses = fn(&[u8]) -> bool;
+        let decoders: [(&str, &[u8], Refuses); 3] = [
+            ("id shard", &id_bytes, |bytes| {
+                LegacyIdShard::decode(bytes).is_err()
+            }),
+            ("writer shard", &writer_bytes, |bytes| {
+                LegacyWriterShard::decode(bytes).is_err()
+            }),
+            ("directory", &directory_bytes, |bytes| {
+                LegacyDirectory::decode(bytes).is_err()
+            }),
+        ];
+        for (object, bytes, refused) in decoders {
+            assert!(refused(&bytes[..bytes.len() - 1]), "{object}: truncated");
+            assert!(refused(&[bytes, &[0]].concat()), "{object}: trailing byte");
+            assert!(refused(&[]), "{object}: empty");
+            let magic_and_count = [7, 9];
+            let every_byte = [7, 9, bytes.len() / 2, bytes.len() - 1];
+            let flipped: &[usize] = match object {
+                "directory" => &every_byte,
+                _ => &magic_and_count,
+            };
+            for at in flipped {
+                let mut bad = bytes.to_vec();
+                bad[*at] ^= 1;
+                assert!(refused(&bad), "{object}: byte {at} flipped");
+            }
+        }
+        let mut other_digest = writer_bytes.clone();
+        other_digest[SHARD_HEADER_BYTES] ^= 1;
+        assert!(
+            LegacyWriterShard::decode(&other_digest).is_err(),
+            "a writer digest must be the digest of the stored name"
+        );
+
+        let mut unsorted = id_shard.clone();
+        unsorted.entries.swap(0, 1);
+        assert!(message(unsorted.encode().unwrap_err()).contains("strictly ascending"));
+        let mut unsorted = writer_shard.clone();
+        unsorted.entries.swap(0, 1);
+        assert!(message(unsorted.encode().unwrap_err()).contains("strictly ascending"));
+        let mut main_named = writer_shard.clone();
+        main_named.entries[0].kind = LegacyWriterKind::Main;
+        main_named.entries[1].kind = LegacyWriterKind::Main;
+        assert!(message(main_named.encode().unwrap_err()).contains("main exactly when"));
+
+        let mut other_layout = directory.clone();
+        other_layout.layout = 2;
+        let error = message(other_layout.encode().unwrap_err());
+        assert!(error.contains("layout version 2 is not known"), "{error}");
+        let mut patched = directory_bytes[..directory_bytes.len() - SHA256_BYTES].to_vec();
+        patched[8..12].copy_from_slice(&2u32.to_le_bytes());
+        let trailer = sha256(&patched);
+        patched.extend_from_slice(&trailer);
+        let error = message(LegacyDirectory::decode(&patched).unwrap_err());
+        assert!(error.contains("layout version 2 is not known"), "{error}");
+        let mut miscounted = directory.clone();
+        miscounted.commits += 1;
+        assert!(message(miscounted.encode().unwrap_err()).contains("disagree"));
+
+        for (row, record) in objects.files()[1].iter().enumerate() {
+            let id = Ulid::from_string(&record.commit.graph_commit_id).unwrap();
+            assert_eq!(id_shard.find(id), Some((1, row as u32)));
+            assert_eq!(directory.id_shard_of(id), Some(0));
+        }
+        assert_eq!(id_shard.find(Ulid::from(3u128)), None);
+        assert_eq!(directory.id_shard_of(Ulid::from(3u128)), None);
+        assert_eq!(directory.id_shard_of(Ulid::from(u128::MAX)), None);
+        let main: Vec<_> = writer_shard.find(None).collect();
+        assert_eq!(main.len(), 1);
+        assert_eq!(
+            (
+                main[0].kind,
+                main[0].first_file,
+                main[0].files,
+                main[0].head
+            ),
+            (LegacyWriterKind::Main, 0, 1, Ulid::from(1_004u128))
+        );
+        let feature: Vec<_> = writer_shard.find(Some("feature.fork")).collect();
+        assert_eq!(feature.len(), 1);
+        assert_eq!(
+            (
+                feature[0].first_file,
+                feature[0].files,
+                feature[0].parent_version
+            ),
+            (1, 1, 0)
+        );
+        assert_eq!(writer_shard.find(Some("other")).count(), 0);
+        assert_eq!(directory.writer_shards_of(None), 0..1);
+        assert_eq!(directory.writer_shards_of(Some("feature.fork")), 0..1);
+    }
+
+    #[test]
+    fn legacy_plan_cuts_id_shards_at_the_entry_bound() {
+        assert_eq!(LEGACY_SHARD_ENTRIES, 21_844);
+        let plan = |count: usize| {
+            LegacyObjects::plan(
+                &LegacyLayout::CURRENT,
+                13,
+                Ulid::from(1u128),
+                &[legacy_chain(
+                    LegacyWriterKind::Main,
+                    None,
+                    None,
+                    legacy_records(None, 1 << 40, count, 1)
+                        .into_iter()
+                        .map(|record| HistoryRecord {
+                            tables: Vec::new(),
+                            ..record
+                        })
+                        .collect(),
+                )],
+                &BTreeSet::new(),
+            )
+            .unwrap()
+        };
+        let full = plan(LEGACY_SHARD_ENTRIES);
+        assert_eq!(full.id_shards().len(), 1);
+        let full_bytes = full.id_shards()[0].encode().unwrap().len();
+        assert!(
+            full_bytes <= TAIL_BYTES && full_bytes + ID_ENTRY_BYTES > TAIL_BYTES,
+            "a full shard of {full_bytes} bytes is the most one lineage read holds"
+        );
+        let over = plan(LEGACY_SHARD_ENTRIES + 1);
+        let entries: Vec<_> = over
+            .id_shards()
+            .iter()
+            .map(|shard| shard.entries.len())
+            .collect();
+        assert_eq!(entries, [LEGACY_SHARD_ENTRIES, 1]);
+        let directory = over.directory();
+        assert_eq!(directory.commits, LEGACY_SHARD_ENTRIES as u64 + 1);
+        assert!(directory.id_shards[0].last < directory.id_shards[1].first);
+        assert!(directory.files.len() > 1, "the chain spans several files");
+        assert_eq!(
+            directory
+                .files
+                .iter()
+                .map(|file| u64::from(file.rows))
+                .sum::<u64>(),
+            directory.commits
+        );
+    }
+
+    #[test]
+    fn legacy_plan_cuts_data_files_at_each_cap_and_never_across_a_writer() {
+        let records = legacy_records(None, 500, 7, 1);
+        let fields = commit_bytes(&records[1].commit) as u64;
+        let bytes = record_bytes(&records[1].commit, &records[1].tables) as u64;
+        assert!(
+            commit_bytes(&records[0].commit) < fields as usize,
+            "the genesis record has no parent and measures less"
+        );
+        let layout = |release_bytes: u64, file_record_bytes: u64, block_slots: u32| LegacyLayout {
+            release_bytes,
+            file_record_bytes,
+            block_slots,
+            ..LegacyLayout::CURRENT
+        };
+        let current = LegacyLayout::CURRENT;
+        let rows_of = |layout: LegacyLayout, chains: Vec<LegacyChain>| {
+            LegacyObjects::plan(&layout, 13, Ulid::from(1u128), &chains, &BTreeSet::new())
+                .map(|objects| objects.files().iter().map(Vec::len).collect::<Vec<_>>())
+                .map_err(message)
+        };
+        let main = |records: Vec<HistoryRecord>| {
+            vec![legacy_chain(LegacyWriterKind::Main, None, None, records)]
+        };
+        assert_eq!(
+            rows_of(
+                layout(3 * fields, current.file_record_bytes, current.block_slots),
+                main(records.clone())
+            ),
+            Ok(vec![3, 3, 1]),
+            "cut at the commit-field cap"
+        );
+        assert_eq!(
+            rows_of(
+                layout(current.release_bytes, 2 * bytes, current.block_slots),
+                main(records.clone())
+            ),
+            Ok(vec![2, 2, 2, 1]),
+            "cut at the record-byte cap"
+        );
+        assert_eq!(
+            rows_of(
+                layout(current.release_bytes, current.file_record_bytes, 4),
+                main(records.clone())
+            ),
+            Ok(vec![4, 3]),
+            "cut at the row cap"
+        );
+        let mut broken = records.clone();
+        broken[4].commit.parent_commit_id = Some(Ulid::from(1u128).to_string());
+        assert_eq!(
+            rows_of(current, main(broken)),
+            Ok(vec![4, 3]),
+            "cut where the first-parent link breaks"
+        );
+        let mut oversized = records[..3].to_vec();
+        let template = crate::tests::history_table_states().remove(0);
+        oversized[1].tables = (1..=256u64)
+            .map(|table| {
+                let mut row = template.clone();
+                row.registration.identity = TableIdentity::new(table, 3).unwrap();
+                row
+            })
+            .collect();
+        assert_eq!(
+            rows_of(
+                layout(current.release_bytes, bytes * 3, current.block_slots),
+                main(oversized)
+            ),
+            Ok(vec![1, 1, 1]),
+            "a lone oversized record gets its own file"
+        );
+        let two_writers = vec![
+            legacy_chain(LegacyWriterKind::Main, None, None, records[..2].to_vec()),
+            legacy_chain(
+                LegacyWriterKind::Retired,
+                Some("old.fork"),
+                None,
+                legacy_records(Some("old.fork"), 900, 2, 3),
+            ),
+        ];
+        let objects = LegacyObjects::plan(
+            &layout(3 * fields, current.file_record_bytes, current.block_slots),
+            13,
+            Ulid::from(1u128),
+            &two_writers,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            objects.files().iter().map(Vec::len).collect::<Vec<_>>(),
+            [2, 2],
+            "a file never crosses a writer"
+        );
+        let files = &objects.directory().files;
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| (file.first_version, file.last_version, file.rows))
+                .collect::<Vec<_>>(),
+            [(1, 2, 2), (3, 4, 2)]
+        );
+        assert_eq!(
+            files[0].records_sha256,
+            legacy_records_sha256(&records[..2]).unwrap()
+        );
+        let writers = &objects.writer_shards()[0].entries;
+        let mut placed: Vec<_> = writers
+            .iter()
+            .map(|writer| (writer.native.clone(), writer.first_file, writer.files))
+            .collect();
+        placed.sort();
+        assert_eq!(placed, [(None, 0, 1), (Some("old.fork".to_string()), 1, 1)]);
+
+        let refused =
+            |layout: LegacyLayout, chains: Vec<LegacyChain>| rows_of(layout, chains).unwrap_err();
+        let empty = LegacyChain {
+            kind: LegacyWriterKind::Live,
+            native: Some("idle.fork".to_string()),
+            parent: None,
+            parent_version: 0,
+            head_version: 1,
+            records: Vec::new(),
+        };
+        assert!(refused(current, vec![empty]).contains("has no own commit"));
+        assert!(
+            refused(
+                layout(fields - 1, current.file_record_bytes, current.block_slots),
+                main(records.clone())
+            )
+            .contains("over the bounds")
+        );
+        assert!(
+            refused(
+                current,
+                vec![
+                    legacy_chain(LegacyWriterKind::Main, None, None, records[..2].to_vec()),
+                    legacy_chain(LegacyWriterKind::Main, None, None, records[1..3].to_vec()),
+                ]
+            )
+            .contains("written by two chains")
+        );
+        assert!(
+            refused(
+                current,
+                vec![legacy_chain(
+                    LegacyWriterKind::Live,
+                    Some("feature.fork"),
+                    None,
+                    records.clone()
+                )]
+            )
+            .contains("names native branch")
+        );
+        let mut block_id = records[..1].to_vec();
+        block_id[0].commit.graph_commit_id = "hb1.not.a.ulid".to_string();
+        assert!(refused(current, main(block_id)).contains("not a canonical ULID"));
+        assert!(
+            refused(
+                LegacyLayout {
+                    version: 2,
+                    ..current
+                },
+                main(records.clone())
+            )
+            .contains("layout version 2 is not known")
+        );
+        assert!(
+            refused(
+                LegacyLayout {
+                    shard_entries: current.shard_entries + 1,
+                    ..current
+                },
+                main(records)
+            )
+            .contains("exceeds the bounds")
+        );
+    }
+
+    #[tokio::test]
+    async fn put_immutable_accepts_equal_bytes_and_refuses_different_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let session = crate::lance_access::control_session();
+        let (store, base) = store(root, &session).await.unwrap();
+        let path = legacy_directory_path(&base);
+        let first = Bytes::from_static(b"first");
+        assert!(put_immutable(&store, &path, first.clone()).await.unwrap());
+        assert!(put_immutable(&store, &path, first.clone()).await.unwrap());
+        assert!(
+            !put_immutable(&store, &path, Bytes::from_static(b"other"))
+                .await
+                .unwrap()
+        );
+        let held = request(&store, &path, None).await.unwrap().unwrap();
+        assert_eq!(body(held, |size| 0..size).await.unwrap().bytes, first);
+    }
+
+    #[tokio::test]
+    async fn write_legacy_lists_data_files_and_hides_the_locator() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let session = crate::lance_access::control_session();
+        let objects = legacy_objects(99);
+        write_legacy(root, &session, &objects).await.unwrap();
+        let data_files = [
+            "legacy/data/00000000.lance".to_string(),
+            "legacy/data/00000001.lance".to_string(),
+        ];
+        assert_eq!(stored_names(root).await.unwrap(), data_files);
+
+        let (store, base) = store(root, &session).await.unwrap();
+        let planted = legacy_locator_path(&base).join(format!(
+            "directory.{LOCATOR_EXTENSION}.tmp.{}",
+            "0f".repeat(16)
+        ));
+        store
+            .inner
+            .put_opts(
+                &planted,
+                PutPayload::from_static(b"x"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_names(root).await.unwrap(),
+            data_files,
+            "the locator prefix is skipped, a planted temporary included"
+        );
+        assert_eq!(
+            list_extents(&store, &base, None).await.unwrap(),
+            [ExtentKey::LegacyData(0), ExtentKey::LegacyData(1)]
+        );
+
+        let expected: Vec<HistoryRecord> = objects.files().concat();
+        let records = read_records(root, &session).await.unwrap();
+        assert_eq!(records.len(), expected.len());
+        for record in &expected {
+            assert_eq!(records.get(&record.commit.graph_commit_id), Some(record));
+        }
+        let lineage = read_lineage(root, &session).await.unwrap();
+        assert_eq!(lineage.len(), expected.len());
+
+        let fetch_all = |path: Path| {
+            let store = &store;
+            async move {
+                let result = request(store, &path, None).await.unwrap().unwrap();
+                body(result, |size| 0..size).await.unwrap().bytes
+            }
+        };
+        let directory = fetch_all(legacy_directory_path(&base)).await;
+        assert_eq!(
+            sha256(&directory),
+            sha256(&objects.directory().encode().unwrap())
+        );
+        assert_eq!(
+            &LegacyDirectory::decode(&directory).unwrap(),
+            objects.directory()
+        );
+        let id_shard = fetch_all(legacy_shard_path(&base, LEGACY_IDS_DIR, 0)).await;
+        assert_eq!(sha256(&id_shard), objects.directory().id_shards[0].sha256);
+        assert_eq!(
+            &LegacyIdShard::decode(&id_shard).unwrap(),
+            &objects.id_shards()[0]
+        );
+        let writer_shard = fetch_all(legacy_shard_path(&base, LEGACY_WRITERS_DIR, 0)).await;
+        assert_eq!(
+            sha256(&writer_shard),
+            objects.directory().writer_shards[0].sha256
+        );
+        assert_eq!(
+            &LegacyWriterShard::decode(&writer_shard).unwrap(),
+            &objects.writer_shards()[0]
+        );
+
+        write_legacy(root, &session, &objects)
+            .await
+            .expect("an equal legacy set is accepted again");
+        let error = message(
+            write_legacy(root, &session, &legacy_objects(100))
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            error.contains("holds other bytes") && error.contains("directory.oglx"),
+            "{error}"
+        );
+        let mut other_tables = legacy_objects(99);
+        other_tables.files[1][0].tables.clear();
+        let error = message(
+            write_legacy(root, &session, &other_tables)
+                .await
+                .unwrap_err(),
+        );
+        assert!(error.contains("that differ"), "{error}");
+    }
+
+    /// One record under an opaque id, as the genesis of a graph born at stamp
+    /// 14 is archived: a singleton, never in a block and never under `legacy/`.
+    fn born_at_14() -> HistoryRecord {
+        let mut genesis = records().remove(0);
+        genesis.commit.graph_commit_id = "born-at-14".to_string();
+        genesis.commit.parent_commit_id = None;
+        genesis
+    }
+
+    #[test]
+    fn at_rows_keeps_the_named_rows_and_refuses_one_beyond_the_file() {
+        let records = legacy_records(None, 1_000, 5, 1);
+        let ids: Vec<&str> = records
+            .iter()
+            .map(|record| record.commit.graph_commit_id.as_str())
+            .collect();
+        let full = Rows::Full(Arc::new(records.clone()));
+        let one = full.clone().at_rows(&BTreeSet::from([3])).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(
+            one.commits()
+                .next()
+                .map(|commit| commit.graph_commit_id.as_str()),
+            Some(ids[3])
+        );
+        assert_eq!(
+            full.clone().at_rows(&(0..5).collect()).unwrap().len(),
+            5,
+            "every row named hands the object back whole"
+        );
+        let error = message(full.at_rows(&BTreeSet::from([5])).unwrap_err());
+        assert!(
+            error.contains("beyond the rows of the data file"),
+            "{error}"
+        );
+        let lineage = Rows::Lineage(Arc::new(
+            records.iter().map(|record| record.commit.clone()).collect(),
+        ));
+        let ends = lineage.at_rows(&BTreeSet::from([0, 4])).unwrap();
+        assert_eq!(
+            ends.commits()
+                .map(|commit| commit.graph_commit_id.as_str())
+                .collect::<Vec<_>>(),
+            [ids[0], ids[4]]
+        );
+    }
+
+    /// The GETs of legacy lookups through one handle, a cleared handle, a
+    /// handle that only hits singletons, and a read without a handle.
+    #[tokio::test]
+    async fn legacy_lookup_reads_the_directory_once_per_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let session = crate::lance_access::control_session();
+        let objects = legacy_objects(99);
+        write_legacy(root, &session, &objects).await.unwrap();
+        let genesis = born_at_14();
+        settle(root, &session, std::slice::from_ref(&genesis))
+            .await
+            .unwrap();
+        let main_first = &objects.files()[0][0];
+        let fork_last = &objects.files()[1][2];
+        let main_id = main_first.commit.graph_commit_id.as_str();
+        let fork_id = fork_last.commit.graph_commit_id.as_str();
+        let genesis_id = genesis.commit.graph_commit_id.as_str();
+        let gets = crate::tests::HistoryGets::default();
+        let handle = ExtentCache::default();
+        crate::instrumentation::with_query_io_probes(gets.probes(), async {
+            assert_eq!(
+                read_commit_in(root, &session, &handle, main_id)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                Some(&main_first.commit)
+            );
+            assert_eq!(
+                gets.drain(),
+                (4, 1, 0),
+                "the absent singleton name, the directory, the id shard and the data file"
+            );
+            assert_eq!(
+                legacy_directory(root, &session, Some(&handle))
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(objects.directory())
+            );
+            assert_eq!(
+                read_record_in(root, &session, &handle, fork_id)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                Some(fork_last)
+            );
+            assert_eq!(
+                gets.drain(),
+                (1, 0, 0),
+                "the directory and the id shard are held: the other data file alone"
+            );
+            assert_eq!(
+                read_commit_in(root, &session, &handle, main_id)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                Some(&main_first.commit)
+            );
+            assert_eq!(
+                read_commit_in(root, &session, &handle, fork_id)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                Some(&fork_last.commit)
+            );
+            assert_eq!(
+                read_record_in(root, &session, &handle, fork_id)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                Some(fork_last)
+            );
+            assert_eq!(
+                gets.drain(),
+                (0, 0, 0),
+                "held data files serve lineage and record reads"
+            );
+            assert!(
+                objects.files()[0].len() > 1,
+                "the located row is one of several in its data file"
+            );
+            let one_row = KEY_BYTES + ROW_CHARGE;
+            let located = read_lineage_of_bounded_in(root, &session, &handle, &[main_id], one_row)
+                .await
+                .expect("a located id is charged its address and its one row");
+            assert_eq!(located.get(main_id), Some(&main_first.commit));
+            assert_eq!(located.len(), 1);
+            let error = message(
+                read_lineage_of_bounded_in(root, &session, &handle, &[main_id], one_row - 1)
+                    .await
+                    .unwrap_err(),
+            );
+            assert!(
+                error.contains("selective lineage byte budget exhausted"),
+                "{error}"
+            );
+            assert_eq!(gets.drain(), (0, 0, 0), "the bounded reads are warm");
+            assert_eq!(
+                read_commit_in(root, &session, &handle, genesis_id)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                Some(&genesis.commit)
+            );
+            assert_eq!(
+                gets.drain(),
+                (1, 0, 0),
+                "an id the locator does not list falls back to its singleton"
+            );
+            assert_eq!(
+                read_commit_in(root, &session, &handle, "never-published")
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert_eq!(gets.drain(), (1, 1, 0));
+            handle.clear();
+            assert_eq!(
+                read_commit_in(root, &session, &handle, main_id)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                Some(&main_first.commit)
+            );
+            assert_eq!(
+                gets.drain(),
+                (4, 1, 0),
+                "a cleared handle probes the directory again"
+            );
+
+            let fresh = ExtentCache::default();
+            assert_eq!(
+                read_commit_in(root, &session, &fresh, genesis_id)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                Some(&genesis.commit)
+            );
+            assert_eq!(
+                gets.drain(),
+                (1, 0, 0),
+                "a singleton hit never asks for the directory"
+            );
+            assert_eq!(
+                read_commit_in(root, &session, &fresh, "never-published")
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                gets.drain(),
+                (2, 1, 0),
+                "the first singleton miss reads the directory, which lists no such id"
+            );
+            assert_eq!(
+                read_commit_in(root, &session, &fresh, "never-published")
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert_eq!(gets.drain(), (1, 1, 0));
+
+            assert_eq!(
+                read_commit(root, &session, main_id).await.unwrap().as_ref(),
+                Some(&main_first.commit)
+            );
+            assert_eq!(
+                gets.drain(),
+                (4, 1, 0),
+                "a read without a handle pays the probe itself"
+            );
+            let found = read_records_of(root, &session, &[main_id, fork_id, genesis_id])
+                .await
+                .unwrap();
+            assert_eq!(found.get(main_id), Some(main_first));
+            assert_eq!(found.get(fork_id), Some(fork_last));
+            assert_eq!(found.get(genesis_id), Some(&genesis));
+            assert_eq!(
+                gets.drain(),
+                (6, 1, 0),
+                "the first singleton miss, the directory, the id shard once, two data files \
+                 and the singleton hit"
+            );
+        })
+        .await;
+
+        let cold = 4 * KEY_BYTES
+            + objects.directory().encode().unwrap().len()
+            + objects.id_shards()[0].encode().unwrap().len()
+            + TAIL_BYTES;
+        let located =
+            read_lineage_of_bounded_in(root, &session, &ExtentCache::default(), &[main_id], cold)
+                .await
+                .expect(
+                    "a cold lookup is charged four addresses, the directory and the id shard, \
+                     and still covers one suffix read of the data file",
+                );
+        assert_eq!(located.get(main_id), Some(&main_first.commit));
+        let error = message(
+            read_lineage_of_bounded_in(
+                root,
+                &session,
+                &ExtentCache::default(),
+                &[main_id],
+                cold - 1,
+            )
+            .await
+            .expect_err("one byte less leaves no suffix read for the data file"),
+        );
+        assert!(
+            error.ends_with("selective lineage byte budget exhausted"),
+            "{error}"
+        );
+    }
+
+    /// Every way the locator can disagree with the objects it names fails the
+    /// lookup loudly; none hands back another commit's row.
+    #[tokio::test]
+    async fn legacy_lookup_refuses_a_locator_that_disagrees_with_its_objects() {
+        use object_store::ObjectStoreExt as _;
+        let session = crate::lance_access::control_session();
+        let objects = legacy_objects(99);
+        let ids: Vec<&str> = objects.files()[0]
+            .iter()
+            .map(|record| record.commit.graph_commit_id.as_str())
+            .collect();
+        let lookup = |root: &str, wanted: Vec<&str>| {
+            let (root, session) = (root.to_string(), Arc::clone(&session));
+            let wanted: Vec<String> = wanted.into_iter().map(str::to_string).collect();
+            async move {
+                let wanted: Vec<&str> = wanted.iter().map(String::as_str).collect();
+                let budget = DEFAULT_LINEAGE_BYTES;
+                let fresh = ExtentCache::default();
+                read_lineage_of_bounded_in(&root, &session, &fresh, &wanted, budget)
+                    .await
+                    .map_err(message)
+            }
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        write_legacy(root, &session, &objects).await.unwrap();
+        let (store, base) = store(root, &session).await.unwrap();
+        assert_eq!(lookup(root, vec![ids[0]]).await.unwrap().len(), 1);
+
+        let data_file = ExtentKey::LegacyData(0).path(&base);
+        store.inner.delete(&data_file).await.unwrap();
+        let error = lookup(root, vec![ids[0]]).await.unwrap_err();
+        assert!(
+            error.contains("the directory lists data file 0 and the object is absent"),
+            "{error}"
+        );
+
+        let shard_path = legacy_shard_path(&base, LEGACY_IDS_DIR, 0);
+        let mut swapped = objects.id_shards()[0].clone();
+        let (file, row) = (swapped.entries[0].file, swapped.entries[0].row);
+        (swapped.entries[0].file, swapped.entries[0].row) =
+            (swapped.entries[1].file, swapped.entries[1].row);
+        (swapped.entries[1].file, swapped.entries[1].row) = (file, row);
+        assert_ne!(swapped, objects.id_shards()[0]);
+        store
+            .inner
+            .put_opts(
+                &shard_path,
+                PutPayload::from(swapped.encode().unwrap()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let error = lookup(root, vec![ids[0]]).await.unwrap_err();
+        assert!(
+            error.contains("id shard 0 does not hash to the digest the directory lists"),
+            "{error}"
+        );
+
+        store.inner.delete(&shard_path).await.unwrap();
+        let error = lookup(root, vec![ids[0]]).await.unwrap_err();
+        assert!(
+            error.contains("the directory lists id shard 0 and the object is absent"),
+            "{error}"
+        );
+
+        let mut misplaced = objects.clone();
+        misplaced.id_shards[0].entries[1].row = 0;
+        misplaced.id_shards[0].entries[2].row = 3;
+        misplaced.directory.id_shards[0].sha256 = sha256(&misplaced.id_shards[0].encode().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        write_legacy(root, &session, &misplaced).await.unwrap();
+        assert_eq!(lookup(root, vec![ids[4]]).await.unwrap().len(), 1);
+        let error = lookup(root, vec![ids[2]]).await.unwrap_err();
+        assert!(
+            error.contains(&format!(
+                "the locator places commit '{}' at row 3 of data file 0, which holds another \
+                 commit",
+                ids[2]
+            )),
+            "{error}"
+        );
+        let error = lookup(root, vec![ids[0], ids[1]]).await.unwrap_err();
+        assert!(
+            error.contains("the locator places two requested commits at row 0 of data file 0"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_root_without_legacy_history_pays_one_directory_miss_per_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let session = crate::lance_access::control_session();
+        let genesis = born_at_14();
+        settle(root, &session, std::slice::from_ref(&genesis))
+            .await
+            .unwrap();
+        let genesis_id = genesis.commit.graph_commit_id.as_str();
+        let gets = crate::tests::HistoryGets::default();
+        let handle = ExtentCache::default();
+        crate::instrumentation::with_query_io_probes(gets.probes(), async {
+            assert_eq!(
+                read_commit_in(root, &session, &handle, genesis_id)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                Some(&genesis.commit)
+            );
+            assert_eq!(
+                gets.drain(),
+                (1, 0, 0),
+                "a graph born at stamp 14 finds its genesis in one GET"
+            );
+            assert_eq!(
+                read_commit_in(root, &session, &handle, "never-published")
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                gets.drain(),
+                (2, 2, 0),
+                "a true not-found adds the directory miss once"
+            );
+            assert_eq!(
+                read_commit_in(root, &session, &handle, "never-published")
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                gets.drain(),
+                (1, 1, 0),
+                "the handle keeps that the root has no directory"
+            );
+            assert!(
+                legacy_directory(root, &session, Some(&handle))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(gets.drain(), (0, 0, 0));
+            assert!(
+                legacy_directory(root, &session, None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(gets.drain(), (1, 1, 0));
+        })
+        .await;
+    }
+
+    /// A lineage naming a merged parent the directory lists as absent is
+    /// complete without it; an unlisted id, or any id on a root without a
+    /// directory, is still a missing parent.
+    #[tokio::test]
+    async fn lineage_accepts_a_merged_parent_the_directory_lists_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let session = crate::lance_access::control_session();
+        let objects = legacy_objects(99);
+        write_legacy(root, &session, &objects).await.unwrap();
+        let main_head = objects.files()[0].last().unwrap().commit.clone();
+        let head_merging = |merged: u128| GraphLineageRow {
+            graph_commit_id: Ulid::from(9_000u128).to_string(),
+            graph_manifest_version: main_head.graph_manifest_version + 1,
+            generation: main_head.generation + 1,
+            parent_commit_id: Some(main_head.graph_commit_id.clone()),
+            merged_parent_commit_id: Some(Ulid::from(merged).to_string()),
+            ..main_head.clone()
+        };
+        let graph = |root: &str, head: GraphLineageRow| {
+            crate::commit_graph::CommitGraph::from_head(
+                root,
+                Arc::clone(&session),
+                head,
+                &[],
+                crate::commit_graph::HistoryCache::default(),
+            )
+        };
+        let probes = crate::instrumentation::QueryIoProbes::default();
+        let refreshes = Arc::clone(&probes.projection_full_refreshes);
+        crate::instrumentation::with_query_io_probes(probes, async {
+            let listed = graph(root, head_merging(7));
+            let lineage = listed.lineage().await.unwrap();
+            assert_eq!(lineage.first_parent_chain().unwrap().len(), 6);
+            assert!(lineage.get_commit(&Ulid::from(7u128).to_string()).is_none());
+            assert_eq!(refreshes.load(Ordering::Relaxed), 1);
+            listed.lineage().await.unwrap();
+            assert_eq!(
+                refreshes.load(Ordering::Relaxed),
+                1,
+                "a listed absent parent counts as held: `__history` is not read again"
+            );
+            let unlisted = Ulid::from(8u128).to_string();
+            let refused = graph(root, head_merging(8)).lineage().await.err();
+            let error = message(refused.expect("an unlisted merged parent is missing"));
+            assert!(
+                error.contains("does not hold it") && error.contains(&unlisted),
+                "{error}"
+            );
+        })
+        .await;
+
+        let bare = tempfile::tempdir().unwrap();
+        let bare = bare.path().to_str().unwrap();
+        settle(bare, &session, &objects.files()[0]).await.unwrap();
+        let refused = graph(bare, head_merging(7)).lineage().await.err();
+        let error = message(refused.expect("a root without a directory lists no absent parent"));
+        assert!(error.contains("does not hold it"), "{error}");
+        let mut unmerged = head_merging(7);
+        unmerged.merged_parent_commit_id = None;
+        assert_eq!(
+            graph(bare, unmerged)
+                .lineage()
+                .await
+                .unwrap()
+                .first_parent_chain()
+                .unwrap()
+                .len(),
+            6
         );
     }
 }

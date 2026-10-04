@@ -46,6 +46,32 @@ pub(crate) async fn overwrite(
     Ok((committed, batch))
 }
 
+/// Create `uri` with `batch` as its first version, stamped by the batch's schema
+/// metadata: the birth of a `__manifest` fixture of an older stamp.
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) async fn create_for_test(uri: &str, batch: RecordBatch) -> Result<Dataset> {
+    let schema = batch.schema();
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        store_params: Some(crate::storage::lance_store_params_for_uri(uri)?),
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        auto_cleanup: None,
+        skip_auto_cleanup: true,
+        ..Default::default()
+    };
+    let params = crate::lance_clone::write_params(uri, params)
+        .await
+        .map_err(crate::error::OmniError::storage)?;
+    Dataset::write(
+        arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(params),
+    )
+    .await
+    .map_err(crate::error::OmniError::storage)
+}
+
 /// Commit `batches` as the whole stored row set at `dataset`'s version + 1 (the module doc: zero
 /// retries, the version number is the CAS).
 pub(crate) async fn commit_overwrite(

@@ -15,9 +15,12 @@ use std::path::{Path, PathBuf};
 use omnigraph::db::Omnigraph;
 use omnigraph_cluster::seams::FailScenario;
 use omnigraph_cluster::{DeploymentLookup, apply_deployment};
-use omnigraph_core::graph_commit_id::intent_nonce;
 use serial_test::serial;
 use tempfile::tempdir;
+
+fn intent_nonce(commit_id: &str) -> Option<&str> {
+    commit_id.rsplit('.').next()
+}
 
 const SCHEMA: &str = r#"
 node Person {

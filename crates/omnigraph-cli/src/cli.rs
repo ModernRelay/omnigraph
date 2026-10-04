@@ -317,12 +317,12 @@ pub(crate) enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Report whether graph storage is in the format this binary serves; this
-    /// binary converts no older format (rebuild those by export and load)
+    /// Convert a standalone graph's storage offline from format v13 to the
+    /// format this binary serves (v14); older formats are rebuilt by export and load
     Upgrade {
         /// Standalone graph storage URI; alternatively use --store
         uri: Option<String>,
-        /// Report only; the command writes nothing either way
+        /// Report whether the conversion can run; writes nothing
         #[arg(long)]
         check: bool,
         /// Requested storage format (defaults to the format this binary serves)

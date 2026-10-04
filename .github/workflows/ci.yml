@@ -732,12 +732,22 @@ jobs:
   storage_upgrade_compatibility:
     name: Storage Upgrade Compatibility
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Two builds use one target directory here: the genuine stamp-13
+    # predecessor CLI (one package, one bin, no test features), then the
+    # current tree's test targets. Their dependency feature sets differ (the
+    # test builds enable dev-dependency features such as lance-io's defaults
+    # and test-util), so the second build reuses only the dependency artifacts
+    # whose features match. The v5 fence measured a cold predecessor CLI at
+    # 25m40s.
+    timeout-minutes: 90
     permissions:
       contents: read
     env:
       CARGO_TERM_COLOR: always
       RUST_MIN_STACK: 16777216
+      # A missing predecessor binary fails the genuine journey instead of
+      # skipping it: this context is required on every change.
+      OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS: '1'
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -761,12 +771,50 @@ jobs:
       - name: Check storage compatibility gate configuration
         run: python3 scripts/check-storage-upgrade-ci.py --self-test
 
+      # The genuine stamp-13 predecessor for the one in-place route
+      # (`omnigraph upgrade`, storage format 13 to 14). Keep this immutable:
+      # HEAD^ is not a stable format reference, and the last main commit that
+      # wrote stamp 13 is the source the journey converts.
+      - name: Build genuine stamp-13 CLI
+        env:
+          STAMP_13_SOURCE_COMMIT: c0a4519f38d65dc1356728981983da8b096cfbef
+        run: |
+          set -euo pipefail
+          v13_source="$RUNNER_TEMP/omnigraph-stamp-13"
+          v13_bin="$RUNNER_TEMP/omnigraph-stamp-13-bin"
+          git fetch --no-tags --depth=1 origin "$STAMP_13_SOURCE_COMMIT"
+          git worktree add --detach "$v13_source" "$STAMP_13_SOURCE_COMMIT"
+          cargo build --locked \
+            --manifest-path "$v13_source/Cargo.toml" \
+            --package omnigraph-cli \
+            --bin omnigraph \
+            --target-dir "$GITHUB_WORKSPACE/target"
+          cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$v13_bin"
+          test -x "$v13_bin"
+          # Clean path-package artifacts through both workspace manifests while
+          # retaining shared registry dependencies: the predecessor and current
+          # packages share names and versions, so either manifest alone can
+          # miss a stale path identity and link the wrong rlib.
+          cargo clean --workspace --locked \
+            --manifest-path "$v13_source/Cargo.toml" \
+            --target-dir "$GITHUB_WORKSPACE/target"
+          cargo clean --workspace --locked \
+            --target-dir "$GITHUB_WORKSPACE/target"
+          echo "OMNIGRAPH_V13_BIN=$v13_bin" >> "$GITHUB_ENV"
+
       - name: Run required storage upgrade crossversion tests
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/storage-upgrade-crossversion.log"
           cargo test --workspace --locked --test crossversion_upgrade --features "$FAILPOINT_FEATURES" storage_upgrade -- --test-threads=1 2>&1 | tee "$test_log"
           python3 scripts/check-storage-upgrade-ci.py --check-log crossversion "$test_log"
+
+      - name: Run required storage upgrade engine tests
+        run: |
+          set -euo pipefail
+          test_log="$RUNNER_TEMP/storage-upgrade-engine.log"
+          cargo test --locked -p omnigraph-engine --lib --features failpoints db::upgrade::tests -- --test-threads=1 2>&1 | tee "$test_log"
+          python3 scripts/check-storage-upgrade-ci.py --check-log engine "$test_log"
 
       - name: Run required storage upgrade lance tests
         run: |

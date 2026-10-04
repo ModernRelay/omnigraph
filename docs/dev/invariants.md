@@ -135,6 +135,10 @@ different:
   durable graph visibility;
 - maintained parallel truth or cold full-history reconstruction per request.
 
+Cases an RFC has argued: the flat locator objects and legacy data files under
+`__history/legacy/`, written once by the stamp-13 storage upgrade, in the
+[RFC 0068 amendment](../rfcs/0068-graph-commit-record.md#why-this-is-not-a-deny-list-shape).
+
 ## Current support boundaries
 
 - The server is cluster-only and ledger v2 is the sole operational protocol.

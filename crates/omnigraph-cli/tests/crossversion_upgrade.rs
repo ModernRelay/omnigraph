@@ -21,6 +21,11 @@
 //! `OMNIGRAPH_V6_BIN` (the released 0.10.x CLI) proves both directions of the
 //! v6/v10 fence (RFC 0062 registration clock, RFC 0042 native-ref retirement
 //! metadata and RFC 0040 system columns).
+//! `OMNIGRAPH_V13_BIN` (a main build that writes storage format 13, CI builds
+//! `c0a4519f`) drives the one in-place route: the offline `omnigraph upgrade`
+//! of a genuine stamp-13 root to format 14 with its branches and commit
+//! history kept. With `OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS=1` an unset
+//! variable fails instead of skipping.
 
 mod support;
 
@@ -91,6 +96,34 @@ fn v6_bin() -> Option<PathBuf> {
     assert!(
         reported.contains("omnigraph 0.10."),
         "OMNIGRAPH_V6_BIN must be a released 0.10.x binary (the last internal-v6 writer), got: {reported}",
+    );
+    Some(path)
+}
+
+/// Resolve the stamp-13 predecessor: `OMNIGRAPH_V13_BIN`, else a binary placed
+/// under `target/storage-upgrade-binaries/stamp-13/`. The journey proves the
+/// stamp by behaviour, so any main build that writes format 13 serves locally.
+fn v13_bin() -> Option<PathBuf> {
+    const VARIABLE: &str = "OMNIGRAPH_V13_BIN";
+    let local = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/storage-upgrade-binaries/stamp-13")
+        .join(format!("omnigraph{}", std::env::consts::EXE_SUFFIX));
+    let selected = std::env::var_os(VARIABLE)
+        .map(PathBuf::from)
+        .or_else(|| local.is_file().then_some(local));
+    let Some(path) = selected else {
+        assert!(
+            std::env::var_os("OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS").is_none(),
+            "required storage upgrade predecessor {VARIABLE} is unset"
+        );
+        eprintln!("skipping genuine v13 storage upgrade: {VARIABLE} is unset");
+        return None;
+    };
+    assert!(
+        path.is_file(),
+        "{VARIABLE} is not a binary file: {} \
+         (unset it to skip, or point it at an omnigraph binary built from a stamp-13 main commit)",
+        path.display(),
     );
     Some(path)
 }
@@ -874,6 +907,112 @@ fn storage_upgrade_current_binary_reports_already_current_on_a_fresh_graph() {
         );
     }
     assert_eq!(graph_files(&graph), before, "upgrade must not write");
+
+    let report =
+        support::parse_stdout_json(&output_success(cli().args(["upgrade", uri, "--json"])));
+    let location = report["location"].as_str().unwrap();
+    let echo = format!("omnigraph upgrade → {location} (direct, local)");
+    for (flags, mode) in [(vec!["--check"], "check"), (vec![], "execute")] {
+        let output = output_success(cli().args(["upgrade", uri]).args(&flags));
+        let mut expected = human_report_lines(
+            &report,
+            &format!("upgrade {location}: already_current ({mode})"),
+            &format!("format: {current} -> {current} (default target)"),
+            "route: none",
+        );
+        if mode == "check" {
+            expected.push(CHECK_ADVISORY_LINE.to_owned());
+        }
+        assert_eq!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            expected,
+            "{mode}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.lines().any(|line| line == echo),
+            mode == "execute",
+            "only execute mode echoes the write target: {stderr}"
+        );
+    }
+    let quiet = output_success(cli().args(["--quiet", "upgrade", uri]));
+    assert!(
+        !String::from_utf8_lossy(&quiet.stderr).contains("omnigraph upgrade →"),
+        "--quiet must drop the write-target echo"
+    );
+    assert_eq!(graph_files(&graph), before, "upgrade must not write");
+}
+
+const CHECK_ADVISORY_LINE: &str = "Check is advisory. Keep the graph offline: stop all readers, \
+     writers and maintenance, retain a verified backup of the whole root, then run `omnigraph \
+     upgrade <graph>` without `--check`.";
+
+/// The human `upgrade` lines of a finding-free report: the three passed lines
+/// are literal, the rest carry the values the JSON report of that state holds.
+fn human_report_lines(
+    report: &serde_json::Value,
+    headline: &str,
+    format: &str,
+    route: &str,
+) -> Vec<String> {
+    let work = &report["work"];
+    let count = |field: &str| work[field].as_u64().unwrap();
+    let joined = |field: &str| {
+        let items: Vec<&str> = report[field]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item.as_str().unwrap())
+            .collect();
+        if items.is_empty() {
+            "none".to_owned()
+        } else {
+            items.join(", ")
+        }
+    };
+    vec![
+        headline.to_owned(),
+        format!(
+            "graph identity: {}",
+            report["graph_identity"].as_str().unwrap_or("unknown")
+        ),
+        format.to_owned(),
+        route.to_owned(),
+        format!("completed handlers: {}", joined("completed_handlers")),
+        format!(
+            "last durable completed boundary: {}",
+            report["last_durable_completed_boundary"]
+                .as_str()
+                .unwrap_or("none")
+        ),
+        format!(
+            "source: {} live refs, {} retired refs, {} orphan writers, {} legacy commits, \
+             {} bookkeeping versions, {} absent parents",
+            count("live_refs"),
+            count("retired_refs"),
+            count("orphan_writers"),
+            count("legacy_commits"),
+            count("bookkeeping_versions"),
+            count("absent_parents")
+        ),
+        format!(
+            "legacy objects: {} data files, {} id shards, {} writer shards, {} schema contents, \
+             {} bytes",
+            count("data_files"),
+            count("id_shards"),
+            count("writer_shards"),
+            count("schema_contents"),
+            count("legacy_bytes")
+        ),
+        format!(
+            "census: {} reads, {} cells",
+            count("census_reads"),
+            count("census_cells")
+        ),
+    ]
 }
 
 #[test]
@@ -1385,5 +1524,572 @@ fn storage_upgrade_refuses_cluster_path_aliases() {
                 "{alias} must refuse before effects"
             );
         }
+    }
+}
+
+const V13_HANDLER: &str = "history-lance-files-v13-to-v14";
+
+/// The live branches of the stamp-13 journey graph once the predecessor is
+/// done with it: `review` is the second branch of that name (the first was
+/// merged into main and deleted) and `child` is a fork of the deleted `temp`.
+const V13_LIVE_BRANCHES: [&str; 3] = ["main", "review", "child"];
+
+fn v13_query_source() -> &'static str {
+    r#"
+query docs() {
+    match { $d: Doc }
+    return { $d.slug, $d.title, $d.body, $d.embedding }
+    order { $d.slug }
+}
+query edges() {
+    match { $a: Doc $a $c:cites $b }
+    return { $a.slug, $b.slug, $c.note }
+}
+query retitle($title: String) { update Doc set { title: $title } where slug = "ml-intro" }
+query remove() { delete Doc where slug = "rl-intro" }
+query revise() { update Doc set { body: "written after storage upgrade" } where slug = "dl-basics" }
+query vectors($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 1
+}
+"#
+}
+
+/// The rows `name` returns through `binary` at `selector value`, with the
+/// predecessor's widened floats narrowed so both binaries print alike.
+fn journey_rows(
+    binary: Option<&Path>,
+    uri: &str,
+    query_path: &str,
+    selector: &str,
+    value: &str,
+    name: &str,
+) -> serde_json::Value {
+    let params = if name == "vectors" {
+        r#"{"q":[0.1,0.2,0.3,0.4]}"#
+    } else {
+        "{}"
+    };
+    let args = [
+        "query", name, "--query", query_path, "--store", uri, selector, value, "--params", params,
+        "--json",
+    ];
+    let output = match binary {
+        Some(old) => {
+            let output = run_old(old, &args);
+            assert_ok("stamp-13 query", &output);
+            output
+        }
+        None => output_success(cli().args(args)),
+    };
+    let mut rows = support::parse_stdout_json(&output)["rows"].clone();
+    normalize_f32_and_nulls(&mut rows);
+    rows
+}
+
+/// A commit object the predecessor listed: every field it printed must hold
+/// the same value in the current listing, which may add fields.
+fn assert_lists_commit(listing: &serde_json::Value, expected: &serde_json::Value) {
+    let id = expected["graph_commit_id"].as_str().unwrap();
+    let found = listing["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|commit| commit["graph_commit_id"] == id)
+        .unwrap_or_else(|| panic!("commit {id} is missing after the upgrade: {listing}"));
+    for (field, value) in expected.as_object().unwrap() {
+        assert_eq!(&found[field], value, "commit {id} field {field} changed");
+    }
+}
+
+#[test]
+fn genuine_v13_storage_upgrade_preserves_history() {
+    let Some(old) = v13_bin() else {
+        return;
+    };
+    let old = old.as_path();
+    let temp = tempdir().unwrap();
+    let graph = temp.path().join("standalone.omni");
+    let uri = graph.to_str().unwrap();
+    let schema = temp.path().join("stamp13.pg");
+    let data = temp.path().join("stamp13.jsonl");
+    let queries = temp.path().join("stamp13.gq");
+    std::fs::write(
+        &schema,
+        format!(
+            "{}\nedge Cites: Doc -> Doc {{ note: String }}\n",
+            std::fs::read_to_string(fixture("search.pg")).unwrap()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &data,
+        format!(
+            "{}\n{}\n",
+            std::fs::read_to_string(fixture("search.jsonl"))
+                .unwrap()
+                .trim_end(),
+            r#"{"edge":"Cites","id":"citation-1","from":"ml-intro","to":"dl-basics","data":{"note":"preserved edge"}}"#,
+        ),
+    )
+    .unwrap();
+    std::fs::write(&queries, v13_query_source()).unwrap();
+    let query_path = queries.to_str().unwrap();
+
+    assert_ok(
+        "stamp-13 init",
+        &run_old(old, &["init", "--schema", schema.to_str().unwrap(), uri]),
+    );
+    let born = run_old(old, &["snapshot", uri, "--json"]);
+    assert_ok("stamp-13 snapshot", &born);
+    assert_eq!(
+        support::parse_stdout_json(&born)["internal_schema_version"],
+        13,
+        "OMNIGRAPH_V13_BIN must be a build that writes storage format 13"
+    );
+    assert_ok(
+        "stamp-13 load",
+        &run_old(
+            old,
+            &[
+                "load",
+                "--mode",
+                "overwrite",
+                "--data",
+                data.to_str().unwrap(),
+                uri,
+            ],
+        ),
+    );
+    let old_mutate = |name: &str, branch: &str, params: &str| {
+        assert_ok(
+            "stamp-13 mutate",
+            &run_old(
+                old,
+                &[
+                    "mutate", name, "--query", query_path, "--store", uri, "--branch", branch,
+                    "--params", params,
+                ],
+            ),
+        );
+    };
+    let old_branch = |args: &[&str]| {
+        let mut full = vec!["branch"];
+        full.extend_from_slice(args);
+        full.extend_from_slice(&["--uri", uri]);
+        assert_ok("stamp-13 branch", &run_old(old, &full));
+    };
+    old_branch(&["create", "review"]);
+    old_mutate("retitle", "main", r#"{"title":"organism main"}"#);
+    old_mutate("remove", "review", "{}");
+    old_branch(&["merge", "review", "--into", "main"]);
+    old_branch(&["delete", "review"]);
+    old_branch(&["create", "review"]);
+    old_mutate("retitle", "review", r#"{"title":"organism recreated"}"#);
+    old_branch(&["create", "temp"]);
+    old_mutate("retitle", "temp", r#"{"title":"organism temp"}"#);
+    old_branch(&["create", "child", "--from", "temp"]);
+    old_branch(&["delete", "temp"]);
+
+    let histories: Vec<serde_json::Value> = V13_LIVE_BRANCHES
+        .into_iter()
+        .map(|branch| {
+            let output = run_old(old, &["commit", "list", uri, "--branch", branch, "--json"]);
+            assert_ok("stamp-13 commit list", &output);
+            support::parse_stdout_json(&output)["commits"].clone()
+        })
+        .collect();
+    let mut historical_rows = std::collections::BTreeMap::new();
+    for commit in histories
+        .iter()
+        .flat_map(|history| history.as_array().unwrap())
+    {
+        if commit["graph_branch"] == "temp" {
+            continue;
+        }
+        let id = commit["graph_commit_id"].as_str().unwrap();
+        historical_rows.entry(id.to_owned()).or_insert_with(|| {
+            [
+                journey_rows(Some(old), uri, query_path, "--snapshot", id, "docs"),
+                journey_rows(Some(old), uri, query_path, "--snapshot", id, "edges"),
+            ]
+        });
+    }
+    assert_eq!(
+        histories[2]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|commit| commit["graph_branch"] == "temp")
+            .count(),
+        1,
+        "`child` inherits the one commit of the deleted `temp`; neither binary selects a commit \
+         of a deleted branch by id, so it is read through `child`: {}",
+        histories[2]
+    );
+    assert!(
+        historical_rows.len() >= 5,
+        "the predecessor wrote fewer commits than the journey needs: {:?}",
+        historical_rows.keys().collect::<Vec<_>>()
+    );
+    let exports: Vec<_> = V13_LIVE_BRANCHES
+        .into_iter()
+        .map(|branch| {
+            let output = run_old(old, &["export", uri, "--branch", branch]);
+            assert_ok("stamp-13 export", &output);
+            canonical_export_rows(&output.stdout)
+        })
+        .collect();
+    let before = graph_files(&graph);
+
+    let refused = output_failure(cli().args(["snapshot", uri]));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("`omnigraph upgrade <graph> --check`"),
+        "the stamp-13 refusal must name the route: {stderr}"
+    );
+    let check = support::parse_stdout_json(&output_success(
+        cli().args(["upgrade", uri, "--check", "--json"]),
+    ));
+    assert_eq!(check["outcome"], "check_passed", "{check}");
+    assert_eq!(check["observed_format"], 13);
+    assert_eq!(check["target_format"], 14);
+    assert_eq!(check["target_defaulted"], true);
+    assert_eq!(check["route"], serde_json::json!([V13_HANDLER]));
+    assert_eq!(check["completed_handlers"], serde_json::json!([]));
+    assert_eq!(check["findings"], serde_json::json!([]));
+    assert_eq!(check["work"]["live_refs"], V13_LIVE_BRANCHES.len());
+    assert!(
+        check["work"]["legacy_commits"].as_u64().unwrap() >= historical_rows.len() as u64,
+        "{check}"
+    );
+    assert_eq!(graph_files(&graph), before, "--check must write nothing");
+    let human = output_success(cli().args(["upgrade", uri, "--check"]));
+    let mut expected = human_report_lines(
+        &check,
+        &format!(
+            "upgrade {}: check_passed (check)",
+            check["location"].as_str().unwrap()
+        ),
+        "format: 13 -> 14 (default target)",
+        "route: history-lance-files-v13-to-v14",
+    );
+    assert_eq!(
+        expected[4..6],
+        [
+            "completed handlers: none",
+            "last durable completed boundary: none"
+        ]
+    );
+    expected.push(CHECK_ADVISORY_LINE.to_owned());
+    assert_eq!(
+        String::from_utf8(human.stdout)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(
+        !String::from_utf8_lossy(&human.stderr).contains("omnigraph upgrade →"),
+        "--check writes nothing, so it echoes no write target"
+    );
+    assert_eq!(graph_files(&graph), before, "--check must write nothing");
+    let other_target = support::parse_stdout_json(&output_failure(cli().args([
+        "upgrade",
+        uri,
+        "--check",
+        "--to-format",
+        "13",
+        "--json",
+    ])));
+    assert_eq!(other_target["outcome"], "check_failed", "{other_target}");
+    assert!(
+        other_target["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["code"] == "unsupported_target"),
+        "{other_target}"
+    );
+    assert_eq!(
+        graph_files(&graph),
+        before,
+        "a refused target writes nothing"
+    );
+
+    let upgraded =
+        support::parse_stdout_json(&output_success(cli().args(["upgrade", uri, "--json"])));
+    assert_eq!(upgraded["outcome"], "completed", "{upgraded}");
+    assert_eq!(upgraded["observed_format"], 13);
+    assert_eq!(upgraded["target_format"], 14);
+    assert_eq!(
+        upgraded["completed_handlers"],
+        serde_json::json!([V13_HANDLER])
+    );
+    assert_eq!(upgraded["last_durable_completed_boundary"], "activated");
+    assert_eq!(upgraded["findings"], serde_json::json!([]));
+    assert!(upgraded["recovery"].is_null(), "{upgraded}");
+    assert_eq!(
+        upgraded["work"], check["work"],
+        "the conversion must do the work the check planned"
+    );
+    let after = graph_files(&graph);
+    assert!(
+        after.contains_key(Path::new("__history/legacy/locator/directory.oglx")),
+        "{:?}",
+        after.keys().collect::<Vec<_>>()
+    );
+    for check_mode in [true, false] {
+        let mut command = cli();
+        command.args(["upgrade", uri, "--json"]);
+        if check_mode {
+            command.arg("--check");
+        }
+        let again = support::parse_stdout_json(&output_success(&mut command));
+        assert_eq!(again["outcome"], "already_current", "{again}");
+        assert_eq!(again["observed_format"], 14);
+        assert_eq!(graph_files(&graph), after, "a rerun must write nothing");
+    }
+    assert!(
+        !run_old(old, &["snapshot", uri]).status.success(),
+        "the predecessor must refuse the upgraded root"
+    );
+
+    for (index, branch) in V13_LIVE_BRANCHES.into_iter().enumerate() {
+        let exported = output_success(cli().args(["export", uri, "--branch", branch]));
+        assert_eq!(
+            canonical_export_rows(&exported.stdout),
+            exports[index],
+            "{branch}"
+        );
+        let served = support::parse_stdout_json(&output_success(
+            cli().args(["snapshot", uri, "--branch", branch, "--json"]),
+        ));
+        assert_eq!(served["internal_schema_version"], 14, "{branch}");
+        let listing = support::parse_stdout_json(&output_success(
+            cli().args(["commit", "list", uri, "--branch", branch, "--json"]),
+        ));
+        for commit in histories[index].as_array().unwrap() {
+            assert_lists_commit(&listing, commit);
+        }
+        assert_eq!(
+            journey_rows(None, uri, query_path, "--branch", branch, "vectors"),
+            serde_json::json!([{"d.slug":"ml-intro"}]),
+            "{branch}"
+        );
+    }
+    let check_history = || {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let db = Omnigraph::open(uri).await.unwrap();
+            for (index, branch) in V13_LIVE_BRANCHES.into_iter().enumerate() {
+                db.sync_branch(branch).await.unwrap();
+                for commit in histories[index].as_array().unwrap() {
+                    let written_on = commit["graph_branch"].as_str().unwrap_or("main");
+                    let selector = match (written_on, branch) {
+                        ("temp", "child") => ReadTarget::branch("child"),
+                        (written_on, branch) if written_on == branch => {
+                            ReadTarget::snapshot(omnigraph::db::SnapshotId::new(
+                                commit["graph_commit_id"].as_str().unwrap(),
+                            ))
+                        }
+                        _ => continue,
+                    };
+                    let version = commit["graph_manifest_version"].as_u64().unwrap();
+                    let numeric = db
+                        .snapshot_at_graph_manifest_version(version)
+                        .await
+                        .unwrap();
+                    let by_id = db.snapshot_of(selector).await.unwrap();
+                    assert_eq!(numeric.graph_manifest_version(), version);
+                    assert_eq!(numeric.datasets().count(), by_id.datasets().count());
+                    for entry in numeric.datasets() {
+                        assert!(
+                            entry.same_registration(by_id.dataset(&entry.type_key).unwrap()),
+                            "numeric snapshot and commit selector disagree at {branch}/{version}"
+                        );
+                    }
+                }
+            }
+        });
+        for (id, expected) in &historical_rows {
+            assert_eq!(
+                journey_rows(None, uri, query_path, "--snapshot", id, "docs"),
+                expected[0],
+                "retained docs at {id}"
+            );
+            assert_eq!(
+                journey_rows(None, uri, query_path, "--snapshot", id, "edges"),
+                expected[1],
+                "retained edges at {id}"
+            );
+        }
+    };
+    check_history();
+
+    output_success(cli().args([
+        "mutate", "revise", "--query", query_path, "--store", uri, "--branch", "review",
+    ]));
+    output_success(cli().args([
+        "branch", "merge", "review", "--into", "main", "--uri", uri, "--json",
+    ]));
+    let merged = journey_rows(None, uri, query_path, "--branch", "main", "docs");
+    assert!(merged.as_array().unwrap().iter().any(
+        |row| row["d.slug"] == "dl-basics" && row["d.body"] == "written after storage upgrade"
+    ));
+    assert!(
+        !merged
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["d.slug"] == "rl-intro")
+    );
+    let written_after_upgrade: Vec<(&str, String)> = [(0, "main"), (1, "review")]
+        .into_iter()
+        .map(|(index, branch)| {
+            let listing = support::parse_stdout_json(&output_success(
+                cli().args(["commit", "list", uri, "--branch", branch, "--json"]),
+            ));
+            let fresh: Vec<&str> = listing["commits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|commit| commit["graph_branch"].as_str().unwrap_or("main") == branch)
+                .map(|commit| commit["graph_commit_id"].as_str().unwrap())
+                .filter(|id| {
+                    !histories[index]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|old| old["graph_commit_id"] == *id)
+                })
+                .collect();
+            assert_eq!(
+                fresh.len(),
+                1,
+                "{branch} gained exactly one commit after the upgrade: {listing}"
+            );
+            (branch, fresh[0].to_owned())
+        })
+        .collect();
+    let pinned_before_cleanup: std::collections::BTreeMap<String, Vec<u64>> =
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let db = Omnigraph::open(uri).await.unwrap();
+            let mut pins = std::collections::BTreeMap::new();
+            for id in historical_rows.keys() {
+                let snapshot = db
+                    .snapshot_of(ReadTarget::snapshot(omnigraph::db::SnapshotId::new(id)))
+                    .await
+                    .unwrap();
+                pins.insert(
+                    id.clone(),
+                    snapshot
+                        .datasets()
+                        .flat_map(|entry| {
+                            [
+                                Some(entry.published_dataset_version),
+                                entry.version_metadata.staged_version(),
+                            ]
+                        })
+                        .flatten()
+                        .collect(),
+                );
+            }
+            pins
+        });
+    for policy in [["--keep", "4"], ["--older-than", "7d"]] {
+        output_success(
+            cli()
+                .args(["cleanup", uri])
+                .args(policy)
+                .args(["--confirm", "--json"]),
+        );
+    }
+    assert_eq!(
+        journey_rows(None, uri, query_path, "--branch", "main", "docs"),
+        merged
+    );
+    let child = output_success(cli().args(["export", uri, "--branch", "child"]));
+    assert_eq!(canonical_export_rows(&child.stdout), exports[2]);
+    for (branch, id) in &written_after_upgrade {
+        for name in ["docs", "edges"] {
+            assert_eq!(
+                journey_rows(None, uri, query_path, "--snapshot", id, name),
+                journey_rows(None, uri, query_path, "--branch", branch, name),
+                "the head commit {id} of {branch} must stay readable by id after cleanup"
+            );
+        }
+    }
+    let mut retained = Vec::new();
+    for (id, expected) in &historical_rows {
+        let output = cli()
+            .args([
+                "query",
+                "docs",
+                "--query",
+                query_path,
+                "--store",
+                uri,
+                "--snapshot",
+                id,
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        if output.status.success() {
+            let mut rows = support::parse_stdout_json(&output)["rows"].clone();
+            normalize_f32_and_nulls(&mut rows);
+            assert_eq!(rows, expected[0], "retained docs at {id} after cleanup");
+            assert_eq!(
+                journey_rows(None, uri, query_path, "--snapshot", id, "edges"),
+                expected[1],
+                "retained edges at {id} after cleanup"
+            );
+            retained.push(id.as_str());
+            continue;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let reclaimed: u64 = stderr
+            .split_once("historical published dataset version ")
+            .and_then(|(_, rest)| rest.split_once(" was reclaimed"))
+            .and_then(|(version, _)| version.parse().ok())
+            .unwrap_or_else(|| {
+                panic!("commit {id} must be served or refused as reclaimed: {stderr}")
+            });
+        assert!(
+            pinned_before_cleanup[id].contains(&reclaimed),
+            "commit {id} is refused for table version {reclaimed}, which its snapshot never \
+             pinned: {:?}",
+            pinned_before_cleanup[id]
+        );
+    }
+    for (index, branch) in [(0, "main"), (1, "review")] {
+        let head = histories[index]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|commit| commit["graph_branch"].as_str().unwrap_or("main") == branch)
+            .max_by_key(|commit| commit["graph_manifest_version"].as_u64().unwrap())
+            .unwrap()["graph_commit_id"]
+            .as_str()
+            .unwrap();
+        assert!(
+            retained.contains(&head),
+            "`cleanup --keep 4` must keep {head}, the head the predecessor left on {branch} and \
+             the parent of a live commit, readable by id; retained {retained:?}"
+        );
+    }
+
+    std::fs::remove_dir_all(&graph).unwrap();
+    for (path, bytes) in &before {
+        let destination = graph.join(path);
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(destination, bytes).unwrap();
+    }
+    for (index, branch) in V13_LIVE_BRANCHES.into_iter().enumerate() {
+        let output = run_old(old, &["export", uri, "--branch", branch]);
+        assert_ok("whole-root backup restore", &output);
+        assert_eq!(canonical_export_rows(&output.stdout), exports[index]);
     }
 }

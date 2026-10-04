@@ -166,21 +166,41 @@ OMNIGRAPH_V5_BIN=<dir>/target/debug/omnigraph cargo test --locked -p omnigraph-c
 The older seams work the same way with released binaries: `OMNIGRAPH_OLD_BIN` (0.7.2) and `OMNIGRAPH_PREVIOUS_BIN` (0.8.1). `OMNIGRAPH_V6_BIN` (the 0.10.0 release) owns the v6↔v10 fence. RFC 0062 introduced v7's registration clock, RFC 0042's native-ref retirement metadata requires v8, RFC 0040's system columns stamped new graphs v9, and RFC 0067's detached table commits stamp every graph v10. The v0.9 journey is a different case, a fully exercised v6 graph — branches, edges, vectors, full-text and blobs — that the current binary refuses and that is rebuilt from a 0.9 export; `Test Workspace` runs both on every pull request that changes engine input, with the releases it installs.
 
 The separate `Storage Upgrade Compatibility` CI job requires the
-`storage_upgrade` cases of `crossversion_upgrade.rs` (the `omnigraph upgrade`
-report on a fresh graph and the cluster-path refusal), `lance_version_columns`
-and `forbidden_apis`. They need no predecessor binary. Missing cases, empty
-runs and skipped required cases fail the job. To run the crossversion scope
-locally:
+`storage_upgrade` cases of `crossversion_upgrade.rs` (the report on a fresh
+graph, the cluster-path refusal and
+`genuine_v13_storage_upgrade_preserves_history`), the engine
+`db::upgrade::tests`, `lance_version_columns` and `forbidden_apis`. Missing
+cases, empty runs and skipped required cases fail the job.
+
+The genuine journey needs the stamp-13 CLI: the job builds it from the commit
+`ci.yml` pins as `STAMP_13_SOURCE_COMMIT` and exports `OMNIGRAPH_V13_BIN`. It
+proves its predecessor by behaviour (that binary's `snapshot --json` reports
+`internal_schema_version` 13 and the current `upgrade --check` observes 13),
+builds branches, a merge, a deleted branch, a recreated one and a fork of a
+deleted branch with the old binary, upgrades, and compares commit history,
+rows, `cleanup` and a backup restore after it. Without the binary it prints a
+skip line locally and panics when `OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS=1`,
+as CI sets. To run the crossversion scope locally, build the predecessor as
+for the v5 fence above and pass it:
 
 ```bash
-cargo test --workspace --locked --test crossversion_upgrade --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints storage_upgrade -- --test-threads=1
+OMNIGRAPH_V13_BIN=<dir>/target/debug/omnigraph cargo test --workspace --locked --test crossversion_upgrade --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints storage_upgrade -- --test-threads=1
 ```
 
-`db/upgrade/tests.rs` owns the `upgrade_storage` report: `already_current`
-with no write on a fresh graph, `unsupported_source` with the open guard's
-text for another stamp, `unsupported_target` for another `--to-format`, and
-`recovery_required` for a pending conversion marker. Keep ordinary-open
-refusal for all pre-v14 stamps.
+`db/upgrade/tests.rs` owns the `upgrade_storage` protocol over
+`legacy::write::Stamp13History`, the test-only stamp-13 writer of
+`omnigraph-catalog` that replays scripted publishes in the stamp-13 overwrite
+order: the reports (`already_current` with no write on a fresh graph,
+`unsupported_source`, `unsupported_target`, the pending-marker reports,
+`--check` leaving the store untouched), conversion and equivalence of main,
+named refs and fresh forks, the pre-fence refusals and bounds, every seam
+interrupted and rerun, and the post-upgrade reads: commit list and change feed
+across the upgrade, numeric snapshots below it, merges on a legacy base,
+retired refs, leftover merge-input tags and `cleanup`. The census, plan,
+locator codecs and legacy read arms are owned by the `legacy_` tests of
+`omnigraph-catalog` (`tests.rs`, `history.rs`). A fixture cannot drift from
+the predecessor unnoticed only because the genuine journey is required; change
+both together. Keep ordinary-open refusal for all pre-v14 stamps.
 `schema_apply.rs`, `system_column_upgrade.rs` and historical-read owners cover
 atomic contract publication, first-touch retry and current-contract historical
 reads. The catalog tests own row uniqueness, projection and validation;

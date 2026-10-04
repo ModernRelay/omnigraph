@@ -54,7 +54,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `schema plan` | Preview a schema migration | direct |
 | `schema upgrade-system-columns` | Respell a graph's system columns in place; needs a graph that normal open accepts and keeps its storage format | direct |
 | `lint` | Validate `.gq` source | local schema or direct graph |
-| `upgrade` | Report whether graph storage is in the format this binary serves; writes nothing | direct standalone |
+| `upgrade` | Convert a v13 graph's storage to the format this binary serves, offline; `--check` writes nothing | direct standalone |
 | `optimize` | Compact data and reconcile declared indexes | direct |
 | `rebuild-full-text-indexes` | Replace full-text indexes on one branch | direct |
 | `repair` | Report each table's Lance history against its registration (`no_drift` or `foreign_drift`) | direct |
@@ -135,17 +135,17 @@ omnigraph schema upgrade-system-columns ./graph.omni --check --json
 ```
 
 `--store` is an alternative to the positional storage URI. `omnigraph upgrade`
-reports the graph's storage format against the one this binary serves (v14)
-and writes nothing, with or without `--check`; this build has no in-place
-storage conversion. A v14 graph reports `already_current` and exits 0. Any
-other format reports the finding `unsupported_source` with the refusal text of
-normal open, a `--to-format` other than 14 reports `unsupported_target`, and a
-graph carrying a pending conversion marker reports `recovery_required`; each
-exits 1. JSON reports the observed and target formats, findings and recovery
-action. Server and cluster addressing are refused. See
-[storage format report](../operations/upgrade.md#storage-format-report).
-`schema upgrade-system-columns` is a separate operation on a served graph; see
-[system-column upgrade](../operations/upgrade.md#system-column-upgrade-legacy-spellings).
+converts a standalone v13 graph to the format this binary serves (v14),
+offline and in place, keeping branches and commit history; stop every process
+using the graph and retain a verified whole-root backup first. `--check` writes
+nothing; `--to-format` accepts 14 only. `check_passed`, `already_current` (a
+v14 graph) and `completed` exit 0; `check_failed` (`unsupported_source` for a
+format below 13, `newer_than_binary` for one above 14, `unsupported_target`)
+and `recovery_required` (a pending attempt, finished as `recovery.action` says,
+or leftover recovery files) exit 1. The report names the formats, the route,
+the `work` counts, findings and the recovery action. Server and cluster
+addressing are refused; see [storage upgrade](../operations/upgrade.md#storage-upgrade).
+`schema upgrade-system-columns` is a separate operation on a served graph: [system-column upgrade](../operations/upgrade.md#system-column-upgrade-legacy-spellings).
 
 ## Load modes
 

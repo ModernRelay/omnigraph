@@ -5675,7 +5675,6 @@ name = "omnigraph-cluster"
 version = "0.11.0"
 dependencies = [
  "omnigraph-compiler",
- "omnigraph-core",
  "omnigraph-engine",
  "omnigraph-policy",
  "omnigraph-seams",
