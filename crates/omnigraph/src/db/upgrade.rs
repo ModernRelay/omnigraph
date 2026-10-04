@@ -2,7 +2,6 @@
 //! this binary serves. This binary holds no conversion route, so the command
 //! reads main's `__manifest` stamp and never writes.
 
-
 use serde::Serialize;
 
 use crate::db::manifest::layout::open_manifest_dataset_native_with_session;
