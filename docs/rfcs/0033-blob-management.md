@@ -1741,7 +1741,11 @@ publisher architecture.
   bound); §10's rewrite-amplification sentence "The schema-apply rewrite has
   no byte ceiling yet (§8.4)"; and Phase 4's "make the schema-apply rewrite
   bounded and streamed (§8.4)". A dropped Blob property's managed bytes now
-  stay with their data files until a compaction rewrites the fragment. The
+  stay with their data files until the next `optimize`, which rewrites every
+  fragment still holding a dropped column without reading it (the
+  `compaction_memory.rs` erasure instrument measured 34.1 MiB at its peak on 64
+  rows of a kept and a dropped 1 MiB value, under the 42 MiB compaction bound),
+  and `cleanup` then deletes them. The
   `lance_surface_guards.rs` evolution guard pins the Lance facts; the
   `compaction_memory.rs` instrument measured schema apply's peak at 72.1 and
   136.1 MiB on 64 and 128 MiB Blob tables before, and 5.1 MiB on both after.

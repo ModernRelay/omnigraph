@@ -172,15 +172,19 @@ rejected. The plan reports the exact unsupported step before anything changes.
 
 A drop removes the declaration from the current schema and reclaims no storage
 at apply. Older commits still read the dropped data until `omnigraph cleanup`
-stops retaining them; after that, the dropped data cannot be recovered. Review
-the plan carefully, and treat the cleanup that follows as the step that cannot
-be undone. A dropped type's data is reclaimed by cleanup with a retention that
-excludes the commits before the drop. A dropped property's values stay in the
-table's current data files, beside the properties that remain, so cleanup
-alone does not free them: they are removed when `omnigraph optimize` rewrites
-the fragments that hold them, and optimize rewrites only small fragments and
-fragments with many deleted rows. See [optimize](../operations/maintenance.md#optimize)
-and [cleanup](../operations/maintenance.md#cleanup).
+stops retaining them. A dropped type's data is reclaimed by that cleanup. A
+dropped property's values also stay in the table's current data files, beside
+the properties that remain, until the next `omnigraph optimize`: every
+optimize rewrites each fragment of a table that still stores a dropped
+property's values, copying only the remaining properties. To erase dropped
+data, run optimize after the drop, then cleanup with a retention that excludes
+the commits before the optimize; after that, the dropped data cannot be
+recovered. Optimize rewrites main only: a branch or tag that references the
+dropped values keeps them until it is deleted, or until the branch is merged
+and main is optimized again. Review the plan carefully, and treat that cleanup
+as the step that cannot be undone. See
+[optimize](../operations/maintenance.md#optimize) and
+[cleanup](../operations/maintenance.md#cleanup).
 
 Cluster-managed graphs change schema through `omnigraph cluster apply`. Direct
 schema apply and the server schema-apply endpoint refuse cluster-managed graphs.
