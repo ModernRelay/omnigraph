@@ -2895,22 +2895,45 @@ fn validation_schema(
     Ok(Arc::new(arrow_schema::Schema::new(fields)))
 }
 
+/// Same table state: every `DatasetEntry` field except `type_key` (the lookup key)
+/// and `manifest_version` (which `__manifest` publish wrote the row).
 fn same_manifest_state(
     left: Option<&crate::db::DatasetEntry>,
     right: Option<&crate::db::DatasetEntry>,
 ) -> bool {
     match (left, right) {
         (Some(left), Some(right)) => {
-            left.identity == right.identity
-                && left.dataset_path == right.dataset_path
-                && left.published_dataset_version == right.published_dataset_version
-                && left.native_dataset_branch == right.native_dataset_branch
-                && left.entity_count == right.entity_count
-                && left.version_metadata == right.version_metadata
+            let crate::db::DatasetEntry {
+                identity,
+                type_key: _,
+                dataset_path,
+                published_dataset_version,
+                native_dataset_branch,
+                entity_count,
+                version_metadata,
+                manifest_version: _,
+            } = left;
+            *identity == right.identity
+                && *dataset_path == right.dataset_path
+                && *published_dataset_version == right.published_dataset_version
+                && *native_dataset_branch == right.native_dataset_branch
+                && *entity_count == right.entity_count
+                && *version_metadata == right.version_metadata
         }
         (None, None) => true,
         _ => false,
     }
+}
+
+/// Same graph state: equal `schema_contract` and `same_manifest_state` for every table.
+fn same_graph_state(left: &Snapshot, right: &Snapshot) -> bool {
+    left.schema_contract() == right.schema_contract()
+        && left.datasets().chain(right.datasets()).all(|entry| {
+            same_manifest_state(
+                left.dataset(&entry.type_key),
+                right.dataset(&entry.type_key),
+            )
+        })
 }
 
 fn ensure_merge_identity_compatible(
@@ -3370,15 +3393,9 @@ async fn validate_merge_candidates(
     }
 }
 
-/// Whether exact pure-insert provenance already discharges every logical check
-/// that would otherwise require materializing a fast-forward `ChangeSet`.
-///
-/// This deliberately recognizes only node tables with identity-backed `@key`
-/// semantics and no additional value, enum, or non-key uniqueness constraint.
-/// Edge candidates retain validation because RI/cardinality are cross-table;
-/// every unfamiliar candidate shape also retains the general evaluator. The
-/// source rows were accepted under the same schema identity, and strict exact-
-/// `id` publication rechecks their only remaining target interaction.
+/// Whether certified pure inserts into node types constrained only by `@key` discharge
+/// every check a fast forward's `ChangeSet` would run: the target holds the base's rows,
+/// and edges keep validation for their cross-table checks.
 fn proven_fast_forward_needs_no_validation(
     catalog: &Catalog,
     candidates: &HashMap<String, CandidateTableState>,
@@ -4866,7 +4883,7 @@ impl Omnigraph {
                 commit: None,
             });
         }
-        let is_fast_forward = base_commit.graph_commit_id == target_head_commit_id;
+        let head_is_base = base_commit.graph_commit_id == target_head_commit_id;
         let merged_parent = source_commits.into_records(&base_commit.graph_commit_id);
         if merged_parent.head.commit.graph_commit_id != source_head_commit_id {
             return Err(OmniError::manifest_internal(format!(
@@ -4884,7 +4901,7 @@ impl Omnigraph {
         let preparation = async {
             input_guard.pin(source_txn.manifest_probe.dataset()).await?;
             input_guard.pin(target_txn.manifest_probe.dataset()).await?;
-            let base_snapshot = if is_fast_forward {
+            let base_snapshot = if head_is_base {
                 target_txn.base.clone()
             } else {
                 let base =
@@ -4914,6 +4931,7 @@ impl Omnigraph {
                 return Err(error);
             }
         };
+        let is_fast_forward = head_is_base || same_graph_state(&base_snapshot, &target_txn.base);
         // The handle remains bound to its original branch throughout the merge.
         // The captured transaction supplies every physical and publish target.
         let target_was_active = self.active_branch().await == target_branch;

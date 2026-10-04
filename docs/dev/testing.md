@@ -29,7 +29,7 @@ The invariants behind these rules are in [invariants.md](invariants.md). Lance-d
 | `omnigraph-cli` | `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
 | `omnigraph-dst` | `crates/omnigraph-dst/tests/` (`scenarios.rs`, `lane_b.rs`, `torn_init.rs`) plus in-source proofs | Crate-local fixtures. Deterministic simulation; needs `--cfg tokio_unstable` (the workspace `.cargo/config.toml` sets it for every build; the default workspace gate excludes the crate by name). Run from `crates/omnigraph-dst`: its `[env]`-only `.cargo/config.toml` supplies the pool trio that `require_pool_env` asserts at process start. `#[ignore]`d tests are fleet/hunt instruments driven by the DST workflows |
 | `omnigraph-bench` | In-source configuration tests and `crates/omnigraph-bench/tests/` | Checked-in cases and suites under `benchmarks/` |
-| `omnigraph-gqt` | `tests/gq_logic_tests.rs`, one libtest test per `.gqt` case (`datatest-stable`, `harness = false`), plus in-source format self-tests and the corpus layout check | The `.gqt` corpus under `crates/omnigraph-gqt/cases/`; format in RFC 0045 |
+| `omnigraph-gqt` | `tests/gq_logic_tests.rs`, one libtest test per `.gqt` case (`datatest-stable`, `harness = false`), plus in-source format self-tests and the corpus layout check | The `.gqt` corpus under `crates/omnigraph-gqt/cases/`; author-marked slow cases under `crates/omnigraph-gqt/cases_slow/`, run by the `GQT slow nightly` workflow and never by `cargo test`; format in RFC 0045 |
 
 Do not copy server or CLI process setup into a new suite. Their support modules own hermetic configuration, binary startup, temporary roots, and common assertions.
 
@@ -248,8 +248,12 @@ section, one `<name>: <type>` line per result column in `.pg` property syntax
 executed schema is also checked against the compiler's inferred schema, so a
 wrongly typed column fails even when every cell is null (RFC 0045
 §Comparison semantics). Every `ok`/`FAIL` line carries the case's elapsed
-time, and a case over budget belongs in a `heavy-repro:` `#[ignore]`d test
-under `crates/omnigraph/tests/repro_issue_*.rs`, not the corpus. A name filter
+time, and a case over budget leaves the corpus: it moves to
+`crates/omnigraph-gqt/cases_slow/`, the nightly slow tier
+([GQT README](../../crates/omnigraph-gqt/README.md#slow-cases)), when the
+format can express it, and a symptom the format cannot express belongs in a
+`heavy-repro:` `#[ignore]`d test under
+`crates/omnigraph/tests/repro_issue_*.rs`. A name filter
 that matches no case is libtest's ordinary green zero-test run; read the
 `filtered out` count.
 

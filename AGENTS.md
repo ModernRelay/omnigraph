@@ -186,8 +186,10 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   the defect: a `.gqt` logic test when the defect is visible in rows, counts,
   result column types, or errors, a `_issue_NNN` Rust test when it needs mechanism or scale
   assertions; when the reported symptom additionally needs scale to
-  manifest, a second `#[ignore]`d test in a `tests/repro_issue_*.rs` target
-  guards it, and the two cross-reference each other in comments.
+  manifest, a second test guards it, a `.gqt` case under
+  `crates/omnigraph-gqt/cases_slow/` when the format can express the symptom
+  and an `#[ignore]`d test in a `tests/repro_issue_*.rs` target otherwise,
+  and the two cross-reference each other in comments.
 - Every `#[ignore]`d test opens its ignore message with its species
   (`instrument:`, `hunt:`, `heavy-repro:`, or the environment it needs);
   expensive regression repros use `heavy-repro:` and thereby enroll in the
