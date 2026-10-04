@@ -61,8 +61,9 @@ pub(super) struct Lowered {
     pub(super) root: Plan,
     /// The one operator of every live node, the tree `root` heads.
     pub(super) operators: HashMap<NodeId, Plan>,
-    /// What the ranked scan reported in this pass, for the overfetch ladder.
-    pub(super) report: Arc<Mutex<ScanReport>>,
+    /// What each nearest scan reported in this pass, by plan node: the
+    /// overfetch ladder's input and the run's probe decisions.
+    pub(super) report: Arc<Mutex<ScanReports>>,
     /// The in-memory filter applications of the tree, one per conjunct.
     in_memory_filters: usize,
 }
@@ -332,7 +333,7 @@ struct Walk<'l, 'a> {
     lowering: &'l Lowering<'a>,
     pass: &'l Pass,
     scope: Scope,
-    report: Arc<Mutex<ScanReport>>,
+    report: Arc<Mutex<ScanReports>>,
     outers: Vec<OuterScope>,
     operators: HashMap<NodeId, Plan>,
     in_memory_filters: usize,
@@ -358,7 +359,7 @@ impl<'l, 'a> Walk<'l, 'a> {
                 }),
                 ctx: Arc::new(ProjectionContext::for_plan(lowering.catalog, lowering.plan)),
             },
-            report: Arc::new(Mutex::new(ScanReport::default())),
+            report: Arc::new(Mutex::new(ScanReports::new())),
             outers: Vec::new(),
             operators: HashMap::new(),
             in_memory_filters: 0,
@@ -452,6 +453,7 @@ impl Lower for Walk<'_, '_> {
                 ScanSource::Table {
                     mode: Box::new(mode),
                     report: Arc::clone(&self.report),
+                    node: id,
                 }
             }
             _ => {

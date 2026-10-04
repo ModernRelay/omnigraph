@@ -636,10 +636,12 @@ impl Requirements {
         if score.is_some() && self.aggregate {
             return Ok(());
         }
+        // A key is constant by what it names: an alias by the `return` item it
+        // aliases, on the written side and on the planned side alike.
         let written: Vec<&omnigraph_compiler::query::ast::Ordering> = self
             .order
             .iter()
-            .filter(|key| !matcher.constant(&key.expr))
+            .filter(|key| !matcher.constant(self.resolved_key(&key.expr)))
             .collect();
         if score.is_none() && self.order.is_empty() {
             let sorted = top
@@ -708,7 +710,17 @@ impl Requirements {
                 ));
             }
         }
-        let rest: Vec<&IROrdering> = keys.filter(|key| !constant_ir(&key.expr)).collect();
+        let returns = projection_of(plan, top)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let planned_constant = |expr: &IRExpr| match expr {
+            IRExpr::AliasRef(column) => returns
+                .iter()
+                .find(|projection| result_column(projection).as_deref() == Some(column))
+                .is_some_and(|projection| constant_ir(&projection.expr)),
+            other => constant_ir(other),
+        };
+        let rest: Vec<&IROrdering> = keys.filter(|key| !planned_constant(&key.expr)).collect();
         if rest.len() != written.len() {
             return Err(ValidationError::violated(
                 "order",
@@ -719,9 +731,6 @@ impl Requirements {
                 ),
             ));
         }
-        let returns = projection_of(plan, top)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
         for (key, planned) in written.iter().zip(&rest) {
             if key.descending != planned.descending
                 || !self.same_key(&key.expr, planned, returns, matcher, budget)?

@@ -387,6 +387,29 @@ fn another_limit_fails_the_row_cut() {
     assert_eq!(check, "row cut");
 }
 
+/// An order key constant for every row (a parameter, `now()`) orders
+/// nothing; when `return` projects it under an alias the planner binds the key
+/// to that alias, and the order check treats the alias as the constant it
+/// projects.
+#[test]
+fn a_constant_key_bound_to_a_return_alias_is_accepted() {
+    for (query, params) in [
+        (
+            "query q($x: I64) { match { $d: Doc } return { $d.slug, $x as x } order { $x } }",
+            vec![("x", Literal::Integer(7))],
+        ),
+        (
+            "query q() { match { $d: Doc } return { $d.slug, now() as t } order { now() } }",
+            vec![],
+        ),
+    ] {
+        let fixture = Fixture::new(query, &params);
+        fixture
+            .accept(fixture.plan())
+            .unwrap_or_else(|error| panic!("{query}: {error:?}"));
+    }
+}
+
 #[test]
 fn a_dropped_or_reversed_key_fails_the_order() {
     let fixture = ranked();

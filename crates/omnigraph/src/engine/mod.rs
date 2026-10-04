@@ -174,7 +174,7 @@ async fn run_once(
     ctx: &QueryContext,
     pass: &Pass,
     rung: usize,
-) -> Result<(RecordBatch, ScanReport, Vec<ReportRow>)> {
+) -> Result<(RecordBatch, ScanReports, Vec<ReportRow>)> {
     let lowered = lowering.lower_query(pass)?;
     lowered.record_in_memory_filters();
     let batch = run_plan(&lowered, lowering.plan, ctx).await?;
@@ -439,6 +439,23 @@ pub(crate) async fn execute(
         lowered.record_in_memory_filters();
         let fused = Box::pin(run_plan(&lowered, &bound.plan, &ctx)).await?;
         executed.record(pass_rows(&lowered, &bound.plan, 0)?);
+        // Each nearest arm's probe ladder, by its scan, after the fusion's gate.
+        let reports = lowered
+            .report
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for (scan, report) in reports {
+            if !report.probes.is_empty() {
+                executed.decide(
+                    scan,
+                    0,
+                    report::Taken::Probes {
+                        attempts: report.probes,
+                    },
+                );
+            }
+        }
         return Ok(PlanRun {
             result: QueryResult::new(fused.schema(), vec![fused]),
             plan: bound,
@@ -464,8 +481,15 @@ pub(crate) async fn execute(
         pass = next;
     }
 
-    let (result_batch, report, rows) = Box::pin(run_once(&lowering, &ctx, &pass, 0)).await?;
+    let (result_batch, reports, rows) = Box::pin(run_once(&lowering, &ctx, &pass, 0)).await?;
     executed.record(rows);
+    let nearest_report = |mut reports: ScanReports| {
+        nearest
+            .as_ref()
+            .and_then(|scan| reports.remove(&scan.id))
+            .unwrap_or_default()
+    };
+    let report = nearest_report(reports);
     if let Some(NearestScan { id, .. }) = &nearest
         && !report.probes.is_empty()
     {
@@ -539,9 +563,10 @@ pub(crate) async fn execute(
                         pass.with_exact_nearest(id, k)
                     }
                 };
-                let (retried, retried_report, rows) =
+                let (retried, retried_reports, rows) =
                     Box::pin(run_once(&lowering, &ctx, &wider, rung)).await?;
                 executed.record(rows);
+                let retried_report = nearest_report(retried_reports);
                 if !retried_report.probes.is_empty() {
                     executed.decide(
                         id,

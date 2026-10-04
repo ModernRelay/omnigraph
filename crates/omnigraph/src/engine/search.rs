@@ -144,9 +144,13 @@ impl std::fmt::Debug for EligibleIds {
     }
 }
 
-/// What the nearest scan reported back to the query level: the LAST scan of
-/// the ranked variable in a pass. `rows == k` means the scan was full, so a
-/// shortfall above it can only be recovered by asking for more candidates.
+/// What each nearest table scan of one pass reported, by its plan node: a
+/// standalone search order has one, an `rrf()` one per nearest arm.
+pub(super) type ScanReports = std::collections::BTreeMap<NodeId, ScanReport>;
+
+/// What one nearest scan reported back to the query level in a pass.
+/// `rows == k` means the scan was full, so a shortfall above it can only be
+/// recovered by asking for more candidates.
 #[derive(Debug, Default, Clone)]
 pub(super) struct ScanReport {
     pub(super) nearest_scan: Option<NearestScanReport>,

@@ -548,6 +548,12 @@ query fused($t: String, $q: Vector(4)) {
     order { rrf(nearest($d.embedding, $q), bm25($d.text, $t)) }
     limit 3
 }
+query fused_vectors($q: Vector(4), $r: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { rrf(nearest($d.embedding, $q), nearest($d.embedding, $r)) }
+    limit 3
+}
 "#;
 
 const CITATION_SCHEMA: &str = r#"
@@ -965,13 +971,32 @@ async fn a_fusion_replays() {
     params.insert("q".to_string(), Literal::List(vec![Literal::Float(0.0); 4]));
     let Replayed { result, search, .. } = replayed(&db, DOC_QUERIES, "fused", &params).await;
     assert_eq!(result.len(), 3);
+    let kinds: Vec<&str> = search
+        .iter()
+        .map(|decision| decision["decision"].as_str().unwrap())
+        .collect();
     assert_eq!(
-        search
-            .iter()
-            .filter(|decision| decision["decision"] == "gate")
-            .count(),
-        1,
-        "the fusion's gate records one verdict: {search:#?}"
+        kinds,
+        ["gate", "probes"],
+        "the fusion's gate records one verdict, then its nearest arm its probe attempts: {search:#?}"
+    );
+
+    // Two nearest arms record their attempts apart, one decision per scan.
+    let mut params =
+        ParamMap::from([("q".to_string(), Literal::List(vec![Literal::Float(0.0); 4]))]);
+    params.insert("r".to_string(), Literal::List(vec![Literal::Float(9.0); 4]));
+    let Replayed { result, search, .. } =
+        replayed(&db, DOC_QUERIES, "fused_vectors", &params).await;
+    assert_eq!(result.len(), 3);
+    let probed: Vec<u64> = search
+        .iter()
+        .filter(|decision| decision["decision"] == "probes")
+        .map(|decision| decision["id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(probed.len(), 2, "{search:#?}");
+    assert_ne!(
+        probed[0], probed[1],
+        "each arm records under its own scan: {search:#?}"
     );
 }
 
