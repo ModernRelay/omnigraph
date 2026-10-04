@@ -2314,10 +2314,12 @@ async fn merge_and_load_close_a_block_under_the_session_budget() {
                     break;
                 }
             }
-            let closing_merge = closing_merge.expect(&format!(
-                "{OLD_COMMIT_COUNT_BOUND} merges closed no block on main: the merge published \
-                 under the production budget"
-            ));
+            let closing_merge = closing_merge.unwrap_or_else(|| {
+                panic!(
+                    "{OLD_COMMIT_COUNT_BOUND} merges closed no block on main: the merge published \
+                     under the production budget"
+                )
+            });
             let closed_block = block_dir_of(
                 closing_merge
                     .parent_commit_id
