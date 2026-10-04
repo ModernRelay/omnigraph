@@ -149,7 +149,7 @@ See [Operating a cluster](../clusters/index.md).
 
 - Recovery required: reopen the graph read-write or restart its server. A
   graph carrying a sidecar from a release before 0.12 must first be opened
-  read-write with that release.
+  read-write with that release (`omnigraph snapshot <graph>` is such an open).
 - Foreign drift: `repair` reports Lance commits above a table's last linear
   version as `foreign_drift`; no read or write uses them and no command
   adopts them (below).

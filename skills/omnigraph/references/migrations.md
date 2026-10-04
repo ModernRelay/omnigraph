@@ -56,6 +56,50 @@ Do not point `init --force` at the old root. The
 [upgrade guide](https://github.com/ModernRelay/omnigraph/blob/v0.11.0/docs/user/operations/upgrade.md) owns qualification,
 interruption handling, external Blob caveats and cluster cutover details.
 
+## Upgrade v0.11 to storage format 14
+
+The binary after 0.11 (main after 2026-10-04) serves storage format 14 only:
+it refuses a v8 or v9 graph on open and names `omnigraph upgrade`. Its
+`upgrade` converts a standalone v8, v9 or v13 graph to 14 in place and keeps
+branches, commit ids and commit history; no table row is rewritten.
+`--to-format` accepts 14 only. The upgrade is offline and cannot verify that
+itself: stop every server, reader, writer and maintenance process, take and
+verify a backup of the whole graph root (rollback is that backup with the
+0.11 binary), then with the new binary:
+
+```bash
+omnigraph upgrade ./graph.omni --check --json
+omnigraph upgrade ./graph.omni --json
+omnigraph commit list ./graph.omni --json
+```
+
+`--check` writes nothing. A run without `--check` marks the graph as pending,
+which every normal open refuses, and a run that stops is resumed by the same
+command with the same executable. Never delete the marker or anything under
+`__history/`. What a 0.11 graph brings with it:
+
+- Its schema is read from `_schema.pg`, `_schema.ir.json` and
+  `__schema_state.json` at the graph root, which must be present, consistent
+  and match the tables' columns. The upgrade leaves them in place; format 14
+  never reads them. Every pre-upgrade commit is recorded under the one schema
+  live at the upgrade, as 0.11 kept only the latest schema.
+- A `.staging` schema object or a recovery file left by 0.11 is refused until
+  a 0.11 read-write open resolves it (`omnigraph snapshot ./graph.omni` with
+  the 0.11 binary is such an open; a property-only `.staging` 0.11 refuses
+  too and names the manual choice). A `__schema_apply_lock__` branch left
+  alone by a killed 0.11 schema apply is handled by the upgrade.
+- On a root where 0.11 `cleanup` or `schema apply --allow-data-loss` ran, the
+  first `cleanup` after the upgrade is `cleanup --keep 1 --confirm` alone;
+  later runs with any retention option pass.
+- A cluster-managed graph is not converted: export with 0.11, then `init` and
+  `load --mode overwrite` with the new binary, as in the section above.
+- A 0.9/0.10 graph (v6) is first taken to v9 with the 0.11 `upgrade` above,
+  then to 14; v7 and v10 to v12 are rebuilt.
+
+The current
+[upgrade guide](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/upgrade.md#storage-upgrade)
+owns the findings table, the limits and the recovery actions.
+
 ### Identity and response changes
 
 - GQ system fields are `$p.@id`, `$e.@src`, and `$e.@dst`. Bare `id`, `src`

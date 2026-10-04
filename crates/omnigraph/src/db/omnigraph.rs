@@ -3279,7 +3279,7 @@ fn blob_properties_for_table_key<'a>(
 /// fields. Blob reads admit a missing marker only at the exact current physical
 /// table entry and refuse every older snapshot rather than inferring identity
 /// from Lance field IDs or positions, even when no rename occurred.
-fn fixup_physical_schemas(catalog: &mut Catalog) -> Result<()> {
+pub(crate) fn fixup_physical_schemas(catalog: &mut Catalog) -> Result<()> {
     let system_columns = catalog.system_columns;
     // Canonically ordered walk (DST determinism: hash order must not leak
     // into schema fixups).
@@ -3627,7 +3627,7 @@ async fn finish_init_coordinator(
     Ok(coordinator)
 }
 
-fn schema_table_key(type_kind: SchemaTypeKind, name: &str) -> String {
+pub(crate) fn schema_table_key(type_kind: SchemaTypeKind, name: &str) -> String {
     match type_kind {
         SchemaTypeKind::Node => format!("node:{}", name),
         SchemaTypeKind::Edge => format!("edge:{}", name),
@@ -3635,7 +3635,7 @@ fn schema_table_key(type_kind: SchemaTypeKind, name: &str) -> String {
     }
 }
 
-fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result<Arc<Schema>> {
+pub(crate) fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result<Arc<Schema>> {
     if let Some(type_name) = table_key.strip_prefix("node:") {
         let node_type: &NodeType = catalog
             .node_types

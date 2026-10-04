@@ -54,7 +54,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `schema plan` | Preview a schema migration | direct |
 | `schema upgrade-system-columns` | Respell a graph's system columns in place; needs a graph that normal open accepts and keeps its storage format | direct |
 | `lint` | Validate `.gq` source | local schema or direct graph |
-| `upgrade` | Convert a v13 graph's storage to the format this binary serves, offline; `--check` writes nothing | direct standalone |
+| `upgrade` | Convert a v8, v9 or v13 graph's storage to the format this binary serves, offline; `--check` writes nothing | direct standalone |
 | `optimize` | Compact data and reconcile declared indexes | direct |
 | `rebuild-full-text-indexes` | Replace full-text indexes on one branch | direct |
 | `repair` | Report each table's Lance history against its registration (`no_drift` or `foreign_drift`) | direct |
@@ -135,12 +135,12 @@ omnigraph schema upgrade-system-columns ./graph.omni --check --json
 ```
 
 `--store` is an alternative to the positional storage URI. `omnigraph upgrade`
-converts a standalone v13 graph to the format this binary serves (v14),
-offline and in place, keeping branches and commit history; stop every process
-using the graph and retain a verified whole-root backup first. `--check` writes
+converts a standalone v8, v9 (release 0.11.x) or v13 graph to v14, offline and
+in place, keeping branches and commit history; stop every process using the
+graph and retain a verified whole-root backup first. `--check` writes
 nothing; `--to-format` accepts 14 only. `check_passed`, `already_current` (a
-v14 graph) and `completed` exit 0; `check_failed` (`unsupported_source` for a
-format below 13, `newer_than_binary` for one above 14, `unsupported_target`)
+v14 graph) and `completed` exit 0; `check_failed` (`unsupported_source` for any
+other format below 14, `newer_than_binary` above 14, `unsupported_target`)
 and `recovery_required` (a pending attempt, finished as `recovery.action` says,
 or leftover recovery files) exit 1. The report names the formats, the route,
 the `work` counts, findings and the recovery action. Server and cluster

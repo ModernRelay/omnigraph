@@ -1,9 +1,12 @@
-//! `omnigraph upgrade`: the offline conversion of a standalone root from
-//! storage format 13 to 14. The upgrade reads every ref of `__manifest` at a
-//! pinned version, fences main with its intent, writes the graph commits of
-//! the source as immutable objects under `__history/legacy/`, converts every
-//! live ref to its head alone, validates what it wrote and activates main. A
-//! run that stops after the fence is resumed by running the command again.
+//! `omnigraph upgrade`: the offline conversion of a standalone root to storage
+//! format 14 from each [`UpgradeSource`], by two routes: from 13, whose schema
+//! contract is a row of `__manifest`, and from 8 or 9, whose contract is read
+//! from the graph root (`root_schema`) until the fence binds it. The upgrade
+//! reads every ref of `__manifest` at a pinned version, fences main with its
+//! intent, writes the graph commits of the source as immutable objects under
+//! `__history/legacy/`, converts every live ref to its head alone, validates
+//! what it wrote and activates main. A run that stops after the fence is
+//! resumed by running the command again.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -19,27 +22,56 @@ use lance_file::version::LanceFileVersion;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use omnigraph_compiler::{SchemaIR, SchemaTypeKind, build_catalog_from_ir};
+
+use crate::branch_control::retire_branch_recoverably;
+use crate::branch_names::{ensure_logical_branch_name, logical_branch_name};
 use crate::db::legacy_sidecars::pending_legacy_sidecars;
-use crate::db::manifest::TableIdentity;
 use crate::db::manifest::history::{self, HistoryRecord, LegacyDirectory, LegacyLayout};
 use crate::db::manifest::layout::open_manifest_dataset_native_with_session;
 use crate::db::manifest::legacy::{
-    self, CensusError, CensusInput, CensusRef, HeadScan, LegacyCensus, LegacyManifestSource,
-    LegacyPlan, MAX_CENSUS_CELLS, MAX_CENSUS_SNAPSHOT_BYTES, SourceRole, Stamp13Source,
+    self, CensusError, CensusHead, CensusInput, CensusRef, HeadScan, LegacyCensus,
+    LegacyManifestSource, LegacyPlan, MAX_CENSUS_CELLS, MAX_CENSUS_SNAPSHOT_BYTES,
+    RootContractSource, SourceRole, Stamp13Source,
 };
 use crate::db::manifest::migrations::{
     INTERNAL_MANIFEST_SCHEMA_VERSION, INTERNAL_SCHEMA_VERSION_KEY, MAX_BRANCHES, MAX_INTENT_BYTES,
-    SourceBranch, UPGRADE_PENDING_KEY, UPGRADE_PROTOCOL, UPGRADE_RECEIPT_KEY,
-    UPGRADE_SOURCE_FORMAT, UpgradeIntent, UpgradeSchemaContract, branch_completed, fence_operation,
-    guard_stamp, intent_from, read_stamp, receipt, recovery_guidance,
+    SourceBranch, SourceLock, UPGRADE_PENDING_KEY, UPGRADE_PROTOCOL, UPGRADE_RECEIPT_KEY,
+    UPGRADE_SOURCE_FORMATS, UpgradeIntent, UpgradeSchemaContract, UpgradeSource, branch_completed,
+    fence_operation, guard_stamp, intent_from, read_stamp, receipt, recovery_guidance,
 };
 use crate::db::manifest::retention::retired_manifest_branches;
-use crate::db::manifest::state::{TablePin, TableState, read_converted_state};
+use crate::db::manifest::state::{SchemaContractRow, TablePin, TableState, read_converted_state};
+use crate::db::manifest::{DatasetEntry, TableIdentity, TableRegistration, open_dataset_entry};
+use crate::db::omnigraph::{fixup_physical_schemas, schema_for_table_key, schema_table_key};
 use crate::error::{OmniError, Result};
 use crate::seams::{decide_seam, fail};
-use crate::storage::{normalize_root_uri, storage_for_uri};
+use crate::storage::{StorageAdapter, normalize_root_uri, storage_for_uri};
 
-const HANDLER: &str = "history-lance-files-v13-to-v14";
+mod root_schema;
+
+/// What a report names when the run stopped before the stamp of the source
+/// told the route: the pending intent is unreadable, or main carries a stamp
+/// no route converts.
+const UNROUTED_HANDLER: &str = "history-lance-files-to-v14";
+/// The logical name of the ref a 0.11.x schema apply holds while it runs.
+const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";
+/// The release whose roots are stamped 8 or 9, as a refusal names it.
+const ROOT_CONTRACT_RELEASE: &str = "omnigraph 0.11.x";
+
+/// The name of the route from `source`, as a report carries it.
+fn handler(source: UpgradeSource) -> String {
+    format!(
+        "history-lance-files-v{}-to-v{INTERNAL_MANIFEST_SCHEMA_VERSION}",
+        source.stamp()
+    )
+}
+
+/// [`handler`] of a run that may have stopped before any route was chosen.
+fn handler_or_unrouted(routed: Option<UpgradeSource>) -> String {
+    routed.map_or_else(|| UNROUTED_HANDLER.to_string(), handler)
+}
+
 /// The rows one head of `__manifest` may hold.
 const MAX_ROWS: usize = 1_000_000;
 /// The decoded bytes one head of `__manifest` may hold.
@@ -60,6 +92,9 @@ struct Bounds {
     head_rows: usize,
     head_bytes: usize,
     retired_refs: usize,
+    /// The bytes one root schema object may hold: the three become one row of
+    /// a head, so each is bounded as a head is.
+    root_object_bytes: u64,
 }
 
 impl Bounds {
@@ -69,6 +104,7 @@ impl Bounds {
         head_rows: MAX_ROWS,
         head_bytes: MAX_METADATA_BYTES,
         retired_refs: MAX_BRANCHES,
+        root_object_bytes: MAX_METADATA_BYTES as u64,
     };
 }
 
@@ -129,6 +165,9 @@ pub struct UpgradeWork {
     pub census_reads: u64,
     pub census_cells: u64,
     pub legacy_bytes: u64,
+    /// The tables of main's head opened to compare their columns with the
+    /// contract at the graph root; zero on the route whose contract is a row.
+    pub table_opens: u64,
 }
 
 impl UpgradeWork {
@@ -148,6 +187,7 @@ impl UpgradeWork {
             census_reads: counts.census_reads,
             census_cells: counts.census_cells,
             legacy_bytes: counts.legacy_bytes,
+            table_opens: 0,
         }
     }
 
@@ -275,13 +315,42 @@ impl UpgradeReport {
         });
     }
 
+    /// Ask for `remedy` under the route this run chose, or under
+    /// [`UNROUTED_HANDLER`] when it stopped before choosing one.
     fn recover(&mut self, code: &str, message: impl Into<String>, remedy: Remedy) {
+        let handler = self
+            .route
+            .last()
+            .map_or(UNROUTED_HANDLER, String::as_str)
+            .to_string();
+        self.recover_as(&handler, code, message, remedy);
+    }
+
+    fn recover_as(
+        &mut self,
+        handler: &str,
+        code: &str,
+        message: impl Into<String>,
+        remedy: Remedy,
+    ) {
         self.outcome = UpgradeOutcome::RecoveryRequired;
         self.finding(code, message);
         self.recovery = Some(UpgradeRecovery {
-            failed_handler: HANDLER.into(),
+            failed_handler: handler.into(),
             executable_compatibility: remedy.executable().into(),
             action: remedy.action(self.target_format),
+        });
+    }
+
+    /// The source graph holds unfinished work of the build that wrote it:
+    /// `build` resolves it by `action` before any conversion is attempted.
+    fn source_recovery(&mut self, handler: String, message: String, build: &str, action: &str) {
+        self.outcome = UpgradeOutcome::RecoveryRequired;
+        self.finding("source_recovery_required", message);
+        self.recovery = Some(UpgradeRecovery {
+            failed_handler: handler,
+            executable_compatibility: build.into(),
+            action: action.into(),
         });
     }
 
@@ -401,38 +470,44 @@ async fn run(
             return Ok(());
         }
     };
+    let routed = pending
+        .as_ref()
+        .map(|intent| intent.source_format)
+        .or(report.observed_format)
+        .and_then(UpgradeSource::from_stamp);
     if pending.is_some() && options.check {
-        report.recover("pending_upgrade", recovery_guidance(&main), Remedy::Rerun);
+        report.recover_as(
+            &handler_or_unrouted(routed),
+            "pending_upgrade",
+            recovery_guidance(&main),
+            Remedy::Rerun,
+        );
         return Ok(());
     }
     let storage = crate::storage::decorate(storage_for_uri(root)?);
     let sidecars = pending_legacy_sidecars(root, storage.as_ref()).await?;
     if !sidecars.is_empty() {
-        report.outcome = UpgradeOutcome::RecoveryRequired;
-        report.finding(
-            "source_recovery_required",
+        report.source_recovery(
+            handler_or_unrouted(routed),
             format!(
                 "{} recovery sidecar(s) under `__recovery/` ({}) must be resolved before the \
                  storage conversion",
                 sidecars.len(),
                 sidecars.join(", ")
             ),
+            "the omnigraph build that wrote the recovery sidecars",
+            "stop all writers, retain the backup, open the graph read-write with the build that \
+             wrote the sidecars so it finishes its recovery, then rerun `omnigraph upgrade \
+             <graph> --check`",
         );
-        report.recovery = Some(UpgradeRecovery {
-            failed_handler: HANDLER.into(),
-            executable_compatibility: "the omnigraph build that wrote the recovery sidecars".into(),
-            action: "stop all writers, retain the backup, open the graph read-write with the \
-                     build that wrote the sidecars so it finishes its recovery, then rerun \
-                     `omnigraph upgrade <graph> --check`"
-                .into(),
-        });
         return Ok(());
     }
     if report.target_format != INTERNAL_MANIFEST_SCHEMA_VERSION {
+        let [oldest, older, newest] = UPGRADE_SOURCE_FORMATS;
         report.finding(
             "unsupported_target",
             format!(
-                "this binary converts storage format v{UPGRADE_SOURCE_FORMAT} to \
+                "this binary converts storage formats v{oldest}, v{older} and v{newest} to \
                  v{INTERNAL_MANIFEST_SCHEMA_VERSION} and serves \
                  v{INTERNAL_MANIFEST_SCHEMA_VERSION} alone; `--to-format` accepts \
                  {INTERNAL_MANIFEST_SCHEMA_VERSION} only"
@@ -440,30 +515,22 @@ async fn run(
         );
         return Ok(());
     }
-    if pending.is_none() {
+    let Some(source) = routed else {
         match (guard_stamp(&main), report.observed_format) {
-            (Ok(_), _) => {
-                report.outcome = UpgradeOutcome::AlreadyCurrent;
-                return Ok(());
-            }
+            (Ok(_), _) => report.outcome = UpgradeOutcome::AlreadyCurrent,
             (Err(error), Some(stamp)) if stamp > INTERNAL_MANIFEST_SCHEMA_VERSION => {
                 report.finding("newer_than_binary", error.to_string());
-                return Ok(());
             }
-            (Err(_), Some(UPGRADE_SOURCE_FORMAT)) => {}
-            (Err(error), _) => {
-                report.finding("unsupported_source", error.to_string());
-                return Ok(());
-            }
+            (Err(error), _) => report.finding("unsupported_source", error.to_string()),
         }
-    }
-    report.route.push(HANDLER.into());
+        return Ok(());
+    };
+    report.route.push(handler(source));
     let fenced = pending.is_some();
     if fenced {
         report.last_durable_completed_boundary = Some("source_fenced".into());
     }
 
-    let source = Stamp13Source;
     let pinned_main = match &pending {
         Some(intent) => {
             let version = intent.branches.last().map_or(0, |main| main.version);
@@ -473,42 +540,60 @@ async fn run(
         }
         None => main.clone(),
     };
-    let contract = match source.admits(&pinned_main, SourceRole::LiveHead) {
-        Ok(_) => source.version_schema(&pinned_main, None).await?.contract,
-        Err(error) if fenced => return Err(error),
-        Err(error) => {
-            report.finding("unsupported_source", error.to_string());
-            return Ok(());
+    let (branches, retire, attempt) = match &pending {
+        Some(intent) => (
+            intent.branches.clone(),
+            intent.retire.clone(),
+            intent.attempt.clone(),
+        ),
+        None => {
+            let (branches, retire) = partition_locks(inventory(&main).await?, source);
+            (branches, retire, ulid::Ulid::new().to_string())
         }
-    };
-    let Some(contract) = contract else {
-        let missing = format!(
-            "version {} of main holds no schema contract row",
-            pinned_main.version().version
-        );
-        if fenced {
-            return Err(invalid(missing));
-        }
-        report.finding("unsupported_source", missing);
-        return Ok(());
-    };
-    report.graph_identity = Some(contract.head.schema_identity_domain.clone());
-    let (branches, attempt) = match &pending {
-        Some(intent) => {
-            if intent.graph_identity != contract.head.schema_identity_domain {
-                return Err(invalid("upgrade schema identity changed"));
-            }
-            intent
-                .schema_contract
-                .as_ref()
-                .ok_or_else(|| invalid("storage upgrade intent names no schema contract"))?
-                .validate_row(&contract)?;
-            (intent.branches.clone(), intent.attempt.clone())
-        }
-        None => (inventory(&main).await?, ulid::Ulid::new().to_string()),
     };
     authorize(&branches, actor, policy)?;
-    verify_inventory(root, &branches, pending.as_ref()).await?;
+    let chosen = route(
+        root,
+        storage.as_ref(),
+        source,
+        &pinned_main,
+        pending.as_ref(),
+        bounds,
+        report,
+    )
+    .await?;
+    let Some(Route {
+        source: reader,
+        contract,
+        root_ir,
+    }) = chosen
+    else {
+        return Ok(());
+    };
+    let reader = reader.as_ref();
+    report.graph_identity = Some(contract.head.schema_identity_domain.clone());
+    if let Some(intent) = &pending {
+        if intent.graph_identity != contract.head.schema_identity_domain {
+            return Err(invalid("upgrade schema identity changed"));
+        }
+        intent
+            .schema_contract
+            .as_ref()
+            .ok_or_else(|| invalid("storage upgrade intent names no schema contract"))?
+            .validate_row(&contract)?;
+    }
+    for lock in &retire {
+        report.finding(
+            "schema_apply_lock_retired",
+            format!(
+                "live branch `{}` is the schema-apply lock of {ROOT_CONTRACT_RELEASE}, which a \
+                 schema apply did not release; the upgrade retires it once main is fenced, as the \
+                 completed apply would have, and keeps its head as a retired ref",
+                lock.native
+            ),
+        );
+    }
+    verify_inventory(root, &branches, &retire, pending.as_ref(), source).await?;
 
     let directory = match &pending {
         Some(intent) => {
@@ -540,9 +625,10 @@ async fn run(
                     report.finding(
                         "history_objects_present",
                         format!(
-                            "`__history/` already holds objects no v{UPGRADE_SOURCE_FORMAT} \
-                             build writes ({}); restore the whole root, `__history/` included, \
-                             from the backup taken before the earlier attempt",
+                            "`__history/` already holds objects no v{} build writes ({}); \
+                             restore the whole root, `__history/` included, from the backup \
+                             taken before the earlier attempt",
+                            source.stamp(),
                             foreign.join(", ")
                         ),
                     );
@@ -554,30 +640,31 @@ async fn run(
                     return Ok(());
                 }
             }
-            let input = match bounded_input(&main, &branches, &attempt, bounds, fenced).await? {
-                Ok(input) => input,
-                Err(over) if fenced => {
-                    report.recover(
-                        "unsupported_source",
-                        over.join("; "),
-                        Remedy::FencingExecutable,
-                    );
-                    return Ok(());
-                }
-                Err(over) => {
-                    for message in over {
-                        report.finding("unsupported_source", message);
+            let input =
+                match bounded_input(&main, &branches, &retire, &attempt, bounds, fenced).await? {
+                    Ok(input) => input,
+                    Err(over) if fenced => {
+                        report.recover(
+                            "unsupported_source",
+                            over.join("; "),
+                            Remedy::FencingExecutable,
+                        );
+                        return Ok(());
                     }
-                    return Ok(());
-                }
-            };
+                    Err(over) => {
+                        for message in over {
+                            report.finding("unsupported_source", message);
+                        }
+                        return Ok(());
+                    }
+                };
             let layout = pending
                 .as_ref()
                 .map_or(LegacyLayout::CURRENT, |intent| intent.legacy.layout);
             let census = match legacy::census_within(
                 root,
                 &input,
-                &source,
+                reader,
                 bounds.census_cells,
                 bounds.census_snapshot_bytes,
             )
@@ -586,11 +673,28 @@ async fn run(
                 Ok(census) => census,
                 Err(error) => return report.census_finding(error, fenced),
             };
+            let mut table_opens = 0;
+            if !fenced && let Some(ir) = &root_ir {
+                if let Some(differs) = contract_differs_from_tables(ir, &census.heads)? {
+                    report.finding("unsupported_source", differs);
+                    return Ok(());
+                }
+                let (opened, differs) =
+                    columns_differ_from_contract(root, &session, ir, &census.heads).await?;
+                if let Some(differs) = differs {
+                    report.finding("unsupported_source", differs);
+                    return Ok(());
+                }
+                table_opens = opened;
+            }
             let plan = match legacy::plan(&census, &layout) {
                 Ok(plan) => plan,
                 Err(error) => return report.census_finding(error, fenced),
             };
-            report.work = UpgradeWork::of_census(&census, &plan);
+            report.work = UpgradeWork {
+                table_opens,
+                ..UpgradeWork::of_census(&census, &plan)
+            };
             Some((census, plan))
         }
     };
@@ -625,11 +729,12 @@ async fn run(
             let intent = UpgradeIntent {
                 protocol: UPGRADE_PROTOCOL,
                 attempt,
-                source_format: UPGRADE_SOURCE_FORMAT,
+                source_format: source.stamp(),
                 target_format: INTERNAL_MANIFEST_SCHEMA_VERSION,
                 graph_identity: contract.head.schema_identity_domain.clone(),
                 branches,
-                schema_contract: Some(UpgradeSchemaContract::from_row(&contract)),
+                retire,
+                schema_contract: Some(UpgradeSchemaContract::from_row(&contract)?),
                 legacy: plan.clone(),
             };
             let json = intent_json(&intent)?;
@@ -637,16 +742,18 @@ async fn run(
                 report.outcome = UpgradeOutcome::CheckPassed;
                 return Ok(());
             }
-            verify_inventory(root, &intent.branches, None).await?;
+            verify_inventory(root, &intent.branches, &intent.retire, None, source).await?;
             history::archive_schema(root, &session, &contract).await?;
             let pinned = intent.branches.last();
-            if !fence_main(root, pinned, json, intent.target_format, report).await? {
+            let target = intent.target_format;
+            if !fence_main(root, pinned, json, source, target, report).await? {
                 return Ok(());
             }
             intent
         }
     };
     fail(&UPGRADE_AFTER_FENCE)?;
+    retire_locks(root, &intent.retire).await?;
 
     if let Some((census, _)) = &census {
         match legacy::materialize(root, &session, census, &intent.legacy).await {
@@ -677,9 +784,9 @@ async fn run(
         if branch_completed(&current, branch, &intent)? {
             continue;
         }
-        verify_source_head(&current, branch, native.is_none())?;
+        verify_source_head(&current, branch, native.is_none(), source)?;
         let head = converted_head(root, &session, branch, census.as_ref()).await?;
-        publish_conversion(root, &session, current, branch, &intent, &head).await?;
+        publish_conversion(root, &session, reader, current, branch, &intent, &head).await?;
         report.last_durable_completed_boundary =
             Some(format!("converted:{}", native.unwrap_or("main")));
         fail(&UPGRADE_AFTER_BRANCH)?;
@@ -698,22 +805,347 @@ async fn run(
                 named(native)
             )));
         }
-        let source = current
+        let pinned = current
             .checkout_version(branch.version)
             .await
             .map_err(OmniError::storage)?;
         let head = converted_head(root, &session, branch, None).await?;
-        equivalent_13_14(&source, &current, native, &head).await?;
+        equivalent_to_source(reader, &pinned, &current, native, &head).await?;
         validate_converted_contract(&current, native, &head, &intent).await?;
     }
-    verify_inventory(root, &intent.branches, Some(&intent)).await?;
+    verify_inventory(
+        root,
+        &intent.branches,
+        &intent.retire,
+        Some(&intent),
+        source,
+    )
+    .await?;
     fail(&UPGRADE_BEFORE_ACTIVATION)?;
     publish_activation(open(root, None).await?).await?;
     report.last_durable_completed_boundary = Some("activated".into());
     fail(&UPGRADE_AFTER_ACTIVATION)?;
     report.outcome = UpgradeOutcome::Completed;
-    report.completed_handlers.push(HANDLER.into());
+    report.completed_handlers.push(handler(source));
     Ok(())
+}
+
+/// The live refs of `source` split into the ones the upgrade converts and the
+/// schema-apply locks of 0.11.x it retires; a source whose contract is a row
+/// has no such lock.
+fn partition_locks(
+    branches: Vec<SourceBranch>,
+    source: UpgradeSource,
+) -> (Vec<SourceBranch>, Vec<SourceLock>) {
+    let is_lock = |branch: &SourceBranch| {
+        !source.contract_in_row()
+            && branch
+                .native
+                .as_deref()
+                .is_some_and(|native| logical_branch_name(native) == SCHEMA_APPLY_LOCK_BRANCH)
+    };
+    let (locks, branches): (Vec<_>, Vec<_>) = branches.into_iter().partition(is_lock);
+    let retire = locks
+        .into_iter()
+        .filter_map(|lock| {
+            lock.native.map(|native| SourceLock {
+                native,
+                identity: lock.identity,
+            })
+        })
+        .collect();
+    (branches, retire)
+}
+
+/// Retire every ref of `retire` as a 0.11.x branch delete does; one already
+/// retired under its pinned identity is left as it is.
+async fn retire_locks(root: &str, retire: &[SourceLock]) -> Result<()> {
+    if retire.is_empty() {
+        return Ok(());
+    }
+    let main = open(root, None).await?;
+    for lock in retire {
+        retire_branch_recoverably(&main, &lock.native, &lock.identity).await?;
+    }
+    Ok(())
+}
+
+/// The reader of one source format and the schema contract every live ref is
+/// converted under. `root_ir` is the IR of a contract read from the root
+/// objects, `None` on the route whose contract is a row.
+struct Route {
+    source: Box<dyn LegacyManifestSource>,
+    contract: SchemaContractRow,
+    root_ir: Option<SchemaIR>,
+}
+
+/// The route from `source` over `main`, the version of main the upgrade pins.
+/// `None` when the report holds why an unfenced graph has none; a fenced graph
+/// (`pending`) was admitted before its fence, so what refuses it is an error.
+async fn route(
+    root: &str,
+    storage: &dyn StorageAdapter,
+    source: UpgradeSource,
+    main: &Dataset,
+    pending: Option<&UpgradeIntent>,
+    bounds: Bounds,
+    report: &mut UpgradeReport,
+) -> Result<Option<Route>> {
+    let fenced = pending.is_some();
+    let refuse = |report: &mut UpgradeReport, error: OmniError| {
+        if fenced {
+            Err(error)
+        } else {
+            report.finding("unsupported_source", error.to_string());
+            Ok(None)
+        }
+    };
+    if source.contract_in_row() {
+        let reader = Stamp13Source;
+        if let Err(error) = reader.admits(main, SourceRole::LiveHead) {
+            return refuse(report, error);
+        }
+        let Some(contract) = reader.version_schema(main, None).await?.contract else {
+            return refuse(
+                report,
+                invalid(format!(
+                    "version {} of main holds no schema contract row",
+                    main.version().version
+                )),
+            );
+        };
+        return Ok(Some(Route {
+            source: Box::new(reader),
+            contract,
+            root_ir: None,
+        }));
+    }
+    let (contract, root_ir) = match pending {
+        Some(intent) => {
+            let bound = intent
+                .schema_contract
+                .as_ref()
+                .ok_or_else(|| invalid("storage upgrade intent names no schema contract"))?;
+            let session = crate::lance_access::control_session();
+            match history::read_schema(root, &session, &bound.content_sha256, &bound.identity).await
+            {
+                Ok(contract) => (contract, None),
+                Err(error) if root_schema::store_did_not_answer(&error) => return Err(error),
+                Err(error) => {
+                    report.recover(
+                        "legacy_objects_differ",
+                        format!(
+                            "the schema content `{}` the upgrade intent binds cannot be read \
+                             from `__history/schemas/`: {error}; restore the whole root from the \
+                             backup taken before the attempt",
+                            bound.content_sha256
+                        ),
+                        Remedy::FencingExecutable,
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+        None => {
+            if let Some(staging) = root_schema::staging_object(root, storage).await? {
+                report.source_recovery(
+                    handler(source),
+                    format!(
+                        "schema object `{staging}` at the graph root is the unfinished part of \
+                         a schema apply by {ROOT_CONTRACT_RELEASE}; it must be resolved before \
+                         the storage conversion"
+                    ),
+                    ROOT_CONTRACT_RELEASE,
+                    "stop all writers, retain the backup, open the graph read-write with \
+                     omnigraph 0.11.x so it finishes or rolls back the schema apply, then rerun \
+                     `omnigraph upgrade <graph> --check`",
+                );
+                return Ok(None);
+            }
+            let loaded = match root_schema::load_validated_schema_contract(
+                root,
+                storage,
+                bounds.root_object_bytes,
+            )
+            .await
+            {
+                Ok(loaded) => loaded,
+                Err(error) if root_schema::store_did_not_answer(&error) => return Err(error),
+                Err(error) => {
+                    let [pg, ir, state] = root_schema::SCHEMA_FILENAMES;
+                    report.finding(
+                        "unsupported_source",
+                        format!(
+                            "the schema contract of this v{} graph cannot be read from `{pg}`, \
+                             `{ir}` and `{state}` at the graph root: {error}; restore the whole \
+                             root from one backup ({ROOT_CONTRACT_RELEASE} refuses to open this \
+                             state as well)",
+                            source.stamp()
+                        ),
+                    );
+                    return Ok(None);
+                }
+            };
+            if let Err(error) = root_schema::stamp_covers_vintage(source.stamp(), &loaded.ir) {
+                return refuse(report, error);
+            }
+            (loaded.row, Some(loaded.ir))
+        }
+    };
+    let reader = RootContractSource::new(source.stamp(), contract.clone())?;
+    if let Err(error) = reader.admits(main, SourceRole::LiveHead) {
+        return refuse(report, error);
+    }
+    Ok(Some(Route {
+        source: Box::new(reader),
+        contract,
+        root_ir,
+    }))
+}
+
+/// The table key and identity of every node and edge type `ir` declares.
+fn described_tables(ir: &SchemaIR) -> Result<BTreeSet<(String, TableIdentity)>> {
+    let nodes = ir.nodes.iter().map(|node| {
+        (
+            SchemaTypeKind::Node,
+            &node.name,
+            node.type_id,
+            node.table_incarnation_id,
+        )
+    });
+    let edges = ir.edges.iter().map(|edge| {
+        (
+            SchemaTypeKind::Edge,
+            &edge.name,
+            edge.type_id,
+            edge.table_incarnation_id,
+        )
+    });
+    let mut described = BTreeSet::new();
+    for (kind, name, type_id, incarnation) in nodes.chain(edges) {
+        let identity = TableIdentity::new(type_id.get(), incarnation.get())
+            .map_err(|error| invalid(error.to_string()))?;
+        described.insert((schema_table_key(kind, name), identity));
+    }
+    Ok(described)
+}
+
+/// How the first table of main's head differs in its columns from the ones
+/// the root contract `ir` declares, with the count of tables opened; `None`
+/// when every pinned table stores exactly the declared columns.
+async fn columns_differ_from_contract(
+    root: &str,
+    session: &Arc<Session>,
+    ir: &SchemaIR,
+    heads: &[CensusHead],
+) -> Result<(u64, Option<String>)> {
+    let main = heads
+        .iter()
+        .find(|head| head.native.is_none())
+        .ok_or_else(|| OmniError::manifest_internal("the census derived no head for main"))?;
+    let mut catalog = build_catalog_from_ir(ir).map_err(|error| invalid(error.to_string()))?;
+    fixup_physical_schemas(&mut catalog)?;
+    let mut opened = 0;
+    for table in &main.record.tables {
+        let TableState::Pinned(pin) = &table.state else {
+            continue;
+        };
+        let registration = &table.registration;
+        let declared = schema_for_table_key(&catalog, &registration.table_key)?;
+        let entry = DatasetEntry {
+            identity: registration.identity,
+            type_key: registration.table_key.clone(),
+            dataset_path: registration.table_path.clone(),
+            published_dataset_version: pin.table_version,
+            native_dataset_branch: pin.table_branch.clone(),
+            entity_count: pin.row_count,
+            version_metadata: pin.metadata.clone(),
+            manifest_version: pin.manifest_version,
+        };
+        let dataset = open_dataset_entry(&entry, root, Some(session)).await?;
+        opened += 1;
+        let stored = arrow_schema::Schema::from(dataset.schema());
+        if let Some(differs) = column_difference(&registration.table_key, &declared, &stored) {
+            return Ok((opened, Some(differs)));
+        }
+    }
+    Ok((opened, None))
+}
+
+/// The first column of main's `table_key` whose name or type differs between
+/// the root contract (`declared`) and the stored table (`stored`).
+fn column_difference(
+    table_key: &str,
+    declared: &arrow_schema::Schema,
+    stored: &arrow_schema::Schema,
+) -> Option<String> {
+    const REMEDY: &str = "restore the three root schema objects from the backup taken with the \
+                          tables, or rebuild the graph by export and load with omnigraph 0.11.x";
+    for field in declared.fields() {
+        match stored.field_with_name(field.name()) {
+            Err(_) => {
+                return Some(format!(
+                    "main's table {table_key} has no column `{}`, which the schema contract at \
+                     the graph root declares as {}; {REMEDY}",
+                    field.name(),
+                    field.data_type()
+                ));
+            }
+            Ok(found) if found.data_type() != field.data_type() => {
+                return Some(format!(
+                    "main's table {table_key} stores column `{}` as {}, the schema contract at \
+                     the graph root declares {}; {REMEDY}",
+                    field.name(),
+                    found.data_type(),
+                    field.data_type()
+                ));
+            }
+            Ok(_) => {}
+        }
+    }
+    stored
+        .fields()
+        .iter()
+        .find(|field| declared.field_with_name(field.name()).is_err())
+        .map(|field| {
+            format!(
+                "main's table {table_key} has column `{}`, which the schema contract at the \
+                 graph root does not declare; {REMEDY}",
+                field.name()
+            )
+        })
+}
+
+/// How the first live head that differs registers other tables than the root
+/// contract `ir` describes; `None` when every head registers exactly those,
+/// as 0.11.x requires of the refs it serves under the one contract.
+fn contract_differs_from_tables(ir: &SchemaIR, heads: &[CensusHead]) -> Result<Option<String>> {
+    let described = described_tables(ir)?;
+    let registered =
+        |registration: &TableRegistration| (registration.table_key.clone(), registration.identity);
+    for head in heads {
+        let native = named(head.native.as_deref());
+        let registers: BTreeSet<(String, TableIdentity)> = head
+            .record
+            .tables
+            .iter()
+            .filter(|table| !matches!(table.state, TableState::Dropped { .. }))
+            .map(|table| registered(&table.registration))
+            .collect();
+        if let Some((key, _)) = registers.difference(&described).next() {
+            return Ok(Some(format!(
+                "{native} registers tables the schema contract at the graph root does not \
+                 describe: {key}"
+            )));
+        }
+        if let Some((key, _)) = described.difference(&registers).next() {
+            return Ok(Some(format!(
+                "{native} does not register table {key}, which the schema contract at the \
+                 graph root describes"
+            )));
+        }
+    }
+    Ok(None)
 }
 
 fn require_bound_directory(directory: &LegacyDirectory, intent: &UpgradeIntent) -> Result<()> {
@@ -804,10 +1236,7 @@ fn authorize(
         OmniError::Policy("storage upgrade requires an actor when policy is installed".into())
     })?;
     for branch in branches {
-        let name = branch
-            .native
-            .as_deref()
-            .map_or("main", crate::branch_names::logical_branch_name);
+        let name = branch.native.as_deref().map_or("main", logical_branch_name);
         checker
             .check(
                 omnigraph_policy::PolicyAction::SchemaApply,
@@ -858,14 +1287,28 @@ async fn inventory(main: &Dataset) -> Result<Vec<SourceBranch>> {
 }
 
 /// The refs the census reads: the pinned live refs with the ref each forked
-/// from, and every retired ref at its head.
+/// from, and every retired ref at its head, the locks of `retire` among them
+/// whether the fence retired them yet or not.
 async fn census_input(
     main: &Dataset,
     branches: &[SourceBranch],
+    retire: &[SourceLock],
     attempt: &str,
-    retired_refs: HashMap<String, BranchContents>,
+    mut retired_refs: HashMap<String, BranchContents>,
 ) -> Result<CensusInput> {
     let contents = crate::branch_control::list_live_manifest_branch_contents(main).await?;
+    for lock in retire {
+        if retired_refs.contains_key(&lock.native) {
+            continue;
+        }
+        let live = contents.get(&lock.native).ok_or_else(|| {
+            invalid(format!(
+                "ref '{}' is neither live nor retired as the upgrade pinned it",
+                lock.native
+            ))
+        })?;
+        retired_refs.insert(lock.native.clone(), live.clone());
+    }
     let mut live = Vec::with_capacity(branches.len());
     for branch in branches {
         let parent = match &branch.native {
@@ -913,9 +1356,16 @@ async fn census_input(
     })
 }
 
-fn verify_source_head(dataset: &Dataset, source: &SourceBranch, fenced: bool) -> Result<()> {
-    let native = source.native.as_deref();
-    let expected = source
+/// `dataset` is the head the upgrade pinned for `branch`: stamped as `source`
+/// is, or one version above it and stamped 14 when it is the fenced main.
+fn verify_source_head(
+    dataset: &Dataset,
+    branch: &SourceBranch,
+    fenced: bool,
+    source: UpgradeSource,
+) -> Result<()> {
+    let native = branch.native.as_deref();
+    let expected = branch
         .version
         .checked_add(u64::from(fenced))
         .ok_or_else(|| invalid("upgrade version overflow"))?;
@@ -930,7 +1380,7 @@ fn verify_source_head(dataset: &Dataset, source: &SourceBranch, fenced: bool) ->
     }
     let stamp = match fenced {
         true => INTERNAL_MANIFEST_SCHEMA_VERSION,
-        false => UPGRADE_SOURCE_FORMAT,
+        false => source.stamp(),
     };
     if read_stamp(dataset) != Some(stamp) {
         return Err(invalid(format!(
@@ -943,17 +1393,21 @@ fn verify_source_head(dataset: &Dataset, source: &SourceBranch, fenced: bool) ->
 }
 
 /// The live refs are the pinned ones, each at its pinned or converted head,
-/// and a fenced main still carries `pending`.
+/// beside the locks of `retire` until the fence retires them, and a fenced
+/// main still carries `pending`.
 async fn verify_inventory(
     root: &str,
     branches: &[SourceBranch],
+    retire: &[SourceLock],
     pending: Option<&UpgradeIntent>,
+    source: UpgradeSource,
 ) -> Result<()> {
     let main = open(root, None).await?;
     let observed: BTreeSet<String> =
         crate::branch_control::list_live_manifest_branch_contents(&main)
             .await?
             .into_keys()
+            .filter(|native| !retire.iter().any(|lock| lock.native == *native))
             .collect();
     let expected: BTreeSet<String> = branches
         .iter()
@@ -968,13 +1422,13 @@ async fn verify_inventory(
     if pending.is_some() && intent_from(&main)?.as_ref() != pending {
         return Err(invalid("main no longer carries this upgrade's intent"));
     }
-    for source in branches {
-        let native = source.native.as_deref();
+    for branch in branches {
+        let native = branch.native.as_deref();
         let dataset = open(root, native).await?;
         if crate::branch_control::dataset_branch_identifier(&dataset)
             .await
             .map_err(OmniError::storage)?
-            != source.identity
+            != branch.identity
         {
             return Err(invalid(format!(
                 "the native lifetime of {} changed during the offline upgrade",
@@ -982,11 +1436,12 @@ async fn verify_inventory(
             )));
         }
         let converted = match pending {
-            Some(intent) => branch_completed(&dataset, source, intent)?,
+            Some(intent) => branch_completed(&dataset, branch, intent)?,
             None => false,
         };
         if !converted {
-            verify_source_head(&dataset, source, pending.is_some() && native.is_none())?;
+            let fenced = pending.is_some() && native.is_none();
+            verify_source_head(&dataset, branch, fenced, source)?;
         }
     }
     Ok(())
@@ -1004,8 +1459,8 @@ async fn preflight_refs(root: &str, branches: &[SourceBranch]) -> Result<Vec<Upg
     for branch in branches {
         let native = branch.native.as_deref();
         if let Some(native) = native {
-            let logical = crate::branch_names::logical_branch_name(native);
-            crate::branch_names::ensure_logical_branch_name(logical)?;
+            let logical = logical_branch_name(native);
+            ensure_logical_branch_name(logical)?;
             if !logical_names.insert(logical.to_string()) {
                 findings.push(unsupported(format!(
                     "two live refs carry the logical branch name '{logical}'"
@@ -1039,6 +1494,7 @@ async fn preflight_refs(root: &str, branches: &[SourceBranch]) -> Result<Vec<Upg
 async fn bounded_input(
     main: &Dataset,
     branches: &[SourceBranch],
+    retire: &[SourceLock],
     attempt: &str,
     bounds: Bounds,
     fenced: bool,
@@ -1055,7 +1511,7 @@ async fn bounded_input(
             bounds.retired_refs
         )]));
     }
-    let input = census_input(main, branches, attempt, retired_refs).await?;
+    let input = census_input(main, branches, retire, attempt, retired_refs).await?;
     let live = input.live.iter().map(|source| (source, "", ""));
     let retired = input
         .retired
@@ -1164,7 +1620,8 @@ fn source_pin(scan: &HeadScan, identity: TableIdentity) -> Option<&TablePin> {
 /// The converted version of a ref holds the visible state of its source
 /// version: the same pinned tables, its own head commit alone under its
 /// logical name, and none when the ref wrote no commit of its own.
-async fn equivalent_13_14(
+async fn equivalent_to_source(
+    scanner: &dyn LegacyManifestSource,
     source: &Dataset,
     target: &Dataset,
     native: Option<&str>,
@@ -1179,7 +1636,7 @@ async fn equivalent_13_14(
             source.version().version
         ))
     };
-    let scan = Stamp13Source.scan_head(source).await?;
+    let scan = scanner.scan_head(source).await?;
     let (mut state, _) = read_converted_state(target).await?;
     state.entries.sort_by_key(|entry| entry.identity);
     let mut pinned: Vec<_> = head
@@ -1224,7 +1681,7 @@ async fn equivalent_13_14(
             )));
         }
     }
-    let key = native.map_or("main", crate::branch_names::logical_branch_name);
+    let key = native.map_or("main", logical_branch_name);
     let id = &head.commit.graph_commit_id;
     let own = head.commit.native_branch.as_deref() == native;
     let expected = match own {
@@ -1283,12 +1740,13 @@ async fn fence_main(
     root: &str,
     pinned: Option<&SourceBranch>,
     intent: String,
+    source: UpgradeSource,
     target: u32,
     report: &mut UpgradeReport,
 ) -> Result<bool> {
     let unfenced = open(root, None).await?;
     if let Some(pinned) = pinned {
-        verify_source_head(&unfenced, pinned, false)?;
+        verify_source_head(&unfenced, pinned, false, source)?;
     }
     match publish_fence(unfenced, intent, target).await {
         Ok(_) => {
@@ -1347,6 +1805,7 @@ async fn publish_activation(dataset: Dataset) -> Result<Dataset> {
 async fn publish_conversion(
     root: &str,
     session: &Arc<Session>,
+    scanner: &dyn LegacyManifestSource,
     current: Dataset,
     branch: &SourceBranch,
     intent: &UpgradeIntent,
@@ -1404,7 +1863,7 @@ async fn publish_conversion(
             named(native)
         )));
     }
-    equivalent_13_14(&source, &target, native, head).await?;
+    equivalent_to_source(scanner, &source, &target, native, head).await?;
     validate_converted_contract(&target, native, head, intent).await
 }
 

@@ -771,7 +771,42 @@ jobs:
       - name: Check storage compatibility gate configuration
         run: python3 scripts/check-storage-upgrade-ci.py --self-test
 
-      # The genuine stamp-13 predecessor for the one in-place route
+      # The genuine predecessors of the release route (`omnigraph upgrade`,
+      # storage format 8 or 9 to 14): v0.11.0 writes stamp 9 and converts a
+      # v0.10.0 graph to stamp 8. The release assets are trusted exactly as
+      # the `test` job's v0.9.0 and v0.10.0 installs trust them: `install.sh`
+      # verifies the archive against the `.sha256` published beside it, and
+      # no digest is pinned here.
+      - name: Install released v0.10.0 and v0.11.0 CLIs
+        run: |
+          set -euo pipefail
+          v6_dir="$RUNNER_TEMP/omnigraph-v010"
+          v011_dir="$RUNNER_TEMP/omnigraph-v011"
+          # The installer downloads the official archive and verifies its
+          # SHA256 before extraction. An exact VERSION never falls back to edge.
+          # A failed download leaves nothing behind, so each release gets three
+          # attempts before this required context goes red.
+          install_release() {
+            for attempt in 1 2 3; do
+              REPO_SLUG=ModernRelay/omnigraph VERSION="$1" INSTALL_DIR="$2" \
+                bash scripts/install.sh && return 0
+              echo "install of $1 failed on attempt $attempt/3; retrying"
+              sleep 10
+            done
+            return 1
+          }
+          install_release v0.10.0 "$v6_dir"
+          test -x "$v6_dir/omnigraph"
+          [[ "$("$v6_dir/omnigraph" --version)" == "omnigraph 0.10.0" ]] \
+            || { echo "::error::the storage upgrades of a 0.10.0 graph require the genuine v0.10.0 CLI"; exit 1; }
+          install_release v0.11.0 "$v011_dir"
+          test -x "$v011_dir/omnigraph"
+          [[ "$("$v011_dir/omnigraph" --version)" == "omnigraph 0.11.0" ]] \
+            || { echo "::error::the release storage upgrade requires the genuine v0.11.0 CLI"; exit 1; }
+          echo "OMNIGRAPH_V6_BIN=$v6_dir/omnigraph" >> "$GITHUB_ENV"
+          echo "OMNIGRAPH_V011_BIN=$v011_dir/omnigraph" >> "$GITHUB_ENV"
+
+      # The genuine stamp-13 predecessor for the main-build in-place route
       # (`omnigraph upgrade`, storage format 13 to 14). Keep this immutable:
       # HEAD^ is not a stable format reference, and the last main commit that
       # wrote stamp 13 is the source the journey converts.

@@ -79,14 +79,44 @@ do not introduce historical schema-language semantics. See
 
 ## Pending storage conversion
 
-The offline stamp-13 to stamp-14 upgrade sets `UPGRADE_PENDING_KEY`
+The offline upgrade to stamp 14, from stamp 8, 9 or 13, sets `UPGRADE_PENDING_KEY`
 (`omnigraph:storage_upgrade_pending`) on main's `__manifest` from its fence
-commit to its activation commit; the value is the `UpgradeIntent`. Ordinary
+commit to its activation commit; the value is the `UpgradeIntent`, whose
+`source_format` names the route. Ordinary
 open, read-only included, refuses a graph that carries it with
-`recovery_guidance`. Only main is fenced: a stamp-13 process opened before the
+`recovery_guidance`. Only main is fenced: a source-build process opened before the
 fence can still publish on an unconverted named ref, which is why the upgrade
 requires every process stopped and refuses a moved ref (`verify_source_head`)
 instead of adopting it. Never remove the key by hand.
+
+A stamp-8 or stamp-9 source has one stop of its own before the fence,
+`source_recovery_required` and writing nothing: a `.staging` copy of
+`_schema.pg`, `_schema.ir.json` or `__schema_state.json` at the graph root,
+the unfinished schema apply of release 0.11.x, or a recovery sidecar, each
+with or without a live `__schema_apply_lock__` ref beside it. A read-write
+open by 0.11.x (`omnigraph snapshot` is one) removes the sidecar and finishes
+or rolls back an apply whose live and staging schemas imply different table
+sets; when both imply the same table set (a property-only apply) 0.11.x
+refuses too and leaves the choice between the live and the staging schema to
+the operator. 0.11.x releases the lock only in the process that took it, so
+the lock outlives that open. A live `__schema_apply_lock__` ref on an
+otherwise clean root (no `.staging` copy, no recovery sidecar) is the lock of
+an apply that was killed before releasing it, or whose release failed after
+the apply completed; every such kill point leaves a consistent root, so the
+upgrade reports it as `schema_apply_lock_retired` and,
+once main is fenced, retires the ref with the same
+`retire_branch_recoverably` a 0.11.x branch delete runs, so the converted
+graph does not hold it as a live ref. The retirement is idempotent: a rerun
+stopped before it retires the lock, one stopped after it finds it retired,
+and the census reads the lock as a retired ref either way. The upgrade
+deletes no root object, but a fenced rerun does not read them: the fence
+binds the digest of the contract archived under `__history/schemas/` before
+it, and the rerun reads that archive, so a root object changed or removed
+after the fence does not strand the graph (an unreadable archive is
+`legacy_objects_differ`, resolved from the backup). The route also compares
+the contract's columns with each registered table's Lance columns before any
+write, so root objects restored from a backup older than a property-only
+apply are `unsupported_source`, not a contract of every commit.
 
 The upgrade owns its own recovery; no other writer resumes it. Every durable
 effect is either create-only under `__history/` (`put_if_absent`, equal bytes
