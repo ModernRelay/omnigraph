@@ -1436,8 +1436,8 @@ node Document {
     db.load_jsonl(&data, LoadMode::Overwrite).await.unwrap();
 
     // Admission policy is not durable graph data. Reopen with the default
-    // deny policy so the rewrite proves that a historical descriptor is
-    // carried without re-authorizing or probing its caller-owned target.
+    // deny policy so the drop proves that a stored descriptor stays in place
+    // without re-authorizing or probing its caller-owned target.
     let db = Omnigraph::open(uri).await.unwrap();
 
     let documents_before = count_rows(&db, "node:Document").await;
@@ -1448,10 +1448,9 @@ node Document {
         .graph_manifest_version();
 
     // Drop `note` from Document. v1 + chassis commit #3 emit
-    // `DropProperty`; the rewrite path projects to the
-    // target schema (no `note`), commits via stage_overwrite. Row
-    // counts are unchanged — only the column is dropped from the
-    // current schema view.
+    // `DropProperty`; a metadata-only Project removes the column from the
+    // table's schema and keeps every data file. Row counts are unchanged —
+    // only the column is dropped from the current schema view.
     let desired = initial.replace("    note: String?\n", "");
 
     // Confirm the plan emits DropProperty (not UnsupportedChange).
@@ -1469,10 +1468,10 @@ node Document {
         "expected DropProperty {{ type=Document, property=note }} in plan; got {plan:?}",
     );
 
-    // An unrelated schema rewrite carries the descriptor, not the external
-    // payload. The caller-owned target may be unavailable without blocking
-    // schema evolution.
+    // The drop reads no row, so the caller-owned target of a stored external
+    // descriptor may be unavailable without blocking schema evolution.
     std::fs::remove_file(&external_path).unwrap();
+    let files_before = data_file_paths(&db, "node:Document").await;
     let probes = omnigraph::instrumentation::MergeWriteProbes::default();
     let result = omnigraph::instrumentation::with_merge_write_probes(
         probes.clone(),
@@ -1482,10 +1481,12 @@ node Document {
     .unwrap();
     assert!(result.supported);
     assert!(result.applied);
-    // Three managed values (valid empty, inline, packed) in one batched read.
-    assert_eq!(probes.blob_managed_batch_read_calls(), 1);
-    assert_eq!(probes.blob_payload_read_calls(), 3);
+    // Metadata-only: no managed or external payload is read, and every data
+    // file the table had before is still the table's data.
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0);
+    assert_eq!(probes.blob_payload_read_calls(), 0);
     assert_eq!(probes.external_blob_payload_read_calls(), 0);
+    assert_eq!(data_file_paths(&db, "node:Document").await, files_before);
     assert_exact_id_primary_key(&db, "node:Document").await;
 
     // Manifest advanced; row count unchanged.
@@ -1546,7 +1547,7 @@ node Document {
             assert_eq!(reference.length, None);
         }
         BlobContent::Managed { .. } => {
-            panic!("schema rewrite must preserve the external Blob descriptor")
+            panic!("schema apply must preserve the external Blob descriptor")
         }
     }
 
@@ -1640,11 +1641,26 @@ node Document {
     );
 }
 
+/// A ranged external Blob descriptor survives a schema change on its table:
+/// the column changes are metadata-only, so the stored descriptor is never
+/// rebuilt and cannot be widened to its whole object.
 #[tokio::test]
 #[cfg(feature = "failpoints")]
 #[serial_test::parallel]
-async fn schema_apply_rejects_ranged_external_blob_before_arm_or_effects() {
-    use helpers::recovery::{branch_head_commit_id, sidecar_operation_ids};
+async fn schema_apply_preserves_ranged_external_blob_across_column_changes() {
+    async fn assert_ranged(db: &Omnigraph, target: ReadTarget, property: &str) {
+        let read = db
+            .read_blob_at(target, node_blob_cell("Document", "ranged", property))
+            .await
+            .unwrap();
+        match read.content {
+            BlobContent::External(reference) => {
+                assert_eq!(reference.uri, "s3://bucket/object");
+                assert_eq!((reference.offset, reference.length), (4, Some(8)));
+            }
+            BlobContent::Managed { .. } => panic!("the ranged descriptor must stay external"),
+        }
+    }
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -1654,62 +1670,62 @@ node Document {
     content: Blob?
 }
 "#;
-    let desired = r#"
+    let added = r#"
 node Document {
     title: String @key
     content: Blob?
     note: String?
 }
 "#;
+    let renamed = r#"
+node Document {
+    title: String @key
+    body: Blob? @rename_from("content")
+}
+"#;
     let db = Omnigraph::init(uri, initial).await.unwrap();
-    let table_uri = helpers::seed_ranged_external_blob_row(&db, uri).await;
+    helpers::seed_ranged_external_blob_row(&db, uri).await;
+    let before = db.resolve_snapshot("main").await.unwrap();
+    let files_before = data_file_paths(&db, "node:Document").await;
 
-    let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let manifest_before = before.graph_manifest_version();
-    let table_before = before
-        .dataset("node:Document")
-        .unwrap()
-        .published_dataset_version;
-    let physical_head_before = lance::Dataset::open(&table_uri)
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let apply = |desired: &'static str| {
+        omnigraph::instrumentation::with_merge_write_probes(
+            probes.clone(),
+            db.apply_schema(desired),
+        )
+    };
+    assert!(apply(added).await.unwrap().applied);
+    assert_ranged(&db, ReadTarget::branch("main"), "content").await;
+    // The snapshot before the add reads the same cell under the same name.
+    assert_ranged(&db, ReadTarget::snapshot(before), "content").await;
+
+    assert!(apply(renamed).await.unwrap().applied);
+    assert_ranged(&db, ReadTarget::branch("main"), "body").await;
+
+    assert_eq!(probes.blob_payload_read_calls(), 0);
+    assert_eq!(probes.external_blob_payload_read_calls(), 0);
+    assert_eq!(data_file_paths(&db, "node:Document").await, files_before);
+}
+
+/// The data files of a table's pinned version, per fragment id.
+async fn data_file_paths(db: &Omnigraph, table_key: &str) -> Vec<(u64, Vec<String>)> {
+    helpers::open_pinned_dataset_for_test(db, "main", table_key)
         .await
-        .unwrap()
-        .version()
-        .version;
-    let lineage_before = branch_head_commit_id(dir.path(), "main").await.unwrap();
-    assert!(sidecar_operation_ids(dir.path()).is_empty());
-
-    let error = db.apply_schema(desired).await.unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("cannot preserve ranged external Blob descriptor"),
-        "unexpected schema-apply refusal: {error}"
-    );
-    let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    assert_eq!(after.graph_manifest_version(), manifest_before);
-    assert_eq!(
-        after
-            .dataset("node:Document")
-            .unwrap()
-            .published_dataset_version,
-        table_before
-    );
-    assert_eq!(
-        lance::Dataset::open(&table_uri)
-            .await
-            .unwrap()
-            .version()
-            .version,
-        physical_head_before
-    );
-    assert_eq!(
-        branch_head_commit_id(dir.path(), "main").await.unwrap(),
-        lineage_before
-    );
-    assert!(
-        sidecar_operation_ids(dir.path()).is_empty(),
-        "ranged descriptor refusal must occur before recovery arm"
-    );
+        .get_fragments()
+        .iter()
+        .map(|fragment| {
+            (
+                fragment.id() as u64,
+                fragment
+                    .metadata()
+                    .files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 #[tokio::test]
