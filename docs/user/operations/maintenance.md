@@ -288,5 +288,5 @@ for tables with an `error`.
 - Run `cleanup` from an explicit retention policy after backups and rollback
   requirements have been reviewed.
 
-Storage-format upgrades are `omnigraph upgrade`, not maintenance. See
+Moving a graph to another storage format is not maintenance. See
 [Upgrading](upgrade.md).

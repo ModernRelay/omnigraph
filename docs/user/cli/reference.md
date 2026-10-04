@@ -52,9 +52,9 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `schema show` | Read the accepted schema | direct or served |
 | `schema apply` | Apply a schema to a standalone graph | direct |
 | `schema plan` | Preview a schema migration | direct |
-| `schema upgrade-system-columns` | Respell a v8 graph's system columns in place (storage format v8 to v9) | direct |
+| `schema upgrade-system-columns` | Respell a graph's system columns in place; needs a graph that normal open accepts and keeps its storage format | direct |
 | `lint` | Validate `.gq` source | local schema or direct graph |
-| `upgrade` | Check or execute a registered offline storage migration | direct standalone |
+| `upgrade` | Report whether graph storage is in the format this binary serves; writes nothing | direct standalone |
 | `optimize` | Compact data and reconcile declared indexes | direct |
 | `rebuild-full-text-indexes` | Replace full-text indexes on one branch | direct |
 | `repair` | Report each table's Lance history against its registration (`no_drift` or `foreign_drift`) | direct |
@@ -134,18 +134,18 @@ omnigraph upgrade ./graph.omni --json
 omnigraph schema upgrade-system-columns ./graph.omni --check --json
 ```
 
-`--store` is an alternative to the positional storage URI. Target format defaults
-to 11: qualified v6 inputs run v6 → v7 → v8 → v10 → v11, v7 inputs
-v7 → v8 → v10 → v11, v8 and v9 inputs v10 → v11, v10 inputs the v11 step alone;
-`--to-format 8` or `--to-format 10` stops there with the older format.
-Explicit target 7 remains available, but the current binary refuses normal open
-of v7. `--check` performs read-only preflight and reports output-dependent checks
-in `work.deferred_checks`; execution validates those before the affected handler
-has effects. Execution requires stopped writers, stopped maintenance and a
-verified whole-root backup. A failed check, refusal or
-required recovery exits 1. JSON reports the route, formats, findings, durable
-boundary, recovery action and work categories. Server and cluster addressing
-are refused. See [storage migration](../operations/upgrade.md#explicit-storage-migration).
+`--store` is an alternative to the positional storage URI. `omnigraph upgrade`
+reports the graph's storage format against the one this binary serves (v14)
+and writes nothing, with or without `--check`; this build has no in-place
+storage conversion. A v14 graph reports `already_current` and exits 0. Any
+other format reports the finding `unsupported_source` with the refusal text of
+normal open, a `--to-format` other than 14 reports `unsupported_target`, and a
+graph carrying a pending conversion marker reports `recovery_required`; each
+exits 1. JSON reports the observed and target formats, findings and recovery
+action. Server and cluster addressing are refused. See
+[storage format report](../operations/upgrade.md#storage-format-report).
+`schema upgrade-system-columns` is a separate operation on a served graph; see
+[system-column upgrade](../operations/upgrade.md#system-column-upgrade-legacy-spellings).
 
 ## Load modes
 

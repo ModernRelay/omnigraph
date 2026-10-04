@@ -2951,6 +2951,13 @@ async fn settings_show_all_lists_the_definition_in_order() {
                 "default",
                 "request"
             ),
+            show_row(
+                "history_release_bytes",
+                "262144",
+                "262144",
+                "default",
+                "request"
+            ),
         ])
     );
 }

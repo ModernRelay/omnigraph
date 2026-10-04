@@ -16,6 +16,7 @@ use omnigraph_cluster::{
     force_unlock_storage_root, plan_config_dir_authorized, reconcile_deployment,
     upgrade_deployment_ledger,
 };
+use omnigraph_core::graph_commit_id::intent_nonce;
 
 const SCHEMA: &str = "node Person { name: String @key }";
 
@@ -429,10 +430,13 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
         panic!("expected neutral-fence proof: {:?}", result.graphs);
     };
     assert_eq!(
-        commit.graph_commit_id,
+        intent_nonce(&commit.graph_commit_id).unwrap(),
         fence["lineage"]["graph_commit_id"].as_str().unwrap()
     );
-    assert_ne!(commit.graph_commit_id, original_commit);
+    assert_ne!(
+        intent_nonce(&commit.graph_commit_id).unwrap(),
+        original_commit
+    );
     assert_eq!(commit.actor_id.as_deref(), Some("principal:recovery"));
     assert_eq!(*fenced_contract, contract);
     let db = Box::pin(Omnigraph::open_read_only(uri)).await.unwrap();
@@ -451,7 +455,7 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
     assert!(
         history
             .iter()
-            .all(|entry| entry.graph_commit_id != original_commit)
+            .all(|entry| intent_nonce(&entry.graph_commit_id).unwrap() != original_commit)
     );
     let finished: serde_json::Value =
         serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();

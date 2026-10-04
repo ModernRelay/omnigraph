@@ -1,6 +1,7 @@
 // The crate is `#![cfg(tokio_unstable)]`-gated; without the flag the lib
 // compiles EMPTY, so this file must vanish with it too (see scenarios.rs).
 #![cfg(tokio_unstable)]
+#![recursion_limit = "256"]
 
 //! LANE B — the real-death instruments. A separate `dst_child` process
 //! runs a seeded workload on a local-FS root (the substrate that

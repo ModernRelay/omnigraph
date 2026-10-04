@@ -2,6 +2,7 @@
 mod catalog_tests;
 pub mod commit_graph;
 pub(crate) mod graph_coordinator;
+pub(crate) mod legacy_sidecars;
 pub mod manifest;
 pub(crate) mod omnigraph;
 mod schema_state;
@@ -33,9 +34,6 @@ pub(crate) use omnigraph::{WriteAuthorityToken, WriteTxn};
 pub(crate) use omnigraph_core::metadata::now_micros;
 pub(crate) use schema_state::SchemaContractIdentity;
 pub use snapshot::{Snapshot, SnapshotDataset, SnapshotScanner};
-#[cfg(feature = "dst")]
-#[doc(hidden)]
-pub use upgrade::dst_prepare_legacy_upgrade_fixture;
 pub use upgrade::{
     UpgradeFinding, UpgradeMode, UpgradeOptions, UpgradeOutcome, UpgradeRecovery, UpgradeReport,
     UpgradeWork, upgrade_storage, upgrade_storage_as,

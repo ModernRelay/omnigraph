@@ -1,27 +1,29 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use arrow_array::{Array, LargeStringArray, RecordBatch, StringArray, UInt64Array};
-use futures::future::BoxFuture;
-use futures::{Stream, StreamExt, TryStreamExt};
+use arrow_array::{Array, ArrayRef, LargeStringArray, RecordBatch, StringArray};
+use futures::TryStreamExt;
 use lance::Dataset;
 
 use crate::error::{OmniError, Result};
-use crate::record::{
-    SCHEMA_CONTENT_COLUMNS, StoredShape, expand_from_storage, flat_projection, packed_projection,
-    stored_shape,
+use crate::history::{self, Appended, HistoryRecord};
+use crate::record::expand_from_storage;
+/// The row schema's public path; it is defined in the private `record` module.
+pub use crate::record::manifest_schema;
+use crate::row::{
+    CommitColumns, CommitColumnsBuilder, RawTable, ReplacedClock, ReplacedColumns,
+    ReplacedColumnsBuilder, TableColumns, TableColumnsBuilder, metadata_measure,
 };
-/// The row schemas' public path; they are defined in the private `record` module.
-pub use crate::record::{flat_manifest_schema, manifest_schema};
 
-use super::layout::{manifest_version_from_object_id, table_object_id, version_object_id};
+use super::layout::{replaced_table_object_id, table_object_id};
 use super::metadata::TableVersionMetadata;
-use super::migrations::read_stamp;
+use super::migrations::{guard_row_layout, read_stamp};
 use super::{
-    MAIN_BRANCH_HEAD_KEY, OBJECT_TYPE_GRAPH_COMMIT, OBJECT_TYPE_GRAPH_HEAD,
-    OBJECT_TYPE_SCHEMA_CONTRACT, OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE,
-    OBJECT_TYPE_TABLE_VERSION, SCHEMA_CONTRACT_OBJECT_ID, TableIdentity, TableRegistration,
+    HistoryReleaseBytes, MAIN_BRANCH_HEAD_KEY, OBJECT_TYPE_GRAPH_COMMIT,
+    OBJECT_TYPE_REPLACED_TABLE, OBJECT_TYPE_SETTLED_COMMIT, OBJECT_TYPE_TABLE, TAIL_MAX_COMMITS,
+    TableIdentity, TableRegistration,
 };
+use omnigraph_core::graph_commit_id::parse_history_block_id;
 
 #[derive(Debug, Clone)]
 pub struct DatasetEntry {
@@ -55,14 +57,11 @@ impl DatasetEntry {
 pub struct ManifestState {
     pub version: u64,
     pub entries: Vec<DatasetEntry>,
-    /// Exact materialized `graph_head:<branch>` values from this SAME manifest
-    /// version. Keeping the head beside the table snapshot prevents a
-    /// manifest-only refresh from leaving coarse write authority split between
-    /// a fresh table view and the commit graph's older derived cache.
+    /// The exact head of the branch read, keyed by its logical name (`main` for
+    /// main), from this SAME manifest version: the head commit's id when the
+    /// branch incarnation read wrote that commit, empty on a fork that has not
+    /// published.
     pub graph_heads: HashMap<String, String>,
-    /// The `schema_contract` row's small fields from this SAME manifest
-    /// version; `None` before the row exists (a stamp-12 version read through
-    /// time travel).
     pub schema_contract: Option<SchemaContractHead>,
 }
 
@@ -70,7 +69,7 @@ pub struct ManifestState {
 /// `metadata` column and the part of the contract every manifest-state read
 /// folds. The texts stay in the content columns, projected for serving admission
 /// and by [`read_schema_contract_row`].
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SchemaContractHead {
     pub schema_ir_hash: String,
     pub schema_identity_version: u32,
@@ -110,340 +109,731 @@ impl SchemaContractRow {
     }
 }
 
-#[derive(Debug, Clone)]
-struct TableTombstoneEntry {
-    identity: TableIdentity,
-    table_key: String,
-    tombstone_version: u64,
-    manifest_version: u64,
-}
-
-/// A graph-lineage commit projected out of the `__manifest` `graph_commit`
-/// rows (RFC-013 step 4). Field-for-field identical to `commit_graph::GraphCommit`
-/// so the commit-graph cache can be sourced from the manifest projection without
-/// touching any reader above that boundary. Kept as a separate struct here to
-/// keep `state.rs` free of the `commit_graph` module dependency.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// The record of one graph commit: the `graph_commit` row of a `__manifest`
+/// version while the commit is a branch's head, a `settled_commit` row while
+/// the branch buffers it, a `__history` row once the branch has appended it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphLineageRow {
     pub graph_commit_id: String,
+    /// Accepted schema identity of this commit, also retained in history.
+    pub schema_contract: Option<SchemaContractHead>,
+    /// The name of this commit's schema content under `__history/schemas/`
+    /// ([`history::schema_content_hash`]); present exactly when
+    /// `schema_contract` is.
+    pub schema_content_hash: Option<String>,
     pub graph_branch: Option<String>,
+    /// The Lance native ref of the branch incarnation that wrote the commit,
+    /// `None` on main.
+    pub native_branch: Option<String>,
     pub graph_manifest_version: u64,
+    /// The greatest generation among the commit's parents plus one; the
+    /// genesis commit is generation 0.
+    #[serde(default)]
+    pub generation: u64,
     pub parent_commit_id: Option<String>,
     pub merged_parent_commit_id: Option<String>,
     pub actor_id: Option<String>,
     pub created_at: i64,
 }
 
-/// JSON payload of a `graph_commit` row's `metadata` column. The immutable
-/// commit fields that have no dedicated manifest column live here; the mutable
-/// graph-facing values (`graph_commit_id`, `graph_branch`,
-/// `graph_manifest_version`) reuse the persisted manifest columns `object_id`,
-/// `table_branch`, and `table_version`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct GraphCommitMetadata {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    parent_commit_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    merged_parent_commit_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    actor_id: Option<String>,
-    created_at: i64,
+/// The pin of a live table: the table version a graph commit published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TablePin {
+    pub table_version: u64,
+    pub table_branch: Option<String>,
+    pub row_count: u64,
+    pub metadata: TableVersionMetadata,
+    /// The `__manifest` version whose publish wrote the pin.
+    pub manifest_version: u64,
 }
 
-/// JSON payload of a `graph_head` row's `metadata` column.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct GraphHeadMetadata {
-    head_commit_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    parent_commit_id: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableState {
+    /// Registered, with no pin.
+    Registered,
+    Pinned(TablePin),
+    /// Dropped by the publish of `__manifest` version `dropped_at`, which
+    /// sealed the table at `sealed_version`. A dropped identity never returns.
+    Dropped {
+        dropped_at: u64,
+        sealed_version: u64,
+    },
 }
 
-/// The `object_id` for a branch's mutable head pointer row. Main encodes as
-/// `graph_head:main`; named branches as `graph_head:<branch>`.
-pub fn graph_head_object_id(branch: Option<&str>) -> String {
-    format!(
-        "{}{}",
-        super::GRAPH_HEAD_OBJECT_ID_PREFIX,
-        branch.unwrap_or(MAIN_BRANCH_HEAD_KEY)
-    )
+/// One `table` row: the registration of a table identity and its state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRow {
+    pub registration: TableRegistration,
+    pub state: TableState,
 }
 
-#[derive(Debug)]
-struct ManifestScan {
-    table_registrations: HashMap<TableIdentity, TableRegistration>,
-    version_entries: Vec<DatasetEntry>,
-    tombstones: Vec<TableTombstoneEntry>,
-    /// Graph-lineage `graph_commit` rows, collected in the SAME pass only when
-    /// the caller asked (`collect_lineage`). Empty on the table-state read hot
-    /// path so it never pays the O(commits) lineage JSON decode; populated on the
-    /// publish path, where `load_publish_state` already needs the parent and would
-    /// otherwise scan `__manifest` a second time via `read_graph_lineage`.
-    lineage_rows: Vec<GraphLineageRow>,
-    /// Exact materialized `graph_head:<branch>` values, collected on every
-    /// table-state/publish pass. This is bounded by branch count; unlike
-    /// `lineage_rows`, it does not grow with commit history. OCC must distinguish
-    /// a present head from an absent one (notably on a fresh named branch).
-    graph_heads: HashMap<String, String>,
-    /// The `schema_contract` row's head, collected on every pass.
-    schema_contract: Option<SchemaContractHead>,
-    schema_contract_row: Result<Option<SchemaContractRow>>,
-    /// Every scanned row in the logical `manifest_schema()` columns (expanded
-    /// from the packed shape when stored so, the content columns included),
-    /// kept only on the publish scan: the copy-on-write publish rewrites them.
-    live_rows: Vec<RecordBatch>,
+/// What a `replaced_table` row restores in the versions before its publish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplacedRow {
+    /// The `table` row as the publish read it.
+    Table(Box<TableRow>),
+    /// No row: the publish registered the identity.
+    Unregistered(TableRegistration),
 }
 
-pub async fn read_manifest_state_with_registration_clocks(
-    dataset: &Dataset,
-) -> Result<ManifestState> {
-    if super::migrations::read_stamp(dataset) != Some(6) {
-        return Err(OmniError::manifest_internal(
-            "registration-clock conversion requires a v6 source".to_string(),
-        ));
-    }
-    let scan = read_manifest_scan_with_clocks(dataset, false, None, true, false, false).await?;
-    manifest_state_from_scan(dataset.version().version, scan)
+/// One `replaced_table` row: what the publish of `__manifest` version
+/// `replaced_at` read for a table identity it registered, pinned, renamed or
+/// dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplacedTable {
+    pub replaced_at: u64,
+    pub before: ReplacedRow,
 }
 
-pub async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestState> {
-    let version = dataset.version().version;
-    // The table-state hot path never needs lineage, so don't pay its JSON decode.
-    let scan = read_manifest_scan(dataset, false).await?;
-    manifest_state_from_scan(version, scan)
-}
-
-/// Read the visible table state and complete graph-lineage projection from one
-/// coherent `__manifest` scan.
-///
-/// `GraphCoordinator` needs both projections. Keeping them in one pass avoids a
-/// second dataset open/full scan and guarantees its table snapshot and lineage
-/// cache describe the exact same manifest version.
-pub async fn read_manifest_state_and_lineage(
-    dataset: &Dataset,
-) -> Result<(ManifestState, Vec<GraphLineageRow>)> {
-    let version = dataset.version().version;
-    let ManifestScan {
-        table_registrations,
-        version_entries,
-        tombstones,
-        lineage_rows,
-        graph_heads,
-        schema_contract,
-        schema_contract_row: _,
-        live_rows: _,
-    } = read_manifest_scan(dataset, true).await?;
-    let state = assemble_manifest_state(
-        version,
-        table_registrations,
-        version_entries,
-        tombstones
-            .into_iter()
-            .map(|t| (t.identity, t.manifest_version)),
-        graph_heads,
-        schema_contract,
-    )?;
-    Ok((state, lineage_rows))
-}
-
-fn manifest_state_from_scan(version: u64, scan: ManifestScan) -> Result<ManifestState> {
-    assemble_manifest_state(
-        version,
-        scan.table_registrations,
-        scan.version_entries,
-        scan.tombstones
-            .into_iter()
-            .map(|t| (t.identity, t.manifest_version)),
-        scan.graph_heads,
-        scan.schema_contract,
-    )
-}
-
-/// Fold accumulators for the manifest projection, retained by a coordinator so
-/// a refresh can fold ONLY newly appended rows instead of re-scanning the
-/// whole catalog (the projection at head H is derivable from the
-/// projection at H-1 plus the appended rows). The fold arms are the exact
-/// reductions `assemble_manifest_state` applies — both paths run through this
-/// type, so the incremental and full projections CANNOT diverge in
-/// dedup/filter/sort semantics. Sizes: `registrations`/`latest_versions`/
-/// `tombstone_map` are O(tables), and `graph_heads` is O(branches). Lineage is
-/// deliberately not retained here: `GraphCoordinator` already owns that
-/// projection, and duplicating it made an otherwise small exception-safety
-/// clone O(commit history).
-#[derive(Debug, Clone)]
-pub struct ProjectionAccumulator {
-    registrations: HashMap<TableIdentity, TableRegistration>,
-    latest_versions: HashMap<TableIdentity, DatasetEntry>,
-    tombstone_map: HashMap<TableIdentity, u64>,
-    graph_heads: HashMap<String, String>,
-    schema_contract: Option<SchemaContractHead>,
-}
-
-impl ProjectionAccumulator {
-    fn empty() -> Self {
-        Self {
-            registrations: HashMap::new(),
-            latest_versions: HashMap::new(),
-            tombstone_map: HashMap::new(),
-            graph_heads: HashMap::new(),
-            schema_contract: None,
+impl ReplacedTable {
+    pub fn identity(&self) -> TableIdentity {
+        match &self.before {
+            ReplacedRow::Table(table) => table.registration.identity,
+            ReplacedRow::Unregistered(registration) => registration.identity,
         }
     }
+}
 
-    /// Fold rows in. THE one copy of the per-row reductions: the full scan,
-    /// the fragment-restricted delta fold, and `assemble_manifest_state`
-    /// (and through it the publisher's post-publish fold) all run this, so
-    /// none of them can drift in dedup/keep semantics.
-    fn fold_parts(
-        &mut self,
-        registrations: HashMap<TableIdentity, TableRegistration>,
-        version_entries: Vec<DatasetEntry>,
-        tombstones: impl IntoIterator<Item = (TableIdentity, u64)>,
-        graph_heads: HashMap<String, String>,
-        schema_contract: Option<SchemaContractHead>,
-    ) -> Result<()> {
-        for (identity, registration) in registrations {
-            if let Some(existing) = self.registrations.insert(identity, registration.clone()) {
-                if existing != registration {
-                    return Err(OmniError::manifest_internal(format!(
-                        "manifest has conflicting table rows for identity {identity}"
-                    )));
-                }
-            }
+const COMMIT_ROW_BYTES: usize = 128;
+pub(crate) const TABLE_ROW_BYTES: usize = 256;
+
+/// The size of one commit record as `__history` and the head row store it,
+/// in the measure of [`CommitBuffer::buffered_bytes`].
+pub(crate) fn commit_bytes(commit: &GraphLineageRow) -> usize {
+    let contract = commit.schema_contract.as_ref();
+    [
+        Some(commit.graph_commit_id.as_str()),
+        commit.graph_branch.as_deref(),
+        commit.native_branch.as_deref(),
+        commit.parent_commit_id.as_deref(),
+        commit.merged_parent_commit_id.as_deref(),
+        commit.actor_id.as_deref(),
+        contract.map(|head| head.schema_ir_hash.as_str()),
+        contract.map(|head| head.schema_identity_domain.as_str()),
+        commit.schema_content_hash.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::len)
+    .fold(COMMIT_ROW_BYTES, usize::saturating_add)
+}
+
+/// The size of one `table` row in the same measure.
+pub(crate) fn table_bytes(table: &TableRow) -> usize {
+    let registration = &table.registration;
+    let pin = match &table.state {
+        TableState::Pinned(pin) => {
+            pin.table_branch.as_ref().map_or(0, String::len)
+                + metadata_measure(&pin.metadata, None).unwrap_or(0)
         }
-        for entry in version_entries {
-            match self.latest_versions.get(&entry.identity) {
-                Some(existing) if existing.manifest_version == entry.manifest_version => {
-                    return Err(OmniError::manifest_internal(format!(
-                        "manifest has two rows for identity {} at manifest version {}",
-                        entry.identity, entry.manifest_version
-                    )));
-                }
-                Some(existing) if existing.manifest_version > entry.manifest_version => {}
-                _ => {
-                    self.latest_versions.insert(entry.identity, entry);
-                }
-            }
-        }
-        for (identity, tombstone_clock) in tombstones {
-            match self.tombstone_map.get(&identity) {
-                Some(existing) if *existing == tombstone_clock => {
-                    return Err(OmniError::manifest_internal(format!(
-                        "manifest has two rows for identity {identity} at manifest version {tombstone_clock}"
-                    )));
-                }
-                Some(existing) if *existing > tombstone_clock => {}
-                _ => {
-                    self.tombstone_map.insert(identity, tombstone_clock);
-                }
-            }
-        }
-        self.graph_heads.extend(graph_heads);
-        if let Some(head) = schema_contract {
-            self.schema_contract = Some(head);
-        }
-        Ok(())
+        _ => 0,
+    };
+    TABLE_ROW_BYTES + registration.table_key.len() + registration.table_path.len() + pin
+}
+
+/// The size of one `settled_commit` row as stored
+/// ([`crate::row::CommitColumnsBuilder::push_settled`]): the parent only when
+/// it is not `previous`, the schema contract only when it differs from `child`'s.
+fn settled_bytes(
+    commit: &GraphLineageRow,
+    previous: Option<&GraphLineageRow>,
+    child: &GraphLineageRow,
+) -> usize {
+    let own_parent = previous.is_none_or(|previous| {
+        commit.parent_commit_id.as_deref() != Some(previous.graph_commit_id.as_str())
+    });
+    let own_contract = commit.schema_contract != child.schema_contract
+        || commit.schema_content_hash != child.schema_content_hash;
+    let contract = commit.schema_contract.as_ref().filter(|_| own_contract);
+    [
+        Some(commit.graph_commit_id.as_str()),
+        commit.graph_branch.as_deref(),
+        commit.native_branch.as_deref(),
+        commit.parent_commit_id.as_deref().filter(|_| own_parent),
+        commit.merged_parent_commit_id.as_deref(),
+        commit.actor_id.as_deref(),
+        contract.map(|head| head.schema_ir_hash.as_str()),
+        contract.map(|head| head.schema_identity_domain.as_str()),
+        commit
+            .schema_content_hash
+            .as_deref()
+            .filter(|_| own_contract),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::len)
+    .fold(COMMIT_ROW_BYTES, usize::saturating_add)
+}
+
+/// One `replaced_table` row as stored over `current`, the identity's `table` row of
+/// the same version ([`crate::row::TableColumnsBuilder::push_replaced`]): the key only
+/// when `current` has another, a pin's metadata as its delta against `current`'s pin.
+fn replaced_bytes(replaced: &ReplacedTable, current: Option<&TableRow>) -> usize {
+    let (registration, pin) = match &replaced.before {
+        ReplacedRow::Table(table) => (
+            &table.registration,
+            match &table.state {
+                TableState::Pinned(pin) => Some(pin),
+                _ => None,
+            },
+        ),
+        ReplacedRow::Unregistered(registration) => (registration, None),
+    };
+    let key = match current {
+        Some(current) if current.registration.table_key == registration.table_key => 0,
+        _ => registration.table_key.len(),
+    };
+    let pin = pin.map_or(0, |before| {
+        let base = match current.map(|current| &current.state) {
+            Some(TableState::Pinned(base)) => Some(&base.metadata),
+            _ => None,
+        };
+        let metadata = metadata_measure(&before.metadata, base).unwrap_or(0);
+        before.table_branch.as_ref().map_or(0, String::len) + metadata
+    });
+    TABLE_ROW_BYTES.saturating_add(key).saturating_add(pin)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The `table` rows [`CommitBuffer::tables_at`] has cloned on this thread.
+    pub(crate) static TABLE_ROWS_REBUILT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The buffer of one `__manifest` version: the most recent first-parent
+/// ancestors of its head that the branch has not appended to `__history`,
+/// oldest first, and the `replaced_table` rows that restore the `table` rows
+/// each of them was written with.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommitBuffer {
+    pub(crate) commits: Vec<GraphLineageRow>,
+    pub(crate) replaced: Vec<ReplacedTable>,
+}
+
+impl CommitBuffer {
+    /// The buffered commits, oldest first.
+    pub fn commits(&self) -> &[GraphLineageRow] {
+        &self.commits
     }
 
-    fn fold_scan(&mut self, scan: ManifestScan) -> Result<()> {
-        // A delta tombstone may refer to a registration in an older fragment,
-        // so validate against the union of incoming and retained authority.
-        // Do this before mutating the accumulator to preserve exception safety.
-        for tombstone in &scan.tombstones {
-            let registration = scan
-                .table_registrations
-                .get(&tombstone.identity)
-                .or_else(|| self.registrations.get(&tombstone.identity))
-                .ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "manifest tombstone for identity {} has no table registration",
-                        tombstone.identity
-                    ))
-                })?;
-            if registration.table_key != tombstone.table_key {
+    pub fn replaced(&self) -> &[ReplacedTable] {
+        &self.replaced
+    }
+
+    pub fn get(&self, graph_commit_id: &str) -> Option<&GraphLineageRow> {
+        self.commits
+            .iter()
+            .find(|commit| commit.graph_commit_id == graph_commit_id)
+    }
+
+    /// Whether the next publish on top of `head` appends the buffered commits
+    /// to `__history`. A head with an `hb1` id carries the decision in its
+    /// slot: slot 0 opened a new block, so the buffer holds a complete one.
+    /// Any other head is measured over `current`, the `table` rows of the
+    /// version that holds this buffer, and the commit ceiling bounds both.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn is_full<'a>(
+        &self,
+        head: &GraphLineageRow,
+        current: impl IntoIterator<Item = &'a TableRow>,
+    ) -> Result<bool> {
+        self.is_full_under(head, current, HistoryReleaseBytes::PRODUCTION)
+    }
+
+    /// [`Self::is_full`] under `budget`, the byte budget of the publish that
+    /// asks. A head with an `hb1` id answers from its slot whatever the
+    /// budget, so sessions with different budgets agree; a malformed one is refused.
+    pub(crate) fn is_full_under<'a>(
+        &self,
+        head: &GraphLineageRow,
+        current: impl IntoIterator<Item = &'a TableRow>,
+        budget: HistoryReleaseBytes,
+    ) -> Result<bool> {
+        if self.commits.is_empty() {
+            return Ok(false);
+        }
+        if self.commits.len() >= TAIL_MAX_COMMITS {
+            return Ok(true);
+        }
+        Ok(match parse_history_block_id(&head.graph_commit_id)? {
+            Some(id) => id.slot == 0,
+            None => self.buffered_bytes(head, current) >= budget.0,
+        })
+    }
+
+    /// Whether the commit published on top of `head` is the last one the
+    /// buffer takes before its release: the byte budget or the commit ceiling
+    /// is reached once `head` joins the buffered commits. `current` is as in
+    /// [`Self::buffered_bytes`].
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn closes_with<'a>(
+        &self,
+        head: &GraphLineageRow,
+        current: impl IntoIterator<Item = &'a TableRow>,
+    ) -> bool {
+        self.closes_with_under(head, current, HistoryReleaseBytes::PRODUCTION)
+    }
+
+    /// [`Self::closes_with`] under `budget`, as [`Self::is_full_under`].
+    pub(crate) fn closes_with_under<'a>(
+        &self,
+        head: &GraphLineageRow,
+        current: impl IntoIterator<Item = &'a TableRow>,
+        budget: HistoryReleaseBytes,
+    ) -> bool {
+        self.buffered_bytes(head, current) >= budget.0 || self.commits.len() + 1 >= TAIL_MAX_COMMITS
+    }
+
+    /// The measure the byte budget is checked against: the buffered commits
+    /// as stored, the `replaced_table` rows as stored over `current`, the
+    /// `table` rows of the version that holds this buffer, and `head` whole,
+    /// as string lengths plus a fixed allowance per row. A pure function of
+    /// one `__manifest` version.
+    pub fn buffered_bytes<'a>(
+        &self,
+        head: &GraphLineageRow,
+        current: impl IntoIterator<Item = &'a TableRow>,
+    ) -> usize {
+        let settled = self.commits.iter().enumerate().map(|(index, commit)| {
+            let previous = index.checked_sub(1).map(|previous| &self.commits[previous]);
+            settled_bytes(
+                commit,
+                previous,
+                self.commits.get(index + 1).unwrap_or(head),
+            )
+        });
+        let replaced = (!self.replaced.is_empty()).then(|| {
+            let current: HashMap<TableIdentity, &TableRow> = current
+                .into_iter()
+                .map(|table| (table.registration.identity, table))
+                .collect();
+            self.replaced
+                .iter()
+                .map(|replaced| {
+                    replaced_bytes(replaced, current.get(&replaced.identity()).copied())
+                })
+                .fold(0, usize::saturating_add)
+        });
+        settled
+            .chain(std::iter::once(commit_bytes(head)))
+            .chain(replaced)
+            .fold(0, usize::saturating_add)
+    }
+
+    /// The `table` rows of `__manifest` version `version`, from the `table`
+    /// rows `current` of the version that holds this buffer: per identity the
+    /// row the first publish after `version` read, else the current row. Exact
+    /// for the version of the head and of every buffered commit.
+    pub fn tables_at(&self, version: u64, current: &[TableRow]) -> Vec<TableRow> {
+        let tables: Vec<TableRow> = self.rows_at(version, current).cloned().collect();
+        #[cfg(test)]
+        TABLE_ROWS_REBUILT.set(TABLE_ROWS_REBUILT.get() + tables.len());
+        tables
+    }
+
+    /// The rows of [`Self::tables_at`], borrowed from `current` and the buffer.
+    fn rows_at<'a>(
+        &'a self,
+        version: u64,
+        current: &'a [TableRow],
+    ) -> impl Iterator<Item = &'a TableRow> {
+        let mut first_after = HashMap::<TableIdentity, &ReplacedTable>::new();
+        for replaced in self.replaced.iter().filter(|row| row.replaced_at > version) {
+            first_after
+                .entry(replaced.identity())
+                .and_modify(|first| {
+                    if replaced.replaced_at < first.replaced_at {
+                        *first = replaced;
+                    }
+                })
+                .or_insert(replaced);
+        }
+        current.iter().filter_map(move |table| {
+            match first_after.get(&table.registration.identity).copied() {
+                None => Some(table),
+                Some(ReplacedTable {
+                    before: ReplacedRow::Table(before),
+                    ..
+                }) => Some(before.as_ref()),
+                Some(ReplacedTable {
+                    before: ReplacedRow::Unregistered(_),
+                    ..
+                }) => None,
+            }
+        })
+    }
+
+    /// The record of `commit`, a buffered commit or the head, with the `table`
+    /// rows of the version that wrote it.
+    pub fn record_of(&self, commit: &GraphLineageRow, current: &[TableRow]) -> HistoryRecord {
+        HistoryRecord {
+            commit: commit.clone(),
+            tables: self.tables_at(commit.graph_manifest_version, current),
+        }
+    }
+
+    /// The record of every buffered commit, oldest first.
+    pub fn records(&self, current: &[TableRow]) -> Vec<HistoryRecord> {
+        self.commits
+            .iter()
+            .map(|commit| self.record_of(commit, current))
+            .collect()
+    }
+
+    /// The buffer of the version a publish writes over the version holding
+    /// this one. `replaced_head` is the head that publish replaces, `changed`
+    /// the rows it read and changed, `head` the head it writes, `current` the
+    /// `table` rows it read, `budget` the byte budget of that publish. A full
+    /// buffer gives way to `replaced_head` alone, and only when `appended`
+    /// holds every commit that leaves.
+    pub(crate) fn after_publish<'a>(
+        &self,
+        replaced_head: Option<&GraphLineageRow>,
+        changed: Vec<ReplacedTable>,
+        head: &GraphLineageRow,
+        appended: Option<&Appended>,
+        current: impl IntoIterator<Item = &'a TableRow>,
+        budget: HistoryReleaseBytes,
+    ) -> Result<Self> {
+        let releases = match replaced_head {
+            Some(head) => self.is_full_under(head, current, budget)?,
+            None => false,
+        };
+        let mut commits = if releases {
+            if let Some(kept) = self
+                .commits
+                .iter()
+                .find(|commit| !appended.is_some_and(|appended| appended.holds(commit)))
+            {
                 return Err(OmniError::manifest_internal(format!(
-                    "manifest tombstone identity {} has diagnostic alias '{}', current binding is '{}'",
-                    tombstone.identity, tombstone.table_key, registration.table_key
+                    "graph commit '{}' would leave the buffer of `__manifest` and no Append of \
+                     this attempt wrote it to `__history`",
+                    kept.graph_commit_id
                 )));
             }
+            Vec::new()
+        } else {
+            self.commits.clone()
+        };
+        commits.extend(replaced_head.cloned());
+        let oldest = commits.first().unwrap_or(head).graph_manifest_version;
+        let replaced = self
+            .replaced
+            .iter()
+            .cloned()
+            .chain(changed)
+            .filter(|row| row.replaced_at > oldest)
+            .collect();
+        Ok(Self { commits, replaced })
+    }
+}
+
+/// The records of every commit one `__manifest` version holds: the buffered
+/// commits, oldest first, and the head. What a merge appends for its source
+/// branch and a delete for the branch it retires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchRecords {
+    pub buffer: CommitBuffer,
+    pub head: HistoryRecord,
+    /// The merge base the merging branch resolved, when it is known: the target
+    /// descends from it, so it and the commits before it are not appended again.
+    pub merge_base: Option<String>,
+}
+
+impl BranchRecords {
+    /// The buffered commits, oldest first, then the head.
+    pub fn commits(&self) -> impl Iterator<Item = &GraphLineageRow> {
+        self.buffer
+            .commits
+            .iter()
+            .chain(std::iter::once(&self.head.commit))
+    }
+
+    /// The record of each of [`Self::commits`], unbuilt.
+    pub(crate) fn held(&self) -> impl Iterator<Item = HeldRecord<'_>> {
+        self.commits().map(|commit| HeldRecord {
+            commit,
+            buffer: &self.buffer,
+            current: &self.head.tables,
+        })
+    }
+
+    /// The buffered records, oldest first, then the head, each built as it is taken.
+    pub fn oldest_first(&self) -> impl Iterator<Item = HistoryRecord> {
+        self.held().map(|held| history::RecordSource::record(&held))
+    }
+
+    pub fn get(&self, graph_commit_id: &str) -> Option<HistoryRecord> {
+        self.held()
+            .find(|held| held.commit.graph_commit_id == graph_commit_id)
+            .map(|held| history::RecordSource::record(&held))
+    }
+}
+
+impl From<HistoryRecord> for BranchRecords {
+    /// The records of a version that buffers nothing.
+    fn from(head: HistoryRecord) -> Self {
+        Self {
+            buffer: CommitBuffer::default(),
+            head,
+            merge_base: None,
         }
-        self.fold_parts(
-            scan.table_registrations,
-            scan.version_entries,
-            scan.tombstones
-                .into_iter()
-                .map(|t| (t.identity, t.manifest_version)),
-            scan.graph_heads,
-            scan.schema_contract,
-        )
-    }
-
-    /// Drop one branch's head pointer (its durable row was deleted — the
-    /// mutable-row half of a head update, or a branch deletion; a replacement,
-    /// when one exists, arrives via the delta fragments' live rows).
-    pub(crate) fn remove_head(&mut self, branch_key: &str) {
-        self.graph_heads.remove(branch_key);
-    }
-
-    /// Drop the schema contract's head (its durable row was deleted, the
-    /// mutable-row half of a contract replacement; the replacement arrives via
-    /// the delta fragments' live rows).
-    pub(crate) fn remove_schema_contract(&mut self) {
-        self.schema_contract = None;
-    }
-
-    /// Reduce to the visible state at `version`. Pure and repeatable.
-    pub(crate) fn finish(&self, version: u64) -> Result<ManifestState> {
-        finish_manifest_state(
-            version,
-            &self.registrations,
-            self.latest_versions.values().cloned(),
-            &self.tombstone_map,
-            self.graph_heads.clone(),
-            self.schema_contract.clone(),
-        )
     }
 }
 
-/// One coherent scan producing the finished state, compact retained fold
-/// accumulators, and lineage rows handed off to `CommitGraph`. The plain read
-/// paths keep `read_manifest_state`.
-pub(crate) async fn read_manifest_projection(
-    dataset: &Dataset,
-) -> Result<(ManifestState, ProjectionAccumulator, Vec<GraphLineageRow>)> {
-    let version = dataset.version().version;
-    let scan = read_manifest_scan_fragments(dataset, true, None).await?;
-    projection_from_scan(version, scan)
+/// The record of `commit`, a buffered commit or the head of the version whose
+/// `table` rows are `current`, built when its extent is encoded.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HeldRecord<'a> {
+    pub(crate) commit: &'a GraphLineageRow,
+    pub(crate) buffer: &'a CommitBuffer,
+    pub(crate) current: &'a [TableRow],
 }
 
-pub(crate) async fn read_manifest_projection_with_contract(
-    dataset: &Dataset,
-) -> Result<(
-    ManifestState,
-    ProjectionAccumulator,
-    Vec<GraphLineageRow>,
-    Result<SchemaContractRow>,
-)> {
-    let version = dataset.version().version;
-    let (scan, contract) = read_manifest_scan_with_contract(dataset, true).await?;
-    let (state, accumulator, lineage_rows) = projection_from_scan(version, scan)?;
-    Ok((state, accumulator, lineage_rows, contract))
+impl history::RecordSource for HeldRecord<'_> {
+    fn commit_row(&self) -> &GraphLineageRow {
+        self.commit
+    }
+
+    fn record_bytes(&self) -> usize {
+        self.buffer
+            .rows_at(self.commit.graph_manifest_version, self.current)
+            .map(table_bytes)
+            .fold(commit_bytes(self.commit), usize::saturating_add)
+    }
+
+    fn record(&self) -> HistoryRecord {
+        self.buffer.record_of(self.commit, self.current)
+    }
 }
 
-pub(crate) async fn read_manifest_state_with_contract(
-    dataset: &Dataset,
-) -> Result<(ManifestState, Result<SchemaContractRow>)> {
-    let (scan, contract) = read_manifest_scan_with_contract(dataset, false).await?;
-    Ok((
-        manifest_state_from_scan(dataset.version().version, scan)?,
-        contract,
-    ))
+/// Every row of one `__manifest` version: one row per table identity, the
+/// head commit's record, and the buffer.
+#[derive(Debug, Clone)]
+pub(crate) struct ManifestRows {
+    pub(crate) tables: Vec<TableRow>,
+    pub(crate) head: GraphLineageRow,
+    pub(crate) buffer: CommitBuffer,
+    pub(crate) schema_contract_head: Option<SchemaContractHead>,
+    pub(crate) schema_contract: Option<SchemaContractRow>,
 }
 
-async fn read_manifest_scan_with_contract(
+impl ManifestRows {
+    /// The logical [`manifest_schema`] batch of these rows.
+    pub(crate) fn to_batch(&self) -> Result<RecordBatch> {
+        if self.schema_contract_head.as_ref() != self.schema_contract.as_ref().map(|row| &row.head)
+        {
+            return Err(OmniError::manifest_internal(
+                "cannot serialize a projected or inconsistent schema contract",
+            ));
+        }
+        let rows = self.tables.len() + 1 + self.buffer.commits.len() + self.buffer.replaced.len();
+        let mut object_ids = Vec::with_capacity(rows);
+        let mut object_types = Vec::with_capacity(rows);
+        let mut tables = TableColumnsBuilder::default();
+        let mut commits = CommitColumnsBuilder::default();
+        let mut replaced = ReplacedColumnsBuilder::default();
+        for table in &self.tables {
+            object_ids.push(table_object_id(table.registration.identity));
+            object_types.push(OBJECT_TYPE_TABLE);
+            tables.push(table)?;
+            commits.push_null();
+            replaced.push_null();
+        }
+        object_ids.push(self.head.graph_commit_id.clone());
+        object_types.push(OBJECT_TYPE_GRAPH_COMMIT);
+        tables.push_null();
+        commits.push(&self.head);
+        replaced.push_null();
+        let buffered = &self.buffer.commits;
+        for (index, commit) in buffered.iter().enumerate() {
+            let child = buffered.get(index + 1).unwrap_or(&self.head);
+            object_ids.push(commit.graph_commit_id.clone());
+            object_types.push(OBJECT_TYPE_SETTLED_COMMIT);
+            tables.push_null();
+            commits.push_settled(
+                commit,
+                index.checked_sub(1).map(|_| &buffered[index - 1]),
+                child,
+            );
+            replaced.push_null();
+        }
+        let current: HashMap<TableIdentity, &TableRow> = self
+            .tables
+            .iter()
+            .map(|table| (table.registration.identity, table))
+            .collect();
+        for row in &self.buffer.replaced {
+            object_ids.push(replaced_table_object_id(row.identity(), row.replaced_at));
+            object_types.push(OBJECT_TYPE_REPLACED_TABLE);
+            let current = current.get(&row.identity()).copied();
+            let registered = match &row.before {
+                ReplacedRow::Table(table) => {
+                    tables.push_replaced(table, current)?;
+                    false
+                }
+                ReplacedRow::Unregistered(registration) => {
+                    tables.push_replaced(
+                        &TableRow {
+                            registration: registration.clone(),
+                            state: TableState::Registered,
+                        },
+                        current,
+                    )?;
+                    true
+                }
+            };
+            commits.push_null();
+            replaced.push(ReplacedClock {
+                replaced_at: row.replaced_at,
+                registered,
+            });
+        }
+
+        if let Some(contract) = &self.schema_contract {
+            object_ids.push(crate::SCHEMA_CONTRACT_OBJECT_ID.to_string());
+            object_types.push(crate::OBJECT_TYPE_SCHEMA_CONTRACT);
+            tables.push_contract(&contract.head)?;
+            commits.push_null();
+            replaced.push_null();
+        }
+        let row_count = object_types.len();
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(object_ids)),
+            Arc::new(StringArray::from(object_types)),
+        ];
+        columns.extend(tables.finish());
+        columns.extend(commits.finish());
+        columns.extend(replaced.finish());
+        let mut sources = vec![None; row_count];
+        let mut irs = vec![None; row_count];
+        if let Some(contract) = &self.schema_contract {
+            sources[row_count - 1] = Some(contract.source.as_str());
+            irs[row_count - 1] = Some(contract.ir.as_str());
+        }
+        columns.push(Arc::new(LargeStringArray::from(sources)));
+        columns.push(Arc::new(LargeStringArray::from(irs)));
+        RecordBatch::try_new(manifest_schema(), columns).map_err(OmniError::arrow_internal)
+    }
+
+    /// The records of the buffered commits, oldest first, and of the head.
+    pub(crate) fn records(&self) -> BranchRecords {
+        BranchRecords {
+            buffer: self.buffer.clone(),
+            head: HistoryRecord {
+                commit: self.head.clone(),
+                tables: self.tables.clone(),
+            },
+            merge_base: None,
+        }
+    }
+
+    /// The record of the head or of the buffered commit `graph_commit_id`.
+    pub(crate) fn record(&self, graph_commit_id: &str) -> Option<HistoryRecord> {
+        let held = std::iter::once(&self.head).chain(self.buffer.commits());
+        held.into_iter()
+            .find(|commit| commit.graph_commit_id == graph_commit_id)
+            .map(|commit| self.buffer.record_of(commit, &self.tables))
+    }
+
+    /// The visible state of these rows, read at `version` of the branch whose
+    /// native ref is `native_branch`: the pinned tables by alias, and the exact
+    /// head.
+    pub(crate) fn state(&self, version: u64, native_branch: Option<&str>) -> Result<ManifestState> {
+        let mut state = manifest_state(&self.tables, &self.head, version, native_branch)?;
+        state.schema_contract = self.schema_contract_head.clone();
+        Ok(state)
+    }
+}
+
+/// The visible state of the `table` rows and the head commit's record of one
+/// `__manifest` version, as [`ManifestRows::state`] reads it.
+pub(crate) fn manifest_state(
+    tables: &[TableRow],
+    head: &GraphLineageRow,
+    version: u64,
+    native_branch: Option<&str>,
+) -> Result<ManifestState> {
+    let mut entries: Vec<DatasetEntry> = tables
+        .iter()
+        .filter_map(|table| match &table.state {
+            TableState::Pinned(pin) => Some(dataset_entry(&table.registration, pin)),
+            TableState::Registered | TableState::Dropped { .. } => None,
+        })
+        .collect();
+    let mut aliases = HashMap::<&str, TableIdentity>::new();
+    for entry in &entries {
+        if let Some(existing) = aliases.insert(&entry.type_key, entry.identity) {
+            return Err(OmniError::manifest_internal(format!(
+                "manifest has two live table identities ({existing} and {}) bound to alias '{}'",
+                entry.identity, entry.type_key
+            )));
+        }
+    }
+    entries.sort_by(|a, b| a.type_key.cmp(&b.type_key));
+    Ok(ManifestState {
+        schema_contract: head.schema_contract.clone(),
+        version,
+        entries,
+        graph_heads: exact_head(head, native_branch)
+            .map(|head| (head_key(head), head.graph_commit_id.clone()))
+            .into_iter()
+            .collect(),
+    })
+}
+
+fn dataset_entry(registration: &TableRegistration, pin: &TablePin) -> DatasetEntry {
+    DatasetEntry {
+        identity: registration.identity,
+        type_key: registration.table_key.clone(),
+        dataset_path: registration.table_path.clone(),
+        published_dataset_version: pin.table_version,
+        native_dataset_branch: pin.table_branch.clone(),
+        entity_count: pin.row_count,
+        version_metadata: pin.metadata.clone(),
+        manifest_version: pin.manifest_version,
+    }
+}
+
+/// `head` when the branch incarnation `native_branch` wrote it. A fork that has
+/// not published holds the head its source wrote, which is its effective head
+/// and not its exact one.
+pub(crate) fn exact_head<'a>(
+    head: &'a GraphLineageRow,
+    native_branch: Option<&str>,
+) -> Option<&'a GraphLineageRow> {
+    (head.native_branch.as_deref() == native_branch).then_some(head)
+}
+
+fn head_key(head: &GraphLineageRow) -> String {
+    head.graph_branch
+        .as_deref()
+        .unwrap_or(MAIN_BRANCH_HEAD_KEY)
+        .to_string()
+}
+
+/// Full rows for a publisher: source and IR must be present and valid.
+pub(crate) async fn read_manifest_rows(dataset: &Dataset) -> Result<ManifestRows> {
+    let (rows, content_error) = scan_manifest_rows(dataset, true).await?;
+    if let Some(error) = content_error {
+        return Err(error);
+    }
+    Ok(rows)
+}
+
+/// Ordinary state, history and retention reads need the accepted identity, not its texts.
+pub(crate) async fn read_manifest_rows_projected(dataset: &Dataset) -> Result<ManifestRows> {
+    let (rows, _) = scan_manifest_rows(dataset, false).await?;
+    Ok(rows)
+}
+
+/// Cold admission reads all columns once, using main's bounded scan-local IO policy.
+/// Content errors stay deferred until the caller has refreshed this exact capture.
+pub(crate) async fn read_manifest_rows_with_contract(
     dataset: &Dataset,
-    collect_lineage: bool,
-) -> Result<(ManifestScan, Result<SchemaContractRow>)> {
+) -> Result<(ManifestRows, Result<SchemaContractRow>)> {
     let content_shape = require_schema_content(dataset);
     let scan_dataset = if content_shape.is_ok()
         && !dataset
@@ -455,305 +845,394 @@ async fn read_manifest_scan_with_contract(
     } else {
         dataset.clone()
     };
-    let version = dataset.version().version;
-    let mut scan = read_manifest_scan_with_clocks(
-        &scan_dataset,
-        collect_lineage,
-        None,
-        false,
-        false,
-        content_shape.is_ok(),
-    )
-    .await?;
-    let captured = std::mem::replace(&mut scan.schema_contract_row, Ok(None));
-    let contract = content_shape
-        .and(captured)
-        .and_then(|row| finish_schema_contract_row(row, scan.schema_contract.as_ref(), version));
-    Ok((scan, contract))
+    let (rows, error) = scan_manifest_rows(&scan_dataset, content_shape.is_ok()).await?;
+    let contract = content_shape.and(error.map_or(Ok(()), Err)).and_then(|()| {
+        finish_schema_contract_row(
+            rows.schema_contract.clone(),
+            rows.schema_contract_head.as_ref(),
+            dataset.version().version,
+        )
+    });
+    Ok((rows, contract))
 }
 
-fn projection_from_scan(
-    version: u64,
-    mut scan: ManifestScan,
-) -> Result<(ManifestState, ProjectionAccumulator, Vec<GraphLineageRow>)> {
-    let lineage_rows = std::mem::take(&mut scan.lineage_rows);
-    let mut accumulator = ProjectionAccumulator::empty();
-    accumulator.fold_scan(scan)?;
-    let state = accumulator.finish(version)?;
-    Ok((state, accumulator, lineage_rows))
-}
-
-/// Fold ONLY the live rows of `fragments` of `dataset` into `accumulator`
-/// (the appended-fragments delta of an incremental refresh) and reduce to the
-/// state at the dataset's version.
-pub(crate) async fn fold_projection_delta(
+async fn scan_manifest_rows(
     dataset: &Dataset,
-    fragments: Vec<lance_table::format::Fragment>,
-    accumulator: &mut ProjectionAccumulator,
-) -> Result<(ManifestState, Vec<GraphLineageRow>)> {
-    let version = dataset.version().version;
-    let mut scan = read_manifest_scan_fragments(dataset, true, Some(fragments)).await?;
-    let lineage_rows = std::mem::take(&mut scan.lineage_rows);
-    accumulator.fold_scan(scan)?;
-    Ok((accumulator.finish(version)?, lineage_rows))
+    with_content: bool,
+) -> Result<(ManifestRows, Option<OmniError>)> {
+    guard_row_layout(dataset)?;
+    crate::instrumentation::record_manifest_scan();
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&crate::record::packed_projection(dataset, with_content))
+        .map_err(OmniError::storage)?;
+    let mut batches = scanner
+        .try_into_stream()
+        .await
+        .map_err(OmniError::storage)?;
+    let mut rows = RowsDecoder::default();
+    while let Some(batch) = batches.try_next().await.map_err(OmniError::storage)? {
+        rows.push(&batch, Some(dataset.version().version), with_content)?;
+    }
+    let error = rows.content_error.take();
+    Ok((rows.finish()?, error))
 }
 
-/// `(object_type, object_id)` of the rows at `offsets` inside one fragment,
-/// read from a pinned version where those rows are still live. Bounded by the
-/// deletion-vector difference the caller measured — a handful of rows, never
-/// history-sized.
-pub(crate) async fn read_object_identities_at_offsets(
-    dataset: &Dataset,
-    fragment: lance_table::format::Fragment,
-    offsets: &std::collections::HashSet<u32>,
-) -> Result<Vec<(String, String)>> {
-    if offsets.is_empty() {
-        return Ok(Vec::new());
+/// Strict decoding of the acknowledged batch retained by the publisher cache.
+pub(crate) fn rows_of_batch(stored: &RecordBatch) -> Result<ManifestRows> {
+    let mut rows = RowsDecoder::default();
+    rows.push(stored, None, true)?;
+    if let Some(error) = rows.content_error.take() {
+        return Err(error);
+    }
+    rows.finish()
+}
+
+#[derive(Default)]
+struct RowsDecoder {
+    schema_contract_head: Option<SchemaContractHead>,
+    schema_contract: Option<SchemaContractRow>,
+    content_error: Option<OmniError>,
+    tables: BTreeMap<TableIdentity, TableRow>,
+    head: Option<GraphLineageRow>,
+    buffered: Vec<(GraphLineageRow, bool)>,
+    replaced: BTreeMap<(u64, TableIdentity), (ReplacedClock, RawTable)>,
+    version: Option<u64>,
+}
+
+/// Refuse a commit row read at `version` that names a later `__manifest` version.
+fn check_commit_clock(commit: &GraphLineageRow, version: Option<u64>) -> Result<()> {
+    if version.is_some_and(|version| commit.graph_manifest_version > version) {
+        return Err(OmniError::manifest_internal(format!(
+            "graph commit {} carries manifest version {} above the scanned dataset version",
+            commit.graph_commit_id, commit.graph_manifest_version
+        )));
+    }
+    Ok(())
+}
+
+impl RowsDecoder {
+    /// Decode a stored batch read at `version`, which no clock of a row may exceed.
+    fn push(
+        &mut self,
+        stored: &RecordBatch,
+        version: Option<u64>,
+        with_content: bool,
+    ) -> Result<()> {
+        self.version = version;
+        let batch = expand_from_storage(stored)?;
+        let lookup = |name: &str| batch.column_by_name(name);
+        let object_ids = string_column(&batch, "object_id")?;
+        let object_types = string_column(&batch, "object_type")?;
+        let table_columns = TableColumns::new(&lookup)?;
+        let commit_columns = CommitColumns::new(&lookup)?;
+        let replaced_columns = ReplacedColumns::new(&lookup)?;
+        if with_content && self.content_error.is_none() {
+            if let Err(error) = fold_schema_contract_batch(&batch, &mut self.schema_contract) {
+                self.content_error = Some(error);
+            }
+        }
+        for row in 0..batch.num_rows() {
+            let object_type = object_types.value(row);
+            if object_ids.value(row) == crate::SCHEMA_CONTRACT_OBJECT_ID
+                && object_type != crate::OBJECT_TYPE_SCHEMA_CONTRACT
+            {
+                return Err(OmniError::manifest_internal(format!(
+                    "manifest row '{}' has object_type '{object_type}'",
+                    crate::SCHEMA_CONTRACT_OBJECT_ID
+                )));
+            }
+            let foreign = match object_type {
+                OBJECT_TYPE_TABLE => !commit_columns.is_null(row) || !replaced_columns.is_null(row),
+                OBJECT_TYPE_GRAPH_COMMIT | OBJECT_TYPE_SETTLED_COMMIT => {
+                    !table_columns.is_null(row) || !replaced_columns.is_null(row)
+                }
+                OBJECT_TYPE_REPLACED_TABLE => !commit_columns.is_null(row),
+                _ => false,
+            };
+            if foreign {
+                return Err(foreign_fields(object_type, row));
+            }
+            match object_type {
+                crate::OBJECT_TYPE_SCHEMA_CONTRACT => {
+                    if !commit_columns.is_null(row) || !replaced_columns.is_null(row) {
+                        return Err(foreign_fields(object_type, row));
+                    }
+                    let head = decode_schema_contract_row(
+                        object_ids,
+                        string_column(&batch, "metadata")?,
+                        row,
+                    )?;
+                    if self.schema_contract_head.replace(head).is_some() {
+                        return Err(OmniError::manifest_internal(
+                            "manifest has two schema_contract rows",
+                        ));
+                    }
+                }
+                OBJECT_TYPE_TABLE => {
+                    let table = table_columns.decode(row, version)?;
+                    let identity = table.registration.identity;
+                    let expected = table_object_id(identity);
+                    if object_ids.value(row) != expected {
+                        return Err(OmniError::manifest_internal(format!(
+                            "manifest table row at index {row} has object_id '{}', expected '{expected}'",
+                            object_ids.value(row)
+                        )));
+                    }
+                    if self.tables.insert(identity, table).is_some() {
+                        return Err(OmniError::manifest_internal(format!(
+                            "manifest has two table rows for identity {identity}"
+                        )));
+                    }
+                }
+                OBJECT_TYPE_GRAPH_COMMIT => {
+                    let (commit, inherits) = commit_columns.decode(row, object_ids.value(row))?;
+                    if inherits {
+                        return Err(OmniError::manifest_internal(format!(
+                            "head commit '{}' inherits a schema contract and has no newer commit",
+                            commit.graph_commit_id
+                        )));
+                    }
+                    check_commit_clock(&commit, version)?;
+                    if let Some(first) = self.head.replace(commit) {
+                        return Err(OmniError::manifest_internal(format!(
+                            "manifest holds more than one graph_commit row ({} among them); a \
+                             branch holds one head commit",
+                            first.graph_commit_id
+                        )));
+                    }
+                }
+                OBJECT_TYPE_SETTLED_COMMIT => {
+                    let (commit, inherits) = commit_columns.decode(row, object_ids.value(row))?;
+                    check_commit_clock(&commit, version)?;
+                    self.buffered.push((commit, inherits));
+                }
+                OBJECT_TYPE_REPLACED_TABLE => {
+                    let clock = replaced_columns.decode(row)?;
+                    let table = table_columns.raw(row)?;
+                    let expected = replaced_table_object_id(table.identity, clock.replaced_at);
+                    if object_ids.value(row) != expected {
+                        return Err(OmniError::manifest_internal(format!(
+                            "manifest replaced_table row at index {row} has object_id '{}', \
+                             expected '{expected}'",
+                            object_ids.value(row)
+                        )));
+                    }
+                    if version.is_some_and(|version| clock.replaced_at > version) {
+                        return Err(OmniError::manifest_internal(format!(
+                            "replaced_table row '{expected}' is replaced above the scanned \
+                             dataset version"
+                        )));
+                    }
+                    if self
+                        .replaced
+                        .insert((clock.replaced_at, table.identity), (clock, table))
+                        .is_some()
+                    {
+                        return Err(OmniError::manifest_internal(format!(
+                            "manifest has two replaced_table rows '{expected}'"
+                        )));
+                    }
+                }
+                other => {
+                    return Err(OmniError::manifest_internal(format!(
+                        "manifest row at index {row} has object type '{other}', which this \
+                         storage format does not hold"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
-    let fragment_id = u32::try_from(fragment.id).map_err(|_| {
-        OmniError::manifest_internal(format!(
-            "manifest fragment id {} cannot be represented as a Lance row address",
-            fragment.id
-        ))
-    })?;
-    let mut addresses = offsets
-        .iter()
-        .copied()
-        .map(|offset| {
-            u64::from(lance_core::utils::address::RowAddress::new_from_parts(
-                fragment_id,
-                offset,
-            ))
-        })
-        .collect::<Vec<_>>();
-    addresses.sort_unstable();
-
-    // A fragment restriction limits which files a scanner visits; it is not a
-    // row-level take. Use the physical addresses already supplied by the
-    // deletion-vector delta so a compacted, history-sized fragment still reads
-    // only the newly deleted head rows from the exact pinned old dataset.
-    let dataset = Arc::new(dataset.clone());
-    let projection_schema = dataset
-        .schema()
-        .project_preserve_system_columns(&["object_id", "object_type"])
-        .map_err(OmniError::storage)?;
-    let projection = lance::dataset::ProjectionRequest::from_schema(projection_schema)
-        .into_projection_plan(Arc::clone(&dataset))
-        .map_err(OmniError::storage)?;
-    let batch = lance::dataset::TakeBuilder::try_new_from_addresses(
-        dataset,
-        addresses,
-        Arc::new(projection),
-    )
-    .map_err(OmniError::storage)?
-    .execute()
-    .await
-    .map_err(OmniError::storage)?;
-    crate::instrumentation::record_projection_identity_rows(batch.num_rows());
-
-    let object_ids = string_column(&batch, "object_id")?;
-    let object_types = string_column(&batch, "object_type")?;
-    let identities = (0..batch.num_rows())
-        .map(|row| {
-            (
-                object_types.value(row).to_string(),
-                object_ids.value(row).to_string(),
+    fn finish(self) -> Result<ManifestRows> {
+        let head = self.head.ok_or_else(|| {
+            OmniError::manifest_internal(
+                "manifest holds no graph_commit row; every version carries its head commit"
+                    .to_string(),
             )
-        })
-        .collect();
-    Ok(identities)
-}
-
-/// Reduce raw manifest rows to the visible per-table state: keep the
-/// registration with the greatest `manifest_version` per immutable table
-/// identity, drop any sealed by a tombstone with a greater `manifest_version`,
-/// then sort by `table_key` for deterministic output. Shared by the scan path
-/// (`read_manifest_state`) and the in-memory post-publish fold in the publisher
-/// (RFC-013 PR2 #1b), so the two CANNOT diverge in the dedup/filter/sort — the
-/// byte-identity the fold relies on. Tombstones are passed as
-/// `(identity, manifest_version)` tuples so callers outside this module need
-/// not name the private `TableTombstoneEntry`.
-pub(crate) fn assemble_manifest_state(
-    version: u64,
-    registrations: HashMap<TableIdentity, TableRegistration>,
-    version_entries: Vec<DatasetEntry>,
-    tombstones: impl IntoIterator<Item = (TableIdentity, u64)>,
-    graph_heads: HashMap<String, String>,
-    schema_contract: Option<SchemaContractHead>,
-) -> Result<ManifestState> {
-    assemble_manifest_projection(
-        version,
-        registrations,
-        version_entries,
-        tombstones,
-        graph_heads,
-        schema_contract,
-    )
-    .map(|(state, _)| state)
-}
-
-/// Return the exact compact accumulators alongside the visible state. The
-/// publisher already folds these inputs; retaining the result avoids another
-/// scan after the graph coordinator has adopted the corresponding lineage.
-pub(crate) fn assemble_manifest_projection(
-    version: u64,
-    registrations: HashMap<TableIdentity, TableRegistration>,
-    version_entries: Vec<DatasetEntry>,
-    tombstones: impl IntoIterator<Item = (TableIdentity, u64)>,
-    graph_heads: HashMap<String, String>,
-    schema_contract: Option<SchemaContractHead>,
-) -> Result<(ManifestState, ProjectionAccumulator)> {
-    let mut accumulator = ProjectionAccumulator::empty();
-    accumulator.fold_parts(
-        registrations,
-        version_entries,
-        tombstones,
-        graph_heads,
-        schema_contract,
-    )?;
-    Ok((accumulator.finish(version)?, accumulator))
-}
-
-/// The shared reduction tail (tombstone filter, alias-uniqueness check, sort)
-/// — one implementation under both the full-scan path and the incremental
-/// fold, so the two cannot diverge.
-fn finish_manifest_state(
-    version: u64,
-    registrations: &HashMap<TableIdentity, TableRegistration>,
-    latest_versions: impl Iterator<Item = DatasetEntry>,
-    tombstone_map: &HashMap<TableIdentity, u64>,
-    graph_heads: HashMap<String, String>,
-    schema_contract: Option<SchemaContractHead>,
-) -> Result<ManifestState> {
-    let mut entries: Vec<DatasetEntry> = latest_versions
-        .filter(|entry| {
-            tombstone_map
-                .get(&entry.identity)
-                .map(|tombstone_clock| *tombstone_clock < entry.manifest_version)
-                .unwrap_or(true)
-        })
-        .map(|mut entry| {
-            let registration = registrations.get(&entry.identity).ok_or_else(|| {
-                OmniError::manifest_internal(format!(
-                    "manifest missing table row for identity {} (version row alias '{}')",
-                    entry.identity, entry.type_key
-                ))
-            })?;
-            entry.type_key = registration.table_key.clone();
-            entry.dataset_path = registration.table_path.clone();
-            Ok(entry)
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let mut aliases = HashMap::<String, TableIdentity>::new();
-    for entry in &entries {
-        if let Some(existing) = aliases.insert(entry.type_key.clone(), entry.identity) {
-            if existing != entry.identity {
+        })?;
+        let mut buffered = self.buffered;
+        buffered.sort_by_key(|(commit, _)| commit.graph_manifest_version);
+        if buffered.len() > TAIL_MAX_COMMITS {
+            return Err(OmniError::manifest_internal(format!(
+                "manifest buffers {} commits, above the bound of {TAIL_MAX_COMMITS}",
+                buffered.len()
+            )));
+        }
+        let mut commits: Vec<GraphLineageRow> = Vec::with_capacity(buffered.len());
+        for (mut commit, inherits) in buffered.into_iter().rev() {
+            if inherits {
+                let child = commits.last().unwrap_or(&head);
+                commit.schema_contract = child.schema_contract.clone();
+                commit.schema_content_hash = child.schema_content_hash.clone();
+            }
+            commits.push(commit);
+        }
+        commits.reverse();
+        for index in 1..commits.len() {
+            if commits[index].parent_commit_id.is_none() {
+                commits[index].parent_commit_id = Some(commits[index - 1].graph_commit_id.clone());
+            }
+        }
+        let children = commits.iter().skip(1).chain(std::iter::once(&head));
+        if let Some((parent, child)) = commits.iter().zip(children).find(|(parent, child)| {
+            child.parent_commit_id.as_deref() != Some(parent.graph_commit_id.as_str())
+        }) {
+            return Err(OmniError::manifest_internal(format!(
+                "manifest buffers graph commit '{}' and the next commit it holds, '{}', is not \
+                 its first-parent child",
+                parent.graph_commit_id, child.graph_commit_id
+            )));
+        }
+        let mut replaced = Vec::with_capacity(self.replaced.len());
+        for ((replaced_at, identity), (clock, raw)) in self.replaced {
+            let Some(current) = self.tables.get(&identity) else {
                 return Err(OmniError::manifest_internal(format!(
-                    "manifest has two live table identities ({existing} and {}) bound to alias '{}'",
-                    entry.identity, entry.type_key
+                    "manifest has a replaced_table row for identity {identity} and no table row \
+                     for it"
                 )));
+            };
+            let table = raw.into_replaced_row(Some(current), self.version)?;
+            let before = match (clock.registered, table.state) {
+                (false, state) => ReplacedRow::Table(Box::new(TableRow {
+                    registration: table.registration,
+                    state,
+                })),
+                (true, TableState::Registered) => ReplacedRow::Unregistered(table.registration),
+                (true, _) => {
+                    return Err(OmniError::manifest_internal(format!(
+                        "replaced_table row '{}' marks a registration and carries a pin or a \
+                         drop",
+                        replaced_table_object_id(identity, replaced_at)
+                    )));
+                }
+            };
+            replaced.push(ReplacedTable {
+                replaced_at,
+                before,
+            });
+        }
+        Ok(ManifestRows {
+            schema_contract_head: self.schema_contract_head,
+            schema_contract: self.schema_contract,
+            tables: self.tables.into_values().collect(),
+            head,
+            buffer: CommitBuffer { commits, replaced },
+        })
+    }
+}
+
+fn foreign_fields(object_type: &str, row: usize) -> OmniError {
+    OmniError::manifest_internal(format!(
+        "manifest {object_type} row at index {row} carries fields of another row type"
+    ))
+}
+
+pub async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestState> {
+    read_manifest_rows_projected(dataset).await?.state(
+        dataset.version().version,
+        dataset.manifest().branch.as_deref(),
+    )
+}
+
+/// The visible table state of `dataset`'s version and the rows it was read
+/// from, the head commit's record among them, from one scan. Reads
+/// `__manifest` only.
+pub(crate) async fn read_manifest_state_and_rows(
+    dataset: &Dataset,
+) -> Result<(ManifestState, ManifestRows)> {
+    let rows = read_manifest_rows_projected(dataset).await?;
+    let state = rows.state(
+        dataset.version().version,
+        dataset.manifest().branch.as_deref(),
+    )?;
+    Ok((state, rows))
+}
+
+/// Every pin the branch `dataset` is checked out on has held: the pins of its
+/// `__manifest` version, of the commits that version buffers, and the pins
+/// recorded with each older commit of its lineage, which `__history` holds.
+pub(crate) async fn read_manifest_entries(
+    root_uri: &str,
+    dataset: &Dataset,
+) -> Result<Vec<DatasetEntry>> {
+    let rows = read_manifest_rows_projected(dataset).await?;
+    let oldest = rows.buffer.commits.first().unwrap_or(&rows.head);
+    let mut parent = oldest.parent_commit_id.clone();
+    let mut records = match parent {
+        Some(_) => history::read_records(root_uri, &dataset.session()).await?,
+        None => HashMap::new(),
+    };
+    let mut pins = BTreeMap::<(TableIdentity, u64), TablePin>::new();
+    for buffered in &rows.buffer.commits {
+        for table in rows
+            .buffer
+            .rows_at(buffered.graph_manifest_version, &rows.tables)
+        {
+            if let TableState::Pinned(pin) = &table.state {
+                pins.insert(
+                    (table.registration.identity, pin.manifest_version),
+                    pin.clone(),
+                );
             }
         }
     }
-    entries.sort_by(|a, b| a.type_key.cmp(&b.type_key));
-    Ok(ManifestState {
-        version,
-        entries,
-        graph_heads,
-        schema_contract,
-    })
-}
-
-// Preserve historical registrations for cleanup's published-pin proof, including
-// versions superseded by later writes. Current snapshots alone are insufficient.
-pub(crate) async fn read_manifest_entries(dataset: &Dataset) -> Result<Vec<DatasetEntry>> {
-    let scan = read_manifest_scan(dataset, false).await?;
-    let registrations = scan.table_registrations;
-    scan.version_entries
-        .into_iter()
-        .map(|mut entry| {
-            let registration = registrations.get(&entry.identity).ok_or_else(|| {
+    while let Some(id) = parent {
+        let record = records.remove(&id).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "graph commit '{id}' is the parent of a commit on this branch and `__history` \
+                 does not hold it"
+            ))
+        })?;
+        parent = record.commit.parent_commit_id;
+        for table in record.tables {
+            if let TableState::Pinned(pin) = table.state {
+                pins.insert((table.registration.identity, pin.manifest_version), pin);
+            }
+        }
+    }
+    let mut registrations = HashMap::with_capacity(rows.tables.len());
+    for table in rows.tables {
+        if let TableState::Pinned(pin) = table.state {
+            pins.insert((table.registration.identity, pin.manifest_version), pin);
+        }
+        registrations.insert(table.registration.identity, table.registration);
+    }
+    pins.into_iter()
+        .map(|((identity, _), pin)| {
+            let registration = registrations.get(&identity).ok_or_else(|| {
                 OmniError::manifest_internal(format!(
-                    "manifest missing table row for identity {}",
-                    entry.identity
+                    "manifest missing table row for identity {identity}"
                 ))
             })?;
-            entry.type_key = registration.table_key.clone();
-            entry.dataset_path = registration.table_path.clone();
-            Ok(entry)
+            Ok(dataset_entry(registration, &pin))
         })
         .collect()
-}
-
-/// The full table state the publisher needs to build its CAS batch, plus the
-/// `graph_commit` lineage rows for parent resolution — all from ONE `__manifest`
-/// scan (RFC-013 P2). Replaces the prior four scans on the publish path (three
-/// thin accessors + a separate `read_graph_lineage`): `load_publish_state`
-/// projects every piece it needs out of this single result.
-pub(crate) struct PublishScan {
-    pub(crate) table_registrations: HashMap<TableIdentity, TableRegistration>,
-    pub(crate) version_entries: Vec<DatasetEntry>,
-    /// `(identity, manifest_version)` of each tombstone, mapped to the sealed
-    /// Lance data version the tombstone row records.
-    pub(crate) tombstones: Vec<((TableIdentity, u64), u64)>,
-    pub(crate) lineage_rows: Vec<GraphLineageRow>,
-    /// Exact `graph_head:<branch>` rows keyed by the branch suffix (`main` for
-    /// main). Absence is meaningful and is preserved by a missing map entry.
-    pub(crate) graph_heads: HashMap<String, String>,
-    /// The `schema_contract` row's head; absent before the row exists.
-    pub(crate) schema_contract: Option<SchemaContractHead>,
-    /// The scanned rows themselves, the input of `commit::overwrite`.
-    pub(crate) live_rows: Vec<RecordBatch>,
 }
 
 pub(crate) async fn read_manifest_table_registrations(
     dataset: &Dataset,
 ) -> Result<Vec<TableRegistration>> {
-    Ok(read_manifest_scan(dataset, false)
+    Ok(read_manifest_rows_projected(dataset)
         .await?
-        .table_registrations
-        .into_values()
+        .tables
+        .into_iter()
+        .map(|table| table.registration)
         .collect())
 }
 
-/// One-scan read of everything the publish path needs. `collect_lineage` is
-/// always on here (the publisher resolves a parent), so the lineage JSON decode
-/// rides the same pass as the table-state assembly instead of a second scan.
-pub(crate) async fn read_publish_scan(dataset: &Dataset) -> Result<PublishScan> {
-    let scan = read_manifest_scan_with_clocks(dataset, true, None, false, true, false).await?;
-    Ok(publish_scan_from_rows(scan))
-}
-
-pub(crate) async fn decode_publish_batch(
-    dataset: &Dataset,
-    batch: RecordBatch,
-) -> Result<PublishScan> {
-    let batches = futures::stream::iter([expand_from_storage(&batch)]);
-    let scan = reduce_manifest_batches(dataset, batches, true, false, false, true, false).await?;
-    Ok(publish_scan_from_rows(scan))
-}
-
-fn publish_scan_from_rows(scan: ManifestScan) -> PublishScan {
-    PublishScan {
-        table_registrations: scan.table_registrations,
-        version_entries: scan.version_entries,
-        tombstones: scan
-            .tombstones
-            .into_iter()
-            .map(|tombstone| {
-                (
-                    (tombstone.identity, tombstone.manifest_version),
-                    tombstone.tombstone_version,
-                )
-            })
-            .collect(),
-        lineage_rows: scan.lineage_rows,
-        graph_heads: scan.graph_heads,
-        schema_contract: scan.schema_contract,
-        live_rows: scan.live_rows,
-    }
+pub(crate) fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("manifest batch missing '{name}' column"))
+        })?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("manifest column '{name}' is not Utf8"))
+        })
 }
 
 /// Decode one `schema_contract` row's head out of its `metadata` column.
@@ -766,8 +1245,8 @@ fn decode_schema_contract_row(
     require_object_id(
         object_ids,
         row,
-        SCHEMA_CONTRACT_OBJECT_ID,
-        OBJECT_TYPE_SCHEMA_CONTRACT,
+        crate::SCHEMA_CONTRACT_OBJECT_ID,
+        crate::OBJECT_TYPE_SCHEMA_CONTRACT,
     )?;
     if metadata.is_null(row) {
         return Err(OmniError::manifest_internal(
@@ -790,11 +1269,11 @@ pub(crate) async fn read_schema_contract_row(
     crate::instrumentation::record_manifest_scan();
     let mut scanner = dataset.scan();
     scanner
-        .project(&packed_projection(dataset, true))
+        .project(&crate::record::packed_projection(dataset, true))
         .map_err(OmniError::storage)?;
     scanner.filter_expr(
         datafusion::prelude::col("object_id")
-            .eq(datafusion::prelude::lit(SCHEMA_CONTRACT_OBJECT_ID)),
+            .eq(datafusion::prelude::lit(crate::SCHEMA_CONTRACT_OBJECT_ID)),
     );
     scanner.materialization_style(lance::dataset::scanner::MaterializationStyle::AllEarly);
     let mut batches = scanner
@@ -823,8 +1302,8 @@ pub(crate) fn schema_contract_from_batch(
 
 fn require_schema_content(dataset: &Dataset) -> Result<()> {
     let stamp = read_stamp(dataset);
-    if stored_shape(stamp) != StoredShape::Packed
-        || SCHEMA_CONTENT_COLUMNS
+    if stamp != Some(crate::INTERNAL_MANIFEST_SCHEMA_VERSION)
+        || crate::record::SCHEMA_CONTENT_COLUMNS
             .iter()
             .any(|name| dataset.schema().field(name).is_none())
     {
@@ -835,7 +1314,7 @@ fn require_schema_content(dataset: &Dataset) -> Result<()> {
             stamp.map_or("?".to_string(), |stamp| stamp.to_string())
         )));
     }
-    for name in SCHEMA_CONTENT_COLUMNS {
+    for name in crate::record::SCHEMA_CONTENT_COLUMNS {
         let field = dataset
             .schema()
             .field(name)
@@ -857,15 +1336,16 @@ fn fold_schema_contract_batch(
     let object_ids = string_column(batch, "object_id")?;
     let object_types = string_column(batch, "object_type")?;
     let metadata = string_column(batch, "metadata")?;
-    let sources = large_string_column(batch, SCHEMA_CONTENT_COLUMNS[0])?;
-    let irs = large_string_column(batch, SCHEMA_CONTENT_COLUMNS[1])?;
+    let sources = large_string_column(batch, crate::record::SCHEMA_CONTENT_COLUMNS[0])?;
+    let irs = large_string_column(batch, crate::record::SCHEMA_CONTENT_COLUMNS[1])?;
     for row in 0..batch.num_rows() {
-        if object_ids.value(row) != SCHEMA_CONTRACT_OBJECT_ID {
+        if object_ids.value(row) != crate::SCHEMA_CONTRACT_OBJECT_ID {
             continue;
         }
-        if object_types.value(row) != OBJECT_TYPE_SCHEMA_CONTRACT {
+        if object_types.value(row) != crate::OBJECT_TYPE_SCHEMA_CONTRACT {
             return Err(OmniError::manifest_internal(format!(
-                "manifest row '{SCHEMA_CONTRACT_OBJECT_ID}' has object_type '{}'",
+                "manifest row '{}' has object_type '{}'",
+                crate::SCHEMA_CONTRACT_OBJECT_ID,
                 object_types.value(row)
             )));
         }
@@ -917,862 +1397,6 @@ fn finish_schema_contract_row(
     Ok(contract)
 }
 
-/// Decode one `graph_commit` row (`object_type == OBJECT_TYPE_GRAPH_COMMIT`) into
-/// a [`GraphLineageRow`]. The single decode for both lineage readers — the
-/// dedicated `read_graph_lineage` scan and the folded `collect_lineage` branch of
-/// `read_manifest_scan` — so the two cannot drift. The caller has already matched
-/// the object type; `row` indexes into the per-batch columns.
-pub(crate) fn decode_graph_commit_row(
-    object_ids: &StringArray,
-    metadata: &StringArray,
-    versions: &UInt64Array,
-    branches: &StringArray,
-    row: usize,
-) -> Result<GraphLineageRow> {
-    if metadata.is_null(row) {
-        return Err(OmniError::manifest_internal(format!(
-            "manifest graph_commit row missing metadata for {}",
-            object_ids.value(row)
-        )));
-    }
-    let commit_meta: GraphCommitMetadata =
-        serde_json::from_str(metadata.value(row)).map_err(|e| {
-            OmniError::manifest_internal(format!("failed to decode graph_commit metadata: {e}"))
-        })?;
-    Ok(GraphLineageRow {
-        graph_commit_id: object_ids.value(row).to_string(),
-        graph_branch: if branches.is_null(row) {
-            None
-        } else {
-            Some(branches.value(row).to_string())
-        },
-        graph_manifest_version: required_u64(versions, row, "table_version")?,
-        parent_commit_id: commit_meta.parent_commit_id,
-        merged_parent_commit_id: commit_meta.merged_parent_commit_id,
-        actor_id: commit_meta.actor_id,
-        created_at: commit_meta.created_at,
-    })
-}
-
-/// Decode one `graph_head` row into its exact branch-key / commit-id pair.
-/// Shared by the dedicated lineage reader and the publisher's folded one-scan
-/// path so presence, absence, and malformed-row handling cannot drift.
-pub(crate) fn decode_graph_head_row(
-    object_ids: &StringArray,
-    metadata: &StringArray,
-    row: usize,
-) -> Result<(String, String)> {
-    if metadata.is_null(row) {
-        return Err(OmniError::manifest_internal(format!(
-            "manifest graph_head row missing metadata for {}",
-            object_ids.value(row)
-        )));
-    }
-    let head_meta: GraphHeadMetadata = serde_json::from_str(metadata.value(row)).map_err(|e| {
-        OmniError::manifest_internal(format!("failed to decode graph_head metadata: {e}"))
-    })?;
-    let branch_key = object_ids
-        .value(row)
-        .strip_prefix(super::GRAPH_HEAD_OBJECT_ID_PREFIX)
-        .ok_or_else(|| {
-            OmniError::manifest_internal(format!(
-                "invalid graph_head object id {}",
-                object_ids.value(row)
-            ))
-        })?
-        .to_string();
-    Ok((branch_key, head_meta.head_commit_id))
-}
-
-fn require_clock_at_or_below(clock: u64, dataset: &Dataset, table_key: &str) -> Result<()> {
-    let version = dataset.version().version;
-    if clock > version {
-        return Err(OmniError::manifest_internal(format!(
-            "manifest row for {table_key} carries manifest version {clock} above the scanned \
-             dataset version {version}"
-        )));
-    }
-    Ok(())
-}
-
-fn registration_clock(
-    dataset: &Dataset,
-    legacy: bool,
-    key_version: u64,
-    table_version: u64,
-    update_versions: Option<&UInt64Array>,
-    row: usize,
-    table_key: &str,
-) -> Result<u64> {
-    if legacy && key_version != table_version {
-        return Err(OmniError::manifest_internal(format!(
-            "v6 manifest row for {table_key} has key version {key_version}, expected table version {table_version}"
-        )));
-    }
-    let clock = match update_versions {
-        Some(versions) => required_u64(versions, row, "_row_last_updated_at_version")?,
-        None => key_version,
-    };
-    if !legacy || update_versions.is_some() {
-        require_clock_at_or_below(clock, dataset, table_key)?;
-    }
-    Ok(clock)
-}
-
-async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<ManifestScan> {
-    read_manifest_scan_fragments(dataset, collect_lineage, None).await
-}
-
-/// The one manifest row decoder. `fragments = None` scans the whole catalog;
-/// `Some(...)` restricts to the given fragments' LIVE rows — the incremental
-/// refresh's delta read, which decodes O(appended rows) instead of
-/// O(history).
-async fn read_manifest_scan_fragments(
-    dataset: &Dataset,
-    collect_lineage: bool,
-    fragments: Option<Vec<lance_table::format::Fragment>>,
-) -> Result<ManifestScan> {
-    read_manifest_scan_with_clocks(dataset, collect_lineage, fragments, false, false, false).await
-}
-
-/// The columns a `__manifest` scan projects: `record` whole when packed, the content
-/// columns only when `with_content` (publication or cold admission), the flat
-/// logical columns otherwise.
-fn manifest_projection(dataset: &Dataset, shape: StoredShape, with_content: bool) -> Vec<String> {
-    match shape {
-        StoredShape::Packed => packed_projection(dataset, with_content),
-        StoredShape::Flat => flat_projection(),
-    }
-}
-
-fn read_manifest_scan_with_clocks(
-    dataset: &Dataset,
-    collect_lineage: bool,
-    fragments: Option<Vec<lance_table::format::Fragment>>,
-    use_row_update_versions: bool,
-    retain_live_rows: bool,
-    read_contract: bool,
-) -> BoxFuture<'_, Result<ManifestScan>> {
-    Box::pin(async move {
-        let historical;
-        let dataset = if let Some(stamp @ (7 | 13)) = super::migrations::read_stamp(dataset)
-            && dataset
-                .schema()
-                .metadata
-                .contains_key(crate::migrations::UPGRADE_PENDING_KEY)
-        {
-            historical =
-                Box::pin(crate::migrations::historical_source(dataset.clone(), stamp)).await?;
-            &historical
-        } else {
-            dataset
-        };
-        let stamp = read_stamp(dataset);
-        let shape = stored_shape(stamp);
-        crate::instrumentation::record_manifest_scan();
-        let mut projection = manifest_projection(dataset, shape, retain_live_rows || read_contract);
-        if use_row_update_versions {
-            projection.push("_row_last_updated_at_version".to_string());
-        }
-        let is_delta_scan = fragments.is_some();
-        let mut scanner = dataset.scan();
-        scanner.project(&projection).map_err(OmniError::storage)?;
-        if let Some(fragments) = fragments {
-            // Lance semantics this fold depends on: `with_fragments(vec![])`
-            // scans ZERO fragments (it does not fall back to all) — an empty
-            // delta (a DV-only refresh window) must read nothing.
-            scanner.with_fragments(fragments);
-        }
-        let batches = scanner
-            .try_into_stream()
-            .await
-            .map_err(OmniError::storage)?
-            .map(move |batch| {
-                let batch = batch.map_err(OmniError::storage)?;
-                match shape {
-                    StoredShape::Packed => expand_from_storage(&batch),
-                    StoredShape::Flat => Ok(batch),
-                }
-            });
-        reduce_manifest_batches(
-            dataset,
-            batches,
-            collect_lineage,
-            use_row_update_versions,
-            is_delta_scan,
-            retain_live_rows,
-            read_contract,
-        )
-        .await
-    })
-}
-
-async fn reduce_manifest_batches(
-    dataset: &Dataset,
-    mut batches: impl Stream<Item = Result<RecordBatch>> + Unpin,
-    collect_lineage: bool,
-    use_row_update_versions: bool,
-    is_delta_scan: bool,
-    retain_live_rows: bool,
-    read_contract: bool,
-) -> Result<ManifestScan> {
-    let legacy = read_stamp(dataset) == Some(6);
-    let mut table_registrations = HashMap::new();
-    let mut version_entries = Vec::new();
-    let mut tombstones = Vec::new();
-    let mut lineage_rows = Vec::new();
-    let mut graph_heads = HashMap::new();
-    let mut schema_contract = None;
-    let mut schema_contract_row = Ok(None);
-    let mut live_rows = Vec::new();
-
-    while let Some(batch) = batches.try_next().await? {
-        if read_contract
-            && let Ok(found) = &mut schema_contract_row
-            && let Err(error) = fold_schema_contract_batch(&batch, found)
-        {
-            schema_contract_row = Err(error);
-        }
-        if retain_live_rows {
-            live_rows.push(batch.clone());
-        }
-        // Reduce each batch before polling the next; the owned projection is
-        // retained, but Arrow buffers for the complete journal are not.
-        let batch = &batch;
-        let object_types = string_column(batch, "object_type")?;
-        let locations = string_column(batch, "location")?;
-        let metadata = string_column(batch, "metadata")?;
-        let table_keys = string_column(batch, "table_key")?;
-        let stable_table_ids = u64_column(batch, "stable_table_id")?;
-        let table_incarnation_ids = u64_column(batch, "table_incarnation_id")?;
-        let versions = u64_column(batch, "table_version")?;
-        let branches = string_column(batch, "table_branch")?;
-        let row_counts = u64_column(batch, "row_count")?;
-        let update_versions = use_row_update_versions
-            .then(|| u64_column(batch, "_row_last_updated_at_version"))
-            .transpose()?;
-        // `object_id` is needed for the exact graph-head authority even on the
-        // table-state path. We still skip every `graph_commit` decode there, so
-        // the added work is bounded by the number of branch-head rows rather
-        // than growing with commit history.
-        let object_ids = string_column(batch, "object_id")?;
-
-        for row in 0..batch.num_rows() {
-            let table_key = table_keys.value(row).to_string();
-            if object_ids.value(row) == SCHEMA_CONTRACT_OBJECT_ID
-                && object_types.value(row) != OBJECT_TYPE_SCHEMA_CONTRACT
-            {
-                return Err(OmniError::manifest_internal(format!(
-                    "manifest row '{SCHEMA_CONTRACT_OBJECT_ID}' has object_type '{}'",
-                    object_types.value(row)
-                )));
-            }
-            match object_types.value(row) {
-                OBJECT_TYPE_TABLE => {
-                    let identity = required_table_identity(
-                        stable_table_ids,
-                        table_incarnation_ids,
-                        row,
-                        OBJECT_TYPE_TABLE,
-                    )?;
-                    require_object_id(
-                        object_ids,
-                        row,
-                        &table_object_id(identity),
-                        OBJECT_TYPE_TABLE,
-                    )?;
-                    if locations.is_null(row) {
-                        return Err(OmniError::manifest_internal(format!(
-                            "manifest table row missing location for {}",
-                            table_key
-                        )));
-                    }
-                    let table_path = locations.value(row).to_string();
-                    let canonical_path = super::table_path_for_identity(&table_key, identity)?;
-                    if table_path != canonical_path {
-                        return Err(OmniError::manifest_internal(format!(
-                            "manifest table row for identity {identity} has path '{table_path}', \
-                             expected '{canonical_path}'"
-                        )));
-                    }
-                    let registration = TableRegistration {
-                        identity,
-                        table_key,
-                        table_path,
-                    };
-                    if let Some(existing) =
-                        table_registrations.insert(identity, registration.clone())
-                    {
-                        if existing != registration {
-                            return Err(OmniError::manifest_internal(format!(
-                                "manifest has conflicting table rows for identity {identity}"
-                            )));
-                        }
-                    }
-                }
-                OBJECT_TYPE_TABLE_VERSION => {
-                    let identity = required_table_identity(
-                        stable_table_ids,
-                        table_incarnation_ids,
-                        row,
-                        OBJECT_TYPE_TABLE_VERSION,
-                    )?;
-                    let table_version = required_u64(versions, row, "table_version")?;
-                    let key_version = manifest_version_from_object_id(
-                        object_ids.value(row),
-                        identity,
-                        OBJECT_TYPE_TABLE_VERSION,
-                    )?;
-                    let manifest_version = registration_clock(
-                        dataset,
-                        legacy,
-                        key_version,
-                        table_version,
-                        update_versions,
-                        row,
-                        &table_key,
-                    )?;
-                    let row_count = required_u64(row_counts, row, "row_count")?;
-                    if metadata.is_null(row) {
-                        return Err(OmniError::manifest_internal(format!(
-                            "manifest table_version row missing metadata for {}",
-                            table_key
-                        )));
-                    }
-                    let table_branch = if branches.is_null(row) {
-                        None
-                    } else {
-                        Some(branches.value(row).to_string())
-                    };
-                    version_entries.push(DatasetEntry {
-                        identity,
-                        type_key: table_key.clone(),
-                        dataset_path: String::new(),
-                        published_dataset_version: table_version,
-                        native_dataset_branch: table_branch,
-                        entity_count: row_count,
-                        version_metadata: TableVersionMetadata::from_json_str(metadata.value(row))?,
-                        manifest_version,
-                    });
-                }
-                OBJECT_TYPE_TABLE_TOMBSTONE => {
-                    let identity = required_table_identity(
-                        stable_table_ids,
-                        table_incarnation_ids,
-                        row,
-                        OBJECT_TYPE_TABLE_TOMBSTONE,
-                    )?;
-                    let tombstone_version = required_u64(versions, row, "table_version")?;
-                    let key_version = manifest_version_from_object_id(
-                        object_ids.value(row),
-                        identity,
-                        OBJECT_TYPE_TABLE_TOMBSTONE,
-                    )?;
-                    let manifest_version = registration_clock(
-                        dataset,
-                        legacy,
-                        key_version,
-                        tombstone_version,
-                        update_versions,
-                        row,
-                        &table_key,
-                    )?;
-                    tombstones.push(TableTombstoneEntry {
-                        identity,
-                        table_key,
-                        tombstone_version,
-                        manifest_version,
-                    });
-                }
-                // `graph_commit` rows (RFC-013) are decoded ONLY for the publish
-                // path, which resolves a parent. The table-state hot path skips
-                // them, while still decoding the bounded graph-head authority
-                // rows below.
-                OBJECT_TYPE_GRAPH_COMMIT => {
-                    require_null_table_identity(
-                        stable_table_ids,
-                        table_incarnation_ids,
-                        row,
-                        OBJECT_TYPE_GRAPH_COMMIT,
-                    )?;
-                    if collect_lineage {
-                        lineage_rows.push(decode_graph_commit_row(
-                            object_ids, metadata, versions, branches, row,
-                        )?);
-                    }
-                }
-                OBJECT_TYPE_GRAPH_HEAD => {
-                    require_null_table_identity(
-                        stable_table_ids,
-                        table_incarnation_ids,
-                        row,
-                        OBJECT_TYPE_GRAPH_HEAD,
-                    )?;
-                    let (branch_key, head_commit_id) =
-                        decode_graph_head_row(object_ids, metadata, row)?;
-                    graph_heads.insert(branch_key, head_commit_id);
-                }
-                OBJECT_TYPE_SCHEMA_CONTRACT => {
-                    require_null_table_identity(
-                        stable_table_ids,
-                        table_incarnation_ids,
-                        row,
-                        OBJECT_TYPE_SCHEMA_CONTRACT,
-                    )?;
-                    let head = decode_schema_contract_row(object_ids, metadata, row)?;
-                    if schema_contract.replace(head).is_some() {
-                        return Err(OmniError::manifest_internal(
-                            "manifest has two schema_contract rows".to_string(),
-                        ));
-                    }
-                }
-                // Commit rows are skipped on the table-state path; unknown future
-                // object types are skipped on every path.
-                _ => {}
-            }
-        }
-    }
-
-    version_entries.sort_by(|a, b| {
-        a.identity
-            .cmp(&b.identity)
-            .then(a.manifest_version.cmp(&b.manifest_version))
-    });
-    // Whole-catalog invariant only: a delta scan's tombstone can reference a
-    // registration living in an unread older fragment (a table drop in the
-    // refresh window), so the join check would misfire there — the fold's
-    // `finish` joins against the ACCUMULATED registration map instead.
-    if !is_delta_scan {
-        let mut clocks = std::collections::HashSet::new();
-        for (identity, clock) in version_entries
-            .iter()
-            .map(|entry| (entry.identity, entry.manifest_version))
-            .chain(
-                tombstones
-                    .iter()
-                    .map(|tombstone| (tombstone.identity, tombstone.manifest_version)),
-            )
-        {
-            if !clocks.insert((identity, clock)) && (!legacy || use_row_update_versions) {
-                return Err(OmniError::manifest_internal(format!(
-                    "manifest has two rows for identity {identity} at manifest version {clock}"
-                )));
-            }
-        }
-        for tombstone in &tombstones {
-            let registration = table_registrations
-                .get(&tombstone.identity)
-                .ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "manifest tombstone for identity {} has no table registration",
-                        tombstone.identity
-                    ))
-                })?;
-            if registration.table_key != tombstone.table_key {
-                return Err(OmniError::manifest_internal(format!(
-                    "manifest tombstone identity {} has diagnostic alias '{}', current binding is '{}'",
-                    tombstone.identity, tombstone.table_key, registration.table_key
-                )));
-            }
-        }
-    }
-
-    Ok(ManifestScan {
-        table_registrations,
-        version_entries,
-        tombstones,
-        lineage_rows,
-        graph_heads,
-        schema_contract,
-        schema_contract_row,
-        live_rows,
-    })
-}
-
-/// Project the graph-lineage rows (`graph_commit` + `graph_head`) out of
-/// `__manifest` (RFC-013 step 4). Returns every commit and the per-branch head
-/// map (keyed by branch name, `"main"` for main). `__manifest` is the single
-/// source of graph lineage: the commit-graph cache is sourced from here, and the
-/// publisher resolves a new commit's parent from here inside its CAS loop.
-///
-/// Dedicated scan (separate from `read_manifest_scan`): it decodes ONLY the two
-/// lineage object types and builds no table snapshot, so the table-state hot
-/// path never pays for lineage JSON and this path never pays for table-entry
-/// assembly.
-pub async fn read_graph_lineage(
-    dataset: &Dataset,
-) -> Result<(Vec<GraphLineageRow>, HashMap<String, String>)> {
-    crate::instrumentation::record_manifest_scan();
-    let shape = stored_shape(read_stamp(dataset));
-    let mut scanner = dataset.scan();
-    scanner
-        .project(&manifest_projection(dataset, shape, false))
-        .map_err(OmniError::storage)?;
-    let mut batches = scanner
-        .try_into_stream()
-        .await
-        .map_err(OmniError::storage)?;
-
-    let mut graph_commits = Vec::new();
-    let mut graph_heads = HashMap::new();
-
-    while let Some(batch) = batches.try_next().await.map_err(OmniError::storage)? {
-        let batch = match shape {
-            StoredShape::Packed => expand_from_storage(&batch)?,
-            StoredShape::Flat => batch,
-        };
-        // Reduce each batch before polling the next; the owned projection is
-        // retained, but Arrow buffers for the complete journal are not.
-        let batch = &batch;
-        let object_ids = string_column(batch, "object_id")?;
-        let object_types = string_column(batch, "object_type")?;
-        let metadata = string_column(batch, "metadata")?;
-        let stable_table_ids = u64_column(batch, "stable_table_id")?;
-        let table_incarnation_ids = u64_column(batch, "table_incarnation_id")?;
-        let versions = u64_column(batch, "table_version")?;
-        let branches = string_column(batch, "table_branch")?;
-
-        for row in 0..batch.num_rows() {
-            match object_types.value(row) {
-                OBJECT_TYPE_GRAPH_COMMIT => {
-                    require_null_table_identity(
-                        stable_table_ids,
-                        table_incarnation_ids,
-                        row,
-                        OBJECT_TYPE_GRAPH_COMMIT,
-                    )?;
-                    graph_commits.push(decode_graph_commit_row(
-                        object_ids, metadata, versions, branches, row,
-                    )?);
-                }
-                OBJECT_TYPE_GRAPH_HEAD => {
-                    require_null_table_identity(
-                        stable_table_ids,
-                        table_incarnation_ids,
-                        row,
-                        OBJECT_TYPE_GRAPH_HEAD,
-                    )?;
-                    let (branch_key, head_commit_id) =
-                        decode_graph_head_row(object_ids, metadata, row)?;
-                    graph_heads.insert(branch_key, head_commit_id);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    Ok((graph_commits, graph_heads))
-}
-
-/// The current head of a branch's lineage: the [`GraphLineageRow`] with the
-/// greatest `(graph_manifest_version, created_at, graph_commit_id)`. This is the same
-/// ordering the commit-graph cache uses to pick its head (`should_replace_head`)
-/// — kept in one place so the publisher's per-attempt parent resolution and the
-/// cache agree by construction. `None` only for a graph with no commits yet
-/// (a parentless genesis).
-pub fn head_lineage_row(rows: &[GraphLineageRow]) -> Option<&GraphLineageRow> {
-    rows.iter().max_by(|a, b| {
-        a.graph_manifest_version
-            .cmp(&b.graph_manifest_version)
-            .then_with(|| a.created_at.cmp(&b.created_at))
-            .then_with(|| a.graph_commit_id.cmp(&b.graph_commit_id))
-    })
-}
-
-/// One `__manifest` row materializing a piece of a graph commit's lineage. The
-/// publisher maps these onto its `PendingVersionRow`s (folding lineage into the
-/// table-version publish batch), and the genesis init path pushes them straight
-/// into the init batch.
-pub struct GraphLineageRowPart {
-    pub object_id: String,
-    pub object_type: &'static str,
-    pub metadata: String,
-    pub table_version: Option<u64>,
-    pub table_branch: Option<String>,
-}
-
-/// Encode one graph commit into its two `__manifest` rows: the immutable
-/// `graph_commit` row plus the mutable `graph_head:<branch>` pointer (a
-/// merge-insert on `object_id` updates the head in place). `branch` is `None`
-/// for main. The immutable commit fields with no dedicated column live in the
-/// `graph_commit` row's `metadata` JSON; the mutable head pointer payload lives
-/// in the `graph_head` row's `metadata`.
-pub fn graph_lineage_row_parts(
-    commit: &GraphLineageRow,
-    branch: Option<&str>,
-) -> Result<[GraphLineageRowPart; 2]> {
-    let commit_metadata = serde_json::to_string(&GraphCommitMetadata {
-        parent_commit_id: commit.parent_commit_id.clone(),
-        merged_parent_commit_id: commit.merged_parent_commit_id.clone(),
-        actor_id: commit.actor_id.clone(),
-        created_at: commit.created_at,
-    })
-    .map_err(|e| {
-        OmniError::manifest_internal(format!("failed to encode graph_commit metadata: {e}"))
-    })?;
-    let head_metadata = serde_json::to_string(&GraphHeadMetadata {
-        head_commit_id: commit.graph_commit_id.clone(),
-        parent_commit_id: commit.parent_commit_id.clone(),
-    })
-    .map_err(|e| {
-        OmniError::manifest_internal(format!("failed to encode graph_head metadata: {e}"))
-    })?;
-
-    Ok([
-        // Only the immutable commit row carries the manifest version + branch.
-        GraphLineageRowPart {
-            object_id: commit.graph_commit_id.clone(),
-            object_type: OBJECT_TYPE_GRAPH_COMMIT,
-            metadata: commit_metadata,
-            table_version: Some(commit.graph_manifest_version),
-            table_branch: commit.graph_branch.clone(),
-        },
-        // The head row reuses `metadata` for its pointer payload.
-        GraphLineageRowPart {
-            object_id: graph_head_object_id(branch),
-            object_type: OBJECT_TYPE_GRAPH_HEAD,
-            metadata: head_metadata,
-            table_version: None,
-            table_branch: None,
-        },
-    ])
-}
-
-/// The `metadata` JSON of a `schema_contract` row carrying `head`.
-pub(crate) fn schema_contract_metadata_json(head: &SchemaContractHead) -> Result<String> {
-    serde_json::to_string(head).map_err(|e| {
-        OmniError::manifest_internal(format!("failed to encode schema_contract metadata: {e}"))
-    })
-}
-
-pub(crate) fn entries_to_batch(
-    entries: &[DatasetEntry],
-    version_metadata: &HashMap<TableIdentity, String>,
-    genesis_lineage: &[GraphLineageRowPart],
-    schema_contract: Option<&SchemaContractRow>,
-) -> Result<RecordBatch> {
-    let cap = entries.len() * 2 + genesis_lineage.len() + usize::from(schema_contract.is_some());
-    let mut object_ids = Vec::with_capacity(cap);
-    let mut object_types = Vec::with_capacity(cap);
-    let mut locations = Vec::with_capacity(cap);
-    let mut metadata = Vec::with_capacity(cap);
-    let mut table_keys = Vec::with_capacity(cap);
-    let mut table_identities = Vec::with_capacity(cap);
-    let mut table_versions = Vec::with_capacity(cap);
-    let mut table_branches = Vec::with_capacity(cap);
-    let mut row_counts = Vec::with_capacity(cap);
-    let mut schema_sources = Vec::with_capacity(cap);
-    let mut schema_irs = Vec::with_capacity(cap);
-
-    for entry in entries {
-        object_ids.push(table_object_id(entry.identity));
-        object_types.push(OBJECT_TYPE_TABLE.to_string());
-        locations.push(Some(entry.dataset_path.clone()));
-        metadata.push(None);
-        table_keys.push(entry.type_key.clone());
-        table_identities.push(Some(entry.identity));
-        table_versions.push(None);
-        table_branches.push(None);
-        row_counts.push(None);
-        schema_sources.push(None);
-        schema_irs.push(None);
-
-        object_ids.push(version_object_id(entry.identity, entry.manifest_version));
-        object_types.push(OBJECT_TYPE_TABLE_VERSION.to_string());
-        locations.push(None);
-        metadata.push(Some(
-            version_metadata
-                .get(&entry.identity)
-                .cloned()
-                .ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "missing initial version metadata for {}",
-                        entry.type_key
-                    ))
-                })?,
-        ));
-        table_keys.push(entry.type_key.clone());
-        table_identities.push(Some(entry.identity));
-        table_versions.push(Some(entry.published_dataset_version));
-        table_branches.push(entry.native_dataset_branch.clone());
-        row_counts.push(Some(entry.entity_count));
-        schema_sources.push(None);
-        schema_irs.push(None);
-    }
-
-    // Genesis graph-lineage rows ride the init write so a fresh graph carries
-    // its `graph_commit` + `graph_head` in `__manifest` from version one (no
-    // separate lineage fragment, no second commit). `table_key` is non-nullable
-    // but lineage rows have no table identity, so the empty string stands in
-    // (never matched by a real key).
-    for part in genesis_lineage {
-        object_ids.push(part.object_id.clone());
-        object_types.push(part.object_type.to_string());
-        locations.push(None);
-        metadata.push(Some(part.metadata.clone()));
-        table_keys.push(String::new());
-        table_identities.push(None);
-        table_versions.push(part.table_version);
-        table_branches.push(part.table_branch.clone());
-        row_counts.push(None);
-        schema_sources.push(None);
-        schema_irs.push(None);
-    }
-
-    if let Some(contract) = schema_contract {
-        object_ids.push(SCHEMA_CONTRACT_OBJECT_ID.to_string());
-        object_types.push(OBJECT_TYPE_SCHEMA_CONTRACT.to_string());
-        locations.push(None);
-        metadata.push(Some(schema_contract_metadata_json(&contract.head)?));
-        table_keys.push(String::new());
-        table_identities.push(None);
-        table_versions.push(None);
-        table_branches.push(None);
-        row_counts.push(None);
-        schema_sources.push(Some(contract.source.clone()));
-        schema_irs.push(Some(contract.ir.clone()));
-    }
-
-    manifest_rows_batch(
-        object_ids,
-        object_types,
-        locations,
-        metadata,
-        table_keys,
-        table_identities,
-        table_versions,
-        table_branches,
-        row_counts,
-        schema_sources,
-        schema_irs,
-    )
-}
-
-pub(crate) fn manifest_rows_batch(
-    object_ids: Vec<String>,
-    object_types: Vec<String>,
-    locations: Vec<Option<String>>,
-    metadata: Vec<Option<String>>,
-    table_keys: Vec<String>,
-    table_identities: Vec<Option<TableIdentity>>,
-    table_versions: Vec<Option<u64>>,
-    table_branches: Vec<Option<String>>,
-    row_counts: Vec<Option<u64>>,
-    schema_sources: Vec<Option<String>>,
-    schema_irs: Vec<Option<String>>,
-) -> Result<RecordBatch> {
-    let len = object_ids.len();
-    if table_identities.len() != len {
-        return Err(OmniError::manifest_internal(format!(
-            "manifest batch has {} object rows but {} table identities",
-            len,
-            table_identities.len()
-        )));
-    }
-    if schema_sources.len() != len || schema_irs.len() != len {
-        return Err(OmniError::manifest_internal(format!(
-            "manifest batch has {len} object rows but {} schema sources and {} schema IRs",
-            schema_sources.len(),
-            schema_irs.len()
-        )));
-    }
-    for (row, (object_type, identity)) in
-        object_types.iter().zip(table_identities.iter()).enumerate()
-    {
-        let carries_content = schema_sources[row].is_some() || schema_irs[row].is_some();
-        if carries_content != (object_type == OBJECT_TYPE_SCHEMA_CONTRACT) {
-            return Err(OmniError::manifest_internal(format!(
-                "manifest {object_type} row at index {row} {} schema contract content",
-                if carries_content {
-                    "must not carry"
-                } else {
-                    "is missing its"
-                }
-            )));
-        }
-        match object_type.as_str() {
-            OBJECT_TYPE_TABLE | OBJECT_TYPE_TABLE_VERSION | OBJECT_TYPE_TABLE_TOMBSTONE => {
-                let identity = identity.ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "manifest {object_type} row at index {row} is missing table identity"
-                    ))
-                })?;
-                identity.validate()?;
-                let object_id = object_ids.get(row).ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "manifest {object_type} row at index {row} is missing object_id"
-                    ))
-                })?;
-                match object_type.as_str() {
-                    OBJECT_TYPE_TABLE => {
-                        let expected_object_id = table_object_id(identity);
-                        if object_id != &expected_object_id {
-                            return Err(OmniError::manifest_internal(format!(
-                                "manifest {object_type} row at index {row} has object_id {object_id:?}, expected '{expected_object_id}'"
-                            )));
-                        }
-                    }
-                    _ => {
-                        if table_versions.get(row).copied().flatten().is_none() {
-                            return Err(OmniError::manifest_internal(format!(
-                                "manifest {object_type} row at index {row} is missing table_version"
-                            )));
-                        }
-                        manifest_version_from_object_id(object_id, identity, object_type)?;
-                    }
-                }
-            }
-            OBJECT_TYPE_GRAPH_COMMIT | OBJECT_TYPE_GRAPH_HEAD | OBJECT_TYPE_SCHEMA_CONTRACT
-                if identity.is_some() =>
-            {
-                return Err(OmniError::manifest_internal(format!(
-                    "manifest {object_type} row at index {row} must not carry table identity"
-                )));
-            }
-            OBJECT_TYPE_SCHEMA_CONTRACT => {
-                if object_ids[row] != SCHEMA_CONTRACT_OBJECT_ID {
-                    return Err(OmniError::manifest_internal(format!(
-                        "manifest {object_type} row at index {row} has object_id {:?}, expected '{SCHEMA_CONTRACT_OBJECT_ID}'",
-                        object_ids[row]
-                    )));
-                }
-                if schema_sources[row].is_none() || schema_irs[row].is_none() {
-                    return Err(OmniError::manifest_internal(format!(
-                        "manifest {object_type} row at index {row} is missing its source or IR text"
-                    )));
-                }
-            }
-            _ => {}
-        }
-    }
-    let stable_table_ids = table_identities
-        .iter()
-        .map(|identity| identity.map(|identity| identity.stable_table_id))
-        .collect::<Vec<_>>();
-    let table_incarnation_ids = table_identities
-        .iter()
-        .map(|identity| identity.map(|identity| identity.table_incarnation_id))
-        .collect::<Vec<_>>();
-    RecordBatch::try_new(
-        manifest_schema(),
-        vec![
-            Arc::new(StringArray::from(object_ids)),
-            Arc::new(StringArray::from(object_types)),
-            Arc::new(StringArray::from(locations)),
-            Arc::new(StringArray::from(metadata)),
-            Arc::new(StringArray::from(table_keys)),
-            Arc::new(UInt64Array::from(stable_table_ids)),
-            Arc::new(UInt64Array::from(table_incarnation_ids)),
-            Arc::new(UInt64Array::from(table_versions)),
-            Arc::new(StringArray::from(table_branches)),
-            Arc::new(UInt64Array::from(row_counts)),
-            Arc::new(LargeStringArray::from(schema_sources)),
-            Arc::new(LargeStringArray::from(schema_irs)),
-        ],
-    )
-    .map_err(OmniError::arrow_internal)
-}
-
 fn large_string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a LargeStringArray> {
     batch
         .column_by_name(name)
@@ -1784,70 +1408,6 @@ fn large_string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Lar
         .ok_or_else(|| {
             OmniError::manifest_internal(format!("manifest column '{name}' is not LargeUtf8"))
         })
-}
-
-pub(crate) fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
-    batch
-        .column_by_name(name)
-        .ok_or_else(|| {
-            OmniError::manifest_internal(format!("manifest batch missing '{name}' column"))
-        })?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            OmniError::manifest_internal(format!("manifest column '{name}' is not Utf8"))
-        })
-}
-
-pub(crate) fn u64_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt64Array> {
-    batch
-        .column_by_name(name)
-        .ok_or_else(|| {
-            OmniError::manifest_internal(format!("manifest batch missing '{name}' column"))
-        })?
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| {
-            OmniError::manifest_internal(format!("manifest column '{name}' is not UInt64"))
-        })
-}
-
-fn required_u64(column: &UInt64Array, row: usize, name: &str) -> Result<u64> {
-    if column.is_null(row) {
-        return Err(OmniError::manifest_internal(format!(
-            "manifest column '{name}' is null at row {row}"
-        )));
-    }
-    Ok(column.value(row))
-}
-
-fn required_table_identity(
-    stable_table_ids: &UInt64Array,
-    table_incarnation_ids: &UInt64Array,
-    row: usize,
-    object_type: &str,
-) -> Result<TableIdentity> {
-    let stable_table_id = required_u64(stable_table_ids, row, "stable_table_id")?;
-    let table_incarnation_id = required_u64(table_incarnation_ids, row, "table_incarnation_id")?;
-    TableIdentity::new(stable_table_id, table_incarnation_id).map_err(|error| {
-        OmniError::manifest_internal(format!(
-            "manifest {object_type} row at index {row} has invalid table identity: {error}"
-        ))
-    })
-}
-
-pub(crate) fn require_null_table_identity(
-    stable_table_ids: &UInt64Array,
-    table_incarnation_ids: &UInt64Array,
-    row: usize,
-    object_type: &str,
-) -> Result<()> {
-    if !stable_table_ids.is_null(row) || !table_incarnation_ids.is_null(row) {
-        return Err(OmniError::manifest_internal(format!(
-            "manifest {object_type} row at index {row} must not carry table identity"
-        )));
-    }
-    Ok(())
 }
 
 fn require_object_id(

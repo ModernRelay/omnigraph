@@ -77,6 +77,7 @@ refuses startup; no default is substituted.
 | `ann_nprobes` | integer, at least `0` | `20` | request | `OMNIGRAPH_ANN_NPROBES` | the partition cap per index delta of a `nearest` scan; `0` is no cap |
 | `stage_write_concurrency` | integer `1..=64` | `8` | process | `OMNIGRAPH_LOAD_CONCURRENCY` | the width of the staged-write fan-out for `load` and `mutate` |
 | `traversal_work_limit` | integer `1..=9223372036854775807` | `1000000` | request | `OMNIGRAPH_TRAVERSAL_WORK_LIMIT` | shared traversal row-work cap for statements containing alternatives or wildcard |
+| `history_release_bytes` | integer `1024..=262144` | `262144` | request | `OMNIGRAPH_HISTORY_RELEASE_BYTES` | the byte budget of a branch's buffer of unreleased commits; a mutate, load or branch merge of the session whose buffer and head reach it closes a history block, and the publish after it writes the block under `__history` (schema apply, branch create and delete, repair and upgrade publish under the production budget); a load reaches it only through the CLI or an embedded `Session`, since the HTTP load routes take no settings; query results never change, only the number of requests and files; production keeps the default, a caller may only lower it |
 
 For these statements the cap covers all traversals, including named and nested
 ones, and remains shared across retries. It charges consumed source rows,
@@ -100,6 +101,17 @@ Internal traversal pins used by the GQT harness can force indexed execution. A
 forced CSR pin is refused for statements with selections; there is no public
 `set traversal` setting.
 
+`history_release_bytes` is measured as `CommitBuffer::buffered_bytes` measures
+a branch's `__manifest`: the buffered `settled_commit` and `replaced_table`
+rows as stored plus the head whole. The commit that reaches the budget records
+the decision in its commit id's slot, so sessions publishing to one branch
+under different budgets agree on where a block closes, and the publish after
+it releases the block whatever its own budget. A load carries the setting only
+from the CLI or an embedded `Session`: the HTTP load routes take no settings.
+The bound on a head's commit
+fields stays 256 KiB, the production budget. A lower budget means more and
+smaller `__history` files and more requests per release, never different rows.
+
 A name outside the table, a value of the wrong type, and a value outside the
 declared values or range are each refused with the table's row. A `process`
 setting named in a request is refused too: the `settings` field has no member
@@ -111,7 +123,7 @@ settings line's refusal as `ERROR line <n>, column <c>: <message>`.
 set merge_lineage = fast;
 error: unknown value `fast` for setting `merge_lineage`; expected one of off, on, verify
 set traversal = csr;                      (likewise reset traversal; and show traversal;)
-error: unknown setting `traversal`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit
+error: unknown setting `traversal`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, history_release_bytes
 set ann_nprobes = "many";
 error: setting `ann_nprobes` takes an integer of at least 0, got a string
 set stage_write_concurrency = 0;

@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::db::manifest::HistoryReleaseBytes;
 use crate::engine::{
     check_param_date_literals, evaluate_constant, id_in_list_expr, ir_expr_to_df_expr,
 };
@@ -818,6 +819,7 @@ impl Session {
             actor_id,
             expected_head,
             settings.stage_write_concurrency(),
+            HistoryReleaseBytes(settings.history_release_bytes()),
         )
         .await
     }
@@ -859,6 +861,7 @@ impl Omnigraph {
         actor_id: Option<&str>,
         expected_head: Option<&str>,
         stage_write_concurrency: usize,
+        history_release_bytes: HistoryReleaseBytes,
     ) -> Result<crate::MutationReceipt> {
         const MAX_PRE_EFFECT_REPREPARES: usize = 32;
 
@@ -876,6 +879,7 @@ impl Omnigraph {
                     actor_id,
                     expected_head,
                     stage_write_concurrency,
+                    history_release_bytes,
                     attempt == 0,
                     &mut retryable,
                 )
@@ -909,6 +913,7 @@ impl Omnigraph {
         actor_id: Option<&str>,
         expected_head: Option<&str>,
         stage_write_concurrency: usize,
+        history_release_bytes: HistoryReleaseBytes,
         first_attempt: bool,
         retryable: &mut bool,
     ) -> Result<crate::MutationReceipt> {
@@ -1008,7 +1013,11 @@ impl Omnigraph {
                     .await?;
                 fail(&MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
                 let lineage_intent = self
-                    .new_lineage_intent_for_branch(requested.as_deref(), actor_id)
+                    .new_lineage_intent_for_branch(
+                        requested.as_deref(),
+                        actor_id,
+                        history_release_bytes,
+                    )
                     .await?;
                 // `_held_gates` holds the shared schema permit, branch
                 // effect gate, and sorted table gates acquired by `commit_all`.

@@ -57,47 +57,6 @@ query insert_person_and_friend($name: String, $age: I32, $friend: String) {
 }
 "#;
 
-/// Materialize main's accepted contract as legacy files before removing its row.
-pub async fn make_legacy_flat_manifest_fixture(root: &std::path::Path, stamp: u32) {
-    assert!((5..=11).contains(&stamp));
-    let uri = root.to_str().unwrap();
-    let mut manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
-        .await
-        .unwrap();
-    let contract = omnigraph_catalog::ManifestCoordinator::read_schema_contract_at(
-        uri,
-        None,
-        manifest.version().version,
-    )
-    .await
-    .unwrap();
-    let ir: omnigraph_compiler::SchemaIR = serde_json::from_str(&contract.ir).unwrap();
-    let state = serde_json::json!({
-        "format_version": 2,
-        "schema_shape_hash": omnigraph_compiler::schema_shape_hash_from_ir(&ir).unwrap(),
-        "schema_ir_hash": contract.head.schema_ir_hash,
-        "schema_identity_version": contract.head.schema_identity_version,
-        "schema_identity_domain": contract.head.schema_identity_domain,
-    });
-    std::fs::write(root.join("_schema.pg"), &contract.source).unwrap();
-    std::fs::write(root.join("_schema.ir.json"), &contract.ir).unwrap();
-    std::fs::write(
-        root.join("__schema_state.json"),
-        serde_json::to_vec_pretty(&state).unwrap(),
-    )
-    .unwrap();
-    omnigraph_catalog::migrations::restamp_flat_for_test(&mut manifest, stamp)
-        .await
-        .unwrap();
-    assert_eq!(
-        omnigraph_catalog::migrations::read_stamp(&manifest),
-        Some(stamp)
-    );
-    assert!(manifest.schema().field("record").is_none());
-    assert!(manifest.schema().field("schema_source").is_none());
-    assert!(manifest.schema().field("schema_ir").is_none());
-}
-
 /// Build the graph-level selector used by the dedicated Blob read facade.
 pub fn node_blob_cell(
     type_name: impl Into<String>,

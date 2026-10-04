@@ -7,7 +7,6 @@ pub(crate) async fn run(
     check: bool,
     to_format: Option<u32>,
     json: bool,
-    quiet: bool,
 ) -> Result<()> {
     let target = scope::resolve_scope(
         &operator::load_operator_config()?,
@@ -48,9 +47,6 @@ pub(crate) async fn run(
             "upgrade refuses graph `{uri}` inside cluster `{root}`; a qualified cluster upgrade operation is required"
         );
     }
-    if !check {
-        echo_write_target(quiet, "upgrade", &uri, false);
-    }
     let report =
         omnigraph::db::upgrade_storage(&uri, omnigraph::db::UpgradeOptions { check, to_format })
             .await?;
@@ -75,10 +71,6 @@ fn print_human(report: &omnigraph::db::UpgradeReport) -> Result<()> {
         mode.as_str().unwrap_or("unknown")
     );
     println!(
-        "graph identity: {}",
-        report.graph_identity.as_deref().unwrap_or("unknown")
-    );
-    println!(
         "format: {} -> {}{}",
         report
             .observed_format
@@ -90,55 +82,12 @@ fn print_human(report: &omnigraph::db::UpgradeReport) -> Result<()> {
             ""
         }
     );
-    println!("route: {}", report.route.join(" -> "));
-    println!(
-        "completed handlers: {}",
-        report.completed_handlers.join(", ")
-    );
-    println!(
-        "last durable completed boundary: {}",
-        report
-            .last_durable_completed_boundary
-            .as_deref()
-            .unwrap_or("unknown")
-    );
-    println!(
-        "work: {} metadata rows, {} retained snapshots, {} payload bytes copied, {} payload bytes rewritten",
-        report.work.metadata_rows,
-        report.work.retained_snapshots,
-        report.work.payload_bytes_copied,
-        report.work.payload_bytes_rewritten
-    );
-    println!(
-        "validation bytes: {}",
-        report
-            .work
-            .validation_bytes
-            .map_or_else(|| "unknown".into(), |v| v.to_string())
-    );
-    for check in &report.work.deferred_checks {
-        println!("validation deferred until the preceding conversion completes: {check}");
-    }
-    for exclusion in &report.work.external_blob_exclusions {
-        println!("external bytes excluded from preservation: {exclusion}");
-    }
-    for property in &report.work.historical_blob_identity_limits {
-        println!(
-            "historical Blob delivery retains the pre-0.10 property-lifetime restriction: {property}"
-        );
-    }
     for finding in &report.findings {
         println!("{}: {}", finding.code, finding.message);
     }
     if let Some(recovery) = &report.recovery {
-        println!("failed handler: {}", recovery.failed_handler);
         println!("recovery executable: {}", recovery.executable_compatibility);
         println!("recovery action: {}", recovery.action);
-    }
-    if matches!(report.mode, omnigraph::db::UpgradeMode::Check) {
-        println!(
-            "Check is advisory. Stop all writers and maintenance and retain a verified backup before execution."
-        );
     }
     Ok(())
 }

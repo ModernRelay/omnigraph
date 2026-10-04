@@ -317,14 +317,15 @@ pub(crate) enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Upgrade graph storage offline using registered migration handlers
+    /// Report whether graph storage is in the format this binary serves; this
+    /// binary converts no older format (rebuild those by export and load)
     Upgrade {
         /// Standalone graph storage URI; alternatively use --store
         uri: Option<String>,
-        /// Run read-only preflight without conversion or recovery writes
+        /// Report only; the command writes nothing either way
         #[arg(long)]
         check: bool,
-        /// Requested storage format (defaults to the binary's declared target)
+        /// Requested storage format (defaults to the format this binary serves)
         #[arg(long, value_name = "N")]
         to_format: Option<u32>,
         #[arg(long)]

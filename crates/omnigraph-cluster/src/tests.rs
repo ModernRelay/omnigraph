@@ -2890,15 +2890,26 @@ fn offline_deployment_graph_completion_reserve_covers_maximum_serialized_engine_
         SchemaNonPublicationProof,
     };
 
-    // Quotes need the maximum escaping admitted for a 256-byte actor: control
-    // characters are refused at the boundary. IDs and hashes are fixed width.
     let actor = "\"".repeat(256);
+    assert_eq!(
+        actor.len(),
+        256,
+        "the actor is the 256-byte maximum spelled with the quote, the most escaping admitted; control characters are refused at the boundary"
+    );
     let authority = DeploymentAuthority {
         kind: AuthorityKind::AuthenticatedIdentity,
         actor: Some(actor.clone()),
     };
     let id = "7ZZZZZZZZZZZZZZZZZZZZZZZZZ".to_string();
-    let parent = "00000000000000000000000000".to_string();
+    let longest_published =
+        |fill: &str| format!("hb1.{}.16383.{}", fill.repeat(26), fill.repeat(26));
+    let published = longest_published("Z");
+    let parent = longest_published("Z");
+    assert_eq!(
+        published.len(),
+        63,
+        "a published commit id is bounded by the `hb1.<block>.<slot>.<nonce>` shape with a five-digit slot; hashes and intent nonces are fixed width"
+    );
     let contract = SchemaContractDigest {
         source_hash: "f".repeat(64),
         schema_ir_hash: format!("sha256:{}", "f".repeat(64)),
@@ -2906,11 +2917,12 @@ fn offline_deployment_graph_completion_reserve_covers_maximum_serialized_engine_
         schema_identity_version: u32::MAX,
     };
     let commit = GraphCommit {
-        graph_commit_id: id.clone(),
+        graph_commit_id: published,
         graph_branch: None,
         graph_manifest_version: u64::MAX,
+        generation: u64::MAX,
         parent_commit_id: Some(parent.clone()),
-        merged_parent_commit_id: None,
+        merged_parent_commit_id: Some(longest_published("Y")),
         actor_id: Some(actor.clone()),
         created_at: i64::MIN,
     };

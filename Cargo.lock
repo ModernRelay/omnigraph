@@ -5607,13 +5607,17 @@ name = "omnigraph-catalog"
 version = "0.11.0"
 dependencies = [
  "arrow-array",
+ "arrow-ipc",
  "arrow-schema",
  "async-trait",
+ "bytes",
  "datafusion",
  "futures",
  "lance",
  "lance-core",
+ "lance-encoding",
  "lance-file",
+ "lance-io",
  "lance-namespace",
  "lance-namespace-impls",
  "lance-table",
@@ -5671,6 +5675,7 @@ name = "omnigraph-cluster"
 version = "0.11.0"
 dependencies = [
  "omnigraph-compiler",
+ "omnigraph-core",
  "omnigraph-engine",
  "omnigraph-policy",
  "omnigraph-seams",

@@ -120,6 +120,12 @@ pub struct SettingsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = traversal_work_limit_schema)]
     pub traversal_work_limit: Option<i64>,
+    /// `history_release_bytes`: the byte budget of a branch's buffer of
+    /// unreleased commits for this request's mutate or merge publishes, `1024..=262144`; an
+    /// `i64` like `traversal_work_limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(schema_with = history_release_bytes_schema)]
+    pub history_release_bytes: Option<i64>,
 }
 
 impl SettingsRequest {
@@ -144,6 +150,9 @@ impl SettingsRequest {
         }
         if let Some(limit) = self.traversal_work_limit {
             assignments.push((SettingId::TraversalWorkLimit, SettingValue::Integer(limit)));
+        }
+        if let Some(bytes) = self.history_release_bytes {
+            assignments.push((SettingId::HistoryReleaseBytes, SettingValue::Integer(bytes)));
         }
         assignments
     }
@@ -181,6 +190,10 @@ fn ann_nprobes_schema() -> utoipa::openapi::schema::Object {
 
 fn traversal_work_limit_schema() -> utoipa::openapi::schema::Object {
     setting_schema(SettingId::TraversalWorkLimit)
+}
+
+fn history_release_bytes_schema() -> utoipa::openapi::schema::Object {
+    setting_schema(SettingId::HistoryReleaseBytes)
 }
 
 /// Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.
@@ -2274,12 +2287,13 @@ mod tests {
             merge_lineage: Some(MergeLineage::Off),
             ann_nprobes: Some(7),
             traversal_work_limit: Some(123),
+            history_release_bytes: Some(2048),
         };
         let expected = format!(
-            "{{\"{}\":\"v2\",\"{}\":\"off\",\"{}\":7,\"{}\":123}}",
-            request_rows[0], request_rows[1], request_rows[2], request_rows[3]
+            "{{\"{}\":\"v2\",\"{}\":\"off\",\"{}\":7,\"{}\":123,\"{}\":2048}}",
+            request_rows[0], request_rows[1], request_rows[2], request_rows[3], request_rows[4]
         );
-        assert_eq!(request_rows.len(), 4);
+        assert_eq!(request_rows.len(), 5);
         assert_eq!(serde_json::to_string(&populated).unwrap(), expected);
         assert_eq!(
             populated

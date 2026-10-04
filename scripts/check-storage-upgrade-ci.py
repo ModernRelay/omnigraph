@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Require every storage migration coverage scope, with no empty or skipped runs."""
+"""Require every storage format coverage scope, with no empty or skipped runs."""
 
 import argparse
 import json
@@ -14,43 +14,13 @@ CONTEXT = "Storage Upgrade Compatibility"
 FEATURES = "omnigraph-engine/failpoints,omnigraph-cluster/failpoints"
 CASES = (
     "storage_upgrade_current_binary_reports_already_current_on_a_fresh_graph",
-    "genuine_v09_explicit_storage_upgrade_preserves_history",
-    "genuine_v010_explicit_storage_upgrade_preserves_history",
     "storage_upgrade_refuses_cluster_path_aliases",
-    "genuine_v09_storage_upgrade_refuses_ambiguous_branch_names",
-)
-ENGINE_CASES = (
-    "storage_upgrade_schema_contract_converts_mixed_branch_formats",
-    "storage_upgrade_schema_contract_cleanup_retries_after_each_delete",
-    "storage_upgrade_schema_contract_resumes_every_partial_cleanup_state",
-    "storage_upgrade_schema_contract_refuses_forged_historical_fence",
-    "storage_upgrade_refuses_restamped_current_layout_and_injected_legacy_contract",
-    "storage_upgrade_current_contract_ignores_legacy_orphans_and_former_sentinel_name",
-    "storage_upgrade_schema_contract_interruption_boundaries_retry",
-    "storage_upgrade_schema_contract_refuses_contract_drift_on_retry",
-    "storage_upgrade_schema_contract_refuses_invalid_contract_without_effects",
-    "storage_upgrade_schema_contract_refuses_legacy_artifacts_without_effects",
-    "storage_upgrade_legacy_constructor_does_not_admit_ordinary_opens",
-    "storage_upgrade_check_has_no_local_store_effects",
-    "storage_upgrade_interruption_boundaries_retry_without_mixed_visibility",
-    "storage_upgrade_recovery_refuses_foreign_head_movement",
-    "storage_upgrade_tracks_metadata_writes_and_no_payload_effects",
-    "storage_upgrade_policy_denial_precedes_effects",
-    "storage_upgrade_refuses_unknown_ownership_and_source",
-    "storage_upgrade_refuses_preexisting_recovery_without_healing",
-    "storage_upgrade_current_main_refuses_legacy_branch_without_effects",
-    "storage_upgrade_history_budget_precedes_manifest_reads",
 )
 SCOPES = {
     "crossversion": (
         'cargo test --workspace --locked --test crossversion_upgrade --features "$FAILPOINT_FEATURES" storage_upgrade -- --test-threads=1',
         "crates/omnigraph-cli/tests/crossversion_upgrade.rs",
         "",
-    ),
-    "engine": (
-        "cargo test --locked -p omnigraph-engine --lib --features failpoints db::upgrade::tests -- --test-threads=1",
-        "crates/omnigraph/src/db/upgrade/tests.rs",
-        "db::upgrade::tests::",
     ),
     "lance": (
         "cargo test --locked -p omnigraph-engine --test lance_version_columns --features failpoints -- --test-threads=1",
@@ -99,12 +69,6 @@ def validate(workflow: str, policy: dict) -> list[str]:
         failures.append("storage compatibility requires the canonical workspace failpoint features")
     for token in (
         f"name: {CONTEXT}",
-        "OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS: '1'",
-        "VERSION=v0.9.0",
-        "VERSION=v0.10.0",
-        "OMNIGRAPH_V09_BIN=",
-        "OMNIGRAPH_V6_BIN=",
-        "bash scripts/install.sh",
         "run: python3 scripts/check-storage-upgrade-ci.py --self-test",
     ):
         if token not in job:
@@ -130,8 +94,6 @@ def expected_cases(scope: str, root: Path = ROOT) -> set[str]:
     ))
     if scope == "crossversion":
         names = {name for name in names if "storage_upgrade" in name} | set(CASES)
-    elif scope == "engine":
-        names |= set(ENGINE_CASES)
     return {prefix + name for name in names}
 
 
@@ -183,7 +145,7 @@ class GuardTests(unittest.TestCase):
             changed = self.workflow.replace("  storage_upgrade_compatibility:\n", "  storage_upgrade_compatibility:\n" + line)
             self.assertTrue(validate(changed, self.policy))
         for line in ("        if: false\n", "        continue-on-error: true\n"):
-            changed = self.workflow.replace("      - name: Run required storage upgrade engine tests\n", "      - name: Run required storage upgrade engine tests\n" + line)
+            changed = self.workflow.replace("      - name: Run required storage upgrade lance tests\n", "      - name: Run required storage upgrade lance tests\n" + line)
             self.assertNotEqual(changed, self.workflow)
             self.assertTrue(validate(changed, self.policy))
 
@@ -205,7 +167,7 @@ class GuardTests(unittest.TestCase):
             good.replace("test beta ... ok", "test beta ... ignored"),
             good.replace("2 passed", "0 passed"),
             good.replace("0 ignored", "1 ignored"),
-            good + "skipping explicit storage upgrade: missing predecessor\n",
+            good + "skipping storage upgrade report: missing graph\n",
             good + good,
         ):
             with self.subTest(log=log):
@@ -234,7 +196,7 @@ def main() -> int:
         for failure in failures:
             print(f"Storage upgrade CI: {failure}", file=sys.stderr)
         return 1
-    print("Storage upgrade CI OK (required predecessors, refusal, recovery, Lance and protocol coverage).")
+    print("Storage upgrade CI OK (format report, cluster refusal, Lance and protocol coverage).")
     return 0
 
 

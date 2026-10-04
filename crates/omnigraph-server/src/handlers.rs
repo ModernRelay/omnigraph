@@ -3331,9 +3331,9 @@ mod blob_error_tests {
         }
     }
 
-    /// A storage failure while the Blob route resolves a snapshot target for
-    /// a policy-gated actor reaches the log with its class through the
-    /// delivery path itself, and the client sees only the redacted 500.
+    /// A storage failure while the Blob route resolves a snapshot target this
+    /// handle does not hold (the read goes to `__history`) for a policy-gated
+    /// actor reaches the log with its class; the client sees the redacted 500.
     #[tokio::test]
     async fn blob_delivery_logs_the_class_of_a_target_resolution_storage_failure() {
         let capture = crate::test_log_capture::Capture::default();
@@ -3347,7 +3347,9 @@ mod blob_error_tests {
         .await
         .unwrap();
         let engine = Omnigraph::open(uri).await.unwrap();
-        let snapshot = engine.resolve_snapshot("main").await.unwrap();
+        let snapshot = omnigraph::db::SnapshotId::new(
+            "hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.0.01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        );
         let policy: PolicyConfig = serde_yaml::from_str(
             "version: 1\n\
              groups:\n  team: [act-alice]\n\
@@ -3371,14 +3373,15 @@ mod blob_error_tests {
             snapshot: Some(snapshot.as_str().to_string()),
         };
 
-        // Unarmed, the same request resolves its target and reaches the cell.
         let unarmed = read_blob_for_delivery(&handle, Some(&actor), query())
             .await
             .unwrap_err();
-        assert_ne!(unarmed.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_ne!(
+            unarmed.status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unarmed, the request reads `__history`, finds no such commit and is refused"
+        );
 
-        // With the fault installed on this task, reopening the graph catalog
-        // at the snapshot's version fails in the object store.
         let probes = omnigraph::instrumentation::QueryIoProbes {
             manifest_wrapper: Some(Arc::new(CatalogReadFault)),
             ..Default::default()
@@ -3402,7 +3405,11 @@ mod blob_error_tests {
         .await
         .unwrap_err()
         .into_response();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "with the fault installed on this task, the read of `__history` fails in the object store"
+        );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();

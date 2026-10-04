@@ -208,15 +208,16 @@ system-column namespace (RFC 0040); schema v10 lets a registration name a
 detached table commit (RFC 0067); schema v11 makes that commit the table's
 version for life and records `omnigraph.last_linear_version` on every
 registration (RFC: Detached-only tables). Schema v12 packs the catalog record;
-schema v13 stores the schema contract row in each branch's `__manifest`.
-Normal open serves v13 only; qualified v6/v7/v8/v9/v10/v11/v12 graphs have
-explicit offline routes to v13, and the
-system-column respelling is a separate step on a served graph. The v7 → v8 handler
-changes only manifest configuration metadata and does not infer fork ownership
-or retire branches. Source v6/v7 graphs with reserved retirement metadata refuse;
-v8 no-op admission validates markers and counts only live logical refs
-while retaining physical ancestors. Older binaries must not expose retired refs
-as live branches.
+schema v13 stores the schema contract row in each branch's `__manifest`;
+schema v14 keeps a buffer of a branch's latest commits there, as
+`settled_commit` and `replaced_table` rows that store what differs from the
+head and the current `table` rows, released on `HISTORY_RELEASE_BYTES` (or
+the lower `history_release_bytes` a session set), and
+older commits in Lance files under `__history`.
+Normal open serves v14 only; a graph at any other stamp is refused and rebuilt
+by export and load, and the
+system-column respelling is a separate step on a served graph. Older binaries
+must not expose retired refs as live branches.
 See [versioning](versioning.md).
 
 Stock `Branches::get` and `list` include every physical ref. OmniGraph's logical

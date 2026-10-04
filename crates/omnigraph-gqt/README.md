@@ -429,7 +429,7 @@ always miss, `head_failed` then `list`. `delete_prefix` logs only its listing;
 deletes performed inside the adapter are not counted. An
 `exists` the store refused is `head_failed` whether the head or the list
 after it failed. An adapter the engine builds for itself instead of using
-the handle's (the storage upgrade or the graph-index load of a historical
+the handle's (the graph-index load of a historical
 read) is outside the wrapped one; no gqt step reaches one today. An adapter
 object probed then read in one step is a repeat read: `head` and whole-object
 `get` share a key. Repeated loads in that step also count as repeat reads.
@@ -519,7 +519,7 @@ runner section. Ambient fault, entropy and pool overrides also refuse
 admission, including replay, as does a set settings variable
 (`OMNIGRAPH_ENGINE`, `OMNIGRAPH_RRF_PLAN`, `OMNIGRAPH_MERGE_LINEAGE`,
 `OMNIGRAPH_ANN_NPROBES`, `OMNIGRAPH_LOAD_CONCURRENCY`,
-`OMNIGRAPH_TRAVERSAL_WORK_LIMIT`) and the retired
+`OMNIGRAPH_TRAVERSAL_WORK_LIMIT`, `OMNIGRAPH_HISTORY_RELEASE_BYTES`) and the retired
 `OMNIGRAPH_TRAVERSAL_MODE`, which names no setting any more. A case session
 never reads the environment (the runner's own `OMNIGRAPH_GQ_ENGINE` above is
 the one seed), so neither variable decides anything; the refusal keeps a stale

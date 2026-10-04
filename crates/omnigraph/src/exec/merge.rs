@@ -1,5 +1,6 @@
 use super::*;
 use crate::changes::row_compare::{RawRow, rows_equal};
+use crate::db::manifest::HistoryReleaseBytes;
 use crate::ordered_cursor::{
     HYDRATION_SCAN_BATCH_BYTES, KeyFilter, KeyOrder, OrderedRowCursor, WalkSubject,
 };
@@ -4767,6 +4768,7 @@ impl Session {
             target,
             actor_id,
             self.settings().merge_lineage(),
+            HistoryReleaseBytes(self.settings().history_release_bytes()),
         ))
         .await;
         if let Err(error) = fail(&BRANCH_MERGE_PRE_RETURN) {
@@ -4785,101 +4787,26 @@ impl Session {
 }
 
 impl Omnigraph {
-    /// The merge base over the two captured lineages, with the records of
-    /// merged parents that live in other branches read from those branches;
-    /// a record no live branch holds leaves the walk at the base it found.
+    /// Prove a base from captured records, then read only addressed history
+    /// blocks needed by the exact ancestry walk.
     async fn resolve_merge_base(
-        &self,
-        source_commits: &crate::db::commit_graph::CommitGraphSnapshot,
-        target_commits: &crate::db::commit_graph::CommitGraphSnapshot,
+        source: &crate::db::commit_graph::CommitGraph,
+        target: &crate::db::commit_graph::CommitGraph,
         source_commit_id: &str,
         target_commit_id: &str,
-        merging_branches: &[Option<&str>],
     ) -> Result<crate::db::commit_graph::GraphCommit> {
-        let mut resolver = crate::db::commit_graph::MergeBaseResolver::new(
-            source_commits,
-            target_commits,
-            source_commit_id,
-            target_commit_id,
-        );
-        let mut other_branches: Option<Vec<String>> = None;
-        let mut retired_imported = false;
-        loop {
-            let search = resolver.search();
-            let resolved = !search.needs_import();
-            let next_branch = if resolved {
-                None
-            } else {
-                if other_branches.is_none() {
-                    other_branches = Some(
-                        self.branch_list()
-                            .await?
-                            .into_iter()
-                            .filter(|branch| {
-                                !merging_branches.contains(&Some(branch.as_str()))
-                                    && !(branch == "main" && merging_branches.contains(&None))
-                            })
-                            .collect(),
-                    );
-                }
-                other_branches.as_mut().and_then(Vec::pop)
-            };
-            let Some(branch) = next_branch else {
-                if !resolved && !retired_imported {
-                    retired_imported = true;
-                    for (_, graph) in ManifestCoordinator::retired_commit_graphs(self.uri()).await?
-                    {
-                        if !resolver.search().needs_import() {
-                            break;
-                        }
-                        resolver.import(graph.load_commits().await?)?;
-                    }
-                    continue;
-                }
-                let both_sides: Vec<&String> = search
-                    .unresolved_source
-                    .iter()
-                    .filter(|id| search.unresolved_target.contains(id))
-                    .collect();
-                if !both_sides.is_empty() {
-                    tracing::warn!(
-                        commits = ?both_sides,
-                        "merge lineage names commits no live branch holds that both branches \
-                         descend from; the merge base may be older than the true one"
-                    );
-                } else if !resolved {
-                    tracing::debug!(
-                        source = ?search.unresolved_source,
-                        target = ?search.unresolved_target,
-                        "merge lineage names commits no live branch holds; the merge base is \
-                         chosen from the reachable history"
-                    );
-                }
-                return search.base.ok_or_else(|| {
-                    OmniError::manifest(
-                        "captured branch commits are unavailable or have no common ancestor"
-                            .to_string(),
-                    )
-                });
-            };
-            let branch = Some(branch.as_str()).filter(|b| *b != "main");
-            let rows = match ManifestCoordinator::read_graph_lineage_at(self.uri(), branch).await {
-                Ok((rows, _)) => rows,
-                Err(OmniError::BranchNotFound { .. }) => {
-                    tracing::debug!(
-                        branch = ?branch,
-                        "branch listed for merge-base resolution was deleted before its \
-                         lineage was read"
-                    );
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            resolver.import(
-                rows.into_iter()
-                    .map(crate::db::commit_graph::graph_commit_from_manifest_row),
-            )?;
+        if source.head().graph_commit_id != source_commit_id
+            || target.head().graph_commit_id != target_commit_id
+        {
+            return Err(OmniError::manifest_internal(
+                "captured merge heads do not match the accepted inputs",
+            ));
         }
+        source.merge_base(target).await?.ok_or_else(|| {
+            OmniError::manifest(
+                "captured branch commits are unavailable or have no common ancestor".to_string(),
+            )
+        })
     }
 
     async fn branch_merge_impl(
@@ -4888,6 +4815,7 @@ impl Omnigraph {
         target: &str,
         actor_id: Option<&str>,
         lineage: MergeLineage,
+        history_release_bytes: HistoryReleaseBytes,
     ) -> Result<MergeResult> {
         let outer_prepare_timing = crate::instrumentation::start_merge_timing(
             crate::instrumentation::MergeTimingPhase::OuterPrepare,
@@ -4900,7 +4828,6 @@ impl Omnigraph {
             ));
         }
 
-        let relevant_branches = [source_branch.as_deref(), target_branch.as_deref()];
         let _schema_permit = self.write_queue().acquire_schema_shared().await;
         let _branch_guards = self
             .write_queue()
@@ -4922,16 +4849,14 @@ impl Omnigraph {
             .effective_graph_head
             .clone()
             .ok_or_else(|| OmniError::manifest("target branch has no head commit".to_string()))?;
-        let base_commit = self
-            .resolve_merge_base(
-                &source_commits,
-                &target_commits,
-                &source_head_commit_id,
-                &target_head_commit_id,
-                &relevant_branches,
-            )
-            .await
-            .map_err(OmniError::before_effect)?;
+        let base_commit = Self::resolve_merge_base(
+            &source_commits.graph,
+            &target_commits.graph,
+            &source_head_commit_id,
+            &target_head_commit_id,
+        )
+        .await
+        .map_err(OmniError::before_effect)?;
 
         if source_head_commit_id == target_head_commit_id
             || base_commit.graph_commit_id == source_head_commit_id
@@ -4942,6 +4867,14 @@ impl Omnigraph {
             });
         }
         let is_fast_forward = base_commit.graph_commit_id == target_head_commit_id;
+        let merged_parent = source_commits.into_records(&base_commit.graph_commit_id);
+        if merged_parent.head.commit.graph_commit_id != source_head_commit_id {
+            return Err(OmniError::manifest_internal(format!(
+                "the captured source head record names commit '{}', and the captured source \
+                 head is '{source_head_commit_id}'",
+                merged_parent.head.commit.graph_commit_id
+            )));
+        }
 
         let witness = target_txn.authority.staging_witness()?;
         let mut input_guard = crate::db::manifest::retention::MergeInputGuard::new(
@@ -5000,10 +4933,11 @@ impl Omnigraph {
             source_branch.as_deref(),
             target_branch.as_deref(),
             &target_head_commit_id,
-            &source_head_commit_id,
+            merged_parent,
             is_fast_forward,
             actor_id,
             lineage,
+            history_release_bytes,
         ))
         .await;
         if !merge_result
@@ -5045,10 +4979,11 @@ impl Omnigraph {
         source_branch: Option<&str>,
         target_branch: Option<&str>,
         target_head_commit_id: &str,
-        source_head_commit_id: &str,
+        merged_parent: crate::db::manifest::BranchRecords,
         is_fast_forward: bool,
         actor_id: Option<&str>,
         lineage: MergeLineage,
+        history_release_bytes: HistoryReleaseBytes,
     ) -> Result<MergeResult> {
         let source_snapshot = &source_txn.base;
         let target_snapshot = &target_txn.base;
@@ -5519,9 +5454,9 @@ impl Omnigraph {
             })
             .collect::<crate::db::manifest::ExpectedTableVersions>();
         let mut merge_lineage = self
-            .new_lineage_intent_for_branch(target_branch, actor_id)
+            .new_lineage_intent_for_branch(target_branch, actor_id, history_release_bytes)
             .await?;
-        merge_lineage.merged_parent_commit_id = Some(source_head_commit_id.to_string());
+        merge_lineage.merged_parent = Some(merged_parent);
 
         // RFC 0067: every HEAD-advancing candidate chains its chunks detached
         // from the pin captured before classification, and a first-touch

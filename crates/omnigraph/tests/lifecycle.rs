@@ -384,8 +384,13 @@ async fn init_creates_graph() {
         db.internal_schema_version_of(ReadTarget::branch("main"))
             .await
             .unwrap(),
-        13,
-        "fresh graphs are stamped at the current manifest format (v13, the schema contract as a `schema_contract` row of main's `__manifest` over the packed catalog record, detached-only tables, RFC 0067 detached table commits, RFC 0040 system columns and RFC 0042 retirement metadata)"
+        14,
+        "fresh graphs are stamped v14: current state in `__manifest`, settled commits in `__history`"
+    );
+    assert_eq!(
+        omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
+        14,
+        "the writer's stamp constant is the released format number"
     );
     assert_eq!(contract_row.source, TEST_SCHEMA);
     assert!(snap.dataset("node:Person").is_some());

@@ -2636,7 +2636,11 @@ async fn branch_merge_records_actor_on_latest_commit() {
         later_head.parent_commit_id.as_deref(),
         Some(head.graph_commit_id.as_str())
     );
-    assert_eq!(outcome.commit, commits.get_commit(&head.graph_commit_id));
+    let lineage = commits.lineage().await.unwrap();
+    assert_eq!(
+        outcome.commit.as_ref(),
+        lineage.get_commit(&head.graph_commit_id)
+    );
 }
 
 #[tokio::test]

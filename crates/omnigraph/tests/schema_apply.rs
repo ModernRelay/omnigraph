@@ -12,6 +12,7 @@ use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::loader::LoadMode;
 use omnigraph::{BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
+use omnigraph_core::graph_commit_id::intent_nonce;
 use sha2::{Digest, Sha256};
 
 use helpers::*;
@@ -843,7 +844,11 @@ async fn prepared_schema_receipt_reconciles_its_own_publication_after_restart_an
         .unwrap();
     let commit = result.commit.as_ref().unwrap();
     assert!(result.applied);
-    assert_eq!(commit.graph_commit_id, commit_id);
+    assert_eq!(
+        intent_nonce(&commit.graph_commit_id).unwrap(),
+        commit_id,
+        "the published ID carries the intent nonce"
+    );
     assert_eq!(
         commit.parent_commit_id.as_deref(),
         Some(predecessor.graph_commit_id.as_str())
@@ -851,7 +856,10 @@ async fn prepared_schema_receipt_reconciles_its_own_publication_after_restart_an
     assert_eq!(commit.actor_id.as_deref(), Some("deployer"));
     assert_eq!(commit.graph_manifest_version, result.graph_manifest_version);
     assert_eq!(&result.contract, prepared.desired_contract());
-    assert_eq!(db.get_commit(&commit_id).await.unwrap(), *commit);
+    assert_eq!(
+        db.get_commit(&commit.graph_commit_id).await.unwrap(),
+        *commit
+    );
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"After publication"}}"#,
         LoadMode::Merge,
@@ -951,7 +959,7 @@ async fn prepared_schema_reconciliation_distinguishes_unpublished_effects_from_l
         );
         if published {
             assert!(
-                matches!(&error, OmniError::RecoveryRequired { operation_id, .. } if Some(operation_id.as_str()) == prepared.graph_commit_id())
+                matches!(&error, OmniError::RecoveryRequired { operation_id, .. } if intent_nonce(operation_id).unwrap() == prepared.graph_commit_id().unwrap())
             );
         }
         let files = schema_storage_bytes(dir.path());
@@ -964,8 +972,8 @@ async fn prepared_schema_reconciliation_distinguishes_unpublished_effects_from_l
             {
                 SchemaApplyReconciliation::Committed { commit, contract } if published => {
                     assert_eq!(
-                        Some(commit.graph_commit_id.as_str()),
-                        prepared.graph_commit_id()
+                        intent_nonce(&commit.graph_commit_id).unwrap(),
+                        prepared.graph_commit_id().unwrap()
                     );
                     assert_eq!(
                         commit.parent_commit_id.as_deref(),
@@ -1001,16 +1009,16 @@ async fn prepared_schema_reconciliation_distinguishes_unpublished_effects_from_l
         match result {
             SchemaApplySettlement::Committed { commit, .. } if published => {
                 assert_eq!(
-                    Some(commit.graph_commit_id.as_str()),
-                    prepared.graph_commit_id()
+                    intent_nonce(&commit.graph_commit_id).unwrap(),
+                    prepared.graph_commit_id().unwrap()
                 );
             }
             SchemaApplySettlement::NotPublished {
                 proof: SchemaNonPublicationProof::Fence { commit, .. },
             } if !published => {
                 assert_eq!(
-                    Some(commit.graph_commit_id.as_str()),
-                    fence.graph_commit_id()
+                    intent_nonce(&commit.graph_commit_id).unwrap(),
+                    fence.graph_commit_id().unwrap()
                 );
                 assert_eq!(db.schema_source().as_str(), TEST_SCHEMA);
                 assert!(db.apply_prepared_schema_as(&prepared, None).await.is_err());
@@ -2795,8 +2803,8 @@ async fn schema_settlement_fences_only_the_original_candidate_and_repeats_its_ow
                 None,
             ) => {
                 assert_eq!(
-                    Some(commit.graph_commit_id.as_str()),
-                    fence.graph_commit_id()
+                    intent_nonce(&commit.graph_commit_id).unwrap(),
+                    fence.graph_commit_id().unwrap()
                 );
                 assert_eq!(
                     commit.graph_manifest_version,
