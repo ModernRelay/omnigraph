@@ -3788,6 +3788,59 @@ async fn stamps_11_and_12_are_refused_by_open_read_and_publish() {
     }
 }
 
+/// A snapshot reports the stamp of the `__manifest` version it captured, from its
+/// attached dataset and from the fallback open, not the head's: after the head is
+/// restamped to a refused version the snapshot taken before still says v14.
+#[tokio::test]
+async fn snapshot_stamp_follows_the_captured_version_not_the_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let mut dataset = open_manifest_dataset(uri, None).await.unwrap();
+    let born = dataset.version().version;
+    let held = ManifestCoordinator::snapshot_at(uri, None, born)
+        .await
+        .unwrap();
+    assert!(held.manifest_dataset.is_some());
+
+    super::migrations::set_stamp_for_test(&mut dataset, 13)
+        .await
+        .unwrap();
+    let head = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(super::migrations::read_stamp(&head), Some(13));
+    assert!(head.version().version > born);
+
+    let stamp_of = |snapshot: Snapshot| async move {
+        ManifestCoordinator::internal_schema_stamp_for_snapshot(uri, &snapshot).await
+    };
+    assert_eq!(stamp_of(held.clone()).await.unwrap(), Some(14));
+    let mut detached = held.clone();
+    detached.manifest_dataset = None;
+    assert_eq!(
+        stamp_of(detached.clone()).await.unwrap(),
+        Some(14),
+        "the fallback opens the captured version, not the restamped head"
+    );
+    let elsewhere = tempfile::tempdir().unwrap();
+    let error = ManifestCoordinator::internal_schema_stamp_for_snapshot(
+        elsewhere.path().to_str().unwrap(),
+        &held,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("another root"), "{error}");
+    let mut unprovenanced = detached;
+    unprovenanced.graph_branch = Some("feature".to_string());
+    unprovenanced.native_branch = None;
+    let error = stamp_of(unprovenanced).await.unwrap_err();
+    assert!(
+        error.to_string().contains("lacks native branch provenance"),
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn publish_keeps_one_row_per_table_and_buffers_the_head_it_read() {
     let dir = tempfile::tempdir().unwrap();

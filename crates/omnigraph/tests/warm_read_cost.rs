@@ -76,6 +76,47 @@ async fn warm_same_branch_read_does_no_resolution_opens() {
     .await;
 }
 
+/// Reading a branch's storage-format stamp (`omnigraph snapshot`, the served
+/// `GET /snapshot`) costs what any warm read costs: one version probe and no
+/// `__manifest` read. The stamp comes from the snapshot's own manifest version,
+/// so it describes the same graph version as the tables beside it, where the
+/// stamp was once read by resolving the branch again and opening `__manifest`
+/// at its newest version.
+#[tokio::test]
+async fn warm_stamp_read_costs_one_version_probe() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
+        commit_many(&db, 5).await;
+
+        let (stamp, io) = measure(db.internal_schema_version_of(ReadTarget::branch("main"))).await;
+        assert_eq!(stamp.unwrap(), 14);
+        assert_eq!(io.version_probes, 1, "{io:?}");
+        assert_eq!(io.manifest_reads, 0, "{io:?}");
+        assert_eq!(io.internal_open_count, 0, "{io:?}");
+
+        let (pair, io) = measure(async {
+            let snapshot = db.snapshot_of(ReadTarget::branch("main")).await?;
+            let stamp = db.internal_schema_version_at(&snapshot).await?;
+            Ok::<_, omnigraph::error::OmniError>((snapshot.graph_manifest_version(), stamp))
+        })
+        .await;
+        let (version, stamp) = pair.unwrap();
+        assert_eq!(stamp, 14);
+        assert_eq!(
+            version,
+            db.snapshot_of(ReadTarget::branch("main"))
+                .await
+                .unwrap()
+                .graph_manifest_version()
+        );
+        assert_eq!(io.version_probes, 1, "{io:?}");
+        assert_eq!(io.manifest_reads, 0, "{io:?}");
+        assert_eq!(io.internal_open_count, 0, "{io:?}");
+    })
+    .await;
+}
+
 /// A multi-table query (a traversal touching Person, WorksAt, and Company) scans
 /// `__manifest` zero times. Fix 2 opens every touched table by location+version,
 /// so manifest IO no longer scales with the number of tables — pre-Fix-2 each

@@ -222,7 +222,7 @@ keep their existing routes and do not expose MCP.
 | `/graphs/{id}/load`, `/load/ndjson` | Bounded batch loading |
 | `/graphs/{id}/blob` | GET/HEAD one Blob cell |
 | `/graphs/{id}/branches` | Branch management and merge |
-| `/graphs/{id}/snapshot`, `/commits` | Snapshot, history, and per-commit changes |
+| `/graphs/{id}/snapshot`, `/commits` | Snapshot (`internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version), history, and per-commit changes |
 | `/graphs/{id}/changes` | Poll a branch feed or establish a baseline |
 | `/graphs/{id}/schema` | Show the accepted schema |
 | `/graphs/{id}/export` | Stream a branch snapshot as JSONL |
