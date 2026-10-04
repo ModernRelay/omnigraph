@@ -690,6 +690,32 @@ pub struct StagedCompaction {
     pub metrics: CompactionMetrics,
 }
 
+/// The metadata-only commits of one table's schema evolution, planned once by
+/// [`TableStore::plan_schema_evolution`] from the dataset's manifest alone and
+/// consumed step by step by [`TableStore::stage_schema_evolution`].
+#[derive(Debug, Clone)]
+pub struct SchemaEvolution {
+    /// Renames and drops: the surviving columns in target order, committed as
+    /// `Operation::Project`. `None` when no column is renamed, dropped or
+    /// otherwise changed.
+    project: Option<LanceSchema>,
+    /// Additions: the complete target schema, committed as `Operation::Merge`
+    /// over the unchanged fragments. `None` when no column is added.
+    merge: Option<LanceSchema>,
+    /// The `(field id, name)` columns, in order, of the dataset the next step
+    /// must be staged against: the planned base, then each step's result.
+    expected: Vec<(i32, String)>,
+}
+
+/// A schema's columns as `(field id, name)` in pre-order: the identity a
+/// staged evolution step checks its dataset against.
+fn schema_columns(schema: &LanceSchema) -> Vec<(i32, String)> {
+    schema
+        .fields_pre_order()
+        .map(|field| (field.id, field.name.clone()))
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct StagedWrite {
     transaction: Transaction,
@@ -4067,6 +4093,216 @@ impl TableStore {
         )
         .build();
         Ok(StagedWrite::new(transaction, Vec::new(), Vec::new()))
+    }
+
+    /// Plan the metadata-only commits that move a table from its dataset
+    /// schema to `target`, the desired physical schema in catalog order, with
+    /// `renames` naming each renamed column as `(from, to)`. Reads only the
+    /// manifest.
+    ///
+    /// A target column maps to the dataset column it is renamed from, or to
+    /// the column of its own name, and keeps that column's field id, type,
+    /// nullability and metadata (the unenforced primary key and the Blob-v2
+    /// extension included), so the data files and indexes that reference the
+    /// id keep serving it; only its name and its
+    /// `omnigraph.stable_property_id` marker follow the target. A marker that
+    /// names another property refuses. Every other target column is new: it
+    /// must be nullable, and it takes a field id above every id the table's
+    /// data files still reference (`Manifest::max_field_id`), so a fragment
+    /// that lacks it reads it as null. A dataset column no target column maps
+    /// to is dropped. A column whose type or nullability would change refuses:
+    /// that needs a rewrite, which schema apply never plans.
+    pub(crate) fn plan_schema_evolution(
+        ds: &Dataset,
+        target: &arrow_schema::Schema,
+        renames: &[(String, String)],
+    ) -> Result<SchemaEvolution> {
+        let current = ds.schema();
+        let mut source_of = HashMap::<&str, &str>::with_capacity(renames.len());
+        for (from, to) in renames {
+            if source_of.insert(to.as_str(), from.as_str()).is_some() {
+                return Err(OmniError::manifest_internal(format!(
+                    "schema evolution renames two columns to '{to}'"
+                )));
+            }
+        }
+        let mut fields = Vec::with_capacity(target.fields().len());
+        let mut consumed = HashSet::<&str>::new();
+        let mut renamed = false;
+        let mut added = false;
+        for target_field in target.fields() {
+            let name = target_field.name().as_str();
+            let source = match source_of.get(name) {
+                Some(from) if current.field(from).is_some() => Some(*from),
+                // The rename was applied by an earlier step of this evolution.
+                Some(_) if current.field(name).is_some() => Some(name),
+                Some(from) => {
+                    return Err(OmniError::manifest_internal(format!(
+                        "column '{name}' is renamed from '{from}', which the dataset does not have"
+                    )));
+                }
+                None => current.field(name).map(|_| name),
+            };
+            let Some(source) = source else {
+                if !target_field.is_nullable() {
+                    return Err(OmniError::manifest_internal(format!(
+                        "new column '{name}' is not nullable; adding it without a rewrite needs a nullable column"
+                    )));
+                }
+                fields.push(
+                    lance::datatypes::Field::try_from(target_field.as_ref())
+                        .map_err(OmniError::lance_internal)?,
+                );
+                added = true;
+                continue;
+            };
+            if !consumed.insert(source) {
+                return Err(OmniError::manifest_internal(format!(
+                    "two target columns map to dataset column '{source}'"
+                )));
+            }
+            let existing = current
+                .field(source)
+                .expect("the source column was found above");
+            let desired = lance::datatypes::Field::try_from(target_field.as_ref())
+                .map_err(OmniError::lance_internal)?;
+            if existing.data_type() != desired.data_type() || existing.nullable != desired.nullable
+            {
+                return Err(OmniError::manifest_internal(format!(
+                    "column '{source}' cannot become '{name}' without a rewrite: {:?} (nullable {}) -> {:?} (nullable {})",
+                    existing.data_type(),
+                    existing.nullable,
+                    desired.data_type(),
+                    desired.nullable,
+                )));
+            }
+            let mut field = existing.clone();
+            if source != name {
+                field.name = name.to_string();
+                renamed = true;
+            }
+            match target_field
+                .metadata()
+                .get(crate::db::STABLE_PROPERTY_ID_METADATA_KEY)
+            {
+                Some(property_id) => {
+                    match field
+                        .metadata
+                        .get(crate::db::STABLE_PROPERTY_ID_METADATA_KEY)
+                    {
+                        Some(existing_id) if existing_id != property_id => {
+                            return Err(OmniError::manifest_internal(format!(
+                                "column '{source}' carries property identity {existing_id}, not {property_id}"
+                            )));
+                        }
+                        Some(_) => {}
+                        None => {
+                            field.metadata.insert(
+                                crate::db::STABLE_PROPERTY_ID_METADATA_KEY.to_string(),
+                                property_id.clone(),
+                            );
+                        }
+                    }
+                }
+                None => {
+                    if field
+                        .metadata
+                        .contains_key(crate::db::STABLE_PROPERTY_ID_METADATA_KEY)
+                    {
+                        return Err(OmniError::manifest_internal(format!(
+                            "column '{source}' carries a property identity its target '{name}' lacks"
+                        )));
+                    }
+                }
+            }
+            fields.push(field);
+        }
+        let dropped = current
+            .fields
+            .iter()
+            .any(|field| !consumed.contains(field.name.as_str()));
+
+        let mut evolved = LanceSchema {
+            fields,
+            metadata: current.metadata.clone(),
+        };
+        // Only the new columns (id -1) take ids, above every id the table's
+        // data files still reference.
+        evolved.set_field_id(Some(ds.manifest.max_field_id()));
+        evolved.validate().map_err(OmniError::lance_internal)?;
+
+        let expected = schema_columns(current);
+        if !added {
+            let project = (&evolved != current).then_some(evolved);
+            return Ok(SchemaEvolution {
+                project,
+                merge: None,
+                expected,
+            });
+        }
+        let project = if renamed || dropped {
+            let surviving = evolved
+                .fields
+                .iter()
+                .filter(|field| current.field_by_id(field.id).is_some())
+                .cloned()
+                .collect();
+            Some(LanceSchema {
+                fields: surviving,
+                metadata: current.metadata.clone(),
+            })
+        } else {
+            None
+        };
+        Ok(SchemaEvolution {
+            project,
+            merge: Some(evolved),
+            expected,
+        })
+    }
+
+    /// Stage the next metadata-only commit of a planned schema evolution (see
+    /// [`Self::plan_schema_evolution`]) against `ds`, or `None` when no step
+    /// remains. Renames and drops stage first, as `Operation::Project`
+    /// (Lance's own rename and drop); additions follow, as `Operation::Merge`
+    /// over `ds`'s unchanged fragments (Lance's own all-null add). Lance
+    /// refuses a Merge that renames a field, so a table with both kinds
+    /// commits the Project detached and stages the Merge against that
+    /// version: at most two commits. `ds` must have the columns the previous
+    /// step left (the planned base first), or the step refuses. Neither step
+    /// writes or rewrites a data file or reads a row; every surviving index
+    /// keeps its coverage, and an index on a dropped column leaves with it.
+    /// HEAD does NOT advance.
+    pub async fn stage_schema_evolution(
+        &self,
+        ds: &Dataset,
+        evolution: &mut SchemaEvolution,
+    ) -> Result<Option<StagedWrite>> {
+        if schema_columns(ds.schema()) != evolution.expected {
+            return Err(OmniError::manifest_internal(format!(
+                "schema evolution step staged against {} version {}, whose columns are not the ones the plan expects",
+                ds.uri(),
+                ds.manifest.version
+            )));
+        }
+        let operation = if let Some(schema) = evolution.project.take() {
+            evolution.expected = schema_columns(&schema);
+            Operation::Project {
+                schema,
+                preserves_nullability: true,
+            }
+        } else if let Some(schema) = evolution.merge.take() {
+            evolution.expected = schema_columns(&schema);
+            Operation::Merge {
+                fragments: ds.manifest.fragments.as_ref().clone(),
+                schema,
+                preserves_nullability: true,
+            }
+        } else {
+            return Ok(None);
+        };
+        let transaction = TransactionBuilder::new(ds.manifest.version, operation).build();
+        Ok(Some(StagedWrite::new(transaction, Vec::new(), Vec::new())))
     }
 
     /// Stage an overwrite (write_fragments + Operation::Overwrite { schema, fragments }).
