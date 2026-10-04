@@ -45,7 +45,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
 | `blob get`, `blob stat` | Read or inspect one Blob cell | direct or served |
 | `branch create/list/delete/merge` | Manage graph branches | direct or served |
-| `snapshot` | Show a branch snapshot | direct or served |
+| `snapshot` | Show a branch snapshot: `internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version | direct or served |
 | `commit list/show/changes` | Inspect history or one commit's entity changes | direct or served |
 | `changes poll/baseline` | Consume a branch change feed or establish a new baseline | direct or served |
 | `export` | Stream a branch as JSONL | direct or served |
@@ -73,10 +73,6 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 `rebuild-full-text-indexes` accepts `--branch` (default `main`), `--json`, and
 `--as` for actor attribution. Direct maintenance does not load server policy;
 see the [rebuild procedure](../operations/maintenance.md#rebuild-full-text-indexes).
-
-`snapshot` reports `internal_schema_version`, `graph_manifest_version`, and the
-datasets from one captured graph version, so the storage format it prints is
-the format of the tables listed beside it.
 
 ## Query inputs and output
 
