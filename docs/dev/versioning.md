@@ -260,9 +260,16 @@ What a converted 0.11.x root (stamp 8 or 9) does not carry over:
   the same version removal on the tables it changed), removed table versions
   and no `__manifest` version, so a retained pre-upgrade `__manifest` version
   can pin a table version that is gone. The collector then reports `is absent
-  from the listing` and sweeps nothing. `cleanup --keep 1` alone, as the first
-  cleanup after the upgrade, drops those `__manifest` versions; the upgrade
-  guide gives the order.
+  from the listing` and sweeps nothing for that table. `cleanup` deletes no
+  version of main's or a live branch's `__manifest` (`would_prune` is only
+  reported; retired trees are reclaimed separately), so the refusal lasts
+  while a policy retains such a version. Any narrower earlier `cleanup`
+  leaves such versions too: it sweeps the table versions only its
+  `would_prune` versions pin, and a wider policy retains those again.
+  `cleanup --keep 1` retains only each live branch's head, each non-main
+  branch's base, merge bases and tags, and passes unless one of those is
+  such a version; `--older-than` and a wider `--keep` refuse until no
+  version they retain pins a removed table version.
 - `_graph_commit_recoveries.lance/` stays as an unreferenced dataset.
 - The route writes no `last_linear_version` fill commit: `commit list` after
   the upgrade equals `commit list` before it.
