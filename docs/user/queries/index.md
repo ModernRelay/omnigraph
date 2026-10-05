@@ -222,10 +222,9 @@ repeats the leading `order` key (`T33`); without an alias the column is
 the predicates `search(...)`, `fuzzy(...)` and `match_text(...)` in `return`
 (`T35`, they belong in `match`) are refused at compile time. Aggregated
 queries are outside search ordering: group
-results are not score-ranked and cannot project a score (`T9`). One bound on the tie-break: a `bm25()` ordering
-with no secondary keys reads a bounded set of top-scoring matches, so among
-rows tied exactly at that bound's cut, which rows enter the result follows
-the scan bound rather than entity ids.
+results are not score-ranked and cannot project a score (`T9`). A `bm25()`
+ordering reads every matching entity before the final limit, so rows tied on
+score are ordered by entity id.
 
 ## Blobs
 

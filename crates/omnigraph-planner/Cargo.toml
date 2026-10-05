@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-planner"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 description = "Logical and physical plans, optimizer passes and the routing registry for Omnigraph operations. Zero Lance dependency."
 license = "MIT"
@@ -9,7 +9,7 @@ homepage = "https://github.com/ModernRelay/omnigraph"
 documentation = "https://docs.rs/omnigraph-planner"
 
 [dependencies]
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.11.0" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.12.0" }
 arrow-schema = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

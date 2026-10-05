@@ -64,7 +64,7 @@ apply, import, refresh or approval executor.
 Apply creates graphs and changes schemas and stored queries. Existing roots,
 policies, provider/Blob bindings, trust and format stay fixed. New graph bindings
 are validated with creation; deletion and replacement of existing runtime
-bindings refuse. Normal engine open requires v13; server HTTP requires v0.12.
+bindings refuse. Normal engine open requires v14; server HTTP requires v0.12.
 
 The applied revision and every achieved base retain each graph's exact source/IR
 digests and identity domain/version, captured coherently during conversion and
