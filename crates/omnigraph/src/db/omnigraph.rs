@@ -1163,8 +1163,9 @@ impl Omnigraph {
             .await
     }
 
-    /// Respell this graph's system columns in place, v8 to v9; the operation
-    /// and its preflight live in `system_column_upgrade` (RFC 0040 step 3).
+    /// Respell this graph's system columns in place; the storage format stays
+    /// v14. The operation and its preflight live in `system_column_upgrade`
+    /// (RFC 0040 step 3).
     pub async fn upgrade_system_columns(
         &self,
         options: SystemColumnUpgradeOptions,

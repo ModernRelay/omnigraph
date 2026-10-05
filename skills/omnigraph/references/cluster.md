@@ -57,7 +57,6 @@ paths.
 omnigraph cluster validate --config .              # parse + typecheck everything
 omnigraph cluster plan     --config .              # preview — REQUIRED reading before apply
 omnigraph cluster apply    --config . --as <you>   # converge; the first run creates ledger + graphs
-omnigraph cluster force-unlock <LOCK_ID> --config .   # release the lock apply kept (id on stderr); the first apply creates the ledger
 omnigraph cluster force-unlock <LOCK_ID> --config .  # clear the lock apply printed, once its work has settled
 omnigraph-server --cluster . --bind 127.0.0.1:8080 --unauthenticated  # serve (local dev)
 ```
