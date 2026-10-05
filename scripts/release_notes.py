@@ -142,14 +142,20 @@ class Repository:
     def released(self, version: str) -> bool:
         return self.git("rev-parse", "--verify", "--end-of-options", f"refs/tags/{version}^{{commit}}", optional=True) is not None
 
-    def added_by(self, base: str | None, target: str, path: str) -> str | None:
-        """Subject of the newest commit in base..target that added path. Rename
+    def _newest_add(self, base: str | None, target: str, path: str, field: str) -> str | None:
+        """One field of the newest commit in base..target that added path. Rename
         detection and log.follow are off so a developer's diff.renames or
-        log.follow setting cannot change it."""
+        log.follow setting cannot change the answer."""
         revisions = [f"{base}..{target}"] if base else [target]
-        out = self.git("-c", "log.follow=false", "log", "--no-renames", "--diff-filter=A", "-n", "1", "--format=%s",
-                       *revisions, "--", path)
+        out = self.git("-c", "log.follow=false", "log", "--no-renames", "--diff-filter=A", "-n", "1",
+                       f"--format={field}", *revisions, "--", path)
         return out.decode("utf-8").strip() or None
+
+    def added_by(self, base: str | None, target: str, path: str) -> str | None:
+        return self._newest_add(base, target, path, "%s")
+
+    def adding_commit(self, base: str | None, target: str, path: str) -> str | None:
+        return self._newest_add(base, target, path, "%H")
 
 
 def is_external(destination: str) -> bool:
@@ -654,8 +660,17 @@ def verify_snapshot(repo: Repository, content: str, audited: str | None = None) 
             raise NotesError("release file changed after snapshot generation; regenerate it")
         # A note added by the release-prep PR gains its (#NNN) only after the squash,
         # so a recorded link must agree with history, and a later one is ignored.
-        if any(expected_info["links"].get(path) != number for path, number in info["links"].items()):
-            raise NotesError("recorded pull request links disagree with history; regenerate the snapshot")
+        # The release squash may also replace a prep-branch subject that carried a
+        # number (a cherry-pick): a note added by the same commit as this snapshot
+        # keeps its recorded link.
+        snapshot_commit = None
+        for path, number in info["links"].items():
+            if expected_info["links"].get(path) == number:
+                continue
+            if snapshot_commit is None:
+                snapshot_commit = repo.adding_commit(selected.base, selected.target, f"docs/releases/{info['version']}.md") or ""
+            if not snapshot_commit or repo.adding_commit(selected.base, selected.target, path) != snapshot_commit:
+                raise NotesError("recorded pull request links disagree with history; regenerate the snapshot")
         expected_info["links"] = info["links"]
     if info != expected_info or content != render(repo, selected, expected_info):
         raise NotesError("snapshot differs from its recorded inputs; regenerate it")
