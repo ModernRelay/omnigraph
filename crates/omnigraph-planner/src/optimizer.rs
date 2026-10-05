@@ -9,7 +9,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use omnigraph_compiler::QueryDiagnostic;
 use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR, is_fresh_variable};
 use omnigraph_compiler::query::ast::AggFunc;
-use omnigraph_compiler::query::codes::{P001, P002, P004};
+use omnigraph_compiler::query::codes::{P001, P002, P004, P005};
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeSelection};
 
@@ -1155,6 +1155,32 @@ pub(crate) fn physical_plan_with(
 
 /// The nodes of the pipeline under `root` that constrain its rows: every
 /// node reachable from `root` without entering an `AntiJoin`'s inner tree.
+/// Whether a traversal of the top-level pipeline under `root` connects
+/// bindings `a` and `b`, through any chain of `Expand`s.
+fn traversal_connects(plan: &PhysicalPlan, root: NodeId, a: &str, b: &str) -> bool {
+    let edges: Vec<(&str, &str)> = top_level(plan, root)
+        .into_iter()
+        .filter_map(|id| match plan.node(id) {
+            Some(PhysicalNode::Expand { src, dst, .. }) => Some((src.as_str(), dst.as_str())),
+            _ => None,
+        })
+        .collect();
+    let mut reached = vec![a];
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for (src, dst) in &edges {
+            for (from, to) in [(src, dst), (dst, src)] {
+                if reached.contains(from) && !reached.contains(to) {
+                    reached.push(to);
+                    grew = true;
+                }
+            }
+        }
+    }
+    reached.contains(&b)
+}
+
 fn top_level(plan: &PhysicalPlan, root: NodeId) -> Vec<NodeId> {
     let mut nodes = Vec::new();
     let mut pending = vec![root];
@@ -2655,6 +2681,43 @@ impl Lowering<'_> {
                 })?;
                 let limit = limit.and_then(|limit| usize::try_from(limit).ok());
                 let [primary_arm, secondary_arm] = arms;
+                if primary_arm.binding != secondary_arm.binding
+                    && traversal_connects(
+                        &self.physical,
+                        primary,
+                        &primary_arm.binding,
+                        &secondary_arm.binding,
+                    )
+                {
+                    // One of two bindings a traversal connects always starts
+                    // it and the other is reached, and engine v2 ranks only the
+                    // binding a traversal starts from: no declaration order
+                    // serves both arms, so the refusal offers none.
+                    let call = |arm: &SearchArm| {
+                        let function = match arm.kind {
+                            RankKind::Nearest => "nearest",
+                            RankKind::Bm25 => "bm25",
+                        };
+                        format!(
+                            "{function}(${}.{}, {})",
+                            arm.binding, arm.property, arm.query
+                        )
+                    };
+                    return Err(PlanError::Unsupported(Box::new(
+                        QueryDiagnostic::plan(
+                            P005,
+                            format!(
+                                "`rrf()` ranks `${}` and `${}`, which one traversal connects; engine v2 ranks only the binding a traversal starts from, so one arm always ranks a traversal destination and no declaration order serves both",
+                                primary_arm.binding, secondary_arm.binding
+                            ),
+                        )
+                        .with_expression(format!(
+                            "rrf({}, {})",
+                            call(primary_arm),
+                            call(secondary_arm)
+                        )),
+                    )));
+                }
                 let mut lowered_arms = Vec::with_capacity(2);
                 let mut bm25_scans = Vec::new();
                 let mut primary_scan = None;

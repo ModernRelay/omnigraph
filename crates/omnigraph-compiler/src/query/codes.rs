@@ -76,6 +76,7 @@ codes! {
     P002 = "an edge alternation or wildcard traversal needs a finite traversal work limit";
     P003 = "the traversal work limit is out of range or recorded twice";
     P004 = "an edge alternation or wildcard traversal cannot run in CSR traversal mode";
+    P005 = "an rrf() ranks two bindings one traversal connects";
 }
 
 #[cfg(test)]

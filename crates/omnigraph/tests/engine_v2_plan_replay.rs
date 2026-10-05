@@ -1188,6 +1188,36 @@ query nearest_destination($q: Vector(4)) {
         );
     }
 
+    // An `rrf()` whose arms rank two bindings one traversal connects is
+    // refused whichever binding is declared first, with no reorder fix to
+    // follow: the binding declared first starts the traversal and the other
+    // is reached, so a reorder hint would only send the caller back and forth.
+    for (name, first, second) in [("d_first", "$d", "$t"), ("t_first", "$t", "$d")] {
+        let source = format!(
+            "query {name}() {{\n    match {{ {first}: Doc {second}: Doc $d knows $t }}\n    return {{ $d.slug, $t.slug }}\n    order {{ rrf(bm25($d.text, \"needle\"), bm25($t.text, \"needle\")) }}\n    limit 1\n}}\n"
+        );
+        let refused = db
+            .query(ReadTarget::branch("main"), &source, name, &ParamMap::new())
+            .await
+            .expect_err("both declaration orders refuse the fused shape");
+        let diagnostic = refused.diagnostic().unwrap_or_else(|| {
+            panic!("{name}: a plan refusal carries its diagnostic: {refused:?}")
+        });
+        assert_eq!(diagnostic.code.as_str(), "P005", "{name}: {refused}");
+        assert_eq!(
+            diagnostic.fix, None,
+            "{name}: no declaration order serves both arms"
+        );
+        assert_eq!(
+            diagnostic
+                .stage
+                .as_ref()
+                .and_then(|stage| stage.expression.as_deref()),
+            Some(r#"rrf(bm25($d.text, "needle"), bm25($t.text, "needle"))"#),
+            "{name}"
+        );
+    }
+
     // A refusal raised while the query is resolved, before lowering, keeps
     // its diagnostic too: the statistics pass that resolves the query first
     // must not turn it into a planner defect. An edge wildcard refuses CSR
