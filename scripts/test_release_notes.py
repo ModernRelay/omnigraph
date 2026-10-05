@@ -207,6 +207,53 @@ class ReleaseNotesTests(unittest.TestCase):
             with self.subTest(message=message), self.assertRaisesRegex(notes.NotesError, message):
                 notes.check_release_file(RELEASE, raw, version, breaking)
 
+    def test_format_follows_the_version(self):
+        self.assertEqual(notes.format_for("v0.12.0"), 1)
+        for version in ("v0.13.0", "v0.12.1", "v1.0.0"):
+            self.assertEqual(notes.format_for(version), 2)
+
+    def test_previous_tag_reads_only_version_tags(self):
+        for base, expected in (("refs/tags/v0.12.0", "v0.12.0"), ("v0.12.0", "v0.12.0"), ("previous", None),
+                               (None, None), (BASE, None), ("refs/heads/v0.12.0", None)):
+            with self.subTest(base=base):
+                self.assertEqual(notes.previous_tag(base), expected)
+
+    def test_format_two_metadata_records_release_links_and_previous(self):
+        self.repo.trees[TARGET][RELEASE] = RELEASE_TEXT
+        self.repo.subjects[NEW] = "feat: predicate (#803)"
+        selected = notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0")
+        info = notes.metadata(selected, "v0.13.0", "2026-10-20", 2, "v0.12.0")
+        self.assertEqual(info["format"], 2)
+        self.assertEqual(info["release"], {RELEASE: notes.digest(RELEASE_TEXT)})
+        self.assertEqual(info["links"], {NEW: 803})
+        self.assertEqual(info["previous"], "v0.12.0")
+        self.assertEqual(set(notes.metadata(selected, "v0.13.0", "2026-10-20")), notes.FORMAT1_KEYS)
+
+    def test_format_two_refuses_a_legacy_baseline(self):
+        selected = notes.select(self.repo, BASE, TARGET, LEGACY)
+        with self.assertRaisesRegex(notes.NotesError, "no legacy baseline"):
+            notes.metadata(selected, "v0.12.0", "2026-10-20", 2)
+
+    def test_snapshot_info_validates_format_two_records(self):
+        self.repo.trees[TARGET][RELEASE] = RELEASE_TEXT
+        self.repo.subjects[NEW] = "feat: predicate (#803)"
+        selected = notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0")
+        info = notes.metadata(selected, "v0.13.0", "2026-10-20", 2, "v0.12.0")
+
+        def record(value):
+            return "<!-- release-notes: " + json.dumps(value, sort_keys=True, separators=(",", ":")) + " -->\n"
+
+        self.assertEqual(notes.snapshot_info(record(info)), info)
+        for forged, message in (
+            (dict(info, release={}), "SHA-256 digest of changelog.d/v0.13.0.md"),
+            (dict(info, links={OLD: 5}), "pull request numbers"),
+            (dict(info, links={NEW: "803"}), "pull request numbers"),
+            (dict(info, previous="previous"), "previous release"),
+            ({key: value for key, value in info.items() if key != "links"}, "invalid release snapshot provenance"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(notes.NotesError, message):
+                notes.snapshot_info(record(forged))
+
     def test_unreleased_edits_and_reverts_use_final_tree(self):
         self.repo.trees[TARGET][NEW] = b"- Final wording.\n"
         self.assertEqual(notes.select(self.repo, BASE, TARGET).notes[NEW], b"- Final wording.\n")

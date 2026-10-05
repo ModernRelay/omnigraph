@@ -52,6 +52,10 @@ MAX_HIGHLIGHTS = 5
 MINOR_MIN_HIGHLIGHTS = 3
 WHY_HEADING = "Why these changes"
 HIGHLIGHTS_HEADING = "Highlights"
+PREVIOUS_TAG = re.compile(r"(?:refs/tags/)?(v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))")
+FORMAT_ONE_VERSIONS = frozenset({"v0.12.0"})
+FORMAT1_KEYS = frozenset({"format", "version", "date", "base", "target", "notes", "legacy", "working_tree", "config"})
+FORMAT2_KEYS = FORMAT1_KEYS | {"release", "links", "previous"}
 
 
 class NotesError(Exception):
@@ -408,7 +412,18 @@ def select(repo: Repository, base: str | None, target: str, legacy: str | None =
                      digest(repo.read(None if working_tree else target_sha, CONFIG)), release, links)
 
 
-def metadata(selection: Selection, version: str, date: str | None) -> dict:
+def format_for(version: str) -> int:
+    """v0.12.0 was published in format 1 and stays there; every later release uses format 2."""
+    return 1 if version in FORMAT_ONE_VERSIONS else 2
+
+
+def previous_tag(base: str | None) -> str | None:
+    match = PREVIOUS_TAG.fullmatch(base or "")
+    return match.group(1) if match else None
+
+
+def metadata(selection: Selection, version: str, date: str | None, notes_format: int = 1,
+             previous: str | None = None) -> dict:
     if not isinstance(version, str) or not VERSION.fullmatch(version):
         raise NotesError("version must be vMAJOR.MINOR.PATCH")
     if date is not None:
@@ -421,9 +436,19 @@ def metadata(selection: Selection, version: str, date: str | None) -> dict:
             raise NotesError("release date must be YYYY-MM-DD") from error
     if selection.legacy and version != "v0.12.0":
         raise NotesError("the legacy baseline applies only to v0.12.0")
-    return {"format": 1, "version": version, "date": date, "base": selection.base,
+    info = {"format": notes_format, "version": version, "date": date, "base": selection.base,
             "target": selection.target, "notes": selection.inputs(), "legacy": selection.legacy,
             "working_tree": selection.working_tree, "config": selection.config}
+    if notes_format == 2:
+        if selection.legacy:
+            raise NotesError("format 2 releases have no legacy baseline")
+        if previous is not None and not VERSION.fullmatch(previous):
+            raise NotesError("the previous release must be vMAJOR.MINOR.PATCH")
+        info.update(release=selection.release_inputs(), links=dict(sorted(selection.links.items())),
+                    previous=previous)
+    elif notes_format != 1:
+        raise NotesError(f"unknown release-notes format {notes_format}")
+    return info
 
 
 def render(repo: Repository, selection: Selection, info: dict, publication_ref: str | None = None) -> str:
@@ -477,14 +502,28 @@ def require_configured_selection(repo: Repository, selected: Selection, version:
         raise NotesError("snapshot base, version and legacy source must match changelog.d/release.json")
 
 
+def check_format2_record(info: dict) -> None:
+    expected = f"changelog.d/{info['version']}.md"
+    release, links, previous = info["release"], info["links"], info["previous"]
+    if (not isinstance(release, dict) or list(release) != [expected] or not isinstance(release[expected], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", release[expected])):
+        raise NotesError(f"format 2 snapshots record the SHA-256 digest of {expected}")
+    if not isinstance(links, dict) or any(path not in info["notes"] or type(number) is not int or number < 1
+                                          for path, number in links.items()):
+        raise NotesError("snapshot links must map selected notes to pull request numbers")
+    if previous is not None and not (isinstance(previous, str) and VERSION.fullmatch(previous)):
+        raise NotesError("snapshot previous release must be a version or null")
+
+
 def snapshot_info(content: str) -> dict:
     matches = PROVENANCE.findall(content)
     if len(matches) != 1:
         raise NotesError("release snapshot must contain exactly one provenance record")
     info = json.loads(matches[0])
-    if not isinstance(info, dict) or set(info) != {"format", "version", "date", "base", "target", "notes", "legacy", "working_tree", "config"}:
+    keys = {1: FORMAT1_KEYS, 2: FORMAT2_KEYS}.get(info.get("format")) if isinstance(info, dict) else None
+    if keys is None or set(info) != keys:
         raise NotesError("invalid release snapshot provenance")
-    if info["format"] != 1 or info["working_tree"] is not False or not info["date"]:
+    if info["working_tree"] is not False or not info["date"]:
         raise NotesError("publication requires a dated snapshot of committed inputs")
     for name in ("base", "target", "legacy"):
         value = info[name]
@@ -496,6 +535,8 @@ def snapshot_info(content: str) -> dict:
         for path, value in info["notes"].items()
     ) or not isinstance(info["config"], str) or not re.fullmatch(r"[0-9a-f]{64}", info["config"]):
         raise NotesError("snapshot must record note and configuration SHA-256 digests")
+    if info["format"] == 2:
+        check_format2_record(info)
     metadata(Selection(info["base"], info["target"], {}, info["legacy"]), info["version"], info["date"])
     return info
 
