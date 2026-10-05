@@ -43,6 +43,8 @@ LEGACY_PREFIX = "# OmniGraph v0.12.0\n\nUnreleased.\n\n"
 DEFINITION = re.compile(r"^\[([^\]]+)\]: (\S+)$")
 RELEASE_FILE = re.compile(r"changelog\.d/(v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))\.md")
 SQUASH_SUBJECT = re.compile(r"\(#([1-9][0-9]*)\)$")
+NOTE_CHARACTERS = 200
+BREAKING_CHARACTERS = 400
 
 
 class NotesError(Exception):
@@ -202,6 +204,32 @@ def render_note(repo: Repository, revision: str | None, path: str, raw: bytes, p
         destination = link_destination(repo, revision, path, token.meta["url"], publication_ref)
         lines[start] = f"[{definition.group(1)}]: {destination}\n"
     return "".join(lines)
+
+
+def visible_text(document) -> str:
+    """Rendered words of a parsed Markdown document: no markup, link destinations or definitions."""
+    pieces = []
+    for token in descendants(document.tokens):
+        if token.type in {"text", "code_inline"}:
+            pieces.append(token.content)
+        elif token.type in {"softbreak", "hardbreak"}:
+            pieces.append(" ")
+    return " ".join("".join(pieces).split())
+
+
+def check_note_caps(path: str, raw: bytes) -> None:
+    category, text = note_text(path, raw)
+    document = parse_markdown(text)
+    blocks = [token.type for token in document.tokens
+              if token.type.endswith("_open") or token.type in {"fence", "code_block", "html_block", "hr"}]
+    if blocks != ["bullet_list_open", "list_item_open", "paragraph_open"]:
+        raise NotesError(f"{path}: a note is one bullet with one paragraph; move details to the linked guide")
+    length = len(visible_text(document))
+    limit = BREAKING_CHARACTERS if category == "breaking" else NOTE_CHARACTERS
+    if length > limit:
+        raise NotesError(f"{path}: {length} characters, over the {limit}-character limit for .{category}.md notes")
+    if category == "breaking" and not document.links:
+        raise NotesError(f"{path}: link the guide that holds the upgrade steps")
 
 
 def is_release_file(path: str) -> bool:
