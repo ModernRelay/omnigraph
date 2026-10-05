@@ -93,9 +93,17 @@ command with the same executable. Never delete the marker or anything under
   the 0.11 binary is such an open; a property-only `.staging` 0.11 refuses
   too and names the manual choice). A `__schema_apply_lock__` branch left
   alone by a killed 0.11 schema apply is handled by the upgrade.
-- On a root where 0.11 `cleanup` or `schema apply --allow-data-loss` ran, the
-  first `cleanup` after the upgrade is `cleanup --keep 1 --confirm` alone;
-  later runs with any retention option pass.
+- `cleanup` deletes no commit of a live branch, so a commit can outlive the
+  table versions it names: on a root where 0.11 `cleanup` or
+  `schema apply --allow-data-loss` ran, and after any narrower earlier
+  `cleanup`. Such a commit stays listed, but a read at it is refused. A
+  `cleanup` whose policy retains one refuses its tables
+  (`is absent from the listing`) and still exits 0. A branch base, merge base
+  or tag is retained under every policy: while one is such a commit, every
+  `cleanup` refuses, and deleting that branch or tag releases it. Otherwise
+  `--older-than D` passes once those commits are older than `D`, `--keep N`
+  once they fall outside the newest `N`, and `cleanup --keep 1 --confirm`
+  passes.
 - A v8 graph keeps its legacy `id`/`src`/`dst` system columns through the
   upgrade. In 0.12.0,
   `schema upgrade-system-columns ./graph.omni [--check] [--json]` respells a

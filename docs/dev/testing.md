@@ -193,17 +193,24 @@ on the existing `Doc`, with a commit before and one after it) and an
 are byte-identical after `completed`, and compares what the two commits
 around the apply answer for the added property before and after the upgrade.
 `genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup`
-runs the old binary's `cleanup --keep 1` before the upgrade and asserts the
-cleanup order of the upgrade guide after it; a commit the old binary refused
-as reclaimed must be refused after the upgrade, any other failure of a read
-fails the journey, and at least one commit must still be served.
+runs the old binary's `cleanup --keep 1` before the upgrade. After the
+upgrade, a write and a merge, `cleanup --older-than 7d` refuses a table on a
+pre-upgrade linear pin. `cleanup --keep 1` then passes and keeps every
+`__manifest` version; `--older-than 7d` and `--keep 100` still refuse, and
+`--older-than 0s` passes, as the upgrade guide
+describes. A commit the old binary refused as reclaimed must be refused after
+the upgrade, any other failure of a read fails the journey, and at least one
+commit must still be served.
 `genuine_v0_10_0_to_stamp_8_storage_upgrade_preserves_history` builds the
 graph with 0.10.0, takes it to stamp 8 with the 0.11.0
 `upgrade --to-format 8`, and upgrades from there;
 `genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history`
 lets the 0.11.0 `upgrade` run to its default target (stamp 9, the three
-handlers through the system-column respelling) and asserts the reads at the
-commits written before that respelling. Main builds 10 to 13 also
+handlers through the system-column respelling). That route needs a graph
+with only main, so 0.10.0 merges and deletes `review` before 0.11.0's default
+conversion, and 0.11.0 forks `temp` after it. The journey asserts the reads at
+every commit main lists right after the predecessor's conversion, those
+written before the respelling among them. Main builds 10 to 13 also
 print `0.11.0`, so these journeys prove their source by the stamp
 `snapshot --json` reports, not by `--version`.
 

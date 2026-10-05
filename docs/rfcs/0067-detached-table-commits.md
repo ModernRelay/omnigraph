@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - ragnorc
 created: 2026-09-14
-updated: 2026-09-30
+updated: 2026-10-04
 discussion: null
 supersedes:
   - "0065"
@@ -16,6 +16,16 @@ blocked_on: []
 ---
 
 # RFC 0067: Detached table commits
+
+> **Engine settlement disposition:**
+> [Engine settlement and resource bounds](2026-10-01-engine-settlement-and-resource-bounds.md)
+> publishes the schema contract atomically in `__manifest`, with no contract
+> file or schema sentinel. Historical: "schema contract file promotion after the
+> schema-apply publication" in the residual recovery surface (User and
+> operational behavior), and in the Content writers table the sentinel, the
+> staged contract, and its promotion, discard, or install in the Schema apply
+> and System-column upgrade rows. Current: detached staging of table effects,
+> the three-field pin, and the one `__manifest` publication.
 
 **Surveyed:** OmniGraph 0.11.0 on `main` at `d1dd8b97`; unmodified Lance
 11.0.0 from crates.io and Lance `main` at v12.0.0-rc.1 (2026-09-14); RFCs
