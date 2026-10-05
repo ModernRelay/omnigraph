@@ -134,16 +134,20 @@ what the release is. When the release has any breaking note, a
 users to act; it is printed at the top of the upgrade actions. A
 `## Highlights` section holds three to five `### ` highlights for a minor or
 major release, and up to five for a patch release, each at most 150 words.
-Name each highlight by the database technique (projection pushdown,
-copy-on-write branches, compare-and-swap publication), then say what it
-changes for the user, then list its pull requests:
+Head each highlight with what users gain, then explain it in database terms
+(projection pushdown, copy-on-write branches, compare-and-swap publication)
+and list its pull requests:
 
 ```markdown
-### Projection pushdown
+### Counting no longer loads every embedding
 
-A `Vector` or `Blob` column is read only when the query names it, so a `count`
-over embedding-heavy types stops loading every vector. #760, #795
+Projection pushdown: a `Vector` or `Blob` column is read only when the query
+names it, so a `count` over embedding-heavy types reads no vectors. #760, #795
 ```
+
+The release-prep pull request may leave `## Highlights` empty for someone else
+to write: the preview shows them as still to be written and CI passes, but the
+snapshot refuses a minor or major release until three to five are in.
 
 Notes print as one list per section, in file-name order. To put the most
 important ones first, add a `## Note order` section listing note file names,

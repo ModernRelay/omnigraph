@@ -366,6 +366,18 @@ class ReleaseNotesTests(unittest.TestCase):
         self.put(RELEASE, release_text(contributors=()))
         notes.check_release_inputs(notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0"), "v0.13.0", complete=False)
 
+    def test_highlights_can_be_pending_until_the_snapshot(self):
+        self.put(RELEASE, release_text(highlights=0))
+        selected, _, content = self.snapshot2()
+        self.assertIn(f"## Highlights\n\n_{notes.PENDING_HIGHLIGHTS}_\n", content)
+        notes.check_release_inputs(selected, "v0.13.0", complete=False)
+        with self.assertRaisesRegex(notes.NotesError, "0 highlights; write 3 to 5"):
+            notes.check_release_inputs(selected, "v0.13.0", complete=True)
+        self.put(RELEASE, release_text(highlights=6))
+        selected = notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0")
+        with self.assertRaisesRegex(notes.NotesError, "6 highlights; write 3 to 5"):
+            notes.check_release_inputs(selected, "v0.13.0", complete=False)
+
     def test_format_two_preview_without_release_file_shows_placeholder(self):
         _, _, content = self.snapshot2()
         self.assertIn(f"_{notes.PENDING_RELEASE_FILE}_", content)
