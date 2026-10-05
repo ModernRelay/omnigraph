@@ -24,7 +24,8 @@ CONFIG = json.dumps({"version": "v0.13.0", "base": "previous", "legacy": None}).
 RELEASE = "changelog.d/v0.13.0.md"
 
 
-def release_text(intro="OmniGraph 0.13 makes reads cheaper.", why=None, highlights=3, body="Scans read only named columns."):
+def release_text(intro="OmniGraph 0.13 makes reads cheaper.", why=None, highlights=3, body="Scans read only named columns.",
+                 contributors=("azimafroozeh", "pronskiy")):
     parts = [intro, ""]
     if why is not None:
         parts += ["## Why these changes", "", why, ""]
@@ -32,6 +33,8 @@ def release_text(intro="OmniGraph 0.13 makes reads cheaper.", why=None, highligh
         parts += ["## Highlights", ""]
         for number in range(highlights):
             parts += [f"### Highlight {number + 1}", "", body, ""]
+    if contributors:
+        parts += ["## Contributors", ""] + [f"- @{handle}" for handle in contributors] + [""]
     return ("\n".join(parts).rstrip("\n") + "\n").encode()
 
 
@@ -329,6 +332,39 @@ class ReleaseNotesTests(unittest.TestCase):
                 selected = notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0")
                 with self.assertRaisesRegex(notes.NotesError, message):
                     notes.check_release_inputs(selected, "v0.13.0", complete=True)
+
+    def test_format_two_joins_soft_wrapped_lines(self):
+        self.put(RELEASE, release_text(intro="OmniGraph 0.13 makes\nreads cheaper.",
+                                       body="Scans read only\nnamed columns.\n\n```text\nline one\nline two\n```"))
+        self.put("changelog.d/wrapped.fixed.md", b"- A wrapped note\n  that continues.\n")
+        self.put("changelog.d/hard.fixed.md", b"- A hard break\\\n  stays.\n")
+        _, _, content = self.snapshot2()
+        self.assertIn("OmniGraph 0.13 makes reads cheaper.\n", content)
+        self.assertIn("Scans read only named columns.\n\n```text\nline one\nline two\n```", content)
+        self.assertIn("- A wrapped note that continues.\n", content)
+        self.assertIn("- A hard break\\\n  stays.\n", content)
+
+    def test_contributors_are_thanked_before_the_footer(self):
+        self.put(RELEASE, release_text(contributors=("azimafroozeh", "aaltshuler", "pronskiy")))
+        _, _, content = self.snapshot2()
+        thanks = "## Contributors\n\nThanks to @azimafroozeh, @aaltshuler and @pronskiy, who contributed to this release.\n"
+        self.assertIn(thanks, content)
+        self.assertLess(content.index("## Features"), content.index(thanks))
+        self.assertLess(content.index(thanks), content.index("**Full changelog:**"))
+        self.put(RELEASE, release_text(contributors=("pronskiy",)))
+        self.assertIn("Thanks to @pronskiy, who contributed to this release.", self.snapshot2()[2])
+
+    def test_contributor_refusals(self):
+        for raw, message in ((release_text(contributors=()), "add '## Contributors'"),
+                             (release_text(contributors=("pronskiy", "pronskiy")), "appears twice"),
+                             (release_text(contributors=("not a handle",)), "one GitHub handle per")):
+            with self.subTest(message=message):
+                self.put(RELEASE, raw)
+                selected = notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0")
+                with self.assertRaisesRegex(notes.NotesError, message):
+                    notes.check_release_inputs(selected, "v0.13.0", complete=True)
+        self.put(RELEASE, release_text(contributors=()))
+        notes.check_release_inputs(notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0"), "v0.13.0", complete=False)
 
     def test_format_two_preview_without_release_file_shows_placeholder(self):
         _, _, content = self.snapshot2()
