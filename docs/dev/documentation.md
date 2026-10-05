@@ -83,10 +83,15 @@ environment on later runs; reinstall when the requirements change.
 ## Release notes
 
 Add one permanent `changelog.d/<descriptive-slug>.<category>.md` file with each
-user-visible change. No PR number or release number is needed. Internal-only
-changes need no note. Write the outcome in one to three sentences and link to
-the guide for detail; keep necessary migration instructions even when longer.
-Review the note with its code. There is no separate release-note approver.
+user-visible change. No PR number or release number is needed: the release
+page links each note to the pull request whose squash commit added it.
+Internal-only changes need no note. A note is one bullet with one sentence or
+two, at most 200 characters of visible text (code spans count, link
+destinations and definitions do not); move detail into the guide it links.
+A breaking note may use 400 characters, says who is affected and what to do,
+and links the guide that holds the steps, usually the
+[upgrade guide](../user/operations/upgrade.md). Review the note with its code.
+There is no separate release-note approver.
 
 | Suffix | Section |
 |---|---|
@@ -98,8 +103,9 @@ Review the note with its code. There is no separate release-note approver.
 | `deprecated` | Deprecations |
 | `removed` | Removals |
 
-Start the file with a Markdown bullet and end it with a newline. Examples,
-nested lists and code spans stay intact. Local links use reference definitions
+Start the file with a Markdown bullet and end it with a newline. Code spans
+stay intact; nested lists, fenced examples and second paragraphs are refused
+in new notes. Local links use reference definitions
 at column zero, with a relative destination and optional heading anchor:
 
 ```markdown
@@ -118,6 +124,39 @@ including literal unmatched backticks and backslashes. Close fenced code blocks
 so they cannot consume the following note. The composer only rewrites link
 definitions outside code, preserving the rest of each fragment apart from
 normalizing CRLF line endings to LF. Do not add release headings to fragments.
+
+### The release file
+
+The release-prep pull request adds `changelog.d/<version>.md`, named for the
+`version` in `release.json`. It opens with an intro of at most 80 words saying
+what the release is. When the release has any breaking note, a
+`## Why these changes` section of at most 80 words says why the release asks
+users to act; it is printed at the top of the upgrade actions. A
+`## Highlights` section holds three to five `### ` highlights for a minor or
+major release, and up to five for a patch release, each at most 150 words.
+Name each highlight by the database technique (projection pushdown,
+copy-on-write branches, compare-and-swap publication), then say what it
+changes for the user, then list its pull requests:
+
+```markdown
+### Projection pushdown
+
+A `Vector` or `Blob` column is read only when the query names it, so a `count`
+over embedding-heavy types stops loading every vector. #760, #795
+```
+
+No other headings are allowed. Links follow the note rules. The file is
+immutable once its release is tagged.
+
+### Pull request titles
+
+The `Release Note Gate` check reads the title as `type(scope)!: summary`
+with a lowercase type from `feat`, `fix`, `perf`, `refactor`, `docs`, `test`,
+`ci`, `build`, `chore`, `revert`, `rfc`, `bench` or `release`. A `feat`,
+`fix` or `perf` pull request adds a note; a `!` title adds a `.breaking.md`
+note. A maintainer adds the `skip-changelog` label when a typed change has
+nothing users can see. The squash commit keeps the title and its `(#NNN)`,
+which is where the release page's pull request links come from.
 
 Preview local edits and untracked notes from the repository root after
 [activating the documentation environment](#documentation-tools):
@@ -149,8 +188,8 @@ release. CRLF and LF checkouts have the same identity; other content changes do
 not. The checker validates selected notes' links against the selected tree;
 historical raw notes are not checked against today's moving documentation.
 
-With the documentation environment active, release preparation creates a
-versioned snapshot and updates `docs/releases/README.md` from committed inputs
+With the documentation environment active and `changelog.d/<version>.md`
+written, release preparation creates a versioned snapshot and updates `docs/releases/README.md` from committed inputs
 and an explicit date:
 
 ```bash
@@ -172,7 +211,10 @@ target SHA documents where generation ran; squash merging may remove that
 commit. Validation compares the complete selected note set and digests,
 configuration, and regenerated document against the audited release tree. It
 requires ancestry only for the durable release base and legacy source. Any later
-note or configuration change requires regeneration. Verify a prepared committed
+note or configuration change requires regeneration. Format-2 snapshots, every release after
+v0.12.0, also record the release file's digest, the previous release tag and
+the pull request link of each note; a recorded link must still match history
+when the release is verified. Verify a prepared committed
 snapshot with the documentation environment active:
 
 ```bash
@@ -198,14 +240,13 @@ backfills; v0.12.0 onward require a valid snapshot. Edge releases are unchanged.
 After publication, update the configuration for the next release: set its base
 to the release just published, advance the version and set `legacy` to `null`.
 
-The hand-written v0.12.0 document was converted into two notes before its
-snapshot, `changelog.d/a-release-highlights.added.md` and
-`changelog.d/a-compatibility-and-behavior-changes.changed.md`, so v0.12.0 is
-generated from notes alone and its `legacy` is `null`. A `legacy` baseline is
-frozen against its pin at snapshot preparation, any mismatch is refused, and
-publication regenerates from the pinned source with the baseline body ahead of
-the note sections. Generated snapshots require exact verification, and existing
-published documents and URLs stay unchanged.
+v0.12.0 is the only format-1 release: its hand-written document was converted
+into two notes, `changelog.d/a-release-highlights.added.md` and
+`changelog.d/a-compatibility-and-behavior-changes.changed.md`, and its page
+keeps that shape. Later releases are format 2. Their GitHub release body is
+the snapshot without its heading, status line and provenance comment.
+Generated snapshots require exact verification, and existing published
+documents and URLs stay unchanged.
 
 ## Review checklist
 
