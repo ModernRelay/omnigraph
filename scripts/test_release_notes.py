@@ -34,6 +34,7 @@ def release_text(intro="OmniGraph 0.13 makes reads cheaper.", why=None, highligh
 
 
 RELEASE_TEXT = release_text()
+V0_12_0 = "a9aa28502a2217aefdf3464dbc6c39fb58d23d65"
 
 
 class MemoryRepository(notes.Repository):
@@ -138,6 +139,39 @@ class ReleaseNotesTests(unittest.TestCase):
         selected = notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0")
         self.assertEqual(selected.links, {NEW: 803})
         self.assertEqual(notes.select(self.repo, "previous", "HEAD").links, {})
+
+    def test_note_caps_accept_one_short_paragraph(self):
+        notes.check_note_caps(NEW, b"- Add `in` list membership to GQ, pushed into the scan.\n")
+        notes.check_note_caps(NEW, b"- Short note.\r\n")
+        notes.check_note_caps(NEW, ("- " + "é" * 200 + "\n").encode())
+        notes.check_note_caps("changelog.d/upgrade.breaking.md",
+                              b"- Upgrade the CLI and server together. See the [upgrade guide][up-guide].\n\n"
+                              b"[up-guide]: ../docs/user/operations/upgrade.md\n")
+
+    def test_note_caps_count_visible_text_not_markup_or_definitions(self):
+        text = "- `code` [link][caps-link] " + "x" * 180 + "\n\n[caps-link]: ../docs/user/operations/upgrade.md\n"
+        notes.check_note_caps(NEW, text.encode())
+
+    def test_note_caps_refuse_long_or_structured_notes(self):
+        breaking = "changelog.d/upgrade.breaking.md"
+        for path, raw, message in (
+            (NEW, b"- " + b"word " * 50 + b"\n", "over the 200-character limit"),
+            (NEW, ("- " + "é" * 201 + "\n").encode(), "over the 200-character limit"),
+            (NEW, b"- First paragraph.\n\n  Second paragraph.\n", "one bullet with one paragraph"),
+            (NEW, b"- Feature:\n  - nested detail\n", "one bullet with one paragraph"),
+            (NEW, b"- Example:\n\n  ```text\n  code\n  ```\n", "one bullet with one paragraph"),
+            (breaking, b"- Upgrade everything together.\n", "link the guide"),
+            (breaking, b"- " + b"word " * 90 + b"[g][g-up].\n\n[g-up]: https://example.com\n", "over the 400-character limit"),
+        ):
+            with self.subTest(raw=raw[:40]), self.assertRaisesRegex(notes.NotesError, message):
+                notes.check_note_caps(path, raw)
+
+    def test_v0_12_0_oversized_notes_fail_the_caps(self):
+        repo = notes.Repository(notes.ROOT)
+        for path in ("changelog.d/a-release-highlights.added.md",
+                     "changelog.d/a-compatibility-and-behavior-changes.changed.md"):
+            with self.subTest(path=path), self.assertRaises(notes.NotesError):
+                notes.check_note_caps(path, repo.read(V0_12_0, path))
 
     def test_unreleased_edits_and_reverts_use_final_tree(self):
         self.repo.trees[TARGET][NEW] = b"- Final wording.\n"
