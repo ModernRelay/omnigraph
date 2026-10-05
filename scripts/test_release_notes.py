@@ -4,6 +4,7 @@
 import copy
 import io
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -46,6 +47,7 @@ class MemoryRepository(notes.Repository):
         self.trees[OTHER] = dict(base)
         self.working = dict(self.trees[TARGET])
         self.tags = set()
+        self.subjects = {}
 
     def resolve(self, ref):
         sha = self.refs.get(ref, ref)
@@ -76,6 +78,9 @@ class MemoryRepository(notes.Repository):
 
     def released(self, version):
         return version in self.tags
+
+    def added_by(self, base, target, path):
+        return self.subjects.get(path)
 
 
 class ReleaseNotesTests(unittest.TestCase):
@@ -119,6 +124,20 @@ class ReleaseNotesTests(unittest.TestCase):
         selected = notes.select(self.repo, "previous", "HEAD")
         self.assertEqual(list(selected.notes), [NEW])
         self.assertEqual(selected.release, {})
+
+    def test_pull_request_number_comes_from_the_squash_subject(self):
+        for subject, number in (("feat(gq): add list membership (#803)", 803), ("release: v0.12.0 (#877)", 877),
+                                ("Merge pull request #680 from x/y", None), ("fix: refer to #12 in text", None),
+                                ("fix: zero (#0)", None), (None, None)):
+            with self.subTest(subject=subject):
+                self.assertEqual(notes.pr_number(subject), number)
+
+    def test_selection_links_notes_to_their_pull_requests(self):
+        self.repo.subjects[NEW] = "feat: add predicate (#803)"
+        self.repo.trees[TARGET]["changelog.d/direct.fixed.md"] = b"- Direct push.\n"
+        selected = notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0")
+        self.assertEqual(selected.links, {NEW: 803})
+        self.assertEqual(notes.select(self.repo, "previous", "HEAD").links, {})
 
     def test_unreleased_edits_and_reverts_use_final_tree(self):
         self.repo.trees[TARGET][NEW] = b"- Final wording.\n"
@@ -700,6 +719,34 @@ class ReleaseNotesTests(unittest.TestCase):
         raw = repo.read("d0bbe07fc666d1bf8e89815d39f4dfe20be18d24", notes.LEGACY_PATH)
         self.assertEqual(notes.digest(raw), "de05c5362a0acc9c942324e5a753932b6d229627e96bf9f4fb43b6e5f0b88f77")
         self.assertEqual(sum(line.startswith(b"- ") for line in raw.splitlines()), 50)
+
+
+class AddedByGitTests(unittest.TestCase):
+    def test_added_by_reads_the_adding_commit_subject(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args):
+                subprocess.run(["git", "-C", directory, "-c", "user.name=t", "-c", "user.email=t@example.com",
+                                "-c", "commit.gpgsign=false", *args], check=True, capture_output=True)
+
+            git("init", "-q", "-b", "main")
+            git("config", "diff.renames", "copies")
+            (root / "changelog.d").mkdir()
+            (root / "changelog.d/first.added.md").write_text("- First.\n")
+            git("add", "-A")
+            git("commit", "-q", "-m", "feat: first (#5)")
+            repo = notes.Repository(root)
+            base = repo.resolve("HEAD")
+            git("mv", "changelog.d/first.added.md", "changelog.d/moved.added.md")
+            (root / "changelog.d/second.added.md").write_text("- Second.\n")
+            git("add", "-A")
+            git("commit", "-q", "-m", "feat: second (#6)")
+            self.assertEqual(repo.added_by(None, "HEAD", "changelog.d/second.added.md"), "feat: second (#6)")
+            self.assertEqual(repo.added_by(None, "HEAD", "changelog.d/moved.added.md"), "feat: second (#6)")
+            self.assertEqual(repo.added_by(None, base, "changelog.d/first.added.md"), "feat: first (#5)")
+            self.assertIsNone(repo.added_by(base, "HEAD", "changelog.d/first.added.md"))
+            self.assertIsNone(repo.added_by(None, "HEAD", "changelog.d/untracked.added.md"))
 
 
 if __name__ == "__main__":
