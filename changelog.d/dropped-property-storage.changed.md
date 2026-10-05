@@ -1,9 +1,12 @@
-- Dropping a property removes it from the schema without rewriting its table,
-  and maintenance erases its values: every `omnigraph optimize` rewrites the
-  table fragments that still store a dropped property's values, whatever
-  their size, and the next `omnigraph cleanup` that no longer retains the
-  commits before that optimize deletes the old files. Dropped types are
-  reclaimed by `cleanup` alone, as before. See
+- Dropping a property no longer rewrites its table. In v0.12 schema apply
+  rewrote the table without the dropped values, so `omnigraph cleanup` alone
+  erased them; now they stay in the table's data files until
+  `omnigraph optimize` rewrites every fragment that holds them, whatever its
+  size. To erase them, run optimize, delete every branch created from a commit
+  before it and every tag naming such a commit (merging a branch does not
+  release its files), then run `cleanup` with a retention that excludes the
+  commits before the optimize, for example `--keep 1`. Dropped types are still
+  reclaimed by `cleanup` alone. See
   [dropping declarations][dropped-property-storage-drops].
 
 [dropped-property-storage-drops]: ../docs/user/schema/index.md#schema-changes
