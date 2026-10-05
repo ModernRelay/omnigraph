@@ -601,6 +601,25 @@ impl Requirements {
         matcher: &Matcher<'_>,
         budget: &mut Budget,
     ) -> Result<(), ValidationError> {
+        // A row cut is the query's `limit` and nothing else: one, at the
+        // root (checked next), when the query writes it, and none anywhere
+        // when it does not, a correlated block's tree included.
+        budget.visit(u64::try_from(plan.live().count()).unwrap_or(u64::MAX))?;
+        let cuts = plan
+            .live()
+            .filter(|(_, node)| {
+                matches!(node, PhysicalNode::Limit { .. } | PhysicalNode::Page { .. })
+            })
+            .count();
+        let allowed = usize::from(self.limit.is_some());
+        if cuts != allowed {
+            return Err(ValidationError::violated(
+                "row cut",
+                format!(
+                    "the plan cuts its rows {cuts} times; the query's `limit` allows {allowed}"
+                ),
+            ));
+        }
         let mut id = plan.root();
         if let Some(limit) = self.limit {
             let rows = usize::try_from(limit).unwrap_or(usize::MAX);

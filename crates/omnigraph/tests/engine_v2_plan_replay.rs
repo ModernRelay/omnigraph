@@ -1268,6 +1268,44 @@ query instants() {
     );
 }
 
+/// A saved plan carrying a row cut the query does not write is invalid
+/// evidence: a `Limit(0)` over the unfiltered count would replay as no rows
+/// where the query returns its one count row.
+#[tokio::test]
+async fn an_unwritten_row_cut_refuses_the_replay_of_a_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = people(&dir).await;
+    let mut run = db
+        .query_inspected(
+            ReadTarget::branch("main"),
+            PEOPLE_QUERIES,
+            "count_people",
+            &ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    let plan = &mut run.plan.plan;
+    let root = plan.root();
+    let properties = plan.properties(root).cloned();
+    let cut = plan.add(PhysicalNode::Limit {
+        input: root,
+        rows: 0,
+    });
+    if let Some(properties) = properties {
+        plan.set_properties(cut, properties);
+    }
+    plan.set_root(cut);
+    let refused = db
+        .replay_bound_plan(
+            ReadTarget::branch("main"),
+            &run.replay_envelope(PEOPLE_QUERIES, "count_people"),
+        )
+        .await
+        .err()
+        .expect("the added cut is refused");
+    assert!(refused.to_string().contains("row cut"), "{refused}");
+}
+
 #[tokio::test]
 async fn an_insert_after_planning_refuses_the_replay_of_a_count() {
     let dir = tempfile::tempdir().unwrap();

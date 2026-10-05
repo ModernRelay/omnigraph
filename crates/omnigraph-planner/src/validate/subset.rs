@@ -510,7 +510,10 @@ impl Tracer {
 }
 
 /// The checker's arena: every node the derivation reached, `None` where a
-/// rule removed one.
+/// rule removed or replaced one. Only the current node of each role is kept,
+/// so the arena's expressions partition the query's own and its memory is
+/// linear in the query; a replaced node is released before its successor is
+/// stored, and a rule naming it is refused like any other stale reference.
 struct Arena {
     nodes: Vec<Option<ChainNode>>,
     current: std::collections::HashMap<Role, usize>,
@@ -544,6 +547,12 @@ fn pinned(plan: &PhysicalPlan, type_key: &str) -> Option<Option<u64>> {
         .datasets
         .get(type_key)
         .map(|pin| pin.as_ref().map(|pin| pin.version))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The nodes the last checked derivation's arena still held at its end.
+    pub(super) static RETAINED_NODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Check `derivation` for `member` against the candidate `plan`.
@@ -582,6 +591,8 @@ pub(crate) fn check(
             node.role()
         )));
     }
+    #[cfg(test)]
+    RETAINED_NODES.with(|retained| retained.set(arena.nodes.iter().flatten().count()));
     let candidate = chain_of(plan, input)?;
     if reached.len() != candidate.len()
         || reached
@@ -1046,6 +1057,9 @@ fn apply(
     };
     for (role, successor) in successors {
         budget.node()?;
+        if let Some(replaced) = arena.current.get(&role).copied() {
+            arena.nodes[replaced] = None;
+        }
         let index = arena.nodes.len();
         match successor {
             Some(node) => {

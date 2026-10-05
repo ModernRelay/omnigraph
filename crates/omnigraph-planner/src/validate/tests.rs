@@ -387,6 +387,43 @@ fn another_limit_fails_the_row_cut() {
     assert_eq!(check, "row cut");
 }
 
+/// A row cut the query does not write is refused wherever it sits: over the
+/// root of a query without `limit`, and below the root of one with it.
+#[test]
+fn an_unwritten_row_cut_fails_the_row_cut() {
+    let cut_over = |plan: &mut PhysicalPlan, input: usize| {
+        let properties = plan.properties(input).cloned();
+        let cut = plan.add(PhysicalNode::Limit { input, rows: 0 });
+        if let Some(properties) = properties {
+            plan.set_properties(cut, properties);
+        }
+        cut
+    };
+
+    let unlimited = Fixture::new(
+        "query q() { match { $d: Doc $d.title contains \"graph\" } return { $d.slug } }",
+        &[],
+    );
+    let mut plan = unlimited.plan();
+    let root = plan.root();
+    let cut = cut_over(&mut plan, root);
+    plan.set_root(cut);
+    let (check, detail) = unlimited.refused(plan);
+    assert_eq!(check, "row cut", "{detail}");
+
+    let limited = filtered();
+    let mut plan = limited.plan();
+    let Some(PhysicalNode::Limit { input, .. }) = plan.node(plan.root()).cloned() else {
+        panic!("the limited plan's root is its cut");
+    };
+    let below = cut_over(&mut plan, input);
+    if let Some(PhysicalNode::Limit { input, .. }) = plan.node_mut(plan.root()) {
+        *input = below;
+    }
+    let (check, detail) = limited.refused(plan);
+    assert_eq!(check, "row cut", "{detail}");
+}
+
 /// An order key constant for every row (a parameter, `now()`) orders
 /// nothing; when `return` projects it under an alias the planner binds the key
 /// to that alias, and the order check treats the alias as the constant it
@@ -763,6 +800,31 @@ fn derivation_cost_grows_with_the_query() {
             scope.as_str()
         );
     }
+}
+
+/// The checker keeps only each role's current node: absorbing 64 conjuncts
+/// one at a time replaces the filter and the scan 64 times, and every
+/// replaced node is released, so the arena ends holding no more than the
+/// chain's six roles rather than a copy of the predicate per step.
+#[test]
+fn the_derivation_arena_keeps_only_current_nodes() {
+    let filter: Vec<String> = (0..64)
+        .map(|index| format!("$d.title != \"{index}\""))
+        .collect();
+    let query = format!(
+        "query q() {{ match {{ $d: Doc {} }} return {{ $d.slug }} order {{ $d.year }} limit 10 }}",
+        filter.join(" ")
+    );
+    let fixture = Fixture::new(&query, &[]);
+    let derivation = fixture.derivation().expect("an exact-subset member");
+    assert!(
+        derivation.steps.len() >= 64,
+        "every conjunct is absorbed by its own step: {}",
+        derivation.steps.len()
+    );
+    fixture.accept(fixture.plan()).unwrap();
+    let retained = super::subset::RETAINED_NODES.with(std::cell::Cell::get);
+    assert!(retained <= 6, "the arena retained {retained} nodes");
 }
 
 /// A rule may name only a node the derivation has reached and not yet

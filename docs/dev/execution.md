@@ -650,7 +650,9 @@ rules it applies (`AbsorbScanFilter`, `PruneScanColumns`, `Lower`,
 `RankBm25Scan`) over arena references; the validator checks that the IR is
 the declaration's lowering, rebuilds the canonical chain
 `Limit(Sort(Project([Search](Filter(Scan)))))`, re-applies every rule
-against its precondition and requires the result to equal the plan. A member
+against its precondition and requires the result to equal the plan. The
+checker's arena keeps only each role's current node, releasing a replaced one
+before storing its successor, so its memory is linear in the query. A member
 is accepted as `exact_subset`; every other plan as `invariants_only`.
 
 A fresh plan that fails a check is a planner defect (an internal error). A

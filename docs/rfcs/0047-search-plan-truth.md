@@ -591,8 +591,12 @@ charged per expression and plan node checked and per conjunct an absorption
 copies. A member's derivation grows linearly with its conjuncts (the
 `instrument:` test `derivation_cost_grows_with_the_query` prints bytes, steps,
 nodes, visits and time; 256 conjuncts take about 58 KB, 261 steps and 11 ms).
-No planning-time memory pool exists, so evidence memory is bounded by the byte
-and node limits instead of being charged to the query pool. The planner
+No planning-time memory pool exists. The checker's arena keeps only each
+role's current node and releases a replaced node before storing its
+successor, so its retained expressions partition the query's own: evidence
+memory is linear in the compiled query, whose size the request limits bound,
+while the node limit bounds the arena's slots and the visit charge bounds the
+copying work. The planner
 always records a member's derivation; no optional rewrite is skipped for
 budget, and exhaustion on a fresh plan is a resource outcome
 (`ResourceLimitExceeded`).
@@ -1026,3 +1030,11 @@ None.
   blocks; evidence memory is bounded by byte and node limits because no
   planning pool exists; the fusion and aggregate order checks land with
   step 5.
+- 2026-10-05: two review findings on step 2a, both fixed with regressions.
+  The row-cut check refused a wrong `limit` but accepted a cut the query
+  does not write; a plan now carries exactly the query's cut, one at the
+  root or none anywhere. The derivation arena kept every replaced node, so
+  its retained predicate data grew quadratically with the conjuncts while
+  every counter passed; it now releases a replaced node, and the statement
+  that the byte and node limits bound evidence memory is replaced by the
+  linear bound above.
