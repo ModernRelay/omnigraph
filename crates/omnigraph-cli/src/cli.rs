@@ -169,11 +169,9 @@ pub(crate) enum Command {
         params: ParamsArgs,
         #[arg(long)]
         branch: Option<String>,
-        /// Compare-and-swap precondition: run only if the branch's head
-        /// commit id (from `omnigraph query --json` or `omnigraph commit list`)
-        /// still equals this value.
-        /// A lost race exits with code 4 and, with --json, the structured
-        /// `precondition_failure` body — re-read the branch and decide again.
+        /// Compare-and-swap: run only while the branch head still equals this commit id
+        /// (from `omnigraph query --json` or `omnigraph commit list`). A lost race exits
+        /// 4 against a server, 1 embedded; --json prints `precondition_failure`.
         #[arg(long = "if-commit", value_name = "COMMIT_ID")]
         if_commit: Option<String>,
         /// Session setting for this invocation (repeatable): `name=value` in
@@ -369,8 +367,8 @@ pub(crate) enum Command {
     Cleanup {
         /// Graph URI
         uri: Option<String>,
-        /// Number of recent versions to keep per dataset. Either `--keep` or
-        /// `--older-than` (or both) must be set.
+        /// Number of recent graph commits to keep on every live branch. Either
+        /// `--keep` or `--older-than` (or both) must be set.
         #[arg(long)]
         keep: Option<u32>,
         /// Only remove versions older than this duration. Accepts Go-style
@@ -878,7 +876,7 @@ pub(crate) enum SchemaCommand {
         json: bool,
     },
     /// Respell a legacy graph's system columns in place (`id`/`src`/`dst` to
-    /// `__id`/`__src`/`__dst`, storage format v8 to v9; RFC 0040)
+    /// `__id`/`__src`/`__dst`); the storage format stays v14 (RFC 0040)
     #[command(name = "upgrade-system-columns")]
     UpgradeSystemColumns {
         /// Standalone graph storage URI; alternatively use --store

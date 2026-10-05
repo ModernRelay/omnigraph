@@ -88,9 +88,10 @@ JSONL format:
   string such as `["alice","bob"]`; omit `id` or supply exactly that value. An
   unkeyed edge gets a generated id unless top-level `id` supplies one.
 
-`data` holds user properties. On new v9 graphs, `data.id` is a declared user
-property and `data.__id` is refused. v8 also accepts legacy `data.id` as identity
-when top-level `id` is absent; supplying both identity placements is refused.
+`data` holds user properties. On new graphs, `data.id` is a declared user
+property and `data.__id` is refused. A legacy graph (physical `id`/`src`/`dst`)
+also accepts `data.id` as identity when top-level `id` is absent; supplying
+both identity placements is refused.
 Exports put entity `id` at the top level on both vintages. Before loading a
 predecessor export into a new graph, relocate its identity as described in
 [migration guidance](migrations.md).
@@ -188,7 +189,8 @@ happens after a successful merge publication.
 
 Deleting a parent branch is supported while descendants remain. Logical deletion
 retains the native history descendants need; only explicit `cleanup` reclaims
-unneeded table forks and retired refs. `optimize` does not perform that collection.
+unretained table versions, retired refs, and table forks left by branches
+created under 0.11 or earlier. `optimize` does not perform that collection.
 
 ### Merge conflicts
 
@@ -199,9 +201,9 @@ HTTP `409`). The same edge inserted on both branches depends on its identity:
 unkeyed edges are both kept; `@unique(@src, @dst)` reports `unique_violation`;
 `@key(@src, @dst)` converges identical inserts to one row and reports
 `divergent_insert` (with the derived id) when non-key properties differ —
-re-insert the agreed values on one branch, then merge again. If a branch both
-sides merged earlier has since been deleted, an entity both received from it
-can still report `divergent_update`.
+re-insert the agreed values on one branch, then merge again. A branch both
+sides merged earlier stays their merge base after it is deleted, and `cleanup`
+keeps the history that base needs.
 
 ### Schema apply blocks non-main branches
 

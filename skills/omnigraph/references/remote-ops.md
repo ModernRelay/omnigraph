@@ -26,8 +26,9 @@ the exact `graph_commit_id` and metadata published by that attempt. A successful
 mutation that matches nothing returns `"commit": null`.
 
 GQ branch statements are different: inspect `outcome`. Creation/deletion return
-null commits despite their branch effects, and a merge's optional commit is a
-later target-head lookup, not an exact receipt. See [branch statements](changes.md#branch-statements).
+null commits despite their branch effects. A merge returns the exact commit it
+published, or `"commit": null` when the target was already up to date. See
+[branch statements](changes.md#branch-statements).
 
 Persist the receipt with downstream state when a workflow needs an audit or
 resume position. Do not infer the published commit by listing history after the
@@ -75,7 +76,8 @@ exits `4`; HTTP returns `412` with `precondition_failure: {expected, actual?}`.
 Re-read and decide again. Fetching a head id after the read does not close the
 race.
 
-Over HTTP, send the raw id in the `Omnigraph-If-Graph-Commit` header to
+Over HTTP, beside the `Omnigraph-Http-Api: 0.12` header every graph request
+needs, send the raw id in the `Omnigraph-If-Graph-Commit` header to
 `POST /graphs/{id}/mutate/if-graph-commit` or
 `POST /graphs/{id}/queries/{name}/if-graph-commit`. The plain routes reject that
 header; an older server answers `404`, so never fall back to the unconditional
@@ -84,7 +86,8 @@ route.
 ## Typed failures and recovery
 
 - `429 Too Many Requests`: the write did not start. Honor `Retry-After`, then
-  retry.
+  retry. The CLI marks this case with exit `75` and a `command_outcome` whose
+  `action` is `retry`, only when no earlier step of the command took effect.
 - Structured `read_set_conflict` means an input changed before publication.
   Refresh and reconsider the operation, including schema/table identity changes;
   an unchanged retry need not succeed. Commit conflicts use generic `conflict`,
@@ -92,13 +95,14 @@ route.
 - `key_conflict`: an append or strict insert found an existing id. Decide
   whether that entity is the intended one; do not silently turn the operation
   into an upsert.
-- `recovery_required`: durable work needs reconciliation; effects may be absent,
-  partial, or already published. Write entry can heal some proven cases even on
-  a running server, but an unresolved intent remains a refusal (HTTP `503` with
-  `recovery_required.operation_id`). Follow the error message's remedy, using
-  operator recovery/reopen when needed, and reconcile the
-  original outcome before replaying. A failed branch merge now cleans up work it
-  can prove safe; cancellation and ambiguous ownership still require recovery.
+- `recovery_required` (HTTP `503` with `recovery_required.operation_id`): no
+  0.12 mutation, load or branch merge returns it, because a write that fails
+  before its single publication leaves the graph unchanged. It remains for a
+  graph that still holds a `__recovery/` sidecar from a pre-0.12 build (open
+  it read-write with that build first) and for a schema apply or
+  system-column upgrade that fails after its commit was published; the named
+  commit already contains the change. Follow the error message's remedy and
+  do not replay.
 
 The effect-free conflict details are distinct from a lost response or a recovery
 requirement. Neither HTTP `409`/`503` nor the CLI's generic failure exit `1` is

@@ -123,7 +123,7 @@ omnigraph mutate update_person --query queries.gq --store graph.omni \
 `--if-commit` runs the mutation only while the target branch is still at that
 commit. Any intervening commit on the branch invalidates the condition, even
 when it changed unrelated data. A mismatch has no effect and exits with code
-4; JSON output includes `precondition_failure` with `expected` and optional
+4 against a server, 1 on an embedded `--store` run; JSON output includes `precondition_failure` with `expected` and optional
 `actual` commit ids. Re-read and decide again instead of retrying blindly.
 
 ## Storage upgrade
@@ -321,8 +321,8 @@ Without a context, existing direct cluster commands behave as before.
 `--direct` explicitly selects that path, ignoring even a malformed context;
 `cluster.yaml` still owns the storage root. Managed-only arguments with
 `--direct` or without a context refuse. Other cluster verbs, including
-`approve`, `observe`, `refresh`, and `force-unlock`, refuse when a managed
-context is present. API failures never trigger direct execution.
+`observe` and `force-unlock`, refuse when a managed context is present. API
+failures never trigger direct execution.
 
 ## Managed data access
 

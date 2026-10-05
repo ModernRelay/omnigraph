@@ -210,9 +210,10 @@ omnigraph mutate update_person --query queries.gq --store graph.omni \
 
 The condition compares the effective head of the target branch. Any
 intervening commit invalidates it, including a commit that changed an unrelated
-entity or type. On mismatch, nothing is written: the CLI exits with code 4 and
-JSON output contains `precondition_failure` with `expected` and optional
-`actual` commit ids. Re-read the branch and decide again; do not blindly retry
+entity or type. On mismatch, nothing is written: the CLI exits with code 4
+against a server and with code 1 on an embedded graph such as this `--store`
+run, and JSON output contains `precondition_failure` with `expected` and
+optional `actual` commit ids. Re-read the branch and decide again; do not blindly retry
 the old mutation. The precondition is still checked when the mutation would
 match no entities.
 

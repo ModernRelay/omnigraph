@@ -107,7 +107,8 @@ fn graph_vocabulary_help_exposes_only_canonical_export_selection() {
 
     let cleanup_help = stdout_string(&output_success(cli().arg("cleanup").arg("--help")));
     assert!(cleanup_help.contains("backing dataset"));
-    assert!(cleanup_help.contains("per dataset"));
+    assert!(cleanup_help.contains("graph commits to keep on every live branch"));
+    assert!(!cleanup_help.contains("per dataset"));
 
     let embed_help = stdout_string(&output_success(cli().arg("embed").arg("--help")));
     assert!(embed_help.contains("matching records"));

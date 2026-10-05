@@ -84,7 +84,9 @@ CLI never follows an external URI: `get` refuses it and directs the caller to
 ## HTTP reads
 
 `GET` and `HEAD /graphs/{id}/blob` take `entity`, `type`, `id`, `property`, and
-either `branch` or `snapshot`. Managed values support one standard `Range`,
+either `branch` or `snapshot`, plus the `Omnigraph-Http-Api: 0.12` header every
+protected graph route requires (`api_contract_mismatch` without it). Managed
+values support one standard `Range`,
 `ETag`, `If-Match`, and `If-None-Match`. Treat an ETag as an opaque validator of
 that graph representation, not a content hash.
 
@@ -94,8 +96,8 @@ in `Location`; it does not fetch, sign, authorize, or proxy the object.
 ## Lifecycle
 
 A reader stays pinned to the snapshot selected when it opens. Explicit
-`cleanup` (including table forks left by a deleted branch) can reclaim bytes
-needed by a long read, so quiesce such readers first; branch deletion and
+`cleanup` (including table versions only a deleted branch kept) can reclaim
+bytes needed by a long read, so quiesce such readers first; branch deletion and
 schema drops alone defer reclamation to `cleanup`. Blob-aware compaction is
 supported.
 
@@ -103,4 +105,4 @@ Historical identity fails closed: if a rename, drop/re-add, or branch lifetime
 does not prove that a historical property is the same logical Blob property,
 OmniGraph returns an error rather than guessing.
 
-Canonical user contract: [Blob values](https://github.com/ModernRelay/omnigraph/blob/v0.11.0/docs/user/blobs.md).
+Canonical user contract: [Blob values](https://github.com/ModernRelay/omnigraph/blob/v0.12.0/docs/user/blobs.md).
