@@ -1214,9 +1214,11 @@ async fn pinned_file_field_ids(db: &Omnigraph, table_key: &str) -> Vec<(String, 
 /// every fragment still holding a dropped property's values, here one
 /// fragment without deletions that Lance's planner leaves alone, in one graph
 /// commit with batches sized by the remaining Blob property, and `cleanup`
-/// then deletes the old files, so no file of the graph holds the dropped
-/// bytes. A table with no dropped column and nothing to compact is neither
-/// sized nor committed. Bytes on disk need filesystem assertions.
+/// then deletes the old files once nothing retains them, so no file of the
+/// graph holds the dropped bytes. A branch made after the drop and before the
+/// optimize retains them, even once merged into main, until it is deleted. A
+/// table with no dropped column and nothing to compact is neither sized nor
+/// committed. Bytes on disk need filesystem assertions.
 #[tokio::test]
 async fn optimize_then_cleanup_erases_dropped_property_values() {
     const MIB: usize = 1024 * 1024;
@@ -1305,6 +1307,8 @@ async fn optimize_then_cleanup_erases_dropped_property_values() {
             .any(|(_, fields)| dropped_ids.iter().all(|id| fields.contains(id))),
         "test precondition: the drop keeps the data file naming both dropped ids"
     );
+    // Its head and fork point pin the table version holding the dropped values.
+    db.branch_create("retained").await.unwrap();
     let tag_pin = helpers::pinned_version(&db, "main", "node:Tag").await;
     let commits_before = db.list_commits(None).await.unwrap().len();
 
@@ -1370,6 +1374,29 @@ async fn optimize_then_cleanup_erases_dropped_property_values() {
     for needle in &needles {
         assert!(!files_containing(dir.path(), needle).is_empty());
     }
+    // Merging the branch does not release its pins, and neither does another
+    // optimize of main: cleanup keeps every live branch's head and fork point.
+    db.load(
+        "retained",
+        r#"{"type":"Tag","data":{"slug":"u","icon":"base64:dQ=="}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.branch_merge("retained", "main").await.unwrap().outcome,
+        MergeOutcome::Merged
+    );
+    db.optimize().await.unwrap();
+    let stats = db.cleanup(keep_one()).await.unwrap();
+    assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
+    for needle in &needles {
+        assert!(
+            !files_containing(dir.path(), needle).is_empty(),
+            "the live branch retains the dropped bytes"
+        );
+    }
+    db.branch_delete("retained").await.unwrap();
     let stats = db.cleanup(keep_one()).await.unwrap();
     assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
     for needle in &needles {
