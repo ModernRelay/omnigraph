@@ -291,7 +291,12 @@ async fn open_refuses_a_stamp_below_the_served_floor_before_any_effect() {
                 "{error}"
             );
             assert!(error.to_string().contains("omnigraph export"), "{error}");
-            assert!(!error.to_string().contains("omnigraph upgrade"), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("omnigraph upgrade <graph> --check"),
+                "{error}"
+            );
             assert_eq!(
                 reached_effects.load(std::sync::atomic::Ordering::SeqCst),
                 0,

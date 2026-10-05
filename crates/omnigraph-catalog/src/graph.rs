@@ -22,6 +22,7 @@ use super::state::{
     read_manifest_state, read_manifest_state_and_rows,
 };
 use super::{TableIdentity, TableRegistration, table_path_for_identity};
+use crate::history::ExtentCache;
 use crate::record::{compact_to_storage, manifest_storage_schema};
 use crate::seams::{decide_seam, fail};
 
@@ -333,23 +334,30 @@ pub(crate) async fn open_manifest_graph(
     })
 }
 
+/// What one `__manifest` version is read from: its own rows, or the record
+/// the legacy history of an upgraded root holds for it.
+pub(crate) enum VersionState {
+    Rows(ManifestState),
+    Legacy(crate::legacy::LegacyAt),
+}
+
 pub(crate) async fn snapshot_state_at(
     root_uri: &str,
     branch: Option<&str>,
     version: u64,
-) -> Result<(Dataset, ManifestState)> {
+    history: &ExtentCache,
+) -> Result<(Dataset, VersionState)> {
     let control_session = crate::lance_access::control_session();
-    let dataset = open_manifest_dataset_with_session(
-        root_uri.trim_end_matches('/'),
-        branch,
-        &control_session,
-    )
-    .await?;
+    let root = root_uri.trim_end_matches('/');
+    let dataset = open_manifest_dataset_with_session(root, branch, &control_session).await?;
     let dataset = dataset
         .checkout_version(version)
         .await
         .map_err(OmniError::storage)?;
-    let state = read_manifest_state(&dataset).await?;
+    let state = match crate::legacy::at_version(root, &control_session, history, &dataset).await? {
+        None => VersionState::Rows(read_manifest_state(&dataset).await?),
+        Some(at) => VersionState::Legacy(at),
+    };
     Ok((dataset, state))
 }
 

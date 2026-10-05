@@ -213,8 +213,10 @@ bindings cannot be projected.
 Each projection needs a distinct result column name (`T25`): use aliases when
 expressions would collide. Aliases can be used in `order`, but cannot be
 projected again in `return` (`T36`), and alias ordering cannot be combined with
-a `nearest` ordering (`T18`). Order aggregates by their alias; `order {
-count($f) }` fails when the query runs.
+a `nearest` ordering (`T18`). Order an aggregate by its alias or by repeating
+the returned expression (`order { count($f) desc }`); an order key that is not
+a property, a system field, the leading search key, a `return` item, or an
+alias is refused at type checking (`T42`).
 
 In JSON results, null fields are omitted from rows and node objects; null
 elements within lists remain `null`. Dates are `"2026-04-29"`; DateTime values

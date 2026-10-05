@@ -47,6 +47,8 @@ use omnigraph_core::graph_commit_id::commit_id_answers;
 pub mod graph;
 pub mod history;
 pub mod layout;
+#[doc(hidden)]
+pub mod legacy;
 pub mod migrations;
 // Test-only since RFC-013 step 3a (compiled under `test` or the `test-util`
 // feature the engine's tests enable): with both reads (Fix 2) and writes
@@ -63,8 +65,8 @@ pub use branch_names::is_merge_input_tag;
 
 pub use graph::{GenesisManifestAttempt, ManifestInitError};
 use graph::{
-    OpenedManifest, init_manifest_graph, load_initial_manifest_state, open_exact_genesis_manifest,
-    open_manifest_graph, snapshot_state_at,
+    OpenedManifest, VersionState, init_manifest_graph, load_initial_manifest_state,
+    open_exact_genesis_manifest, open_manifest_graph, snapshot_state_at,
 };
 pub use history::HistoryRecord;
 #[cfg(test)]
@@ -683,16 +685,30 @@ impl HistoryRecord {
     /// the commit names under `__history/schemas/`, never from a `__manifest`
     /// version.
     pub fn snapshot(&self, root_uri: &str) -> Result<Snapshot> {
-        let state = state::manifest_state(
-            &self.tables,
-            &self.commit,
+        let mut snapshot = self.snapshot_as(
+            root_uri,
             self.commit.graph_manifest_version,
             self.commit.native_branch.as_deref(),
         )?;
+        snapshot.graph_branch = self.commit.graph_branch.clone();
+        Ok(snapshot)
+    }
+
+    /// [`Self::snapshot`] as `version` of the ref `native` reads it: labelled
+    /// with that version, and holding the head only when `native` wrote it.
+    pub(crate) fn snapshot_as(
+        &self,
+        root_uri: &str,
+        version: u64,
+        native: Option<&str>,
+    ) -> Result<Snapshot> {
+        let state = state::manifest_state(&self.tables, &self.commit, version, native)?;
         let mut snapshot = ManifestCoordinator::snapshot_from_state(root_uri, state);
         snapshot.contract_source = ContractSource::Archive(self.commit.schema_content_hash.clone());
-        snapshot.graph_branch = self.commit.graph_branch.clone();
-        snapshot.native_branch = self.commit.native_branch.clone();
+        snapshot.graph_branch = native
+            .map(branch_names::logical_branch_name)
+            .map(str::to_string);
+        snapshot.native_branch = native.map(str::to_string);
         Ok(snapshot)
     }
 }
@@ -967,6 +983,20 @@ impl CollectorBranch {
         snapshot.graph_branch = self.branch.clone();
         snapshot.native_branch = self.dataset.manifest().branch.clone();
         Ok(snapshot)
+    }
+
+    /// The snapshot at a retained `version` of the branch, through `history`,
+    /// as [`ManifestCoordinator::snapshot_at_in`] serves it; `None` for a
+    /// version below the genesis commit, which holds no table to protect.
+    pub async fn snapshot_at(
+        &self,
+        version: u64,
+        history: &crate::commit_graph::HistoryCache,
+    ) -> Result<Option<Snapshot>> {
+        let branch = self.branch.as_deref();
+        let (dataset, state) =
+            snapshot_state_at(&self.root_uri, branch, version, history.objects()).await?;
+        ManifestCoordinator::version_snapshot(&self.root_uri, branch, version, dataset, state)
     }
 }
 
@@ -1577,15 +1607,49 @@ impl ManifestCoordinator {
         branch: Option<&str>,
         version: u64,
     ) -> Result<Snapshot> {
+        Self::snapshot_at_in(root_uri, branch, version, &HistoryCache::default()).await
+    }
+
+    /// [`Self::snapshot_at`] through `history`. A version of an upgraded root
+    /// written before the storage upgrade is served from the legacy history:
+    /// the record of its commit, or of the nearest commit at or below it.
+    pub async fn snapshot_at_in(
+        root_uri: &str,
+        branch: Option<&str>,
+        version: u64,
+        history: &HistoryCache,
+    ) -> Result<Snapshot> {
         let root = root_uri.trim_end_matches('/');
-        let (dataset, state) = snapshot_state_at(root, branch, version).await?;
-        let mut snapshot = Self::snapshot_from_state(root, state);
-        snapshot.native_branch = dataset.manifest().branch.clone();
+        let (dataset, state) = snapshot_state_at(root, branch, version, history.objects()).await?;
+        let native = dataset.manifest().branch.clone();
+        Self::version_snapshot(root, branch, version, dataset, state)?
+            .ok_or_else(|| crate::legacy::pre_genesis(native.as_deref(), version))
+    }
+
+    /// The snapshot of a checked-out version; `None` for a version below the
+    /// genesis commit, which holds no table.
+    fn version_snapshot(
+        root: &str,
+        branch: Option<&str>,
+        version: u64,
+        dataset: Dataset,
+        state: VersionState,
+    ) -> Result<Option<Snapshot>> {
+        use crate::legacy::LegacyAt;
+        let native = dataset.manifest().branch.clone();
+        let mut snapshot = match state {
+            VersionState::Rows(state) => Self::snapshot_from_state(root, state),
+            VersionState::Legacy(LegacyAt::PreGenesis) => return Ok(None),
+            VersionState::Legacy(LegacyAt::Exact(record) | LegacyAt::Nearest(record)) => {
+                record.snapshot_as(root, version, native.as_deref())?
+            }
+        };
+        snapshot.native_branch = native;
         snapshot.manifest_dataset = Some(dataset);
         snapshot.graph_branch = branch
             .filter(|branch| *branch != "main")
             .map(str::to_string);
-        Ok(snapshot)
+        Ok(Some(snapshot))
     }
 
     /// One live graph branch's `__manifest` opened once for the collector,

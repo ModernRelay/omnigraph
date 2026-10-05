@@ -10,7 +10,7 @@ version axes. Never derive one axis from another.
 |---|---|---|
 | Release | Published workspace artifacts move in lockstep. | Workspace manifests, lockfile, generated metadata, release automation. |
 | CLI ↔ server wire | One v0.12 contract; coordinated client/server upgrades. Exact request admission and CLI discovery/response validation. | Shared contract header, DTOs, HTTP refusal tests and OpenAPI drift tests. |
-| Graph storage | Closed stamp range `[MIN_SUPPORTED, CURRENT]`, independent of system column vintage; a graph at any other stamp is rebuilt by export and load; no open-time migration. | Main-manifest stamp guard on both bounds. |
+| Graph storage | Closed stamp range `[MIN_SUPPORTED, CURRENT]`, independent of system column vintage; a standalone graph at stamp 8, 9 or 13 is converted by the offline `omnigraph upgrade`, a graph at any other stamp is rebuilt by export and load; no open-time migration. | Main-manifest stamp guard on both bounds. |
 | Lance dependency and file format | One deliberately pinned Lance family and explicit stable file version. | Lockfile, write parameters, and Lance surface guards. |
 
 ## Current storage contract
@@ -29,8 +29,9 @@ Both system-column vintages of [RFC 0040](../rfcs/0040-system-column-namespace.m
 feature set determines the vintage, never the storage stamp.
 `omnigraph schema upgrade-system-columns` converts the spellings on a
 supported standalone graph without changing its storage stamp. Normal open
-refuses a graph at any other stamp, and this build has no in-place storage
-conversion.
+refuses a graph at any other stamp. The one in-place storage conversion is
+the offline `omnigraph upgrade`, from stamps 8 and 9 (release 0.11.x) and
+from stamp 13.
 
 - v4 was the last released pre-identity format, used by OmniGraph 0.8.x.
 - v5 was an unreleased development format that introduced SchemaIR v2,
@@ -123,6 +124,15 @@ conversion.
   would read the buffer as the whole history, so the stamp refuses it before
   any open. Two unreleased prototype layouts were stamped 14 and 15 in
   development trees only; neither shipped and neither has a conversion route.
+  A root converted from stamp 8, 9 or 13 also holds `__history/legacy/`, written once
+  by the upgrade and never again: the pre-upgrade commits as Lance data files
+  under `legacy/data/` and the flat locator objects under `legacy/locator/`
+  that find a commit by id and a writer by native name. A root born at 14 has
+  no `legacy/`. The layout and its bounds are in
+  [RFC 0068](../rfcs/0068-graph-commit-record.md#amendment-legacy-commits-of-the-stamp-13-upgrade).
+  A stamp-14 binary built before the upgrade landed reads no `legacy/`: on a
+  converted root it reports pre-upgrade commit ids as not found and refuses
+  full-history reads, with no stamp to fence it.
 - the unreleased v7–v19 stamps of the rejected MemWAL experiment never shipped
   and are not supported migration inputs. Reuse of a numeric stamp by another
   design (RFC 0062, RFC 0042 or RFC 0040) does not make an experimental graph
@@ -130,22 +140,147 @@ conversion.
   rebuild at a fresh root.
 
 Normal open refuses lower and higher stamps before recovery or table decoding;
-it never migrates a graph. This build has no in-place storage conversion:
-`omnigraph upgrade` reads main's `__manifest` stamp, reports the storage
-format state and writes nothing. A graph at stamp 14 reports
-`already_current`. Any other stamp is the finding `unsupported_source` with
-the open guard's refusal text, and a `--to-format` other than 14 is the
-finding `unsupported_target`. A graph carrying `UPGRADE_PENDING_KEY`
-(`omnigraph:storage_upgrade_pending`) reports `recovery_required` and stays
-refused by normal open; the conversion is finished with the executable that
-started it.
+it never migrates a graph. `omnigraph upgrade` is the one conversion, on a
+standalone root, under one protocol (`UPGRADE_PROTOCOL` 6) from the stamps in
+`UPGRADE_SOURCE_FORMATS` (8, 9 and 13). `UpgradeIntent.source_format` chooses
+the route, and the report names it per source:
+`history-lance-files-v8-to-v14`, `history-lance-files-v9-to-v14` and
+`history-lance-files-v13-to-v14`. A stop before any route is chosen (an
+unreadable intent, or recovery sidecars on a stamp no route converts) names
+`history-lance-files-to-v14` as its failed handler. A graph at stamp 14
+reports `already_current`. A stamp above 14 is the finding
+`newer_than_binary`, any other stamp outside `UPGRADE_SOURCE_FORMATS` is
+`unsupported_source` with the open guard's refusal text, and a `--to-format`
+other than 14 is `unsupported_target`, checked before the stamp. A graph
+carrying `UPGRADE_PENDING_KEY` (`omnigraph:storage_upgrade_pending`) stays
+refused by normal open; `--check` reports it `recovery_required` and a run
+without `--check` resumes the attempt its intent names.
 
-The in-place conversion is written once per release, by the release that ships
-a new format, and it converts from the last released stamp only. Stamps that
-exist only between releases get no conversion; each layout change still takes
-a new stamp, so a graph written in between is refused and never misread.
-[RFC 0064](../rfcs/0064-explicit-storage-upgrades.md) holds the offline
-protocol.
+The two kinds of source differ only in where the schema contract comes from
+and in the shape of the `__manifest` rows read (`legacy::LegacyManifestSource`):
+
+- Stamp 13 (`Stamp13Source`): the packed shape, with the contract in the
+  `schema_contract` row of each version.
+- Stamps 8 and 9 (`RootContractSource`): the flat shape of release 0.11.x,
+  which holds no contract row. The contract is read from `_schema.pg`,
+  `_schema.ir.json` and `__schema_state.json` at the graph root
+  (`db/upgrade/root_schema.rs`), each object in one read bounded by
+  `MAX_METADATA_BYTES` (64 MiB, the head bound), and is the contract of
+  every version. A `.staging` copy of one of the three objects, or
+  a recovery sidecar, is `source_recovery_required`, with or without a live
+  `__schema_apply_lock__` ref beside it; a live `__schema_apply_lock__` ref on
+  an otherwise clean root (no `.staging` copy, no sidecar) is reported as
+  `schema_apply_lock_retired` and handled once main is
+  fenced, so it is not a live ref of the converted graph, as the 0.11.x apply
+  that created it would have left it; a missing, inconsistent or over-bound
+  object, a stamp 8 whose IR declares `__id`/`__src`/`__dst`, a live ref whose
+  tables are not exactly those of the contract, or a registered table whose
+  Lance columns are not the ones the contract declares (one table open per
+  table, counted as `table_opens`; the check runs in `--check` and before any
+  write, so root objects restored from a backup older than a property-only
+  apply are refused), is `unsupported_source`. An absent object, or one whose
+  bytes cannot be read, is `unsupported_source`; every other storage failure
+  reading the three objects is `preflight_failed`: rerun the check. Once main
+  is fenced the contract is read from the archive under `__history/schemas/`
+  the intent binds, never from the root objects again, so a root object
+  changed or removed after the fence does not stop the rerun. Every decoded
+  pin gets
+  `last_linear_version = Some(table_version)`. The three root objects are
+  left in place: no stamp-14 reader opens them, and they go stale at the next
+  schema apply.
+
+The run, in order (`crates/omnigraph/src/db/upgrade.rs`):
+
+1. Preflight, writing nothing, after the actor is authorized (a denied actor
+   gets the policy denial, not a source finding): every live ref carries the
+   source stamp in the shape of its source and the contract is read (from the
+   contract row at 13, from the root objects at 8 and 9), `__history/` holds nothing but
+   schema archives, and
+   the census (`omnigraph-catalog/src/legacy/census.rs`) reads every own
+   version of every live and retired ref at its pinned head and derives the
+   `HistoryRecord` of every commit. `--check` stops here with `check_passed`
+   and the `UpgradeWork` counts.
+2. The fence: one commit on main that stamps it 14 and sets the pending key
+   to the `UpgradeIntent` (the live refs at their source versions, the schema
+   contract, and the `LegacyPlan` with the SHA-256 of the legacy directory).
+   Retired refs are not in the intent; the writer shards bind them.
+3. The legacy objects, created with `put_if_absent`: data files, id shards,
+   writer shards, then the directory.
+4. One conversion commit per live ref, main last, leaving the head alone in
+   the stamp-14 layout with an `omnigraph:storage_upgrade_receipt`.
+5. Validation: every legacy object is read again against the directory and
+   the intent, and every converted ref is compared with its source version.
+6. Activation: main drops the pending key.
+
+A stopped run is resumed from the intent. Before the directory exists the
+census is rerun at the pinned versions under the intent's `LegacyLayout` and
+must plan the same directory bytes (`legacy_plan_changed` otherwise); after
+it exists the directory is the plan and no census runs. The bounds are
+`MAX_BRANCHES` (1024 live refs, and as many retired refs), 1,000,000 rows or
+64 MiB per live or retired head, checked before every census,
+`HISTORY_RELEASE_BYTES` of commit fields and `MAX_RECORD_BYTES` per record,
+`TAIL_BYTES` for the directory, and `MAX_CENSUS_CELLS` (2^33): a stamp-13
+publish rewrites every row, so the census reads about 1.5 N² cells for N
+commits on one lineage and refuses above about 75,000 commits. A stamp-8 or
+stamp-9 `__manifest` never loses a row or a version: its head holds one
+registration row per table and publish, the census reads every version since
+`init`, and the commit count at which it refuses has not been derived.
+`MAX_CENSUS_SNAPSHOT_BYTES` (1 GiB) bounds the `TableRow` values the census
+retains, one per table for every commit record and head, and the
+`TableRegistration` values it keeps for the first version of every ref and
+for every version below a ref's first own commit. It refuses from the head
+scans alone, counting each ref's own commits plus one head times the tables
+of its head, so a graph whose tables were added late is over-counted; and
+again while reading, as each value is retained. The bound counts inline
+bytes only (`size_of` of each value): the strings they own are not counted
+and the plan holds a second copy of the records, so the process needs
+several times the bound. A resume after the directory exists
+verifies one data file at a time and keeps only the commit ids.
+
+After the upgrade a commit id from before it resolves through the locator, a
+full lineage read lists the legacy data files beside the native blocks, and
+a numeric snapshot at a version below the upgrade serves the legacy record of
+the commit at that version, or of the nearest commit below it, relabelled
+with the requested version; a version of main below its genesis commit is
+`manifest_not_found`. Retired refs are never converted: their heads resolve
+through the writer shards.
+
+What a converted 0.11.x root (stamp 8 or 9) does not carry over:
+
+- One schema contract for every pre-upgrade commit. 0.11.x overwrote the root
+  objects at each schema apply, so every legacy `HistoryRecord` names the
+  contract live at the upgrade (`UpgradeWork.schema_contents` is 1). The
+  table set and pins of an old commit are exact. A read at an old commit id
+  is planned against the live contract, as 0.11.x did.
+- Lance table versions above a pin, left by an interrupted 0.11.x write, are
+  not detected: the upgrade opens each table of main's head at its pinned
+  version only, for the column comparison. `omnigraph repair` reports them
+  as `foreign_drift` and `cleanup` lists them as foreign versions.
+- 0.11.x `cleanup`, and 0.11.x `schema apply --allow-data-loss` (which ran
+  the same version removal on the tables it changed), removed table versions
+  and no `__manifest` version, so a retained pre-upgrade `__manifest` version
+  can pin a table version that is gone. The collector then reports `is absent
+  from the listing` and sweeps nothing for that table. `cleanup` deletes no
+  version of main's or a live branch's `__manifest` (`would_prune` is only
+  reported; retired trees are reclaimed separately), so the refusal lasts
+  while a policy retains such a version. Any narrower earlier `cleanup`
+  leaves such versions too: it sweeps the table versions only its
+  `would_prune` versions pin, and a wider policy retains those again.
+  `cleanup --keep 1` retains only each live branch's head, each non-main
+  branch's base, merge bases and tags, and passes unless one of those is
+  such a version; `--older-than` and a wider `--keep` refuse until no
+  version they retain pins a removed table version.
+- `_graph_commit_recoveries.lance/` stays as an unreferenced dataset.
+- The route writes no `last_linear_version` fill commit: `commit list` after
+  the upgrade equals `commit list` before it.
+
+Stamps 10 to 13 were written by main development builds only, 13 from
+2026-10-01 to 2026-10-04. Stamps 10 to 12 and every stamp below 8 stay
+rebuild-only. Stamps that exist only between releases get no
+conversion unless a route is written for them, as for 13; each layout change
+still takes a new stamp, so a graph written in between is refused and never
+misread. [RFC 0064](../rfcs/0064-explicit-storage-upgrades.md) holds the
+offline protocol.
 
 ## Recovery sidecars
 
@@ -169,25 +304,33 @@ Current compatibility fences and the required upstream reading set are in
 
 ## Rebuild
 
-A graph at any stamp other than 14 is rebuilt: export with the binary of the
-release that wrote it, relocate each record's `data.id` into top-level `id`,
-then `init` and `load --mode overwrite` with this binary. Data, vectors and
-blobs are preserved; commit history and branches are not. See
+A graph at stamps 10 to 12 or below 8, and a cluster-managed graph at 8, 9 or
+13, is rebuilt:
+export with the binary that wrote it, relocate `data.id` into top-level `id`
+in each record that has no top-level `id` (an existing one is preserved), then
+`init` and `load --mode overwrite` with this binary.
+Data, vectors and blobs are preserved; commit history and branches are not. See
 [the upgrade guide](../user/operations/upgrade.md).
 
 ## Storage upgrade support matrix
 
 The `storage_upgrade_compatibility` CI job (Storage Upgrade Compatibility)
-requires the `omnigraph upgrade` report and cluster-refusal tests of
-`crossversion_upgrade.rs`, Lance version qualification and protocol guards on
-every change. Missing test cases, empty runs and skipped required cases fail
-the job.
+builds the genuine stamp-13 CLI from main commit `c0a4519f`, installs the
+released 0.10.0 and 0.11.0 CLIs, and requires the
+`storage_upgrade` cases of `crossversion_upgrade.rs`, the engine
+`db::upgrade::tests`, Lance version qualification and protocol guards on
+every change. Missing test cases, empty runs, a missing predecessor binary
+and skipped required cases fail the job.
 
 | Source format | Normal open | `omnigraph upgrade` | Required coverage owner |
 |---|---|---|---|
 | Current / v14 | Accepted | `already_current` for the default or target 14; any other target is `unsupported_target` | `upgrade/tests.rs` and CLI `crossversion_upgrade.rs::storage_upgrade_current_binary_reports_already_current_on_a_fresh_graph`; stamp tests in `migrations.rs` |
-| Any other stamp | Refused | `unsupported_source`; export and rebuild | `upgrade/tests.rs`, the format fences and the refuse-and-rebuild tests in `crossversion_upgrade.rs` |
-| Pending conversion marker | Refused | `recovery_required` | `upgrade/tests.rs` |
+| v13 (main builds 2026-10-01 to 2026-10-04), standalone | Refused, naming `omnigraph upgrade` | Converted in place: `check_passed`, then `completed`; branches and history kept | CLI `crossversion_upgrade.rs::genuine_v13_storage_upgrade_preserves_history` against the genuine `c0a4519f` binary; `upgrade/tests.rs` over `legacy::write::LegacyHistory` fixtures; `omnigraph-catalog` `legacy_` tests |
+| v9 (release 0.11.x), standalone | Refused, naming `omnigraph upgrade` | Converted in place; branches and history kept, one schema contract for every pre-upgrade commit, root schema objects left in place | CLI `crossversion_upgrade.rs::genuine_v0_11_0_storage_upgrade_preserves_history` and `genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup` against the released 0.11.0 binary, `genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history` against the released 0.10.0 and 0.11.0 binaries; `upgrade/tests.rs` over `LegacyHistory::create_stamped` fixtures (`a_stamp_9_root_reached_from_6_by_the_released_upgrade_converts_its_retained_versions` for the retained stamp-6/7/8 versions); `omnigraph-catalog` `RootContractSource` tests |
+| v8 (release 0.11.x, legacy system column spellings), standalone | Refused, naming `omnigraph upgrade` | Converted in place, as v9 | CLI `crossversion_upgrade.rs::genuine_v0_10_0_to_stamp_8_storage_upgrade_preserves_history` against the released 0.10.0 and 0.11.0 binaries; the stamp-8 cases of `upgrade/tests.rs` |
+| v8, v9 or v13, cluster-managed | Refused | Refused before any read; export and rebuild | `crossversion_upgrade.rs::storage_upgrade_refuses_cluster_path_aliases` |
+| Any other stamp | Refused | `unsupported_source` (`newer_than_binary` above 14); export and rebuild | `upgrade/tests.rs`, the format fences and the refuse-and-rebuild tests in `crossversion_upgrade.rs` |
+| Pending conversion marker | Refused | `--check`: `recovery_required`; execute: resumes its own intent, refuses another's | `upgrade/tests.rs` |
 
 These tests cover local standalone roots. Object-store backend qualification
 and deployment branch-protection configuration require their own environment

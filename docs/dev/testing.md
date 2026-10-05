@@ -167,21 +167,85 @@ OMNIGRAPH_V5_BIN=<dir>/target/debug/omnigraph cargo test --locked -p omnigraph-c
 The older seams work the same way with released binaries: `OMNIGRAPH_OLD_BIN` (0.7.2) and `OMNIGRAPH_PREVIOUS_BIN` (0.8.1). `OMNIGRAPH_V6_BIN` (the 0.10.0 release) owns the v6↔v10 fence. RFC 0062 introduced v7's registration clock, RFC 0042's native-ref retirement metadata requires v8, RFC 0040's system columns stamped new graphs v9, and RFC 0067's detached table commits stamp every graph v10. The v0.9 journey is a different case, a fully exercised v6 graph — branches, edges, vectors, full-text and blobs — that the current binary refuses and that is rebuilt from a 0.9 export; `Test Workspace` runs both on every pull request that changes engine input, with the releases it installs.
 
 The separate `Storage Upgrade Compatibility` CI job requires the
-`storage_upgrade` cases of `crossversion_upgrade.rs` (the `omnigraph upgrade`
-report on a fresh graph and the cluster-path refusal), `lance_version_columns`
-and `forbidden_apis`. They need no predecessor binary. Missing cases, empty
-runs and skipped required cases fail the job. To run the crossversion scope
-locally:
+`storage_upgrade` cases of `crossversion_upgrade.rs` (the report on a fresh
+graph, the cluster-path refusal and the five genuine journeys:
+`genuine_v13_storage_upgrade_preserves_history`,
+`genuine_v0_11_0_storage_upgrade_preserves_history`,
+`genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup`,
+`genuine_v0_10_0_to_stamp_8_storage_upgrade_preserves_history` and
+`genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history`), the engine
+`db::upgrade::tests`, `lance_version_columns` and `forbidden_apis`. Missing
+cases, empty runs and skipped required cases fail the job.
+
+The stamp-13 journey needs the stamp-13 CLI: the job builds it from the commit
+`ci.yml` pins as `STAMP_13_SOURCE_COMMIT` and exports `OMNIGRAPH_V13_BIN`. It
+proves its predecessor by behaviour (that binary's `snapshot --json` reports
+`internal_schema_version` 13 and the current `upgrade --check` observes 13),
+builds branches, a merge, a deleted branch, a recreated one and a fork of a
+deleted branch with the old binary, upgrades, and compares commit history,
+rows, `cleanup` and a backup restore after it.
+
+The 0.11.x journeys need the released CLIs, which the job installs:
+`OMNIGRAPH_V011_BIN` (0.11.0, writes stamp 9) and `OMNIGRAPH_V6_BIN` (0.10.0).
+`genuine_v0_11_0_storage_upgrade_preserves_history` runs the same script as
+the stamp-13 journey plus a schema apply (a new type and a nullable property
+on the existing `Doc`, with a commit before and one after it) and an
+`optimize` with the old binary, asserts that the three root schema objects
+are byte-identical after `completed`, and compares what the two commits
+around the apply answer for the added property before and after the upgrade.
+`genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup`
+runs the old binary's `cleanup --keep 1` before the upgrade. After the
+upgrade, a write and a merge, `cleanup --older-than 7d` refuses a table on a
+pre-upgrade linear pin. `cleanup --keep 1` then passes and keeps every
+`__manifest` version; `--older-than 7d` and `--keep 100` still refuse, and
+`--older-than 0s` passes, as the upgrade guide
+describes. A commit the old binary refused as reclaimed must be refused after
+the upgrade, any other failure of a read fails the journey, and at least one
+commit must still be served.
+`genuine_v0_10_0_to_stamp_8_storage_upgrade_preserves_history` builds the
+graph with 0.10.0, takes it to stamp 8 with the 0.11.0
+`upgrade --to-format 8`, and upgrades from there;
+`genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history`
+lets the 0.11.0 `upgrade` run to its default target (stamp 9, the three
+handlers through the system-column respelling). That route needs a graph
+with only main, so 0.10.0 merges and deletes `review` before 0.11.0's default
+conversion, and 0.11.0 forks `temp` after it. The journey asserts the reads at
+every commit main lists right after the predecessor's conversion, those
+written before the respelling among them. Main builds 10 to 13 also
+print `0.11.0`, so these journeys prove their source by the stamp
+`snapshot --json` reports, not by `--version`.
+
+Each journey resolver reads its variable, else the binary under
+`target/storage-upgrade-binaries/` (`stamp-13/`, `v0.11.0/`, `v0.10.0/`).
+Without a binary the journey prints a skip line locally and panics when
+`OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS=1`, as CI sets. The v6 format fence
+reads `OMNIGRAPH_V6_BIN` alone and skips when it is unset, whatever that
+variable says. To run the
+crossversion scope locally, build the stamp-13 predecessor as for the v5 fence
+above, install the two releases with `scripts/install.sh` (`VERSION=v0.11.0`
+and `VERSION=v0.10.0`, each with its `INSTALL_DIR`), place the three binaries
+in those directories and run:
 
 ```bash
 cargo test --workspace --locked --test crossversion_upgrade --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints storage_upgrade -- --test-threads=1
 ```
 
-`db/upgrade/tests.rs` owns the `upgrade_storage` report: `already_current`
-with no write on a fresh graph, `unsupported_source` with the open guard's
-text for another stamp, `unsupported_target` for another `--to-format`, and
-`recovery_required` for a pending conversion marker. Keep ordinary-open
-refusal for all pre-v14 stamps.
+`db/upgrade/tests.rs` owns the `upgrade_storage` protocol over
+`legacy::write::LegacyHistory`, the test-only writer of
+`omnigraph-catalog` that replays scripted publishes: `create` in the stamp-13
+overwrite order, `create_stamped` in the flat shape of stamps 8 and 9, for
+which the test module also writes the three root schema objects. It covers
+the reports (`already_current` with no write on a fresh graph,
+`unsupported_source`, `unsupported_target`, the pending-marker reports,
+`--check` leaving the store untouched), conversion and equivalence of main,
+named refs and fresh forks, the pre-fence refusals and bounds, every seam
+interrupted and rerun, and the post-upgrade reads: commit list and change feed
+across the upgrade, numeric snapshots below it, merges on a legacy base,
+retired refs, leftover merge-input tags and `cleanup`. The census, plan,
+locator codecs and legacy read arms are owned by the `legacy_` tests of
+`omnigraph-catalog` (`tests.rs`, `history.rs`). A fixture cannot drift from
+the predecessor unnoticed only because the genuine journey is required; change
+both together. Keep ordinary-open refusal for all pre-v14 stamps.
 `schema_apply.rs`, `system_column_upgrade.rs` and historical-read owners cover
 atomic contract publication, first-touch retry and current-contract historical
 reads. The catalog tests own row uniqueness, projection and validation;

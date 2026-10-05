@@ -104,8 +104,10 @@ baseline recovery, see [`changes.md`](changes.md).
 omnigraph graphs list --server <name-or-url> --json
 ```
 
-Lists the graphs a multi-graph server serves. Remote servers only (rejects local
-URIs); a cluster-scoped policy bundle must grant `graph_list`. See
+Lists the graphs a multi-graph server serves, with each graph's `state`. Remote
+servers only (rejects local URIs); a cluster-scoped policy bundle must grant
+`graph_list`. `--discovery` (implied in a managed folder) returns only graph
+ids and names to an identity credential and needs no `graph_list`. See
 [`server-policy.md`](server-policy.md).
 
 ## Schema
@@ -125,11 +127,19 @@ omnigraph upgrade "$REPO" --json
 omnigraph schema upgrade-system-columns "$REPO" --check --json
 ```
 
-The default target is v9; `--to-format 8` retains legacy system spellings and
-can preserve live branches. The v9 step requires only `main` and no user
-property starting with `_`. These standalone operations require stopped writers
-and a verified whole-root backup; cluster-managed roots refuse. Read
-[migration preconditions](migrations.md) before executing.
+`omnigraph upgrade` converts a standalone v8 or v9 graph (written by 0.11) or
+a v13 graph to storage format 14 in place, keeping branches, commit ids and
+commit history; `--to-format` accepts 14 only. `schema upgrade-system-columns`
+is a separate step on a graph already at 14: it respells the legacy
+`id`/`src`/`dst` system columns and requires only `main` and no user property
+starting with `_`. Both are standalone, offline operations: stop every process
+using the graph and keep a verified whole-root backup; cluster-managed roots
+refuse. Read
+[upgrading from v0.11](migrations.md#upgrade-v011-to-storage-format-14) and
+the other [migration preconditions](migrations.md) before executing.
+
+With the 0.11 binary the default target was v9, and `--to-format 8` kept
+legacy system spellings and could preserve live branches.
 
 ## Lint
 
@@ -236,15 +246,18 @@ actor attribution and does not install server policy on direct access.
 omnigraph cleanup $REPO --keep 5 --older-than 7d --confirm
 ```
 
-Garbage-collects old dataset versions, dropping time-travel reachability for
-anything pruned. **Destructive** — requires `--confirm`. At least one of
-`--keep` and `--older-than` is required; with both, a version must be outside
-both windows. Duration units: `s`, `m`, `h`, `d`, `w`.
+Deletes table versions that no retained graph commit pins, dropping
+time-travel reachability for anything pruned. **Destructive** — requires
+`--confirm`. At least one of `--keep` and `--older-than` is required; with
+both, a graph commit must be outside both windows. Duration units: `s`, `m`,
+`h`, `d`, `w`.
 
-Cleanup also reclaims unneeded table forks and retired branch refs while
-preserving live branches, retained native ancestry, tags and recovery pins.
-`--keep` bounds versions within retained datasets, not the number of graph
-commits or unused forks. Branch deletion and `optimize` defer this reclamation.
+`--keep N` retains the newest `N` graph commits of every live branch and every
+table version they pin; it counts graph commits, not Lance versions of a
+dataset. Each live branch's head, selected merge bases and natively tagged
+snapshots are always retained. Cleanup also reclaims table forks left by
+earlier builds and retired branch refs once nothing needs them. Branch
+deletion and `optimize` leave this reclamation to `cleanup`.
 
 ## Stored Queries
 
@@ -282,8 +295,9 @@ Precedence (highest first):
 
 **Managed folders.** In a directory with `.omnigraph/context` (written by
 `omnigraph use`) and no explicit `--server`/`--profile`/`--store`/`--cluster`,
-`query` and `mutate` go to the managed data endpoint with the cached
-`cluster token` credential and require `--graph`. If `OMNIGRAPH_PROFILE` or an
+`query`, `mutate`, `load`, `commit list`/`show` and `graphs list` go to the
+managed data endpoint with an identity credential the CLI acquires and caches
+itself; all but `graphs list` require `--graph`. If `OMNIGRAPH_PROFILE` or an
 operator default server/store competes, they refuse with
 `managed_target_ambiguous`. Global `--direct` restores the ordinary resolution
 above. Other data commands are unaffected.
@@ -314,7 +328,7 @@ For params:
 - `jsonl` — NDJSON, one per line, with metadata line first
 - `json` — pretty `ReadOutput` envelope (metadata, columns, and rows); the `rows` array is printed compact and verbatim
 
-`--format arrow` appears in `--help` but 0.11.0 has no Arrow output: it always
+`--format arrow` appears in `--help` but 0.12.0 has no Arrow output: it always
 fails with "has no text rendering". Do not use it, or set it as
 `defaults.output`.
 
@@ -334,33 +348,40 @@ curl http://127.0.0.1:8080/healthz
 ```
 
 `/healthz` is process health. Use `GET /readyz` for rollout readiness: it reports
-the booted applied digest, ledger revision/CAS, served/quarantined counts and
-shutdown grace. It returns `503` once draining starts. Readiness is not proof
-that every configured graph is healthy; authorized `graphs list --json` includes
-the quarantined graph inventory.
+its `status`, the booted applied digest, ledger revision/CAS, the registered,
+ready, loading and blocked graph counts and shutdown grace. It returns `503`
+while a graph is still loading, when a nonempty inventory has no ready graph,
+and once draining starts. Readiness is not proof that every configured graph
+is healthy; authorized `graphs list --server <name|url> --json` returns one
+`graphs` list with each graph's `state` and `action`, blocked graphs included.
 
 ## Cluster Control Plane
 
 ```bash
 omnigraph cluster validate     --config <dir>          # parse + typecheck the declaration
-omnigraph cluster import       --config <dir>          # one-time: create the state ledger
 omnigraph cluster plan         --config <dir> [--json] # preview (schema changes show migration steps)
-omnigraph cluster apply        --config <dir> --as <actor>   # converge; idempotent
-omnigraph cluster approve <resource> --config <dir> --as <actor>  # gate destructive changes (graph deletes)
+omnigraph cluster apply        --config <dir> --as <actor>   # direct (serving stopped): bootstrap or update
+omnigraph cluster apply --server <name|url> --config <dir>   # submit to the running server; activates without restart
 omnigraph cluster status       --config <dir> [--json] # read the ledger (read-only)
-omnigraph cluster observe      --config <dir> [--json] # what refresh would record: no lock, no sweep, no write
+omnigraph cluster observe      --config <dir> [--json] # current observations: no lock, no write
 omnigraph cluster plan --observe --config <dir>        # plan without taking the lock
-omnigraph cluster refresh      --config <dir>          # re-observe live graphs; flags drift
-omnigraph cluster force-unlock <LOCK_ID> --config <dir>  # clear a crashed run's lock (exact id from status)
+omnigraph cluster force-unlock <LOCK_ID> --config <dir>  # remove an exact lock once its owner is quiescent
+omnigraph --cluster <root> cluster upgrade-ledger --writers-stopped  # one-time: convert a stopped 0.11 (v1) ledger
 ```
 
 `observe` and `plan --observe` report an existing lock instead of refusing, and
-print `authority: "observed"` with the `state_cas` they read (`plan`/`refresh`/
-`import` output carries `authority: locked|observed|unlocked`).
+print `authority: "observed"` with the `state_cas` they read (`plan` output
+carries `authority: locked|observed|unlocked`).
+
+The 0.11 verbs `import`, `refresh` and `approve` are removed. A fresh direct
+`apply` creates the ledger, and a ledger written by 0.11 is converted once with
+`upgrade-ledger` while serving and writers are stopped. Direct `apply` keeps
+its admission lock after it completes: once the owner and its I/O have settled,
+release that exact lock id with `force-unlock` before starting the server.
 
 A managed folder (see [`cluster.md`](cluster.md#managed-clusters)) uses a
-different verb set; `validate`, `import`, `approve`, `observe`, `refresh`, and
-`force-unlock` refuse there unless `--direct` is given:
+different verb set; `validate`, `observe`, and `force-unlock` (without
+`--cluster`) refuse there unless `--direct` is given:
 
 ```bash
 omnigraph use <CLUSTER_ID> --api <origin> [--config <dir>]
@@ -371,7 +392,7 @@ omnigraph cluster apply --plan <PLAN_RUN_ID>
 omnigraph cluster status [RUN_ID | --operation <id> [--wait]]
 omnigraph cluster history [--limit N] [--since <RFC3339>]
 omnigraph cluster cancel <RUN_ID>
-omnigraph cluster token --graph <id> (--actions read,change,… [--ttl 1h] | --clear)
+omnigraph cluster token ([--ttl 1h] | --clear)   # optional; --graph <id> --actions … is the legacy restricted profile
 omnigraph cluster delete --incarnation <id> [--retention-seconds 86400]
 omnigraph cluster undo-delete --incarnation <id> --deletion-id <id>
 ```
@@ -384,6 +405,10 @@ wait deadline, 6 cancelled.
 
 Topology rule: `omnigraph schema apply` and `omnigraph init` **refuse a
 cluster-managed graph** — in a cluster their jobs belong to `cluster apply`.
-Data commands (`load`, `mutate`, branches) work either way — point them at the
-derived root (`<dir>/graphs/<id>.omni`, or `<storage>/graphs/<id>.omni` for an
-S3-backed cluster). See `references/cluster.md`.
+Data commands (`load`, `mutate`, branches) normally go through the running
+server (`--server <name> --graph <id>`). A direct write or maintenance run at
+the derived root (`<dir>/graphs/<id>.omni`, or `<storage>/graphs/<id>.omni` for
+an S3-backed cluster) takes the cluster's exclusive writer admission and keeps
+the lock after it succeeds: stop the server first, then release that exact
+lock id with `cluster force-unlock` before another owner starts. See
+`references/cluster.md`.

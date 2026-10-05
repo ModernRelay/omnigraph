@@ -12,15 +12,74 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CONTEXT = "Storage Upgrade Compatibility"
 FEATURES = "omnigraph-engine/failpoints,omnigraph-cluster/failpoints"
+STAMP_13_SOURCE_COMMIT = "c0a4519f38d65dc1356728981983da8b096cfbef"
 CASES = (
     "storage_upgrade_current_binary_reports_already_current_on_a_fresh_graph",
+    "genuine_v13_storage_upgrade_preserves_history",
     "storage_upgrade_refuses_cluster_path_aliases",
+    "genuine_v0_11_0_storage_upgrade_preserves_history",
+    "genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup",
+    "genuine_v0_10_0_to_stamp_8_storage_upgrade_preserves_history",
+    "genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history",
+)
+ENGINE_CASES = (
+    "a_fresh_graph_is_already_current_and_nothing_is_written",
+    "restamped_current_layout_is_refused_as_source",
+    "a_target_other_than_the_served_format_is_unsupported",
+    "a_pending_conversion_with_a_valid_intent_is_reported_by_check_as_pending",
+    "a_pending_conversion_with_an_unreadable_intent_is_unknown_ownership",
+    "check_has_no_local_store_effects",
+    "a_source_root_is_converted_once_and_is_then_current",
+    "history_leftovers_refuse_before_fence",
+    "over_bound_record_refuses_before_fence",
+    "census_over_bound_refuses_before_reads",
+    "policy_denial_precedes_effects",
+    "recovery_sidecars_refuse_under_the_route_of_the_stamp",
+    "a_staged_schema_object_at_the_root_refuses_before_the_contract_is_read",
+    "an_unreadable_root_contract_refuses_as_unsupported_source",
+    "a_store_failure_reading_the_root_contract_fails_preflight_and_a_rerun_routes",
+    "a_live_ref_stamped_differently_from_main_fails_preflight",
+    "the_schema_state_v0_11_0_writes_converts_with_or_without_an_unread_field",
+    "stamp_8_refuses_v3_system_columns_and_stamp_9_converts_the_legacy_ones",
+    "a_live_schema_apply_lock_is_retired_and_a_retired_one_converts",
+    "a_schema_apply_lock_beside_staging_or_a_sidecar_stays_refused",
+    "an_over_bound_root_schema_object_refuses_as_unsupported_source",
+    "a_root_contract_whose_columns_the_tables_lack_refuses_before_any_write",
+    "a_root_contract_that_does_not_describe_a_live_ref_refuses",
+    "a_stamp_9_root_reached_from_6_by_the_released_upgrade_converts_its_retained_versions",
+    "cleanup_after_upgrade_with_keep_four_and_older_than",
+    "merge_with_legacy_base_pins_and_collector_keeps_it",
+    "leftover_merge_input_tag_on_bookkeeping_version_resolves",
+    "commit_list_and_change_feed_cross_the_upgrade",
+    "numeric_snapshot_below_upgrade",
+    "fork_of_deleted_branch_serves_inherited_version",
+    "retired_commit_graphs_serve_legacy_heads",
+    "named_and_fresh_fork_conversions_pass_equivalence",
+    "fork_head_and_writer_head_release_equal_copies",
+    "interrupted::interruption_boundaries_retry_without_mixed_visibility",
+    "interrupted::interruption_boundaries_retry_from_stamp_9",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock",
+    "interrupted::interruption_boundaries_retry_from_stamp_8",
+    "interrupted::a_fenced_stamp_8_or_9_rerun_reads_the_archived_contract_not_the_root_objects",
+    "interrupted::a_fenced_stamp_9_rerun_without_its_archived_contract_asks_for_the_backup",
+    "interrupted::partial_legacy_write_is_completed_on_retry",
+    "interrupted::resume_after_directory_skips_census",
+    "interrupted::fenced_census_applies_source_bounds_and_directory_resume_reads_no_head",
+    "interrupted::foreign_layout_version_refuses",
+    "interrupted::a_source_changed_after_the_fence_refuses_as_plan_changed",
+    "interrupted::modified_legacy_object_refuses_resume",
+    "interrupted::unreadable_legacy_object_asks_for_a_rerun",
 )
 SCOPES = {
     "crossversion": (
         'cargo test --workspace --locked --test crossversion_upgrade --features "$FAILPOINT_FEATURES" storage_upgrade -- --test-threads=1',
         "crates/omnigraph-cli/tests/crossversion_upgrade.rs",
         "",
+    ),
+    "engine": (
+        "cargo test --locked -p omnigraph-engine --lib --features failpoints db::upgrade::tests -- --test-threads=1",
+        "crates/omnigraph/src/db/upgrade/tests.rs",
+        "db::upgrade::tests::",
     ),
     "lance": (
         "cargo test --locked -p omnigraph-engine --test lance_version_columns --features failpoints -- --test-threads=1",
@@ -33,6 +92,66 @@ SCOPES = {
         "",
     ),
 }
+PREDECESSOR_TOKENS = (
+    "OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS: '1'",
+    f"STAMP_13_SOURCE_COMMIT: {STAMP_13_SOURCE_COMMIT}",
+    'git worktree add --detach "$v13_source" "$STAMP_13_SOURCE_COMMIT"',
+    'echo "OMNIGRAPH_V13_BIN=$v13_bin" >> "$GITHUB_ENV"',
+)
+PREDECESSOR_SCRIPT = """\
+set -euo pipefail
+v13_source="$RUNNER_TEMP/omnigraph-stamp-13"
+v13_bin="$RUNNER_TEMP/omnigraph-stamp-13-bin"
+git fetch --no-tags --depth=1 origin "$STAMP_13_SOURCE_COMMIT"
+git worktree add --detach "$v13_source" "$STAMP_13_SOURCE_COMMIT"
+cargo build --locked \\
+  --manifest-path "$v13_source/Cargo.toml" \\
+  --package omnigraph-cli \\
+  --bin omnigraph \\
+  --target-dir "$GITHUB_WORKSPACE/target"
+cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$v13_bin"
+test -x "$v13_bin"
+# Clean path-package artifacts through both workspace manifests while
+# retaining shared registry dependencies: the predecessor and current
+# packages share names and versions, so either manifest alone can
+# miss a stale path identity and link the wrong rlib.
+cargo clean --workspace --locked \\
+  --manifest-path "$v13_source/Cargo.toml" \\
+  --target-dir "$GITHUB_WORKSPACE/target"
+cargo clean --workspace --locked \\
+  --target-dir "$GITHUB_WORKSPACE/target"
+echo "OMNIGRAPH_V13_BIN=$v13_bin" >> "$GITHUB_ENV\""""
+RELEASE_TOKENS = (
+    'echo "OMNIGRAPH_V6_BIN=$v6_dir/omnigraph" >> "$GITHUB_ENV"',
+    'echo "OMNIGRAPH_V011_BIN=$v011_dir/omnigraph" >> "$GITHUB_ENV"',
+)
+RELEASE_SCRIPT = """\
+set -euo pipefail
+v6_dir="$RUNNER_TEMP/omnigraph-v010"
+v011_dir="$RUNNER_TEMP/omnigraph-v011"
+# The installer downloads the official archive and verifies its
+# SHA256 before extraction. An exact VERSION never falls back to edge.
+# A failed download leaves nothing behind, so each release gets three
+# attempts before this required context goes red.
+install_release() {
+  for attempt in 1 2 3; do
+    REPO_SLUG=ModernRelay/omnigraph VERSION="$1" INSTALL_DIR="$2" \\
+      bash scripts/install.sh && return 0
+    echo "install of $1 failed on attempt $attempt/3; retrying"
+    sleep 10
+  done
+  return 1
+}
+install_release v0.10.0 "$v6_dir"
+test -x "$v6_dir/omnigraph"
+[[ "$("$v6_dir/omnigraph" --version)" == "omnigraph 0.10.0" ]] \\
+  || { echo "::error::the storage upgrades of a 0.10.0 graph require the genuine v0.10.0 CLI"; exit 1; }
+install_release v0.11.0 "$v011_dir"
+test -x "$v011_dir/omnigraph"
+[[ "$("$v011_dir/omnigraph" --version)" == "omnigraph 0.11.0" ]] \\
+  || { echo "::error::the release storage upgrade requires the genuine v0.11.0 CLI"; exit 1; }
+echo "OMNIGRAPH_V6_BIN=$v6_dir/omnigraph" >> "$GITHUB_ENV"
+echo "OMNIGRAPH_V011_BIN=$v011_dir/omnigraph" >> "$GITHUB_ENV\""""
 
 
 def scope_script(scope: str) -> str:
@@ -70,6 +189,8 @@ def validate(workflow: str, policy: dict) -> list[str]:
     for token in (
         f"name: {CONTEXT}",
         "run: python3 scripts/check-storage-upgrade-ci.py --self-test",
+        *PREDECESSOR_TOKENS,
+        *RELEASE_TOKENS,
     ):
         if token not in job:
             failures.append(f"storage compatibility is missing {token!r}")
@@ -77,6 +198,10 @@ def validate(workflow: str, policy: dict) -> list[str]:
         r"^        run: \|\n((?:^          .*\n|^\n)+)", job, re.MULTILINE
     )
     scripts = {"\n".join(line[10:] for line in body.rstrip().splitlines()) for body in scripts}
+    if PREDECESSOR_SCRIPT not in scripts:
+        failures.append("storage compatibility requires the exact genuine stamp-13 build script")
+    if RELEASE_SCRIPT not in scripts:
+        failures.append("storage compatibility requires the exact released v0.10.0 and v0.11.0 install script")
     for scope in SCOPES:
         if scope_script(scope) not in scripts:
             failures.append(f"storage compatibility requires the exact fail-closed {scope} command and log check")
@@ -94,6 +219,8 @@ def expected_cases(scope: str, root: Path = ROOT) -> set[str]:
     ))
     if scope == "crossversion":
         names = {name for name in names if "storage_upgrade" in name} | set(CASES)
+    elif scope == "engine":
+        names |= set(ENGINE_CASES)
     return {prefix + name for name in names}
 
 
@@ -145,7 +272,7 @@ class GuardTests(unittest.TestCase):
             changed = self.workflow.replace("  storage_upgrade_compatibility:\n", "  storage_upgrade_compatibility:\n" + line)
             self.assertTrue(validate(changed, self.policy))
         for line in ("        if: false\n", "        continue-on-error: true\n"):
-            changed = self.workflow.replace("      - name: Run required storage upgrade lance tests\n", "      - name: Run required storage upgrade lance tests\n" + line)
+            changed = self.workflow.replace("      - name: Run required storage upgrade engine tests\n", "      - name: Run required storage upgrade engine tests\n" + line)
             self.assertNotEqual(changed, self.workflow)
             self.assertTrue(validate(changed, self.policy))
 
@@ -155,8 +282,90 @@ class GuardTests(unittest.TestCase):
             self.assertTrue(validate(changed, self.policy))
         self.assertTrue(validate(self.workflow.replace(FEATURES, ""), self.policy))
 
+    def test_missing_predecessor_build_or_requirement_fails(self):
+        for token in PREDECESSOR_TOKENS:
+            with self.subTest(token=token):
+                changed = self.workflow.replace(token, "")
+                self.assertNotEqual(changed, self.workflow)
+                self.assertTrue(validate(changed, self.policy))
+        moved = self.workflow.replace(STAMP_13_SOURCE_COMMIT, "0" * 40)
+        self.assertNotEqual(moved, self.workflow)
+        self.assertTrue(validate(moved, self.policy))
+
+    def test_removed_or_altered_predecessor_build_line_fails(self):
+        exact = ["storage compatibility requires the exact genuine stamp-13 build script"]
+        lines = PREDECESSOR_SCRIPT.splitlines()
+        block = "".join(f"          {line}\n" for line in lines)
+        self.assertEqual(self.workflow.count(block), 1)
+        for index, line in enumerate(lines):
+            for replacement in ([], [f"true # {line}"], [f"{line} || true"]):
+                with self.subTest(line=line, replacement=replacement):
+                    altered = lines[:index] + replacement + lines[index + 1:]
+                    changed = self.workflow.replace(
+                        block, "".join(f"          {line}\n" for line in altered)
+                    )
+                    failures = validate(changed, self.policy)
+                    self.assertTrue(set(exact) <= set(failures), failures)
+        swapped = self.workflow.replace("--package omnigraph-cli", "--package omnigraph-server")
+        self.assertNotEqual(swapped, self.workflow)
+        self.assertEqual(validate(swapped, self.policy), exact)
+
+    def storage_job(self):
+        start = self.workflow.index("  storage_upgrade_compatibility:\n")
+        end = self.workflow.index("\n  v5_v10_format_fence:\n", start)
+        return self.workflow[start:end]
+
+    def test_missing_release_binary_export_fails(self):
+        job = self.storage_job()
+        for token in RELEASE_TOKENS:
+            with self.subTest(token=token):
+                self.assertEqual(job.count(token), 1)
+                changed = self.workflow.replace(job, job.replace(token, ""))
+                failures = validate(changed, self.policy)
+                self.assertIn(f"storage compatibility is missing {token!r}", failures)
+
+    def test_removed_or_altered_release_install_line_fails(self):
+        exact = ["storage compatibility requires the exact released v0.10.0 and v0.11.0 install script"]
+        job = self.storage_job()
+        lines = RELEASE_SCRIPT.splitlines()
+        block = "".join(f"          {line}\n" for line in lines)
+        self.assertEqual(job.count(block), 1)
+        for index, line in enumerate(lines):
+            for replacement in ([], [f"true # {line}"], [f"{line} || true"]):
+                with self.subTest(line=line, replacement=replacement):
+                    altered = lines[:index] + replacement + lines[index + 1:]
+                    changed = self.workflow.replace(job, job.replace(
+                        block, "".join(f"          {line}\n" for line in altered)
+                    ))
+                    failures = validate(changed, self.policy)
+                    self.assertTrue(set(exact) <= set(failures), failures)
+        for before, after in (
+            ("install_release v0.11.0", "install_release v0.12.0"),
+            ("for attempt in 1 2 3", "for attempt in 1"),
+            ("bash scripts/install.sh && return 0", "bash scripts/install.sh; return 0"),
+        ):
+            with self.subTest(before=before, after=after):
+                moved = self.workflow.replace(job, job.replace(before, after))
+                self.assertNotEqual(moved, self.workflow)
+                self.assertEqual(validate(moved, self.policy), exact)
+
     def test_missing_required_context_fails(self):
         self.assertTrue(validate(self.workflow, {}))
+
+    def test_expected_cases_name_the_genuine_journey_and_every_engine_case(self):
+        crossversion = expected_cases("crossversion")
+        for name in CASES:
+            self.assertIn(name, crossversion)
+        engine = expected_cases("engine")
+        for name in ENGINE_CASES:
+            self.assertIn("db::upgrade::tests::" + name, engine)
+
+    def test_every_named_case_exists_in_its_source(self):
+        for scope, cases in (("crossversion", CASES), ("engine", ENGINE_CASES)):
+            source = (ROOT / SCOPES[scope][1]).read_text()
+            for name in cases:
+                with self.subTest(name=name):
+                    self.assertRegex(source, rf"\bfn {name.rsplit('::', 1)[-1]}\(")
 
     def test_log_requires_every_case_and_positive_unskipped_summary(self):
         good = "test alpha ... ok\ntest beta ... ok\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 1s\n"
@@ -167,7 +376,9 @@ class GuardTests(unittest.TestCase):
             good.replace("test beta ... ok", "test beta ... ignored"),
             good.replace("2 passed", "0 passed"),
             good.replace("0 ignored", "1 ignored"),
-            good + "skipping storage upgrade report: missing graph\n",
+            good + "skipping genuine stamp-13 storage upgrade: OMNIGRAPH_V13_BIN is unset\n",
+            good + "skipping genuine v0.11.0 storage upgrade: OMNIGRAPH_V011_BIN is unset\n",
+            good + "skipping genuine v0.10.0 storage upgrade: OMNIGRAPH_V6_BIN is unset\n",
             good + good,
         ):
             with self.subTest(log=log):
@@ -196,7 +407,7 @@ def main() -> int:
         for failure in failures:
             print(f"Storage upgrade CI: {failure}", file=sys.stderr)
         return 1
-    print("Storage upgrade CI OK (format report, cluster refusal, Lance and protocol coverage).")
+    print("Storage upgrade CI OK (genuine stamp-13 route, genuine v0.11.0 and v0.10.0 release route, cluster refusal, engine protocol, Lance and registry coverage).")
     return 0
 
 

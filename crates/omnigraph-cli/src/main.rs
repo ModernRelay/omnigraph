@@ -1624,7 +1624,16 @@ async fn run(cli: Cli) -> Result<()> {
             to_format,
             json,
         } => {
-            upgrade::run(&cli.profile, &cli.store, uri, check, to_format, json).await?;
+            upgrade::run(
+                &cli.profile,
+                &cli.store,
+                uri,
+                check,
+                to_format,
+                json,
+                cli.quiet,
+            )
+            .await?;
         }
         Command::Optimize { uri, json } => {
             let uri = resolve_maintenance_uri(
