@@ -2,6 +2,7 @@
 """Release-note contracts, using in-memory Git trees and read-only integration."""
 
 import copy
+import hashlib
 import io
 import json
 import subprocess
@@ -35,6 +36,7 @@ def release_text(intro="OmniGraph 0.13 makes reads cheaper.", why=None, highligh
 
 RELEASE_TEXT = release_text()
 V0_12_0 = "a9aa28502a2217aefdf3464dbc6c39fb58d23d65"
+V0_12_0_BODY_SHA256 = "60f73177ee77bc39aa7f04da88e833a4957a9f332a764b5487da6f12df4db752"
 
 
 class MemoryRepository(notes.Repository):
@@ -253,6 +255,77 @@ class ReleaseNotesTests(unittest.TestCase):
         ):
             with self.subTest(message=message), self.assertRaisesRegex(notes.NotesError, message):
                 notes.snapshot_info(record(forged))
+
+    def put(self, path, raw):
+        for tree in (self.repo.trees[TARGET], self.repo.trees[AUDITED], self.repo.working):
+            tree[path] = raw
+
+    def snapshot2(self, version="v0.13.0"):
+        self.repo.refs["refs/tags/v0.12.0"] = BASE
+        config = json.dumps({"version": version, "base": "refs/tags/v0.12.0", "legacy": None}).encode()
+        for tree in (self.repo.trees[TARGET], self.repo.trees[AUDITED], self.repo.working):
+            tree[notes.CONFIG] = config
+        selected = notes.select(self.repo, "refs/tags/v0.12.0", "HEAD", release_version=version)
+        info = notes.metadata(selected, version, "2026-10-20", 2, notes.previous_tag("refs/tags/v0.12.0"))
+        return selected, info, notes.render(self.repo, selected, info)
+
+    def test_v0_12_0_body_is_byte_identical(self):
+        output = io.StringIO()
+        with patch("sys.stdout", output):
+            self.assertEqual(notes.main(["body", "--tag", "v0.12.0", "--target", "v0.12.0"]), 0)
+        self.assertEqual(hashlib.sha256(output.getvalue().encode("utf-8")).hexdigest(), V0_12_0_BODY_SHA256)
+
+    def test_format_two_page_order_links_and_footer(self):
+        self.put(RELEASE, release_text(why="The write path changed."))
+        self.put(notes.UPGRADE_GUIDE, b"# Upgrading\n")
+        self.put("changelog.d/upgrade.breaking.md",
+                 b"- Upgrade together. See the [guide][up-guide].\n\n[up-guide]: ../docs/user/operations/upgrade.md\n")
+        self.put("changelog.d/crash.fixed.md", b"- Fix a crash.\n")
+        self.repo.subjects.update({NEW: "feat: predicate (#803)", "changelog.d/upgrade.breaking.md": "feat!: contract (#814)"})
+        _, _, content = self.snapshot2()
+        order = ["OmniGraph 0.13 makes reads cheaper.", "## Highlights", "### Highlight 1", "## Upgrade actions",
+                 "The write path changed.", "- Upgrade together.", "## Features", "- A new predicate.",
+                 "## Fixes", "- Fix a crash.", "**Full changelog:**"]
+        positions = [content.index(text) for text in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn(f"- A new predicate. ([#803]({notes.REPOSITORY}/pull/803))", content)
+        self.assertIn(f"[guide][up-guide]. ([#814]({notes.REPOSITORY}/pull/814))", content)
+        self.assertIn("- Fix a crash.\n", content)
+        self.assertIn(f"[v0.12.0...v0.13.0]({notes.REPOSITORY}/compare/v0.12.0...v0.13.0)", content)
+        self.assertIn("[Upgrade guide](../user/operations/upgrade.md)", content)
+
+    def test_format_two_preview_without_release_file_shows_placeholder(self):
+        _, _, content = self.snapshot2()
+        self.assertIn(f"_{notes.PENDING_RELEASE_FILE}_", content)
+        self.assertNotIn("## Highlights", content)
+        self.assertNotIn("Upgrade guide", content)
+
+    def test_patch_release_with_no_notes_renders_intro_and_says_so(self):
+        for tree in (self.repo.trees[TARGET], self.repo.trees[AUDITED], self.repo.working):
+            del tree[NEW]
+        self.put("changelog.d/v0.13.1.md", release_text(highlights=0))
+        _, _, content = self.snapshot2("v0.13.1")
+        self.assertIn("OmniGraph 0.13 makes reads cheaper.\n\nNo user-visible changes recorded.", content)
+        self.assertNotIn("## Highlights", content)
+        self.assertNotIn("## Upgrade actions", content)
+
+    def test_format_two_body_drops_header_and_provenance(self):
+        self.put(RELEASE, RELEASE_TEXT)
+        selected, info, content = self.snapshot2()
+        body = notes.render(self.repo, selected, info, "v0.13.0", header=False)
+        self.assertTrue(content.startswith("# OmniGraph v0.13.0\n\nReleased 2026-10-20.\n\n<!-- release-notes: "))
+        self.assertTrue(body.startswith("OmniGraph 0.13 makes reads cheaper."))
+        self.assertNotIn("<!-- release-notes", body)
+
+    def test_release_file_links_follow_the_note_link_rules(self):
+        self.put(RELEASE, release_text(intro="See the [query guide][rel-guide].\n\n[rel-guide]: ../docs/user/queries/index.md#predicates"))
+        selected, info, content = self.snapshot2()
+        self.assertIn("[rel-guide]: ../user/queries/index.md#predicates", content)
+        published = notes.render(self.repo, selected, info, "v0.13.0", header=False)
+        self.assertIn(f"[rel-guide]: {notes.REPOSITORY}/blob/v0.13.0/docs/user/queries/index.md#predicates", published)
+        self.put(RELEASE, release_text(intro="See [guide](../docs/user/queries/index.md)."))
+        with self.assertRaisesRegex(notes.NotesError, "reference definitions"):
+            self.snapshot2()
 
     def test_unreleased_edits_and_reverts_use_final_tree(self):
         self.repo.trees[TARGET][NEW] = b"- Final wording.\n"
