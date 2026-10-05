@@ -14,7 +14,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
@@ -41,6 +41,7 @@ PROVENANCE = re.compile(r"^<!-- release-notes: (.+) -->$", re.MULTILINE)
 PROVENANCE_MARKER = re.compile(r"<!--\s*release-notes\b", re.IGNORECASE)
 LEGACY_PREFIX = "# OmniGraph v0.12.0\n\nUnreleased.\n\n"
 DEFINITION = re.compile(r"^\[([^\]]+)\]: (\S+)$")
+RELEASE_FILE = re.compile(r"changelog\.d/(v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))\.md")
 
 
 class NotesError(Exception):
@@ -195,15 +196,30 @@ def render_note(repo: Repository, revision: str | None, path: str, raw: bytes, p
     return "".join(lines)
 
 
+def is_release_file(path: str) -> bool:
+    return RELEASE_FILE.fullmatch(path) is not None
+
+
 def select_notes(base: dict[str, bytes], target: dict[str, bytes]) -> dict[str, bytes]:
     base = {path: canonical(raw) for path, raw in base.items()}
     target = {path: canonical(raw) for path, raw in target.items()}
+    # Earlier releases' files sit in the base tree, so this also freezes them.
     changed = [path for path, raw in base.items() if target.get(path) != raw]
     if changed:
         raise NotesError("published notes were changed, renamed or removed: " + ", ".join(sorted(changed)))
     for path, raw in target.items():
-        note_text(path, raw)
-    return {path: target[path] for path in sorted(target.keys() - base.keys())}
+        if not is_release_file(path):
+            note_text(path, raw)
+    return {path: target[path] for path in sorted(target.keys() - base.keys()) if not is_release_file(path)}
+
+
+def select_release(base: dict[str, bytes], target: dict[str, bytes], version: str) -> dict[str, bytes]:
+    expected = f"changelog.d/{version}.md"
+    new = sorted(path for path in target.keys() - base.keys() if is_release_file(path))
+    stray = [path for path in new if path != expected]
+    if stray:
+        raise NotesError(f"release files are named for the configured version ({expected}): {', '.join(stray)}")
+    return {expected: canonical(target[expected])} if expected in new else {}
 
 
 @dataclass
@@ -215,9 +231,14 @@ class Selection:
     baseline: str = ""
     working_tree: bool = False
     config: str = ""
+    release: dict[str, bytes] = field(default_factory=dict)
+    links: dict[str, int] = field(default_factory=dict)
 
     def inputs(self) -> dict[str, str]:
         return {path: digest(raw) for path, raw in self.notes.items()}
+
+    def release_inputs(self) -> dict[str, str]:
+        return {path: digest(raw) for path, raw in self.release.items()}
 
 
 def unreleased_legacy_body(content: str) -> str:
@@ -241,12 +262,16 @@ def migration_baseline(repo: Repository, revision: str | None, legacy: str, free
     return pinned_body if freeze else current_body
 
 
-def select(repo: Repository, base: str | None, target: str, legacy: str | None = None, working_tree: bool = False, freeze_legacy: bool = False) -> Selection:
+def select(repo: Repository, base: str | None, target: str, legacy: str | None = None, working_tree: bool = False,
+           freeze_legacy: bool = False, release_version: str | None = None) -> Selection:
     target_sha = repo.resolve(target)
     base_sha = repo.resolve(base) if base is not None else None
     if base_sha is not None:
         repo.require_ancestor(base_sha, target_sha)
-    notes = select_notes(repo.notes(base_sha) if base_sha else {}, repo.notes(None if working_tree else target_sha))
+    base_files = repo.notes(base_sha) if base_sha else {}
+    target_files = repo.notes(None if working_tree else target_sha)
+    notes = select_notes(base_files, target_files)
+    release = select_release(base_files, target_files, release_version) if release_version else {}
     legacy_sha, baseline = None, ""
     if legacy is not None:
         if not SHA.fullmatch(legacy):
@@ -255,7 +280,7 @@ def select(repo: Repository, base: str | None, target: str, legacy: str | None =
         repo.require_ancestor(legacy_sha, target_sha)
         baseline = migration_baseline(repo, None if working_tree else target_sha, legacy_sha, freeze_legacy)
     return Selection(base_sha, target_sha, notes, legacy_sha, baseline, working_tree,
-                     digest(repo.read(None if working_tree else target_sha, CONFIG)))
+                     digest(repo.read(None if working_tree else target_sha, CONFIG)), release)
 
 
 def metadata(selection: Selection, version: str, date: str | None) -> dict:
