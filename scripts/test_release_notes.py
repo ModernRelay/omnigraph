@@ -18,6 +18,21 @@ GUIDE = "docs/user/queries/index.md"
 ORIGINAL = b"# OmniGraph v0.12.0\n\nUnreleased.\n\n## Highlights\n\n- Original [guide](../user/queries/index.md).\n"
 ADOPTED = ORIGINAL.replace(b"Original [guide]", b"Updated CLI [guide]") + b"\n- Landed feature one.\n- Landed feature two.\n- Landed fix one.\n- Landed fix two.\n"
 CONFIG = json.dumps({"version": "v0.13.0", "base": "previous", "legacy": None}).encode()
+RELEASE = "changelog.d/v0.13.0.md"
+
+
+def release_text(intro="OmniGraph 0.13 makes reads cheaper.", why=None, highlights=3, body="Scans read only named columns."):
+    parts = [intro, ""]
+    if why is not None:
+        parts += ["## Why these changes", "", why, ""]
+    if highlights:
+        parts += ["## Highlights", ""]
+        for number in range(highlights):
+            parts += [f"### Highlight {number + 1}", "", body, ""]
+    return ("\n".join(parts).rstrip("\n") + "\n").encode()
+
+
+RELEASE_TEXT = release_text()
 
 
 class MemoryRepository(notes.Repository):
@@ -77,6 +92,33 @@ class ReleaseNotesTests(unittest.TestCase):
 
     def test_selects_target_paths_absent_from_base(self):
         self.assertEqual(list(notes.select(self.repo, "previous", "HEAD").notes), [NEW])
+
+    def test_release_file_is_selected_separately_from_notes(self):
+        self.repo.trees[TARGET][RELEASE] = RELEASE_TEXT
+        selected = notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0")
+        self.assertEqual(list(selected.notes), [NEW])
+        self.assertEqual(selected.release, {RELEASE: RELEASE_TEXT})
+        self.assertEqual(selected.release_inputs(), {RELEASE: notes.digest(RELEASE_TEXT)})
+
+    def test_release_file_for_another_version_is_refused(self):
+        self.repo.trees[TARGET]["changelog.d/v0.14.0.md"] = RELEASE_TEXT
+        with self.assertRaisesRegex(notes.NotesError, "named for the configured version"):
+            notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0")
+
+    def test_published_release_file_is_immutable(self):
+        old = "changelog.d/v0.12.0.md"
+        self.repo.trees[BASE][old] = RELEASE_TEXT
+        self.repo.trees[TARGET][old] = RELEASE_TEXT + b"\nEdited.\n"
+        with self.assertRaisesRegex(notes.NotesError, "published notes"):
+            notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0")
+        self.repo.trees[TARGET][old] = RELEASE_TEXT
+        self.assertEqual(notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0").release, {})
+
+    def test_format_one_selection_ignores_release_files(self):
+        self.repo.trees[TARGET][RELEASE] = RELEASE_TEXT
+        selected = notes.select(self.repo, "previous", "HEAD")
+        self.assertEqual(list(selected.notes), [NEW])
+        self.assertEqual(selected.release, {})
 
     def test_unreleased_edits_and_reverts_use_final_tree(self):
         self.repo.trees[TARGET][NEW] = b"- Final wording.\n"
