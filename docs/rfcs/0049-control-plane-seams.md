@@ -124,7 +124,7 @@ counts distinguish actual startup outcomes. `GET /graphs` returns one `graphs`
 list including those outcomes under the same gate, with `state` (`loading`,
 `ready`, `blocked`, `transitioning`, `stopping`), `read_available`, `write_available`, optional sanitized
 `failure`, and `action` (`none`, `wait_for_startup`, `wait_for_transition`,
-`restart_after_correction`, `wait_for_restart`). Closed transitions count as
+`apply_correction_or_restart`, `wait_for_restart`). Closed transitions count as
 blocked; pending initial admission counts as loading.
 These booleans describe runtime availability, not permission. Raw failures stay
 in server logs. The separate `quarantined` response field is removed.

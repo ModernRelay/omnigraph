@@ -118,29 +118,29 @@ between graph roots.
 ## Cluster failures
 
 - Run `cluster validate` before `plan` or `apply`.
-- Graph deletion is outside the supported deployment class; no approval command
-  authorizes it.
+- Graph removal, adoption and missing-root recreation require exact confirmations
+  through `--lifecycle FILE`; see [lifecycle and repair](../clusters/index.md#explicit-lifecycle-and-repair).
 - A retained lock requires prior-owner and accepted-I/O quiescence, exclusion
   of other admissions/unlocks, and its exact ID; follow
   [ownership transfer](../deployment.md#writer-topology).
 - Directory boot reads `cluster.yaml` to resolve storage, but served graph,
-  query, and policy resources come from applied state. Submit schema/query
-  changes and graph additions with `cluster apply --server` for live activation.
+  query, and policy resources come from applied state. Submit configuration
+  changes with `cluster apply --server` for live activation.
 - By default one graph that cannot open is quarantined while healthy graphs
   serve. Use `--require-all-graphs` when partial startup is unacceptable.
 - `external_blob_base_overlaps_storage_root`: an `external_blobs` base lies
   inside, or contains, the cluster storage root that holds every graph and the
   applied state. For a new declaration, move the base to a sibling prefix before
-  applying. Existing external-Blob bindings cannot be replaced through the
-  current deployment class. An invalid applied binding keeps its graph blocked;
+  applying. Correct existing external-Blob bindings in the desired configuration
+  and apply them. An invalid applied binding keeps its graph blocked;
   if every graph is blocked, startup fails with `cluster_no_healthy_graphs`. See
   [External Blob references](../clusters/config.md#external-blob-references).
 - `external_blob_storage_root_uncomparable`: the cluster storage root is
   spelled with a path component an external Blob base cannot express (an empty
   component, or a percent sign in a local path), so a base of the same storage
   kind cannot be proven to lie outside it. Moving the base does not help:
-  correct a new declaration before applying. Existing graph roots and Blob
-  bindings remain fixed. Validation refuses the base, and an invalid applied
+  correct the declaration or remove the allow-list before applying. Graph roots
+  remain fixed. Validation refuses the base, and an invalid applied
   binding keeps the graph blocked, as for an overlap.
 
 See [Operating a cluster](../clusters/index.md).

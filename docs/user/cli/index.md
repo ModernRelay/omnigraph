@@ -187,12 +187,15 @@ Without a managed context, cluster commands read a directory containing
 
 ```bash
 omnigraph cluster validate --config ./company-brain
-omnigraph cluster plan --config ./company-brain
+omnigraph cluster plan --config ./company-brain --as act-alice
 omnigraph cluster apply --config ./company-brain --as act-alice
 ```
 
-They manage graph definitions, schemas, stored queries, and policies—not graph
-data. See [Operating a cluster](../clusters/index.md).
+They manage graph definitions, schemas, stored queries, policies, embedding
+providers and external Blob rules. Use `--lifecycle FILE` on plan and apply for
+explicit removal, adoption, recreation, catalog repair or schema-contract
+correction. Use the same actor and lifecycle file for both commands. See
+[Operating a cluster](../clusters/index.md).
 
 For a managed cluster, log in to its Intent API and select the cluster for
 your config directory:

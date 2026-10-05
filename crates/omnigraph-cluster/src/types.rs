@@ -193,11 +193,24 @@ pub struct PlanChange {
     /// whose applied ledger metadata needs to converge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata_change: Option<PlanMetadataChange>,
+    /// Explicit lifecycle work remains visible even when source digests match.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<PlanLifecycleAction>,
     /// For schema updates: the engine's migration plan against the live
     /// graph (RFC-004 §D7's data-aware preview). Absent when the preview is
-    /// unavailable (warning `schema_preview_unavailable`).
+    /// unavailable (error `schema_preview_unavailable`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migration: Option<SchemaMigrationPlan>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanLifecycleAction {
+    RemoveRetainingStorage,
+    Adopt,
+    Recreate,
+    RepairCatalog,
+    CorrectSchemaContract,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]

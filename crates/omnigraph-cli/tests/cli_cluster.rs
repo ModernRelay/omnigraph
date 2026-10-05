@@ -91,6 +91,12 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
             "lock_id":"server-owner", "outstanding_id":null, "lookup":null},
         "active":false
     });
+    let lifecycle = temp.path().join("lifecycle.json");
+    fs::write(
+        &lifecycle,
+        r#"{"repair_catalog":["query.knowledge.find_person"]}"#,
+    )
+    .unwrap();
     let schema = fs::read_to_string(temp.path().join("people.pg")).unwrap();
     for declared_storage in [Some(remote_root.as_str()), None] {
         let captured_config = match declared_storage {
@@ -120,6 +126,8 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
                     "--config",
                 ])
                 .arg(temp.path())
+                .arg("--lifecycle")
+                .arg(&lifecycle)
                 .arg("--json"),
         );
         assert_eq!(
@@ -144,6 +152,10 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
             );
         }
         assert_eq!(requests[1].body["deployment_id"], id);
+        assert_eq!(
+            requests[1].body["deployment"]["options"]["repair_catalog"],
+            serde_json::json!(["query.knowledge.find_person"])
+        );
         assert_eq!(
             requests[1].body["deployment"]["canonical_root"],
             remote_root

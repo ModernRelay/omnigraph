@@ -29,8 +29,9 @@ schema or contents. See [signed data credentials](server.md#signed-data-credenti
 
 `config_manage` is cluster-scoped. It authorizes configuration changes through
 the identity-authorized cluster API, including stored queries, graph creation,
-and a new graph's initial schema and policy bindings. Existing policy membership
-and bindings stay fixed in the current deployment class. Changing an existing
+and policy membership/binding changes on existing graphs. Grants and revocations
+are authorized by the currently applied policy, never the proposed policy.
+Changing an existing
 graph's schema requires that graph's `schema_apply` permission;
 reading its remote schema or migration preview requires `read` on `main`.
 The reserved graph `admin` action does not grant cluster management.
@@ -120,9 +121,11 @@ omnigraph policy explain \
   --actor act-alice --action read --branch main
 ```
 
-Bind policies when bootstrapping or creating a graph. Deployment preserves
-existing policy bindings; changing an existing cluster or graph policy is outside
-its current schema/query deployment class.
+Edit the policy file or its `applies_to` bindings, then run
+`cluster apply --server URL --config DIR`. The server finishes admitted requests
+before activating matching HTTP and engine permissions. Later requests use the
+new rules. Cluster management policy changes take effect in the same deployment;
+a newly granted administrator cannot authorize that grant.
 
 ## Actor identity
 

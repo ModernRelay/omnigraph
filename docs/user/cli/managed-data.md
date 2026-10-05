@@ -29,8 +29,8 @@ or `change`. Ad-hoc query and mutation source uses `read` or `change`
 respectively. Control-plane admin or apply permission does not confer graph
 permission.
 
-Existing graph policy bindings stay fixed in the current deployment class;
-editing a source file alone has no effect. Schema changes use the
+Apply graph policy grants, revocations and binding changes through the cluster
+configuration workflow; editing a source file alone has no effect. Changes use the
 [cluster configuration workflow](../clusters/index.md#deploy-without-restarting);
 identity credentials do not bypass its ownership or permission checks.
 

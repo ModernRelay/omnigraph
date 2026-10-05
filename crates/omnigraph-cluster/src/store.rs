@@ -364,6 +364,30 @@ impl ClusterStore {
         .await
     }
 
+    /// Restore the one valid value for a content-addressed slot under the
+    /// cluster's sole writer admission. The verified digest fixes every byte;
+    /// reading damaged content (possibly oversized or non-UTF8) adds no proof.
+    /// Atomic replacement is bounded by captured source size. A concurrent
+    /// valid repair of this slot necessarily writes the same bytes.
+    pub(crate) async fn repair_payload(
+        &self,
+        kind: &ResourceKind,
+        digest: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        let relative =
+            Self::payload_relative(kind, digest).ok_or("resource kind has no payload")?;
+        if content.len() > crate::config::MAX_CONFIG_SOURCE_BYTES
+            || sha256_hex(content.as_bytes()) != digest
+        {
+            return Err("repair source does not match its bounded digest".into());
+        }
+        self.adapter
+            .write_text(&self.uri(&relative), content)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn write_content_addressed(
         &self,
         relative: &str,

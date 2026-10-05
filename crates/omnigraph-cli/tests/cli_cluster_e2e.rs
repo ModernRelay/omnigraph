@@ -300,6 +300,81 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
         "{mismatched:?}"
     );
     assert_eq!(server.id(), original_pid);
+    if storage_root.is_none() {
+        // Simulate missing storage while its owner is stopped, then prove an
+        // unrelated deployment and explicit recovery both work in one new PID.
+        server.stop();
+        unlock();
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.path().join("__cluster/state.json")).unwrap())
+                .unwrap();
+        let prior_contract = state["applied_revision"]["schema_contracts"]["peer"].clone();
+        fs::remove_dir_all(temp.path().join("graphs/peer.omni")).unwrap();
+        let recovering = spawn_server_with_cluster_env(
+            temp.path(),
+            &[(
+                "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+                r#"{"act-live":"live-deployment-token"}"#,
+            )],
+        );
+        let recovery_pid = recovering.id();
+        let read_peer = || {
+            client.post(format!("{}/graphs/peer/query", recovering.base_url))
+            .bearer_auth("live-deployment-token")
+            .json(&serde_json::json!({"query":"query people() { match { $p: Person } return { $p.name } }", "name":"people", "params":{}}))
+            .send().unwrap()
+        };
+        assert_eq!(read_peer().status(), 503);
+        // The tools query differs from the last accepted bytes; peer is unchanged.
+        let unrelated = parse_stdout_json(&output_success(
+            cli()
+                .env("OMNIGRAPH_BEARER_TOKEN", "live-deployment-token")
+                .args([
+                    "cluster",
+                    "apply",
+                    "--server",
+                    &recovering.base_url,
+                    "--config",
+                ])
+                .arg(temp.path())
+                .arg("--json"),
+        ));
+        assert_eq!(unrelated["active"], true, "{unrelated}");
+        assert_eq!(read_peer().status(), 503);
+        let lifecycle = temp.path().join("lifecycle.json");
+        fs::write(
+            &lifecycle,
+            serde_json::to_vec(&serde_json::json!({"recreate_graphs":{"peer":prior_contract}}))
+                .unwrap(),
+        )
+        .unwrap();
+        let repaired = parse_stdout_json(&output_success(
+            cli()
+                .env("OMNIGRAPH_BEARER_TOKEN", "live-deployment-token")
+                .args([
+                    "cluster",
+                    "apply",
+                    "--server",
+                    &recovering.base_url,
+                    "--config",
+                ])
+                .arg(temp.path())
+                .arg("--lifecycle")
+                .arg(&lifecycle)
+                .arg("--json"),
+        ));
+        assert_eq!(repaired["active"], true, "{repaired}");
+        assert_eq!(
+            repaired["deployment"]["result"]["graphs"]["peer"]["outcome"],
+            "created"
+        );
+        assert_ne!(
+            repaired["deployment"]["result"]["graphs"]["peer"]["contract"],
+            prior_contract
+        );
+        assert_eq!(read_peer().status(), 200);
+        assert_eq!(recovering.id(), recovery_pid);
+    }
 }
 
 #[test]
@@ -454,7 +529,7 @@ fn cluster_e2e_offline_deployment_has_root_only_receipts_and_explicit_unlock() {
         ]));
         assert_eq!(refused.status.code(), Some(2));
         assert!(
-            String::from_utf8_lossy(&refused.stderr).contains("requires config-addressed apply")
+            String::from_utf8_lossy(&refused.stderr).contains("require config-addressed apply")
         );
         for args in [
             vec!["cluster", "upgrade-ledger", "--writers-stopped"],
@@ -596,7 +671,7 @@ fn cluster_e2e_force_unlock_unblocks_apply() {
 fn cluster_e2e_lost_ledger_does_not_adopt_existing_graphs() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
-    apply_cluster_fixture(temp.path());
+    let initial = apply_cluster_fixture(temp.path());
     let graph = temp.path().join("graphs/knowledge.omni");
     let before = manifest_dataset_version(&graph);
     fs::remove_file(temp.path().join("__cluster/state.json")).unwrap();
@@ -607,11 +682,22 @@ fn cluster_e2e_lost_ledger_does_not_adopt_existing_graphs() {
             .arg("--json"),
     );
     assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("already exists"),
+        parse_stdout_json(&refused)["diagnostics"][0]["code"] == "graph_adoption_required",
         "{refused:?}"
     );
     assert_eq!(manifest_dataset_version(&graph), before);
     assert!(!temp.path().join("__cluster/lock.json").exists());
+    let created = &initial["result"]["graphs"]["knowledge"];
+    let lifecycle = temp.path().join("lifecycle.json");
+    fs::write(&lifecycle, serde_json::to_vec(&serde_json::json!({"adopt_graphs": {"knowledge": {
+        "contract": created["contract"], "graph_manifest_version": created["graph_manifest_version"]
+    }}})).unwrap()).unwrap();
+    let adopted = apply_lifecycle_fixture(temp.path(), &lifecycle);
+    assert_eq!(
+        adopted["result"]["graphs"]["knowledge"]["outcome"],
+        "adopted"
+    );
+    assert_eq!(manifest_dataset_version(&graph), before);
 }
 
 #[test]
@@ -621,7 +707,20 @@ fn cluster_e2e_destroyed_graph_is_not_silently_recreated() {
     apply_cluster_fixture(temp.path());
     let graph = temp.path().join("graphs/knowledge.omni");
     let before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    let contract = &state["applied_revision"]["schema_contracts"]["knowledge"];
     fs::remove_dir_all(&graph).unwrap();
+    // A query change makes this graph affected. An unrelated/no-op deployment
+    // must not open every declared graph merely to check its availability.
+    fs::write(
+        temp.path().join("people.gq"),
+        "query find_person($name: String) {
+  match { $p: Person { name: $name } }
+  return { $p.name }
+}
+",
+    )
+    .unwrap();
     let refused = output_failure(
         cli()
             .args(["cluster", "apply", "--config"])
@@ -638,10 +737,26 @@ fn cluster_e2e_destroyed_graph_is_not_silently_recreated() {
     );
     assert!(!graph.exists());
     assert!(!temp.path().join("__cluster/lock.json").exists());
+    let lifecycle = temp.path().join("lifecycle.json");
+    fs::write(
+        &lifecycle,
+        serde_json::to_vec(&serde_json::json!({"recreate_graphs":{"knowledge":contract}})).unwrap(),
+    )
+    .unwrap();
+    let recreated = apply_lifecycle_fixture(temp.path(), &lifecycle);
+    assert_eq!(
+        recreated["result"]["graphs"]["knowledge"]["outcome"],
+        "created"
+    );
+    assert_ne!(
+        recreated["result"]["graphs"]["knowledge"]["contract"],
+        *contract
+    );
+    assert!(graph.join("__manifest").exists());
 }
 
 #[test]
-fn cluster_e2e_declared_graph_created_by_apply_and_deletion_refused() {
+fn cluster_e2e_declared_graph_requires_exact_removal_and_adoption() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
     apply_cluster_fixture(temp.path());
@@ -667,7 +782,7 @@ fn cluster_e2e_declared_graph_created_by_apply_and_deletion_refused() {
             .join("graphs/engineering.omni/__manifest")
             .exists()
     );
-    fs::write(&config, source).unwrap();
+    fs::write(&config, &source).unwrap();
     let before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
     let refused = output_failure(
         cli()
@@ -677,7 +792,7 @@ fn cluster_e2e_declared_graph_created_by_apply_and_deletion_refused() {
     );
     assert_eq!(
         parse_stdout_json(&refused)["diagnostics"][0]["code"],
-        "deployment_scope"
+        "graph_delete_confirmation_required"
     );
     assert_eq!(
         fs::read(temp.path().join("__cluster/state.json")).unwrap(),
@@ -689,6 +804,42 @@ fn cluster_e2e_declared_graph_created_by_apply_and_deletion_refused() {
             .exists()
     );
     assert!(!temp.path().join("__cluster/lock.json").exists());
+    let graph = temp.path().join("graphs/engineering.omni");
+    let version = manifest_dataset_version(&graph);
+    let confirmation = serde_json::json!({
+        "contract": created["result"]["graphs"]["engineering"]["contract"],
+        "graph_manifest_version": version
+    });
+    let lifecycle = temp.path().join("lifecycle.json");
+    fs::write(
+        &lifecycle,
+        serde_json::to_vec(&serde_json::json!({"delete_graphs":{"engineering":confirmation}}))
+            .unwrap(),
+    )
+    .unwrap();
+    let deleted = apply_lifecycle_fixture(temp.path(), &lifecycle);
+    assert_eq!(
+        deleted["result"]["graphs"]["engineering"]["outcome"],
+        "deleted"
+    );
+    assert_eq!(
+        deleted["result"]["graphs"]["engineering"]["retained_storage"],
+        true
+    );
+    assert_eq!(manifest_dataset_version(&graph), version);
+    fs::write(&config, &expanded).unwrap();
+    fs::write(
+        &lifecycle,
+        serde_json::to_vec(&serde_json::json!({"adopt_graphs":{"engineering":confirmation}}))
+            .unwrap(),
+    )
+    .unwrap();
+    let adopted = apply_lifecycle_fixture(temp.path(), &lifecycle);
+    assert_eq!(
+        adopted["result"]["graphs"]["engineering"]["outcome"],
+        "adopted"
+    );
+    assert_eq!(manifest_dataset_version(&graph), version);
 }
 
 #[test]
@@ -708,7 +859,7 @@ fn cluster_e2e_removed_v1_commands_are_not_executable() {
 }
 
 #[test]
-fn cluster_e2e_payload_drift_self_heals() {
+fn cluster_e2e_payload_drift_requires_targeted_repair() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
     apply_cluster_fixture(temp.path());
@@ -734,6 +885,33 @@ fn cluster_e2e_payload_drift_self_heals() {
         "{status}"
     );
     apply_cluster_fixture(temp.path());
+    assert!(
+        !blob.exists(),
+        "unchanged configuration must not repair untargeted payloads"
+    );
+    let lifecycle = temp.path().join("lifecycle.json");
+    fs::write(
+        &lifecycle,
+        r#"{"repair_catalog":["query.knowledge.find_person"]}"#,
+    )
+    .unwrap();
+    let plan = parse_stdout_json(&output_success(
+        cli()
+            .args(["--as", "act-cluster-test", "cluster", "plan", "--config"])
+            .arg(temp.path())
+            .arg("--lifecycle")
+            .arg(&lifecycle)
+            .arg("--json"),
+    ));
+    assert!(
+        plan["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["lifecycle"] == "repair_catalog")
+    );
+    assert!(!blob.exists(), "plan must remain effect-free");
+    apply_lifecycle_fixture(temp.path(), &lifecycle);
     assert_eq!(fs::read(&blob).unwrap(), expected);
     let clean = cluster_json(temp.path(), "status");
     assert!(
@@ -747,4 +925,24 @@ fn cluster_e2e_payload_drift_self_heals() {
                 .starts_with("catalog_payload")),
         "{clean}"
     );
+}
+
+/// Exercise lifecycle JSON through the same direct owner/unlock discipline as
+/// apply_cluster_fixture; no raw ledger or graph mutation bypasses the command.
+fn apply_lifecycle_fixture(
+    root: &std::path::Path,
+    lifecycle: &std::path::Path,
+) -> serde_json::Value {
+    let result = parse_stdout_json(&output_success(
+        cli()
+            .args(["--as", "act-cluster-test", "cluster", "apply", "--config"])
+            .arg(root)
+            .arg("--lifecycle")
+            .arg(lifecycle)
+            .arg("--json"),
+    ));
+    assert_eq!(result["status"], "complete", "{result}");
+    assert_eq!(result["result"]["converged"], true, "{result}");
+    unlock_cluster_fixture(root);
+    result
 }

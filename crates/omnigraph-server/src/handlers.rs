@@ -161,10 +161,10 @@ pub(crate) async fn server_graphs_list(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<GraphListResponse>, ApiError> {
-    let registry = &state.routing().registry;
+    let snapshot = state.routing().registry.snapshot_ref();
 
-    // Server-level Cedar gate. `state.server_policy` is loaded from the
-    // cluster-scoped policy bundle at startup. When no server policy is
+    // Capture management authorization and inventory from one activated
+    // registry snapshot. When no server policy is
     // configured, `authorize_request_server` falls through to the MR-723
     // default-deny semantics (every non-Read action denied for an
     // authenticated actor). `GraphList` is not `Read`, so without a server
@@ -172,7 +172,7 @@ pub(crate) async fn server_graphs_list(
     // the registry until the operator explicitly authorizes it).
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
-        state.server_policy.as_deref(),
+        snapshot.server_policy.as_deref(),
         PolicyRequest {
             action: PolicyAction::GraphList,
             branch: None,
@@ -187,9 +187,9 @@ pub(crate) async fn server_graphs_list(
     };
     let stopping = state.draining.load(std::sync::atomic::Ordering::SeqCst)
         || state.operations.snapshot().closed;
-    let mut graphs: Vec<GraphInfo> = registry
-        .entries()
-        .into_iter()
+    let mut graphs: Vec<GraphInfo> = snapshot
+        .graphs
+        .values()
         .filter(|entry| may_list(entry.key().graph_id.as_str()))
         .map(|entry| {
             let failure = match &entry {
@@ -222,7 +222,7 @@ pub(crate) async fn server_graphs_list(
                         GraphEntry::Loading(_) => GraphAvailabilityAction::WaitForStartup,
                         GraphEntry::Ready(_) => GraphAvailabilityAction::None,
                         GraphEntry::Transitioning(_) => GraphAvailabilityAction::WaitForTransition,
-                        GraphEntry::Blocked(_) => GraphAvailabilityAction::RestartAfterCorrection,
+                        GraphEntry::Blocked(_) => GraphAvailabilityAction::ApplyCorrectionOrRestart,
                     }
                 },
             }
@@ -512,29 +512,32 @@ pub(crate) fn resolve_registered_graph(
     key: &GraphKey,
     actor: Option<&AuthenticatedActor>,
 ) -> std::result::Result<GraphRequest, ApiError> {
-    let (policy, invalid_policy, message) =
-        match state.routing().registry.capture(&state.operations, key)? {
-            RegistryCapture::Loading(graph) => (
-                graph.policy.clone(),
-                false,
-                "graph is loading; wait for its startup attempt to complete",
+    let (captured, server_policy) = state
+        .routing()
+        .registry
+        .capture_with_policy(&state.operations, key)?;
+    let (policy, invalid_policy, message) = match captured {
+        RegistryCapture::Loading(graph) => (
+            graph.policy.clone(),
+            false,
+            "graph is loading; wait for its startup attempt to complete",
+        ),
+        RegistryCapture::Ready(handle) => return Ok(handle),
+        RegistryCapture::Gone => return Err(ApiError::not_found("graph not found")),
+        RegistryCapture::Transitioning(view) => (
+            view.policy.clone(),
+            false,
+            "graph admission is closed for a serving transition",
+        ),
+        RegistryCapture::Blocked(graph) => (
+            graph.policy.clone(),
+            matches!(
+                graph.failure,
+                StartupFailure::InvalidPolicy | StartupFailure::InvalidConfiguration
             ),
-            RegistryCapture::Ready(handle) => return Ok(handle),
-            RegistryCapture::Gone => return Err(ApiError::not_found("graph not found")),
-            RegistryCapture::Transitioning(view) => (
-                view.policy.clone(),
-                false,
-                "graph admission is closed for a serving transition",
-            ),
-            RegistryCapture::Blocked(graph) => (
-                graph.policy.clone(),
-                matches!(
-                    graph.failure,
-                    StartupFailure::InvalidPolicy | StartupFailure::InvalidConfiguration
-                ),
-                "graph is unavailable; an operator must correct its startup failure and restart",
-            ),
-        };
+            "graph is unavailable; an operator must apply an explicit correction or restart after fixing startup configuration",
+        ),
+    };
     // Invalid policy is not equivalent to the operator choosing no policy.
     // Both startup failures and transitions preserve authorization before
     // disclosing a known graph's unavailability.
@@ -555,7 +558,7 @@ pub(crate) fn resolve_registered_graph(
         || matches!(
             authorize(
                 actor,
-                state.server_policy.as_deref(),
+                server_policy.as_deref(),
                 PolicyRequest {
                     action: PolicyAction::GraphList,
                     branch: None,
@@ -609,10 +612,9 @@ pub(crate) enum Authz {
 /// policy-evaluation error). Two sources of the policy engine:
 ///   * Per-graph handler — passes `handle.policy.as_deref()` so the
 ///     graph's Cedar rules govern read/change/branch_*/schema_apply.
-///   * Management handler — passes `state.server_policy.as_deref()` so
-///     server-level Cedar rules govern `graph_list` (the only shipped
-///     server-scoped action; runtime `graph_create` / `graph_delete`
-///     are deferred until a managed cluster catalog lands).
+///   * Management handler — captures the current registry snapshot policy so
+///     server-level Cedar rules govern management access coherently with its
+///     graph inventory.
 ///
 /// The MR-731 invariant lives inside this function: actor identity is
 /// supplied as a separate argument from the resolved bearer match. The

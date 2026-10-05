@@ -574,6 +574,15 @@ async fn cluster_command(
         } | ClusterCommand::Apply {
             schema_correction: Some(_),
             ..
+        } | ClusterCommand::Apply {
+            lifecycle: Some(_),
+            ..
+        } | ClusterCommand::Plan {
+            lifecycle: Some(_),
+            ..
+        } | ClusterCommand::Plan {
+            schema_correction: Some(_),
+            ..
         } | ClusterCommand::Status {
             deployment_id: Some(_),
             ..

@@ -1693,7 +1693,7 @@ async fn existing_lock_makes_plan_fail() {
 }
 
 #[tokio::test]
-async fn state_lock_false_bypasses_lock_with_warning() {
+async fn plan_refuses_execution_without_required_lock() {
     let dir = fixture();
     fs::write(
         dir.path().join(CLUSTER_CONFIG_FILE),
@@ -1710,7 +1710,12 @@ graphs:
     .unwrap();
 
     let out = plan_config_dir(dir.path()).await;
-    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(!out.ok, "{:?}", out.diagnostics);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "deployment_requires_lock")
+    );
     assert!(!out.state_observations.locked);
     assert!(!out.state_observations.lock_acquired);
     assert!(
@@ -1856,7 +1861,7 @@ async fn durable_store_verifies_immutable_bundle_bytes_and_encoded_bound() {
     let store = ClusterStore::for_config_dir(dir.path());
     let source_digest = sha256_hex(SCHEMA.as_bytes());
     let mut bundle = deployment::DeploymentBundle {
-        schema_corrections: BTreeMap::new(),
+        options: DeploymentOptions::default(),
         version: 2,
         canonical_root: store.canonical_root().unwrap(),
         config_digest: sha256_hex(b"configuration"),
@@ -2709,8 +2714,8 @@ async fn offline_deployment_reserves_created_query_projection_before_schema_effe
     let mut config = fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
     let mut declarations = String::new();
     let mut projected_growth = 0;
-    for index in 0..256 {
-        let name = format!("query_{index:03}_{}", "x".repeat(480));
+    for index in 0..512 {
+        let name = format!("query_{index:03}_{}", "x".repeat(200));
         let address = config::query_address("knowledge", &name);
         assert!(address.len() <= 512);
         let source = QUERY.replace("find_person", &name);
@@ -2842,6 +2847,8 @@ fn offline_deployment_reserves_partial_projection_resource_count() {
                     GraphDeployment {
                         intent: None,
                         create: None,
+                        adopt: None,
+                        delete: None,
                         observed_manifest_version: 1,
                         state: GraphDeploymentState::NotStarted,
                         settlement: None,
@@ -2863,7 +2870,7 @@ fn offline_deployment_reserves_partial_projection_resource_count() {
         }
         assert!(desired.len() <= deployment::MAX_RESOURCES);
         let bundle = DeploymentBundle {
-            schema_corrections: BTreeMap::new(),
+            options: DeploymentOptions::default(),
             version: 2,
             canonical_root: "file:///capacity-only".into(),
             config_digest: "e".repeat(64),
@@ -2945,6 +2952,8 @@ fn offline_deployment_graph_completion_reserve_covers_maximum_serialized_engine_
         // change. Null cancels that same term in both sides of this comparison.
         intent: None,
         create: None,
+        adopt: None,
+        delete: None,
         observed_manifest_version: u64::MAX,
         state: GraphDeploymentState::NotStarted,
         settlement: None,
@@ -3277,7 +3286,7 @@ fn write_create_sidecar(
 
 #[tokio::test]
 async fn plan_embeds_migration_preview_for_schema_update() {
-    let dir = fixture();
+    let dir = identity_fixture();
     apply_identity_fixture(dir.path()).await;
     fs::write(
         dir.path().join("people.pg"),
@@ -3285,7 +3294,13 @@ async fn plan_embeds_migration_preview_for_schema_update() {
     )
     .unwrap();
 
-    let out = plan_config_dir(dir.path()).await;
+    let out = plan_config_dir_with_deployment_options(
+        dir.path(),
+        PlanOptions::default(),
+        &DeploymentOptions::default(),
+        Some("principal:owner".into()),
+    )
+    .await;
     assert!(out.ok, "{:?}", out.diagnostics);
     let schema_change = out
         .changes
@@ -3300,10 +3315,44 @@ async fn plan_embeds_migration_preview_for_schema_update() {
             .contains("add_property"),
         "{migration:?}"
     );
+
+    let caller = DeploymentCaller::storage_owner(Some("principal:owner".into()));
+    let root = dir.path().join("graphs/knowledge.omni");
+    let db = Omnigraph::open(root.to_str().unwrap()).await.unwrap();
+    db.branch_create("feature").await.unwrap();
+    let before = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let version = identity_manifest_version(dir.path()).await;
+    let plan = plan_config_dir_with_deployment_options(
+        dir.path(),
+        PlanOptions::default(),
+        &DeploymentOptions::default(),
+        Some("principal:owner".into()),
+    )
+    .await;
+    assert!(!plan.ok, "{plan:?}");
+    let error = apply_deployment(dir.path(), None, &caller, &BTreeMap::new(), |_, _, _| {})
+        .await
+        .unwrap_err();
+    assert!(
+        plan.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == error.code)
+    );
+    assert!(
+        plan.changes
+            .iter()
+            .all(|change| change.disposition == Some(ApplyDisposition::Blocked))
+    );
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        before
+    );
+    assert_eq!(identity_manifest_version(dir.path()).await, version);
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
 }
 
 #[tokio::test]
-async fn plan_warns_when_preview_unavailable() {
+async fn plan_refuses_when_live_graph_is_unavailable() {
     let dir = fixture();
     apply_identity_fixture(dir.path()).await;
     fs::remove_dir_all(dir.path().join(CLUSTER_GRAPHS_DIR)).unwrap(); // missing live root
@@ -3314,17 +3363,19 @@ async fn plan_warns_when_preview_unavailable() {
     .unwrap();
 
     let out = plan_config_dir(dir.path()).await;
-    assert!(out.ok, "{:?}", out.diagnostics);
+    assert!(!out.ok, "{:?}", out.diagnostics);
     let schema_change = out
         .changes
         .iter()
         .find(|change| change.resource == "schema.knowledge")
         .unwrap();
     assert!(schema_change.migration.is_none());
+    assert_eq!(schema_change.disposition, Some(ApplyDisposition::Blocked));
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
     assert!(
         out.diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == "schema_preview_unavailable")
+            .any(|diagnostic| diagnostic.code == "graph_unavailable")
     );
 }
 
@@ -3996,7 +4047,7 @@ async fn read_only_commands_ignore_missing_recovery_sidecar_dir() {
 }
 
 #[tokio::test]
-async fn read_only_commands_warn_on_pending_recovery_sidecar_in_storage_root() {
+async fn status_warns_and_plan_refuses_pending_recovery_in_storage_root() {
     let dir = fixture();
     let storage = tempfile::tempdir().unwrap();
     let storage_path = storage.path().to_string_lossy().to_string();
@@ -4023,7 +4074,12 @@ async fn read_only_commands_warn_on_pending_recovery_sidecar_in_storage_root() {
     );
 
     let plan = plan_config_dir(dir.path()).await;
-    assert!(plan.ok, "{:?}", plan.diagnostics);
+    assert!(!plan.ok, "{:?}", plan.diagnostics);
+    assert!(
+        plan.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "policy_recovery_required")
+    );
     assert!(
         plan.diagnostics
             .iter()
@@ -4683,7 +4739,7 @@ async fn serving_snapshot_reads_applied_empty_cluster() {
 // ---- query discovery (Terraform-style declaration) ----
 
 #[tokio::test]
-async fn plan_refuses_unsupported_inventory_and_binding_changes_without_approval_flow() {
+async fn plan_requires_exact_removal_confirmation_and_accepts_policy_rebinding() {
     let dir = fixture();
     apply_identity_fixture(dir.path()).await;
     let path = dir.path().join(CLUSTER_CONFIG_FILE);
@@ -4693,20 +4749,23 @@ async fn plan_refuses_unsupported_inventory_and_binding_changes_without_approval
         "version: 1\ngraphs: {}\n".to_owned(),
         original.replace("applies_to: [knowledge]", "applies_to: [cluster]"),
     ] {
-        fs::write(&path, source).unwrap();
+        fs::write(&path, &source).unwrap();
         let plan = plan_config_dir(dir.path()).await;
-        assert!(!plan.ok, "{plan:?}");
-        assert!(
-            plan.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "deployment_scope"),
-            "{plan:?}"
-        );
-        assert!(
-            plan.changes
-                .iter()
-                .all(|change| change.disposition == Some(ApplyDisposition::Blocked))
-        );
+        let removing = !source.contains("knowledge");
+        assert_eq!(plan.ok, !removing, "{plan:?}");
+        if removing {
+            assert!(
+                plan.diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "graph_delete_confirmation_required"),
+                "{plan:?}"
+            );
+            assert!(
+                plan.changes
+                    .iter()
+                    .all(|change| change.disposition == Some(ApplyDisposition::Blocked))
+            );
+        }
         let wire = serde_json::to_value(&plan).unwrap();
         assert!(wire.get("approvals_required").is_none());
         assert_eq!(

@@ -645,6 +645,12 @@ pub(crate) enum ClusterCommand {
         /// any lock instead of refusing, and label the output `observed`.
         #[arg(long)]
         observe: bool,
+        /// Core: exact lifecycle confirmations and repair options as JSON (at most 16 MiB).
+        #[arg(long)]
+        lifecycle: Option<PathBuf>,
+        /// Core: exact observed schema contracts to correct.
+        #[arg(long, conflicts_with = "lifecycle")]
+        schema_correction: Option<PathBuf>,
         /// Managed: select a pushed revision; omission uses the bound head.
         #[arg(long = "rev", alias = "revision")]
         revision: Option<String>,
@@ -670,8 +676,11 @@ pub(crate) enum ClusterCommand {
         deployment_id: Option<String>,
         /// Core config apply only: JSON map from graph id to the exact observed
         /// SchemaContractDigest being corrected (at most 16 MiB).
-        #[arg(long, conflicts_with = "plan")]
+        #[arg(long, conflicts_with_all = ["plan", "lifecycle"])]
         schema_correction: Option<PathBuf>,
+        /// Core: exact graph deletion/adoption/recreation confirmations and catalog repair options.
+        #[arg(long, conflicts_with = "plan")]
+        lifecycle: Option<PathBuf>,
         /// Attest prior writers and accepted graph/control I/O are quiescent.
         #[arg(long, requires = "deployment_id")]
         writers_stopped: bool,

@@ -142,11 +142,13 @@ Cases an RFC has argued: the flat locator objects and legacy data files under
 ## Current support boundaries
 
 - The server is cluster-only and ledger v2 is the sole operational protocol.
-  Server-owned apply activates schemas, stored queries and new graphs under the
-  existing writer admission; existing engines and runtime bindings stay owned.
+  Server-owned apply activates schemas, queries, policies, provider/Blob bindings
+  and explicitly confirmed graph lifecycle changes under existing writer admission.
+  Runtime views share engine authority and retain immutable request bindings.
   Direct apply bootstraps or deploys while serving is stopped. Legacy ledger
   conversion is explicit and preserves data; no v1 executor remains. Graph
-  deletion and replacement of existing runtime bindings are outside this class.
+  removal retains storage; adoption and missing-root recreation require exact
+  confirmations and never infer identity from matching schema text.
   One outstanding durable authority owns completion/recovery. Generic drain
   does not prove native-I/O settlement or authorize lock release; excluded raw
   and older writers remain an operator obligation.

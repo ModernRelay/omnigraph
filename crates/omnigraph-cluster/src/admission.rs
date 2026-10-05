@@ -313,7 +313,8 @@ pub(crate) async fn acquire_with_store(
     }))))
 }
 
-pub(crate) fn canonical_graph_uri(graph_uri: &str) -> Result<String, Diagnostic> {
+/// Canonical process-owner identity for a graph URI, including local aliases.
+pub fn canonical_graph_uri(graph_uri: &str) -> Result<String, Diagnostic> {
     omnigraph_storage::normalize_root_uri(graph_uri)
         .and_then(|root| omnigraph_storage::write_queue_root_identity(&root))
         .map_err(|error| {

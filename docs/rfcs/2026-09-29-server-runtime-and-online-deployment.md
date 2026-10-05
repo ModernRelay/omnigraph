@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - OmniGraph maintainers
 created: 2026-09-29
-updated: 2026-10-03
+updated: 2026-10-05
 discussion: https://github.com/ModernRelay/omnigraph/pull/799
 supersedes:
   - "0034"
@@ -19,7 +19,7 @@ blocked_on:
   - "B: native accepted-I/O settlement, completion-memory/local-I/O reserves and engine-work bounds"
   - "E0: backend-specific offline deployment/recovery qualification beyond the recorded evidence"
   - "E1: broader native resource and backend fault qualification beyond the recorded same-engine transition evidence"
-  - "Existing-cluster rollout: qualified data-preserving offline conversion to storage v13"
+  - "Existing-cluster rollout: qualified data-preserving offline conversion to storage v14"
   - "Azure: adversarial live-provider qualification under the retained admission wrapper"
 ---
 
@@ -30,7 +30,7 @@ blocked_on:
 The server owns admitted writes through completion and reports exact outcomes
 and graph availability. Ledger v2 is the sole deployment protocol: direct apply
 bootstraps a stopped cluster; server-owned apply changes schemas and stored
-queries and adds graphs without restarting.
+queries, policy/provider/Blob bindings and graph inventory without restarting.
 The engine publishes graph contents and their accepted schema together; the
 existing cluster ledger owns deployment input and applied results. No new
 transaction manager, content-recovery log or job queue is added.
@@ -76,11 +76,11 @@ captures coherent request bindings and supports atomic activation of a
 deployment's affected views. Startup loading remains observable; transient
 startup retry is separate work.
 
-The deployment class covers graph creation and changes to schemas and stored
-queries. Existing graph roots, graph format, policy, credentials, providers,
-trust and external-Blob bindings stay fixed; new graphs receive validated
-bindings in their creation input. Graph deletion and replacement of existing
-runtime bindings are not deployment effects. Schema apply remains main-only and
+The deployment class covers graph creation, schemas, stored queries, graph and
+cluster policies, embedding-provider definitions and bindings, and external-Blob
+rules. Exact lifecycle confirmations authorize graph removal, adoption and
+recreation; explicit catalog repair restores digest-verified payloads. Existing
+graph roots, storage format and credential/trust configuration stay fixed. Schema apply remains main-only and
 requires a single live branch. Unsupported migrations refuse before effects;
 dropping declarations does not reclaim retained data or require a destructive-
 schema override.
@@ -88,14 +88,14 @@ The following are outside this RFC:
 
 - independently available historical reads during a schema transition;
 - durable data-request idempotency keys and lookup after a lost response;
-- live replacement of other runtime bindings, additional serving roles and
+- live credential/trust replacement, additional serving roles and
   general-purpose recovery scheduling;
 - online binary/storage upgrades, automatic embedding and new test-harness protocols.
 
 Those capabilities need separate decisions. The former E2, F and G increments
 are no longer implementation commitments here. Narrow retry of transient graph
 startup/control failures remains in scope to prevent sticky quarantine. Existing
-clusters need a qualified offline v13 conversion before this rollout; its protocol
+clusters need a qualified offline v14 conversion before this rollout; its protocol
 belongs to [Explicit storage upgrades](0064-explicit-storage-upgrades.md).
 Current behavior and test ownership live in [writes](../dev/writes.md),
 [recovery](../dev/recovery.md), [serving](../dev/control-plane.md) and
@@ -205,7 +205,7 @@ terminates at cutoff and leaves unresolved outcomes for startup reconciliation.
 ## Serving views
 
 A serving view binds graph/root incarnation, schema/catalog identity, stored
-queries, fixed authorization/provider bindings and activation witness. Capture it
+queries, immutable authorization/provider bindings and activation witness. Capture it
 before dependent routing or authorization and retain it through the request.
 An engine snapshot remains per-attempt authority; a Session alone is not a
 serving view. Existing trust-file refresh retains its qualified fixed binding.
@@ -223,8 +223,10 @@ closing a graph, owns HTTP/MCP roots through their final logical users and allow
 exact-view resumption or exact achieved schema/query activation under fresh
 epochs. Preparation and resumption bind the real process runtime and share
 shutdown's synchronous boundary. The batch validates schema and query
-replacements together, retaining each existing engine, root and policy; only
-declared graph additions supply new handles. A completed refusal before effects
+replacements together. A runtime-binding replacement shares the existing engine
+coordinator, writer gates, schema authority and Lance sessions without reopening
+storage; its policy, provider client and Blob admission remain immutable. New,
+adopted and explicitly recreated graphs supply validated handles. A completed refusal before effects
 can explicitly abort, even after a drain deadline, restoring unchanged views
 under fresh epochs. Their gates retain old descendants, so a subsequent
 transition still waits for those owners. Expired or abandoned attempts without
@@ -236,7 +238,7 @@ bounded inventory limits these views, and stale ticket identity cannot resume th
 This retirement does not dispose a native candidate or release its charges.
 Logical request ownership does not by itself prove native settlement.
 
-Candidate validation uses read-only captured state. Current v13 engine `refresh`
+Candidate validation uses read-only captured state. Current v14 engine `refresh`
 reads storage and adopts an in-memory view; it no longer installs a contract.
 Changing the serving engine's view still belongs to the owned transition, not
 candidate validation. Read-write local open still performs a capability-probe
@@ -249,7 +251,9 @@ matching stored-query and engine-contract identities throughout; an old request
 cannot resume with old queries against a new contract. Writes, native controls,
 exports and maintenance that can interfere with apply or reclamation must finish
 with known outcomes. Apply then publishes atomically and activation validates
-the exact achieved contract and query bindings. Other effective bindings stay fixed.
+the exact achieved contract, queries and runtime bindings. Management policy and
+graph views activate together. Old admitted views keep their own bindings until
+they finish; candidate policy cannot authorize its own deployment.
 
 Any remaining native read tail must be proven unable to publish, reclaim or
 change serving bindings. Keep its immutable snapshot, input owners and existing
@@ -317,8 +321,9 @@ Conversion captures these from one coherent accepted engine view; successful
 schema outcomes advance them with the resource projection. Refusal and
 not-attempted outcomes preserve them. Bind the same map in the achieved base,
 reserve its encoded capacity, and compare the full identity before serving or
-accepting any deployment, including schema changes and after terminal receipt
-eviction. Matching or changed source text alone cannot adopt a recreated graph
+accepting changes to that graph, including runtime-only changes and after
+terminal receipt eviction. Unaffected graphs are not opened during preparation;
+their unavailability does not prevent an independent deployment. Matching or changed source text alone cannot adopt a recreated graph
 or different accepted IR. Explicit schema correction supplies a map from graph
 ID to the full observed contract through `--schema-correction FILE`. Bind this
 map into the immutable deployment input, compare every acknowledgement against
@@ -329,9 +334,11 @@ establish the acknowledged contract. Status and boot never manufacture one.
 
 The immutable input contains normalized configuration semantics and exact schema
 and stored-query bytes, including query deletions. Persist and verify their
-content-addressed bytes before acceptance. Existing roots, format and runtime bindings must match the applied projection.
-New graph declarations receive exact prepared creation identities; removing or
-replacing an existing graph refuses. Validate the whole
+content-addressed bytes before acceptance. Roots and format remain fixed;
+runtime-binding changes are explicit differences from the applied projection.
+New graph declarations receive exact prepared creation identities. Lifecycle
+confirmations are immutable input, never a bypass around current authority.
+Validate the whole
 effect set and every query against its intended accepted schema before the first
 schema effect. Execution and recovery never reread mutable configuration files.
 There is no digest-based sweep/import/refresh execution path.
@@ -389,7 +396,9 @@ principal in the accepted deployment. Candidate policy never authorizes a
 change to an existing graph; new graph bindings are part of the authorized
 creation input. No persisted approval is a capability. Recovery/lookup check the **current** caller's required
 authority: identity-authorized recovery requires existing `ConfigManage` plus
-graph `SchemaApply` for settlement and `Read` for disclosed evidence, as needed.
+graph `SchemaApply` and `Read` for schema settlement. Deployment status and result
+metadata require current `ConfigManage`, without graph-data `Read` on unrelated
+graphs; they disclose no rows or stored query/policy source.
 No new policy action or read-only right permits fence publication. Recovery can
 settle an earlier actor's outcome without impersonating that actor; preserve
 the original receipt attribution and record the actual recovery executor
@@ -536,10 +545,11 @@ independently of configuration discovery or current input files.
 
 | Command | Behavior |
 |---|---|
-| `omnigraph --cluster ROOT cluster upgrade-ledger --writers-stopped` | Explicit conversion to ledger v2; validate existing applied resources and v13 graphs, then conditionally replace the ledger. |
+| `omnigraph --cluster ROOT cluster upgrade-ledger --writers-stopped` | Explicit conversion to ledger v2; validate existing applied resources and v14 graphs, then conditionally replace the ledger. |
 | `omnigraph --cluster ROOT cluster status [--deployment-id ID]` | Bounded authorized lookup; return incarnation, next sequence, outstanding full ID and lock identity without graph opens or effects. |
-| `omnigraph cluster apply --config DIR [--deployment-id ID] [--schema-correction FILE]` | Bootstrap or execute under direct exclusive admission; allocate and emit the original ID unless supplied. |
-| `omnigraph cluster apply --server URL --config DIR [--deployment-id ID] [--schema-correction FILE]` | Submit captured input to the running owner; keep the PID/listener and activate coherent schema/query bindings and graph additions. |
+| `omnigraph cluster plan --config DIR [--lifecycle FILE]` | Run the same read-only preflight with the intended actor; show lifecycle work even when source digests are unchanged. |
+| `omnigraph cluster apply --config DIR [--deployment-id ID] [--lifecycle FILE]` | Bootstrap or execute under direct exclusive admission; allocate and emit the original ID unless supplied. |
+| `omnigraph cluster apply --server URL --config DIR [--deployment-id ID] [--lifecycle FILE]` | Submit captured input to the running owner; keep the PID/listener and activate coherent schema/query/policy/provider/Blob bindings and explicit graph lifecycle changes. |
 | `omnigraph cluster status --server URL [--deployment-id ID]` | Authorized ledger lookup plus an observation of whether that result is active in this process. |
 | `omnigraph --cluster ROOT cluster apply --deployment-id ID --writers-stopped` | Reconcile that original deployment only; never submit, use new files or replay schema effects. A terminal result is lookup-only. |
 | `omnigraph --cluster ROOT cluster force-unlock LOCK_ID` | Exact-ID release under the operator-exclusion/quiescence procedure; outstanding evidence remains intact. |
@@ -566,6 +576,50 @@ single conversion CAS; an interrupted/lost-ack conversion rereads the root and
 recognizes the same admitted v2 ledger. No automatic migration/downgrade occurs.
 Graph-format conversion remains separately gated by the storage-upgrade decision.
 
+### Explicit lifecycle and repair
+
+`cluster plan` and `cluster apply` accept `--lifecycle FILE`, a bounded JSON
+`DeploymentOptions` value captured with the sources. `schema_corrections` is the
+existing exact-contract correction map; `--schema-correction` is its mutually
+exclusive shorthand. No v1 executor, approval artifact or implicit refresh is
+introduced.
+
+- `delete_graphs` and `adopt_graphs` map IDs to the exact schema contract and
+  observed graph manifest version. Removal must agree with the desired inventory;
+  adoption requires a readable graph at the canonical derived root and matching
+  desired schema. Stale or unnecessary confirmations refuse before effects.
+- `recreate_graphs` acknowledges the previous achieved schema contract of a
+  missing managed graph. Its entire derived root must be absent. Creation uses
+  the existing prepared-birth protocol and records a new identity; it cannot
+  overwrite partial, foreign or retained data.
+- `repair_catalog` names exact policy/query resource addresses to restore from
+  content-addressed desired source bytes. Only those repairs affect admission. A storage owner may supply a missing applied policy only when
+  those bytes match its already-recorded digest. An authenticated caller cannot
+  authorize itself using a replacement for unreadable current policy.
+
+Graph removal unregisters its serving inventory and retains storage, rows,
+branches and history; the result explicitly reports retained storage. Reuse of
+that root requires exact adoption. Physical reclamation is not part of this
+ledger-only effect and cannot be inferred from a removal receipt. Preserve a
+removed runtime's engine owner by canonical URI until restart; exact readoption
+reuses it. Bound active plus retained owners at 2,048 and refuse additional roots
+before effects. Recreation refuses while a live or retained engine still owns
+that root, because draining request descendants does not prove native disposal.
+Startup-blocked entries without an engine can be recreated online.
+
+Policy grants, revocations and rebinding use the currently applied authority.
+Removing a provider still referenced by desired graphs fails configuration
+validation. A provider change does not re-embed stored vectors. Blob rules retain
+root-disjointness and server-safe projection checks. A terminal partial result
+publishes only achieved graph state; serving must install achieved management
+policy too, so a policy handoff cannot strand the corrective deployment.
+
+Plan runs the shared effect-free preparation for the captured lifecycle options
+and actor. Missing graphs, schema drift, unsupported migrations and branch
+restrictions are errors, not successful plans with a warning. Apply repeats
+those checks under writer admission; a plan is not a reservation or permission
+to replay a deployment.
+
 ## Online deployment
 
 `POST /cluster/deployments` accepts a client-known `deployment_id` and one
@@ -584,19 +638,19 @@ including activation; competing POSTs refuse without queueing. The accepted
 future belongs to the server through completion even if its HTTP caller leaves.
 
 Before any effect, validate captured input through the shared serving projection,
-resolve required provider secrets and validate new graph bindings. Close only
+resolve required provider secrets and validate all changed runtime bindings. Close only
 affected graph admissions in one batch. Drain their request descendants, then execute prepared
 intents using their existing engine handles and the server's retained root
 admission. Unaffected graphs continue serving. Install exact achieved schema
-contracts, validated query registries and new graph handles in one registry
-snapshot under the shutdown/attempt/deadline fence. Deterministic pre-effect
+contracts, validated query registries, engine runtime bindings, management policy
+and graph inventory in one registry snapshot under the shutdown/attempt/deadline fence. Deterministic pre-effect
 refusals resume the predecessor views under new epochs. Uncertain effects retain
 closed admission and the existing process-containment rule.
 
 After activation, persist a witness binding the achieved revision and config
 digest to this admission incarnation. Status reports `active` only when the
 witness belongs to this process, still matches the current achieved revision,
-and the affected graphs remain ready. Boot revision/digest stays a boot fact.
+and affected retained graphs remain ready while removed graphs remain absent. Boot revision/digest stays a boot fact.
 Original-ID resubmission is lookup-only before graph closure, including a
 historical inactive result. A late attempt cannot install an older view. A
 terminal inactive or partially converged predecessor permits a corrective
@@ -756,7 +810,7 @@ callbacks. Persistent or unknown failures remain explicit refusals with required
 action. Unsafe external-Blob policy, an uncomparable storage root, digest mismatch
 or unsupported format requires correction, not a transient retry. Candidate
 activation repeats the existing root-disjointness, server-safe policy projection
-and digest checks even though E1 keeps that policy fixed. Report phase, attempts,
+and digest checks for the achieved policy. Report phase, attempts,
 classified failure and limiting resource.
 Supervisor `Retry-After` requires a finite scheduled retry; admission 429 may give
 caller-backoff guidance without scheduling work. Neither header authorizes write
@@ -791,7 +845,7 @@ not a proven no-effect refusal. No general surface-hash or mixed-version
 negotiation framework is required.
 
 v0.12 is a software release, not internal manifest stamp 12. The current binary
-serves storage v13 only; normal open never migrates. Supported standalone roots
+serves storage v14 only; normal open never migrates. Supported standalone roots
 have explicit offline routes under the
 [current storage contract](../dev/versioning.md#current-storage-contract).
 Preserve graph data, identities, branches and retained history. Unsupported roots
@@ -1072,7 +1126,7 @@ schema interface with strict intent version 2, neutral settlement fencing and
 the [v2 ledger protocol](#ledger-v2). Protected evidence and
 prior-owner/control-I/O quiescence remain independent obligations.
 E0 does not wait for E1's retained-engine activation proof and does not claim it.
-Existing-cluster rollout also requires qualified offline v13 conversion.
+Existing-cluster rollout also requires qualified offline v14 conversion.
 E1 does not wait for deferred
 historical serving or data idempotency. Implement slices against the v0.12 contract
 and update their actual status, OpenAPI and user/developer documentation together.
@@ -1100,9 +1154,15 @@ Before enabling an affected increment, its owners must implement and qualify:
 4. Azure: qualify live-provider lease-loss and accepted-I/O faults while the
    existing wrapped server owns HTTP deployments.
 5. Storage/cluster: qualify data-preserving offline conversion of existing
-   cluster roots to v13 before rollout, under the storage-upgrade owner.
+   cluster roots to v14 before rollout, under the storage-upgrade owner.
 
 ## Decision log
+
+- 2026-10-05: Restore declarative policy/provider/Blob lifecycle and explicit
+  graph removal, adoption, recreation and catalog repair under the sole v2
+  protocol. Share exact read-only preparation with plan, limit graph opens to
+  affected resources, and activate achieved authorization coherently. Storage
+  upgrade and native-I/O settlement remain separate work.
 
 - 2026-10-03: Restore the original no-restart goal with one v2 execution protocol.
   Summary, scope, authority, serving views, durable deployment, CLI, online

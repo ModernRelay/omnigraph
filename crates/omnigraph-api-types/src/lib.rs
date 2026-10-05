@@ -2206,7 +2206,7 @@ pub enum GraphAvailabilityAction {
     None,
     WaitForStartup,
     WaitForTransition,
-    RestartAfterCorrection,
+    ApplyCorrectionOrRestart,
     WaitForRestart,
 }
 

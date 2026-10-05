@@ -35,6 +35,7 @@ mod store;
 mod types;
 pub use admission::{
     ClusterAdmission, ClusterAdmissionPurpose, acquire_cluster_admission, acquire_graph_admission,
+    canonical_graph_uri,
 };
 pub use authorization::{
     AuthorizedEffect, AuthorizedPlanOutput, IdentityAuthorization, PlanAuthorization,
@@ -56,8 +57,9 @@ pub use serve::{
     AdmittedServingSnapshot, RootBoundServingSnapshot, ServingBlockedGraph, ServingGraph,
     ServingPolicy, ServingQuery, ServingSnapshot, acquire_serving_admission,
     admit_serving_snapshot, cluster_graph_ids, cluster_root_for_graph_uri,
-    read_root_bound_serving_snapshot, read_root_bound_serving_snapshot_from_storage,
-    read_serving_snapshot, read_serving_snapshot_from_storage, resolve_graph_storage_uri,
+    read_deployment_serving_snapshot, read_root_bound_serving_snapshot,
+    read_root_bound_serving_snapshot_from_storage, read_serving_snapshot,
+    read_serving_snapshot_from_storage, resolve_graph_storage_uri,
 };
 use store::ClusterStore;
 pub use types::*;
@@ -145,10 +147,29 @@ pub async fn plan_config_dir_with_options(
     config_dir: impl AsRef<Path>,
     options: PlanOptions,
 ) -> PlanOutput {
-    // Keep the shared implementation off the forwarding caller's stack.
+    plan_config_dir_with_deployment_options(
+        config_dir,
+        options,
+        &DeploymentOptions::default(),
+        None,
+    )
+    .await
+}
+
+/// Read-only execution preflight for the exact lifecycle input and actor.
+/// This never acquires admission or persists a prepared intent; apply rechecks
+/// the same conditions under the current writer owner.
+pub async fn plan_config_dir_with_deployment_options(
+    config_dir: impl AsRef<Path>,
+    options: PlanOptions,
+    deployment_options: &DeploymentOptions,
+    actor: Option<String>,
+) -> PlanOutput {
     Box::pin(plan_config_dir_impl(
         config_dir.as_ref(),
         options,
+        deployment_options,
+        actor,
         None,
         &mut None,
     ))
@@ -166,6 +187,8 @@ pub async fn plan_config_dir_authorized(
     let plan = Box::pin(plan_config_dir_impl(
         config_dir.as_ref(),
         options,
+        &DeploymentOptions::default(),
+        None,
         Some(identity),
         &mut authorization,
     ))
@@ -179,6 +202,8 @@ pub async fn plan_config_dir_authorized(
 async fn plan_config_dir_impl(
     config_dir: &Path,
     options: PlanOptions,
+    deployment_options: &DeploymentOptions,
+    actor: Option<String>,
     identity: Option<&IdentityAuthorization>,
     authorization: &mut Option<PlanAuthorization>,
 ) -> PlanOutput {
@@ -287,6 +312,12 @@ async fn plan_config_dir_impl(
     if !has_errors(&diagnostics) {
         append_policy_binding_changes(&mut changes, prior_state.as_ref(), &desired);
         append_embedding_profile_changes(&mut changes, prior_state.as_ref(), &desired);
+        append_lifecycle_changes(
+            &mut changes,
+            &prior_resources,
+            &desired.resource_digests,
+            deployment_options,
+        );
     }
     // The same v2 scope rules govern previews and execution. A refused scope
     // is wholly pre-effect; no approval artifact can authorize a removed path.
@@ -298,7 +329,7 @@ async fn plan_config_dir_impl(
                 "convert the stopped cluster ledger to v2 before planning deployments",
             ));
         }
-        match capture_deployment(config_dir, &BTreeMap::new()) {
+        match capture_deployment_with_options(config_dir, deployment_options) {
             Ok(bundle) => preview_deployment_scope(state, &bundle).err(),
             Err(error) => Some(error),
         }
@@ -311,6 +342,7 @@ async fn plan_config_dir_impl(
             change.disposition = Some(
                 if matches!(resource_kind(&change.resource), ResourceKind::Graph(_))
                     && change.operation == PlanOperation::Update
+                    && change.lifecycle.is_none()
                 {
                     ApplyDisposition::Derived
                 } else {
@@ -346,10 +378,28 @@ async fn plan_config_dir_impl(
         }
     }
 
-    // Embed real migration steps for schema updates so plan is a data-aware
-    // preview; failures degrade to the digest diff with a warning.
+    if !has_errors(&diagnostics) {
+        let caller = match identity {
+            Some(identity) => DeploymentCaller::AuthenticatedIdentity(identity.clone()),
+            None => DeploymentCaller::storage_owner(actor),
+        };
+        let preflight = match capture_deployment_with_options(config_dir, deployment_options) {
+            Ok(bundle) => preflight_deployment(&bundle, &caller).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = preflight {
+            for change in &mut changes {
+                change.disposition = Some(ApplyDisposition::Blocked);
+                change.reason = Some(error.code.clone());
+            }
+            diagnostics.push(error);
+        }
+    }
+
+    // Include migration steps only after the exact read-only preflight. An
+    // unavailable preview is a refusal, never an executable-looking plan.
     for change in &mut changes {
-        if change.operation != PlanOperation::Update {
+        if has_errors(&diagnostics) || change.operation != PlanOperation::Update {
             continue;
         }
         let ResourceKind::Schema(graph_id) = resource_kind(&change.resource) else {
@@ -367,11 +417,15 @@ async fn plan_config_dir_impl(
         };
         match preview {
             Ok(migration) => change.migration = Some(migration),
-            Err(err) => diagnostics.push(Diagnostic::warning(
-                "schema_preview_unavailable",
-                change.resource.clone(),
-                format!("could not preview the schema migration: {err}"),
-            )),
+            Err(err) => {
+                change.disposition = Some(ApplyDisposition::Blocked);
+                change.reason = Some("schema_preview_unavailable".into());
+                diagnostics.push(Diagnostic::error(
+                    "schema_preview_unavailable",
+                    change.resource.clone(),
+                    format!("could not preview the schema migration: {err}"),
+                ));
+            }
         }
     }
     let blast_radius = compute_blast_radius(&changes, &desired.dependencies);
@@ -391,6 +445,68 @@ async fn plan_config_dir_impl(
         blast_radius,
         diagnostics,
     }
+}
+
+/// Lifecycle requests can have effects without any configuration digest change.
+/// Keep them in the same plan rather than returning an empty successful preview.
+fn append_lifecycle_changes(
+    changes: &mut Vec<PlanChange>,
+    prior: &BTreeMap<String, String>,
+    desired: &BTreeMap<String, String>,
+    options: &DeploymentOptions,
+) {
+    let actions = options
+        .delete_graphs
+        .keys()
+        .map(|id| {
+            (
+                format!("graph.{id}"),
+                PlanLifecycleAction::RemoveRetainingStorage,
+            )
+        })
+        .chain(
+            options
+                .adopt_graphs
+                .keys()
+                .map(|id| (format!("graph.{id}"), PlanLifecycleAction::Adopt)),
+        )
+        .chain(
+            options
+                .recreate_graphs
+                .keys()
+                .map(|id| (format!("graph.{id}"), PlanLifecycleAction::Recreate)),
+        )
+        .chain(options.schema_corrections.keys().map(|id| {
+            (
+                format!("graph.{id}"),
+                PlanLifecycleAction::CorrectSchemaContract,
+            )
+        }))
+        .chain(
+            options
+                .repair_catalog
+                .iter()
+                .map(|address| (address.clone(), PlanLifecycleAction::RepairCatalog)),
+        );
+    for (address, action) in actions {
+        if let Some(change) = changes.iter_mut().find(|change| change.resource == address) {
+            change.lifecycle = Some(action);
+        } else {
+            changes.push(PlanChange {
+                resource: address.clone(),
+                operation: PlanOperation::Update,
+                before_digest: prior.get(&address).cloned(),
+                after_digest: desired.get(&address).cloned(),
+                disposition: None,
+                reason: None,
+                binding_change: false,
+                metadata_change: None,
+                lifecycle: Some(action),
+                migration: None,
+            });
+        }
+    }
+    changes.sort_by(|a, b| a.resource.cmp(&b.resource));
 }
 
 pub async fn status_config_dir(config_dir: impl AsRef<Path>) -> StatusOutput {

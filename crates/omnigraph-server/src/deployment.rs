@@ -2,7 +2,7 @@
 //! Input and graph outcomes belong to the cluster ledger; this controller owns
 //! only request lifetime, graph admission and activation of serving bindings.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use axum::{
@@ -65,7 +65,12 @@ fn caller(state: &AppState, actor: &AuthenticatedActor) -> Result<DeploymentCall
     }
     crate::handlers::authorize_request(
         Some(actor),
-        state.server_policy.as_deref(),
+        state
+            .routing
+            .registry
+            .snapshot_ref()
+            .server_policy
+            .as_deref(),
         PolicyRequest {
             action: PolicyAction::ConfigManage,
             branch: None,
@@ -96,6 +101,8 @@ fn refusal(error: omnigraph_cluster::Diagnostic) -> ApiError {
 }
 
 fn uncertain(message: impl Into<String>) -> ApiError {
+    let message = message.into();
+    tracing::error!(reason = %message, "deployment requires reconciliation");
     ApiError::internal(message)
 }
 
@@ -111,12 +118,18 @@ fn active_result(
         return false;
     }
     matches!(lookup, Some(DeploymentLookup::Complete { result })
-        if result.result_revision == current_revision
-            && result.activation.as_ref().is_some_and(|active|
-                active.process_incarnation == owner.lock_id()
-                && active.result_revision == current_revision)
-            && result.graphs.keys().all(|id| GraphId::try_from(id.as_str()).is_ok_and(|id|
-                matches!(state.routing.registry.get(&GraphKey::cluster(id)), RegistryLookup::Ready(_)))))
+    if result.result_revision == current_revision
+        && result.activation.as_ref().is_some_and(|active|
+            active.process_incarnation == owner.lock_id()
+            && active.result_revision == current_revision)
+        && result.graphs.iter().all(|(id, outcome)| GraphId::try_from(id.as_str()).is_ok_and(|id| {
+            let current = state.routing.registry.get(&GraphKey::cluster(id));
+            if matches!(outcome, omnigraph_cluster::GraphDeploymentResult::Deleted { .. }) {
+                matches!(current, RegistryLookup::Gone)
+            } else {
+                matches!(current, RegistryLookup::Ready(_))
+            }
+        })))
 }
 
 #[utoipa::path(
@@ -249,7 +262,21 @@ async fn execute(
         omnigraph_cluster::deployment_affected_graphs(&request.deployment, &owner, &caller)
             .await
             .map_err(refusal)?;
-    validate_serving_candidate(&request.deployment, &owner, &caller, &affected).await?;
+    for id in request.deployment.options().recreate_graphs.keys() {
+        let key = GraphKey::cluster(
+            GraphId::try_from(id.as_str())
+                .map_err(|error| ApiError::bad_request(error.to_string()))?,
+        );
+        if matches!(
+            state.routing.registry.get(&key),
+            RegistryLookup::Ready(_) | RegistryLookup::Transitioning(_)
+        ) {
+            return Err(ApiError::conflict(format!(
+                "graph {id} retains a runtime owner; restart after correcting the missing root before recreation"
+            )));
+        }
+    }
+    let retained = validate_serving_candidate(&state, &request.deployment, &owner, &caller).await?;
     let mut keys = Vec::new();
     for id in &affected {
         let key = GraphKey::cluster(
@@ -257,7 +284,9 @@ async fn execute(
                 .map_err(|error| ApiError::bad_request(error.to_string()))?,
         );
         match state.routing.registry.get(&key) {
-            RegistryLookup::Ready(_) => keys.push(key),
+            RegistryLookup::Ready(_)
+            | RegistryLookup::Transitioning(_)
+            | RegistryLookup::Blocked(_) => keys.push(key),
             RegistryLookup::Gone => {} // a new graph becomes visible only after achieved publication
             _ => {
                 return Err(ApiError::conflict(format!(
@@ -269,7 +298,7 @@ async fn execute(
     let transition = state
         .routing
         .registry
-        .prepare_transition(
+        .prepare_deployment_transition(
             &state.operations,
             &keys,
             Instant::now() + TRANSITION_TIMEOUT,
@@ -306,6 +335,7 @@ async fn execute(
             .into_iter()
             .map(|(key, engine)| (key.graph_id.to_string(), engine)),
     );
+    live.extend(retained);
     let mut effects_started = false;
     let applied = omnigraph_cluster::apply_captured_deployment(
         &request.deployment,
@@ -344,61 +374,123 @@ async fn execute(
         .await
         .map_err(|error| {
             uncertain(format!(
-                "deployment applied; activation contract unavailable: {}",
+                "deployment applied; activation contracts unavailable: {}",
                 error.message
             ))
         })?;
-    let snapshot = omnigraph_cluster::read_serving_snapshot_from_storage(owner.canonical_root())
-        .await
-        .map_err(|_| {
-            uncertain("deployment applied; achieved serving snapshot could not be loaded")
-        })?;
-    let settings = crate::settings::settings_from_snapshot(
+    let snapshot =
+        omnigraph_cluster::read_deployment_serving_snapshot(owner.canonical_root(), &affected)
+            .await
+            .map_err(|_| uncertain("deployment applied; achieved serving snapshot unavailable"))?;
+    let settings = crate::settings::deployment_settings_from_snapshot(
         std::path::Path::new(owner.canonical_root()),
-        None,
-        false,
-        false,
         snapshot,
     )
     .map_err(|error| {
         uncertain(format!(
-            "deployment applied; serving configuration is invalid: {error}"
+            "deployment applied; achieved bindings invalid: {error}"
         ))
     })?;
-    let crate::ServerConfigMode::Multi { graphs, .. } = settings.mode;
-    let mut bindings = HashMap::new();
-    let mut additions = Vec::new();
+    let crate::ServerConfigMode::Multi {
+        graphs,
+        server_policy,
+        ..
+    } = settings.mode;
+    let server_policy =
+        prepare_management_policy(server_policy).map_err(|error| uncertain(error.message))?;
+    let mut handles = Vec::new();
+    let mut unavailable = Vec::new();
+    let mut removals: HashSet<_> = keys
+        .iter()
+        .filter(|key| !contracts.contains_key(key.graph_id.as_str()))
+        .cloned()
+        .collect();
     for graph in graphs {
-        if !affected.contains(&graph.graph_id) {
-            continue;
-        }
+        let id = graph.graph_id.clone();
         let contract = contracts
-            .get(&graph.graph_id)
+            .get(&id)
             .ok_or_else(|| uncertain("achieved schema contract is missing"))?
             .clone();
         let key = GraphKey::cluster(
-            GraphId::try_from(graph.graph_id.as_str())
-                .map_err(|error| uncertain(error.to_string()))?,
+            GraphId::try_from(id.as_str()).map_err(|error| uncertain(error.to_string()))?,
         );
-        if keys.contains(&key) {
-            if graph.startup_failure.is_some() {
-                return Err(uncertain("applied graph has invalid serving bindings"));
+        removals.remove(&key);
+        let uri = omnigraph::storage::normalize_root_uri(&graph.uri)
+            .map_err(|error| uncertain(format!("achieved graph URI is invalid: {error}")))?;
+        let prepared = match crate::prepare_single_graph(graph, Some(contract.clone())) {
+            Ok(prepared) => prepared,
+            Err(error) if !live.contains_key(&id) => {
+                unavailable.push(Arc::new(crate::BlockedGraph {
+                    key,
+                    uri,
+                    policy: error.policy,
+                    failure: error.failure,
+                }));
+                continue;
             }
-            bindings.insert(key, (contract, graph.queries));
-        } else {
-            let prepared =
-                crate::prepare_single_graph(graph, Some(contract.clone())).map_err(|error| {
-                    uncertain(format!("new graph serving preparation failed: {error}"))
+            Err(error) => {
+                return Err(uncertain(format!(
+                    "applied runtime bindings invalid: {error}"
+                )));
+            }
+        };
+        if let Some(engine) = live.get(&id) {
+            let policy = prepared
+                .pending
+                .policy
+                .as_ref()
+                .map(|policy| Arc::clone(policy) as Arc<dyn omnigraph_policy::PolicyChecker>);
+            let engine = Arc::new(
+                engine
+                    .with_runtime_bindings(
+                        policy,
+                        prepared.cfg.embedding.clone().map(Arc::new),
+                        prepared.cfg.external_blob_policy.clone(),
+                    )
+                    .map_err(|error| {
+                        uncertain(format!("applied runtime bindings invalid: {error}"))
+                    })?,
+            );
+            crate::verify_server_schema_contract(&engine, Some(&contract))
+                .map_err(|error| uncertain(format!("applied graph contract changed: {error}")))?;
+            let queries = crate::validate_and_attach(prepared.cfg.queries, &engine.catalog(), &id)
+                .map_err(|error| {
+                    uncertain(format!("applied stored queries are invalid: {error}"))
                 })?;
-            let opened = crate::open_prepared_graph(prepared)
-                .await
-                .map_err(|error| uncertain(format!("new graph serving open failed: {error}")))?;
-            additions.push((opened.handle, contract));
+            handles.push((
+                Arc::new(crate::GraphHandle {
+                    key,
+                    uri: prepared.pending.uri.clone(),
+                    engine,
+                    policy: prepared.pending.policy.clone(),
+                    queries,
+                }),
+                contract,
+            ));
+        } else {
+            match crate::open_prepared_graph(prepared).await {
+                Ok(opened) => handles.push((opened.handle, contract)),
+                Err(error) => unavailable.push(Arc::new(crate::BlockedGraph {
+                    key,
+                    uri,
+                    policy: error.policy,
+                    failure: error.failure,
+                })),
+            }
         }
     }
+    let fully_ready = unavailable.is_empty();
     transition
-        .activate(bindings, additions)
+        .activate_deployment(handles, removals, unavailable, server_policy)
         .map_err(|error| uncertain(format!("deployment applied; activation refused: {error}")))?;
+    if result.config_digest.is_none() || !fully_ready {
+        // Serving follows the exact achieved schema/query/runtime projection.
+        // Partial convergence never acknowledges the desired revision active.
+        return Ok(DeploymentResponse {
+            deployment: applied,
+            active: false,
+        });
+    }
     let activated = omnigraph_cluster::record_deployment_activation(
         owner.canonical_root(),
         &request.deployment_id,
@@ -431,27 +523,15 @@ async fn execute(
 /// preparation as startup, before accepting any deployment or graph effect.
 /// Unaffected bindings remain installed and are not reconfigured by this apply.
 async fn validate_serving_candidate(
+    state: &AppState,
     deployment: &CapturedDeployment,
     owner: &omnigraph_cluster::ClusterAdmission,
     caller: &DeploymentCaller,
-    affected: &[String],
-) -> Result<(), ApiError> {
-    let mut snapshot =
+) -> Result<BTreeMap<String, Arc<omnigraph::db::Omnigraph>>, ApiError> {
+    let snapshot =
         omnigraph_cluster::preview_deployment_serving_snapshot(deployment, owner, caller)
             .await
             .map_err(refusal)?;
-    snapshot
-        .graphs
-        .retain(|graph| affected.contains(&graph.graph_id));
-    snapshot
-        .quarantined_graphs
-        .retain(|graph| affected.contains(&graph.graph_id));
-    snapshot
-        .queries
-        .retain(|query| affected.contains(&query.graph_id));
-    snapshot
-        .applied_graphs
-        .retain(|graph| affected.contains(graph));
     let settings = crate::settings::settings_from_snapshot(
         std::path::Path::new(owner.canonical_root()),
         None,
@@ -464,13 +544,90 @@ async fn validate_serving_candidate(
             "deployment serving configuration is invalid: {error}"
         ))
     })?;
-    let crate::ServerConfigMode::Multi { graphs, .. } = settings.mode;
+    let crate::ServerConfigMode::Multi {
+        graphs,
+        server_policy,
+        ..
+    } = settings.mode;
+    prepare_management_policy(server_policy)?;
+    state
+        .routing
+        .registry
+        .validate_owner_capacity(
+            &graphs
+                .iter()
+                .map(|graph| graph.uri.clone())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| ApiError::conflict(error.to_string()))?;
+    let mut retained = BTreeMap::new();
     for graph in graphs {
-        crate::prepare_single_graph(graph, None).map_err(|error| {
+        let id = graph.graph_id.clone();
+        let prepared = crate::prepare_single_graph(graph, None).map_err(|error| {
             ApiError::conflict(format!("deployment serving preparation failed: {error}"))
         })?;
+        let retired = state
+            .routing
+            .registry
+            .retained_engine(&prepared.pending.uri)
+            .map_err(|error| ApiError::conflict(error.to_string()))?;
+        if let Some(engine) = &retired {
+            let confirmation = deployment.options().adopt_graphs.get(&id).ok_or_else(|| {
+                ApiError::conflict(format!("graph {id} retains a deleted runtime owner; exact adoption or restart is required"))
+            })?;
+            let snapshot = engine
+                .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+                .await
+                .map_err(|error| ApiError::from_omni(error.before_effect()))?;
+            if engine.schema_contract_digest() != confirmation.contract
+                || snapshot.graph_manifest_version() != confirmation.graph_manifest_version
+            {
+                return Err(ApiError::conflict(format!(
+                    "graph {id} retained owner does not match the adoption confirmation"
+                )));
+            }
+            retained.insert(id, Arc::clone(engine));
+        }
+        let engine = match state.routing.registry.get(&prepared.pending.key) {
+            RegistryLookup::Ready(view) | RegistryLookup::Transitioning(view) => {
+                Some(Arc::clone(&view.engine))
+            }
+            _ => retired,
+        };
+        if let Some(engine) = engine {
+            let policy = prepared
+                .pending
+                .policy
+                .as_ref()
+                .map(|policy| Arc::clone(policy) as Arc<dyn omnigraph_policy::PolicyChecker>);
+            let engine = engine
+                .with_runtime_bindings(
+                    policy,
+                    prepared.cfg.embedding.clone().map(Arc::new),
+                    prepared.cfg.external_blob_policy.clone(),
+                )
+                .map_err(|error| {
+                    ApiError::conflict(format!("deployment runtime bindings are invalid: {error}"))
+                })?;
+            drop(engine);
+        }
     }
-    Ok(())
+    Ok(retained)
+}
+
+fn prepare_management_policy(
+    source: Option<crate::PolicySource>,
+) -> Result<Option<Arc<crate::PolicyEngine>>, ApiError> {
+    match source {
+        Some(crate::PolicySource::Inline(source)) => {
+            Some(crate::PolicyEngine::load_cluster_from_source(&source))
+        }
+        Some(crate::PolicySource::File(path)) => Some(crate::PolicyEngine::load_cluster(&path)),
+        None => None,
+    }
+    .transpose()
+    .map_err(|error| ApiError::conflict(format!("invalid management policy: {error}")))
+    .map(|policy| policy.map(Arc::new))
 }
 
 fn abort_before_effects(

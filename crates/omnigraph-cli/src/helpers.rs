@@ -35,6 +35,32 @@ pub(crate) fn read_schema_corrections(
         .map_err(|error| color_eyre::eyre::eyre!("invalid schema correction JSON: {error}"))
 }
 
+pub(crate) fn read_deployment_options(
+    lifecycle: Option<&std::path::Path>,
+    correction: Option<&std::path::Path>,
+) -> Result<omnigraph_cluster::DeploymentOptions> {
+    use std::io::Read;
+    if let Some(path) = lifecycle {
+        if correction.is_some() {
+            bail!("--lifecycle and --schema-correction cannot be combined");
+        }
+        let limit = omnigraph_cluster::MAX_BUNDLE_BYTES;
+        let mut bytes = Vec::new();
+        fs::File::open(path)?
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            bail!("lifecycle file exceeds the {limit}-byte deployment input limit");
+        }
+        return serde_json::from_slice(&bytes)
+            .map_err(|error| color_eyre::eyre::eyre!("invalid lifecycle JSON: {error}"));
+    }
+    Ok(omnigraph_cluster::DeploymentOptions {
+        schema_corrections: read_schema_corrections(correction)?,
+        ..Default::default()
+    })
+}
+
 pub(crate) fn ensure_local_graph_parent(uri: &str) -> Result<()> {
     if !uri.contains("://") {
         fs::create_dir_all(uri)?;

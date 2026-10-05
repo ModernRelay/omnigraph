@@ -30,9 +30,10 @@ An applied empty cluster creates no default graph and serves an empty inventory.
 Missing or unapplied state, or a nonempty cluster whose graphs all fail, refuses
 startup. Authentication, policy and data-token root checks still apply.
 
-Use `cluster apply --server URL --config DIR` for schema/query changes and graph
-additions without restart. Direct apply requires stopped serving and a subsequent start. Graph deletion and changes to existing runtime
-bindings are outside this deployment class; see [cluster deployments](../clusters/index.md).
+Use `cluster apply --server URL --config DIR` for schema, query, policy,
+provider and Blob-rule changes without restart. Explicit graph lifecycle changes
+use the same deployment. Direct apply requires stopped serving and a subsequent
+start; see [cluster deployments](../clusters/index.md).
 An unapplied resource edit does not activate it, although changing or breaking
 the directory's config can change where boot looks for applied state.
 
@@ -129,10 +130,9 @@ clock up to 30 seconds ahead, so at most 86,430 seconds can remain on admission.
 Expiry has no grace period. Logout or a permission change at the issuer does
 not revoke an issued token; already accepted operations can finish after
 expiry. Stored-query calls need `invoke_query` plus `read` or `change` for the
-body. Existing policy bindings remain fixed across deployments; editing a
-policy source file does not change permissions. Schema changes use
-`cluster apply --server` and its [current-policy authorization](policy.md#actions);
-the identity credential supplies no permission or ownership bypass.
+body. Apply policy changes through `cluster apply --server`; editing a source
+file alone does not change permissions. Deployment uses
+[current-policy authorization](policy.md#actions); the identity credential supplies no bypass.
 
 Static credentials can coexist for operator recovery. An exact configured
 static credential keeps its existing authority, including credentials with

@@ -1282,7 +1282,7 @@ rules:
         assert_eq!(body["graphs"][1]["graph_id"], "beta");
         assert_eq!(body["graphs"][1]["state"], "blocked");
         assert_eq!(body["graphs"][1]["failure"], "open_failed");
-        assert_eq!(body["graphs"][1]["action"], "restart_after_correction");
+        assert_eq!(body["graphs"][1]["action"], "apply_correction_or_restart");
         assert_eq!(body["graphs"][1]["read_available"], false);
         assert_eq!(body["graphs"][1]["write_available"], false);
         assert!(body.get("quarantined").is_none());
@@ -2320,7 +2320,7 @@ async fn live_deployment_retains_disconnected_owner_and_never_replays_original_i
     let RegistryLookup::Ready(current) = state.routing().registry.get(&key) else {
         panic!("ready")
     };
-    assert!(Arc::ptr_eq(&original_engine, &current.engine));
+    assert!(original_engine.shares_runtime_owner(&current.engine));
     assert_ne!(current.engine.schema_contract_digest(), original_contract);
     let committed_head = original_engine.list_commits(None).await.unwrap()[0]
         .graph_commit_id
@@ -2355,4 +2355,383 @@ async fn live_deployment_retains_disconnected_owner_and_never_replays_original_i
     assert_eq!(old["active"], false);
     assert_eq!(original_engine.schema_contract_digest(), latest_contract);
     assert!(!state.operation_runtime().snapshot().closed);
+
+    // Unrelated runtime payload loss cannot veto another graph's cutover.
+    // The already-admitted knowledge view retains its verified query source.
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(temp.path().join("__cluster/state.json")).unwrap())
+            .unwrap();
+    let query_digest =
+        ledger["applied_revision"]["resources"]["query.knowledge.find_person"]["digest"]
+            .as_str()
+            .unwrap();
+    let catalog_query = temp.path().join(format!(
+        "__cluster/resources/query/knowledge/find_person/{query_digest}.gq"
+    ));
+    let source = fs::read(&catalog_query).unwrap();
+    fs::remove_file(&catalog_query).unwrap();
+    fs::write(
+        temp.path().join("peer.pg"),
+        "node Peer { name: String @key note: String? }\n",
+    )
+    .unwrap();
+    let independent = omnigraph_cluster::capture_deployment(temp.path(), &BTreeMap::new()).unwrap();
+    let (next, _) = status(&app, None).await;
+    let (code, changed) = json_response(
+        &app,
+        submit(&next.next_deployment_id(), &independent, "operator-token"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{changed}");
+    assert_eq!(changed["active"], true);
+    assert!(
+        !catalog_query.exists(),
+        "unrelated corruption must not be silently repaired"
+    );
+    assert!(!state.operation_runtime().snapshot().closed);
+    fs::write(catalog_query, source).unwrap();
+
+    // Recreation cannot dispose a retained native owner, even after graph
+    // admission drains. Refuse before recording an operation or touching data.
+    let recreate = omnigraph_cluster::capture_deployment_with_options(
+        temp.path(),
+        &omnigraph_cluster::DeploymentOptions {
+            recreate_graphs: BTreeMap::from([("knowledge".to_owned(), latest_contract.clone())]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let (next, _) = status(&app, None).await;
+    let ledger_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+    let (code, refused) = json_response(
+        &app,
+        submit(&next.next_deployment_id(), &recreate, "operator-token"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("retains a runtime owner")
+    );
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        ledger_before
+    );
+    assert!(matches!(
+        state.routing().registry.get(&key),
+        RegistryLookup::Ready(_)
+    ));
+
+    // Existing policies can grant and revoke writes on the same runtime.
+    // Candidate authorization cannot grant its submitter permission to apply.
+    let old_policy = fs::read_to_string(temp.path().join("policy.yaml")).unwrap();
+    let old_management = fs::read_to_string(temp.path().join("cluster-policy.yaml")).unwrap();
+    let granted = old_policy.replace("actions: [read]", "actions: [read, change]");
+    fs::write(temp.path().join("policy.yaml"), &granted).unwrap();
+    fs::write(
+        temp.path().join("cluster-policy.yaml"),
+        old_management.replace("[operator]", "[reader]"),
+    )
+    .unwrap();
+    let denied_candidate =
+        omnigraph_cluster::capture_deployment(temp.path(), &BTreeMap::new()).unwrap();
+    let (next, _) = status(&app, None).await;
+    let ledger_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+    let (code, _) = json_response(
+        &app,
+        submit(
+            &next.next_deployment_id(),
+            &denied_candidate,
+            "reader-token",
+        ),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        ledger_before
+    );
+    fs::write(temp.path().join("cluster-policy.yaml"), &old_management).unwrap();
+    let grant = omnigraph_cluster::capture_deployment(temp.path(), &BTreeMap::new()).unwrap();
+    let (code, body) = json_response(
+        &app,
+        submit(&next.next_deployment_id(), &grant, "operator-token"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["active"], true);
+
+    fn change(body: Body) -> Request<Body> {
+        Request::post("/graphs/knowledge/change")
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("authorization", "Bearer reader-token")
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap()
+    }
+    let mutation = serde_json::json!({"query":"query add() { insert Person { name: \"Granted\" } }", "name":"add"});
+    let (code, body) = json_response(&app, change(Body::from(mutation.to_string()))).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+
+    // A revocation waits for a request admitted under the granted policy. New
+    // captures close immediately; after cutover neither HTTP nor engine bypass
+    // can use the old grant.
+    let (polled, body_polled) = tokio::sync::oneshot::channel();
+    let (release, body_released) = tokio::sync::oneshot::channel();
+    let parked = change(Body::from_stream(futures::stream::once(async move {
+        polled.send(()).unwrap();
+        body_released.await.unwrap();
+        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+            br#"{"query":"query add() { insert Person { name: \"BeforeRevocation\" } }","name":"add"}"#,
+        ))
+    })));
+    let request_app = app.clone();
+    let writer = tokio::spawn(async move { json_response(&request_app, parked).await });
+    tokio::time::timeout(Duration::from_secs(10), body_polled)
+        .await
+        .unwrap()
+        .unwrap();
+    fs::write(temp.path().join("policy.yaml"), &old_policy).unwrap();
+    let revoke = omnigraph_cluster::capture_deployment(temp.path(), &BTreeMap::new()).unwrap();
+    let (next, _) = status(&app, None).await;
+    let revoke_request = submit(&next.next_deployment_id(), &revoke, "operator-token");
+    let request_app = app.clone();
+    let revoker = tokio::spawn(async move { json_response(&request_app, revoke_request).await });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(
+            state.routing().registry.get(&key),
+            RegistryLookup::Transitioning(_)
+        ) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !revoker.is_finished(),
+        "revocation must await admitted requests"
+    );
+    let (code, _) = json_response(&app, change(Body::from(mutation.to_string()))).await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+    release.send(()).unwrap();
+    let (code, body) = writer.await.unwrap();
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let (code, body) = revoker.await.unwrap();
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let (code, _) = json_response(&app, change(Body::from(mutation.to_string()))).await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    let RegistryLookup::Ready(revoked) = state.routing().registry.get(&key) else {
+        panic!("ready")
+    };
+    assert!(revoked.engine.shares_runtime_owner(&original_engine));
+    let engine = omnigraph::Session::from_defaults(Arc::clone(&revoked.engine), Default::default());
+    assert!(matches!(
+        engine
+            .mutate_as(
+                "main",
+                "query add() { insert Person { name: \"EngineBypass\" } }",
+                "add",
+                &Default::default(),
+                Some("reader")
+            )
+            .await,
+        Err(omnigraph::error::OmniError::Policy(_))
+    ));
+
+    // Provider definitions, graph selection and Blob allowlists are runtime
+    // settings. Updating and removing them keeps data/history and writer owner.
+    let base_config = fs::read_to_string(temp.path().join("cluster.yaml")).unwrap();
+    for model in ["first-model", "second-model"] {
+        let bound = base_config.replace("    schema: ./people.pg\n", "    schema: ./people.pg\n    embedding_provider: selected\n    external_blobs:\n      allow:\n        - base: s3://lifecycle-assets/allowed\n          scope: server_safe\n");
+        fs::write(temp.path().join("cluster.yaml"), format!("{bound}providers:\n  embedding:\n    selected:\n      kind: mock\n      model: {model}\n")).unwrap();
+        let candidate =
+            omnigraph_cluster::capture_deployment(temp.path(), &BTreeMap::new()).unwrap();
+        let (next, _) = status(&app, None).await;
+        let (code, body) = json_response(
+            &app,
+            submit(&next.next_deployment_id(), &candidate, "operator-token"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert_eq!(body["active"], true);
+        let RegistryLookup::Ready(view) = state.routing().registry.get(&key) else {
+            panic!("ready")
+        };
+        assert!(view.engine.shares_runtime_owner(&original_engine));
+    }
+    // An invalid replacement cannot remove the currently working bindings.
+    let provider_config = fs::read_to_string(temp.path().join("cluster.yaml")).unwrap();
+    let broken = provider_config.replace(
+        "kind: mock",
+        &format!("kind: openai-compatible\n      api_key: ${{{missing_key}}}"),
+    );
+    fs::write(temp.path().join("cluster.yaml"), broken).unwrap();
+    let candidate = omnigraph_cluster::capture_deployment(temp.path(), &BTreeMap::new()).unwrap();
+    let (next, _) = status(&app, None).await;
+    let ledger_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+    let RegistryLookup::Ready(before) = state.routing().registry.get(&key) else {
+        panic!("ready")
+    };
+    let (code, _) = json_response(
+        &app,
+        submit(&next.next_deployment_id(), &candidate, "operator-token"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    let RegistryLookup::Ready(after) = state.routing().registry.get(&key) else {
+        panic!("ready")
+    };
+    assert!(Arc::ptr_eq(&before, &after));
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        ledger_before
+    );
+    fs::write(temp.path().join("cluster.yaml"), &base_config).unwrap();
+    let removed_bindings =
+        omnigraph_cluster::capture_deployment(temp.path(), &BTreeMap::new()).unwrap();
+    let (code, body) = json_response(
+        &app,
+        submit(
+            &next.next_deployment_id(),
+            &removed_bindings,
+            "operator-token",
+        ),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+
+    // Explicit removal hides the graph; exact adoption restores its data and
+    // history rather than recreating it. Both activate without a restart.
+    let peer_key = GraphKey::cluster(GraphId::try_from("peer").unwrap());
+    let RegistryLookup::Ready(peer) = state.routing().registry.get(&peer_key) else {
+        panic!("ready")
+    };
+    let confirmation = omnigraph_cluster::GraphLifecycleConfirmation {
+        contract: peer.engine.schema_contract_digest(),
+        graph_manifest_version: peer
+            .engine
+            .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .graph_manifest_version(),
+    };
+    let peer_owner = Arc::clone(&peer.engine);
+    let removed = base_config
+        .replace("  peer:\n    schema: ./peer.pg\n", "")
+        .replace("[knowledge, peer]", "[knowledge]");
+    fs::write(temp.path().join("cluster.yaml"), &removed).unwrap();
+    let options = omnigraph_cluster::DeploymentOptions {
+        delete_graphs: BTreeMap::from([("peer".into(), confirmation.clone())]),
+        ..Default::default()
+    };
+    let candidate =
+        omnigraph_cluster::capture_deployment_with_options(temp.path(), &options).unwrap();
+    let (next, _) = status(&app, None).await;
+    let (code, body) = json_response(
+        &app,
+        submit(&next.next_deployment_id(), &candidate, "operator-token"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["active"], true);
+    assert!(matches!(
+        state.routing().registry.get(&peer_key),
+        RegistryLookup::Gone
+    ));
+    assert!(temp.path().join("graphs/peer.omni").exists());
+    fs::write(temp.path().join("cluster.yaml"), &base_config).unwrap();
+    let options = omnigraph_cluster::DeploymentOptions {
+        adopt_graphs: BTreeMap::from([("peer".into(), confirmation.clone())]),
+        ..Default::default()
+    };
+    let candidate =
+        omnigraph_cluster::capture_deployment_with_options(temp.path(), &options).unwrap();
+    let (next, _) = status(&app, None).await;
+    // A read-only retained-owner check can fail before deployment acceptance.
+    // Temporarily hide its manifest to exercise the storage failure boundary.
+    let manifest = temp.path().join("graphs/peer.omni/__manifest");
+    let held_manifest = temp.path().join("held-peer-manifest");
+    fs::rename(&manifest, &held_manifest).unwrap();
+    let ledger_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+    let (code, refused) = json_response(
+        &app,
+        submit(&next.next_deployment_id(), &candidate, "operator-token"),
+    )
+    .await;
+    fs::rename(held_manifest, manifest).unwrap();
+    assert!(!code.is_success(), "{refused}");
+    assert!(
+        !state.operation_runtime().snapshot().closed,
+        "preflight read failure must not contain the process: {refused}"
+    );
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        ledger_before
+    );
+    let (code, body) = json_response(
+        &app,
+        submit(&next.next_deployment_id(), &candidate, "operator-token"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["active"], true);
+    let RegistryLookup::Ready(peer) = state.routing().registry.get(&peer_key) else {
+        panic!("ready")
+    };
+    assert!(peer_owner.shares_runtime_owner(&peer.engine));
+    assert_eq!(peer.engine.schema_contract_digest(), confirmation.contract);
+    assert_eq!(
+        peer.engine
+            .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .graph_manifest_version(),
+        confirmation.graph_manifest_version
+    );
+
+    // Management-policy handoff takes effect on all cloned routers. The old
+    // administrator cannot deploy or list; the newly granted one can observe.
+    fs::write(
+        temp.path().join("cluster-policy.yaml"),
+        format!(
+            "{}  - id: inventory\n    allow:\n      actors: {{ group: admins }}\n      actions: [graph_list]\n",
+            old_management.replace("[operator]", "[reader]")
+        ),
+    )
+    .unwrap();
+    let candidate = omnigraph_cluster::capture_deployment(temp.path(), &BTreeMap::new()).unwrap();
+    let (next, _) = status(&app, None).await;
+    let (code, body) = json_response(
+        &app,
+        submit(&next.next_deployment_id(), &candidate, "operator-token"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["active"], true);
+    assert_eq!(
+        json_response(&app, get_request("/cluster/deployments", "operator-token"))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        json_response(&app, get_request("/cluster/deployments", "reader-token"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        json_response(&app, get_request("/graphs", "operator-token"))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        json_response(&app, get_request("/graphs", "reader-token"))
+            .await
+            .0,
+        StatusCode::OK
+    );
 }

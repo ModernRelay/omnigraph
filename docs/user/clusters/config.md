@@ -205,7 +205,7 @@ Prefer relative paths; they are what keep a bundle portable and hermetic.
 |---|---:|---|
 | `validate` | no | Parse and type-check the declaration |
 | `plan` | no | Preview desired differences; unsupported deployment effects still refuse |
-| `apply` | yes | Bootstrap, add graphs, or update schemas and queries |
+| `apply` | yes | Converge graph inventory, schemas, queries, policies and provider/Blob settings |
 | `status` | no | Read recorded deployment and lock status; server status also observes activation |
 | `observe` | no | Report current observations without changing authority |
 | `force-unlock` | yes | Remove one proven-stale lock by exact ID |
@@ -214,8 +214,9 @@ Prefer relative paths; they are what keep a bundle portable and hermetic.
 All execution uses ledger v2 and requires `state.lock: true`. With `--server`,
 apply submits to the existing writer and activates without restart. Direct
 apply owns exclusive admission and requires an explicit handoff before serving.
-Existing roots and runtime bindings stay fixed; graph additions receive their
-new bindings with creation. Graph deletion is not a supported deployment effect.
+Existing roots and storage formats stay fixed. Policy/provider/Blob bindings can
+change; explicit graph removal retains storage for confirmed adoption. See
+[lifecycle and repair](index.md#explicit-lifecycle-and-repair).
 Apply does not load rows or start servers. Root-addressed status, reconciliation
 and conversion do not use `cluster.yaml`; see [the deployment workflow](index.md).
 

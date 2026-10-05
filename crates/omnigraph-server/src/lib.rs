@@ -397,11 +397,6 @@ pub struct AppState {
     bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
     data_token_trust: Option<Arc<data_tokens::DataTokenTrust>>,
     oidc_identity_trust: Option<Arc<oidc_identity::OidcIdentityTrust>>,
-    /// Server-level Cedar policy. Used by management endpoints (`GET
-    /// /graphs`) which act on the registry resource, not on a per-graph
-    /// resource. Loaded from the cluster-scoped policy binding when
-    /// configured. Per-graph policies live on each `GraphHandle.policy`.
-    server_policy: Option<Arc<PolicyEngine>>,
     /// Bounded process-wide ownership for queued served-export bytes. The
     /// response body and detached producer jointly retain each reservation.
     export_transport: export_transport::ExportTransport,
@@ -768,7 +763,6 @@ impl AppState {
             },
             workload,
             bearer_tokens,
-            server_policy: None,
             data_token_trust: None,
             oidc_identity_trust: None,
             operations: operations::OperationRuntime::new(),
@@ -812,6 +806,7 @@ impl AppState {
     ) -> std::result::Result<Self, InsertError> {
         let bearer_tokens = hash_bearer_tokens(bearer_tokens);
         let registry = Arc::new(GraphRegistry::from_entries(entries)?);
+        registry.initialize_server_policy(server_policy.map(Arc::new));
         Ok(Self {
             cluster_admission: None,
             deployments: Arc::new(deployment::DeploymentRuntime::default()),
@@ -821,7 +816,6 @@ impl AppState {
             },
             workload: Arc::new(workload),
             bearer_tokens,
-            server_policy: server_policy.map(Arc::new),
             data_token_trust: None,
             oidc_identity_trust: None,
             operations: operations::OperationRuntime::new(),
@@ -924,14 +918,15 @@ impl AppState {
         {
             return true;
         }
-        if self.server_policy.is_some() {
+        let snapshot = self.routing.registry.snapshot_ref();
+        if snapshot.server_policy.is_some() {
             return true;
         }
         // Any per-graph policy also requires auth — otherwise the
         // policy gate would receive unauthenticated requests. Reading
         // the cached `any_per_graph_policy` flag off the registry
         // snapshot is O(1).
-        self.routing.registry.snapshot_ref().any_per_graph_policy
+        snapshot.any_per_graph_policy
     }
 
     fn authenticate_bearer_token(&self, provided_token: &str) -> Option<AuthenticatedActor> {
@@ -2848,7 +2843,7 @@ async fn prepare_multi_graph_state(
         }
     }
 
-    // Server-level policy (loaded once, applies to management endpoints).
+    // Initial server-level policy, replaced atomically by deployment activation.
     // The placeholder graph_id `"server"` is the sentinel the Cedar
     // resource-model refactor maps to the singleton
     // `Omnigraph::Server::"root"` entity at evaluation time.

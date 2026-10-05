@@ -662,7 +662,7 @@ fn explicit_graph_discovery_preserves_jwt_shaped_static_catalog_and_skips_contex
         let reply = if discovery {
             serde_json::json!({"graphs":[{"graph_id":"alpha","display_name":"alpha"}]})
         } else {
-            serde_json::json!({"graphs":[{"graph_id":"alpha","uri":"file:///private/alpha","state":"ready","read_available":true,"write_available":true,"action":"none"},{"graph_id":"beta","uri":"file:///private/beta","state":"blocked","read_available":false,"write_available":false,"failure":"open_failed","action":"restart_after_correction"}]})
+            serde_json::json!({"graphs":[{"graph_id":"alpha","uri":"file:///private/alpha","state":"ready","read_available":true,"write_available":true,"action":"none"},{"graph_id":"beta","uri":"file:///private/beta","state":"blocked","read_available":false,"write_available":false,"failure":"open_failed","action":"apply_correction_or_restart"}]})
         };
         let server = IntentApiFixture::graph(vec![IntentReply::json(200, reply.clone())]);
         let mut command = cli();

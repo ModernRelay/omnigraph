@@ -17,8 +17,9 @@ use tokio::time::Instant;
 use crate::ApiError;
 use crate::identity::GraphKey;
 use crate::operations::OperationRuntime;
+#[cfg(test)]
 use crate::queries::QueryRegistry;
-use crate::registry::{GraphHandle, GraphRegistry};
+use crate::registry::{BlockedGraph, GraphHandle, GraphRegistry};
 
 /// A non-reusable epoch within one registered graph's lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,7 +38,7 @@ impl ServingEpoch {
     }
 }
 
-/// Immutable bindings for one epoch. Changed bindings retain the same engine;
+/// Immutable bindings for one epoch. Changed bindings retain the engine owner;
 /// a view is not an engine snapshot or a native settlement proof.
 pub struct ServingView {
     handle: Arc<GraphHandle>,
@@ -256,6 +257,8 @@ impl From<ApiError> for ServingTransitionError {
 /// Arc identity fences stale tickets without a second persistent identity.
 pub(crate) struct TransitionRecord {
     pub(crate) predecessors: Vec<Arc<ServingView>>,
+    pub(crate) unavailable: Vec<Arc<BlockedGraph>>,
+    pub(crate) recovering: std::collections::HashSet<GraphKey>,
     pub(crate) deadline: Instant,
 }
 
@@ -324,12 +327,9 @@ impl GraphTransition {
     ) -> Result<HashMap<GraphKey, Arc<Omnigraph>>, ServingTransitionError> {
         self.operations.while_open(|| {
             self.registry.check_drained(&self.record)?;
-            if self
-                .record
-                .predecessors
-                .iter()
-                .any(|view| !view.contract_is_current())
-            {
+            if self.record.predecessors.iter().any(|view| {
+                !self.record.recovering.contains(&view.key) && !view.contract_is_current()
+            }) {
                 return Err(ServingTransitionError::SchemaChanged);
             }
             Ok(self
@@ -344,6 +344,7 @@ impl GraphTransition {
     /// Publish complete query/schema bindings only after the deployment
     /// controller has recorded their durable achieved state. All replacement
     /// engines and policies stay identical; additions are already durable graphs.
+    #[cfg(test)]
     pub(crate) fn activate(
         self,
         bindings: HashMap<GraphKey, (SchemaContractDigest, QueryRegistry)>,
@@ -354,6 +355,28 @@ impl GraphTransition {
             .validate_activation(&self.record, bindings, additions)?;
         self.operations
             .while_open(|| self.registry.activate(&self.record, replacements))
+    }
+
+    /// Publish graph lifecycle and authorization changes in one registry snapshot.
+    pub(crate) fn activate_deployment(
+        self,
+        handles: Vec<(Arc<GraphHandle>, SchemaContractDigest)>,
+        removals: std::collections::HashSet<GraphKey>,
+        unavailable: Vec<Arc<BlockedGraph>>,
+        server_policy: Option<Arc<crate::PolicyEngine>>,
+    ) -> Result<HashMap<GraphKey, ServingEpoch>, ServingTransitionError> {
+        let views = self
+            .registry
+            .validate_deployment_activation(&self.record, handles)?;
+        self.operations.while_open(|| {
+            self.registry.activate_deployment(
+                &self.record,
+                views,
+                removals,
+                unavailable,
+                server_policy,
+            )
+        })
     }
 
     /// The controller attests no deployment effect began. Reopen only these

@@ -220,6 +220,17 @@ impl AppliedPolicies {
         backend: &ClusterStore,
         state: &ClusterState,
     ) -> Result<Self, Diagnostic> {
+        Self::load_optional_with_sources(backend, state, &BTreeMap::new()).await
+    }
+
+    /// Repair authority is restricted to a storage owner. Replacement source
+    /// must hash to the currently applied policy; candidate policy cannot grant
+    /// authority to repair itself. This method does not write catalog bytes.
+    pub(crate) async fn load_optional_with_sources(
+        backend: &ClusterStore,
+        state: &ClusterState,
+        repair_sources: &BTreeMap<String, String>,
+    ) -> Result<Self, Diagnostic> {
         if state.applied_revision.resources.len() > MAX_AUTHORIZATION_RESOURCES {
             return Err(refusal(
                 "policy_bounds_exceeded",
@@ -250,7 +261,13 @@ impl AppliedPolicies {
                     address,
                     MAX_POLICY_BYTES.min(MAX_POLICY_TOTAL_BYTES.saturating_sub(total_bytes)),
                 )
-                .await?;
+                .await
+                .or_else(|error| match repair_sources.get(&entry.digest) {
+                    Some(source) if sha256_hex(source.as_bytes()) == entry.digest => {
+                        Ok(source.clone())
+                    }
+                    _ => Err(error),
+                })?;
             total_bytes = total_bytes.saturating_add(source.len());
             if source.len() > MAX_POLICY_BYTES || total_bytes > MAX_POLICY_TOTAL_BYTES {
                 return Err(refusal(

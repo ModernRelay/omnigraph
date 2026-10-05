@@ -896,6 +896,49 @@ impl Omnigraph {
         self
     }
 
+    /// Prepare an immutable runtime view over this handle's existing owner.
+    ///
+    /// No storage is opened or written. The coordinator, schema authority,
+    /// writer gates and Lance sessions remain shared; policy, embedding client
+    /// and external Blob admission belong to the returned view. A serving
+    /// caller must drain the old view before admitting requests on this one.
+    /// Existing views deliberately retain their original authorization.
+    pub fn with_runtime_bindings(
+        &self,
+        policy: Option<Arc<dyn omnigraph_policy::PolicyChecker>>,
+        embedding_config: Option<Arc<crate::embedding::EmbeddingConfig>>,
+        external_blob_policy: crate::blob::ExternalBlobPolicy,
+    ) -> Result<Self> {
+        let table_store = self
+            .table_store
+            .clone()
+            .with_external_blob_policy(external_blob_policy)?;
+        Ok(Self {
+            root_uri: self.root_uri.clone(),
+            storage: Arc::clone(&self.storage),
+            lance_access: self.lance_access.clone(),
+            coordinator: Arc::clone(&self.coordinator),
+            table_store,
+            runtime_cache: RuntimeCache::default(),
+            feed_cut_cache: tokio::sync::RwLock::new(None),
+            read_caches: Arc::clone(&self.read_caches),
+            schema_view: Arc::clone(&self.schema_view),
+            write_queue: Arc::clone(&self.write_queue),
+            merge_authority_cache: tokio::sync::Mutex::new(None),
+            history: self.history.clone(),
+            policy,
+            embedding: Arc::new(tokio::sync::OnceCell::new()),
+            embedding_config,
+        })
+    }
+
+    /// Whether two immutable runtime views share the same engine owner.
+    /// Equal root strings alone do not establish this relationship.
+    pub fn shares_runtime_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.coordinator, &other.coordinator)
+            && Arc::ptr_eq(&self.write_queue, &other.write_queue)
+    }
+
     /// The injected embedding config, if any (see the `embedding_config` field).
     pub(crate) fn embedding_config_ref(&self) -> Option<&crate::embedding::EmbeddingConfig> {
         self.embedding_config.as_deref()

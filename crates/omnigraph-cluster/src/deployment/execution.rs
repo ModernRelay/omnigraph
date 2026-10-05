@@ -3,7 +3,9 @@ use crate::authorization::AppliedPolicies;
 use omnigraph_policy::PolicyAction;
 use omnigraph_seams::decide_seam;
 
-async fn read_existing(store: &ClusterStore) -> Result<(ClusterState, String), Diagnostic> {
+pub(super) async fn read_existing(
+    store: &ClusterStore,
+) -> Result<(ClusterState, String), Diagnostic> {
     let snapshot = store.read_state(&mut store.observations()).await?;
     Ok((
         snapshot
@@ -29,7 +31,6 @@ async fn policies(
     store: &ClusterStore,
     state: &ClusterState,
     caller: &DeploymentCaller,
-    manage: bool,
 ) -> Result<AppliedPolicies, Diagnostic> {
     caller.authority()?;
     let policies = match caller {
@@ -38,14 +39,10 @@ async fn policies(
         }
         DeploymentCaller::AuthenticatedIdentity(identity) => {
             let policies = AppliedPolicies::load(store, state).await?;
-            if manage {
-                policies.check_cluster(identity.actor())?;
-            }
-            for address in state.applied_revision.resources.keys() {
-                if let ResourceKind::Graph(graph) = resource_kind(address) {
-                    policies.check_graph(identity.actor(), &graph, PolicyAction::Read)?;
-                }
-            }
+            // Configuration management includes ledger/receipt metadata. Graph
+            // Read gates graph data, not unrelated cluster inventory; schema
+            // effects enforce their graph actions separately during preflight.
+            policies.check_cluster(identity.actor())?;
             policies
         }
     };
@@ -101,6 +98,25 @@ fn authorize_bootstrap_bundle(
     Ok(())
 }
 
+fn repair_policy_sources(
+    state: &ClusterState,
+    bundle: &DeploymentBundle,
+) -> BTreeMap<String, String> {
+    bundle
+        .options
+        .repair_catalog
+        .iter()
+        .filter_map(|address| {
+            if !matches!(resource_kind(address), ResourceKind::Policy(_)) {
+                return None;
+            }
+            let entry = state.applied_revision.resources.get(address)?;
+            let source = bundle.sources.get(&entry.digest)?;
+            Some((entry.digest.clone(), source.clone()))
+        })
+        .collect()
+}
+
 async fn deployment_policies(
     store: &ClusterStore,
     state: &ClusterState,
@@ -125,7 +141,20 @@ async fn deployment_policies(
             return AppliedPolicies::load_optional(store, state).await;
         }
     }
-    policies(store, state, caller, true).await
+    if let DeploymentCaller::StorageOwner { .. } = caller {
+        if !bundle.options.repair_catalog.is_empty() {
+            return AppliedPolicies::load_optional_with_sources(
+                store,
+                state,
+                &repair_policy_sources(state, bundle),
+            )
+            .await;
+        }
+        return AppliedPolicies::load_optional(store, state).await;
+    }
+    let applied = AppliedPolicies::load(store, state).await?;
+    applied.check_cluster(caller.actor().unwrap())?;
+    Ok(applied)
 }
 
 // Before first convergence there is no applied management policy. Only the
@@ -137,6 +166,24 @@ async fn lookup_policies(
     caller: &DeploymentCaller,
     id: Option<&str>,
 ) -> Result<AppliedPolicies, Diagnostic> {
+    if matches!(caller, DeploymentCaller::StorageOwner { .. }) {
+        if let Some(pending) = state
+            .outstanding
+            .as_ref()
+            .filter(|pending| Some(pending.id.as_str()) == id)
+        {
+            let bundle = store.read_deployment_bundle(&pending.input_digest).await?;
+            validate_bundle(&bundle, &store.canonical_root()?)?;
+            if !bundle.options.repair_catalog.is_empty() {
+                return AppliedPolicies::load_optional_with_sources(
+                    store,
+                    state,
+                    &repair_policy_sources(state, &bundle),
+                )
+                .await;
+            }
+        }
+    }
     if let DeploymentCaller::AuthenticatedIdentity(identity) = caller {
         if identity.has_bootstrap_authority() && state.applied_revision.resources.is_empty() {
             let pending = state
@@ -160,7 +207,7 @@ async fn lookup_policies(
             return AppliedPolicies::load_optional(store, state).await;
         }
     }
-    policies(store, state, caller, true).await
+    policies(store, state, caller).await
 }
 
 fn graph_ids(state: &ClusterState) -> Vec<String> {
@@ -322,7 +369,7 @@ pub async fn upgrade_deployment_ledger(
     }
     // Refuse unauthorized conversion before acquiring durable admission; a
     // denied caller must not strand a lock. Recheck current policy under it.
-    policies(&store, &before, caller, true).await?;
+    policies(&store, &before, caller).await?;
     let mut observations = store.observations();
     let mut guard = store
         .acquire_lock("upgrade_ledger", &mut observations)
@@ -339,7 +386,7 @@ pub async fn upgrade_deployment_ledger(
                 "ledger changed during conversion; inspect original root",
             ));
         }
-        policies(&store, &state, caller, true).await?;
+        policies(&store, &state, caller).await?;
         authorization::refuse_pending_recovery(&store).await?;
         serve::read_snapshot_for_ledger_upgrade(&store)
             .await
@@ -431,28 +478,34 @@ async fn bootstrap_ledger(
                 "cluster initialized while acquiring bootstrap ownership",
             ));
         }
-        authorization::refuse_pending_recovery(store).await?;
-        for graph in bundle.graph_ids() {
-            if store
-                .graph_root_exists(&store.graph_root(&graph))
-                .await
-                .map_err(|error| refusal("graph_unavailable", error.to_string()))?
-            {
-                return Err(refusal(
-                    "graph_already_exists",
-                    format!(
-                        "graph {graph} already exists; bootstrap never adopts an unregistered graph"
-                    ),
-                ));
-            }
-        }
-        Ok::<_, Diagnostic>(())
+        // Validate the same captured lifecycle input before the first ledger
+        // write. Existing roots require exact adoption confirmation, including
+        // after a lost ledger; failed confirmation leaves no initialized state.
+        let state = empty_ledger();
+        let id = format!("{}:1:{}", state.ledger_id.as_ref().unwrap(), Ulid::new());
+        let input_digest = sha256_hex(
+            &serde_json::to_vec(bundle)
+                .map_err(|error| refusal("deployment_encode", error.to_string()))?,
+        );
+        Box::pin(prepare_deployment(
+            store,
+            bundle,
+            caller,
+            Some((state.clone(), format!("sha256:{}", sha256_hex(b"")))),
+            &BTreeMap::new(),
+            &id,
+            &input_digest,
+        ))
+        .await?;
+        Ok::<_, Diagnostic>(state)
     }
     .await;
-    if let Err(error) = checked {
-        return Err(admission::release_refused_preflight(store, guard.lock_id(), error).await);
-    }
-    let state = empty_ledger();
+    let state = match checked {
+        Ok(state) => state,
+        Err(error) => {
+            return Err(admission::release_refused_preflight(store, guard.lock_id(), error).await);
+        }
+    };
     store
         .write_state(&state, None, &mut observations)
         .await
@@ -531,7 +584,7 @@ fn bundle_from_capture(
         config_digest: desired.config_digest.clone(),
         config_semantics: desired.config_semantics.clone(),
         resources,
-        schema_corrections: BTreeMap::new(),
+        options: DeploymentOptions::default(),
         sources: sources
             .into_iter()
             .map(|(digest, source)| (digest, source.to_string()))
@@ -554,12 +607,41 @@ fn validate_bundle_with_root(
         || bundle.canonical_root != root
         || root.len() > 4096
         || bundle.resources.len() > MAX_RESOURCES
-        || bundle.schema_corrections.len() > MAX_RESOURCES
-        || bundle.schema_corrections.iter().any(|(graph, contract)| {
-            !valid_resource_name(graph)
-                || !valid_contract(contract)
-                || !bundle.resources.contains_key(&graph_address(graph))
-        })
+        || bundle.options.repair_catalog.len() > MAX_RESOURCES
+        || bundle
+            .options
+            .repair_catalog
+            .iter()
+            .any(|address| !valid_address(address))
+        || bundle.options.delete_graphs.len()
+            + bundle.options.adopt_graphs.len()
+            + bundle.options.recreate_graphs.len()
+            > MAX_RESOURCES
+        || bundle
+            .options
+            .delete_graphs
+            .iter()
+            .chain(bundle.options.adopt_graphs.iter())
+            .any(|(graph, confirmation)| {
+                !valid_resource_name(graph)
+                    || !valid_contract(&confirmation.contract)
+                    || confirmation.graph_manifest_version == 0
+            })
+        || bundle
+            .options
+            .recreate_graphs
+            .iter()
+            .any(|(graph, contract)| !valid_resource_name(graph) || !valid_contract(contract))
+        || bundle.options.schema_corrections.len() > MAX_RESOURCES
+        || bundle
+            .options
+            .schema_corrections
+            .iter()
+            .any(|(graph, contract)| {
+                !valid_resource_name(graph)
+                    || !valid_contract(contract)
+                    || !bundle.resources.contains_key(&graph_address(graph))
+            })
         || encoded_size(bundle)? > MAX_BUNDLE_BYTES
         || bundle
             .sources
@@ -775,75 +857,87 @@ pub(crate) fn preview_deployment_scope(
     bundle: &DeploymentBundle,
 ) -> Result<Vec<AuthorizedEffect>, Diagnostic> {
     let before = &state.applied_revision.resources;
+    let options = &bundle.options;
+    for address in &options.repair_catalog {
+        if !bundle.resources.contains_key(address)
+            || !matches!(
+                resource_kind(address),
+                ResourceKind::Query { .. } | ResourceKind::Policy(_)
+            )
+        {
+            return Err(refusal(
+                "catalog_repair_target_invalid",
+                format!("{address} must name a desired policy or stored-query payload"),
+            ));
+        }
+    }
+    for graph in options.delete_graphs.keys() {
+        if !before.contains_key(&graph_address(graph))
+            || bundle.resources.contains_key(&graph_address(graph))
+        {
+            return Err(refusal(
+                "graph_delete_confirmation_unused",
+                format!(
+                    "graph {graph} must be currently managed and absent from desired configuration"
+                ),
+            ));
+        }
+    }
+    for graph in options.adopt_graphs.keys() {
+        if before.contains_key(&graph_address(graph))
+            || !bundle.resources.contains_key(&graph_address(graph))
+        {
+            return Err(refusal(
+                "graph_adopt_confirmation_unused",
+                format!("graph {graph} must be unmanaged and declared in desired configuration"),
+            ));
+        }
+    }
+    for (graph, contract) in &options.recreate_graphs {
+        if !bundle.resources.contains_key(&graph_address(graph))
+            || state
+                .applied_revision
+                .schema_contracts
+                .as_ref()
+                .and_then(|contracts| contracts.get(graph))
+                != Some(contract)
+        {
+            return Err(refusal(
+                "graph_recreate_confirmation_mismatch",
+                format!("graph {graph} recreation must acknowledge its exact achieved contract"),
+            ));
+        }
+    }
+    for graph in options.schema_corrections.keys() {
+        if !before.contains_key(&graph_address(graph))
+            || !bundle.resources.contains_key(&graph_address(graph))
+            || options.recreate_graphs.contains_key(graph)
+        {
+            return Err(refusal(
+                "schema_correction_unneeded",
+                format!("graph {graph} has no existing contract to correct in this deployment"),
+            ));
+        }
+    }
     let addresses: BTreeSet<_> = before.keys().chain(bundle.resources.keys()).collect();
     let mut effects = Vec::new();
     for address in addresses {
         let old = before.get(address);
         let new = bundle.resources.get(address);
         let unchanged = serde_json::to_value(old).unwrap() == serde_json::to_value(new).unwrap();
-        let correction = matches!(resource_kind(address), ResourceKind::Schema(graph) if bundle.schema_corrections.contains_key(&graph));
-        if unchanged && !correction {
+        let explicit = options.repair_catalog.contains(address)
+            || match resource_kind(address) {
+                ResourceKind::Schema(graph) => options.schema_corrections.contains_key(&graph),
+                ResourceKind::Graph(graph) => options.recreate_graphs.contains_key(&graph),
+                _ => false,
+            };
+        if unchanged && !explicit {
             continue;
         }
-        match resource_kind(address) {
-            ResourceKind::Schema(graph)
-                if new.is_some() && bundle.resources.contains_key(&graph_address(&graph)) => {}
-            ResourceKind::Query { graph, .. }
-                if bundle.resources.contains_key(&graph_address(&graph)) => {}
-            ResourceKind::Graph(_) if old.is_none() && new.is_some() => {}
-            ResourceKind::EmbeddingProvider(_) if old.is_none() && new.is_some() => {}
-            ResourceKind::Policy(_)
-                if new.is_some()
-                    && (before.is_empty()
-                        || old.is_none()
-                        || old.zip(new).is_some_and(|(old, new)| {
-                            old.digest == new.digest
-                                && old.applies_to.as_ref().is_some_and(|old_bindings| {
-                                    new.applies_to.as_ref().is_some_and(|new_bindings| {
-                                        old_bindings
-                                            .iter()
-                                            .all(|binding| new_bindings.contains(binding))
-                                            && new_bindings
-                                                .iter()
-                                                .filter(|binding| !old_bindings.contains(binding))
-                                                .all(|binding| match resource_kind(binding) {
-                                                    ResourceKind::Graph(graph) => {
-                                                        !before.contains_key(&graph_address(&graph))
-                                                    }
-                                                    _ => false,
-                                                })
-                                    })
-                                })
-                        })) => {}
-            ResourceKind::Graph(_)
-                if old.zip(new).is_some_and(|(old, new)| {
-                    old.embedding_provider == new.embedding_provider
-                        && old.external_blob_policy == new.external_blob_policy
-                        && old.applies_to == new.applies_to
-                        && old.embedding_profile == new.embedding_profile
-                }) => {}
-            _ => {
-                return Err(refusal(
-                    "deployment_scope",
-                    format!(
-                        "{address} changes unsupported graph removal or existing runtime bindings"
-                    ),
-                ));
-            }
-        }
-        if matches!(resource_kind(address), ResourceKind::Policy(_))
-            && old.is_none()
-            && !before.is_empty()
-            && new.unwrap().applies_to.as_ref().is_none_or(|bindings| {
-                bindings.iter().any(|binding| match resource_kind(binding) {
-                    ResourceKind::Graph(graph) => before.contains_key(&graph_address(&graph)),
-                    _ => true,
-                })
-            })
-        {
+        if matches!(resource_kind(address), ResourceKind::Unknown) {
             return Err(refusal(
                 "deployment_scope",
-                "new policies may bind only newly created graphs",
+                format!("unsupported resource {address}"),
             ));
         }
         effects.push(AuthorizedEffect {
@@ -863,6 +957,70 @@ pub(crate) fn preview_deployment_scope(
         });
     }
     Ok(effects)
+}
+
+fn affected_graphs(
+    state: &ClusterState,
+    bundle: &DeploymentBundle,
+    effects: &[AuthorizedEffect],
+) -> BTreeSet<String> {
+    let mut graphs = BTreeSet::new();
+    for effect in effects {
+        match resource_kind(&effect.resource) {
+            ResourceKind::Graph(graph)
+            | ResourceKind::Schema(graph)
+            | ResourceKind::Query { graph, .. } => {
+                graphs.insert(graph);
+            }
+            ResourceKind::Policy(_) => {
+                let old = state.applied_revision.resources.get(&effect.resource);
+                let new = bundle.resources.get(&effect.resource);
+                let old_bindings: BTreeSet<_> = old
+                    .and_then(|entry| entry.applies_to.as_ref())
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                let new_bindings: BTreeSet<_> = new
+                    .and_then(|entry| entry.applies_to.as_ref())
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                let source_unchanged = old
+                    .zip(new)
+                    .is_some_and(|(old, new)| old.digest == new.digest)
+                    && !bundle.options.repair_catalog.contains(&effect.resource);
+                let bindings: BTreeSet<_> = if source_unchanged {
+                    old_bindings
+                        .symmetric_difference(&new_bindings)
+                        .copied()
+                        .collect()
+                } else {
+                    old_bindings.union(&new_bindings).copied().collect()
+                };
+                for binding in bindings {
+                    if let Some(graph) = binding.strip_prefix("graph.") {
+                        graphs.insert(graph.to_owned());
+                    }
+                }
+            }
+            ResourceKind::EmbeddingProvider(_) => {
+                for (address, resource) in state
+                    .applied_revision
+                    .resources
+                    .iter()
+                    .chain(bundle.resources.iter())
+                {
+                    if resource.embedding_provider.as_deref() == Some(&effect.resource) {
+                        if let ResourceKind::Graph(graph) = resource_kind(address) {
+                            graphs.insert(graph);
+                        }
+                    }
+                }
+            }
+            ResourceKind::Unknown => {}
+        }
+    }
+    graphs
 }
 
 fn source_for<'a>(bundle: &'a DeploymentBundle, address: &str) -> Result<&'a str, Diagnostic> {
@@ -1088,7 +1246,21 @@ pub fn capture_deployment(
     config_dir: impl AsRef<Path>,
     schema_corrections: &BTreeMap<String, omnigraph::db::SchemaContractDigest>,
 ) -> Result<CapturedDeployment, Diagnostic> {
-    capture_deployment_input(config_dir.as_ref(), schema_corrections, None)
+    capture_deployment_with_options(
+        config_dir,
+        &DeploymentOptions {
+            schema_corrections: schema_corrections.clone(),
+            ..DeploymentOptions::default()
+        },
+    )
+}
+
+/// Capture the complete explicit lifecycle input for direct deployment.
+pub fn capture_deployment_with_options(
+    config_dir: impl AsRef<Path>,
+    options: &DeploymentOptions,
+) -> Result<CapturedDeployment, Diagnostic> {
+    capture_deployment_input(config_dir.as_ref(), options, None)
 }
 
 /// Capture local sources for the root advertised by an authenticated server.
@@ -1101,17 +1273,29 @@ pub fn capture_deployment_for_server(
     schema_corrections: &BTreeMap<String, omnigraph::db::SchemaContractDigest>,
     server_canonical_root: &str,
 ) -> Result<CapturedDeployment, Diagnostic> {
+    capture_deployment_for_server_with_options(
+        config_dir,
+        &DeploymentOptions {
+            schema_corrections: schema_corrections.clone(),
+            ..DeploymentOptions::default()
+        },
+        server_canonical_root,
+    )
+}
+
+/// Capture explicit lifecycle input without opening the server's storage here.
+pub fn capture_deployment_for_server_with_options(
+    config_dir: impl AsRef<Path>,
+    options: &DeploymentOptions,
+    server_canonical_root: &str,
+) -> Result<CapturedDeployment, Diagnostic> {
     if remote_root_identity(server_canonical_root)? != server_canonical_root {
         return Err(refusal(
             "storage_root_invalid",
             "the server must advertise a canonical storage root",
         ));
     }
-    capture_deployment_input(
-        config_dir.as_ref(),
-        schema_corrections,
-        Some(server_canonical_root),
-    )
+    capture_deployment_input(config_dir.as_ref(), options, Some(server_canonical_root))
 }
 
 fn remote_root_identity(root: &str) -> Result<String, Diagnostic> {
@@ -1137,7 +1321,7 @@ fn remote_root_identity(root: &str) -> Result<String, Diagnostic> {
 
 fn capture_deployment_input(
     config_dir: &Path,
-    schema_corrections: &BTreeMap<String, omnigraph::db::SchemaContractDigest>,
+    options: &DeploymentOptions,
     server_canonical_root: Option<&str>,
 ) -> Result<CapturedDeployment, Diagnostic> {
     let captured = config::capture_desired(config_dir);
@@ -1166,7 +1350,7 @@ fn capture_deployment_input(
         }
     };
     let mut bundle = bundle_from_capture(&desired, captured.sources, root.clone());
-    bundle.schema_corrections = schema_corrections.clone();
+    bundle.options = options.clone();
     if server_canonical_root.is_some() {
         validate_bundle_with_root(&bundle, &root, remote_root_identity)?;
     } else {
@@ -1224,22 +1408,15 @@ pub async fn deployment_affected_graphs(
     let store = ClusterStore::for_storage_root(admission.canonical_root())?;
     let (state, _) = read_existing(&store).await?;
     require_v2(&state)?;
-    policies(&store, &state, caller, true).await?;
+    deployment_policies(&store, &state, bundle, caller).await?;
     if state.outstanding.is_some() {
         return Err(refusal(
             "cluster_deployment_outstanding",
             "original deployment must be reconciled before a new deployment",
         ));
     }
-    Ok(preview_deployment_scope(&state, bundle)?
-        .into_iter()
-        .filter_map(|effect| match resource_kind(&effect.resource) {
-            ResourceKind::Graph(graph)
-            | ResourceKind::Schema(graph)
-            | ResourceKind::Query { graph, .. } => Some(graph),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>()
+    let effects = preview_deployment_scope(&state, bundle)?;
+    Ok(affected_graphs(&state, bundle, &effects)
         .into_iter()
         .collect())
 }
@@ -1252,9 +1429,9 @@ pub async fn preview_deployment_serving_snapshot(
     admission: &ClusterAdmission,
     caller: &DeploymentCaller,
 ) -> Result<ServingSnapshot, Diagnostic> {
-    deployment_affected_graphs(bundle, admission, caller).await?;
+    let affected = deployment_affected_graphs(bundle, admission, caller).await?;
     let store = ClusterStore::for_storage_root(admission.canonical_root())?;
-    serve::preview_snapshot_with_store(&store, bundle)
+    serve::preview_snapshot_with_store(&store, bundle, &affected)
         .await
         .map_err(|mut diagnostics| diagnostics.remove(0))
 }
@@ -1269,7 +1446,28 @@ pub async fn apply_deployment(
     schema_corrections: &BTreeMap<String, omnigraph::db::SchemaContractDigest>,
     report_id: impl FnOnce(&str, &str, &str),
 ) -> Result<DeploymentLookup, Diagnostic> {
-    let bundle = capture_deployment(config_dir, schema_corrections)?;
+    apply_deployment_with_options(
+        config_dir,
+        requested_id,
+        caller,
+        &DeploymentOptions {
+            schema_corrections: schema_corrections.clone(),
+            ..DeploymentOptions::default()
+        },
+        report_id,
+    )
+    .await
+}
+
+/// Direct deployment including explicit lifecycle and repair confirmations.
+pub async fn apply_deployment_with_options(
+    config_dir: impl AsRef<Path>,
+    requested_id: Option<&str>,
+    caller: &DeploymentCaller,
+    options: &DeploymentOptions,
+    report_id: impl FnOnce(&str, &str, &str),
+) -> Result<DeploymentLookup, Diagnostic> {
+    let bundle = capture_deployment_with_options(config_dir, options)?;
     let store = ClusterStore::for_storage_root(bundle.canonical_root())?;
     bootstrap_ledger(&store, &bundle, caller).await?;
     if let Some(id) = requested_id {
@@ -1407,7 +1605,7 @@ async fn execute_captured_deployment(
         &store,
         bundle,
         caller,
-        admission,
+        None,
         live_graphs,
         &id,
         &input_digest,
@@ -1426,22 +1624,23 @@ async fn execute_captured_deployment(
             "bundle encoding identity changed",
         ));
     }
-    // Catalog query payloads are immutable and unreachable until the final
-    // achieved-projection CAS. Execution never reopens source files.
-    for (address, resource) in &bundle.resources {
-        let kind = resource_kind(address);
-        if matches!(kind, ResourceKind::Query { .. } | ResourceKind::Policy(_)) {
-            store
-                .write_payload(&kind, &resource.digest, source_for(bundle, address)?)
-                .await
-                .map_err(|error| refusal("resource_payload_write_error", error))?;
-        }
-    }
     seams::fail(&DEPLOYMENT_BEFORE_ACCEPTANCE)?;
     cas = replace(&store, &mut state, &cas).await?;
     seams::fail(&DEPLOYMENT_AFTER_ACCEPTANCE)?;
+    install_catalog_payloads(&store, &state, bundle).await?;
     for (graph, entry) in state.outstanding.as_ref().unwrap().graphs.clone() {
-        let result = if let Some(create) = &entry.create {
+        let result = if let Some(confirmation) = &entry.delete {
+            GraphDeploymentResult::Deleted {
+                graph_manifest_version: confirmation.graph_manifest_version,
+                contract: confirmation.contract.clone(),
+                retained_storage: true,
+            }
+        } else if let Some(confirmation) = &entry.adopt {
+            GraphDeploymentResult::Adopted {
+                graph_manifest_version: confirmation.graph_manifest_version,
+                contract: confirmation.contract.clone(),
+            }
+        } else if let Some(create) = &entry.create {
             state
                 .outstanding
                 .as_mut()
@@ -1529,12 +1728,15 @@ async fn prepare_deployment(
     store: &ClusterStore,
     bundle: &DeploymentBundle,
     caller: &DeploymentCaller,
-    admission: &ClusterAdmission,
+    captured_state: Option<(ClusterState, String)>,
     live_graphs: &BTreeMap<String, std::sync::Arc<Omnigraph>>,
     id: &str,
     input_digest: &str,
 ) -> Result<(ClusterState, String, AppliedPolicies), Diagnostic> {
-    let (mut state, cas) = read_existing(store).await?;
+    let (mut state, cas) = match captured_state {
+        Some(snapshot) => snapshot,
+        None => read_existing(store).await?,
+    };
     require_v2(&state)?;
     let policy = deployment_policies(store, &state, bundle, caller).await?;
     if state.outstanding.is_some() {
@@ -1558,139 +1760,16 @@ async fn prepare_deployment(
             "new deployment must use this ledger's exact next sequence",
         ));
     }
-    let mut graphs = BTreeMap::new();
-    for graph in graph_ids(&state) {
-        if store.canonical_root()? != admission.canonical_root() {
-            return Err(refusal(
-                "cluster_admission_root_mismatch",
-                "graph belongs to another root",
-            ));
-        }
-        let schema_address = schema_address(&graph);
-        let schema_changed = state.applied_revision.resources[&schema_address].digest
-            != bundle.resources[&schema_address].digest;
-        let affected = effects
-            .iter()
-            .any(|effect| match resource_kind(&effect.resource) {
-                ResourceKind::Graph(id) | ResourceKind::Schema(id) => id == graph,
-                ResourceKind::Query { graph: id, .. } => id == graph,
-                _ => false,
-            });
-        let db = match live_graphs.get(&graph) {
-            Some(db) => db.clone(),
-            None => std::sync::Arc::new(open_graph(store, &graph, &policy, true).await?),
-        };
-        if admission::admitted_graph_id(
-            admission.canonical_root(),
-            state.applied_revision.schema_contracts.as_ref().unwrap(),
-            db.uri(),
-        )? != graph
-        {
-            return Err(refusal(
-                "cluster_graph_root_mismatch",
-                "live engine does not belong to the affected graph",
-            ));
-        }
-        let snapshot = db
-            .snapshot_of(ReadTarget::branch("main"))
-            .await
-            .map_err(|error| refusal("graph_unavailable", error.to_string()))?;
-        let observed = db.schema_contract_digest();
-        let achieved = &state.applied_revision.schema_contracts.as_ref().unwrap()[&graph];
-        let correction = bundle.schema_corrections.get(&graph);
-        if &observed != achieved {
-            if correction != Some(&observed) {
-                let observed_input =
-                    serde_json::to_string(&BTreeMap::from([(graph.clone(), observed)]))
-                        .map_err(|error| refusal("deployment_encode", error.to_string()))?;
-                return Err(refusal(
-                    "applied_schema_drift",
-                    format!(
-                        "graph {graph} differs from its achieved contract; inspect the graph and explicitly acknowledge this exact observed contract with --schema-correction FILE: {observed_input}"
-                    ),
-                ));
-            }
-        } else if correction.is_some() {
-            return Err(refusal(
-                "schema_correction_unneeded",
-                format!(
-                    "graph {graph} already matches its achieved contract; remove its correction entry"
-                ),
-            ));
-        }
-        if !affected {
-            continue;
-        }
-        let intent = if schema_changed || correction.is_some() {
-            if let DeploymentCaller::AuthenticatedIdentity(identity) = caller {
-                policy.check_graph(identity.actor(), &graph, PolicyAction::SchemaApply)?;
-            }
-            let intent = db
-                .prepare_schema_apply_as(source_for(bundle, &schema_address)?, caller.actor())
-                .await
-                .map_err(|error| refusal("schema_preflight_failed", error.to_string()))?;
-            if intent.base_contract() != correction.unwrap_or(achieved) {
-                return Err(refusal(
-                    "applied_schema_drift",
-                    format!("graph {graph} changed during schema preparation"),
-                ));
-            }
-            Some(intent)
-        } else {
-            None
-        };
-        graphs.insert(
-            graph.clone(),
-            GraphDeployment {
-                create: None,
-                observed_manifest_version: intent.as_ref().map_or(
-                    snapshot.graph_manifest_version(),
-                    PreparedSchemaApply::base_manifest_version,
-                ),
-                intent,
-                state: GraphDeploymentState::NotStarted,
-                settlement: None,
-                recovery_executor: None,
-            },
-        );
-    }
-    for graph in bundle.graph_ids() {
-        if state
-            .applied_revision
-            .resources
-            .contains_key(&graph_address(&graph))
-        {
-            continue;
-        }
-        if bundle.schema_corrections.contains_key(&graph) {
-            return Err(refusal(
-                "schema_correction_unneeded",
-                "new graph has no achieved contract to correct",
-            ));
-        }
-        let create = Omnigraph::prepare_graph_create(
-            &store.graph_root(&graph),
-            source_for(bundle, &schema_address(&graph))?,
-        )
-        .await
-        .map_err(|error| refusal("graph_create_preflight_failed", error.to_string()))?;
-        admission::admitted_graph_id(
-            admission.canonical_root(),
-            &BTreeMap::from([(graph.clone(), create.desired_contract().clone())]),
-            create.root(),
-        )?;
-        graphs.insert(
-            graph,
-            GraphDeployment {
-                create: Some(create),
-                intent: None,
-                observed_manifest_version: 0,
-                state: GraphDeploymentState::NotStarted,
-                settlement: None,
-                recovery_executor: None,
-            },
-        );
-    }
+    let graphs = Box::pin(prepare_graphs(
+        store,
+        &state,
+        bundle,
+        caller,
+        &policy,
+        live_graphs,
+        &effects,
+    ))
+    .await?;
     let authorization = DeploymentAuthorization {
         version: 2,
         ledger_id: state.ledger_id.clone().unwrap(),
@@ -1715,7 +1794,325 @@ async fn prepare_deployment(
         reserved_result_bytes: 0,
     });
     reserve_completion(&mut state, bundle)?;
+    validate_state(&state)?;
     Ok((state, cas, policy))
+}
+
+/// Full read-only deployment preflight. It acquires no writer admission and
+/// never grants authority to execute; apply repeats it under the sole writer.
+pub async fn preflight_deployment(
+    bundle: &CapturedDeployment,
+    caller: &DeploymentCaller,
+) -> Result<(), Diagnostic> {
+    let store = ClusterStore::for_storage_root(bundle.canonical_root())?;
+    validate_bundle(bundle, &store.canonical_root()?)?;
+    let snapshot = store.read_state(&mut store.observations()).await?;
+    let state = snapshot.state.unwrap_or_else(empty_ledger);
+    require_v2(&state)?;
+    let id = format!(
+        "{}:{}:{}",
+        state.ledger_id.as_ref().unwrap(),
+        state.next_sequence.unwrap(),
+        Ulid::new()
+    );
+    let cas = snapshot
+        .state_cas
+        .unwrap_or_else(|| format!("sha256:{}", sha256_hex(b"")));
+    let input_digest = sha256_hex(
+        &serde_json::to_vec(bundle)
+            .map_err(|error| refusal("deployment_encode", error.to_string()))?,
+    );
+    prepare_deployment(
+        &store,
+        bundle,
+        caller,
+        Some((state, cas)),
+        &BTreeMap::new(),
+        &id,
+        &input_digest,
+    )
+    .await?;
+
+    Ok(())
+}
+
+pub(super) async fn graph_confirmation(
+    db: &Omnigraph,
+) -> Result<GraphLifecycleConfirmation, Diagnostic> {
+    let snapshot = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .map_err(|error| refusal("graph_unavailable", error.to_string()))?;
+    Ok(GraphLifecycleConfirmation {
+        contract: db.schema_contract_digest(),
+        graph_manifest_version: snapshot.graph_manifest_version(),
+    })
+}
+
+fn check_confirmation(
+    graph: &str,
+    operation: &str,
+    expected: &GraphLifecycleConfirmation,
+    observed: &GraphLifecycleConfirmation,
+) -> Result<(), Diagnostic> {
+    if expected != observed {
+        let input = serde_json::json!({ operation: { graph: observed } });
+        return Err(refusal(
+            "graph_lifecycle_confirmation_mismatch",
+            format!(
+                "graph {graph} no longer matches its exact {operation} confirmation; inspect the graph before using --lifecycle FILE: {input}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+async fn prepare_graphs(
+    store: &ClusterStore,
+    state: &ClusterState,
+    bundle: &DeploymentBundle,
+    caller: &DeploymentCaller,
+    policy: &AppliedPolicies,
+    live_graphs: &BTreeMap<String, std::sync::Arc<Omnigraph>>,
+    effects: &[AuthorizedEffect],
+) -> Result<BTreeMap<String, GraphDeployment>, Diagnostic> {
+    let affected = affected_graphs(state, bundle, effects);
+    for (address, resource) in &bundle.resources {
+        let kind = resource_kind(address);
+        let relevant = match &kind {
+            ResourceKind::Query { graph, .. } => affected.contains(graph),
+            ResourceKind::Policy(_) => true,
+            _ => false,
+        };
+        if !relevant {
+            continue;
+        }
+        // Explicit repair already supplies the single digest-verified value.
+        // Never read a damaged slot merely to prove that restoring it is safe.
+        if bundle.options.repair_catalog.contains(address) {
+            continue;
+        }
+        let prior = store
+            .read_payload(&kind, &resource.digest)
+            .await
+            .map_err(|error| refusal("resource_payload_read_error", error))?;
+        let previously_applied = state
+            .applied_revision
+            .resources
+            .get(address)
+            .is_some_and(|old| old.digest == resource.digest);
+        let invalid = prior
+            .as_ref()
+            .is_some_and(|source| sha256_hex(source.as_bytes()) != resource.digest)
+            || (prior.is_none() && previously_applied);
+        if invalid && !bundle.options.repair_catalog.contains(address) {
+            return Err(refusal(
+                "catalog_repair_required",
+                format!(
+                    "{address} is missing or corrupt; verify the desired source and explicitly request repair_catalog in --lifecycle FILE"
+                ),
+            ));
+        }
+    }
+    let mut graphs = BTreeMap::new();
+    for graph in affected {
+        let existing = state
+            .applied_revision
+            .resources
+            .contains_key(&graph_address(&graph));
+        let desired = bundle.resources.contains_key(&graph_address(&graph));
+        let schema_address = schema_address(&graph);
+        let mut entry = GraphDeployment {
+            create: None,
+            adopt: None,
+            delete: None,
+            intent: None,
+            observed_manifest_version: 0,
+            state: GraphDeploymentState::NotStarted,
+            settlement: None,
+            recovery_executor: None,
+        };
+        if !existing || bundle.options.recreate_graphs.contains_key(&graph) {
+            let uri = store.graph_root(&graph);
+            let canonical = admission::canonical_graph_uri(&uri)?;
+            let expected_uri = format!(
+                "{}/graphs/{graph}.omni",
+                bundle.canonical_root.trim_start_matches("file://")
+            );
+            if canonical != expected_uri {
+                return Err(refusal(
+                    "cluster_graph_root_mismatch",
+                    "graph root is outside the admitted cluster's canonical graph layout",
+                ));
+            }
+            if let Some(expected) = bundle.options.adopt_graphs.get(&graph) {
+                let db = open_graph(store, &graph, policy, true).await?;
+                let observed = graph_confirmation(&db).await?;
+                check_confirmation(&graph, "adopt_graphs", expected, &observed)?;
+                if observed.contract.source_hash != bundle.resources[&schema_address].digest {
+                    return Err(refusal(
+                        "graph_adopt_schema_mismatch",
+                        format!(
+                            "graph {graph} adoption requires its exact current schema source; apply schema changes after adoption"
+                        ),
+                    ));
+                }
+                admission::admitted_graph_id(
+                    &bundle.canonical_root,
+                    &BTreeMap::from([(graph.clone(), observed.contract.clone())]),
+                    db.uri(),
+                )?;
+                entry.observed_manifest_version = observed.graph_manifest_version;
+                entry.adopt = Some(observed);
+            } else {
+                let exists = store
+                    .graph_root_exists(&uri)
+                    .await
+                    .map_err(|error| refusal("graph_unavailable", error.to_string()))?;
+                if exists {
+                    if existing {
+                        return Err(refusal(
+                            "graph_recreate_root_present",
+                            format!(
+                                "graph {graph} recreation requires a fully absent root; existing or partial storage is never overwritten"
+                            ),
+                        ));
+                    }
+                    let detail = match open_graph(store, &graph, policy, true).await {
+                        Ok(db) => serde_json::to_string(&serde_json::json!({ "adopt_graphs": { graph.clone(): graph_confirmation(&db).await? } })).unwrap(),
+                        Err(_) => "existing root cannot be opened; repair or move it explicitly".to_owned(),
+                    };
+                    return Err(refusal(
+                        "graph_adoption_required",
+                        format!(
+                            "graph {graph} already has storage and requires exact adoption with --lifecycle FILE: {detail}"
+                        ),
+                    ));
+                }
+                let create =
+                    Omnigraph::prepare_graph_create(&uri, source_for(bundle, &schema_address)?)
+                        .await
+                        .map_err(|error| {
+                            refusal("graph_create_preflight_failed", error.to_string())
+                        })?;
+                admission::admitted_graph_id(
+                    &bundle.canonical_root,
+                    &BTreeMap::from([(graph.clone(), create.desired_contract().clone())]),
+                    create.root(),
+                )?;
+                entry.create = Some(create);
+            }
+            graphs.insert(graph, entry);
+            continue;
+        }
+        let schema_changed = desired
+            && state.applied_revision.resources[&schema_address].digest
+                != bundle.resources[&schema_address].digest;
+        let correction = bundle.options.schema_corrections.get(&graph);
+        let db = match live_graphs.get(&graph) {
+            Some(db) => db.clone(),
+            None => std::sync::Arc::new(open_graph(store, &graph, policy, true).await.map_err(|error| {
+                if error.code == "graph_unavailable" {
+                    refusal(&error.code, format!("{}; if graph {graph} is entirely absent, explicitly acknowledge its achieved contract using recreate_graphs in --lifecycle FILE: {}", error.message, serde_json::to_string(&state.applied_revision.schema_contracts.as_ref().unwrap()[&graph]).unwrap()))
+                } else { error }
+            })?),
+        };
+        admission::admitted_graph_id(
+            &bundle.canonical_root,
+            state.applied_revision.schema_contracts.as_ref().unwrap(),
+            db.uri(),
+        )?;
+        let observed = graph_confirmation(&db).await?;
+        let achieved = &state.applied_revision.schema_contracts.as_ref().unwrap()[&graph];
+        if !desired {
+            let expected = bundle.options.delete_graphs.get(&graph).ok_or_else(|| refusal(
+                "graph_delete_confirmation_required",
+                format!("removing graph {graph} retains its storage and requires this exact inspected confirmation in --lifecycle FILE: {}", serde_json::json!({ "delete_graphs": { graph.clone(): observed.clone() } })),
+            ))?;
+            check_confirmation(&graph, "delete_graphs", expected, &observed)?;
+            if &observed.contract != achieved {
+                return Err(refusal(
+                    "applied_schema_drift",
+                    format!("graph {graph} removal cannot adopt a different incarnation"),
+                ));
+            }
+            entry.observed_manifest_version = observed.graph_manifest_version;
+            entry.delete = Some(observed);
+            graphs.insert(graph, entry);
+            continue;
+        }
+        if &observed.contract != achieved {
+            if correction != Some(&observed.contract) {
+                let input =
+                    serde_json::to_string(&BTreeMap::from([(graph.clone(), observed.contract)]))
+                        .unwrap();
+                return Err(refusal(
+                    "applied_schema_drift",
+                    format!(
+                        "graph {graph} differs from its achieved contract; inspect it and acknowledge the exact observed contract with --schema-correction FILE: {input}"
+                    ),
+                ));
+            }
+        } else if correction.is_some() {
+            return Err(refusal(
+                "schema_correction_unneeded",
+                format!(
+                    "graph {graph} already matches its achieved contract; remove its correction entry"
+                ),
+            ));
+        }
+        if schema_changed || correction.is_some() {
+            if let DeploymentCaller::AuthenticatedIdentity(identity) = caller {
+                policy.check_graph(identity.actor(), &graph, PolicyAction::Read)?;
+                policy.check_graph(identity.actor(), &graph, PolicyAction::SchemaApply)?;
+            }
+            let intent = db
+                .prepare_schema_apply_as(source_for(bundle, &schema_address)?, caller.actor())
+                .await
+                .map_err(|error| refusal("schema_preflight_failed", error.to_string()))?;
+            if intent.base_contract() != correction.unwrap_or(achieved) {
+                return Err(refusal(
+                    "applied_schema_drift",
+                    format!("graph {graph} changed during schema preparation"),
+                ));
+            }
+            entry.observed_manifest_version = intent.base_manifest_version();
+            entry.intent = Some(intent);
+        } else {
+            entry.observed_manifest_version = observed.graph_manifest_version;
+        }
+        graphs.insert(graph, entry);
+    }
+    Ok(graphs)
+}
+
+async fn install_catalog_payloads(
+    store: &ClusterStore,
+    state: &ClusterState,
+    bundle: &DeploymentBundle,
+) -> Result<(), Diagnostic> {
+    for (address, resource) in &bundle.resources {
+        let kind = resource_kind(address);
+        if matches!(kind, ResourceKind::Query { .. } | ResourceKind::Policy(_)) {
+            if !bundle.options.repair_catalog.contains(address)
+                && state
+                    .applied_revision
+                    .resources
+                    .get(address)
+                    .is_some_and(|old| old.digest == resource.digest)
+            {
+                continue;
+            }
+            let source = source_for(bundle, address)?;
+            if bundle.options.repair_catalog.contains(address) {
+                store.repair_payload(&kind, &resource.digest, source).await
+            } else {
+                store.write_payload(&kind, &resource.digest, source).await
+            }
+            .map_err(|error| refusal("resource_payload_write_error", error))?;
+        }
+    }
+    Ok(())
 }
 
 fn retained_error(error: Diagnostic, lock_id: &str) -> Diagnostic {
@@ -1734,15 +2131,7 @@ fn validate_pending_input(
     bundle: &DeploymentBundle,
 ) -> Result<(), Diagnostic> {
     let effects = preview_deployment_scope(state, bundle)?;
-    let affected: BTreeSet<_> = effects
-        .iter()
-        .filter_map(|effect| match resource_kind(&effect.resource) {
-            ResourceKind::Graph(graph)
-            | ResourceKind::Schema(graph)
-            | ResourceKind::Query { graph, .. } => Some(graph),
-            _ => None,
-        })
-        .collect();
+    let affected = affected_graphs(state, bundle, &effects);
     if effects != pending.authorization.effects
         || affected != pending.graphs.keys().cloned().collect()
     {
@@ -1771,6 +2160,7 @@ fn validate_pending_input(
                     .base
                     .resource_digests
                     .contains_key(&graph_address(graph))
+                    && !bundle.options.recreate_graphs.contains_key(graph)
             {
                 return Err(refusal(
                     "deployment_authority_changed",
@@ -1779,14 +2169,43 @@ fn validate_pending_input(
             }
             continue;
         }
+        if let Some(confirmation) = &entry.adopt {
+            if bundle.options.adopt_graphs.get(graph) != Some(confirmation)
+                || confirmation.contract.source_hash != bundle.resources[&address].digest
+                || state
+                    .applied_revision
+                    .resources
+                    .contains_key(&graph_address(graph))
+            {
+                return Err(refusal(
+                    "deployment_authority_changed",
+                    "adoption differs from its exact immutable confirmation",
+                ));
+            }
+            continue;
+        }
+        if let Some(confirmation) = &entry.delete {
+            if bundle.options.delete_graphs.get(graph) != Some(confirmation)
+                || pending.authorization.base.schema_contracts.get(graph)
+                    != Some(&confirmation.contract)
+                || bundle.resources.contains_key(&graph_address(graph))
+            {
+                return Err(refusal(
+                    "deployment_authority_changed",
+                    "removal differs from its exact immutable confirmation",
+                ));
+            }
+            continue;
+        }
         let schema_changed =
             state.applied_revision.resources[&address].digest != bundle.resources[&address].digest;
-        if (schema_changed || bundle.schema_corrections.contains_key(graph))
+        if (schema_changed || bundle.options.schema_corrections.contains_key(graph))
             != entry.intent.is_some()
             || entry.intent.as_ref().is_some_and(|intent| {
                 intent.actor() != pending.authorization.authority.actor.as_deref()
                     || intent.base_contract()
                         != bundle
+                            .options
                             .schema_corrections
                             .get(graph)
                             .unwrap_or(&pending.authorization.base.schema_contracts[graph])
@@ -1820,6 +2239,7 @@ async fn finish(
     if pending.graphs.values().any(|entry| !matches!(&entry.state, GraphDeploymentState::Settled { result } if result.terminal())) {
         return Err(refusal("deployment_outcome_unknown", "deployment has unresolved graph effects"));
     }
+    let before_resources = serde_json::to_value(&state.applied_revision.resources).unwrap();
     let mut result = result_from_pending(state, &pending);
     for (graph, outcome) in &result.graphs {
         if !outcome.accepted() {
@@ -1830,7 +2250,8 @@ async fn finish(
                 SchemaApplySettlement::Committed { contract, .. }
                 | SchemaApplySettlement::NoOp { contract, .. },
         }
-        | GraphDeploymentResult::Created { contract, .. } = outcome
+        | GraphDeploymentResult::Created { contract, .. }
+        | GraphDeploymentResult::Adopted { contract, .. } = outcome
         {
             state
                 .applied_revision
@@ -1838,6 +2259,14 @@ async fn finish(
                 .as_mut()
                 .unwrap()
                 .insert(graph.clone(), contract.clone());
+        }
+        if matches!(outcome, GraphDeploymentResult::Deleted { .. }) {
+            state
+                .applied_revision
+                .schema_contracts
+                .as_mut()
+                .unwrap()
+                .remove(graph);
         }
         let belongs = |address: &str| match resource_kind(address) {
             ResourceKind::Graph(id) | ResourceKind::Schema(id) => id == *graph,
@@ -1861,10 +2290,34 @@ async fn finish(
             }
         }
     }
-    // Keep every achieved graph's policy/provider bindings complete, even if
-    // another graph was not attempted. Restrict a policy's target list to the
-    // achieved inventory; a corrective successor may add its new graph targets.
+    // Runtime configuration has no engine publication. Once every graph effect
+    // is terminal, publish its desired projection in this same ledger CAS.
+    // A failed schema retains its old schema/query catalog; runtime bindings
+    // still converge for that surviving graph. Never bind a not-created graph.
     let achieved_graphs = graph_ids(state);
+    for graph in &achieved_graphs {
+        if let Some(desired) = bundle.resources.get(&graph_address(graph)) {
+            let resource = state
+                .applied_revision
+                .resources
+                .get_mut(&graph_address(graph))
+                .unwrap();
+            resource.embedding_provider = desired.embedding_provider.clone();
+            resource.external_blob_policy = desired.external_blob_policy.clone();
+        }
+    }
+    state.applied_revision.resources.retain(|address, _| {
+        !matches!(
+            resource_kind(address),
+            ResourceKind::Policy(_) | ResourceKind::EmbeddingProvider(_)
+        )
+    });
+    state.resource_statuses.retain(|address, _| {
+        !matches!(
+            resource_kind(address),
+            ResourceKind::Policy(_) | ResourceKind::EmbeddingProvider(_)
+        )
+    });
     for (address, resource) in &bundle.resources {
         match resource_kind(address) {
             ResourceKind::EmbeddingProvider(_) => {
@@ -1896,10 +2349,24 @@ async fn finish(
             _ => {}
         }
     }
-    let digests = state_resource_digests(state);
-    result.converged = serde_json::to_value(&state.applied_revision.resources).unwrap()
-        == serde_json::to_value(&bundle.resources).unwrap();
-    if digests != pending.authorization.base.resource_digests
+    for graph in &achieved_graphs {
+        let address = graph_address(graph);
+        let digest = expected_state_graph_resource_digest(
+            state,
+            graph,
+            &state.applied_revision.resources[&address],
+        );
+        state
+            .applied_revision
+            .resources
+            .get_mut(&address)
+            .unwrap()
+            .digest = digest;
+    }
+    let achieved_resources = serde_json::to_value(&state.applied_revision.resources).unwrap();
+    result.converged = result.graphs.values().all(GraphDeploymentResult::accepted)
+        && achieved_resources == serde_json::to_value(&bundle.resources).unwrap();
+    if achieved_resources != before_resources
         || state.applied_revision.schema_contracts.as_ref()
             != Some(&pending.authorization.base.schema_contracts)
         || (result.converged
@@ -2086,9 +2553,63 @@ pub async fn reconcile_deployment(
     let bundle = store.read_deployment_bundle(&pending.input_digest).await?;
     validate_bundle(&bundle, admission.canonical_root())?;
     validate_pending_input(&state, &pending, &bundle)?;
+    install_catalog_payloads(&store, &state, &bundle).await?;
     for (graph, entry) in pending.graphs {
         let result = match entry.state {
             GraphDeploymentState::Settled { .. } => continue,
+            GraphDeploymentState::NotStarted if entry.delete.is_some() || entry.adopt.is_some() => {
+                let confirmation = entry.delete.as_ref().or(entry.adopt.as_ref()).unwrap();
+                admission::admitted_graph_id(
+                    admission.canonical_root(),
+                    &BTreeMap::from([(graph.clone(), confirmation.contract.clone())]),
+                    &store.graph_root(&graph),
+                )?;
+                let db = open_graph(&store, &graph, &policy, true).await?;
+                let observed = graph_confirmation(&db).await?;
+                check_confirmation(
+                    &graph,
+                    if entry.delete.is_some() {
+                        "delete_graphs"
+                    } else {
+                        "adopt_graphs"
+                    },
+                    confirmation,
+                    &observed,
+                )?;
+                if entry.delete.is_some() {
+                    GraphDeploymentResult::Deleted {
+                        graph_manifest_version: observed.graph_manifest_version,
+                        contract: observed.contract,
+                        retained_storage: true,
+                    }
+                } else {
+                    GraphDeploymentResult::Adopted {
+                        graph_manifest_version: observed.graph_manifest_version,
+                        contract: observed.contract,
+                    }
+                }
+            }
+            GraphDeploymentState::NotStarted
+                if entry.create.is_none() && entry.intent.is_none() =>
+            {
+                admission
+                    .validate_graph_uri(&store.graph_root(&graph))
+                    .await?;
+                let db = open_graph(&store, &graph, &policy, true).await?;
+                let observed = graph_confirmation(&db).await?;
+                if pending.authorization.base.schema_contracts.get(&graph)
+                    != Some(&observed.contract)
+                {
+                    return Err(refusal(
+                        "deployment_outcome_unknown",
+                        "graph identity changed before original catalog settlement",
+                    ));
+                }
+                GraphDeploymentResult::QueryOnly {
+                    graph_manifest_version: observed.graph_manifest_version,
+                    schema_digest: bundle.resources[&schema_address(&graph)].digest.clone(),
+                }
+            }
             GraphDeploymentState::NotStarted => GraphDeploymentResult::NotAttempted,
             GraphDeploymentState::Started if entry.create.is_some() => {
                 state
@@ -2132,6 +2653,7 @@ pub async fn reconcile_deployment(
                     )
                 })?;
                 if let DeploymentCaller::AuthenticatedIdentity(identity) = caller {
+                    policy.check_graph(identity.actor(), &graph, PolicyAction::Read)?;
                     policy.check_graph(identity.actor(), &graph, PolicyAction::SchemaApply)?;
                 }
                 admission

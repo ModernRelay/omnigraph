@@ -1,8 +1,9 @@
 # Operating a cluster
 
 An OmniGraph cluster is a declarative bundle of graphs, schemas, stored queries
-and authorization policies. Apply can create graphs and update schemas and
-queries. Submit to the running server to activate those changes without a restart.
+and authorization policies. Apply converges graph inventory, schemas, queries,
+policies and provider/Blob settings. Submit to the running server to activate
+changes without a restart.
 
 Use a cluster for a multi-graph server or shared operational configuration. For
 one local graph, the [quickstart](../quickstart.md) is simpler.
@@ -41,8 +42,10 @@ of the deployment ledger version. The [configuration reference](config.md)
 covers storage roots, embedding providers, external Blob policy and limits.
 
 For server-owned deployment, the applied policy must grant the operator
-`config_manage` at cluster scope, `read` on disclosed graphs, and `schema_apply`
-on graphs whose schema changes. New graphs need suitable declared policies too.
+`config_manage` at cluster scope. Schema changes additionally require `read` and
+`schema_apply` on the affected graphs. Deployment status reveals management
+metadata under `config_manage`; it does not require data access on unrelated
+graphs. New graphs need suitable declared policies too.
 The server derives the actor from its bearer token; `--as` is for direct access.
 
 ## Bootstrap a cluster
@@ -91,7 +94,8 @@ mount or storage credentials for the server’s root.
 The CLI prints the deployment ID before submission. The server keeps its PID,
 listener and writer ownership. It briefly closes admission on affected graphs,
 finishes their admitted requests, publishes schema changes, and activates
-matching schemas and stored queries together. Unaffected graphs keep serving.
+matching schemas, queries and runtime permissions together. Unaffected graphs
+keep serving.
 Graph additions become available through the same deployment.
 
 The response separates the durable deployment result from `active`, which means
@@ -101,13 +105,12 @@ across multiple graphs is not one transaction. Query-only changes create no grap
 commit and also work with multiple branches. Schema changes remain main-only
 and require a single live branch.
 
-Existing graph roots, format, policy, provider, trust and external-Blob bindings
-stay fixed. New graph bindings are validated with their creation input. A refusal before any
-deployment effect restores the unchanged serving views, including after a drain
-timeout; any old requests remain tracked for a subsequent transition. Removing
-graphs or changing existing runtime bindings is outside this deployment class.
-There is one operational ledger protocol; no legacy import, refresh, approval
-or sweep command runs alongside it.
+Policies, provider definitions and graph bindings, and external-Blob rules can
+change on existing graphs. Current permissions authorize the deployment; proposed
+permissions cannot authorize themselves. Provider changes do not re-embed stored
+vectors. Roots, format and credential/trust configuration stay fixed.
+A refusal before effects restores unchanged serving views, including after a
+drain timeout. There is one deployment protocol and no legacy execution fallback.
 
 ## Direct deployments and conversion
 
@@ -179,8 +182,8 @@ and outcome as unknown; it never authorizes replay. See [limits](config.md#limit
 
 ## Correct deliberate schema drift
 
-Every deployment compares the achieved schema identity, even when source text
-changes. A recreated graph or out-of-band schema change refuses with
+Every affected graph is checked against its achieved schema identity, even when
+source text changes. A recreated graph or out-of-band schema change refuses with
 `applied_schema_drift`. To accept a reviewed observed contract, save the exact
 graph-to-contract JSON map from that refusal and submit:
 
@@ -194,6 +197,46 @@ hash, accepted IR hash, identity domain and version, and requires schema-apply
 permission. Unknown, stale or unnecessary entries refuse. Correction accepts the
 identified current graph; it does not restore missing data or history. An
 original-ID resubmission must retain the same correction input.
+
+## Explicit lifecycle and repair
+
+Use the same bounded JSON file with `cluster plan --lifecycle FILE` and
+`cluster apply --lifecycle FILE` (also accepted with `apply --server`). Plan
+refusals name the exact observed confirmations to inspect and copy. Apply checks
+those observations again; a stale confirmation fails before effects.
+
+| JSON field | Meaning |
+|---|---|
+| `delete_graphs` | Map graph IDs to `{ "contract": <observed contract>, "graph_manifest_version": <observed version> }`; remove those graphs from the desired configuration |
+| `adopt_graphs` | Same confirmation shape; declare an existing graph at its derived root with its exact current schema |
+| `recreate_graphs` | Map missing graph IDs to their previous achieved schema contracts; the entire root must be absent |
+| `repair_catalog` | Array of exact policy or stored-query resource addresses to repair from verified source bytes |
+| `schema_corrections` | The exact correction map described above; cannot combine this file with `--schema-correction` |
+
+Removal makes the graph unavailable through the cluster but **retains its
+storage, rows, branches and history**. Reuse requires explicit adoption. The
+running server retains removed graph owners for safe readoption; active and
+retained roots together are limited to 2,048 per process. Restart releases
+retained owners. Recreation refuses while that process still owns the old
+engine; a graph blocked at startup because its root is missing can be recreated
+online.
+Recreation creates an empty graph with a new identity; it never restores lost
+data or overwrites partial storage. Adoption preserves existing identity/history;
+apply schema changes in a subsequent deployment.
+
+For example, to restore one corrupt stored-query payload:
+
+```json
+{"repair_catalog": ["query.knowledge.people"]}
+```
+
+Use the actual resource address from plan/observe. Repairing an unreadable
+applied policy requires direct storage ownership and source bytes matching its
+recorded digest; a remote caller cannot grant itself authority from new files.
+Plan runs effect-free engine and ledger checks and reports unavailable affected graphs,
+schema drift and migration restrictions as errors. An unavailable unrelated
+graph does not block an independent change. Live apply additionally validates
+provider secrets and serving settings on the server.
 
 ## Operational boundaries
 

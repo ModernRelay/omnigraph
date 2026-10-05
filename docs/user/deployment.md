@@ -57,7 +57,7 @@ returns one `graphs` list, including blocked entries, with each graph's `state`
 Blocked entries include a sanitized `failure`: `invalid_configuration`,
 `invalid_policy`, `invalid_external_blob_policy`, `open_failed` or
 `invalid_stored_queries`. Details remain in server logs.
-`restart_after_correction` means correct that graph's configuration or
+`apply_correction_or_restart` means apply an explicit graph correction or correct the
 storage problem and restart; `wait_for_restart` describes shutdown.
 `wait_for_startup` means the graph's one startup attempt has not completed
 admission. It promises no retry time and does not trigger another open.

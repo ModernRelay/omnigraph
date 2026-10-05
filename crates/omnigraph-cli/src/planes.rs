@@ -184,8 +184,8 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         // (rejected downstream with its own message). On `direct`, full-text
         // rebuild attributes its graph publication; other maintenance verbs
         // record no actor. `control` refines per command:
-        // `cluster apply`/`upgrade-ledger` attribute an actor — the other read-only
-        // control verbs (status/plan/validate, policy, queries) never read it.
+        // Apply/upgrade attribute an actor; plan checks the intended actor
+        // against execution preflight. Other read-only control verbs do not.
         ScopeFlag::As => match capability {
             // `--as` names an actor for a direct/`--store` WRITE; a served write
             // resolves the actor from its token. The read commands (`query`,
@@ -201,7 +201,9 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
             Control => matches!(
                 cmd,
                 Command::Cluster {
-                    command: ClusterCommand::Apply { .. } | ClusterCommand::UpgradeLedger { .. },
+                    command: ClusterCommand::Plan { .. }
+                        | ClusterCommand::Apply { .. }
+                        | ClusterCommand::UpgradeLedger { .. },
                     ..
                 }
             ),
@@ -521,8 +523,8 @@ mod tests {
                 parse(&["omnigraph", "init", "--schema", "s.pg", "g.omni"]),
                 [false, false, false, false, false, false],
             ),
-            // Read-only control verbs never read the actor; `cluster
-            // apply`/`upgrade-ledger` do. The cluster family accepts
+            // Plan checks the intended actor; other read-only control verbs
+            // do not. Apply/upgrade attribute it. The cluster family accepts
             // root addressing for durable deployment/recovery, without graph
             // selection or profile scope.
             (
@@ -532,6 +534,10 @@ mod tests {
             (
                 parse(&["omnigraph", "cluster", "status", "--config", "."]),
                 [true, true, false, false, false, false],
+            ),
+            (
+                parse(&["omnigraph", "cluster", "plan", "--config", "."]),
+                [false, false, false, false, true, false],
             ),
             (
                 parse(&["omnigraph", "cluster", "apply", "--config", "."]),

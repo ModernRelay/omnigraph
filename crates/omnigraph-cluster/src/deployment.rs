@@ -1,4 +1,4 @@
-//! Durable schema/query and graph-creation deployments in the cluster ledger.
+//! Durable graph lifecycle and runtime configuration in the cluster ledger.
 //!
 //! Graph publication remains engine authority. This module stores immutable
 //! input and the engine's exact outcomes; it never reconstructs a receipt from
@@ -97,6 +97,27 @@ pub(crate) struct DeploymentAuthorization {
     pub effects: Vec<AuthorizedEffect>,
 }
 
+/// Explicit acknowledgements for operations that cannot be inferred safely from
+/// a config diff. These bytes are captured into the original deployment input.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DeploymentOptions {
+    pub schema_corrections: BTreeMap<String, omnigraph::db::SchemaContractDigest>,
+    pub delete_graphs: BTreeMap<String, GraphLifecycleConfirmation>,
+    pub adopt_graphs: BTreeMap<String, GraphLifecycleConfirmation>,
+    pub recreate_graphs: BTreeMap<String, omnigraph::db::SchemaContractDigest>,
+    pub repair_catalog: BTreeSet<String>,
+}
+
+/// Exact accepted graph incarnation and observed main manifest. A reused name
+/// or equal schema text is insufficient confirmation for adoption or removal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphLifecycleConfirmation {
+    pub contract: omnigraph::db::SchemaContractDigest,
+    pub graph_manifest_version: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapturedDeployment {
@@ -106,14 +127,14 @@ pub struct CapturedDeployment {
     pub(crate) config_semantics: String,
     pub(crate) resources: BTreeMap<String, StateResource>,
     pub(crate) sources: BTreeMap<String, String>,
-    /// Exact observed contracts explicitly acknowledged for correction. Empty
-    /// is the ordinary deployment form; the map is part of immutable input.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) schema_corrections: BTreeMap<String, omnigraph::db::SchemaContractDigest>,
+    pub(crate) options: DeploymentOptions,
 }
 
 /// Frozen, bounded source input. The server never opens caller-supplied paths.
 impl CapturedDeployment {
+    pub fn options(&self) -> &DeploymentOptions {
+        &self.options
+    }
     pub fn canonical_root(&self) -> &str {
         &self.canonical_root
     }
@@ -148,6 +169,10 @@ pub(crate) struct OutstandingDeployment {
 #[serde(deny_unknown_fields)]
 pub(crate) struct GraphDeployment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopt: Option<GraphLifecycleConfirmation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete: Option<GraphLifecycleConfirmation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create: Option<PreparedGraphCreate>,
     pub intent: Option<PreparedSchemaApply>,
     pub observed_manifest_version: u64,
@@ -167,6 +192,15 @@ pub(crate) enum GraphDeploymentState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GraphDeploymentResult {
+    Adopted {
+        graph_manifest_version: u64,
+        contract: omnigraph::db::SchemaContractDigest,
+    },
+    Deleted {
+        graph_manifest_version: u64,
+        contract: omnigraph::db::SchemaContractDigest,
+        retained_storage: bool,
+    },
     Created {
         graph_manifest_version: u64,
         contract: omnigraph::db::SchemaContractDigest,
@@ -193,6 +227,8 @@ impl GraphDeploymentResult {
                     | SchemaApplySettlement::NoOp { .. }
             } | Self::QueryOnly { .. }
                 | Self::Created { .. }
+                | Self::Adopted { .. }
+                | Self::Deleted { .. }
         )
     }
 
@@ -607,9 +643,22 @@ pub(crate) fn validate_state(state: &ClusterState) -> Result<(), Diagnostic> {
                             .bytes()
                             .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
                 }
+                GraphDeploymentResult::Deleted {
+                    retained_storage: false,
+                    ..
+                } => true,
                 GraphDeploymentResult::Created {
                     graph_manifest_version,
                     contract,
+                }
+                | GraphDeploymentResult::Adopted {
+                    graph_manifest_version,
+                    contract,
+                }
+                | GraphDeploymentResult::Deleted {
+                    graph_manifest_version,
+                    contract,
+                    ..
                 } => *graph_manifest_version == 0 || !valid_contract(contract),
                 GraphDeploymentResult::QueryOnly {
                     graph_manifest_version,
@@ -677,6 +726,7 @@ pub(crate) fn validate_state(state: &ClusterState) -> Result<(), Diagnostic> {
             || pending.graphs.iter().any(|(graph, entry)| {
                 !valid_resource_name(graph)
                     || (entry.create.is_none()
+                        && entry.adopt.is_none()
                         && !state
                             .applied_revision
                             .resources
@@ -686,12 +736,25 @@ pub(crate) fn validate_state(state: &ClusterState) -> Result<(), Diagnostic> {
                         .as_ref()
                         .is_some_and(|create| create.validate().is_err())
                     || (entry.create.is_some()
-                        && (entry.intent.is_some()
-                            || entry.observed_manifest_version != 0
-                            || state
-                                .applied_revision
-                                .resources
-                                .contains_key(&graph_address(graph))))
+                        && (entry.intent.is_some() || entry.observed_manifest_version != 0))
+                    || [
+                        entry.create.is_some(),
+                        entry.intent.is_some(),
+                        entry.adopt.is_some(),
+                        entry.delete.is_some(),
+                    ]
+                    .into_iter()
+                    .filter(|present| *present)
+                    .count()
+                        > 1
+                    || entry
+                        .adopt
+                        .iter()
+                        .chain(entry.delete.iter())
+                        .any(|confirmation| {
+                            confirmation.graph_manifest_version != entry.observed_manifest_version
+                                || !valid_contract(&confirmation.contract)
+                        })
                     || (entry.create.is_none() && entry.observed_manifest_version == 0)
                     || entry.intent.as_ref().is_some_and(|intent| {
                         intent.actor() != pending.authorization.authority.actor.as_deref()

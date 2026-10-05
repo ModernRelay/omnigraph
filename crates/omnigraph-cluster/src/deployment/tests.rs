@@ -103,7 +103,14 @@ async fn bootstrap_and_add_graph_use_one_v2_protocol_without_reset() {
         .await
         .unwrap()
         .unwrap();
-    let captured = capture_deployment(dir.path(), &BTreeMap::new()).unwrap();
+    let captured = capture_deployment_with_options(
+        dir.path(),
+        &DeploymentOptions {
+            repair_catalog: BTreeSet::from(["policy.base".into()]),
+            ..DeploymentOptions::default()
+        },
+    )
+    .unwrap();
     let before = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
     let preview = preview_deployment_serving_snapshot(&captured, &admission, &owner())
         .await
@@ -294,7 +301,7 @@ async fn graph_creation_refuses_foreign_root_without_holding_new_admission() {
     let error = apply_deployment(dir.path(), None, &owner(), &BTreeMap::new(), |_, _, _| {})
         .await
         .unwrap_err();
-    assert_eq!(error.code, "graph_create_preflight_failed");
+    assert_eq!(error.code, "graph_adoption_required");
     assert!(
         deployment_status(root, None, &owner())
             .await
@@ -302,6 +309,48 @@ async fn graph_creation_refuses_foreign_root_without_holding_new_admission() {
             .lock_id
             .is_none()
     );
+
+    // Loss of the ledger is still an explicit adoption, never an implicit
+    // replacement. A stale confirmation must not create an empty new ledger.
+    let knowledge = confirmation(dir.path(), "knowledge").await;
+    let second = confirmation(dir.path(), "second").await;
+    fs::remove_file(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let mut stale = second.clone();
+    stale.graph_manifest_version += 1;
+    let mut options = DeploymentOptions {
+        adopt_graphs: BTreeMap::from([
+            ("knowledge".into(), knowledge.clone()),
+            ("second".into(), stale),
+        ]),
+        ..DeploymentOptions::default()
+    };
+    let captured = capture_deployment_with_options(dir.path(), &options).unwrap();
+    assert_eq!(
+        preflight_deployment(&captured, &owner())
+            .await
+            .unwrap_err()
+            .code,
+        "graph_lifecycle_confirmation_mismatch"
+    );
+    assert_eq!(
+        apply_deployment_with_options(dir.path(), None, &owner(), &options, |_, _, _| {})
+            .await
+            .unwrap_err()
+            .code,
+        "graph_lifecycle_confirmation_mismatch"
+    );
+    assert!(!dir.path().join(CLUSTER_STATE_FILE).exists());
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+    options.adopt_graphs.insert("second".into(), second.clone());
+    let adopted = apply_options(dir.path(), &options).await;
+    assert!(
+        adopted
+            .graphs
+            .values()
+            .all(|result| matches!(result, GraphDeploymentResult::Adopted { .. }))
+    );
+    assert_eq!(confirmation(dir.path(), "knowledge").await, knowledge);
+    assert_eq!(confirmation(dir.path(), "second").await, second);
 }
 
 fn identity(actor: &str) -> DeploymentCaller {
@@ -605,4 +654,496 @@ fn remote_capture_does_not_open_server_storage() {
             "deployment_input_invalid"
         );
     }
+}
+
+fn edit_config(dir: &Path, edit: impl FnOnce(&mut serde_yaml::Value)) {
+    let path = dir.join(CLUSTER_CONFIG_FILE);
+    let mut value = serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    edit(&mut value);
+    fs::write(path, serde_yaml::to_string(&value).unwrap()).unwrap();
+}
+
+async fn confirmation(dir: &Path, graph: &str) -> GraphLifecycleConfirmation {
+    let db = Omnigraph::open_read_only(dir.join(format!("graphs/{graph}.omni")).to_str().unwrap())
+        .await
+        .unwrap();
+    execution::graph_confirmation(&db).await.unwrap()
+}
+
+async fn apply_options(dir: &Path, options: &DeploymentOptions) -> DeploymentResult {
+    let applied = apply_deployment_with_options(dir, None, &owner(), options, |_, _, _| {})
+        .await
+        .unwrap();
+    let DeploymentLookup::Complete { result } = applied else {
+        panic!("{applied:?}")
+    };
+    assert!(result.converged, "{result:?}");
+    result
+}
+
+#[tokio::test]
+async fn current_policy_authorizes_policy_edits_rebinding_and_removal() {
+    let dir = crate::tests::identity_fixture();
+    let root = dir.path().to_str().unwrap();
+    bootstrap(dir.path()).await;
+    unlock(root).await;
+    let original = confirmation(dir.path(), "knowledge").await;
+    let graph_policy = dir.path().join("base.policy.yaml");
+    let source = fs::read_to_string(&graph_policy)
+        .unwrap()
+        .replace("principal:reader]", "principal:reader, principal:alice]");
+    fs::write(&graph_policy, &source).unwrap();
+    let applied = apply_deployment(
+        dir.path(),
+        None,
+        &identity("principal:owner"),
+        &BTreeMap::new(),
+        |_, _, _| {},
+    )
+    .await
+    .unwrap();
+    assert!(matches!(applied, DeploymentLookup::Complete { result } if result.converged));
+    let store = ClusterStore::for_config_dir(dir.path());
+    let (state, _) = execution::read_existing(&store).await.unwrap();
+    let policies = crate::authorization::AppliedPolicies::load(&store, &state)
+        .await
+        .unwrap();
+    policies
+        .check_graph(
+            "principal:alice",
+            "knowledge",
+            omnigraph_policy::PolicyAction::Read,
+        )
+        .unwrap();
+    assert_eq!(confirmation(dir.path(), "knowledge").await, original);
+    unlock(root).await;
+    fs::write(dir.path().join("replacement.policy.yaml"), source).unwrap();
+    edit_config(dir.path(), |config| {
+        config["policies"]
+            .as_mapping_mut()
+            .unwrap()
+            .remove(serde_yaml::Value::from("base"));
+        config["policies"]["replacement"] =
+            serde_yaml::from_str("file: ./replacement.policy.yaml\napplies_to: [knowledge]\n")
+                .unwrap();
+    });
+    apply_options(dir.path(), &DeploymentOptions::default()).await;
+    unlock(root).await;
+    edit_config(dir.path(), |config| {
+        config["policies"]
+            .as_mapping_mut()
+            .unwrap()
+            .remove(serde_yaml::Value::from("replacement"));
+    });
+    apply_options(dir.path(), &DeploymentOptions::default()).await;
+    let (state, _) = execution::read_existing(&store).await.unwrap();
+    assert!(!state.applied_revision.resources.contains_key("policy.base"));
+    assert!(
+        !state
+            .applied_revision
+            .resources
+            .contains_key("policy.replacement")
+    );
+    assert!(
+        crate::authorization::AppliedPolicies::load(&store, &state)
+            .await
+            .unwrap()
+            .graph("knowledge")
+            .is_none()
+    );
+    assert_eq!(confirmation(dir.path(), "knowledge").await, original);
+    unlock(root).await;
+    // Current management policy authorizes revoking the author itself. A
+    // subsequent candidate restoring access cannot authorize its own request.
+    let management = dir.path().join("management.policy.yaml");
+    let source = fs::read_to_string(&management).unwrap();
+    fs::write(&management, source.replace("principal:owner, ", "")).unwrap();
+    apply_deployment(
+        dir.path(),
+        None,
+        &identity("principal:owner"),
+        &BTreeMap::new(),
+        |_, _, _| {},
+    )
+    .await
+    .unwrap();
+    unlock(root).await;
+    fs::write(&management, source).unwrap();
+    assert_eq!(
+        apply_deployment(
+            dir.path(),
+            None,
+            &identity("principal:owner"),
+            &BTreeMap::new(),
+            |_, _, _| {}
+        )
+        .await
+        .unwrap_err()
+        .code,
+        "policy_denied"
+    );
+}
+
+#[tokio::test]
+async fn provider_crud_binding_and_blob_updates_preserve_graph_identity() {
+    let dir = crate::tests::identity_fixture();
+    let root = dir.path().to_str().unwrap();
+    bootstrap(dir.path()).await;
+    unlock(root).await;
+    let original = confirmation(dir.path(), "knowledge").await;
+    for model in ["mock:first", "mock:second"] {
+        edit_config(dir.path(), |config| {
+            config["providers"] = serde_yaml::from_str(&format!(
+                "embedding:\n  selected:\n    kind: mock\n    model: {model}\n"
+            ))
+            .unwrap();
+            config["graphs"]["knowledge"]["embedding_provider"] = "selected".into();
+            config["graphs"]["knowledge"]["external_blobs"] = serde_yaml::from_str(
+                "allow:\n  - base: s3://trusted-bucket/data/\n    scope: server_safe\n",
+            )
+            .unwrap();
+        });
+        apply_options(dir.path(), &DeploymentOptions::default()).await;
+        unlock(root).await;
+    }
+    edit_config(dir.path(), |config| {
+        config
+            .as_mapping_mut()
+            .unwrap()
+            .remove(serde_yaml::Value::from("providers"));
+        let graph = config["graphs"]["knowledge"].as_mapping_mut().unwrap();
+        graph.remove(serde_yaml::Value::from("embedding_provider"));
+        graph.remove(serde_yaml::Value::from("external_blobs"));
+    });
+    apply_options(dir.path(), &DeploymentOptions::default()).await;
+    let store = ClusterStore::for_config_dir(dir.path());
+    let (state, _) = execution::read_existing(&store).await.unwrap();
+    assert!(
+        !state
+            .applied_revision
+            .resources
+            .keys()
+            .any(|address| matches!(resource_kind(address), ResourceKind::EmbeddingProvider(_)))
+    );
+    assert!(
+        state.applied_revision.resources["graph.knowledge"]
+            .embedding_provider
+            .is_none()
+    );
+    assert!(
+        state.applied_revision.resources["graph.knowledge"]
+            .external_blob_policy
+            .is_none()
+    );
+    assert_eq!(confirmation(dir.path(), "knowledge").await, original);
+}
+
+#[tokio::test]
+async fn graph_removal_requires_exact_confirmation_retains_storage_and_allows_readoption() {
+    let dir = crate::tests::identity_fixture();
+    let root = dir.path().to_str().unwrap();
+    add_second_graph(dir.path());
+    bootstrap(dir.path()).await;
+    unlock(root).await;
+    let original = confirmation(dir.path(), "second").await;
+    let original_config = fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
+    edit_config(dir.path(), |config| {
+        config["graphs"]
+            .as_mapping_mut()
+            .unwrap()
+            .remove(serde_yaml::Value::from("second"));
+        config["policies"]["base"]["applies_to"] = serde_yaml::from_str("[knowledge]").unwrap();
+    });
+    let err = apply_deployment(dir.path(), None, &owner(), &BTreeMap::new(), |_, _, _| {})
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, "graph_delete_confirmation_required");
+    assert!(err.message.contains("graph_manifest_version"));
+    let correction = DeploymentOptions {
+        schema_corrections: BTreeMap::from([("second".into(), original.contract.clone())]),
+        ..DeploymentOptions::default()
+    };
+    assert_eq!(
+        apply_deployment_with_options(dir.path(), None, &owner(), &correction, |_, _, _| {})
+            .await
+            .unwrap_err()
+            .code,
+        "deployment_input_invalid"
+    );
+    let mut options = DeploymentOptions::default();
+    let mut stale = original.clone();
+    stale.graph_manifest_version += 1;
+    options.delete_graphs.insert("second".into(), stale);
+    assert_eq!(
+        apply_deployment_with_options(dir.path(), None, &owner(), &options, |_, _, _| {})
+            .await
+            .unwrap_err()
+            .code,
+        "graph_lifecycle_confirmation_mismatch"
+    );
+    options
+        .delete_graphs
+        .insert("second".into(), original.clone());
+    let removed = apply_options(dir.path(), &options).await;
+    assert!(matches!(
+        removed.graphs["second"],
+        GraphDeploymentResult::Deleted {
+            retained_storage: true,
+            ..
+        }
+    ));
+    assert_eq!(confirmation(dir.path(), "second").await, original);
+    assert_eq!(
+        apply_deployment_with_options(
+            dir.path(),
+            Some(&removed.id),
+            &owner(),
+            &DeploymentOptions::default(),
+            |_, _, _| {}
+        )
+        .await
+        .unwrap_err()
+        .code,
+        "deployment_input_mismatch"
+    );
+    assert_eq!(
+        read_serving_snapshot_from_storage(root)
+            .await
+            .unwrap()
+            .graphs
+            .len(),
+        1
+    );
+    unlock(root).await;
+    fs::write(dir.path().join(CLUSTER_CONFIG_FILE), original_config).unwrap();
+    assert_eq!(
+        apply_deployment(dir.path(), None, &owner(), &BTreeMap::new(), |_, _, _| {})
+            .await
+            .unwrap_err()
+            .code,
+        "graph_adoption_required"
+    );
+    let options = DeploymentOptions {
+        adopt_graphs: BTreeMap::from([("second".into(), original.clone())]),
+        ..DeploymentOptions::default()
+    };
+    let adopted = apply_options(dir.path(), &options).await;
+    assert!(matches!(
+        adopted.graphs["second"],
+        GraphDeploymentResult::Adopted { .. }
+    ));
+    assert_eq!(confirmation(dir.path(), "second").await, original);
+    assert_eq!(
+        read_serving_snapshot_from_storage(root)
+            .await
+            .unwrap()
+            .graphs
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn missing_graph_recreation_requires_achieved_identity_and_never_overwrites_storage() {
+    let dir = crate::tests::identity_fixture();
+    let root = dir.path().to_str().unwrap();
+    bootstrap(dir.path()).await;
+    unlock(root).await;
+    let original = confirmation(dir.path(), "knowledge").await;
+    let options = DeploymentOptions {
+        recreate_graphs: BTreeMap::from([("knowledge".into(), original.contract.clone())]),
+        ..DeploymentOptions::default()
+    };
+    assert_eq!(
+        apply_deployment_with_options(dir.path(), None, &owner(), &options, |_, _, _| {})
+            .await
+            .unwrap_err()
+            .code,
+        "graph_recreate_root_present"
+    );
+    fs::remove_dir_all(dir.path().join("graphs/knowledge.omni")).unwrap();
+    let recreated = apply_options(dir.path(), &options).await;
+    assert!(matches!(
+        recreated.graphs["knowledge"],
+        GraphDeploymentResult::Created { .. }
+    ));
+    assert_ne!(
+        confirmation(dir.path(), "knowledge")
+            .await
+            .contract
+            .schema_identity_domain,
+        original.contract.schema_identity_domain
+    );
+}
+
+#[tokio::test]
+async fn unrelated_unavailable_graph_does_not_block_affected_graph_preflight_or_apply() {
+    let dir = crate::tests::identity_fixture();
+    let root = dir.path().to_str().unwrap();
+    add_second_graph(dir.path());
+    bootstrap(dir.path()).await;
+    unlock(root).await;
+    fs::remove_dir_all(dir.path().join("graphs/second.omni")).unwrap();
+    let query_path = dir.path().join("people.gq");
+    let source = fs::read_to_string(&query_path).unwrap();
+    fs::write(
+        query_path,
+        source.replace("return { $p.name, $p.age }", "return { $p.name }"),
+    )
+    .unwrap();
+    let captured = capture_deployment(dir.path(), &BTreeMap::new()).unwrap();
+    preflight_deployment(&captured, &owner()).await.unwrap();
+    let result = apply_options(dir.path(), &DeploymentOptions::default()).await;
+    assert_eq!(result.graphs.keys().collect::<Vec<_>>(), vec!["knowledge"]);
+    assert!(!dir.path().join("graphs/second.omni").exists());
+}
+
+#[tokio::test]
+async fn targeted_catalog_repair_restores_exact_bytes_without_candidate_self_authorization() {
+    let dir = crate::tests::identity_fixture();
+    let root = dir.path().to_str().unwrap();
+    bootstrap(dir.path()).await;
+    unlock(root).await;
+    let original = confirmation(dir.path(), "knowledge").await;
+    let store = ClusterStore::for_config_dir(dir.path());
+    let (state, _) = execution::read_existing(&store).await.unwrap();
+    let digest = &state.applied_revision.resources["policy.management"].digest;
+    let relative =
+        ClusterStore::payload_relative(&ResourceKind::Policy("management".into()), digest).unwrap();
+    fs::write(dir.path().join(relative), [0xff, 0xfe]).unwrap();
+    let wrong_target = DeploymentOptions {
+        repair_catalog: BTreeSet::from(["query.knowledge.find_person".into()]),
+        ..DeploymentOptions::default()
+    };
+    assert!(
+        apply_deployment_with_options(dir.path(), None, &owner(), &wrong_target, |_, _, _| {})
+            .await
+            .is_err()
+    );
+    let options = DeploymentOptions {
+        repair_catalog: BTreeSet::from(["policy.management".into()]),
+        ..DeploymentOptions::default()
+    };
+    let management_path = dir.path().join("management.policy.yaml");
+    let trusted_source = fs::read_to_string(&management_path).unwrap();
+    fs::write(
+        &management_path,
+        format!("{trusted_source}\n# changed policy input\n"),
+    )
+    .unwrap();
+    assert!(
+        apply_deployment_with_options(dir.path(), None, &owner(), &options, |_, _, _| {})
+            .await
+            .is_err()
+    );
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+    fs::write(&management_path, trusted_source).unwrap();
+    assert!(
+        apply_deployment_with_options(
+            dir.path(),
+            None,
+            &identity("principal:owner"),
+            &options,
+            |_, _, _| {}
+        )
+        .await
+        .is_err()
+    );
+    apply_options(dir.path(), &options).await;
+    assert_eq!(confirmation(dir.path(), "knowledge").await, original);
+    let (state, _) = execution::read_existing(&store).await.unwrap();
+    crate::authorization::AppliedPolicies::load(&store, &state)
+        .await
+        .unwrap()
+        .check_cluster("principal:owner")
+        .unwrap();
+    unlock(root).await;
+    let query = "query.knowledge.find_person";
+    let digest = &state.applied_revision.resources[query].digest;
+    let relative = ClusterStore::payload_relative(&resource_kind(query), digest).unwrap();
+    fs::write(
+        dir.path().join(relative),
+        vec![b'x'; crate::config::MAX_CONFIG_SOURCE_BYTES + 1],
+    )
+    .unwrap();
+    let options = DeploymentOptions {
+        repair_catalog: BTreeSet::from([query.into()]),
+        ..DeploymentOptions::default()
+    };
+    let captured = capture_deployment_with_options(dir.path(), &options).unwrap();
+    preflight_deployment(&captured, &owner()).await.unwrap();
+    apply_options(dir.path(), &options).await;
+    assert_eq!(confirmation(dir.path(), "knowledge").await, original);
+    assert!(
+        read_serving_snapshot_from_storage(root)
+            .await
+            .unwrap()
+            .diagnostics
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn configuration_management_does_not_require_unrelated_graph_data_read() {
+    let dir = crate::tests::identity_fixture();
+    let root = dir.path().to_str().unwrap();
+    add_second_graph(dir.path());
+    fs::write(
+        dir.path().join("closed.policy.yaml"),
+        "version: 1\nrules: []\n",
+    )
+    .unwrap();
+    edit_config(dir.path(), |config| {
+        config["policies"]["base"]["applies_to"] = serde_yaml::from_str("[knowledge]").unwrap();
+        config["policies"]["closed"] =
+            serde_yaml::from_str("file: ./closed.policy.yaml\napplies_to: [second]\n").unwrap();
+    });
+    bootstrap(dir.path()).await;
+    unlock(root).await;
+    let store = ClusterStore::for_config_dir(dir.path());
+    let (state, _) = execution::read_existing(&store).await.unwrap();
+    assert!(
+        crate::authorization::AppliedPolicies::load(&store, &state)
+            .await
+            .unwrap()
+            .check_graph(
+                "principal:owner",
+                "second",
+                omnigraph_policy::PolicyAction::Read
+            )
+            .is_err()
+    );
+    let actor = identity("principal:owner");
+    deployment_status(root, None, &actor).await.unwrap();
+    let path = dir.path().join("base.policy.yaml");
+    let source = fs::read_to_string(&path)
+        .unwrap()
+        .replace("principal:reader]", "principal:reader, principal:alice]");
+    fs::write(path, source).unwrap();
+    let result = apply_deployment(dir.path(), None, &actor, &BTreeMap::new(), |_, _, _| {})
+        .await
+        .unwrap();
+    let DeploymentLookup::Complete { result } = result else {
+        panic!("missing result")
+    };
+    assert!(result.converged);
+    assert_eq!(
+        result.graphs.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["knowledge"]
+    );
+    deployment_status(root, Some(&result.id), &actor)
+        .await
+        .unwrap();
+    let (state, _) = execution::read_existing(&store).await.unwrap();
+    assert!(
+        crate::authorization::AppliedPolicies::load(&store, &state)
+            .await
+            .unwrap()
+            .check_graph(
+                "principal:owner",
+                "second",
+                omnigraph_policy::PolicyAction::Read
+            )
+            .is_err()
+    );
 }

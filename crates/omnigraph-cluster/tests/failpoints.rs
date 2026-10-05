@@ -741,12 +741,21 @@ fn state_path(config_dir: &Path) -> PathBuf {
 #[serial]
 async fn graph_creation_crash_reconciles_exact_genesis_without_replay() {
     use omnigraph_cluster::seams::catalog as seams;
-    use omnigraph_cluster::{GraphDeploymentResult, reconcile_deployment};
+    use omnigraph_cluster::{
+        DeploymentOptions, GraphDeploymentResult, apply_deployment_with_options,
+        reconcile_deployment,
+    };
     let _scenario = FailScenario::setup();
-    for (seam, created, replace) in [
-        (&seams::DEPLOYMENT_AFTER_STARTED, false, false),
-        (&seams::DEPLOYMENT_AFTER_SCHEMA, true, false),
-        (&seams::DEPLOYMENT_AFTER_SCHEMA, true, true),
+    for (seam, created, replace, recreate) in [
+        (&seams::DEPLOYMENT_AFTER_STARTED, false, false, false),
+        (&seams::DEPLOYMENT_AFTER_SCHEMA, true, false, false),
+        (&seams::DEPLOYMENT_AFTER_SCHEMA, true, true, false),
+        // An unchanged config is not convergence if explicit recreation never
+        // started. Same-name replacement also requires the exact new genesis.
+        (&seams::DEPLOYMENT_AFTER_ACCEPTANCE, false, false, true),
+        (&seams::DEPLOYMENT_AFTER_STARTED, false, false, true),
+        (&seams::DEPLOYMENT_AFTER_SCHEMA, true, false, true),
+        (&seams::DEPLOYMENT_AFTER_SCHEMA, true, true, true),
     ] {
         let dir = fixture();
         let root = dir.path().to_str().unwrap();
@@ -761,21 +770,35 @@ async fn graph_creation_crash_reconciles_exact_genesis_without_replay() {
         .unwrap();
         assert!(matches!(first, DeploymentLookup::Complete { ref result } if result.converged));
         unlock_offline(dir.path()).await;
-        let path = dir.path().join("cluster.yaml");
-        let source = fs::read_to_string(&path).unwrap();
-        fs::write(
-            &path,
-            source.replace("graphs:\n", "graphs:\n  second:\n    schema: ./people.pg\n"),
-        )
-        .unwrap();
+        let target = if recreate { "knowledge" } else { "second" };
+        let mut options = DeploymentOptions::default();
+        if recreate {
+            let uri = dir.path().join("graphs/knowledge.omni");
+            let db = Omnigraph::open_read_only(uri.to_str().unwrap())
+                .await
+                .unwrap();
+            options
+                .recreate_graphs
+                .insert("knowledge".into(), db.schema_contract_digest());
+            drop(db);
+            fs::remove_dir_all(uri).unwrap();
+        } else {
+            let path = dir.path().join("cluster.yaml");
+            let source = fs::read_to_string(&path).unwrap();
+            fs::write(
+                &path,
+                source.replace("graphs:\n", "graphs:\n  second:\n    schema: ./people.pg\n"),
+            )
+            .unwrap();
+        }
         let mut id = String::new();
         {
             let _failure = seam.fire_always();
-            let error = apply_deployment(
+            let error = apply_deployment_with_options(
                 dir.path(),
                 None,
                 &deployment_owner(),
-                &BTreeMap::new(),
+                &options,
                 |issued, _, _| id = issued.into(),
             )
             .await
@@ -784,7 +807,7 @@ async fn graph_creation_crash_reconciles_exact_genesis_without_replay() {
         }
         unlock_offline(dir.path()).await;
         if replace {
-            let graph = dir.path().join("graphs/second.omni");
+            let graph = dir.path().join(format!("graphs/{target}.omni"));
             fs::remove_dir_all(&graph).unwrap();
             Omnigraph::init(graph.to_str().unwrap(), SCHEMA)
                 .await
@@ -806,15 +829,14 @@ async fn graph_creation_crash_reconciles_exact_genesis_without_replay() {
             };
             assert_eq!(result.converged, created);
             assert_eq!(
-                matches!(
-                    result.graphs["second"],
-                    GraphDeploymentResult::Created { .. }
-                ),
+                matches!(result.graphs[target], GraphDeploymentResult::Created { .. }),
                 created
             );
             assert!(matches!(
-                result.graphs["second"],
-                GraphDeploymentResult::Created { .. } | GraphDeploymentResult::Refused { .. }
+                result.graphs[target],
+                GraphDeploymentResult::Created { .. }
+                    | GraphDeploymentResult::Refused { .. }
+                    | GraphDeploymentResult::NotAttempted
             ));
         }
     }
@@ -998,4 +1020,244 @@ async fn graph_creation_partial_result_keeps_only_achieved_policy_bindings() {
             .iter()
             .any(|policy| policy.applies_to == ["graph.knowledge", "graph.second", "graph.third"])
     );
+}
+
+/// Adoption/removal publish only the recorded catalog transition. They never
+/// replay graph writes or authorize a newly recreated root during recovery.
+#[tokio::test]
+#[serial]
+async fn exact_graph_lifecycle_reconciles_without_touching_retained_data() {
+    use omnigraph::db::ReadTarget;
+    use omnigraph_cluster::seams::catalog as seams;
+    use omnigraph_cluster::{
+        DeploymentOptions, GraphDeploymentResult, GraphLifecycleConfirmation,
+        apply_deployment_with_options, reconcile_deployment,
+    };
+    let _scenario = FailScenario::setup();
+    for (seam, foreign, aliased) in [
+        (&seams::DEPLOYMENT_AFTER_ACCEPTANCE, false, false),
+        (&seams::DEPLOYMENT_BEFORE_RESULT, false, false),
+        (&seams::DEPLOYMENT_AFTER_RESULT, false, false),
+        (&seams::DEPLOYMENT_AFTER_ACCEPTANCE, true, false),
+        #[cfg(unix)]
+        (&seams::DEPLOYMENT_AFTER_ACCEPTANCE, false, true),
+    ] {
+        for remove in [false, true] {
+            let dir = fixture();
+            let root = dir.path().to_str().unwrap();
+            let config_path = dir.path().join("cluster.yaml");
+            let one_graph = fs::read_to_string(&config_path).unwrap();
+            let two_graphs =
+                one_graph.replace("graphs:\n", "graphs:\n  second:\n    schema: ./people.pg\n");
+            if remove {
+                fs::write(&config_path, &two_graphs).unwrap();
+            }
+            apply_deployment(
+                dir.path(),
+                None,
+                &deployment_owner(),
+                &BTreeMap::new(),
+                |_, _, _| {},
+            )
+            .await
+            .unwrap();
+            unlock_offline(dir.path()).await;
+            let uri = dir.path().join("graphs/second.omni");
+            let db = if remove {
+                Omnigraph::open(uri.to_str().unwrap()).await.unwrap()
+            } else {
+                Omnigraph::init(uri.to_str().unwrap(), SCHEMA)
+                    .await
+                    .unwrap()
+            };
+            let session = omnigraph::Session::from_defaults(
+                std::sync::Arc::new(db),
+                omnigraph::settings::SessionSettings::default(),
+            );
+            session
+                .load_jsonl(
+                    r#"{"type":"Person","data":{"name":"Kept","age":37}}"#,
+                    omnigraph::loader::LoadMode::Merge,
+                )
+                .await
+                .unwrap();
+            drop(session);
+            let db = Omnigraph::open_read_only(uri.to_str().unwrap())
+                .await
+                .unwrap();
+            let confirmation = GraphLifecycleConfirmation {
+                contract: db.schema_contract_digest(),
+                graph_manifest_version: db
+                    .snapshot_of(ReadTarget::branch("main"))
+                    .await
+                    .unwrap()
+                    .graph_manifest_version(),
+            };
+            let contents = db.export_jsonl("main", &[]).await.unwrap();
+            drop(db);
+            fs::write(&config_path, if remove { &one_graph } else { &two_graphs }).unwrap();
+            let mut options = DeploymentOptions::default();
+            if remove {
+                options
+                    .delete_graphs
+                    .insert("second".into(), confirmation.clone());
+            } else {
+                options
+                    .adopt_graphs
+                    .insert("second".into(), confirmation.clone());
+            }
+            let mut id = String::new();
+            {
+                let _failure = seam.fire_always();
+                let error = apply_deployment_with_options(
+                    dir.path(),
+                    None,
+                    &deployment_owner(),
+                    &options,
+                    |issued, _, _| id = issued.into(),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.code, "injected_failpoint");
+            }
+            unlock_offline(dir.path()).await;
+            if foreign {
+                fs::remove_dir_all(&uri).unwrap();
+                Omnigraph::init(uri.to_str().unwrap(), SCHEMA)
+                    .await
+                    .unwrap();
+            }
+            #[cfg(unix)]
+            if aliased {
+                let moved = dir.path().join("unmanaged.omni");
+                fs::rename(&uri, &moved).unwrap();
+                std::os::unix::fs::symlink(moved, &uri).unwrap();
+            }
+            fs::remove_file(config_path).unwrap();
+            fs::remove_file(dir.path().join("people.pg")).unwrap();
+            let recovered = reconcile_deployment(root, &id, true, &deployment_owner()).await;
+            if foreign || aliased {
+                assert_eq!(
+                    recovered.unwrap_err().code,
+                    if aliased {
+                        "cluster_graph_root_mismatch"
+                    } else {
+                        "graph_lifecycle_confirmation_mismatch"
+                    }
+                );
+                assert_eq!(
+                    omnigraph_cluster::deployment_status(root, Some(&id), &deployment_owner())
+                        .await
+                        .unwrap()
+                        .outstanding_id
+                        .as_deref(),
+                    Some(id.as_str())
+                );
+                continue;
+            }
+            let DeploymentLookup::Complete { result } = recovered.unwrap() else {
+                panic!("missing exact result")
+            };
+            assert!(result.converged);
+            assert_eq!(result.id, id);
+            assert_eq!(
+                matches!(
+                    result.graphs["second"],
+                    GraphDeploymentResult::Deleted {
+                        retained_storage: true,
+                        ..
+                    }
+                ),
+                remove
+            );
+            assert_eq!(
+                matches!(
+                    result.graphs["second"],
+                    GraphDeploymentResult::Adopted { .. }
+                ),
+                !remove
+            );
+            let db = Omnigraph::open_read_only(uri.to_str().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(db.schema_contract_digest(), confirmation.contract);
+            assert_eq!(db.export_jsonl("main", &[]).await.unwrap(), contents);
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn exact_catalog_repair_survives_acceptance_loss_without_source_checkout() {
+    use omnigraph_cluster::seams::catalog as seams;
+    use omnigraph_cluster::{
+        DeploymentOptions, apply_deployment_with_options, reconcile_deployment,
+    };
+    let _scenario = FailScenario::setup();
+    let dir = fixture();
+    let root = dir.path().to_str().unwrap();
+    apply_deployment(
+        dir.path(),
+        None,
+        &deployment_owner(),
+        &BTreeMap::new(),
+        |_, _, _| {},
+    )
+    .await
+    .unwrap();
+    unlock_offline(dir.path()).await;
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.path().join("__cluster/state.json")).unwrap())
+            .unwrap();
+    let digest = state["applied_revision"]["resources"]["policy.base"]["digest"]
+        .as_str()
+        .unwrap();
+    let payload = dir
+        .path()
+        .join(format!("__cluster/resources/policy/base/{digest}.yaml"));
+    let original = fs::read(&payload).unwrap();
+    fs::write(&payload, [0xff]).unwrap();
+    let options = DeploymentOptions {
+        repair_catalog: ["policy.base".into()].into_iter().collect(),
+        ..DeploymentOptions::default()
+    };
+    let mut id = String::new();
+    {
+        let _failure = seams::DEPLOYMENT_AFTER_ACCEPTANCE.fire_always();
+        assert_eq!(
+            apply_deployment_with_options(
+                dir.path(),
+                None,
+                &deployment_owner(),
+                &options,
+                |issued, _, _| id = issued.into()
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "injected_failpoint"
+        );
+    }
+    // The exact accepted repair is the only authorized fallback for the
+    // unreadable applied policy. A root-only lookup cannot invent that source.
+    let status = omnigraph_cluster::deployment_status(root, Some(&id), &deployment_owner())
+        .await
+        .unwrap();
+    omnigraph_cluster::force_unlock_storage_root(root, status.lock_id.as_deref().unwrap())
+        .await
+        .unwrap();
+    fs::remove_file(dir.path().join("cluster.yaml")).unwrap();
+    fs::remove_file(dir.path().join("base.policy.yaml")).unwrap();
+    fs::remove_file(dir.path().join("people.pg")).unwrap();
+    fs::remove_file(dir.path().join("people.gq")).unwrap();
+    let DeploymentLookup::Complete { result } =
+        reconcile_deployment(root, &id, true, &deployment_owner())
+            .await
+            .unwrap()
+    else {
+        panic!("missing repair receipt")
+    };
+    assert_eq!(result.id, id);
+    assert!(result.converged);
+    assert_eq!(fs::read(payload).unwrap(), original);
 }

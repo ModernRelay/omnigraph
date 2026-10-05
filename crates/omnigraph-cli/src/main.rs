@@ -11,8 +11,8 @@ use omnigraph_api_types::{
 };
 use omnigraph_cluster::{
     DiagnosticSeverity, ForceUnlockOutput, PlanOptions, PlanOutput, StateSyncOutput, StatusOutput,
-    ValidateOutput, force_unlock_config_dir, observe_config_dir, plan_config_dir_with_options,
-    status_config_dir, validate_config_dir,
+    ValidateOutput, force_unlock_config_dir, observe_config_dir, status_config_dir,
+    validate_config_dir,
 };
 use omnigraph_compiler::query::ast::{
     BranchStmt, BranchWrite, EmptyFile, FileBody, QueryFile, SettingStmt,
@@ -264,12 +264,15 @@ fn validate_core_root_arguments(
             ClusterCommand::Apply {
                 schema_correction: Some(_),
                 ..
+            } | ClusterCommand::Apply {
+                lifecycle: Some(_),
+                ..
             }
         )
     {
         return Err(Cli::command().error(
             clap::error::ErrorKind::ArgumentConflict,
-            "--schema-correction requires config-addressed apply; root reconciliation uses only the original captured input",
+            "--schema-correction and --lifecycle require config-addressed apply; root reconciliation uses only the original captured input",
         ));
     }
     if cli.cluster.is_some()
@@ -1975,9 +1978,19 @@ async fn run(cli: Cli) -> Result<()> {
                 config,
                 json,
                 observe,
+                lifecycle,
+                schema_correction,
                 ..
             } => {
-                let output = plan_config_dir_with_options(config, PlanOptions { observe }).await;
+                let options =
+                    read_deployment_options(lifecycle.as_deref(), schema_correction.as_deref())?;
+                let output = omnigraph_cluster::plan_config_dir_with_deployment_options(
+                    config,
+                    PlanOptions { observe },
+                    &options,
+                    resolve_cluster_actor(cli.as_actor.as_deref())?,
+                )
+                .await;
                 finish_cluster_plan(&output, json)?;
             }
             ClusterCommand::Observe { config, json } => {
@@ -1989,6 +2002,7 @@ async fn run(cli: Cli) -> Result<()> {
                 json,
                 deployment_id,
                 schema_correction,
+                lifecycle,
                 writers_stopped,
                 ..
             } => {
@@ -2006,12 +2020,15 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                     finish_core_deployment(result, json)?;
                 } else {
-                    let corrections = read_schema_corrections(schema_correction.as_deref())?;
-                    let result = omnigraph_cluster::apply_deployment(
+                    let options = read_deployment_options(
+                        lifecycle.as_deref(),
+                        schema_correction.as_deref(),
+                    )?;
+                    let result = omnigraph_cluster::apply_deployment_with_options(
                         &config,
                         deployment_id.as_deref(),
                         &caller,
-                        &corrections,
+                        &options,
                         |id, root, lock| {
                             let root = omnigraph::storage::redacted_storage_uri(root);
                             eprintln!(

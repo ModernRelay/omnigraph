@@ -61,16 +61,18 @@ resets graphs nor migrates their storage format. Unknown versions and
 `state.lock: false` refuse. There is no offline/online mode field and no legacy
 apply, import, refresh or approval executor.
 
-Apply creates graphs and changes schemas and stored queries. Existing roots,
-policies, provider/Blob bindings, trust and format stay fixed. New graph bindings
-are validated with creation; deletion and replacement of existing runtime
-bindings refuse. Normal engine open requires v14; server HTTP requires v0.12.
+Apply manages graphs, schemas, queries, policies and provider/Blob bindings.
+Runtime changes are validated before effects and activated with the achieved
+revision. Roots, trust and storage format stay fixed. Exact lifecycle input
+permits graph removal with retained storage, adoption, missing-root recreation
+and targeted catalog repair. Normal engine open requires v14; server HTTP
+requires v0.12.
 
 The applied revision and every achieved base retain each graph's exact source/IR
 digests and identity domain/version, captured coherently during conversion and
-advanced by successful schema outcomes. Serving and every new deployment compare
+advanced by successful schema outcomes. Serving and preparation of every affected graph compare
 this identity even after receipt eviction, rejecting a recreated graph with
-identical schema text. Explicit correction supplies the exact observed contract
+identical schema text. Unaffected graph opens are skipped. Explicit correction supplies the exact observed contract
 through `--schema-correction FILE`; it becomes immutable deployment input and
 requires schema-apply authority even when the source is unchanged.
 
@@ -114,7 +116,9 @@ nonce is unknown. Applied result revision is distinct from server activation.
 
 `DeploymentCaller` preserves the storage-owner trust boundary and an optional
 actor label. Authenticated identity callers recheck current cluster
-`ConfigManage`, graph `Read`, and `SchemaApply` for schema effects/recovery.
+`ConfigManage`; schema effects/recovery additionally require affected graph
+`Read` and `SchemaApply`. Deployment status and results expose management metadata
+under `ConfigManage`, without requiring data access on unrelated graphs.
 Original authority stays immutable; recovery records the current executor while
 preserving the authored engine receipt. The accepted
 [server runtime RFC](../rfcs/2026-09-29-server-runtime-and-online-deployment.md)
@@ -178,8 +182,10 @@ resolves required provider secrets and validates new graph bindings before any
 deployment effect. It reserves one batch transition, atomically closes affected graph
 admission and drains request descendants. Existing engine handles remain owned.
 It executes under the server's lifetime admission, loads the achieved bindings,
-and atomically installs exact contracts, query registries and new graph handles.
-Unchanged siblings continue serving. Pre-effect refusals restore predecessor
+and atomically installs exact contracts, query registries, immutable engine
+runtime bindings, management policy and graph inventory. Rebound engine views
+share the coordinator, write queues, schema and Lance sessions without reopening
+storage. Unchanged siblings continue serving. Pre-effect refusals restore predecessor
 views with new epochs. Uncertain effects use existing process containment.
 
 After installation, the ledger records the result revision/config digest and
@@ -313,8 +319,14 @@ The embedding entry point is `AppState::prepare_same_view`. It binds the actual
 process runtime; callers cannot substitute a new runtime to bypass stopping.
 It grants no schema/query replacement or deployment authority. The internal
 batch capability used by `deployment.rs` validates exact achieved schema/query
-bindings and new graph additions under the same shutdown/attempt fence. There
-is no public arbitrary-view replacement endpoint.
+bindings and explicit graph lifecycle under the same shutdown/attempt fence.
+Logical deletion retains the engine owner by canonical storage identity;
+readoption reuses that owner and validates its exact confirmation. At most 2,048
+active plus retained roots are admitted per process. Retained owners are never
+evicted without settlement; restart clears them. Recreating a graph with a
+retained owner is a pre-effect refusal. Blocked startup entries with no engine
+can receive a newly created graph. There is no public arbitrary-view replacement
+endpoint.
 
 These registrations account for server lifetimes, not universal storage-I/O
 settlement. A joined future or zero operation counter cannot authorize runtime

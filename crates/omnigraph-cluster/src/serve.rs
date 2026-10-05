@@ -221,6 +221,18 @@ pub async fn read_serving_snapshot_from_storage(
     read_snapshot_with_store(&backend).await
 }
 
+/// Project only deployment-affected graphs and their verified runtime payloads.
+/// The ledger and cluster management policy remain authoritative in full;
+/// unrelated graph payload availability cannot veto an independent cutover.
+pub async fn read_deployment_serving_snapshot(
+    storage_root: &str,
+    affected: &[String],
+) -> Result<ServingSnapshot, Vec<Diagnostic>> {
+    let backend =
+        ClusterStore::for_storage_root(storage_root).map_err(|diagnostic| vec![diagnostic])?;
+    read_snapshot_impl(&backend, false, None, Some(affected)).await
+}
+
 /// Test support: read a local cluster's serving snapshot through the
 /// production reader while its storage root reads as `display_root` (see
 /// `ClusterStore::with_display_root`). Graph roots derive from it too.
@@ -414,7 +426,7 @@ fn cluster_root_of_graph_layout(graph_uri: &str) -> Option<String> {
 pub(crate) async fn read_snapshot_with_store(
     backend: &ClusterStore,
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
-    read_snapshot_impl(backend, false, None).await
+    read_snapshot_impl(backend, false, None, None).await
 }
 
 /// Decode and validate legacy applied facts only for stopped-writer conversion.
@@ -422,7 +434,7 @@ pub(crate) async fn read_snapshot_with_store(
 pub(crate) async fn read_snapshot_for_ledger_upgrade(
     backend: &ClusterStore,
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
-    read_snapshot_impl(backend, true, None).await
+    read_snapshot_impl(backend, true, None, None).await
 }
 
 /// Use the ordinary serving projector with already validated frozen candidate
@@ -430,8 +442,9 @@ pub(crate) async fn read_snapshot_for_ledger_upgrade(
 pub(crate) async fn preview_snapshot_with_store(
     backend: &ClusterStore,
     candidate: &crate::CapturedDeployment,
+    affected: &[String],
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
-    read_snapshot_impl(backend, false, Some(candidate)).await
+    read_snapshot_impl(backend, false, Some(candidate), Some(affected)).await
 }
 
 async fn serving_payload(
@@ -457,7 +470,9 @@ async fn read_snapshot_impl(
     backend: &ClusterStore,
     legacy_conversion: bool,
     candidate: Option<&crate::CapturedDeployment>,
+    affected: Option<&[String]>,
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
+    let selected = |graph: &str| affected.is_none_or(|graphs| graphs.iter().any(|id| id == graph));
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     let mut startup_diagnostics: Vec<Diagnostic> = Vec::new();
     let mut quarantined_graphs: BTreeSet<String> = BTreeSet::new();
@@ -536,13 +551,19 @@ async fn read_snapshot_impl(
     let boot_config_digest = state.applied_revision.config_digest.clone();
     let boot_state_revision = state.state_revision;
     let boot_state_cas = observations.state_cas.clone();
-    let boot_applied_graphs = applied_graph_ids(&state);
+    let boot_applied_graphs: Vec<_> = applied_graph_ids(&state)
+        .into_iter()
+        .filter(|id| selected(id))
+        .collect();
     let recovery_pending = boot_applied_graphs
         .iter()
         .any(|graph_id| quarantined_graphs.contains(graph_id));
     for (graph_id, conflict) in
         overlapping_served_external_blob_policies(&state, backend.display_root())
     {
+        if !selected(&graph_id) {
+            continue;
+        }
         quarantined_graphs.insert(graph_id.clone());
         let remedy = match conflict {
             omnigraph::StorageRootConflict::UncomparableRoot { .. } => {
@@ -566,7 +587,9 @@ async fn read_snapshot_impl(
         .resources
         .iter()
         .filter_map(|(address, entry)| match resource_kind(address) {
-            ResourceKind::Graph(graph_id) if !quarantined_graphs.contains(&graph_id) => {
+            ResourceKind::Graph(graph_id)
+                if selected(&graph_id) && !quarantined_graphs.contains(&graph_id) =>
+            {
                 entry.embedding_provider.clone()
             }
             _ => None,
@@ -609,6 +632,9 @@ async fn read_snapshot_impl(
     for (address, entry) in &state.applied_revision.resources {
         match resource_kind(address) {
             ResourceKind::Graph(graph_id) => {
+                if !selected(&graph_id) {
+                    continue;
+                }
                 saw_applied_graph = true;
                 if quarantined_graphs.contains(&graph_id) {
                     continue;
@@ -667,7 +693,7 @@ async fn read_snapshot_impl(
                 let ResourceKind::Query { graph, name } = &kind else {
                     unreachable!()
                 };
-                if quarantined_graphs.contains(graph) {
+                if !selected(graph) || quarantined_graphs.contains(graph) {
                     continue;
                 }
                 match serving_payload(backend, candidate, &kind, &entry.digest, address).await {
@@ -694,9 +720,9 @@ async fn read_snapshot_impl(
                 let applies_to: Vec<String> = applies_to
                     .into_iter()
                     .filter(|binding| {
-                        binding
-                            .strip_prefix("graph.")
-                            .is_none_or(|graph| !quarantined_graphs.contains(graph))
+                        binding.strip_prefix("graph.").is_none_or(|graph| {
+                            selected(graph) && !quarantined_graphs.contains(graph)
+                        })
                     })
                     .collect();
                 if applies_to.is_empty() {
@@ -716,7 +742,7 @@ async fn read_snapshot_impl(
         }
     }
 
-    if graphs.is_empty() {
+    if graphs.is_empty() && affected.is_none() {
         if saw_applied_graph {
             diagnostics.push(Diagnostic::error(
                 "cluster_no_healthy_graphs",
