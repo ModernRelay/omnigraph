@@ -117,13 +117,15 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
     );
     unlock();
 
-    let server = spawn_server_with_cluster_env(
-        temp.path(),
-        &[(
-            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
-            r#"{"act-live":"live-deployment-token"}"#,
-        )],
-    );
+    let bindings = storage_root.is_none().then(LiveBindingsFixture::new);
+    let mut server_env = vec![(
+        "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+        r#"{"act-live":"live-deployment-token","act-reader":"reader-token","act-next":"next-token"}"#,
+    )];
+    if let Some(bindings) = &bindings {
+        server_env.extend(bindings.envs());
+    }
+    let server = spawn_server_with_cluster_env(temp.path(), &server_env);
     let original_pid = server.id();
     let original_url = server.base_url.clone();
     let stop = Arc::new(AtomicBool::new(false));
@@ -300,6 +302,34 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
         "{mismatched:?}"
     );
     assert_eq!(server.id(), original_pid);
+    live_policy_grants_revocations_and_management_handoff(temp.path(), &server);
+    if let Some(bindings) = &bindings {
+        bindings.exercise(temp.path(), &server);
+    }
+    let retained = live_graph_removal_and_readoption(
+        temp.path(),
+        &server,
+        &applied["deployment"]["result"]["graphs"]["tools"]["contract"],
+    );
+    if storage_root.is_none() {
+        live_catalog_repair(temp.path(), &server);
+    }
+    assert_eq!(server.id(), original_pid);
+    assert_eq!(server.base_url, original_url);
+
+    // Reboot from the durable projection: no source apply is allowed to hide
+    // an activation-only change that was never actually persisted.
+    live_policy_handoff_before_restart(temp.path(), &server);
+    server.stop();
+    unlock();
+    let server = spawn_server_with_cluster_env(temp.path(), &server_env);
+    live_policy_state_survives_restart(temp.path(), &server);
+    assert_eq!(live_snapshot(&server, "tools"), retained);
+    assert_live_tool_data(&server);
+    assert_live_person_query(&server);
+    if let Some(bindings) = &bindings {
+        bindings.assert_after_restart(temp.path(), &server);
+    }
     if storage_root.is_none() {
         // Simulate missing storage while its owner is stopped, then prove an
         // unrelated deployment and explicit recovery both work in one new PID.
@@ -310,13 +340,20 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
                 .unwrap();
         let prior_contract = state["applied_revision"]["schema_contracts"]["peer"].clone();
         fs::remove_dir_all(temp.path().join("graphs/peer.omni")).unwrap();
-        let recovering = spawn_server_with_cluster_env(
-            temp.path(),
-            &[(
-                "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
-                r#"{"act-live":"live-deployment-token"}"#,
-            )],
-        );
+        // Deliberately bypass the ledger while every serving writer is stopped.
+        // Text equality must not hide the changed accepted schema contract.
+        let drifted = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let db = Omnigraph::open(temp.path().join("graphs/knowledge.omni").to_str().unwrap())
+                .await
+                .unwrap();
+            db.apply_schema(
+                "node Person { name: String @key age: I32? bio: String? bypassed: Bool? }\n",
+            )
+            .await
+            .unwrap();
+            serde_json::to_value(db.schema_contract_digest()).unwrap()
+        });
+        let recovering = spawn_server_with_cluster_env(temp.path(), &server_env);
         let recovery_pid = recovering.id();
         let read_peer = || {
             client.post(format!("{}/graphs/peer/query", recovering.base_url))
@@ -325,7 +362,8 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
             .send().unwrap()
         };
         assert_eq!(read_peer().status(), 503);
-        // The tools query differs from the last accepted bytes; peer is unchanged.
+        // Change only the tools query; the unavailable peer is unchanged.
+        fs::write(&tools, format!(" {}", fs::read_to_string(&tools).unwrap())).unwrap();
         let unrelated = parse_stdout_json(&output_success(
             cli()
                 .env("OMNIGRAPH_BEARER_TOKEN", "live-deployment-token")
@@ -341,6 +379,12 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
         ));
         assert_eq!(unrelated["active"], true, "{unrelated}");
         assert_eq!(read_peer().status(), 503);
+        live_schema_correction(
+            temp.path(),
+            &recovering,
+            &state["applied_revision"]["schema_contracts"]["knowledge"],
+            &drifted,
+        );
         let lifecycle = temp.path().join("lifecycle.json");
         fs::write(
             &lifecycle,
@@ -374,6 +418,20 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
         );
         assert_eq!(read_peer().status(), 200);
         assert_eq!(recovering.id(), recovery_pid);
+        let peer_snapshot = live_snapshot(&recovering, "peer");
+        let corrected_snapshot = live_snapshot(&recovering, "knowledge");
+        recovering.stop();
+        unlock();
+        let restarted = spawn_server_with_cluster_env(temp.path(), &server_env);
+        assert_eq!(live_snapshot(&restarted, "peer"), peer_snapshot);
+        assert_eq!(live_snapshot(&restarted, "knowledge"), corrected_snapshot);
+        assert_live_schema_matches_source(temp.path(), &restarted);
+        assert_live_person_query(&restarted);
+        assert_live_tool_data(&restarted);
+        bindings
+            .as_ref()
+            .unwrap()
+            .assert_after_restart(temp.path(), &restarted);
     }
 }
 
@@ -945,4 +1003,846 @@ fn apply_lifecycle_fixture(
     assert_eq!(result["result"]["converged"], true, "{result}");
     unlock_cluster_fixture(root);
     result
+}
+
+fn live_apply(
+    config_dir: &std::path::Path,
+    server: &TestServer,
+    token: &str,
+    lifecycle: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut command = cli();
+    command
+        .env("OMNIGRAPH_BEARER_TOKEN", token)
+        .args(["cluster", "apply", "--server", &server.base_url, "--config"])
+        .arg(config_dir)
+        .arg("--json")
+        .timeout(std::time::Duration::from_secs(30));
+    if let Some(options) = lifecycle {
+        let path = config_dir.join("live-lifecycle.json");
+        fs::write(&path, serde_json::to_vec(options).unwrap()).unwrap();
+        command.arg("--lifecycle").arg(path);
+    }
+    let result = parse_stdout_json(&output_success(&mut command));
+    assert_eq!(result["active"], true, "{result}");
+    assert_eq!(
+        result["deployment"]["result"]["converged"], true,
+        "{result}"
+    );
+    result
+}
+
+fn live_get(server: &TestServer, path: &str) -> serde_json::Value {
+    let response = graph_http_client()
+        .get(format!("{}{path}", server.base_url))
+        .bearer_auth("live-deployment-token")
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .unwrap();
+    let status = response.status();
+    let body = response.text().unwrap();
+    assert!(status.is_success(), "{path}: {status}: {body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+fn live_snapshot(server: &TestServer, graph: &str) -> serde_json::Value {
+    live_get(server, &format!("/graphs/{graph}/snapshot"))
+}
+
+fn assert_live_tool_data(server: &TestServer) {
+    let result = parse_stdout_json(&output_success(
+        live_policy_cli("live-deployment-token").args([
+            "query",
+            "tools",
+            "--server",
+            &server.base_url,
+            "--graph",
+            "tools",
+            "--json",
+        ]),
+    ));
+    assert_eq!(result["row_count"], 1, "{result}");
+    assert_eq!(result["rows"][0]["t.name"], "Retained", "{result}");
+}
+
+fn assert_live_person_query(server: &TestServer) {
+    let result = parse_stdout_json(&output_success(
+        live_policy_cli("live-deployment-token").args([
+            "query",
+            "find_person",
+            "--server",
+            &server.base_url,
+            "--graph",
+            "knowledge",
+            "--params",
+            r#"{"name":"Alice"}"#,
+            "--json",
+        ]),
+    ));
+    assert_eq!(result["row_count"], 1, "{result}");
+    assert_eq!(result["rows"][0]["p.name"], "Alice", "{result}");
+}
+
+fn live_graph_removal_and_readoption(
+    config_dir: &std::path::Path,
+    server: &TestServer,
+    contract: &serde_json::Value,
+) -> serde_json::Value {
+    output_success(live_policy_cli("live-deployment-token").args([
+        "mutate",
+        "seed",
+        "--server",
+        &server.base_url,
+        "--graph",
+        "tools",
+        "-e",
+        "query seed() { insert Tool { name: \"Retained\" } }",
+        "--json",
+    ]));
+    let snapshot = live_snapshot(server, "tools");
+    let history = live_get(server, "/graphs/tools/commits");
+    assert_live_tool_data(server);
+    let config_path = config_dir.join("cluster.yaml");
+    let source = fs::read_to_string(&config_path).unwrap();
+    let mut removed: serde_yaml::Value = serde_yaml::from_str(&source).unwrap();
+    removed["graphs"]
+        .as_mapping_mut()
+        .unwrap()
+        .remove(serde_yaml::Value::from("tools"));
+    for policy in removed["policies"].as_mapping_mut().unwrap().values_mut() {
+        policy["applies_to"]
+            .as_sequence_mut()
+            .unwrap()
+            .retain(|graph| graph.as_str() != Some("tools"));
+    }
+    fs::write(&config_path, serde_yaml::to_string(&removed).unwrap()).unwrap();
+    let status_before = live_policy_status(server, "live-deployment-token");
+    let confirmation = serde_json::json!({
+        "contract": contract,
+        "graph_manifest_version": snapshot["graph_manifest_version"],
+    });
+    let mut stale = confirmation.clone();
+    stale["graph_manifest_version"] =
+        (snapshot["graph_manifest_version"].as_u64().unwrap() + 1).into();
+    for (options, expected) in [
+        (serde_json::json!({}), "graph_delete_confirmation_required"),
+        (
+            serde_json::json!({"delete_graphs":{"tools":stale}}),
+            "graph_lifecycle_confirmation_mismatch",
+        ),
+    ] {
+        let path = config_dir.join("live-lifecycle.json");
+        fs::write(&path, serde_json::to_vec(&options).unwrap()).unwrap();
+        let output = output_failure(
+            live_policy_cli("live-deployment-token")
+                .args(["cluster", "apply", "--server", &server.base_url, "--config"])
+                .arg(config_dir)
+                .arg("--lifecycle")
+                .arg(path)
+                .arg("--json"),
+        );
+        let refused = parse_stdout_json(&output);
+        assert!(refused.to_string().contains(expected), "{refused}");
+        assert_eq!(
+            live_policy_status(server, "live-deployment-token"),
+            status_before
+        );
+        assert_eq!(live_snapshot(server, "tools"), snapshot);
+    }
+    let deleted = live_apply(
+        config_dir,
+        server,
+        "live-deployment-token",
+        Some(&serde_json::json!({"delete_graphs":{"tools":confirmation}})),
+    );
+    assert_eq!(
+        deleted["deployment"]["result"]["graphs"]["tools"]["outcome"],
+        "deleted"
+    );
+    assert_eq!(
+        deleted["deployment"]["result"]["graphs"]["tools"]["retained_storage"],
+        true
+    );
+    let response = graph_http_client()
+        .get(format!("{}/graphs/tools/snapshot", server.base_url))
+        .bearer_auth("live-deployment-token")
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    assert_live_person_query(server);
+
+    fs::write(config_path, source).unwrap();
+    let adopted = live_apply(
+        config_dir,
+        server,
+        "live-deployment-token",
+        Some(&serde_json::json!({"adopt_graphs":{"tools":confirmation}})),
+    );
+    assert_eq!(
+        adopted["deployment"]["result"]["graphs"]["tools"]["outcome"],
+        "adopted"
+    );
+    assert_eq!(
+        adopted["deployment"]["result"]["graphs"]["tools"]["contract"],
+        *contract
+    );
+    assert_eq!(live_snapshot(server, "tools"), snapshot);
+    assert_eq!(live_get(server, "/graphs/tools/commits"), history);
+    assert_live_tool_data(server);
+    snapshot
+}
+
+fn live_catalog_repair(config_dir: &std::path::Path, server: &TestServer) {
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(config_dir.join("__cluster/state.json")).unwrap())
+            .unwrap();
+    let digest = ledger["applied_revision"]["resources"]["query.knowledge.find_person"]["digest"]
+        .as_str()
+        .unwrap();
+    let payload = config_dir.join(format!(
+        "__cluster/resources/query/knowledge/find_person/{digest}.gq"
+    ));
+    let expected = fs::read(&payload).unwrap();
+    let snapshot = live_snapshot(server, "knowledge");
+    // The warm view can still answer; only explicit repair may restore the
+    // durable catalog that a fresh server must load.
+    fs::write(&payload, [0xff, 0xfe]).unwrap();
+    assert_live_person_query(server);
+    live_apply(config_dir, server, "live-deployment-token", None);
+    assert_eq!(fs::read(&payload).unwrap(), [0xff, 0xfe]);
+    live_apply(
+        config_dir,
+        server,
+        "live-deployment-token",
+        Some(&serde_json::json!({"repair_catalog":["query.knowledge.find_person"]})),
+    );
+    assert_eq!(fs::read(payload).unwrap(), expected);
+    assert_eq!(live_snapshot(server, "knowledge"), snapshot);
+    assert_live_person_query(server);
+}
+
+fn live_schema_correction(
+    config_dir: &std::path::Path,
+    server: &TestServer,
+    stale: &serde_json::Value,
+    observed: &serde_json::Value,
+) {
+    let before = fs::read(config_dir.join("__cluster/state.json")).unwrap();
+    let path = config_dir.join("live-lifecycle.json");
+    fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_corrections":{"knowledge":stale},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let refused = parse_stdout_json(&output_failure(
+        live_policy_cli("live-deployment-token")
+            .args(["cluster", "apply", "--server", &server.base_url, "--config"])
+            .arg(config_dir)
+            .arg("--lifecycle")
+            .arg(path)
+            .arg("--json"),
+    ));
+    assert!(
+        refused.to_string().contains("applied_schema_drift"),
+        "{refused}"
+    );
+    assert_eq!(
+        fs::read(config_dir.join("__cluster/state.json")).unwrap(),
+        before
+    );
+    live_apply(
+        config_dir,
+        server,
+        "live-deployment-token",
+        Some(&serde_json::json!({"schema_corrections":{"knowledge":observed}})),
+    );
+    assert_live_schema_matches_source(config_dir, server);
+    assert_live_person_query(server);
+}
+
+fn assert_live_schema_matches_source(config_dir: &std::path::Path, server: &TestServer) {
+    let schema = live_get(server, "/graphs/knowledge/schema");
+    assert_eq!(
+        schema["schema_source"],
+        fs::read_to_string(config_dir.join("people.pg")).unwrap()
+    );
+}
+
+/// Exercise policy cutover through the public CLI and a real TCP listener.
+/// The existing journey owns process startup and the later restart.
+fn live_policy_grants_revocations_and_management_handoff(
+    config_dir: &std::path::Path,
+    server: &TestServer,
+) {
+    let original_pid = server.id();
+    let original_url = server.base_url.clone();
+    let graph_policy_path = config_dir.join("graph.policy.yaml");
+    let management_path = config_dir.join("live.policy.yaml");
+    let original_graph_policy = fs::read_to_string(&graph_policy_path).unwrap();
+    let original_management = fs::read_to_string(&management_path).unwrap();
+
+    let before = live_snapshot(server, "knowledge");
+    live_policy_expect_forbidden(&mut live_policy_mutation(server, "PolicyBeforeGrant"));
+    assert_eq!(live_snapshot(server, "knowledge"), before);
+    let before_status = live_policy_status(server, "live-deployment-token");
+
+    let granted = format!(
+        "{}  - id: lifecycle-reader\n    allow:\n      actors: {{ group: lifecycle-readers }}\n      actions: [read, change]\n",
+        original_graph_policy.replace("groups:\n", "groups:\n  lifecycle-readers: [act-reader]\n")
+    );
+    fs::write(&graph_policy_path, &granted).unwrap();
+    fs::write(
+        &management_path,
+        original_management.replace("[act-live]", "[act-reader]"),
+    )
+    .unwrap();
+    live_policy_expect_forbidden(
+        live_policy_cli("reader-token")
+            .args(["cluster", "apply", "--server", &server.base_url, "--config"])
+            .arg(config_dir)
+            .arg("--json"),
+    );
+    assert_eq!(
+        live_policy_status(server, "live-deployment-token"),
+        before_status
+    );
+    assert_eq!(live_snapshot(server, "knowledge"), before);
+
+    // The current administrator can grant data access; the candidate could
+    // not authorize its own submission or publish the attempted mutation.
+    fs::write(&management_path, &original_management).unwrap();
+    live_apply(config_dir, server, "live-deployment-token", None);
+    let mutation = parse_stdout_json(&output_success(&mut live_policy_mutation(
+        server,
+        "PolicyGranted",
+    )));
+    assert!(
+        mutation["commit"]["graph_commit_id"].is_string(),
+        "{mutation}"
+    );
+    live_policy_assert_granted_row(server);
+
+    fs::write(
+        &graph_policy_path,
+        granted.replace("actions: [read, change]", "actions: [read]"),
+    )
+    .unwrap();
+    live_apply(config_dir, server, "live-deployment-token", None);
+    let before = live_snapshot(server, "knowledge");
+    live_policy_expect_forbidden(&mut live_policy_mutation(server, "PolicyAfterRevocation"));
+    assert_eq!(live_snapshot(server, "knowledge"), before);
+    live_policy_assert_granted_row(server);
+
+    // Management authority moves independently of graph permissions. act-next
+    // has no graph grant and must still be able to observe and restore policy.
+    fs::write(
+        &management_path,
+        original_management.replace("[act-live]", "[act-next]"),
+    )
+    .unwrap();
+    let handoff = live_apply(config_dir, server, "live-deployment-token", None);
+    let current = live_policy_status(server, "next-token");
+    assert_eq!(
+        current["status"]["result_revision"],
+        handoff["deployment"]["result"]["result_revision"]
+    );
+    live_policy_expect_forbidden(live_policy_cli("live-deployment-token").args([
+        "cluster",
+        "status",
+        "--server",
+        &server.base_url,
+        "--json",
+    ]));
+    fs::write(&management_path, &original_management).unwrap();
+    live_policy_expect_forbidden(
+        live_policy_cli("live-deployment-token")
+            .args(["cluster", "apply", "--server", &server.base_url, "--config"])
+            .arg(config_dir)
+            .arg("--json"),
+    );
+    assert_eq!(live_policy_status(server, "next-token"), current);
+    live_apply(config_dir, server, "next-token", None);
+    live_policy_status(server, "live-deployment-token");
+    live_policy_expect_forbidden(live_policy_cli("next-token").args([
+        "cluster",
+        "status",
+        "--server",
+        &server.base_url,
+        "--json",
+    ]));
+    assert_eq!(server.id(), original_pid);
+    assert_eq!(server.base_url, original_url);
+}
+
+fn live_policy_handoff_before_restart(config_dir: &std::path::Path, server: &TestServer) {
+    let management_path = config_dir.join("live.policy.yaml");
+    let current = fs::read_to_string(&management_path).unwrap();
+    let handoff = current.replace("[act-live]", "[act-next]");
+    assert_ne!(
+        handoff, current,
+        "fixture must still grant act-live management"
+    );
+    fs::write(management_path, handoff).unwrap();
+    live_apply(config_dir, server, "live-deployment-token", None);
+    live_policy_expect_forbidden(live_policy_cli("live-deployment-token").args([
+        "cluster",
+        "status",
+        "--server",
+        &server.base_url,
+        "--json",
+    ]));
+    live_policy_status(server, "next-token");
+}
+
+fn live_policy_state_survives_restart(config_dir: &std::path::Path, server: &TestServer) {
+    let before = live_snapshot(server, "knowledge");
+    live_policy_expect_forbidden(&mut live_policy_mutation(server, "PolicyAfterRestart"));
+    assert_eq!(live_snapshot(server, "knowledge"), before);
+    live_policy_assert_granted_row(server);
+    live_policy_expect_forbidden(live_policy_cli("live-deployment-token").args([
+        "cluster",
+        "status",
+        "--server",
+        &server.base_url,
+        "--json",
+    ]));
+    live_policy_status(server, "next-token");
+    let management_path = config_dir.join("live.policy.yaml");
+    let handoff = fs::read_to_string(&management_path).unwrap();
+    let restored = handoff.replace("[act-next]", "[act-live]");
+    assert_ne!(restored, handoff, "restart fixture must retain the handoff");
+    fs::write(management_path, restored).unwrap();
+    live_apply(config_dir, server, "next-token", None);
+    live_policy_status(server, "live-deployment-token");
+    live_policy_expect_forbidden(live_policy_cli("next-token").args([
+        "cluster",
+        "status",
+        "--server",
+        &server.base_url,
+        "--json",
+    ]));
+}
+
+fn live_policy_cli(token: &str) -> assert_cmd::Command {
+    let mut command = cli();
+    command
+        .env("OMNIGRAPH_BEARER_TOKEN", token)
+        .timeout(std::time::Duration::from_secs(30));
+    command
+}
+
+fn live_policy_mutation(server: &TestServer, name: &str) -> assert_cmd::Command {
+    let mut command = live_policy_cli("reader-token");
+    command.args([
+        "mutate",
+        "policy_probe",
+        "--server",
+        &server.base_url,
+        "--graph",
+        "knowledge",
+        "-e",
+        "query policy_probe($name: String) { insert Person { name: $name } }",
+        "--params",
+        &serde_json::json!({"name":name}).to_string(),
+        "--json",
+    ]);
+    command
+}
+
+fn live_policy_expect_forbidden(command: &mut assert_cmd::Command) {
+    let output = output_failure(command);
+    let error = parse_stdout_json(&output);
+    let message = error["error"]
+        .as_str()
+        .expect("CLI error message")
+        .to_ascii_lowercase();
+    assert!(
+        message.contains("forbidden") || message.contains("policy denied"),
+        "expected an authorization refusal, got {error}"
+    );
+}
+
+fn live_policy_status(server: &TestServer, token: &str) -> serde_json::Value {
+    parse_stdout_json(&output_success(live_policy_cli(token).args([
+        "cluster",
+        "status",
+        "--server",
+        &server.base_url,
+        "--json",
+    ])))
+}
+
+fn live_policy_assert_granted_row(server: &TestServer) {
+    let rows = parse_stdout_json(&output_success(live_policy_cli("reader-token").args([
+        "query",
+        "policy_read",
+        "--server",
+        &server.base_url,
+        "--graph",
+        "knowledge",
+        "-e",
+        "query policy_read($name: String) { match { $p: Person { name: $name } } return { $p.name } }",
+        "--params",
+        r#"{"name":"PolicyGranted"}"#,
+        "--json",
+    ])));
+    assert_eq!(rows["row_count"], 1, "{rows}");
+    assert_eq!(rows["rows"][0]["p.name"], "PolicyGranted", "{rows}");
+}
+
+/// Bounded loopback dependencies for the existing local live-deployment journey.
+/// The S3 fixture serves HEAD only: overwrite retains the descriptor, while the
+/// engine still probes its size before publishing. No cloud credentials or
+/// external object service participate in this test.
+struct LiveBindingsFixture {
+    first: support::managed_http::IntentApiFixture,
+    replacement: support::managed_http::IntentApiFixture,
+    blobs: support::managed_http::IntentApiFixture,
+    final_snapshot: std::cell::RefCell<Option<serde_json::Value>>,
+}
+
+impl LiveBindingsFixture {
+    fn new() -> Self {
+        use support::managed_http::{IntentApiFixture, IntentReply};
+        let embedding = |vector| {
+            IntentReply::json(
+                200,
+                serde_json::json!({"data":[{"index":0,"embedding":vector}]}),
+            )
+        };
+        let head = IntentReply {
+            status: 200,
+            headers: vec![
+                ("content-length".into(), "8".into()),
+                (
+                    "last-modified".into(),
+                    "Mon, 05 Oct 2026 00:00:00 GMT".into(),
+                ),
+                ("etag".into(), "\"lifecycle-external\"".into()),
+            ],
+            body: Vec::new(),
+        };
+        Self {
+            first: IntentApiFixture::new(vec![
+                embedding([1.0, 0.0, 0.0]),
+                embedding([1.0, 0.0, 0.0]),
+                embedding([0.0, 1.0, 0.0]),
+            ]),
+            // Rebinding, refused replacement, and post-restart checks each
+            // execute a real query. Every call is counted below.
+            replacement: IntentApiFixture::new(vec![embedding([1.0, 0.0, 0.0]); 4]),
+            blobs: IntentApiFixture::new(vec![head.clone(), head]),
+            final_snapshot: std::cell::RefCell::new(None),
+        }
+    }
+
+    fn envs(&self) -> Vec<(&str, &str)> {
+        vec![
+            ("OMNIGRAPH_LIFECYCLE_EMBED_KEY", "test-lifecycle-key"),
+            ("OMNIGRAPH_EMBEDDINGS_MOCK", "0"),
+            ("OMNIGRAPH_EMBED_RETRY_ATTEMPTS", "1"),
+            ("OMNIGRAPH_EMBED_TIMEOUT_MS", "2000"),
+            ("OMNIGRAPH_EMBED_DEADLINE_MS", "3000"),
+            ("AWS_ACCESS_KEY_ID", "lifecycle-test-key"),
+            ("AWS_SECRET_ACCESS_KEY", "lifecycle-test-secret"),
+            ("AWS_SESSION_TOKEN", ""),
+            (
+                "AWS_CONFIG_FILE",
+                "/nonexistent/omnigraph-lifecycle-aws-config",
+            ),
+            (
+                "AWS_SHARED_CREDENTIALS_FILE",
+                "/nonexistent/omnigraph-lifecycle-aws-credentials",
+            ),
+            ("AWS_REGION", "us-east-1"),
+            ("AWS_DEFAULT_REGION", "us-east-1"),
+            ("AWS_ENDPOINT", self.blobs.origin.as_str()),
+            ("AWS_ENDPOINT_URL", self.blobs.origin.as_str()),
+            ("AWS_ENDPOINT_URL_S3", self.blobs.origin.as_str()),
+            ("AWS_ALLOW_HTTP", "true"),
+            ("AWS_VIRTUAL_HOSTED_STYLE_REQUEST", "false"),
+            ("AWS_S3_FORCE_PATH_STYLE", "true"),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+            ("OBJECT_STORE_CLIENT_MAX_RETRIES", "0"),
+            ("OBJECT_STORE_CLIENT_RETRY_TIMEOUT", "2"),
+        ]
+    }
+
+    fn exercise(&self, config_dir: &std::path::Path, server: &TestServer) {
+        let token = "live-deployment-token";
+        let first_profile = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            "kind: openai-compatible\nbase_url: {}/v1\nmodel: space-a\napi_key: ${{OMNIGRAPH_LIFECYCLE_EMBED_KEY}}\n",
+            self.first.origin
+        )).unwrap();
+        fs::write(config_dir.join("bindings.pg"), "node SearchDoc { name: String @key text: String embedding: Vector(3) @embed(\"text\") }\nnode Asset { name: String @key content: Blob? }\n").unwrap();
+        bindings_edit_config(config_dir, |config| {
+            config["graphs"]["bindings"] = serde_yaml::from_str("schema: ./bindings.pg\nembedding_provider: first\nexternal_blobs:\n  allow:\n    - base: s3://lifecycle-assets/first\n      scope: server_safe\n").unwrap();
+            config["providers"] = serde_yaml::from_str("embedding: {}\n").unwrap();
+            config["providers"]["embedding"]["first"] = first_profile;
+            config["policies"]["graph_operators"]["applies_to"]
+                .as_sequence_mut()
+                .unwrap()
+                .push("bindings".into());
+        });
+        live_apply(config_dir, server, token, None);
+        let data = config_dir.join("binding-vectors.jsonl");
+        fs::write(&data, "{\"type\":\"SearchDoc\",\"data\":{\"name\":\"alpha\",\"text\":\"first\",\"embedding\":[1,0,0]}}\n{\"type\":\"SearchDoc\",\"data\":{\"name\":\"beta\",\"text\":\"second\",\"embedding\":[0,1,0]}}\n").unwrap();
+        output_success(
+            cli()
+                .env("OMNIGRAPH_BEARER_TOKEN", token)
+                .args([
+                    "load",
+                    "--server",
+                    &server.base_url,
+                    "--graph",
+                    "bindings",
+                    "--mode",
+                    "overwrite",
+                    "--yes",
+                    "--data",
+                ])
+                .arg(data)
+                .timeout(std::time::Duration::from_secs(30)),
+        );
+        let before = live_snapshot(server, "bindings");
+        bindings_nearest(server, "alpha");
+        bindings_nearest(server, "alpha");
+        self.assert_embedding_requests(&self.first, &["space-a", "space-a"], "/v1/embeddings");
+
+        // Replacing an already-used profile must replace its lazy engine client.
+        bindings_edit_config(config_dir, |config| {
+            config["providers"]["embedding"]["first"]["model"] = "space-b".into();
+        });
+        live_apply(config_dir, server, token, None);
+        bindings_nearest(server, "beta");
+        self.assert_embedding_requests(
+            &self.first,
+            &["space-a", "space-a", "space-b"],
+            "/v1/embeddings",
+        );
+        assert_eq!(live_snapshot(server, "bindings"), before);
+
+        // A new endpoint and graph binding also remove the former definition.
+        let replacement = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            "kind: openai-compatible\nbase_url: {}/v2\nmodel: space-c\napi_key: ${{OMNIGRAPH_LIFECYCLE_EMBED_KEY}}\n",
+            self.replacement.origin
+        )).unwrap();
+        bindings_edit_config(config_dir, |config| {
+            config["providers"]["embedding"]
+                .as_mapping_mut()
+                .unwrap()
+                .remove(serde_yaml::Value::from("first"));
+            config["providers"]["embedding"]["replacement"] = replacement;
+            config["graphs"]["bindings"]["embedding_provider"] = "replacement".into();
+        });
+        live_apply(config_dir, server, token, None);
+        bindings_nearest(server, "alpha");
+        self.assert_embedding_requests(&self.replacement, &["space-c"], "/v2/embeddings");
+        self.first.assert_complete();
+        assert_eq!(live_snapshot(server, "bindings"), before);
+
+        // Missing server credentials refuse before acceptance and keep the
+        // already-used replacement provider working under its existing binding.
+        let config_path = config_dir.join("cluster.yaml");
+        let valid_config = fs::read(&config_path).unwrap();
+        let ledger = fs::read(config_dir.join("__cluster/state.json")).unwrap();
+        let missing = format!(
+            "OMNIGRAPH_MISSING_LIFECYCLE_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        assert!(std::env::var_os(&missing).is_none());
+        bindings_edit_config(config_dir, |config| {
+            config["providers"]["embedding"]["replacement"]["api_key"] =
+                format!("${{{missing}}}").into();
+        });
+        let refused = output_failure(
+            cli()
+                .env("OMNIGRAPH_BEARER_TOKEN", token)
+                .args(["cluster", "apply", "--server", &server.base_url, "--config"])
+                .arg(config_dir)
+                .arg("--json")
+                .timeout(std::time::Duration::from_secs(30)),
+        );
+        assert!(stdout_string(&refused).contains(&missing), "{refused:?}");
+        assert_eq!(
+            fs::read(config_dir.join("__cluster/state.json")).unwrap(),
+            ledger
+        );
+        assert_eq!(live_snapshot(server, "bindings"), before);
+        assert_eq!(self.replacement.requests().len(), 1);
+        fs::write(config_path, valid_config).unwrap();
+        bindings_nearest(server, "alpha");
+        self.assert_embedding_requests(
+            &self.replacement,
+            &["space-c", "space-c"],
+            "/v2/embeddings",
+        );
+
+        bindings_external_load(server, "s3://lifecycle-assets/first/asset.bin", true);
+        self.assert_blob_probes(&["/lifecycle-assets/first/asset.bin"]);
+        bindings_external_redirect(server, "s3://lifecycle-assets/first/asset.bin");
+        let first_blob = live_snapshot(server, "bindings");
+        bindings_edit_config(config_dir, |config| {
+            config["graphs"]["bindings"]["external_blobs"]["allow"][0]["base"] =
+                "s3://lifecycle-assets/second".into();
+        });
+        live_apply(config_dir, server, token, None);
+        assert_eq!(live_snapshot(server, "bindings"), first_blob);
+        bindings_external_load(server, "s3://lifecycle-assets/first/asset.bin", false);
+        assert_eq!(live_snapshot(server, "bindings"), first_blob);
+        self.assert_blob_probes(&["/lifecycle-assets/first/asset.bin"]);
+        bindings_external_redirect(server, "s3://lifecycle-assets/first/asset.bin");
+
+        bindings_external_load(server, "s3://lifecycle-assets/second/asset.bin", true);
+        self.assert_blob_probes(&[
+            "/lifecycle-assets/first/asset.bin",
+            "/lifecycle-assets/second/asset.bin",
+        ]);
+        let final_snapshot = live_snapshot(server, "bindings");
+        // A server must not promote an embedded-only source to server-safe.
+        bindings_edit_config(config_dir, |config| {
+            config["graphs"]["bindings"]["external_blobs"]["allow"][0]["scope"] =
+                "embedded_only".into();
+        });
+        live_apply(config_dir, server, token, None);
+        bindings_external_load(server, "s3://lifecycle-assets/second/asset.bin", false);
+        assert_eq!(live_snapshot(server, "bindings"), final_snapshot);
+        bindings_edit_config(config_dir, |config| {
+            config["graphs"]["bindings"]
+                .as_mapping_mut()
+                .unwrap()
+                .remove(serde_yaml::Value::from("external_blobs"));
+        });
+        live_apply(config_dir, server, token, None);
+        bindings_external_load(server, "s3://lifecycle-assets/second/asset.bin", false);
+        bindings_external_redirect(server, "s3://lifecycle-assets/second/asset.bin");
+        assert_eq!(live_snapshot(server, "bindings"), final_snapshot);
+        self.blobs.assert_complete();
+        *self.final_snapshot.borrow_mut() = Some(final_snapshot);
+    }
+
+    fn assert_after_restart(&self, _config_dir: &std::path::Path, server: &TestServer) {
+        let previous = self.replacement.requests().len();
+        bindings_nearest(server, "alpha");
+        assert_eq!(self.replacement.requests().len(), previous + 1);
+        self.assert_embedding_requests(
+            &self.replacement,
+            &vec!["space-c"; previous + 1],
+            "/v2/embeddings",
+        );
+        self.first.assert_complete();
+        bindings_external_load(server, "s3://lifecycle-assets/second/asset.bin", false);
+        bindings_external_redirect(server, "s3://lifecycle-assets/second/asset.bin");
+        self.blobs.assert_complete();
+        assert_eq!(
+            live_snapshot(server, "bindings"),
+            *self.final_snapshot.borrow().as_ref().unwrap()
+        );
+    }
+
+    fn assert_embedding_requests(
+        &self,
+        fixture: &support::managed_http::IntentApiFixture,
+        models: &[&str],
+        path: &str,
+    ) {
+        let requests = fixture.requests();
+        assert_eq!(requests.len(), models.len());
+        for (request, model) in requests.iter().zip(models) {
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.path, path);
+            assert_eq!(
+                request.headers["authorization"],
+                "Bearer test-lifecycle-key"
+            );
+            assert_eq!(request.body["model"], *model);
+            assert_eq!(
+                request.body["input"],
+                serde_json::json!(["same-query-text"])
+            );
+            assert_eq!(request.body["dimensions"], 3);
+        }
+    }
+
+    fn assert_blob_probes(&self, paths: &[&str]) {
+        let requests = self.blobs.requests();
+        assert_eq!(
+            requests.len(),
+            paths.len(),
+            "external I/O must match admitted sources"
+        );
+        for (request, path) in requests.iter().zip(paths) {
+            assert_eq!(
+                request.method, "HEAD",
+                "overwrite must retain the descriptor without fetching its body"
+            );
+            assert_eq!(request.path, *path);
+        }
+    }
+}
+
+fn bindings_edit_config(config_dir: &std::path::Path, edit: impl FnOnce(&mut serde_yaml::Value)) {
+    let path = config_dir.join("cluster.yaml");
+    let mut config: serde_yaml::Value = serde_yaml::from_slice(&fs::read(&path).unwrap()).unwrap();
+    edit(&mut config);
+    fs::write(path, serde_yaml::to_string(&config).unwrap()).unwrap();
+}
+
+fn bindings_nearest(server: &TestServer, expected: &str) {
+    let response = graph_http_client().post(format!("{}/graphs/bindings/query", server.base_url))
+        .bearer_auth("live-deployment-token")
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&serde_json::json!({"query":"query nearest_docs($q: String) { match { $d: SearchDoc } return { $d.name } order { nearest($d.embedding, $q) } limit 1 }", "name":"nearest_docs", "params":{"q":"same-query-text"}}))
+        .send().unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["row_count"], 1, "{body}");
+    assert_eq!(body["rows"][0]["d.name"], expected, "{body}");
+}
+
+fn bindings_external_load(server: &TestServer, uri: &str, allowed: bool) {
+    let response = graph_http_client().post(format!("{}/graphs/bindings/load", server.base_url))
+        .bearer_auth("live-deployment-token")
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&serde_json::json!({"mode":"overwrite", "data":serde_json::json!({"type":"Asset", "data":{"name":"kept","content":uri}}).to_string()}))
+        .send().unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().unwrap();
+    assert_eq!(status.as_u16(), if allowed { 200 } else { 400 }, "{body}");
+    if !allowed {
+        assert!(
+            body["error"].as_str().unwrap().contains("external Blob"),
+            "{body}"
+        );
+    }
+}
+
+fn bindings_external_redirect(server: &TestServer, uri: &str) {
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let response = client
+        .get(format!("{}/graphs/bindings/blob", server.base_url))
+        .header(
+            omnigraph_api_types::HTTP_API_CONTRACT_HEADER,
+            omnigraph_api_types::HTTP_API_CONTRACT,
+        )
+        .bearer_auth("live-deployment-token")
+        .query(&[
+            ("entity", "node"),
+            ("type", "Asset"),
+            ("id", "kept"),
+            ("property", "content"),
+        ])
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 302);
+    assert_eq!(response.headers()[reqwest::header::LOCATION], uri);
 }

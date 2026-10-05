@@ -138,7 +138,13 @@ availability. The same owners cover coherent schema/query batch activation; thes
 are not generic native settlement. Server `boot_settings` exercises authenticated
 submission, parked requests, caller disconnect, pre-effect refusal and historical
 ID observation. CLI `cli_cluster_e2e` proves one PID/listener survives schema/query
-replacement and graph addition while an unaffected peer keeps serving.
+replacement, graph addition, policy grant/revocation, management handoff and
+confirmed graph removal/readoption while preserving data and history. It checks
+the achieved configuration again after restart. The local journey also exercises
+counted embedding-provider replacement, external-Blob admission changes, catalog
+repair, exact schema correction and missing-root recreation. S3/Azure wrappers
+share the transport-independent phases; local success does not qualify their
+storage-fault paths. CI requires the local journey to execute successfully.
 
 CLI suites own their named planes: cluster lifecycle, data commands, stored queries, schema/config, cross-version rebuild, embedded/remote parity, and local/remote system journeys. Keep `OMNIGRAPH_HOME` hermetic by using `tests/support::cli()` or `cli_process()`.
 
