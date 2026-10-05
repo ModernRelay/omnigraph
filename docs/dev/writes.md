@@ -243,14 +243,19 @@ them read as null. Lance refuses a Merge that renames a field, so a table with
 both kinds chains the Merge on the Project, and the pin names the tip; either
 way the table publishes one logical version past its published version. No
 data file is written and no row or Blob payload is read, so the apply's memory
-and I/O do not grow with the table, every surviving index keeps its coverage,
-and a stored external Blob descriptor, ranged or not, is never rebuilt. A
-dropped column's values stay in the data files until the next optimize
-rewrites every fragment holding them (above); `cleanup` then deletes the old
-files once no retained version references them. Every evolved table's commits
-are planned once, from its manifest, before the first effect, and the effects
-stage exactly that plan, each step checking that its base has the columns the
-previous step left. A column whose type or nullability would change refuses at
+and I/O do not grow with the rows or payload bytes the table stores; they
+still grow with its fragment, schema and index metadata, because planning
+walks the fragment inventory, the Merge carries it and each detached commit
+serializes it. Every surviving index keeps its coverage, and a stored external
+Blob descriptor, ranged or not, is never rebuilt. A dropped column's values
+stay in the data files until the next optimize rewrites every fragment holding
+them (above); `cleanup` then deletes the old files once no retained version
+references them. The collector retains every live branch's head and creation
+point and every tagged version, so a branch created before that optimize keeps
+the old files, merged or not, until it is deleted. Every evolved table's
+commits are planned once, from its manifest, before the first effect, and the
+effects stage exactly that plan, each step checking that its base has the
+columns the previous step left. A column whose type or nullability would change refuses at
 planning; the schema planner emits no such step. The physical column order
 follows the catalog.
 
