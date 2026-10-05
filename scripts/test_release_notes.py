@@ -52,6 +52,7 @@ class MemoryRepository(notes.Repository):
         self.working = dict(self.trees[TARGET])
         self.tags = set()
         self.subjects = {}
+        self.adders = {}
 
     def resolve(self, ref):
         sha = self.refs.get(ref, ref)
@@ -85,6 +86,9 @@ class MemoryRepository(notes.Repository):
 
     def added_by(self, base, target, path):
         return self.subjects.get(path)
+
+    def adding_commit(self, base, target, path):
+        return self.adders.get(path)
 
 
 class ReleaseNotesTests(unittest.TestCase):
@@ -361,6 +365,18 @@ class ReleaseNotesTests(unittest.TestCase):
         self.assertEqual(info["links"], {})
         self.repo.subjects[NEW] = "release: prepare v0.13.0 (#900)"
         self.assertEqual(notes.verify_snapshot(self.repo, content, AUDITED)[1]["links"], {})
+
+    def test_verify_tolerates_a_prep_branch_link_the_release_squash_replaced(self):
+        self.put(RELEASE, RELEASE_TEXT)
+        self.repo.subjects[NEW] = "fix: cherry-picked from main (#912)"
+        _, info, content = self.snapshot2()
+        self.assertEqual(info["links"], {NEW: 912})
+        self.repo.subjects[NEW] = "release: v0.13.0 (#913)"
+        self.repo.adders.update({NEW: "f" * 40, "docs/releases/v0.13.0.md": "e" * 40})
+        with self.assertRaisesRegex(notes.NotesError, "disagree with history"):
+            notes.verify_snapshot(self.repo, content, AUDITED)
+        self.repo.adders["docs/releases/v0.13.0.md"] = "f" * 40
+        self.assertEqual(notes.verify_snapshot(self.repo, content, AUDITED)[1]["links"], {NEW: 912})
 
     def test_verify_refuses_forged_links_and_late_release_edits(self):
         self.put(RELEASE, RELEASE_TEXT)
@@ -1016,6 +1032,8 @@ class AddedByGitTests(unittest.TestCase):
             self.assertEqual(repo.added_by(None, base, "changelog.d/first.added.md"), "feat: first (#5)")
             self.assertIsNone(repo.added_by(base, "HEAD", "changelog.d/first.added.md"))
             self.assertIsNone(repo.added_by(None, "HEAD", "changelog.d/untracked.added.md"))
+            self.assertEqual(repo.adding_commit(None, "HEAD", "changelog.d/moved.added.md"), repo.resolve("HEAD"))
+            self.assertIsNone(repo.adding_commit(base, "HEAD", "changelog.d/first.added.md"))
 
 
 if __name__ == "__main__":
