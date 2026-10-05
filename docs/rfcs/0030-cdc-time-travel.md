@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-08-05
-updated: 2026-08-23
+updated: 2026-10-04
 discussion: null
 supersedes: []
 superseded_by: []
@@ -15,6 +15,17 @@ blocked_on: []
 ---
 
 # RFC 0030: Graph change feed and retained-history contract
+
+> **Detached-only tables disposition:**
+> [RFC: Detached-only tables](2026-09-21-detached-only-tables.md) changed the
+> feed for detached pins: the change set comes from the commit itself, with
+> deletes read from its `omnigraph.deleted_ids` record. Linear intervals only:
+> the row-lineage stamp classification in §4.2, the §4.3 rules that a removing
+> commit always falls back to the exact ID comparison and that no delete record
+> is persisted for the reader, and the adjacent-version admission and
+> `_row_last_updated_at_version` filter of the §14 candidate pruning. Current:
+> the feed contract, which is entity changes, the exact ordered comparison as
+> authority and fallback, cursors, and retention gaps.
 
 C0–C3 are implemented. The §4.4 ordering, client-pagination, and
 continuation-size gates are closed as recorded in §14; C4+ remain design-stage.

@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-09-03
-updated: 2026-10-03
+updated: 2026-10-04
 discussion: null
 supersedes: []
 superseded_by: []
@@ -15,6 +15,15 @@ blocked_on: []
 ---
 
 # RFC 0049: Control-plane seams: observe, readiness witness, bounded shutdown
+
+> **Server runtime disposition:**
+> [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md)
+> removed `cluster refresh`, `cluster import`, and approval execution, refuses
+> `state.lock: false`, and added online activation. Historical: observe defined
+> as `refresh` without the lock, the `unlocked` label, the approval clause of
+> the observe-only reads, "the server never reloads", and the Summary sentence
+> that online activation remains unimplemented. Current: observe-only authority,
+> the readiness witness and inventory, and bounded shutdown.
 
 ## Summary
 
