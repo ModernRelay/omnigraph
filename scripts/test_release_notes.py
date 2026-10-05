@@ -173,6 +173,40 @@ class ReleaseNotesTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaises(notes.NotesError):
                 notes.check_note_caps(path, repo.read(V0_12_0, path))
 
+    def test_release_file_splits_intro_why_and_highlights(self):
+        release = notes.split_release_file(RELEASE, release_text(why="The write path changed.").decode())
+        self.assertEqual(release.intro, "OmniGraph 0.13 makes reads cheaper.")
+        self.assertEqual(release.why, "The write path changed.")
+        self.assertEqual([title for title, _ in release.highlights], ["Highlight 1", "Highlight 2", "Highlight 3"])
+        self.assertTrue(release.highlights_text.startswith("### Highlight 1"))
+
+    def test_release_file_accepts_the_documented_shapes(self):
+        notes.check_release_file(RELEASE, release_text(), "v0.13.0", has_breaking=False)
+        notes.check_release_file(RELEASE, release_text(why="Why."), "v0.13.0", has_breaking=True)
+        notes.check_release_file("changelog.d/v0.13.1.md", release_text(highlights=0), "v0.13.1", has_breaking=False)
+        crlf = notes.check_release_file(RELEASE, release_text().replace(b"\n", b"\r\n"), "v0.13.0", has_breaking=False)
+        self.assertEqual(crlf, notes.check_release_file(RELEASE, release_text(), "v0.13.0", has_breaking=False))
+
+    def test_release_file_refusals(self):
+        many = " ".join(["word"] * 81)
+        for raw, version, breaking, message in (
+            (release_text(intro=""), "v0.13.0", False, "start with an intro"),
+            (release_text(intro=many), "v0.13.0", False, "the intro has 81 words"),
+            (release_text(), "v0.13.0", True, "add '## Why these changes'"),
+            (release_text(why=many), "v0.13.0", True, "has 81 words"),
+            (release_text(highlights=2), "v0.13.0", False, "2 highlights; write 3 to 5"),
+            (release_text(highlights=6), "v0.13.1", False, "6 highlights; write 0 to 5"),
+            (release_text(body=" ".join(["word"] * 151)), "v0.13.0", False, "highlight 'Highlight 1' has 151 words"),
+            (release_text() + b"\n## Roadmap\n\nLater.\n", "v0.13.0", False, "not '## Roadmap'"),
+            (b"# OmniGraph\n\n" + release_text(), "v0.13.0", False, "allowed headings"),
+            (release_text(intro="Intro.\n\n### Stray"), "v0.13.0", False, "belong under"),
+            (release_text().replace(b"## Highlights\n\n", b"## Highlights\n\nLoose text.\n\n"), "v0.13.0", False, "start every highlight"),
+            (release_text(why="One.") + b"\n## Why these changes\n\nTwo.\n", "v0.13.0", False, "appears twice"),
+            (release_text().replace(b"## Highlights", b"Highlights\n----------"), "v0.13.0", False, "use '## ' headings"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(notes.NotesError, message):
+                notes.check_release_file(RELEASE, raw, version, breaking)
+
     def test_unreleased_edits_and_reverts_use_final_tree(self):
         self.repo.trees[TARGET][NEW] = b"- Final wording.\n"
         self.assertEqual(notes.select(self.repo, BASE, TARGET).notes[NEW], b"- Final wording.\n")
