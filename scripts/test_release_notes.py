@@ -327,6 +327,74 @@ class ReleaseNotesTests(unittest.TestCase):
         with self.assertRaisesRegex(notes.NotesError, "reference definitions"):
             self.snapshot2()
 
+    def test_format_two_snapshot_requires_the_release_file(self):
+        selected, info, _ = self.snapshot2()
+        with tempfile.TemporaryDirectory() as directory:
+            self.repo.root = Path(directory)
+            with self.assertRaisesRegex(notes.NotesError, "write changelog.d/v0.13.0.md"):
+                notes.write_snapshot(self.repo, selected, info, False, False)
+            self.assertFalse((self.repo.root / "docs/releases").exists())
+
+    def test_format_two_snapshot_round_trips_through_verify_and_body(self):
+        self.put(RELEASE, RELEASE_TEXT)
+        self.repo.subjects[NEW] = "feat: predicate (#803)"
+        selected, info, content = self.snapshot2()
+        with tempfile.TemporaryDirectory() as directory:
+            self.repo.root = Path(directory)
+            path = notes.write_snapshot(self.repo, selected, info, False, False)
+            self.assertEqual(path.read_text(), content)
+            self.repo.trees[AUDITED]["docs/releases/v0.13.0.md"] = path.read_bytes()
+        self.assertEqual(notes.verify_snapshot(self.repo, content, AUDITED)[1], info)
+        self.repo.refs["refs/tags/v0.13.0"] = AUDITED
+        output = io.StringIO()
+        with patch.object(notes, "Repository", return_value=self.repo), patch("sys.stdout", output):
+            self.assertEqual(notes.main(["body", "--tag", "v0.13.0", "--target", AUDITED]), 0)
+        body = output.getvalue()
+        self.assertTrue(body.startswith("OmniGraph 0.13 makes reads cheaper."))
+        self.assertNotIn("<!-- release-notes", body)
+        self.assertIn(f"([#803]({notes.REPOSITORY}/pull/803))", body)
+
+    def test_verify_tolerates_links_that_appear_after_the_squash(self):
+        self.put(RELEASE, RELEASE_TEXT)
+        _, info, content = self.snapshot2()
+        self.assertEqual(info["links"], {})
+        self.repo.subjects[NEW] = "release: prepare v0.13.0 (#900)"
+        self.assertEqual(notes.verify_snapshot(self.repo, content, AUDITED)[1]["links"], {})
+
+    def test_verify_refuses_forged_links_and_late_release_edits(self):
+        self.put(RELEASE, RELEASE_TEXT)
+        self.repo.subjects[NEW] = "feat: predicate (#803)"
+        _, info, content = self.snapshot2()
+
+        def encode(value):
+            return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+        forged = content.replace(encode(info), encode(dict(info, links={NEW: 999})))
+        with self.assertRaisesRegex(notes.NotesError, "disagree with history"):
+            notes.verify_snapshot(self.repo, forged, AUDITED)
+        self.repo.trees[AUDITED][RELEASE] = RELEASE_TEXT + b"\nLate edit.\n"
+        with self.assertRaisesRegex(notes.NotesError, "release file changed after snapshot"):
+            notes.verify_snapshot(self.repo, content, AUDITED)
+
+    def test_docs_check_applies_caps_before_the_snapshot_exists(self):
+        self.snapshot2()
+        self.repo.working["changelog.d/wordy.fixed.md"] = b"- " + b"word " * 50 + b"\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docs/releases").mkdir(parents=True)
+            errors = []
+            with patch.object(notes, "Repository", return_value=self.repo):
+                notes.check_working_notes(root, errors)
+        self.assertTrue(any("over the 200-character limit" in error for error in errors), errors)
+
+    def test_preview_cli_uses_format_two_for_new_versions(self):
+        self.snapshot2()
+        output = io.StringIO()
+        with patch.object(notes, "Repository", return_value=self.repo), patch("sys.stdout", output):
+            self.assertEqual(notes.main(["preview", "--target", TARGET]), 0)
+        self.assertIn(f"_{notes.PENDING_RELEASE_FILE}_", output.getvalue())
+        self.assertIn('"format":2', output.getvalue())
+
     def test_unreleased_edits_and_reverts_use_final_tree(self):
         self.repo.trees[TARGET][NEW] = b"- Final wording.\n"
         self.assertEqual(notes.select(self.repo, BASE, TARGET).notes[NEW], b"- Final wording.\n")
