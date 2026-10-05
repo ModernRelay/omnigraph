@@ -56,6 +56,10 @@ PREVIOUS_TAG = re.compile(r"(?:refs/tags/)?(v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*
 FORMAT_ONE_VERSIONS = frozenset({"v0.12.0"})
 FORMAT1_KEYS = frozenset({"format", "version", "date", "base", "target", "notes", "legacy", "working_tree", "config"})
 FORMAT2_KEYS = FORMAT1_KEYS | {"release", "links", "previous"}
+PENDING_RELEASE_FILE = "Intro and highlights are written in the release-prep pull request."
+UPGRADE_GUIDE = "docs/user/operations/upgrade.md"
+NOTE_HEADINGS = frozenset({"h1", "h2"})
+INTRO_HEADINGS = frozenset({"h1", "h2", "h3"})
 
 
 class NotesError(Exception):
@@ -187,15 +191,15 @@ def note_text(path: str, raw: bytes) -> tuple[str, str]:
     return match.group(1), text
 
 
-def render_note(repo: Repository, revision: str | None, path: str, raw: bytes, publication_ref: str | None, labels: set[str]) -> str:
-    _, text = note_text(path, raw)
+def rewrite_markdown(repo: Repository, revision: str | None, path: str, text: str, publication_ref: str | None,
+                     labels: set[str], forbidden_headings: frozenset[str] = NOTE_HEADINGS) -> str:
     document = parse_markdown(text)
     if not preserves_boundary(text):
         raise NotesError(f"{path}: unclosed Markdown block would consume the following note")
     if document.environment.get("duplicate_refs"):
         raise NotesError(f"{path}: repeated reference label")
     for token in descendants(document.tokens):
-        if token.type == "heading_open" and token.tag in {"h1", "h2"}:
+        if token.type == "heading_open" and token.tag in forbidden_headings:
             raise NotesError(f"{path}: release headings belong to the renderer")
         if token.type in {"html_inline", "html_block"}:
             raise NotesError(f"{path}: raw HTML is unsupported outside code; use Markdown")
@@ -214,6 +218,21 @@ def render_note(repo: Repository, revision: str | None, path: str, raw: bytes, p
         labels.add(normalized)
         destination = link_destination(repo, revision, path, token.meta["url"], publication_ref)
         lines[start] = f"[{definition.group(1)}]: {destination}\n"
+    return "".join(lines)
+
+
+def render_note(repo: Repository, revision: str | None, path: str, raw: bytes, publication_ref: str | None,
+                labels: set[str], pull_request: int | None = None) -> str:
+    _, text = note_text(path, raw)
+    text = rewrite_markdown(repo, revision, path, text, publication_ref, labels)
+    return append_pull_request(text, pull_request) if pull_request else text
+
+
+def append_pull_request(text: str, number: int) -> str:
+    paragraph = next(token for token in parse_markdown(text).tokens if token.type == "paragraph_open")
+    lines = text.splitlines(keepends=True)
+    last = paragraph.map[1] - 1
+    lines[last] = lines[last].rstrip("\n") + f" ([#{number}]({REPOSITORY}/pull/{number}))\n"
     return "".join(lines)
 
 
@@ -451,13 +470,71 @@ def metadata(selection: Selection, version: str, date: str | None, notes_format:
     return info
 
 
-def render(repo: Repository, selection: Selection, info: dict, publication_ref: str | None = None) -> str:
-    revision = None if selection.working_tree else selection.target
+def render_header(selection: Selection, info: dict) -> str:
     status = f"Released {info['date']}." if info["date"] else "Unreleased preview."
     if selection.working_tree:
         status = f"Working-tree preview based on `{selection.target}`; includes local and untracked notes."
-    parts = [f"# OmniGraph {info['version']}\n\n{status}\n\n",
-             "<!-- release-notes: " + json.dumps(info, sort_keys=True, separators=(",", ":")) + " -->\n\n"]
+    return (f"# OmniGraph {info['version']}\n\n{status}\n\n"
+            "<!-- release-notes: " + json.dumps(info, sort_keys=True, separators=(",", ":")) + " -->\n\n")
+
+
+def render_footer(repo: Repository, revision: str | None, info: dict, has_breaking: bool,
+                  publication_ref: str | None) -> str:
+    links = []
+    if info["previous"]:
+        compare = f"{info['previous']}...{info['version']}"
+        links.append(f"**Full changelog:** [{compare}]({REPOSITORY}/compare/{compare})")
+    if has_breaking:
+        source = f"docs/releases/{info['version']}.md"
+        guide = link_destination(repo, revision, source, posixpath.relpath(UPGRADE_GUIDE, "docs/releases"), publication_ref)
+        links.append(f"[Upgrade guide]({guide})")
+    return " · ".join(links) + "\n" if links else ""
+
+
+def render_v2(repo: Repository, selection: Selection, info: dict, publication_ref: str | None, header: bool) -> str:
+    revision = None if selection.working_tree else selection.target
+    labels: set[str] = set()
+    parts = [render_header(selection, info)] if header else []
+    release, release_path = None, None
+    if selection.release:
+        (release_path, raw), = selection.release.items()
+        release = split_release_file(release_path, canonical(raw).decode("utf-8"))
+        intro = rewrite_markdown(repo, revision, release_path, release.intro, publication_ref, labels, INTRO_HEADINGS)
+        parts.append(intro.rstrip("\n") + "\n\n")
+        if release.highlights_text:
+            highlights = rewrite_markdown(repo, revision, release_path, release.highlights_text, publication_ref, labels)
+            parts.append(f"## {HIGHLIGHTS_HEADING}\n\n" + highlights.rstrip("\n") + "\n\n")
+    else:
+        parts.append(f"_{PENDING_RELEASE_FILE}_\n\n")
+    grouped = {category: [(path, raw) for path, raw in selection.notes.items()
+                          if NOTE_NAME.fullmatch(path).group(1) == category] for category in CATEGORIES}
+    why = release.why if release else ""
+    if grouped["breaking"] or why:
+        parts.append(f"## {CATEGORIES['breaking']}\n\n")
+        if why:
+            text = rewrite_markdown(repo, revision, release_path, why, publication_ref, labels, INTRO_HEADINGS)
+            parts.append(text.rstrip("\n") + "\n\n")
+    for category, title in CATEGORIES.items():
+        if not grouped[category]:
+            continue
+        if category != "breaking":
+            parts.append(f"## {title}\n\n")
+        for path, raw in grouped[category]:
+            note = render_note(repo, revision, path, raw, publication_ref, labels, info["links"].get(path))
+            parts.append(note.rstrip("\n") + "\n\n")
+    if not selection.notes:
+        parts.append("No user-visible changes recorded.\n\n")
+    parts.append(render_footer(repo, revision, info, bool(grouped["breaking"]), publication_ref))
+    return "".join(parts).rstrip("\n") + "\n"
+
+
+def render(repo: Repository, selection: Selection, info: dict, publication_ref: str | None = None,
+           header: bool = True) -> str:
+    """Format 1 always renders its header: v0.12.0's published body includes it."""
+    if info["format"] == 2:
+        return render_v2(repo, selection, info, publication_ref, header)
+    revision = None if selection.working_tree else selection.target
+    parts = [render_header(selection, info)]
     if selection.baseline:
         baseline = selection.baseline
         # Only the migration document uses inline local destinations.
