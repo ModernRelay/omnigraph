@@ -144,9 +144,11 @@ class Repository:
 
     def added_by(self, base: str | None, target: str, path: str) -> str | None:
         """Subject of the newest commit in base..target that added path. Rename
-        detection is off so a developer's diff.renames setting cannot change it."""
+        detection and log.follow are off so a developer's diff.renames or
+        log.follow setting cannot change it."""
         revisions = [f"{base}..{target}"] if base else [target]
-        out = self.git("log", "--no-renames", "--diff-filter=A", "-n", "1", "--format=%s", *revisions, "--", path)
+        out = self.git("-c", "log.follow=false", "log", "--no-renames", "--diff-filter=A", "-n", "1", "--format=%s",
+                       *revisions, "--", path)
         return out.decode("utf-8").strip() or None
 
 

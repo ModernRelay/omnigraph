@@ -1000,6 +1000,7 @@ class AddedByGitTests(unittest.TestCase):
 
             git("init", "-q", "-b", "main")
             git("config", "diff.renames", "copies")
+            git("config", "log.follow", "true")
             (root / "changelog.d").mkdir()
             (root / "changelog.d/first.added.md").write_text("- First.\n")
             git("add", "-A")
