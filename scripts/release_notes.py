@@ -61,6 +61,7 @@ FORMAT_ONE_VERSIONS = frozenset({"v0.12.0"})
 FORMAT1_KEYS = frozenset({"format", "version", "date", "base", "target", "notes", "legacy", "working_tree", "config"})
 FORMAT2_KEYS = FORMAT1_KEYS | {"release", "links", "previous"}
 PENDING_RELEASE_FILE = "Intro and highlights are written in the release-prep pull request."
+PENDING_HIGHLIGHTS = "Highlights are still to be written."
 UPGRADE_GUIDE = "docs/user/operations/upgrade.md"
 NOTE_HEADINGS = frozenset({"h1", "h2"})
 INTRO_HEADINGS = frozenset({"h1", "h2", "h3"})
@@ -348,7 +349,12 @@ def check_words(path: str, part: str, markdown: str, limit: int) -> None:
         raise NotesError(f"{path}: {part} has {words} words; the limit is {limit}")
 
 
-def check_release_file(path: str, raw: bytes, version: str, has_breaking: bool) -> ReleaseFile:
+def minimum_highlights(version: str) -> int:
+    return MINOR_MIN_HIGHLIGHTS if VERSION.fullmatch(version).group(3) == "0" else 0
+
+
+def check_release_file(path: str, raw: bytes, version: str, has_breaking: bool, complete: bool = True) -> ReleaseFile:
+    """complete=False lets a release-prep PR leave the highlights to someone else; the snapshot needs them."""
     release = split_release_file(path, canonical(raw).decode("utf-8"))
     if not release.intro:
         raise NotesError(f"{path}: start with an intro paragraph that says what this release is")
@@ -357,8 +363,8 @@ def check_release_file(path: str, raw: bytes, version: str, has_breaking: bool) 
         raise NotesError(f"{path}: this release has upgrade actions; add '## {WHY_HEADING}' saying why")
     if release.why:
         check_words(path, f"'## {WHY_HEADING}'", release.why, WHY_WORDS)
-    least = MINOR_MIN_HIGHLIGHTS if VERSION.fullmatch(version).group(3) == "0" else 0
-    if not least <= len(release.highlights) <= MAX_HIGHLIGHTS:
+    least = minimum_highlights(version)
+    if len(release.highlights) > MAX_HIGHLIGHTS or (complete and len(release.highlights) < least):
         raise NotesError(f"{path}: {len(release.highlights)} highlights; write {least} to {MAX_HIGHLIGHTS} "
                          f"'### ' sections under '## {HIGHLIGHTS_HEADING}'")
     for title, body in release.highlights:
@@ -373,7 +379,7 @@ def check_release_inputs(selection: Selection, version: str, complete: bool) -> 
     has_breaking = any(NOTE_NAME.fullmatch(path).group(1) == "breaking" for path in selection.notes)
     if selection.release:
         (path, raw), = selection.release.items()
-        release = check_release_file(path, raw, version, has_breaking)
+        release = check_release_file(path, raw, version, has_breaking, complete)
         unknown = [name for name in release.order if f"changelog.d/{name}" not in selection.notes]
         if unknown:
             raise NotesError(f"{path}: '## {ORDER_HEADING}' names notes that are not in this release: {', '.join(unknown)}")
@@ -576,6 +582,8 @@ def render_v2(repo: Repository, selection: Selection, info: dict, publication_re
         if release.highlights_text:
             highlights = rewrite_markdown(repo, revision, release_path, release.highlights_text, publication_ref, labels)
             parts.append(f"## {HIGHLIGHTS_HEADING}\n\n" + unwrap(highlights).rstrip("\n") + "\n\n")
+        elif minimum_highlights(info["version"]):
+            parts.append(f"## {HIGHLIGHTS_HEADING}\n\n_{PENDING_HIGHLIGHTS}_\n\n")
     else:
         parts.append(f"_{PENDING_RELEASE_FILE}_\n\n")
     rank = {f"changelog.d/{name}": index for index, name in enumerate(release.order)} if release else {}
