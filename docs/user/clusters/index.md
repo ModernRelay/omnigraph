@@ -112,6 +112,13 @@ vectors. Roots, format and credential/trust configuration stay fixed.
 A refusal before effects restores unchanged serving views, including after a
 drain timeout. There is one deployment protocol and no legacy execution fallback.
 
+Upgrade the CLI, server and cluster tools together. Before installing the build
+that adds `--lifecycle`, finish outstanding deployments with the build that
+accepted them: captured input now requires `options`, so the new build cannot
+resume older bundles. Completed results remain readable through deployment
+status; recapturing an old deployment with the new CLI changes its input digest
+and can refuse resubmission of that ID. Graph storage format is unchanged.
+
 ## Direct deployments and conversion
 
 Without `--server`, apply executes under its own exclusive admission and requires
