@@ -45,6 +45,13 @@ RELEASE_FILE = re.compile(r"changelog\.d/(v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\
 SQUASH_SUBJECT = re.compile(r"\(#([1-9][0-9]*)\)$")
 NOTE_CHARACTERS = 200
 BREAKING_CHARACTERS = 400
+INTRO_WORDS = 80
+WHY_WORDS = 80
+HIGHLIGHT_WORDS = 150
+MAX_HIGHLIGHTS = 5
+MINOR_MIN_HIGHLIGHTS = 3
+WHY_HEADING = "Why these changes"
+HIGHLIGHTS_HEADING = "Highlights"
 
 
 class NotesError(Exception):
@@ -230,6 +237,77 @@ def check_note_caps(path: str, raw: bytes) -> None:
         raise NotesError(f"{path}: {length} characters, over the {limit}-character limit for .{category}.md notes")
     if category == "breaking" and not document.links:
         raise NotesError(f"{path}: link the guide that holds the upgrade steps")
+
+
+@dataclass(frozen=True)
+class ReleaseFile:
+    intro: str
+    why: str
+    highlights_text: str
+    highlights: list[tuple[str, str]]
+
+
+def split_by_heading(path: str, text: str, tag: str) -> list[tuple[str | None, str]]:
+    """[(None, text before the first heading), (title, body), ...] at ATX headings of one level."""
+    document = parse_markdown(text)
+    lines = text.splitlines(keepends=True)
+    cuts = []
+    for index, token in enumerate(document.tokens):
+        if token.type == "heading_open" and token.tag == tag:
+            if not token.markup.startswith("#"):
+                raise NotesError(f"{path}: use '{'#' * int(tag[1])} ' headings, not underlined ones")
+            cuts.append((document.tokens[index + 1].content.strip(), token.map[0]))
+    starts = [(None, 0)] + cuts
+    ends = [start for _, start in cuts] + [len(lines)]
+    return [(title, "".join(lines[start if title is None else start + 1:end]).strip("\n"))
+            for (title, start), end in zip(starts, ends)]
+
+
+def split_release_file(path: str, text: str) -> ReleaseFile:
+    allowed = f"allowed headings are '## {WHY_HEADING}' and '## {HIGHLIGHTS_HEADING}'"
+    if any(token.type == "heading_open" and token.tag == "h1" for token in parse_markdown(text).tokens):
+        raise NotesError(f"{path}: {allowed}")
+    parts = split_by_heading(path, text, "h2")
+    named: dict[str, str] = {}
+    for title, body in parts[1:]:
+        if title not in {WHY_HEADING, HIGHLIGHTS_HEADING}:
+            raise NotesError(f"{path}: {allowed}, not '## {title}'")
+        if title in named:
+            raise NotesError(f"{path}: '## {title}' appears twice")
+        named[title] = body
+    intro, why = parts[0][1], named.get(WHY_HEADING, "")
+    for body in (intro, why):
+        if any(token.type == "heading_open" for token in parse_markdown(body).tokens):
+            raise NotesError(f"{path}: '###' headings belong under '## {HIGHLIGHTS_HEADING}'")
+    highlights_text = named.get(HIGHLIGHTS_HEADING, "")
+    sections = split_by_heading(path, highlights_text, "h3")
+    if sections[0][1]:
+        raise NotesError(f"{path}: start every highlight with a '### ' heading")
+    return ReleaseFile(intro, why, highlights_text, sections[1:])
+
+
+def check_words(path: str, part: str, markdown: str, limit: int) -> None:
+    words = len(visible_text(parse_markdown(markdown)).split())
+    if words > limit:
+        raise NotesError(f"{path}: {part} has {words} words; the limit is {limit}")
+
+
+def check_release_file(path: str, raw: bytes, version: str, has_breaking: bool) -> ReleaseFile:
+    release = split_release_file(path, canonical(raw).decode("utf-8"))
+    if not release.intro:
+        raise NotesError(f"{path}: start with an intro paragraph that says what this release is")
+    check_words(path, "the intro", release.intro, INTRO_WORDS)
+    if has_breaking and not release.why:
+        raise NotesError(f"{path}: this release has upgrade actions; add '## {WHY_HEADING}' saying why")
+    if release.why:
+        check_words(path, f"'## {WHY_HEADING}'", release.why, WHY_WORDS)
+    least = MINOR_MIN_HIGHLIGHTS if VERSION.fullmatch(version).group(3) == "0" else 0
+    if not least <= len(release.highlights) <= MAX_HIGHLIGHTS:
+        raise NotesError(f"{path}: {len(release.highlights)} highlights; write {least} to {MAX_HIGHLIGHTS} "
+                         f"'### ' sections under '## {HIGHLIGHTS_HEADING}'")
+    for title, body in release.highlights:
+        check_words(path, f"highlight '{title}'", body, HIGHLIGHT_WORDS)
+    return release
 
 
 def is_release_file(path: str) -> bool:
