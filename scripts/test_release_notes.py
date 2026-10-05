@@ -299,6 +299,37 @@ class ReleaseNotesTests(unittest.TestCase):
         self.assertIn(f"[v0.12.0...v0.13.0]({notes.REPOSITORY}/compare/v0.12.0...v0.13.0)", content)
         self.assertIn("[Upgrade guide](../user/operations/upgrade.md)", content)
 
+    def test_format_two_sections_are_tight_lists_with_definitions_after(self):
+        self.put(RELEASE, release_text(why="Why."))
+        self.put(notes.UPGRADE_GUIDE, b"# Upgrading\n")
+        self.put("changelog.d/one.breaking.md", b"- First action. See [one][one-up].\n\n[one-up]: ../docs/user/operations/upgrade.md\n")
+        self.put("changelog.d/two.breaking.md", b"- Second action. See [two][two-up].\n\n[two-up]: ../docs/user/operations/upgrade.md\n")
+        _, _, content = self.snapshot2()
+        self.assertIn("- First action. See [one][one-up].\n- Second action. See [two][two-up].\n\n"
+                      "[one-up]: ../user/operations/upgrade.md\n[two-up]: ../user/operations/upgrade.md\n", content)
+        section = content[content.index("## Upgrade actions"):content.index("## Features")]
+        self.assertEqual(sum(token.type == "bullet_list_open" for token in notes.parse_markdown(section).tokens), 1)
+
+    def test_note_order_puts_listed_notes_first_and_is_not_rendered(self):
+        self.put("changelog.d/a-first.fixed.md", b"- Alpha fix.\n")
+        self.put("changelog.d/z-last.fixed.md", b"- Zulu fix.\n")
+        self.put(RELEASE, RELEASE_TEXT + b"\n## Note order\n\n- z-last.fixed.md\n")
+        selected, _, content = self.snapshot2()
+        self.assertLess(content.index("- Zulu fix."), content.index("- Alpha fix."))
+        self.assertNotIn("Note order", content)
+        notes.check_release_inputs(selected, "v0.13.0", complete=True)
+
+    def test_note_order_refusals(self):
+        self.put("changelog.d/a-first.fixed.md", b"- Alpha fix.\n")
+        for order, message in (("- missing.fixed.md", "not in this release"),
+                               ("- a-first.fixed.md\n- a-first.fixed.md", "appears twice"),
+                               ("a-first.fixed.md", "one note file name per")):
+            with self.subTest(order=order):
+                self.put(RELEASE, RELEASE_TEXT + f"\n## Note order\n\n{order}\n".encode())
+                selected = notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0")
+                with self.assertRaisesRegex(notes.NotesError, message):
+                    notes.check_release_inputs(selected, "v0.13.0", complete=True)
+
     def test_format_two_preview_without_release_file_shows_placeholder(self):
         _, _, content = self.snapshot2()
         self.assertIn(f"_{notes.PENDING_RELEASE_FILE}_", content)

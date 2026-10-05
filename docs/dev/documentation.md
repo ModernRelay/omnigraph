@@ -145,8 +145,12 @@ A `Vector` or `Blob` column is read only when the query names it, so a `count`
 over embedding-heavy types stops loading every vector. #760, #795
 ```
 
-No other headings are allowed. Links follow the note rules. The file is
-immutable once its release is tagged.
+Notes print as one list per section, in file-name order. To put the most
+important ones first, add a `## Note order` section listing note file names,
+one per `- ` line (`- storage-format-14.breaking.md`); listed notes lead their
+sections in that order, the rest follow by file name, and the section itself
+is not printed. No other headings are allowed. Links follow the note rules.
+The file is immutable once its release is tagged.
 
 ### Pull request titles
 
