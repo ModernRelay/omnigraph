@@ -3,6 +3,7 @@
 
 import copy
 import hashlib
+import importlib.util
 import io
 import json
 import subprocess
@@ -394,6 +395,17 @@ class ReleaseNotesTests(unittest.TestCase):
             self.assertEqual(notes.main(["preview", "--target", TARGET]), 0)
         self.assertIn(f"_{notes.PENDING_RELEASE_FILE}_", output.getvalue())
         self.assertIn('"format":2', output.getvalue())
+
+    def test_release_note_gate_matches_the_composer_note_names(self):
+        spec = importlib.util.spec_from_file_location("check_pr_title", notes.ROOT / "scripts/check-pr-title.py")
+        gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gate)
+        self.assertEqual(set(gate.CATEGORIES), set(notes.CATEGORIES))
+        for path in ("changelog.d/x.added.md", "changelog.d/a-b.breaking.md", "changelog.d/v0.13.0.md",
+                     "changelog.d/x.other.md", "changelog.d/sub/x.fixed.md", "docs/x.added.md"):
+            match = notes.NOTE_NAME.fullmatch(path)
+            with self.subTest(path=path):
+                self.assertEqual(bool(gate.NOTE_PATH.fullmatch(path)), bool(match) and match.group(1) in notes.CATEGORIES)
 
     def test_unreleased_edits_and_reverts_use_final_tree(self):
         self.repo.trees[TARGET][NEW] = b"- Final wording.\n"
