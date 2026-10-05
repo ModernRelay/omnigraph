@@ -284,7 +284,8 @@ async fn object_storage_cluster_full_lifecycle(root: &str, expected_scheme: &str
         serde_json::from_str(&adapter.read_text(&ledger_path).await.unwrap()).unwrap();
     let evolved_revision = evolved["state_revision"].as_u64().unwrap();
 
-    // Inventory deletion is an explicit refusal, never a recursive erase.
+    // Inventory deletion requires exact lifecycle confirmation and never
+    // recursively erases graph storage.
     let before_delete = adapter.read_text(&ledger_path).await.unwrap();
     fs::write(
         dir.path().join("cluster.yaml"),
@@ -300,7 +301,7 @@ async fn object_storage_cluster_full_lifecycle(root: &str, expected_scheme: &str
     )
     .await
     .unwrap_err();
-    assert_eq!(refused.code, "deployment_scope");
+    assert_eq!(refused.code, "graph_delete_confirmation_required");
     assert_eq!(
         adapter.read_text(&ledger_path).await.unwrap(),
         before_delete

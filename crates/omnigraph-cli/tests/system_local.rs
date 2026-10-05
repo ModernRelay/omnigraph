@@ -2058,7 +2058,7 @@ fn skip_system_e2e(test_name: &str) -> bool {
 
 /// The whole control-plane story in one test: declare two graphs → converge
 /// (apply creates them) → serve → direct schema/query evolution → serve the new
-/// shape → exact acknowledged drift correction → unsupported deletion refuses.
+/// shape → exact acknowledged drift correction → unconfirmed deletion refuses.
 /// The live same-PID journey is owned by cli_cluster_e2e.
 #[test]
 fn local_cluster_full_lifecycle_declare_serve_evolve_refuse_delete() {
@@ -2164,6 +2164,11 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_refuse_delete() {
         db.apply_schema(rogue_pg).await.unwrap();
         db.schema_contract_digest()
     });
+    // Apply validates only affected graphs. Change this graph's query payload
+    // so its exact achieved contract must be checked before catalog publication.
+    let query_path = dir.join("people.gq");
+    let query_source = fs::read_to_string(&query_path).unwrap();
+    fs::write(&query_path, format!("{query_source}\n")).unwrap();
     let before = fs::read(dir.join("__cluster/state.json")).unwrap();
     let refused = cluster_cli(dir, &["apply"]);
     assert_eq!(refused["ok"], false, "{refused}");
@@ -2201,12 +2206,16 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_refuse_delete() {
         "drift must be dropped back to the declared schema: {shown}"
     );
 
-    // Removal is outside the deployment class. Refusal preserves the whole
-    // achieved projection and both graph roots; no approval command exists.
+    // Removal requires an exact lifecycle confirmation. Refusal preserves the
+    // whole achieved projection and both graph roots.
     fs::write(dir.join("cluster.yaml"), "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries:\n      find_person:\n        file: ./people.gq\n").unwrap();
     let before = fs::read(dir.join("__cluster/state.json")).unwrap();
     let blocked = cluster_cli(dir, &["apply"]);
     assert_eq!(blocked["ok"], false, "{blocked}");
+    assert_eq!(
+        blocked["diagnostics"][0]["code"], "graph_delete_confirmation_required",
+        "{blocked}"
+    );
     assert_eq!(fs::read(dir.join("__cluster/state.json")).unwrap(), before);
     assert!(dir.join("graphs/engineering.omni").exists());
     let server = spawn_server_with_cluster(dir);
