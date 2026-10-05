@@ -42,6 +42,7 @@ PROVENANCE_MARKER = re.compile(r"<!--\s*release-notes\b", re.IGNORECASE)
 LEGACY_PREFIX = "# OmniGraph v0.12.0\n\nUnreleased.\n\n"
 DEFINITION = re.compile(r"^\[([^\]]+)\]: (\S+)$")
 RELEASE_FILE = re.compile(r"changelog\.d/(v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))\.md")
+SQUASH_SUBJECT = re.compile(r"\(#([1-9][0-9]*)\)$")
 
 
 class NotesError(Exception):
@@ -123,6 +124,13 @@ class Repository:
 
     def released(self, version: str) -> bool:
         return self.git("rev-parse", "--verify", "--end-of-options", f"refs/tags/{version}^{{commit}}", optional=True) is not None
+
+    def added_by(self, base: str | None, target: str, path: str) -> str | None:
+        """Subject of the newest commit in base..target that added path. Rename
+        detection is off so a developer's diff.renames setting cannot change it."""
+        revisions = [f"{base}..{target}"] if base else [target]
+        out = self.git("log", "--no-renames", "--diff-filter=A", "-n", "1", "--format=%s", *revisions, "--", path)
+        return out.decode("utf-8").strip() or None
 
 
 def is_external(destination: str) -> bool:
@@ -262,6 +270,11 @@ def migration_baseline(repo: Repository, revision: str | None, legacy: str, free
     return pinned_body if freeze else current_body
 
 
+def pr_number(subject: str | None) -> int | None:
+    match = SQUASH_SUBJECT.search(subject or "")
+    return int(match.group(1)) if match else None
+
+
 def select(repo: Repository, base: str | None, target: str, legacy: str | None = None, working_tree: bool = False,
            freeze_legacy: bool = False, release_version: str | None = None) -> Selection:
     target_sha = repo.resolve(target)
@@ -279,8 +292,14 @@ def select(repo: Repository, base: str | None, target: str, legacy: str | None =
         legacy_sha = repo.resolve(legacy)
         repo.require_ancestor(legacy_sha, target_sha)
         baseline = migration_baseline(repo, None if working_tree else target_sha, legacy_sha, freeze_legacy)
+    links: dict[str, int] = {}
+    if release_version:
+        for path in notes:
+            number = pr_number(repo.added_by(base_sha, target_sha, path))
+            if number is not None:
+                links[path] = number
     return Selection(base_sha, target_sha, notes, legacy_sha, baseline, working_tree,
-                     digest(repo.read(None if working_tree else target_sha, CONFIG)), release)
+                     digest(repo.read(None if working_tree else target_sha, CONFIG)), release, links)
 
 
 def metadata(selection: Selection, version: str, date: str | None) -> dict:
