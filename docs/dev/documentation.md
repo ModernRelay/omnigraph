@@ -149,8 +149,17 @@ Notes print as one list per section, in file-name order. To put the most
 important ones first, add a `## Note order` section listing note file names,
 one per `- ` line (`- storage-format-14.breaking.md`); listed notes lead their
 sections in that order, the rest follow by file name, and the section itself
-is not printed. No other headings are allowed. Links follow the note rules.
-The file is immutable once its release is tagged.
+is not printed. A `## Contributors` section lists the GitHub handles to thank,
+one per `- @handle` line; the snapshot refuses a release file without it, and
+the page prints them as one thank-you line. List the pull request authors
+since the previous release with
+`gh api repos/ModernRelay/omnigraph/compare/<previous>...<target> --paginate --jq '.commits[].author.login' | sort -u`,
+drop bots, and add anyone else worth thanking. No other headings are allowed.
+Links follow the note rules. The file is immutable once its release is tagged.
+
+Wrap notes and the release file as you like: the page joins each paragraph
+into one line, because GitHub shows every newline in a release body as a line
+break. Code blocks and hard line breaks keep their lines.
 
 ### Pull request titles
 

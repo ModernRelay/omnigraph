@@ -54,6 +54,8 @@ WHY_HEADING = "Why these changes"
 HIGHLIGHTS_HEADING = "Highlights"
 ORDER_HEADING = "Note order"
 ORDER_ITEM = re.compile(r"- ([a-z0-9]+(?:-[a-z0-9]+)*\.[a-z]+\.md)")
+CONTRIBUTORS_HEADING = "Contributors"
+CONTRIBUTOR_ITEM = re.compile(r"- @([A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38})")
 PREVIOUS_TAG = re.compile(r"(?:refs/tags/)?(v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))")
 FORMAT_ONE_VERSIONS = frozenset({"v0.12.0"})
 FORMAT1_KEYS = frozenset({"format", "version", "date", "base", "target", "notes", "legacy", "working_tree", "config"})
@@ -279,6 +281,7 @@ class ReleaseFile:
     highlights_text: str
     highlights: list[tuple[str, str]]
     order: tuple[str, ...] = ()
+    contributors: tuple[str, ...] = ()
 
 
 def split_by_heading(path: str, text: str, tag: str) -> list[tuple[str | None, str]]:
@@ -298,13 +301,14 @@ def split_by_heading(path: str, text: str, tag: str) -> list[tuple[str | None, s
 
 
 def split_release_file(path: str, text: str) -> ReleaseFile:
-    allowed = f"allowed headings are '## {WHY_HEADING}', '## {HIGHLIGHTS_HEADING}' and '## {ORDER_HEADING}'"
+    allowed = (f"allowed headings are '## {WHY_HEADING}', '## {HIGHLIGHTS_HEADING}', '## {ORDER_HEADING}' "
+               f"and '## {CONTRIBUTORS_HEADING}'")
     if any(token.type == "heading_open" and token.tag == "h1" for token in parse_markdown(text).tokens):
         raise NotesError(f"{path}: {allowed}")
     parts = split_by_heading(path, text, "h2")
     named: dict[str, str] = {}
     for title, body in parts[1:]:
-        if title not in {WHY_HEADING, HIGHLIGHTS_HEADING, ORDER_HEADING}:
+        if title not in {WHY_HEADING, HIGHLIGHTS_HEADING, ORDER_HEADING, CONTRIBUTORS_HEADING}:
             raise NotesError(f"{path}: {allowed}, not '## {title}'")
         if title in named:
             raise NotesError(f"{path}: '## {title}' appears twice")
@@ -317,17 +321,25 @@ def split_release_file(path: str, text: str) -> ReleaseFile:
     sections = split_by_heading(path, highlights_text, "h3")
     if sections[0][1]:
         raise NotesError(f"{path}: start every highlight with a '### ' heading")
-    order: list[str] = []
-    for line in named.get(ORDER_HEADING, "").split("\n"):
+    order = list_section(path, named.get(ORDER_HEADING, ""), ORDER_ITEM, ORDER_HEADING, "note file name per '- '")
+    contributors = list_section(path, named.get(CONTRIBUTORS_HEADING, ""), CONTRIBUTOR_ITEM, CONTRIBUTORS_HEADING,
+                                "GitHub handle per '- @'")
+    return ReleaseFile(intro, why, highlights_text, sections[1:], order, contributors)
+
+
+def list_section(path: str, body: str, item: re.Pattern, heading: str, shape: str) -> tuple[str, ...]:
+    """The values of a release-file section that is a plain list, one value per line."""
+    values: list[str] = []
+    for line in body.split("\n"):
         if not line.strip():
             continue
-        item = ORDER_ITEM.fullmatch(line.strip())
-        if not item:
-            raise NotesError(f"{path}: list one note file name per '- ' line under '## {ORDER_HEADING}'")
-        if item.group(1) in order:
-            raise NotesError(f"{path}: '{item.group(1)}' appears twice under '## {ORDER_HEADING}'")
-        order.append(item.group(1))
-    return ReleaseFile(intro, why, highlights_text, sections[1:], tuple(order))
+        match = item.fullmatch(line.strip())
+        if not match:
+            raise NotesError(f"{path}: list one {shape} line under '## {heading}'")
+        if match.group(1) in values:
+            raise NotesError(f"{path}: '{match.group(1)}' appears twice under '## {heading}'")
+        values.append(match.group(1))
+    return tuple(values)
 
 
 def check_words(path: str, part: str, markdown: str, limit: int) -> None:
@@ -365,6 +377,8 @@ def check_release_inputs(selection: Selection, version: str, complete: bool) -> 
         unknown = [name for name in release.order if f"changelog.d/{name}" not in selection.notes]
         if unknown:
             raise NotesError(f"{path}: '## {ORDER_HEADING}' names notes that are not in this release: {', '.join(unknown)}")
+        if complete and not release.contributors:
+            raise NotesError(f"{path}: add '## {CONTRIBUTORS_HEADING}' listing the GitHub handles to thank, one per '- @' line")
     elif complete:
         raise NotesError(f"write changelog.d/{version}.md (intro and highlights) before taking the snapshot")
 
@@ -506,6 +520,20 @@ def metadata(selection: Selection, version: str, date: str | None, notes_format:
     return info
 
 
+def unwrap(text: str) -> str:
+    """Join each paragraph's soft-wrapped lines into one: GitHub shows every newline in a
+    release body as a line break. Hard breaks and quoted paragraphs keep their lines."""
+    lines = text.splitlines(keepends=True)
+    paragraphs = [token.map for token in parse_markdown(text).tokens if token.type == "paragraph_open" and token.map]
+    for start, end in sorted(paragraphs, reverse=True):
+        block = lines[start:end]
+        if len(block) < 2 or any(line.rstrip("\n").endswith(("\\", "  ")) for line in block[:-1]) \
+                or any(line.lstrip().startswith(">") for line in block[1:]):
+            continue
+        lines[start:end] = [block[0].rstrip() + "".join(" " + line.strip() for line in block[1:]) + "\n"]
+    return "".join(lines)
+
+
 def split_definitions(text: str) -> tuple[str, list[str]]:
     """A rendered note's bullet, without trailing blank lines, and its reference-definition lines."""
     lines = text.splitlines(keepends=True)
@@ -544,10 +572,10 @@ def render_v2(repo: Repository, selection: Selection, info: dict, publication_re
         (release_path, raw), = selection.release.items()
         release = split_release_file(release_path, canonical(raw).decode("utf-8"))
         intro = rewrite_markdown(repo, revision, release_path, release.intro, publication_ref, labels, INTRO_HEADINGS)
-        parts.append(intro.rstrip("\n") + "\n\n")
+        parts.append(unwrap(intro).rstrip("\n") + "\n\n")
         if release.highlights_text:
             highlights = rewrite_markdown(repo, revision, release_path, release.highlights_text, publication_ref, labels)
-            parts.append(f"## {HIGHLIGHTS_HEADING}\n\n" + highlights.rstrip("\n") + "\n\n")
+            parts.append(f"## {HIGHLIGHTS_HEADING}\n\n" + unwrap(highlights).rstrip("\n") + "\n\n")
     else:
         parts.append(f"_{PENDING_RELEASE_FILE}_\n\n")
     rank = {f"changelog.d/{name}": index for index, name in enumerate(release.order)} if release else {}
@@ -560,7 +588,7 @@ def render_v2(repo: Repository, selection: Selection, info: dict, publication_re
         parts.append(f"## {CATEGORIES['breaking']}\n\n")
         if why:
             text = rewrite_markdown(repo, revision, release_path, why, publication_ref, labels, INTRO_HEADINGS)
-            parts.append(text.rstrip("\n") + "\n\n")
+            parts.append(unwrap(text).rstrip("\n") + "\n\n")
     for category, title in CATEGORIES.items():
         if not grouped[category]:
             continue
@@ -570,7 +598,7 @@ def render_v2(repo: Repository, selection: Selection, info: dict, publication_re
         bullets, definitions = [], []
         for path, raw in grouped[category]:
             note = render_note(repo, revision, path, raw, publication_ref, labels, info["links"].get(path))
-            bullet, note_definitions = split_definitions(note)
+            bullet, note_definitions = split_definitions(unwrap(note))
             bullets.append(bullet)
             definitions.extend(note_definitions)
         parts.append("\n".join(bullets) + "\n\n")
@@ -578,6 +606,10 @@ def render_v2(repo: Repository, selection: Selection, info: dict, publication_re
             parts.append("".join(definitions) + "\n")
     if not selection.notes:
         parts.append("No user-visible changes recorded.\n\n")
+    if release and release.contributors:
+        handles = [f"@{handle}" for handle in release.contributors]
+        thanked = handles[0] if len(handles) == 1 else ", ".join(handles[:-1]) + " and " + handles[-1]
+        parts.append(f"## {CONTRIBUTORS_HEADING}\n\nThanks to {thanked}, who contributed to this release.\n\n")
     parts.append(render_footer(repo, revision, info, bool(grouped["breaking"]), publication_ref))
     return "".join(parts).rstrip("\n") + "\n"
 
