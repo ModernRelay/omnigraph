@@ -333,6 +333,18 @@ def check_release_file(path: str, raw: bytes, version: str, has_breaking: bool) 
     return release
 
 
+def check_release_inputs(selection: Selection, version: str, complete: bool) -> None:
+    """Caps and release-file rules for a version that has no snapshot yet."""
+    for path, raw in selection.notes.items():
+        check_note_caps(path, raw)
+    has_breaking = any(NOTE_NAME.fullmatch(path).group(1) == "breaking" for path in selection.notes)
+    if selection.release:
+        (path, raw), = selection.release.items()
+        check_release_file(path, raw, version, has_breaking)
+    elif complete:
+        raise NotesError(f"write changelog.d/{version}.md (intro and highlights) before taking the snapshot")
+
+
 def is_release_file(path: str) -> bool:
     return RELEASE_FILE.fullmatch(path) is not None
 
@@ -624,14 +636,25 @@ def verify_snapshot(repo: Repository, content: str, audited: str | None = None) 
     # The input commit can disappear after squash. Its complete input manifest,
     # checked against the audited tree, is the proof; target is provenance only.
     source = repo.resolve(audited or "HEAD")
-    selected = select(repo, info["base"], source, info["legacy"], freeze_legacy=True)
+    two = info["format"] == 2
+    selected = select(repo, info["base"], source, info["legacy"], freeze_legacy=True,
+                      release_version=info["version"] if two else None)
     require_configured_selection(repo, selected, info["version"])
-    expected_info = metadata(selected, info["version"], info["date"])
+    previous = previous_tag(read_config(repo, selected.target)["base"]) if two else None
+    expected_info = metadata(selected, info["version"], info["date"], info["format"], previous)
     expected_info["target"] = info["target"]
     if info["config"] != expected_info["config"]:
         raise NotesError("release configuration changed after snapshot generation; regenerate it")
     if info["notes"] != expected_info["notes"]:
         raise NotesError("release notes changed after snapshot generation; regenerate it")
+    if two:
+        if info["release"] != expected_info["release"]:
+            raise NotesError("release file changed after snapshot generation; regenerate it")
+        # A note added by the release-prep PR gains its (#NNN) only after the squash,
+        # so a recorded link must agree with history, and a later one is ignored.
+        if any(expected_info["links"].get(path) != number for path, number in info["links"].items()):
+            raise NotesError("recorded pull request links disagree with history; regenerate the snapshot")
+        expected_info["links"] = info["links"]
     if info != expected_info or content != render(repo, selected, expected_info):
         raise NotesError("snapshot differs from its recorded inputs; regenerate it")
     return selected, expected_info
@@ -698,6 +721,8 @@ def write_snapshot(repo: Repository, selection: Selection, info: dict, replace: 
     if selection.working_tree or not info["date"]:
         raise NotesError("snapshots require a date and committed inputs")
     require_configured_selection(repo, selection, info["version"])
+    if info["format"] == 2:
+        check_release_inputs(selection, info["version"], complete=True)
     if selection.legacy and selection.baseline != migration_baseline(repo, selection.target, selection.legacy, freeze=True):
         raise NotesError("snapshot baseline differs from its pinned legacy source; select the inputs again")
     path = repo.root / "docs/releases" / f"{info['version']}.md"
@@ -740,16 +765,22 @@ def check_working_notes(root: Path, errors: list[str]) -> None:
     try:
         repo = Repository(root)
         config = read_config(repo, None)
-        selected = select(repo, config["base"], "HEAD", config["legacy"], working_tree=True)
-        render(repo, selected, metadata(selected, config["version"], None))
-        path = root / "docs/releases" / f"{config['version']}.md"
+        version = config["version"]
+        two = format_for(version) == 2
+        selected = select(repo, config["base"], "HEAD", config["legacy"], working_tree=True,
+                          release_version=version if two else None)
+        path = root / "docs/releases" / f"{version}.md"
+        if two and not path.exists():
+            check_release_inputs(selected, version, complete=False)
+        render(repo, selected, metadata(selected, version, None, format_for(version), previous_tag(config["base"])))
         if path.exists():
             current = path.read_text(encoding="utf-8")
             if selected.legacy and not PROVENANCE_MARKER.search(current):
                 unreleased_legacy_body(current)
             else:
                 recorded, _ = verify_snapshot(repo, current, "HEAD")
-                if recorded.inputs() != selected.inputs() or recorded.config != selected.config:
+                if (recorded.inputs() != selected.inputs() or recorded.config != selected.config
+                        or recorded.release_inputs() != selected.release_inputs()):
                     raise NotesError("working notes or release configuration changed after snapshot generation")
         index = root / "docs/releases/README.md"
         if not index.exists() or index.read_text(encoding="utf-8") != render_index(repo, directory=index.parent):
@@ -803,16 +834,21 @@ def main(argv: list[str] | None = None) -> int:
             if info["version"] != version:
                 raise NotesError("snapshot version does not match its filename")
             if args.command == "body":
-                print(render(repo, selected, info, publication_ref=version), end="")
+                print(render(repo, selected, info, publication_ref=version, header=info["format"] == 1), end="")
             else:
                 print(f"Release notes OK: {version}, {selected.base}..{selected.target}")
             return 0
         working = getattr(args, "working_tree", False)
         target = repo.resolve(args.target or "HEAD")
         config = read_config(repo, None if working else target)
-        selected = select(repo, None if args.initial_release else (args.base or config["base"]), target, config["legacy"], working)
-        info = metadata(selected, args.version or config["version"], args.date)
+        version = args.version or config["version"]
+        two = format_for(version) == 2
+        base = None if args.initial_release else (args.base or config["base"])
+        selected = select(repo, base, target, config["legacy"], working, release_version=version if two else None)
+        info = metadata(selected, version, args.date, format_for(version), previous_tag(base))
         if args.command == "preview":
+            if two:
+                check_release_inputs(selected, version, complete=False)
             print(render(repo, selected, info, publication_ref=None if working else selected.target), end="")
         else:
             print(write_snapshot(repo, selected, info, args.replace, args.replace_legacy))
