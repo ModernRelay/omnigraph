@@ -24,7 +24,7 @@
 
 <hr>
 
-Omnigraph is engineered working backwards from the new workload introduced by long-horizon agents: Multiple agents sharing a typed world model to continuously retrieve and storea context and coordinate work. 
+Omnigraph is engineered for the new workload introduced by long-horizon agents: Multiple agents sharing a typed world model to continuously retrieve and storea context and coordinate work. 
 
 **Multi-Modal retrieval**: because assembling context for agents requires fusing vector/fts search, graph traversal and filtering <br>
 **Branching**: agents propose reviewable changes rather than writing directly. <br>
